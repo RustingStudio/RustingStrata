@@ -24,12 +24,11 @@ fn gpu_forward_matches_cpu_reference() {
             let got = gm.step(t).unwrap();
             let range = w.iter().fold(f32::MIN, |a, &b| a.max(b)) - w.iter().fold(f32::MAX, |a, &b| a.min(b));
             let diff = got.iter().zip(w).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
-            eprintln!("resident {} pos {i}: argmax {} vs {}, max |dlogit| {diff:.4} (range {range:.2})",
-                gm.resident_layers, ops::argmax(&got), ops::argmax(w));
+            eprintln!("pos {i}: argmax {} vs {}, max |dlogit| {diff:.4} (range {range:.2})", ops::argmax(&got), ops::argmax(w));
             assert_eq!(ops::argmax(&got), ops::argmax(w), "pos {i}");
             assert!(diff <= 0.05 * range, "pos {i}: {diff} vs range {range}");
         }
-        eprintln!("{} tokens in {:?} (CPU experts {:?})", ids.len(), t0.elapsed(), gm.cpu_time);
+        eprintln!("{} tokens in {:?} (CPU {:?}), expert hits {} misses {}", ids.len(), t0.elapsed(), gm.cpu_time, gm.hits, gm.misses);
     }
     assert_eq!(tok.decode(&[ops::argmax(want.last().unwrap()) as u32]).unwrap().trim(), "Paris");
 }

@@ -1,13 +1,14 @@
-//! GPU decode forward for `qwen35` / `qwen35moe` with a fixed expert placement: routed experts of the first N MoE
-//! layers live in VRAM (layer order, as many as fit), the remaining layers run their routed experts on the CPU
-//! reference path. Mirrors `model.rs` step for step.
+//! GPU decode forward for `qwen35` / `qwen35moe`. Routed experts resident in the expert cache run on the GPU; the
+//! rest run on the CPU (`cpu_moe`) while the GPU computes hits and the shared expert. Mirrors `model.rs`.
 
+use crate::cpu_worker::CpuWorker;
 use crate::cuda::{Gpu, GpuTensor};
+use crate::expert_cache::ExpertCache;
 use crate::model::Model;
 use anyhow::bail;
 use cudarc::driver::CudaSlice;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 enum Mixer {
     Delta {
@@ -21,8 +22,7 @@ struct Shared { gate_inp: GpuTensor, gate: GpuTensor, up: GpuTensor, down: GpuTe
 
 enum Ffn {
     Dense { gate: GpuTensor, up: GpuTensor, down: GpuTensor },
-    /// `experts` is None when this layer's routed experts run on the CPU.
-    Moe { router: GpuTensor, experts: Option<[GpuTensor; 3]>, shared: Option<Shared> },
+    Moe { router: GpuTensor, shared: Option<Shared> },
 }
 
 struct Layer { attn_norm: GpuTensor, post_norm: GpuTensor, mixer: Mixer, ffn: Ffn }
@@ -33,17 +33,21 @@ pub struct GpuModel<'a> {
     layers: Vec<Layer>,
     output_norm: GpuTensor,
     output: GpuTensor,
-    /// Scratch activations, addressed by name through `ptrs`.
-    bufs: Vec<CudaSlice<f32>>,
-    ptrs: HashMap<&'static str, u64>,
+    /// Scratch activations by name.
+    bufs: HashMap<&'static str, CudaSlice<f32>>,
     x: CudaSlice<f32>,
-    cpu: CudaSlice<f32>,
+    worker: Option<CpuWorker>,
     logits: CudaSlice<f32>,
     ids: CudaSlice<i32>,
+    slots: CudaSlice<i32>,
     ctx: usize,
     pub pos: usize,
-    pub resident_layers: usize,
-    /// Time spent in CPU expert layers (including the device sync before them).
+    pub cache: Option<ExpertCache>,
+    /// Swap experts every this many tokens (0 = fixed placement).
+    pub adapt_every: usize,
+    pub hits: usize,
+    pub misses: usize,
+    /// Time the CPU worker spent computing missed experts (overlaps GPU work).
     pub cpu_time: Duration,
 }
 
@@ -80,7 +84,7 @@ impl<'a> GpuModel<'a> {
                         up: lt(il, "ffn_up_shexp.weight")?, down: lt(il, "ffn_down_shexp.weight")?,
                     })
                 } else { None };
-                Ffn::Moe { router: lt(il, "ffn_gate_inp.weight")?, experts: None, shared }
+                Ffn::Moe { router: lt(il, "ffn_gate_inp.weight")?, shared }
             } else {
                 Ffn::Dense { gate: lt(il, "ffn_gate.weight")?, up: lt(il, "ffn_up.weight")?, down: lt(il, "ffn_down.weight")? }
             };
@@ -91,43 +95,31 @@ impl<'a> GpuModel<'a> {
 
         let k = c.n_expert_used.max(1);
         let ff = (k * c.n_ff_exp).max(c.n_ff);
-        let sizes: [(&'static str, usize); 23] = [
+        let sizes: [(&'static str, usize); 24] = [
             ("h", c.n_embd), ("mix", c.n_embd), ("qkv", channels), ("z", c.ssm_d_inner), ("beta", nv), ("g", nv),
             ("y", channels), ("o", c.ssm_d_inner), ("qg", c.n_head * 2 * c.head_dim), ("q", c.n_head * c.head_dim),
             ("kraw", kv), ("k", kv), ("v", kv), ("att", c.n_head * c.head_dim), ("rl", c.n_expert), ("wts", k),
             ("ge", ff), ("ue", ff), ("ye", k * c.n_embd), ("shg", c.n_ff_shexp), ("shu", c.n_ff_shexp),
-            ("shy", c.n_embd), ("sg", 1),
+            ("shy", c.n_embd), ("sg", 1), ("wh", k),
         ];
-        let mut bufs = Vec::new();
-        let mut ptrs = HashMap::new();
-        for (name, n) in sizes {
-            let b = gpu.zeros::<f32>(n)?;
-            ptrs.insert(name, gpu.ptr(&b));
-            bufs.push(b);
-        }
-        let (x, cpu, logits, ids) = (gpu.zeros(c.n_embd)?, gpu.zeros(c.n_embd)?, gpu.zeros(c.n_vocab)?, gpu.zeros::<i32>(k)?);
+        let bufs = sizes.into_iter().map(|(name, n)| Ok((name, gpu.zeros::<f32>(n)?))).collect::<anyhow::Result<HashMap<_, _>>>()?;
+        let (x, logits, ids) = (gpu.zeros(c.n_embd)?, gpu.zeros(c.n_vocab)?, gpu.zeros::<i32>(k)?);
+        let slots = gpu.zeros::<i32>(k)?;
         let (free1, _) = gpu.ctx.mem_get_info()?;
 
-        // Fixed placement: whole layers of routed experts, in layer order, while VRAM minus the margin allows.
-        let mut resident_layers = 0;
-        let mut expert_bytes = 0;
-        for (il, l) in layers.iter_mut().enumerate() {
-            let Ffn::Moe { experts, .. } = &mut l.ffn else { continue };
-            let names = ["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"];
-            let need: usize = names.iter().map(|s| m.w.layer(il, s).map(|t| t.data.len()).unwrap_or(0)).sum();
-            let (free, _) = gpu.ctx.mem_get_info()?;
-            if free < need.saturating_add(vram_margin) { break; }
-            *experts = Some([lt(il, names[0])?, lt(il, names[1])?, lt(il, names[2])?]);
-            resident_layers += 1;
-            expert_bytes += need;
-        }
+        let cache = if c.is_moe() {
+            let budget = free1.saturating_sub(vram_margin);
+            Some(ExpertCache::new(m, &gpu, budget)?)
+        } else { None };
+        let worker = if c.is_moe() { Some(CpuWorker::new(m, &gpu.ctx, (0..c.n_layer).collect())?) } else { None };
         let mb = |b: usize| b as f64 / 1048576.0;
         eprintln!(
-            "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {ctx} tokens), routed experts {:.0} MB, resident expert layers {resident_layers}/{}",
-            mb(free0 - free1), mb(2 * 2 * ctx * kv * (c.n_layer / c.full_attention_interval)), mb(expert_bytes),
-            if c.is_moe() { c.n_layer } else { 0 },
+            "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {ctx} tokens), expert slots {:.0} MB, resident experts {}/{}",
+            mb(free0 - free1), mb(2 * 2 * ctx * kv * (c.n_layer / c.full_attention_interval)),
+            mb(cache.as_ref().map_or(0, |x| x.slot_bytes_total())),
+            cache.as_ref().map_or(0, |x| x.resident_count()), cache.as_ref().map_or(0, |x| x.total_experts()),
         );
-        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, ptrs, x, cpu, logits, ids, ctx, pos: 0, resident_layers, cpu_time: Duration::ZERO })
+        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, ctx, pos: 0, cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO })
     }
 
     /// Clear KV and recurrent state.
@@ -148,12 +140,12 @@ impl<'a> GpuModel<'a> {
         if self.pos >= self.ctx { bail!("context full ({} tokens)", self.ctx); }
         let (g, pos, eps, ne) = (&self.gpu, self.pos, c.eps, c.n_embd);
         g.stream.memcpy_htod(&self.m.embed(token), &mut self.x)?;
-        let p = |n: &str| self.ptrs[n];
+        let p = |n: &str| g.ptr(&self.bufs[n]);
         let x = g.ptr(&self.x);
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
         let dv = c.ssm_d_inner / nv;
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
-        let mut cpu_time = Duration::ZERO;
+        let seq = self.worker.as_mut().map_or(0, |w| w.begin());
         for (il, l) in self.layers.iter().enumerate() {
             g.rms_norm(x, 0, l.attn_norm.ptr, p("h"), 0, ne, 1, eps)?;
             match &l.mixer {
@@ -192,7 +184,24 @@ impl<'a> GpuModel<'a> {
                     g.gemv(down, p("ge"), p("ye"))?;
                     g.add(x, p("ye"), ne)?;
                 }
-                Ffn::Moe { router, experts, shared } => {
+                Ffn::Moe { router, shared } => {
+                    let k = c.n_expert_used;
+                    let ids = g.ptr(&self.ids);
+                    g.gemv(router, p("h"), p("rl"))?;
+                    g.router_topk(p("rl"), c.n_expert, k, c.expert_weights_scale, ids, p("wts"))?;
+                    let cache = self.cache.as_ref().unwrap();
+                    let lx = cache.layer(il).unwrap();
+                    let (base, stride) = cache.base(g, lx);
+                    let [mg, mu, md] = lx.mats;
+                    let slots = g.ptr(&self.slots);
+                    let w = self.worker.as_ref().unwrap();
+                    let mb = w.dev + (4 * il * w.layout.stride) as u64;
+                    g.map_hits(ids, g.ptr(&lx.table_dev), slots, p("wts"), p("wh"), k)?;
+                    g.moe_publish(ids, p("wts"), slots, p("h"), mb, k, ne, w.layout.h, seq)?;
+                    g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, k, p("h"), 0, p("ge"))?;
+                    g.moe_gemv(mu.ty, mu.rows, mu.cols, base + mu.off as u64, stride, slots, k, p("h"), 0, p("ue"))?;
+                    g.swiglu(p("ge"), p("ue"), k * c.n_ff_exp)?;
+                    g.moe_gemv(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, k, p("ge"), c.n_ff_exp, p("ye"))?;
                     let (sh, sg) = match shared {
                         Some(s) => {
                             g.gemv(&s.gate_inp, p("h"), p("sg"))?;
@@ -204,25 +213,7 @@ impl<'a> GpuModel<'a> {
                         }
                         None => (0, 0),
                     };
-                    let k = c.n_expert_used;
-                    if let Some([eg, eu, ed]) = experts {
-                        let ids = g.ptr(&self.ids);
-                        g.gemv(router, p("h"), p("rl"))?;
-                        g.router_topk(p("rl"), c.n_expert, k, c.expert_weights_scale, ids, p("wts"))?;
-                        g.moe_gemv(eg, c.n_expert, ids, k, p("h"), 0, p("ge"))?;
-                        g.moe_gemv(eu, c.n_expert, ids, k, p("h"), 0, p("ue"))?;
-                        g.swiglu(p("ge"), p("ue"), k * c.n_ff_exp)?;
-                        g.moe_gemv(ed, c.n_expert, ids, k, p("ge"), c.n_ff_exp, p("ye"))?;
-                        g.moe_combine(x, p("ye"), p("wts"), k, sh, sg, 0, ne)?;
-                    } else {
-                        // ponytail: synchronous CPU round trip per layer; M3 overlaps it with GPU work.
-                        let t0 = Instant::now();
-                        let h = g.stream.clone_dtoh(&self.bufs[0])?;
-                        let y = self.m.routed_experts(il, &h);
-                        g.stream.memcpy_htod(&y, &mut self.cpu)?;
-                        cpu_time += t0.elapsed();
-                        g.moe_combine(x, 0, 0, 0, sh, sg, g.ptr(&self.cpu), ne)?;
-                    }
+                    g.moe_combine(x, p("ye"), p("wh"), k, sh, sg, mb, w.layout.y, seq, slots, ne)?;
                 }
             }
         }
@@ -230,7 +221,18 @@ impl<'a> GpuModel<'a> {
         g.gemv(&self.output, p("h"), g.ptr(&self.logits))?;
         let logits = g.stream.clone_dtoh(&self.logits)?;
         self.pos += 1;
-        self.cpu_time += cpu_time;
+        if let (Some(cache), Some(w)) = (self.cache.as_mut(), self.worker.as_ref()) {
+            for il in 0..self.layers.len() {
+                if cache.layer(il).is_none() { continue; }
+                let r = w.routing(il);
+                let miss = r.iter().filter(|x| x.2 < 0).count();
+                self.misses += miss;
+                self.hits += r.len() - miss;
+                cache.record(il, &r.iter().map(|x| x.0).collect::<Vec<_>>());
+            }
+            self.cpu_time = w.busy();
+            if self.adapt_every > 0 && self.pos % self.adapt_every == 0 { cache.adapt(self.m, &self.gpu, 16)?; }
+        }
         Ok(logits)
     }
 }

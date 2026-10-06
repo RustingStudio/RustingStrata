@@ -208,8 +208,8 @@ impl<'a> Model<'a> {
         y
     }
 
-    /// Router, top-k and the weighted sum of routed experts (no shared expert).
-    pub fn routed_experts(&self, il: usize, h: &[f32]) -> Vec<f32> {
+    /// Router softmax, top-k and normalized weights: (expert, weight) pairs.
+    pub fn route(&self, il: usize, h: &[f32]) -> Vec<(usize, f32)> {
         let c = &self.cfg;
         let mut p = mv(&self.t(il, "ffn_gate_inp.weight"), h);
         ops::softmax(&mut p);
@@ -217,12 +217,17 @@ impl<'a> Model<'a> {
         let sum = top.iter().map(|&e| p[e]).sum::<f32>().max(6.103515625e-5);
         let mut scale = 1.0 / sum;
         if c.expert_weights_scale != 0.0 { scale *= c.expert_weights_scale; }
+        top.into_iter().map(|e| (e, p[e] * scale)).collect()
+    }
+
+    /// Router, top-k and the weighted sum of routed experts (no shared expert).
+    pub fn routed_experts(&self, il: usize, h: &[f32]) -> Vec<f32> {
         let (gate, up, down) = (self.t(il, "ffn_gate_exps.weight"), self.t(il, "ffn_up_exps.weight"), self.t(il, "ffn_down_exps.weight"));
-        let n = c.n_expert;
-        let mut y = vec![0f32; c.n_embd];
-        for &e in &top {
+        let n = self.cfg.n_expert;
+        let mut y = vec![0f32; self.cfg.n_embd];
+        for (e, w) in self.route(il, h) {
             let o = Self::ffn(&gate.expert(e, n), &up.expert(e, n), &down.expert(e, n), h);
-            for (a, b) in y.iter_mut().zip(o) { *a += p[e] * scale * b; }
+            for (a, b) in y.iter_mut().zip(o) { *a += w * b; }
         }
         y
     }
