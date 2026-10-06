@@ -122,6 +122,8 @@ impl ExpertCache {
         let p = &self.pools[lx.pool];
         (gpu.ptr(&p.buf), p.slot_bytes)
     }
+    /// Cache slot of expert `e` in layer `il`, or -1.
+    pub fn slot(&self, il: usize, e: usize) -> i32 { self.layers[il].as_ref().map_or(-1, |l| l.table[e]) }
     pub fn resident(&self, il: usize, e: usize) -> bool { self.layers[il].as_ref().is_some_and(|l| l.table[e] >= 0) }
     pub fn resident_count(&self) -> usize { self.pools.iter().map(|p| p.owner.len()).sum() }
     pub fn slot_bytes_total(&self) -> usize { self.pools.iter().map(|p| p.buf.len()).sum() }
