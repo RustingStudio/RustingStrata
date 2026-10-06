@@ -20,6 +20,17 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   (lib, gguf, ops, quant, tokenizer, cpu_moe) pass. Kept the work: it cannot be verified or rejected without the GPU.
 - No numbers moved. No commit of code.
 
+### 2026-10-06 #2 — GPU busy again
+- `forever_bear` (790 MiB) on the GPU, started by `rusting test . tests --release` from the RustingGames loop
+  (short-lived, relaunched often). No GPU work run.
+- Parity status from cached results: `target/parity-result-gpu.json` 631/640 = 98.59%,
+  `target/parity-result-gpu-q8.json` 630/640 = 98.44% (dp4a Q8 GEMV did not close the gap). Gate needs <= 6 misses.
+  Two misses are at position 0 (right after the prompt): llama.cpp builds the reference with batched prompt
+  processing, so the batched prefill path may change these. Check after prefill lands.
+- **Question for owner:** the RustingGames test loop keeps a game process on the GPU most of the time. May the
+  Strata loop run GPU tests and benchmarks while only that process (< 1.1 GB) holds the GPU? Benchmarks would be
+  noisy; correctness tests would not.
+
 ## Tried and rejected
 
 (none yet)
