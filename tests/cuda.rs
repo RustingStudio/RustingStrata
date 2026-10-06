@@ -76,3 +76,43 @@ fn moe_gemv_selects_experts() {
         assert!(err <= 1e-5, "expert {e}: rel err {err}");
     }
 }
+
+/// Achieved GEMV bandwidth per type (one dense matrix per type, plus 8-expert MoE GEMVs). Run with --ignored.
+#[test]
+#[ignore]
+fn gemv_bandwidth() {
+    let (Some(p), Some(gpu)) = (common::model_path(), gpu()) else { return };
+    let g = Gguf::open(&p).unwrap();
+    let w = Weights { g: &g };
+    let time = |f: &dyn Fn()| {
+        // Warm up long enough for the clocks to ramp.
+        let t0 = std::time::Instant::now();
+        while t0.elapsed().as_millis() < 300 { f(); gpu.stream.synchronize().unwrap(); }
+        let t0 = std::time::Instant::now();
+        for _ in 0..200 { f(); }
+        gpu.stream.synchronize().unwrap();
+        t0.elapsed().as_secs_f64() / 200.0
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, info) in &g.tensors {
+        let ty = GgmlType::from_u32(info.ty).unwrap();
+        let moe = info.dims.len() == 3;
+        if info.dims.len() < 2 || info.dims[0] % 256 != 0 || !seen.insert((ty.name(), moe)) { continue; }
+        let t = w.get(name).unwrap();
+        let dt = gpu.upload(&t).unwrap();
+        let x = gpu.stream.clone_htod(&xs(t.cols)).unwrap();
+        let y = gpu.zeros::<f32>(t.rows).unwrap();
+        let run = || if moe {
+            let n = info.dims[2] as usize;
+            let ids = gpu.stream.clone_htod(&[3i32, 17, 40, 77, 101, 150, 200, 255]).unwrap();
+            let rows = t.rows / n;
+            (time(&|| gpu.moe_gemv(t.ty, rows, t.cols, dt.ptr, dt.bytes() / n, gpu.ptr(&ids), 8, gpu.ptr(&x), 0, gpu.ptr(&y)).unwrap()),
+             8 * dt.bytes() / info.dims[2] as usize)
+        } else {
+            (time(&|| gpu.gemv(&dt, gpu.ptr(&x), gpu.ptr(&y)).unwrap()), dt.bytes())
+        };
+        let (s, bytes) = run();
+        eprintln!("{:8} {:5} {name:32} {:6}x{:5}  {:7.1} us  {:6.1} GB/s", ty.name(), if moe { "moe8" } else { "" },
+            t.rows, t.cols, s * 1e6, bytes as f64 / s / 1e9);
+    }
+}
