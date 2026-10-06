@@ -165,12 +165,13 @@ __device__ __forceinline__ void gemv_row(const u8* w, const float* x, float* y, 
         int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;                                                 \
         if (row < rows) gemv_row<T, SBB>(w + (size_t)row * nsb * SBB, x, y, row, nsb);                         \
     }                                                                                                           \
-    /* grid.y = slot k: weights of expert ids[k], input x + k*x_stride, output y + k*rows. */                    \
-    extern "C" __global__ void moe_gemv_##NAME(const u8* w, const int* ids, const float* x, int x_stride,       \
-                                               float* y, int rows, int nsb) {                                   \
+    /* grid.y = k: weights at w + ids[k]*stride (skipped when ids[k] < 0), input x + k*x_stride,              \
+       output y + k*rows. */                                                                                    \
+    extern "C" __global__ void moe_gemv_##NAME(const u8* w, const int* ids, long long stride, const float* x,  \
+                                               int x_stride, float* y, int rows, int nsb) {                     \
         int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, k = blockIdx.y;                                 \
-        if (row < rows)                                                                                         \
-            gemv_row<T, SBB>(w + ((size_t)ids[k] * rows + row) * nsb * SBB, x + (size_t)k * x_stride,           \
+        if (row < rows && ids[k] >= 0)                                                                          \
+            gemv_row<T, SBB>(w + ids[k] * stride + (size_t)row * nsb * SBB, x + (size_t)k * x_stride,           \
                              y + (size_t)k * rows, row, nsb);                                                   \
     }
 QTYPES(DEF_QUANT)
@@ -344,13 +345,52 @@ extern "C" __global__ void router_topk(float* p, int n, int k, float extra_scale
 }
 
 // x += sum_k w[k] * ye[k] + sigmoid(sg[0]) * sh + cpu (sh and cpu may be null).
+// Expert cache lookup: slots[j] = table[ids[j]] (-1 = not resident); wh[j] = routing weight of hits, else 0.
+extern "C" __global__ void map_hits(const int* ids, const int* table, int* slots, const float* wts, float* wh, int k) {
+    int j = threadIdx.x;
+    if (j >= k) return;
+    int s = table[ids[j]];
+    slots[j] = s;
+    wh[j] = s >= 0 ? wts[j] : 0.0f;
+}
+
+// Copy one layer's routing to the host-mapped mailbox `mb` (activation only if an expert missed), then raise the
+// request flag. One block.
+extern "C" __global__ void moe_publish(const int* ids, const float* wts, const int* slots, const float* h,
+                                       unsigned int* mb, int k, int n, int h_off, unsigned int seq) {
+    int t = threadIdx.x;
+    int miss = __syncthreads_or(t < k && slots[t] < 0);
+    if (t < k) { mb[32 + t] = ids[t]; mb[32 + k + t] = __float_as_uint(wts[t]); mb[32 + 2 * k + t] = slots[t]; }
+    if (miss) for (int i = t; i < n; i += blockDim.x) mb[h_off + i] = __float_as_uint(h[i]);
+    __threadfence_system();
+    __syncthreads();
+    if (t == 0) *(volatile unsigned int*)mb = seq;
+}
+
+// x += sum_j w[j] ye[j] + sigmoid(sg) sh + cpu. If a slot missed, wait for the CPU worker's done flag first.
 extern "C" __global__ void moe_combine(float* x, const float* ye, const float* w, int k, const float* sh,
-                                       const float* sg, const float* cpu, int n) {
+                                       const float* sg, const unsigned int* mb, int y_off, unsigned int seq,
+                                       const int* slots, int n) {
+    __shared__ int miss;
+    if (threadIdx.x == 0) {
+        int m = 0;
+        if (mb) for (int j = 0; j < k; j++) m |= slots[j] < 0;
+        if (m) {
+            unsigned int spins = 0;
+            while (((volatile const unsigned int*)mb)[16] != seq) {
+                __nanosleep(100);
+                if (++spins == (1u << 27)) __trap();  // ~15 s: CPU worker gone
+            }
+            __threadfence_system();
+        }
+        miss = m;
+    }
+    __syncthreads();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float y = 0.0f;
-    for (int j = 0; j < k; j++) y += w[j] * ye[(size_t)j * n + i];
-    if (cpu) y += cpu[i];
+    for (int j = 0; j < k; j++) if (w[j] != 0.0f) y += w[j] * ye[(size_t)j * n + i];
+    if (miss) y += __uint_as_float(((volatile const unsigned int*)mb)[y_off + i]);
     if (sh) y += sigmoid(sg[0]) * sh[i];
     x[i] += y;
 }

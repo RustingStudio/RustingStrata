@@ -14,9 +14,10 @@ const QTYPES: [GgmlType; 11] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ2XS, IQ3XXS, IQ4XS]
 };
-const KERNELS: [&str; 13] = [
+const KERNELS: [&str; 15] = [
     "rms_norm", "l2_norm", "rope_neox", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_step", "norm_gate",
-    "kv_store", "attn_decode", "router_topk", "moe_combine",
+    "kv_store", "attn_decode", "router_topk", "moe_combine", "map_hits",
+    "moe_publish",
 ];
 
 pub struct GpuTensor {
@@ -133,12 +134,16 @@ impl Gpu {
         Ok(())
     }
 
-    /// For k slots: y[k] = W_{ids[k]} x[k], where `w` is an [cols, rows, n_expert] expert tensor.
-    pub fn moe_gemv(&self, w: &GpuTensor, n_expert: usize, ids: u64, k: usize, x: u64, x_stride: usize, y: u64) -> anyhow::Result<()> {
-        let rows = w.rows / n_expert;
-        let nsb = Self::nsb(w)?;
-        launch!(self, &kname("moe_gemv", w.ty), cfg((rows.div_ceil(8) as u32, k as u32), 256, 0),
-            w.ptr, ids, x, x_stride as i32, y, rows as i32, nsb);
+    /// For j < k with ids[j] >= 0: y[j] = W_j x[j], where W_j is the `rows` x `cols` matrix at w + ids[j] * stride bytes.
+    pub fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, y: u64) -> anyhow::Result<()> {
+        if cols % 256 != 0 { bail!("{} expert with {cols} columns: GEMV needs a multiple of 256", ty.name()); }
+        launch!(self, &kname("moe_gemv", ty), cfg((rows.div_ceil(8) as u32, k as u32), 256, 0),
+            w, ids, stride as i64, x, x_stride as i32, y, rows as i32, (cols / 256) as i32);
+        Ok(())
+    }
+
+    pub fn map_hits(&self, ids: u64, table: u64, slots: u64, wts: u64, wh: u64, k: usize) -> anyhow::Result<()> {
+        launch!(self, "map_hits", cfg((1, 1), 32, 0), ids, table, slots, wts, wh, k as i32);
         Ok(())
     }
 
@@ -208,8 +213,15 @@ impl Gpu {
         Ok(())
     }
 
-    pub fn moe_combine(&self, x: u64, ye: u64, w: u64, k: usize, sh: u64, sg: u64, cpu: u64, n: usize) -> anyhow::Result<()> {
-        launch!(self, "moe_combine", Self::grid(n), x, ye, w, k as i32, sh, sg, cpu, n as i32);
+    /// Write routing and (on a miss) `h` to the layer mailbox at `mb` and raise its request flag.
+    pub fn moe_publish(&self, ids: u64, wts: u64, slots: u64, h: u64, mb: u64, k: usize, n: usize, h_off: usize, seq: u32) -> anyhow::Result<()> {
+        launch!(self, "moe_publish", cfg((1, 1), 256, 0), ids, wts, slots, h, mb, k as i32, n as i32, h_off as i32, seq);
+        Ok(())
+    }
+
+    /// `mb` = 0: no CPU part. Otherwise adds the CPU result at word `y_off` of the mailbox once its done flag is `seq`.
+    pub fn moe_combine(&self, x: u64, ye: u64, w: u64, k: usize, sh: u64, sg: u64, mb: u64, y_off: usize, seq: u32, slots: u64, n: usize) -> anyhow::Result<()> {
+        launch!(self, "moe_combine", Self::grid(n), x, ye, w, k as i32, sh, sg, mb, y_off as i32, seq, slots, n as i32);
         Ok(())
     }
 }
