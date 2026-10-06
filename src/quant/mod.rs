@@ -1,7 +1,10 @@
 //! GGML block layouts and scalar reference dequantization.
 //! Ported from llama.cpp `ggml-quants.c` `dequantize_row_*` (MIT License, ggml authors).
 
+pub mod tables;
+
 use half::{bf16, f16};
+use tables::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GgmlType { F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ2XS, IQ3XXS, IQ4XS }
@@ -151,6 +154,53 @@ fn q6k(b: &[u8], y: &mut [f32]) {
     }
 }
 
-fn iq2xs(_: &[u8], _: &mut [f32]) { unimplemented!("Task 4") }
-fn iq3xxs(_: &[u8], _: &mut [f32]) { unimplemented!("Task 4") }
-fn iq4xs(_: &[u8], _: &mut [f32]) { unimplemented!("Task 4") }
+fn sign(signs: u8, j: usize) -> f32 { if signs & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 } }
+
+fn iq2xs(b: &[u8], y: &mut [f32]) {
+    let d = h(b, 0);
+    let scales = &b[66..74];
+    for ib in 0..8 {
+        let db = [d * (0.5 + (scales[ib] & 0xF) as f32) * 0.25, d * (0.5 + (scales[ib] >> 4) as f32) * 0.25];
+        for l in 0..4 {
+            let o = 2 + 2 * (4 * ib + l);
+            let q = u16::from_le_bytes([b[o], b[o + 1]]);
+            let grid = IQ2XS_GRID[(q & 511) as usize].to_le_bytes();
+            let signs = KSIGNS_IQ2XS[(q >> 9) as usize];
+            for j in 0..8 { y[32 * ib + 8 * l + j] = db[l / 2] * grid[j] as f32 * sign(signs, j); }
+        }
+    }
+}
+
+fn iq3xxs(b: &[u8], y: &mut [f32]) {
+    let d = h(b, 0);
+    let (qs, ss) = (&b[2..66], &b[66..98]);
+    for ib in 0..8 {
+        let aux = u32::from_le_bytes(ss[4 * ib..4 * ib + 4].try_into().unwrap());
+        let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
+        for l in 0..4 {
+            let signs = KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
+            let g1 = IQ3XXS_GRID[qs[8 * ib + 2 * l] as usize].to_le_bytes();
+            let g2 = IQ3XXS_GRID[qs[8 * ib + 2 * l + 1] as usize].to_le_bytes();
+            let o = 32 * ib + 8 * l;
+            for j in 0..4 {
+                y[o + j] = db * g1[j] as f32 * sign(signs, j);
+                y[o + j + 4] = db * g2[j] as f32 * sign(signs, j + 4);
+            }
+        }
+    }
+}
+
+fn iq4xs(b: &[u8], y: &mut [f32]) {
+    let d = h(b, 0);
+    let sh = u16::from_le_bytes([b[2], b[3]]);
+    let (sl, qs) = (&b[4..8], &b[8..136]);
+    for ib in 0..8 {
+        let ls = ((sl[ib / 2] >> (4 * (ib % 2))) & 0xF) as i32 | ((((sh >> (2 * ib)) & 3) as i32) << 4);
+        let dl = d * (ls - 32) as f32;
+        for j in 0..16 {
+            let q = qs[16 * ib + j];
+            y[32 * ib + j] = dl * KVALUES_IQ4NL[(q & 0xF) as usize] as f32;
+            y[32 * ib + j + 16] = dl * KVALUES_IQ4NL[(q >> 4) as usize] as f32;
+        }
+    }
+}
