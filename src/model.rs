@@ -8,7 +8,7 @@ use crate::weights::{Tensor, Weights};
 
 pub struct Model<'a> {
     pub cfg: ModelConfig,
-    w: Weights<'a>,
+    pub w: Weights<'a>,
 }
 
 pub enum LayerState {
@@ -199,6 +199,17 @@ impl<'a> Model<'a> {
     }
 
     fn moe(&self, il: usize, h: &[f32]) -> Vec<f32> {
+        let mut y = self.routed_experts(il, h);
+        if let Ok(sg) = self.w.layer(il, "ffn_gate_inp_shexp.weight") {
+            let s = ops::sigmoid(mv(&sg, h)[0]);
+            let o = Self::ffn(&self.t(il, "ffn_gate_shexp.weight"), &self.t(il, "ffn_up_shexp.weight"), &self.t(il, "ffn_down_shexp.weight"), h);
+            for (a, b) in y.iter_mut().zip(o) { *a += s * b; }
+        }
+        y
+    }
+
+    /// Router, top-k and the weighted sum of routed experts (no shared expert).
+    pub fn routed_experts(&self, il: usize, h: &[f32]) -> Vec<f32> {
         let c = &self.cfg;
         let mut p = mv(&self.t(il, "ffn_gate_inp.weight"), h);
         ops::softmax(&mut p);
@@ -212,11 +223,6 @@ impl<'a> Model<'a> {
         for &e in &top {
             let o = Self::ffn(&gate.expert(e, n), &up.expert(e, n), &down.expert(e, n), h);
             for (a, b) in y.iter_mut().zip(o) { *a += p[e] * scale * b; }
-        }
-        if let Ok(sg) = self.w.layer(il, "ffn_gate_inp_shexp.weight") {
-            let s = ops::sigmoid(mv(&sg, h)[0]);
-            let o = Self::ffn(&self.t(il, "ffn_gate_shexp.weight"), &self.t(il, "ffn_up_shexp.weight"), &self.t(il, "ffn_down_shexp.weight"), h);
-            for (a, b) in y.iter_mut().zip(o) { *a += s * b; }
         }
         y
     }

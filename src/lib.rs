@@ -6,3 +6,4 @@ pub mod ops;
 pub mod tokenizer;
 pub mod model;
 pub mod cuda;
+pub mod gpu_model;
