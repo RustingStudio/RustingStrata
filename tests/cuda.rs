@@ -126,3 +126,69 @@ fn gemv_bandwidth() {
             t.rows, t.cols, s * 1e6, bytes as f64 / s / 1e9);
     }
 }
+
+fn f16r(v: f32) -> f32 { half::f16::from_f32(v).to_f32() }
+
+/// Tensor-core GEMM over a tile list matches per-row dot products of fp16-rounded inputs, for every type, with a
+/// gathered X and partial tiles.
+#[test]
+fn gemm_matches_reference_for_every_type() {
+    let (Some(p), Some(gpu)) = (common::model_path(), gpu()) else { return };
+    let g = Gguf::open(&p).unwrap();
+    let w = Weights { g: &g };
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, info) in &g.tensors {
+        let ty = GgmlType::from_u32(info.ty).unwrap();
+        if info.dims.len() < 2 || info.dims[0] % 256 != 0 || !seen.insert(ty.name()) { continue; }
+        let t = w.get(name).unwrap();
+        let dt = gpu.upload(&t).unwrap();
+        let (rows, n_x, m) = (t.rows.min(100), 50, 170);
+        let x = xs(n_x * t.cols);
+        let xrow: Vec<i32> = (0..m).map(|i| ((i * 7) % n_x) as i32).collect();
+        // Tiles: positions 0..128, 128..144 and 144..170 (all with the same matrix).
+        let tiles: Vec<u64> = [(0u64, 128u64), (128, 16), (144, 26)].iter().flat_map(|&(m0, c)| [dt.ptr, m0 | c << 32]).collect();
+        let (dtl, dx, dr) = (gpu.stream.clone_htod(&tiles).unwrap(), gpu.stream.clone_htod(&x).unwrap(), gpu.stream.clone_htod(&xrow).unwrap());
+        let dy = gpu.zeros::<f32>(m * rows).unwrap();
+        gpu.gemm(t.ty, rows, t.cols, gpu.ptr(&dtl), 3, gpu.ptr(&dx), t.cols, gpu.ptr(&dr), gpu.ptr(&dy), rows).unwrap();
+        let got = gpu.stream.clone_dtoh(&dy).unwrap();
+        let mut wr = vec![0f32; t.cols];
+        let mut want = vec![0f32; m * rows];
+        for r in 0..rows {
+            t.row(r, &mut wr);
+            for (i, &xr) in xrow.iter().enumerate() {
+                let xv = &x[xr as usize * t.cols..][..t.cols];
+                want[i * rows + r] = wr.iter().zip(xv).map(|(a, b)| f16r(*a) * f16r(*b)).sum();
+            }
+        }
+        let e = rel_l2(&got, &want);
+        eprintln!("{:8} {name}: gemm rel err {e:.2e}", ty.name());
+        assert!(e <= 1e-4, "{} gemm ({name}): rel err {e}", ty.name());
+    }
+}
+
+/// Prefill GEMM throughput on 4096 positions for a few layer matrices. Run with --ignored.
+#[test]
+#[ignore]
+fn gemm_throughput() {
+    let (Some(p), Some(gpu)) = (common::model_path(), gpu()) else { return };
+    let g = Gguf::open(&p).unwrap();
+    let w = Weights { g: &g };
+    let m = 4096usize;
+    for name in ["blk.0.attn_qkv.weight", "blk.0.attn_gate.weight", "blk.0.ssm_out.weight", "blk.0.ffn_gate_exps.weight", "blk.0.ffn_down_exps.weight"] {
+        let t = w.get(name).unwrap();
+        let rows = if g.tensors[name].dims.len() == 3 { t.rows / g.tensors[name].dims[2] as usize } else { t.rows };
+        let dt = gpu.upload(&t).unwrap();
+        let bm = rusting_strata::cuda::GEMM_BM;
+        let tiles: Vec<u64> = (0..m / bm).flat_map(|i| [dt.ptr, (bm * i) as u64 | (bm as u64) << 32]).collect();
+        let (dtl, dx) = (gpu.stream.clone_htod(&tiles).unwrap(), gpu.stream.clone_htod(&xs(m * t.cols)).unwrap());
+        let dy = gpu.zeros::<f32>(m * rows).unwrap();
+        let run = || gpu.gemm(t.ty, rows, t.cols, gpu.ptr(&dtl), m / bm, gpu.ptr(&dx), t.cols, 0, gpu.ptr(&dy), rows).unwrap();
+        for _ in 0..3 { run(); }
+        gpu.stream.synchronize().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..10 { run(); }
+        gpu.stream.synchronize().unwrap();
+        let s = t0.elapsed().as_secs_f64() / 10.0;
+        eprintln!("{:8} {name:28} {rows:6}x{:5} x {m}: {:8.2} ms  {:6.2} TFLOP/s", t.ty.name(), t.cols, s * 1e3, 2.0 * (m * rows * t.cols) as f64 / s / 1e12);
+    }
+}

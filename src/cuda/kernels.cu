@@ -358,6 +358,86 @@ FTYPES(DEF_FGEMV)
     }
 ITYPES(DEF_IGEMV)
 
+// ---- prefill GEMM: Y[m, n] = sum_k X[m, k] W[n, k] on tensor cores (fp16 inputs, fp32 accumulate) ----
+// Work is a list of tiles of up to GEMM_BM consecutive positions m0 .. m0 + cnt, each with its own weight matrix (so one
+// launch covers every expert of a MoE layer). X row of position m is xrow[m] (or m when xrow is null).
+// grid = (ceil(rows / 64), tiles), block = 2 * GEMM_BM.
+struct GemmTile { const u8* w; int m0, cnt; };
+
+__device__ __forceinline__ u32 ld_s32(const u16* p) { return *(const u32*)p; }
+__device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ u32 h2pack(float a, float b) { return (u32)f2h(a) | ((u32)f2h(b) << 16); }
+
+// BM positions x 64 rows per block, K in steps of BK; warps form a (BM / 32) x 2 grid, each owning 32 x 32 outputs.
+template <int T, int SBB, int BM, int BK>
+__device__ __forceinline__ void gemm_q(const GemmTile* tiles, const float* __restrict__ x, int x_stride, const int* xrow,
+                                       float* y, int y_stride, int rows, int nsb) {
+    constexpr int P = BK + 8, NT = BM * 2, SUBS = BK / 8;  // smem pitch in halves (padding: conflict-free fragments)
+    __shared__ __align__(16) u16 xs[BM * P], ws[64 * P];
+    GemmTile tl = tiles[blockIdx.y];
+    int n0 = blockIdx.x * 64, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    int wm = (warp >> 1) * 32, wn = (warp & 1) * 32;
+    const float* xr[BM * BK / 4 / NT];  // row pointers of the X elements this thread loads (null past cnt)
+    for (int q = 0; q < BM * BK / 4 / NT; q++) {
+        int r = (tid + q * NT) / (BK / 4);
+        xr[q] = r < tl.cnt ? x + (size_t)(xrow ? xrow[tl.m0 + r] : tl.m0 + r) * x_stride : nullptr;
+    }
+    float acc[2][4][4] = {};
+    for (int kb = 0; kb < nsb * (256 / BK); kb++) {
+        int sb = kb / (256 / BK), part = kb % (256 / BK);
+        for (int i = tid; i < 64 * SUBS; i += NT) {
+            int r = i / SUBS, j = i % SUBS;
+            float v[8] = {};
+            if (n0 + r < rows) deq8<T>(tl.w + ((size_t)(n0 + r) * nsb + sb) * SBB, part * SUBS + j, v);
+            *(uint4*)(ws + r * P + j * 8) = make_uint4(h2pack(v[0], v[1]), h2pack(v[2], v[3]), h2pack(v[4], v[5]), h2pack(v[6], v[7]));
+        }
+        for (int q = 0; q < BM * BK / 4 / NT; q++) {
+            int i = tid + q * NT, r = i / (BK / 4), c = (i % (BK / 4)) * 4;
+            float4 v = xr[q] ? *(const float4*)(xr[q] + kb * BK + c) : make_float4(0.f, 0.f, 0.f, 0.f);
+            *(uint2*)(xs + r * P + c) = make_uint2(h2pack(v.x, v.y), h2pack(v.z, v.w));
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < BK; kk += 16) {
+            u32 a[2][4], b[4][2];
+            for (int mt = 0; mt < 2; mt++) {
+                const u16* p = xs + (wm + mt * 16 + g) * P + kk + 2 * t;
+                a[mt][0] = ld_s32(p); a[mt][1] = ld_s32(p + 8 * P); a[mt][2] = ld_s32(p + 8); a[mt][3] = ld_s32(p + 8 * P + 8);
+            }
+            for (int nt = 0; nt < 4; nt++) {
+                const u16* p = ws + (wn + nt * 8 + g) * P + kk + 2 * t;
+                b[nt][0] = ld_s32(p); b[nt][1] = ld_s32(p + 8);
+            }
+            for (int mt = 0; mt < 2; mt++)
+                for (int nt = 0; nt < 4; nt++) mma16816(acc[mt][nt], a[mt][0], a[mt][1], a[mt][2], a[mt][3], b[nt][0], b[nt][1]);
+        }
+        __syncthreads();
+    }
+    for (int mt = 0; mt < 2; mt++)
+        for (int nt = 0; nt < 4; nt++)
+            for (int h = 0; h < 2; h++) {
+                int r = wm + mt * 16 + g + 8 * h, n = n0 + wn + nt * 8 + 2 * t;
+                if (r >= tl.cnt) continue;
+                float* yr = y + (size_t)(tl.m0 + r) * y_stride;
+                if (n < rows) yr[n] = acc[mt][nt][2 * h];
+                if (n + 1 < rows) yr[n + 1] = acc[mt][nt][2 * h + 1];
+            }
+}
+
+#ifndef GEMM_BM
+#define GEMM_BM 128
+#define GEMM_BK 64
+#endif
+#define DEF_GEMM(T, NAME, SBB)                                                                                    \
+    extern "C" __global__ void __launch_bounds__(GEMM_BM * 2) gemm_##NAME(const GemmTile* tiles, const float* x,   \
+            int x_stride, const int* xrow, float* y, int y_stride, int rows, int nsb) {                          \
+        gemm_q<T, SBB, GEMM_BM, GEMM_BK>(tiles, x, x_stride, xrow, y, y_stride, rows, nsb);                     \
+    }
+QTYPES(DEF_GEMM)
+
 // ---- elementwise / norm ----
 
 // grid = rows. out[r] = rmsnorm(x[r]) * w (same w for every row).

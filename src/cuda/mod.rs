@@ -20,6 +20,9 @@ const KERNELS: [&str; 15] = [
     "moe_publish",
 ];
 
+/// Positions per GEMM tile (GEMM_BM in kernels.cu).
+pub const GEMM_BM: usize = 128;
+
 pub struct GpuTensor {
     pub ty: GgmlType,
     pub rows: usize,
@@ -94,7 +97,7 @@ impl Gpu {
         let module = ctx.load_module(ptx(&source(), arch)?).context("load PTX")?;
         let mut fns = HashMap::new();
         let names = KERNELS.iter().map(|s| s.to_string())
-            .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "moe_gemv"].map(|p| kname(p, t))));
+            .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "moe_gemv", "gemm"].map(|p| kname(p, t))));
         for n in names {
             let f = module.load_function(&n).with_context(|| format!("kernel {n}"))?;
             fns.insert(n, f);
@@ -125,6 +128,16 @@ impl Gpu {
     fn nsb(w: &GpuTensor) -> anyhow::Result<i32> {
         if w.cols % 256 != 0 { bail!("{} tensor with {} columns: GEMV needs a multiple of 256", w.ty.name(), w.cols); }
         Ok((w.cols / 256) as i32)
+    }
+
+    /// Tensor-core GEMM over a tile list (see `GemmTile` in kernels.cu): for each tile, positions m0 .. m0 + cnt get
+    /// y[m, 0..rows] = W_tile x[xrow[m]] (x row m when `xrow` is 0). `tiles` is a device array of [w, m0 | cnt << 32].
+    pub fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, xrow: u64, y: u64, y_stride: usize) -> anyhow::Result<()> {
+        if cols % 256 != 0 { bail!("{} matrix with {cols} columns: GEMM needs a multiple of 256", ty.name()); }
+        if n_tiles == 0 { return Ok(()); }
+        launch!(self, &kname("gemm", ty), cfg((rows.div_ceil(64) as u32, n_tiles as u32), 2 * GEMM_BM as u32, 0),
+            tiles, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 256) as i32);
+        Ok(())
     }
 
     /// Shared memory for x quantized to int8 plus per-32 scales (quantized weight types only).
