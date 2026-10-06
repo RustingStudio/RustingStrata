@@ -42,4 +42,7 @@ pub fn top_k(p: &[f32], k: usize) -> Vec<usize> {
     idx
 }
 
-pub fn argmax(x: &[f32]) -> usize { top_k(x, 1)[0] }
+/// Index of the largest value; the first one on ties (same order as `top_k`).
+pub fn argmax(x: &[f32]) -> usize {
+    (1..x.len()).fold(0, |b, i| if x[i].total_cmp(&x[b]).is_gt() { i } else { b })
+}

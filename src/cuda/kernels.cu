@@ -139,9 +139,10 @@ template <> __device__ __forceinline__ void deq8<23>(const u8* b, int sub, float
 
 // One warp per output row; lane `l` covers elements [8l, 8l+8) of every super-block.
 template <int T, int SBB>
-__device__ __forceinline__ void gemv_row(const u8* w, const float* x, float* y, int row, int nsb) {
+__device__ __forceinline__ void gemv_row(const u8* __restrict__ w, const float* __restrict__ x, float* y, int row, int nsb) {
     int lane = threadIdx.x & 31;
     float acc = 0.0f, v[8];
+#pragma unroll 4
     for (int s = 0; s < nsb; s++) {
         deq8<T>(w + (size_t)s * SBB, lane, v);
         const float4* xs = (const float4*)(x + s * 256 + lane * 8);
@@ -236,23 +237,22 @@ extern "C" __global__ void conv_silu(const float* qkv, float* state, const float
     state[(kw - 2) * ch + c] = qkv[c];
 }
 
-// grid = value heads, block = dv; thread j owns state row j (dk floats). y = [q | k | v] after conv and l2 norm.
-// ponytail: state rows are read per thread (uncoalesced); a warp-per-row layout is the upgrade if this shows up in profiles.
+// grid = (value heads, dv / 8), block = 256: warp w owns state row j = 8 * blockIdx.y + w (dk floats, dk <= 256,
+// multiple of 32), lane l holds elements l, l + 32, ... so row loads coalesce. y = [q | k | v] after conv and l2 norm.
+#define MAXK 8
 extern "C" __global__ void deltanet_step(const float* y, float* S, const float* beta, const float* g, float* o,
                                          int nk, int dk, int dv, float scale) {
-    extern __shared__ float sh[];  // q, k: 2*dk
-    int vh = blockIdx.x, j = threadIdx.x, kh = vh % nk;
+    int vh = blockIdx.x, j = blockIdx.y * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31, kh = vh % nk, per = dk >> 5;
+    if (j >= dv) return;
     const float* q = y + kh * dk;
     const float* k = y + nk * dk + kh * dk;
-    float v = y[2 * nk * dk + vh * dv + j];
-    for (int i = threadIdx.x; i < dk; i += blockDim.x) { sh[i] = q[i]; sh[dk + i] = k[i]; }
-    __syncthreads();
     float* row = S + ((size_t)vh * dv + j) * dk;
-    float decay = expf(g[vh]), sk = 0.0f;
-    for (int i = 0; i < dk; i++) { float r = row[i] * decay; row[i] = r; sk += r * sh[dk + i]; }
-    float d = beta[vh] * (v - sk), oq = 0.0f;
-    for (int i = 0; i < dk; i++) { float r = row[i] + d * sh[dk + i]; row[i] = r; oq += r * sh[i]; }
-    o[vh * dv + j] = oq * scale;
+    float decay = expf(g[vh]), r[MAXK], kk[MAXK], sk = 0.0f;
+    for (int t = 0; t < per; t++) { int i = lane + 32 * t; r[t] = row[i] * decay; kk[t] = k[i]; sk += r[t] * kk[t]; }
+    float d = beta[vh] * (y[2 * nk * dk + vh * dv + j] - warp_sum(sk)), oq = 0.0f;
+    for (int t = 0; t < per; t++) { int i = lane + 32 * t; float v = r[t] + d * kk[t]; row[i] = v; oq += v * q[i]; }
+    oq = warp_sum(oq);
+    if (lane == 0) o[vh * dv + j] = oq * scale;
 }
 
 // grid = heads: out = rmsnorm(o_h) * w * silu(z_h), in place on o.
