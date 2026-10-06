@@ -88,7 +88,7 @@ impl Gpu {
     pub fn new() -> anyhow::Result<Gpu> {
         let ctx = CudaContext::new(0).context("CUDA init")?;
         unsafe { ctx.disable_event_tracking() };
-        let stream = ctx.default_stream();
+        let stream = ctx.new_stream()?;
         let (maj, min) = ctx.compute_capability()?;
         let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
         let module = ctx.load_module(ptx(&source(), arch)?).context("load PTX")?;
@@ -127,18 +127,37 @@ impl Gpu {
         Ok((w.cols / 256) as i32)
     }
 
+    /// Shared memory for x quantized to int8 plus per-32 scales (quantized weight types only).
+    fn xq_smem(ty: GgmlType, cols: usize) -> u32 {
+        if Self::float_ty(ty) { 0 } else { (cols + cols / 8) as u32 }
+    }
+
+    fn float_ty(ty: GgmlType) -> bool { matches!(ty, GgmlType::F32 | GgmlType::BF16) }
+
+    /// Rows per warp for the integer GEMV: about 8 super-blocks of work per warp (env STRATA_RPW overrides).
+    fn rpw(cols: usize) -> usize {
+        std::env::var("STRATA_RPW").ok().and_then(|v| v.parse().ok()).unwrap_or((2048 / cols).max(1))
+    }
+
+    /// Launch config and rows-per-warp argument for a GEMV with `rows` x `cols` per matrix and `k` matrices.
+    fn gemv_cfg(ty: GgmlType, rows: usize, cols: usize, k: usize) -> (LaunchConfig, i32) {
+        let rpw = if Self::float_ty(ty) { 1 } else { Self::rpw(cols) };
+        (cfg((rows.div_ceil(8 * rpw) as u32, k as u32), 256, Self::xq_smem(ty, cols)), rpw as i32)
+    }
+
     /// y = W x (all rows of `w`).
     pub fn gemv(&self, w: &GpuTensor, x: u64, y: u64) -> anyhow::Result<()> {
         let nsb = Self::nsb(w)?;
-        launch!(self, &kname("gemv", w.ty), cfg((w.rows.div_ceil(8) as u32, 1), 256, 0), w.ptr, x, y, w.rows as i32, nsb);
+        let (c, rpw) = Self::gemv_cfg(w.ty, w.rows, w.cols, 1);
+        launch!(self, &kname("gemv", w.ty), c, w.ptr, x, y, w.rows as i32, nsb, rpw);
         Ok(())
     }
 
     /// For j < k with ids[j] >= 0: y[j] = W_j x[j], where W_j is the `rows` x `cols` matrix at w + ids[j] * stride bytes.
     pub fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, y: u64) -> anyhow::Result<()> {
         if cols % 256 != 0 { bail!("{} expert with {cols} columns: GEMV needs a multiple of 256", ty.name()); }
-        launch!(self, &kname("moe_gemv", ty), cfg((rows.div_ceil(8) as u32, k as u32), 256, 0),
-            w, ids, stride as i64, x, x_stride as i32, y, rows as i32, (cols / 256) as i32);
+        let (c, rpw) = Self::gemv_cfg(ty, rows, cols, k);
+        launch!(self, &kname("moe_gemv", ty), c, w, ids, stride as i64, x, x_stride as i32, y, rows as i32, (cols / 256) as i32, rpw);
         Ok(())
     }
 
@@ -158,8 +177,8 @@ impl Gpu {
         Ok(())
     }
 
-    pub fn rope_neox(&self, x: u64, stride: usize, heads: usize, n_rot: usize, pos: usize, base: f32) -> anyhow::Result<()> {
-        launch!(self, "rope_neox", cfg((heads as u32, 1), (n_rot / 2) as u32, 0), x, stride as i32, n_rot as i32, pos as i32, base);
+    pub fn rope_neox(&self, x: u64, stride: usize, heads: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
+        launch!(self, "rope_neox", cfg((heads as u32, 1), (n_rot / 2) as u32, 0), x, stride as i32, n_rot as i32, step, base);
         Ok(())
     }
 
@@ -197,15 +216,15 @@ impl Gpu {
         Ok(())
     }
 
-    pub fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, pos: usize) -> anyhow::Result<()> {
-        launch!(self, "kv_store", Self::grid(n), k, v, kc, vc, n as i32, pos as i32);
+    pub fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, step: u64) -> anyhow::Result<()> {
+        launch!(self, "kv_store", Self::grid(n), k, v, kc, vc, n as i32, step);
         Ok(())
     }
 
-    pub fn attn_decode(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, n_pos: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
+    pub fn attn_decode(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
         if hd % 32 != 0 || hd > 512 { bail!("attention head_dim {hd} unsupported (multiple of 32, at most 512)"); }
         launch!(self, "attn_decode", cfg((nh as u32, 1), 256, (8 * hd * 4) as u32),
-            q, kc, vc, qg, out, n_pos as i32, nh as i32, nkv as i32, hd as i32, scale);
+            q, kc, vc, qg, out, step, nh as i32, nkv as i32, hd as i32, scale);
         Ok(())
     }
 
@@ -215,14 +234,14 @@ impl Gpu {
     }
 
     /// Write routing and (on a miss) `h` to the layer mailbox at `mb` and raise its request flag.
-    pub fn moe_publish(&self, ids: u64, wts: u64, slots: u64, h: u64, mb: u64, k: usize, n: usize, h_off: usize, seq: u32) -> anyhow::Result<()> {
-        launch!(self, "moe_publish", cfg((1, 1), 256, 0), ids, wts, slots, h, mb, k as i32, n as i32, h_off as i32, seq);
+    pub fn moe_publish(&self, ids: u64, wts: u64, slots: u64, h: u64, mb: u64, k: usize, n: usize, h_off: usize, step: u64) -> anyhow::Result<()> {
+        launch!(self, "moe_publish", cfg((1, 1), 256, 0), ids, wts, slots, h, mb, k as i32, n as i32, h_off as i32, step);
         Ok(())
     }
 
     /// `mb` = 0: no CPU part. Otherwise adds the CPU result at word `y_off` of the mailbox once its done flag is `seq`.
-    pub fn moe_combine(&self, x: u64, ye: u64, w: u64, k: usize, sh: u64, sg: u64, mb: u64, y_off: usize, seq: u32, slots: u64, n: usize) -> anyhow::Result<()> {
-        launch!(self, "moe_combine", Self::grid(n), x, ye, w, k as i32, sh, sg, mb, y_off as i32, seq, slots, n as i32);
+    pub fn moe_combine(&self, x: u64, ye: u64, w: u64, k: usize, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, slots: u64, n: usize) -> anyhow::Result<()> {
+        launch!(self, "moe_combine", Self::grid(n), x, ye, w, k as i32, sh, sg, mb, y_off as i32, step, slots, n as i32);
         Ok(())
     }
 }

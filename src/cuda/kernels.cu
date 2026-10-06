@@ -153,29 +153,210 @@ __device__ __forceinline__ void gemv_row(const u8* __restrict__ w, const float* 
     if (lane == 0) y[row] = acc;
 }
 
-#define QTYPES(X) X(0, f32, 1024) X(30, bf16, 512) X(8, q8_0, 272) X(10, q2_k, 84) X(11, q3_k, 110) \
-    X(12, q4_k, 144) X(13, q5_k, 176) X(14, q6_k, 210) X(17, iq2_xs, 74) X(18, iq3_xxs, 98) X(23, iq4_xs, 136)
+// ---- integer path: 8 weights of a super-block as int8 (two packed words), with dequant value = d * q - m ----
+// Activations are quantized per 32 elements to int8 in shared memory, and dot products use dp4a.
 
-#define DEF_QUANT(T, NAME, SBB)                                                                                   \
+__device__ __forceinline__ int pack4(int a, int b, int c, int d) { return (a & 255) | ((b & 255) << 8) | ((c & 255) << 16) | (d << 24); }
+__device__ __forceinline__ u32 ldu32(const u8* p) { return *(const u32*)p; }  // 4-byte aligned only
+// Byte j of the result is 0xFF when bit j of s is set (j < 4).
+__device__ __forceinline__ u32 smask4(u32 s) { return ((s * 0x00204081u) & 0x01010101u) * 0xFFu; }
+__device__ __forceinline__ int apply_signs(u32 g, u32 s) { u32 m = smask4(s); return (int)__vsub4(g ^ m, m); }
+
+template <int T> struct QI;
+template <> struct QI<8> {  // Q8_0, 8 blocks of 34
+    static constexpr bool MIN = false;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        const u8* p = b + 34 * (sub >> 2);
+        d = ldh(p);
+        const u8* q = p + 2 + (sub & 3) * 8;  // 2-byte aligned
+        lo = (int)(ld16(q) | (ld16(q + 2) << 16)); hi = (int)(ld16(q + 4) | (ld16(q + 6) << 16));
+    }
+};
+template <> struct QI<10> {  // Q2_K (84 bytes: rows 4-aligned)
+    static constexpr bool MIN = true;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        int e = sub * 8, n = e >> 7, r = e & 127, j = r >> 5, r2 = r & 31;
+        u8 s = b[n * 8 + j * 2 + (r2 >> 4)];
+        d = ldh(b + 80) * (float)(s & 0xF); m = ldh(b + 82) * (float)(s >> 4);
+        const u8* q = b + 16 + 32 * n + r2;
+        lo = (int)((ldu32(q) >> (2 * j)) & 0x03030303u); hi = (int)((ldu32(q + 4) >> (2 * j)) & 0x03030303u);
+    }
+};
+template <> struct QI<11> {  // Q3_K
+    static constexpr bool MIN = false;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        float v[8];
+        deq8<11>(b, sub, v);  // ponytail: via floats; Q3_K is rare in the target quants
+        int e = sub * 8, n = e >> 7, r = e & 127, j = r >> 5, i0 = r & 31, is = n * 8 + j * 2 + (i0 >> 4);
+        const u8* sc = b + 96;
+        int low = is < 8 ? (sc[is] & 0xF) : (sc[is - 8] >> 4);
+        int hs = (sc[8 + (is & 3)] >> (2 * (is >> 2))) & 3;
+        d = ldh(b + 108) * (float)((low | (hs << 4)) - 32);
+        int q[8];
+        for (int i = 0; i < 8; i++) q[i] = d != 0.0f ? __float2int_rn(v[i] / d) : 0;
+        lo = pack4(q[0], q[1], q[2], q[3]); hi = pack4(q[4], q[5], q[6], q[7]);
+    }
+};
+template <> struct QI<12> {  // Q4_K (144 bytes)
+    static constexpr bool MIN = true;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        int e = sub * 8, j = e >> 6, h = (e >> 5) & 1, l = e & 31, s, mi;
+        scale_min_k4(2 * j + h, b + 4, s, mi);
+        d = ldh(b) * (float)s; m = ldh(b + 2) * (float)mi;
+        const u8* q = b + 16 + 32 * j + l;
+        lo = (int)((ldu32(q) >> (4 * h)) & 0x0F0F0F0Fu); hi = (int)((ldu32(q + 4) >> (4 * h)) & 0x0F0F0F0Fu);
+    }
+};
+template <> struct QI<13> {  // Q5_K (176 bytes)
+    static constexpr bool MIN = true;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        int e = sub * 8, j = e >> 6, h = (e >> 5) & 1, l = e & 31, s, mi, bit = 2 * j + h;
+        scale_min_k4(bit, b + 4, s, mi);
+        d = ldh(b) * (float)s; m = ldh(b + 2) * (float)mi;
+        const u8* qh = b + 16 + l;
+        const u8* q = b + 48 + 32 * j + l;
+        lo = (int)(((ldu32(q) >> (4 * h)) & 0x0F0F0F0Fu) | (((ldu32(qh) >> bit) & 0x01010101u) << 4));
+        hi = (int)(((ldu32(q + 4) >> (4 * h)) & 0x0F0F0F0Fu) | (((ldu32(qh + 4) >> bit) & 0x01010101u) << 4));
+    }
+};
+template <> struct QI<14> {  // Q6_K (210 bytes: rows 2-aligned)
+    static constexpr bool MIN = false;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        int e = sub * 8, n = e >> 7, r = e & 127, qt = r >> 5, l = r & 31;
+        const u8* ql = b + 64 * n + (qt & 1) * 32 + l;
+        const u8* qh = b + 128 + 32 * n + l;
+        d = ldh(b + 208) * (float)((const signed char*)b)[192 + 8 * n + (l >> 4) + 2 * qt];
+        u32 l0 = ld16(ql) | (ld16(ql + 2) << 16), l1 = ld16(ql + 4) | (ld16(ql + 6) << 16);
+        u32 h0 = ld16(qh) | (ld16(qh + 2) << 16), h1 = ld16(qh + 4) | (ld16(qh + 6) << 16);
+        int ns = 4 * (qt >> 1), hs = 2 * qt;
+        u32 a = ((l0 >> ns) & 0x0F0F0F0Fu) | (((h0 >> hs) & 0x03030303u) << 4);
+        u32 c = ((l1 >> ns) & 0x0F0F0F0Fu) | (((h1 >> hs) & 0x03030303u) << 4);
+        lo = (int)__vsub4(a, 0x20202020u); hi = (int)__vsub4(c, 0x20202020u);
+    }
+};
+template <> struct QI<17> {  // IQ2_XS (74 bytes: rows 2-aligned)
+    static constexpr bool MIN = false;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        int ib = sub >> 2, l = sub & 3;
+        u32 q = ld16(b + 2 + 2 * (4 * ib + l));
+        u64 g = iq2xs_grid[q & 511];
+        u32 sg = ksigns_iq2xs[q >> 9], sc = b[66 + ib];
+        d = ldh(b) * (0.5f + (float)(l < 2 ? sc & 0xF : sc >> 4)) * 0.25f;
+        lo = apply_signs((u32)g, sg & 15); hi = apply_signs((u32)(g >> 32), sg >> 4);
+    }
+};
+template <> struct QI<18> {  // IQ3_XXS (98 bytes: rows 2-aligned)
+    static constexpr bool MIN = false;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        int ib = sub >> 2, l = sub & 3;
+        u32 aux = ld16(b + 66 + 4 * ib) | (ld16(b + 68 + 4 * ib) << 16);
+        d = ldh(b) * (0.5f + (float)(aux >> 28)) * 0.5f;
+        u32 sg = ksigns_iq2xs[(aux >> (7 * l)) & 127], qq = ld16(b + 2 + 8 * ib + 2 * l);
+        lo = apply_signs(iq3xxs_grid[qq & 255], sg & 15); hi = apply_signs(iq3xxs_grid[qq >> 8], sg >> 4);
+    }
+};
+template <> struct QI<23> {  // IQ4_XS (136 bytes)
+    static constexpr bool MIN = false;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        int ib = sub >> 2, r = (sub & 3) * 8;
+        u32 sh = ld16(b + 2);
+        int ls = ((b[4 + ib / 2] >> (4 * (ib & 1))) & 0xF) | (((sh >> (2 * ib)) & 3) << 4);
+        d = ldh(b) * (float)(ls - 32);
+        const u8* q = b + 8 + 16 * ib + (r & 15);
+        u32 w0 = ldu32(q), w1 = ldu32(q + 4), sft = r < 16 ? 0 : 4;
+        int v[8];
+        for (int i = 0; i < 4; i++) { v[i] = kvalues_iq4nl[(w0 >> (8 * i + sft)) & 0xF]; v[i + 4] = kvalues_iq4nl[(w1 >> (8 * i + sft)) & 0xF]; }
+        lo = pack4(v[0], v[1], v[2], v[3]); hi = pack4(v[4], v[5], v[6], v[7]);
+    }
+};
+
+// Quantize x[0, n) into shared int8 qs[n] and per-32 scales xd[n / 32]; the whole block participates.
+__device__ __forceinline__ void quant_x(const float* __restrict__ x, int n, signed char* qs, float* xd) {
+    for (int i = threadIdx.x * 8; i < n; i += blockDim.x * 8) {
+        float4 a = *(const float4*)(x + i), c = *(const float4*)(x + i + 4);
+        float mx = fmaxf(fmaxf(fmaxf(fabsf(a.x), fabsf(a.y)), fmaxf(fabsf(a.z), fabsf(a.w))),
+                         fmaxf(fmaxf(fabsf(c.x), fabsf(c.y)), fmaxf(fabsf(c.z), fabsf(c.w))));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 1));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
+        float d = mx / 127.0f, id = mx > 0.0f ? 127.0f / mx : 0.0f;
+        int2 q = make_int2(pack4(__float2int_rn(a.x * id), __float2int_rn(a.y * id), __float2int_rn(a.z * id), __float2int_rn(a.w * id)),
+                           pack4(__float2int_rn(c.x * id), __float2int_rn(c.y * id), __float2int_rn(c.z * id), __float2int_rn(c.w * id)));
+        *(int2*)(qs + i) = q;
+        if ((threadIdx.x & 3) == 0) xd[i >> 5] = d;
+    }
+    __syncthreads();
+}
+
+template <int T, int SBB>
+__device__ __forceinline__ void gemv_row_q(const u8* __restrict__ w, const signed char* qs, const float* xd, float* y, int row, int nsb) {
+    int lane = threadIdx.x & 31;
+    float acc = 0.0f;
+#pragma unroll 4
+    for (int s = 0; s < nsb; s++) {
+        int lo, hi; float d, m = 0.0f;
+        QI<T>::get(w + (size_t)s * SBB, lane, lo, hi, d, m);
+        int2 xq = *(const int2*)(qs + s * 256 + lane * 8);
+        float dx = xd[s * 8 + (lane >> 2)];
+        acc += d * dx * (float)__dp4a(lo, xq.x, __dp4a(hi, xq.y, 0));
+        if (QI<T>::MIN) acc -= m * dx * (float)__dp4a(0x01010101, xq.x, __dp4a(0x01010101, xq.y, 0));
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) y[row] = acc;
+}
+
+#define FTYPES(X) X(0, f32, 1024) X(30, bf16, 512)
+#define ITYPES(X) X(8, q8_0, 272) X(10, q2_k, 84) X(11, q3_k, 110) X(12, q4_k, 144) X(13, q5_k, 176) X(14, q6_k, 210) \
+    X(17, iq2_xs, 74) X(18, iq3_xxs, 98) X(23, iq4_xs, 136)
+#define QTYPES(X) FTYPES(X) ITYPES(X)
+
+#define DEF_DEQUANT(T, NAME, SBB)                                                                                 \
     extern "C" __global__ void dequant_##NAME(const u8* w, float* out, int nsb) {                                 \
         const u8* r = w + (size_t)blockIdx.x * nsb * SBB;                                                       \
         for (int s = threadIdx.x; s < nsb * 32; s += blockDim.x)                                                \
             deq8<T>(r + (size_t)(s >> 5) * SBB, s & 31, out + ((size_t)blockIdx.x * nsb + (s >> 5)) * 256 + (s & 31) * 8); \
-    }                                                                                                           \
-    extern "C" __global__ void gemv_##NAME(const u8* w, const float* x, float* y, int rows, int nsb) {          \
+    }
+QTYPES(DEF_DEQUANT)
+
+// Float types read x directly.
+#define DEF_FGEMV(T, NAME, SBB)                                                                                   \
+    extern "C" __global__ void gemv_##NAME(const u8* w, const float* x, float* y, int rows, int nsb, int) {   \
         int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;                                                 \
         if (row < rows) gemv_row<T, SBB>(w + (size_t)row * nsb * SBB, x, y, row, nsb);                         \
     }                                                                                                           \
-    /* grid.y = k: weights at w + ids[k]*stride (skipped when ids[k] < 0), input x + k*x_stride,              \
-       output y + k*rows. */                                                                                    \
     extern "C" __global__ void moe_gemv_##NAME(const u8* w, const int* ids, long long stride, const float* x,  \
-                                               int x_stride, float* y, int rows, int nsb) {                     \
+                                               int x_stride, float* y, int rows, int nsb, int) {              \
         int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, k = blockIdx.y;                                 \
         if (row < rows && ids[k] >= 0)                                                                          \
             gemv_row<T, SBB>(w + ids[k] * stride + (size_t)row * nsb * SBB, x + (size_t)k * x_stride,           \
                              y + (size_t)k * rows, row, nsb);                                                   \
     }
-QTYPES(DEF_QUANT)
+FTYPES(DEF_FGEMV)
+
+// Quantized types: dynamic shared memory holds x as int8 (256 * nsb bytes) then its scales (8 * nsb floats).
+// Each block covers 8 * rpw rows (warp w: rows w, w + 8, ...) so small matrices amortize the x quantization.
+// moe_gemv: grid.y = k; weights at w + ids[k] * stride (skipped when ids[k] < 0), input x + k * x_stride,
+// output y + k * rows.
+#define DEF_IGEMV(T, NAME, SBB)                                                                                   \
+    extern "C" __global__ void gemv_##NAME(const u8* w, const float* x, float* y, int rows, int nsb, int rpw) { \
+        extern __shared__ __align__(16) signed char xs[];                                                       \
+        float* xd = (float*)(xs + 256 * nsb);                                                                   \
+        quant_x(x, 256 * nsb, xs, xd);                                                                          \
+        int r0 = blockIdx.x * 8 * rpw + (threadIdx.x >> 5), r1 = min(rows, r0 - (threadIdx.x >> 5) + 8 * rpw);  \
+        for (int row = r0; row < r1; row += 8) gemv_row_q<T, SBB>(w + (size_t)row * nsb * SBB, xs, xd, y, row, nsb); \
+    }                                                                                                           \
+    extern "C" __global__ void moe_gemv_##NAME(const u8* w, const int* ids, long long stride, const float* x,  \
+                                               int x_stride, float* y, int rows, int nsb, int rpw) {            \
+        extern __shared__ __align__(16) signed char xs[];                                                       \
+        int k = blockIdx.y, e = ids[k];                                                                         \
+        if (e < 0) return;                                                                                      \
+        float* xd = (float*)(xs + 256 * nsb);                                                                   \
+        quant_x(x + (size_t)k * x_stride, 256 * nsb, xs, xd);                                                   \
+        const u8* we = w + e * stride;                                                                          \
+        int r0 = blockIdx.x * 8 * rpw + (threadIdx.x >> 5), r1 = min(rows, r0 - (threadIdx.x >> 5) + 8 * rpw);  \
+        for (int row = r0; row < r1; row += 8)                                                                  \
+            gemv_row_q<T, SBB>(we + (size_t)row * nsb * SBB, xs, xd, y + (size_t)k * rows, row, nsb);           \
+    }
+ITYPES(DEF_IGEMV)
 
 // ---- elementwise / norm ----
 
@@ -198,8 +379,11 @@ extern "C" __global__ void l2_norm(float* x, int n, float eps) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) xr[i] *= sc;
 }
 
+// Per-token values live in device memory so a captured graph can replay: step[0] = position, step[1] = CPU worker seq.
+
 // grid = heads, block = n_rot / 2. NEOX pairs (i, i + n_rot/2).
-extern "C" __global__ void rope_neox(float* x, int stride, int n_rot, int pos, float base) {
+extern "C" __global__ void rope_neox(float* x, int stride, int n_rot, const int* step, float base) {
+    int pos = step[0];
     float* h = x + (size_t)blockIdx.x * stride;
     int i = threadIdx.x, half = n_rot / 2;
     double theta = (double)pos * pow((double)base, -2.0 * i / n_rot);
@@ -267,8 +451,8 @@ extern "C" __global__ void norm_gate(float* o, const float* w, const float* z, i
 
 // ---- attention ----
 
-extern "C" __global__ void kv_store(const float* k, const float* v, u16* kc, u16* vc, int n, int pos) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+extern "C" __global__ void kv_store(const float* k, const float* v, u16* kc, u16* vc, int n, const int* step) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x, pos = step[0];
     if (i < n) { kc[(size_t)pos * n + i] = f2h(k[i]); vc[(size_t)pos * n + i] = f2h(v[i]); }
 }
 
@@ -277,7 +461,8 @@ extern "C" __global__ void kv_store(const float* k, const float* v, u16* kc, u16
 // grid = query heads; each warp walks positions warp, warp+nw, ... with online softmax; warps merge at the end.
 // qg holds [q | gate] per head (2*hd); output is softmax(qK)V * sigmoid(gate).
 extern "C" __global__ void attn_decode(const float* q, const u16* kc, const u16* vc, const float* qg, float* out,
-                                       int n_pos, int nh, int nkv, int hd, float scale) {
+                                       const int* step, int nh, int nkv, int hd, float scale) {
+    int n_pos = step[0] + 1;
     extern __shared__ float sacc[];  // nw * hd
     __shared__ float sm[32], sl[32];
     int h = blockIdx.x, g = h / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
@@ -357,8 +542,9 @@ extern "C" __global__ void map_hits(const int* ids, const int* table, int* slots
 // Copy one layer's routing to the host-mapped mailbox `mb` (activation only if an expert missed), then raise the
 // request flag. One block.
 extern "C" __global__ void moe_publish(const int* ids, const float* wts, const int* slots, const float* h,
-                                       unsigned int* mb, int k, int n, int h_off, unsigned int seq) {
+                                       unsigned int* mb, int k, int n, int h_off, const int* step) {
     int t = threadIdx.x;
+    unsigned int seq = step[1];
     int miss = __syncthreads_or(t < k && slots[t] < 0);
     if (t < k) { mb[32 + t] = ids[t]; mb[32 + k + t] = __float_as_uint(wts[t]); mb[32 + 2 * k + t] = slots[t]; }
     if (miss) for (int i = t; i < n; i += blockDim.x) mb[h_off + i] = __float_as_uint(h[i]);
@@ -369,8 +555,9 @@ extern "C" __global__ void moe_publish(const int* ids, const float* wts, const i
 
 // x += sum_j w[j] ye[j] + sigmoid(sg) sh + cpu. If a slot missed, wait for the CPU worker's done flag first.
 extern "C" __global__ void moe_combine(float* x, const float* ye, const float* w, int k, const float* sh,
-                                       const float* sg, const unsigned int* mb, int y_off, unsigned int seq,
+                                       const float* sg, const unsigned int* mb, int y_off, const int* step,
                                        const int* slots, int n) {
+    unsigned int seq = step[1];
     __shared__ int miss;
     if (threadIdx.x == 0) {
         int m = 0;
