@@ -1,0 +1,223 @@
+//! Scalar CPU reference forward for `qwen35` / `qwen35moe`, one token at a time.
+//! Mirrors llama.cpp `src/models/qwen35moe.cpp`; this is the correctness oracle, not the fast path.
+
+use crate::config::ModelConfig;
+use crate::gguf::Gguf;
+use crate::ops;
+use crate::weights::{Tensor, Weights};
+
+pub struct Model<'a> {
+    pub cfg: ModelConfig,
+    w: Weights<'a>,
+}
+
+pub enum LayerState {
+    /// conv: last (ssm_conv - 1) inputs per channel, oldest first; s: dt_rank x head_v x head_k.
+    Recurrent { conv: Vec<f32>, s: Vec<f32> },
+    /// k, v: pos x n_head_kv x head_dim.
+    Attn { k: Vec<f32>, v: Vec<f32> },
+}
+
+pub struct State {
+    pub layers: Vec<LayerState>,
+    pub pos: usize,
+}
+
+impl State {
+    pub fn new(c: &ModelConfig) -> State {
+        let channels = c.ssm_d_inner + 2 * c.ssm_n_group * c.ssm_d_state;
+        let head_v = c.ssm_d_inner / c.ssm_dt_rank;
+        let layers = (0..c.n_layer)
+            .map(|il| if c.is_recurrent(il) {
+                LayerState::Recurrent {
+                    conv: vec![0.0; (c.ssm_conv - 1) * channels],
+                    s: vec![0.0; c.ssm_dt_rank * head_v * c.ssm_d_state],
+                }
+            } else {
+                LayerState::Attn { k: Vec::new(), v: Vec::new() }
+            })
+            .collect();
+        State { layers, pos: 0 }
+    }
+}
+
+fn mv(t: &Tensor, x: &[f32]) -> Vec<f32> {
+    let mut y = vec![0f32; t.rows];
+    t.matvec(x, &mut y);
+    y
+}
+
+impl<'a> Model<'a> {
+    pub fn load(g: &'a Gguf) -> anyhow::Result<Model<'a>> {
+        let w = Weights { g };
+        w.validate()?;
+        let cfg = ModelConfig::from_gguf(g)?;
+        w.get("token_embd.weight")?;
+        w.get("output_norm.weight")?;
+        Ok(Model { cfg, w })
+    }
+
+    fn t(&self, il: usize, suffix: &str) -> Tensor<'a> {
+        self.w.layer(il, suffix).unwrap_or_else(|e| panic!("{e:#}"))
+    }
+    fn f(&self, il: usize, suffix: &str) -> Vec<f32> { self.t(il, suffix).to_f32() }
+
+    pub fn embed(&self, token: u32) -> Vec<f32> {
+        let mut x = vec![0f32; self.cfg.n_embd];
+        self.w.get("token_embd.weight").unwrap().row(token as usize, &mut x);
+        x
+    }
+
+    /// Run one token; returns logits over the vocabulary.
+    pub fn step(&self, st: &mut State, token: u32) -> Vec<f32> {
+        let c = &self.cfg;
+        let mut x = self.embed(token);
+        let mut h = vec![0f32; c.n_embd];
+        for il in 0..c.n_layer {
+            ops::rms_norm(&x, &self.f(il, "attn_norm.weight"), c.eps, &mut h);
+            let mix = match &mut st.layers[il] {
+                LayerState::Recurrent { conv, s } => self.deltanet(il, &h, conv, s),
+                LayerState::Attn { k, v } => self.attention(il, &h, k, v, st.pos),
+            };
+            for (a, b) in x.iter_mut().zip(&mix) { *a += b; }
+            ops::rms_norm(&x, &self.f(il, "post_attention_norm.weight"), c.eps, &mut h);
+            let ffn = if c.is_moe() { self.moe(il, &h) } else { self.dense_ffn(il, &h) };
+            for (a, b) in x.iter_mut().zip(&ffn) { *a += b; }
+        }
+        st.pos += 1;
+        ops::rms_norm(&x, &self.w.get("output_norm.weight").unwrap().to_f32(), c.eps, &mut h);
+        let head = self.w.get("output.weight").or_else(|_| self.w.get("token_embd.weight")).unwrap();
+        mv(&head, &h)
+    }
+
+    fn deltanet(&self, il: usize, h: &[f32], conv: &mut [f32], s: &mut [f32]) -> Vec<f32> {
+        let c = &self.cfg;
+        let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
+        let dv = c.ssm_d_inner / nv;
+        let channels = c.ssm_d_inner + 2 * nk * dk;
+        let kw = c.ssm_conv;
+
+        let qkv = mv(&self.t(il, "attn_qkv.weight"), h);
+        let z = mv(&self.t(il, "attn_gate.weight"), h);
+        let beta: Vec<f32> = mv(&self.t(il, "ssm_beta.weight"), h).into_iter().map(ops::sigmoid).collect();
+        let (dt_bias, a) = (self.f(il, "ssm_dt.bias"), self.f(il, "ssm_a"));
+        let g: Vec<f32> = mv(&self.t(il, "ssm_alpha.weight"), h).iter().enumerate()
+            .map(|(i, &al)| ops::softplus(al + dt_bias[i]) * a[i]).collect();
+
+        // Causal depthwise conv over [state..., current], then SiLU.
+        let w = self.f(il, "ssm_conv1d.weight");
+        let mut y = vec![0f32; channels];
+        for ch in 0..channels {
+            let mut acc = 0.0;
+            for k in 0..kw - 1 { acc += conv[k * channels + ch] * w[ch * kw + k]; }
+            acc += qkv[ch] * w[ch * kw + kw - 1];
+            y[ch] = ops::silu(acc);
+        }
+        conv.copy_within(channels.., 0);
+        conv[(kw - 2) * channels..].copy_from_slice(&qkv);
+
+        let (q, rest) = y.split_at_mut(nk * dk);
+        let (k, v) = rest.split_at_mut(nk * dk);
+        for hd in q.chunks_exact_mut(dk).chain(k.chunks_exact_mut(dk)) { ops::l2_norm(hd, c.eps); }
+
+        let norm_w = self.f(il, "ssm_norm.weight");
+        let scale = 1.0 / (dk as f32).sqrt();
+        let mut out = vec![0f32; nv * dv];
+        let mut o = vec![0f32; dv];
+        for vh in 0..nv {
+            let kh = vh % nk;
+            let (qh, khv, vv) = (&q[kh * dk..(kh + 1) * dk], &k[kh * dk..(kh + 1) * dk], &v[vh * dv..(vh + 1) * dv]);
+            let sm = &mut s[vh * dv * dk..(vh + 1) * dv * dk]; // row j (value dim) x col i (key dim)
+            let decay = g[vh].exp();
+            for x in sm.iter_mut() { *x *= decay; }
+            for j in 0..dv {
+                let row = &mut sm[j * dk..(j + 1) * dk];
+                let sk: f32 = row.iter().zip(khv).map(|(a, b)| a * b).sum();
+                let d = beta[vh] * (vv[j] - sk);
+                for (r, kk) in row.iter_mut().zip(khv) { *r += d * kk; }
+                o[j] = row.iter().zip(qh.iter()).map(|(a, b)| a * b).sum::<f32>() * scale;
+            }
+            let oh = &mut out[vh * dv..(vh + 1) * dv];
+            ops::rms_norm(&o, &norm_w, c.eps, oh);
+            for (x, zz) in oh.iter_mut().zip(&z[vh * dv..(vh + 1) * dv]) { *x *= ops::silu(*zz); }
+        }
+        mv(&self.t(il, "ssm_out.weight"), &out)
+    }
+
+    fn attention(&self, il: usize, h: &[f32], kc: &mut Vec<f32>, vc: &mut Vec<f32>, pos: usize) -> Vec<f32> {
+        let c = &self.cfg;
+        let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
+        let qg = mv(&self.t(il, "attn_q.weight"), h);
+        let (qn, kn) = (self.f(il, "attn_q_norm.weight"), self.f(il, "attn_k_norm.weight"));
+        let mut q = vec![0f32; nh * hd];
+        for i in 0..nh {
+            let qh = &mut q[i * hd..(i + 1) * hd];
+            ops::rms_norm(&qg[i * 2 * hd..i * 2 * hd + hd], &qn, c.eps, qh);
+            ops::rope_neox(qh, c.n_rot, pos, c.rope_base);
+        }
+        let kraw = mv(&self.t(il, "attn_k.weight"), h);
+        let v = mv(&self.t(il, "attn_v.weight"), h);
+        let mut k = vec![0f32; nkv * hd];
+        for i in 0..nkv {
+            let kh = &mut k[i * hd..(i + 1) * hd];
+            ops::rms_norm(&kraw[i * hd..(i + 1) * hd], &kn, c.eps, kh);
+            ops::rope_neox(kh, c.n_rot, pos, c.rope_base);
+        }
+        kc.extend_from_slice(&k);
+        vc.extend_from_slice(&v);
+        let n = pos + 1;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut out = vec![0f32; nh * hd];
+        let mut sc = vec![0f32; n];
+        for i in 0..nh {
+            let g = i / (nh / nkv);
+            let qh = &q[i * hd..(i + 1) * hd];
+            for (t, s) in sc.iter_mut().enumerate() {
+                let kt = &kc[(t * nkv + g) * hd..(t * nkv + g + 1) * hd];
+                *s = qh.iter().zip(kt).map(|(a, b)| a * b).sum::<f32>() * scale;
+            }
+            ops::softmax(&mut sc);
+            let oh = &mut out[i * hd..(i + 1) * hd];
+            for (t, p) in sc.iter().enumerate() {
+                let vt = &vc[(t * nkv + g) * hd..(t * nkv + g + 1) * hd];
+                for (o, vv) in oh.iter_mut().zip(vt) { *o += p * vv; }
+            }
+            let gate = &qg[i * 2 * hd + hd..(i + 1) * 2 * hd];
+            for (o, gg) in oh.iter_mut().zip(gate) { *o *= ops::sigmoid(*gg); }
+        }
+        mv(&self.t(il, "attn_output.weight"), &out)
+    }
+
+    fn ffn(gate: &Tensor, up: &Tensor, down: &Tensor, h: &[f32]) -> Vec<f32> {
+        let mut a = mv(gate, h);
+        for (x, u) in a.iter_mut().zip(mv(up, h)) { *x = ops::silu(*x) * u; }
+        mv(down, &a)
+    }
+
+    fn dense_ffn(&self, il: usize, h: &[f32]) -> Vec<f32> {
+        Self::ffn(&self.t(il, "ffn_gate.weight"), &self.t(il, "ffn_up.weight"), &self.t(il, "ffn_down.weight"), h)
+    }
+
+    fn moe(&self, il: usize, h: &[f32]) -> Vec<f32> {
+        let c = &self.cfg;
+        let mut p = mv(&self.t(il, "ffn_gate_inp.weight"), h);
+        ops::softmax(&mut p);
+        let top = ops::top_k(&p, c.n_expert_used);
+        let sum = top.iter().map(|&e| p[e]).sum::<f32>().max(6.103515625e-5);
+        let mut scale = 1.0 / sum;
+        if c.expert_weights_scale != 0.0 { scale *= c.expert_weights_scale; }
+        let (gate, up, down) = (self.t(il, "ffn_gate_exps.weight"), self.t(il, "ffn_up_exps.weight"), self.t(il, "ffn_down_exps.weight"));
+        let n = c.n_expert;
+        let mut y = vec![0f32; c.n_embd];
+        for &e in &top {
+            let o = Self::ffn(&gate.expert(e, n), &up.expert(e, n), &down.expert(e, n), h);
+            for (a, b) in y.iter_mut().zip(o) { *a += p[e] * scale * b; }
+        }
+        if let Ok(sg) = self.w.layer(il, "ffn_gate_inp_shexp.weight") {
+            let s = ops::sigmoid(mv(&sg, h)[0]);
+            let o = Self::ffn(&self.t(il, "ffn_gate_shexp.weight"), &self.t(il, "ffn_up_shexp.weight"), &self.t(il, "ffn_down_shexp.weight"), h);
+            for (a, b) in y.iter_mut().zip(o) { *a += s * b; }
+        }
+        y
+    }
+}
