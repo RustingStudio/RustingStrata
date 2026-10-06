@@ -5,3 +5,4 @@ pub mod weights;
 pub mod ops;
 pub mod tokenizer;
 pub mod model;
+pub mod cuda;
