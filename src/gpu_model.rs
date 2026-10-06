@@ -6,7 +6,7 @@ use crate::cuda::{Gpu, GpuTensor};
 use crate::expert_cache::ExpertCache;
 use crate::model::Model;
 use anyhow::bail;
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaGraph, CudaSlice, sys};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -40,6 +40,10 @@ pub struct GpuModel<'a> {
     logits: CudaSlice<f32>,
     ids: CudaSlice<i32>,
     slots: CudaSlice<i32>,
+    /// [position, CPU worker seq] for the current token, read by kernels so the graph can replay.
+    step_buf: CudaSlice<i32>,
+    /// The whole token forward, captured on the first step (None until then, or with STRATA_NO_GRAPH set).
+    graph: Option<CudaGraph>,
     ctx: usize,
     pub pos: usize,
     pub cache: Option<ExpertCache>,
@@ -104,7 +108,7 @@ impl<'a> GpuModel<'a> {
         ];
         let bufs = sizes.into_iter().map(|(name, n)| Ok((name, gpu.zeros::<f32>(n)?))).collect::<anyhow::Result<HashMap<_, _>>>()?;
         let (x, logits, ids) = (gpu.zeros(c.n_embd)?, gpu.zeros(c.n_vocab)?, gpu.zeros::<i32>(k)?);
-        let slots = gpu.zeros::<i32>(k)?;
+        let (slots, step_buf) = (gpu.zeros::<i32>(k)?, gpu.zeros::<i32>(2)?);
         let (free1, _) = gpu.ctx.mem_get_info()?;
 
         let cache = if c.is_moe() {
@@ -119,7 +123,7 @@ impl<'a> GpuModel<'a> {
             mb(cache.as_ref().map_or(0, |x| x.slot_bytes_total())),
             cache.as_ref().map_or(0, |x| x.resident_count()), cache.as_ref().map_or(0, |x| x.total_experts()),
         );
-        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, ctx, pos: 0, cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO })
+        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, step_buf, graph: None, ctx, pos: 0, cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO })
     }
 
     /// Clear KV and recurrent state.
@@ -136,16 +140,37 @@ impl<'a> GpuModel<'a> {
 
     /// Run one token; returns logits over the vocabulary.
     pub fn step(&mut self, token: u32) -> anyhow::Result<Vec<f32>> {
-        let c = &self.m.cfg;
         if self.pos >= self.ctx { bail!("context full ({} tokens)", self.ctx); }
-        let (g, pos, eps, ne) = (&self.gpu, self.pos, c.eps, c.n_embd);
+        let seq = self.worker.as_mut().map_or(0, |w| w.begin());
+        let g = &self.gpu;
         g.stream.memcpy_htod(&self.m.embed(token), &mut self.x)?;
+        g.stream.memcpy_htod(&[self.pos as i32, seq as i32], &mut self.step_buf)?;
+        match &self.graph {
+            Some(graph) => graph.launch()?,
+            None if std::env::var_os("STRATA_NO_GRAPH").is_some() => self.forward()?,
+            None => {
+                g.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                let r = self.forward();
+                let graph = g.stream.end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)?;
+                r?;
+                let graph = graph.ok_or_else(|| anyhow::anyhow!("empty CUDA graph"))?;
+                graph.launch()?;
+                self.graph = Some(graph);
+            }
+        }
+        let logits = self.gpu.stream.clone_dtoh(&self.logits)?;
+        self.after_forward(logits)
+    }
+
+    /// Enqueue (or record into a graph) the token forward; per-token values come from `step_buf`.
+    fn forward(&self) -> anyhow::Result<()> {
+        let c = &self.m.cfg;
+        let (g, eps, ne, step) = (&self.gpu, c.eps, c.n_embd, self.gpu.ptr(&self.step_buf));
         let p = |n: &str| g.ptr(&self.bufs[n]);
         let x = g.ptr(&self.x);
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
         let dv = c.ssm_d_inner / nv;
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
-        let seq = self.worker.as_mut().map_or(0, |w| w.begin());
         for (il, l) in self.layers.iter().enumerate() {
             g.rms_norm(x, 0, l.attn_norm.ptr, p("h"), 0, ne, 1, eps)?;
             match &l.mixer {
@@ -164,13 +189,13 @@ impl<'a> GpuModel<'a> {
                 Mixer::Attn { q, k, v, qn, kn, o, kc, vc } => {
                     g.gemv(q, p("h"), p("qg"))?;
                     g.rms_norm(p("qg"), 2 * hd, qn.ptr, p("q"), hd, hd, nh, eps)?;
-                    g.rope_neox(p("q"), hd, nh, c.n_rot, pos, c.rope_base)?;
+                    g.rope_neox(p("q"), hd, nh, c.n_rot, step, c.rope_base)?;
                     g.gemv(k, p("h"), p("kraw"))?;
                     g.gemv(v, p("h"), p("v"))?;
                     g.rms_norm(p("kraw"), hd, kn.ptr, p("k"), hd, hd, nkv, eps)?;
-                    g.rope_neox(p("k"), hd, nkv, c.n_rot, pos, c.rope_base)?;
-                    g.kv_store(p("k"), p("v"), g.ptr(kc), g.ptr(vc), nkv * hd, pos)?;
-                    g.attn_decode(p("q"), g.ptr(kc), g.ptr(vc), p("qg"), p("att"), pos + 1, nh, nkv, hd, 1.0 / (hd as f32).sqrt())?;
+                    g.rope_neox(p("k"), hd, nkv, c.n_rot, step, c.rope_base)?;
+                    g.kv_store(p("k"), p("v"), g.ptr(kc), g.ptr(vc), nkv * hd, step)?;
+                    g.attn_decode(p("q"), g.ptr(kc), g.ptr(vc), p("qg"), p("att"), step, nh, nkv, hd, 1.0 / (hd as f32).sqrt())?;
                     g.gemv(o, p("att"), p("mix"))?;
                 }
             }
@@ -197,7 +222,7 @@ impl<'a> GpuModel<'a> {
                     let w = self.worker.as_ref().unwrap();
                     let mb = w.dev + (4 * il * w.layout.stride) as u64;
                     g.map_hits(ids, g.ptr(&lx.table_dev), slots, p("wts"), p("wh"), k)?;
-                    g.moe_publish(ids, p("wts"), slots, p("h"), mb, k, ne, w.layout.h, seq)?;
+                    g.moe_publish(ids, p("wts"), slots, p("h"), mb, k, ne, w.layout.h, step)?;
                     g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, k, p("h"), 0, p("ge"))?;
                     g.moe_gemv(mu.ty, mu.rows, mu.cols, base + mu.off as u64, stride, slots, k, p("h"), 0, p("ue"))?;
                     g.swiglu(p("ge"), p("ue"), k * c.n_ff_exp)?;
@@ -213,13 +238,17 @@ impl<'a> GpuModel<'a> {
                         }
                         None => (0, 0),
                     };
-                    g.moe_combine(x, p("ye"), p("wh"), k, sh, sg, mb, w.layout.y, seq, slots, ne)?;
+                    g.moe_combine(x, p("ye"), p("wh"), k, sh, sg, mb, w.layout.y, step, slots, ne)?;
                 }
             }
         }
         g.rms_norm(x, 0, self.output_norm.ptr, p("h"), 0, ne, 1, eps)?;
         g.gemv(&self.output, p("h"), g.ptr(&self.logits))?;
-        let logits = g.stream.clone_dtoh(&self.logits)?;
+        Ok(())
+    }
+
+    /// Advance the position and update expert statistics and placement after a token.
+    fn after_forward(&mut self, logits: Vec<f32>) -> anyhow::Result<Vec<f32>> {
         self.pos += 1;
         if let (Some(cache), Some(w)) = (self.cache.as_mut(), self.worker.as_ref()) {
             for il in 0..self.layers.len() {
