@@ -1,0 +1,356 @@
+// Decode-path kernels. Dequant ports of src/quant/mod.rs (from llama.cpp ggml-quants.c, MIT License, ggml authors).
+// Tables (iq2xs_grid, iq3xxs_grid, ksigns_iq2xs, kvalues_iq4nl) are prepended by src/cuda/mod.rs.
+
+typedef unsigned char u8;
+typedef unsigned short u16;
+typedef unsigned int u32;
+typedef unsigned long long u64;
+
+__device__ __forceinline__ float h2f(u16 h) { float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f; }
+__device__ __forceinline__ u16 f2h(float f) { u16 h; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f)); return h; }
+__device__ __forceinline__ u32 ld16(const u8* p) { return p[0] | (p[1] << 8); }
+__device__ __forceinline__ u32 ld32(const u8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((u32)p[3] << 24); }
+__device__ __forceinline__ float ldh(const u8* p) { return h2f((u16)ld16(p)); }
+__device__ __forceinline__ float silu(float x) { return x / (1.0f + expf(-x)); }
+__device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
+__device__ __forceinline__ float softplus(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
+
+__device__ __forceinline__ float warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+    return v;
+}
+__device__ __forceinline__ float warp_max(float v) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+    return v;
+}
+// Sum over the whole block; every thread gets the result. blockDim.x must be a multiple of 32.
+__device__ float block_sum(float v) {
+    __shared__ float s[32];
+    int lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    v = warp_sum(v);
+    __syncthreads();
+    if (lane == 0) s[w] = v;
+    __syncthreads();
+    v = lane < nw ? s[lane] : 0.0f;
+    return warp_sum(v);
+}
+
+// ---- dequant: 8 values [8*sub, 8*sub+8) of a 256-element super-block ----
+
+template <int T> __device__ void deq8(const u8* b, int sub, float* o);
+
+template <> __device__ __forceinline__ void deq8<0>(const u8* b, int sub, float* o) {  // F32
+    const float* f = (const float*)b + 8 * sub;
+    for (int i = 0; i < 8; i++) o[i] = f[i];
+}
+template <> __device__ __forceinline__ void deq8<30>(const u8* b, int sub, float* o) {  // BF16
+    for (int i = 0; i < 8; i++) o[i] = __uint_as_float(ld16(b + 16 * sub + 2 * i) << 16);
+}
+template <> __device__ __forceinline__ void deq8<8>(const u8* b, int sub, float* o) {  // Q8_0, 8 blocks of 34
+    const u8* p = b + 34 * (sub >> 2);
+    float d = ldh(p);
+    const signed char* q = (const signed char*)p + 2 + (sub & 3) * 8;
+    for (int i = 0; i < 8; i++) o[i] = (float)q[i] * d;
+}
+template <> __device__ __forceinline__ void deq8<10>(const u8* b, int sub, float* o) {  // Q2_K
+    int e = sub * 8, n = e >> 7, r = e & 127, j = r >> 5, r2 = r & 31;
+    u8 s = b[n * 8 + j * 2 + (r2 >> 4)];
+    float dl = ldh(b + 80) * (float)(s & 0xF), ml = ldh(b + 82) * (float)(s >> 4);
+    const u8* q = b + 16 + 32 * n + r2;
+    for (int i = 0; i < 8; i++) o[i] = dl * (float)((q[i] >> (2 * j)) & 3) - ml;
+}
+template <> __device__ __forceinline__ void deq8<11>(const u8* b, int sub, float* o) {  // Q3_K
+    int e = sub * 8, n = e >> 7, r = e & 127, j = r >> 5, i0 = r & 31, is = n * 8 + j * 2 + (i0 >> 4);
+    const u8* sc = b + 96;
+    int low = is < 8 ? (sc[is] & 0xF) : (sc[is - 8] >> 4);
+    int hi = (sc[8 + (is & 3)] >> (2 * (is >> 2))) & 3;
+    float dl = ldh(b + 108) * (float)((low | (hi << 4)) - 32);
+    u8 m = 1 << (n * 4 + j);
+    for (int i = 0; i < 8; i++) {
+        int qi = i0 + i;
+        int v = ((b[32 + 32 * n + qi] >> (2 * j)) & 3) - ((b[qi] & m) ? 0 : 4);
+        o[i] = dl * (float)v;
+    }
+}
+__device__ __forceinline__ void scale_min_k4(int j, const u8* q, int& s, int& m) {
+    if (j < 4) { s = q[j] & 63; m = q[j + 4] & 63; }
+    else { s = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+}
+template <> __device__ __forceinline__ void deq8<12>(const u8* b, int sub, float* o) {  // Q4_K
+    int e = sub * 8, j = e >> 6, hi = (e >> 5) & 1, l = e & 31, s, m;
+    scale_min_k4(2 * j + hi, b + 4, s, m);
+    float d = ldh(b) * (float)s, mn = ldh(b + 2) * (float)m;
+    const u8* q = b + 16 + 32 * j + l;
+    for (int i = 0; i < 8; i++) o[i] = d * (float)(hi ? q[i] >> 4 : q[i] & 0xF) - mn;
+}
+template <> __device__ __forceinline__ void deq8<13>(const u8* b, int sub, float* o) {  // Q5_K
+    int e = sub * 8, j = e >> 6, hi = (e >> 5) & 1, l = e & 31, s, m;
+    scale_min_k4(2 * j + hi, b + 4, s, m);
+    float d = ldh(b) * (float)s, mn = ldh(b + 2) * (float)m;
+    const u8* qh = b + 16 + l;
+    const u8* q = b + 48 + 32 * j + l;
+    u8 bit = 1 << (2 * j + hi);
+    for (int i = 0; i < 8; i++)
+        o[i] = d * ((float)(hi ? q[i] >> 4 : q[i] & 0xF) + ((qh[i] & bit) ? 16.0f : 0.0f)) - mn;
+}
+template <> __device__ __forceinline__ void deq8<14>(const u8* b, int sub, float* o) {  // Q6_K
+    int e = sub * 8, n = e >> 7, r = e & 127, qt = r >> 5, l = r & 31;
+    const u8* ql = b + 64 * n;
+    const u8* qh = b + 128 + 32 * n;
+    float d = ldh(b + 208) * (float)((const signed char*)b)[192 + 8 * n + (l >> 4) + 2 * qt];
+    for (int i = 0; i < 8; i++) {
+        int li = l + i, q;
+        switch (qt) {
+            case 0: q = (ql[li] & 0xF) | ((qh[li] & 3) << 4); break;
+            case 1: q = (ql[li + 32] & 0xF) | (((qh[li] >> 2) & 3) << 4); break;
+            case 2: q = (ql[li] >> 4) | (((qh[li] >> 4) & 3) << 4); break;
+            default: q = (ql[li + 32] >> 4) | (((qh[li] >> 6) & 3) << 4); break;
+        }
+        o[i] = d * (float)(q - 32);
+    }
+}
+template <> __device__ __forceinline__ void deq8<17>(const u8* b, int sub, float* o) {  // IQ2_XS
+    int ib = sub >> 2, l = sub & 3;
+    u32 q = ld16(b + 2 + 2 * (4 * ib + l));
+    u64 g = iq2xs_grid[q & 511];
+    u8 sg = ksigns_iq2xs[q >> 9], sc = b[66 + ib];
+    float db = ldh(b) * (0.5f + (float)(l < 2 ? sc & 0xF : sc >> 4)) * 0.25f;
+    for (int j = 0; j < 8; j++) o[j] = db * (float)((g >> (8 * j)) & 0xFF) * ((sg >> j) & 1 ? -1.0f : 1.0f);
+}
+template <> __device__ __forceinline__ void deq8<18>(const u8* b, int sub, float* o) {  // IQ3_XXS
+    int ib = sub >> 2, l = sub & 3;
+    u32 aux = ld32(b + 66 + 4 * ib);
+    float db = ldh(b) * (0.5f + (float)(aux >> 28)) * 0.5f;
+    u8 sg = ksigns_iq2xs[(aux >> (7 * l)) & 127];
+    u32 g1 = iq3xxs_grid[b[2 + 8 * ib + 2 * l]], g2 = iq3xxs_grid[b[3 + 8 * ib + 2 * l]];
+    for (int j = 0; j < 4; j++) {
+        o[j] = db * (float)((g1 >> (8 * j)) & 0xFF) * ((sg >> j) & 1 ? -1.0f : 1.0f);
+        o[j + 4] = db * (float)((g2 >> (8 * j)) & 0xFF) * ((sg >> (j + 4)) & 1 ? -1.0f : 1.0f);
+    }
+}
+template <> __device__ __forceinline__ void deq8<23>(const u8* b, int sub, float* o) {  // IQ4_XS
+    int ib = sub >> 2, r = (sub & 3) * 8;
+    u32 sh = ld16(b + 2);
+    int ls = ((b[4 + ib / 2] >> (4 * (ib & 1))) & 0xF) | (((sh >> (2 * ib)) & 3) << 4);
+    float dl = ldh(b) * (float)(ls - 32);
+    const u8* q = b + 8 + 16 * ib + (r & 15);
+    for (int i = 0; i < 8; i++) o[i] = dl * (float)kvalues_iq4nl[r < 16 ? q[i] & 0xF : q[i] >> 4];
+}
+
+// One warp per output row; lane `l` covers elements [8l, 8l+8) of every super-block.
+template <int T, int SBB>
+__device__ __forceinline__ void gemv_row(const u8* w, const float* x, float* y, int row, int nsb) {
+    int lane = threadIdx.x & 31;
+    float acc = 0.0f, v[8];
+    for (int s = 0; s < nsb; s++) {
+        deq8<T>(w + (size_t)s * SBB, lane, v);
+        const float4* xs = (const float4*)(x + s * 256 + lane * 8);
+        float4 a = xs[0], c = xs[1];
+        acc += v[0] * a.x + v[1] * a.y + v[2] * a.z + v[3] * a.w + v[4] * c.x + v[5] * c.y + v[6] * c.z + v[7] * c.w;
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) y[row] = acc;
+}
+
+#define QTYPES(X) X(0, f32, 1024) X(30, bf16, 512) X(8, q8_0, 272) X(10, q2_k, 84) X(11, q3_k, 110) \
+    X(12, q4_k, 144) X(13, q5_k, 176) X(14, q6_k, 210) X(17, iq2_xs, 74) X(18, iq3_xxs, 98) X(23, iq4_xs, 136)
+
+#define DEF_QUANT(T, NAME, SBB)                                                                                   \
+    extern "C" __global__ void dequant_##NAME(const u8* w, float* out, int nsb) {                                 \
+        const u8* r = w + (size_t)blockIdx.x * nsb * SBB;                                                       \
+        for (int s = threadIdx.x; s < nsb * 32; s += blockDim.x)                                                \
+            deq8<T>(r + (size_t)(s >> 5) * SBB, s & 31, out + ((size_t)blockIdx.x * nsb + (s >> 5)) * 256 + (s & 31) * 8); \
+    }                                                                                                           \
+    extern "C" __global__ void gemv_##NAME(const u8* w, const float* x, float* y, int rows, int nsb) {          \
+        int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;                                                 \
+        if (row < rows) gemv_row<T, SBB>(w + (size_t)row * nsb * SBB, x, y, row, nsb);                         \
+    }                                                                                                           \
+    /* grid.y = slot k: weights of expert ids[k], input x + k*x_stride, output y + k*rows. */                    \
+    extern "C" __global__ void moe_gemv_##NAME(const u8* w, const int* ids, const float* x, int x_stride,       \
+                                               float* y, int rows, int nsb) {                                   \
+        int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, k = blockIdx.y;                                 \
+        if (row < rows)                                                                                         \
+            gemv_row<T, SBB>(w + ((size_t)ids[k] * rows + row) * nsb * SBB, x + (size_t)k * x_stride,           \
+                             y + (size_t)k * rows, row, nsb);                                                   \
+    }
+QTYPES(DEF_QUANT)
+
+// ---- elementwise / norm ----
+
+// grid = rows. out[r] = rmsnorm(x[r]) * w (same w for every row).
+extern "C" __global__ void rms_norm(const float* x, int x_stride, const float* w, float* out, int out_stride, int n, float eps) {
+    const float* xr = x + (size_t)blockIdx.x * x_stride;
+    float* o = out + (size_t)blockIdx.x * out_stride;
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += xr[i] * xr[i];
+    float sc = 1.0f / sqrtf(block_sum(s) / (float)n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) o[i] = xr[i] * sc * w[i];
+}
+
+// grid = rows, in place.
+extern "C" __global__ void l2_norm(float* x, int n, float eps) {
+    float* xr = x + (size_t)blockIdx.x * n;
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += xr[i] * xr[i];
+    float sc = 1.0f / fmaxf(sqrtf(block_sum(s)), eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) xr[i] *= sc;
+}
+
+// grid = heads, block = n_rot / 2. NEOX pairs (i, i + n_rot/2).
+extern "C" __global__ void rope_neox(float* x, int stride, int n_rot, int pos, float base) {
+    float* h = x + (size_t)blockIdx.x * stride;
+    int i = threadIdx.x, half = n_rot / 2;
+    double theta = (double)pos * pow((double)base, -2.0 * i / n_rot);
+    float s = (float)sin(theta), c = (float)cos(theta), a = h[i], b = h[i + half];
+    h[i] = a * c - b * s;
+    h[i + half] = a * s + b * c;
+}
+
+extern "C" __global__ void add(float* x, const float* y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += y[i];
+}
+
+extern "C" __global__ void swiglu(float* g, const float* u, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) g[i] = silu(g[i]) * u[i];
+}
+
+// ---- Gated DeltaNet ----
+
+extern "C" __global__ void ssm_gates(float* beta, float* g, const float* dt_bias, const float* a, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { beta[i] = sigmoid(beta[i]); g[i] = softplus(g[i] + dt_bias[i]) * a[i]; }
+}
+
+// Causal depthwise conv over [state..., current] then SiLU; state keeps the last kw-1 inputs, oldest first.
+extern "C" __global__ void conv_silu(const float* qkv, float* state, const float* w, float* y, int ch, int kw) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= ch) return;
+    float acc = 0.0f;
+    for (int k = 0; k < kw - 1; k++) acc += state[k * ch + c] * w[c * kw + k];
+    acc += qkv[c] * w[c * kw + kw - 1];
+    y[c] = silu(acc);
+    for (int k = 0; k < kw - 2; k++) state[k * ch + c] = state[(k + 1) * ch + c];
+    state[(kw - 2) * ch + c] = qkv[c];
+}
+
+// grid = value heads, block = dv; thread j owns state row j (dk floats). y = [q | k | v] after conv and l2 norm.
+// ponytail: state rows are read per thread (uncoalesced); a warp-per-row layout is the upgrade if this shows up in profiles.
+extern "C" __global__ void deltanet_step(const float* y, float* S, const float* beta, const float* g, float* o,
+                                         int nk, int dk, int dv, float scale) {
+    extern __shared__ float sh[];  // q, k: 2*dk
+    int vh = blockIdx.x, j = threadIdx.x, kh = vh % nk;
+    const float* q = y + kh * dk;
+    const float* k = y + nk * dk + kh * dk;
+    float v = y[2 * nk * dk + vh * dv + j];
+    for (int i = threadIdx.x; i < dk; i += blockDim.x) { sh[i] = q[i]; sh[dk + i] = k[i]; }
+    __syncthreads();
+    float* row = S + ((size_t)vh * dv + j) * dk;
+    float decay = expf(g[vh]), sk = 0.0f;
+    for (int i = 0; i < dk; i++) { float r = row[i] * decay; row[i] = r; sk += r * sh[dk + i]; }
+    float d = beta[vh] * (v - sk), oq = 0.0f;
+    for (int i = 0; i < dk; i++) { float r = row[i] + d * sh[dk + i]; row[i] = r; oq += r * sh[i]; }
+    o[vh * dv + j] = oq * scale;
+}
+
+// grid = heads: out = rmsnorm(o_h) * w * silu(z_h), in place on o.
+extern "C" __global__ void norm_gate(float* o, const float* w, const float* z, int n, float eps) {
+    float* h = o + (size_t)blockIdx.x * n;
+    const float* zh = z + (size_t)blockIdx.x * n;
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += h[i] * h[i];
+    float sc = 1.0f / sqrtf(block_sum(s) / (float)n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) h[i] = h[i] * sc * w[i] * silu(zh[i]);
+}
+
+// ---- attention ----
+
+extern "C" __global__ void kv_store(const float* k, const float* v, u16* kc, u16* vc, int n, int pos) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { kc[(size_t)pos * n + i] = f2h(k[i]); vc[(size_t)pos * n + i] = f2h(v[i]); }
+}
+
+#define INFINITY __int_as_float(0x7f800000)
+#define MAXD 16  // head_dim <= 512
+// grid = query heads; each warp walks positions warp, warp+nw, ... with online softmax; warps merge at the end.
+// qg holds [q | gate] per head (2*hd); output is softmax(qK)V * sigmoid(gate).
+extern "C" __global__ void attn_decode(const float* q, const u16* kc, const u16* vc, const float* qg, float* out,
+                                       int n_pos, int nh, int nkv, int hd, float scale) {
+    extern __shared__ float sacc[];  // nw * hd
+    __shared__ float sm[32], sl[32];
+    int h = blockIdx.x, g = h / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    int per = hd >> 5;
+    float qv[MAXD], acc[MAXD], m = -INFINITY, l = 0.0f;
+    for (int d = 0; d < per; d++) { qv[d] = q[h * hd + lane + 32 * d]; acc[d] = 0.0f; }
+    for (int t = w; t < n_pos; t += nw) {
+        const u16* kt = kc + ((size_t)t * nkv + g) * hd;
+        const u16* vt = vc + ((size_t)t * nkv + g) * hd;
+        float s = 0.0f;
+        for (int d = 0; d < per; d++) s += qv[d] * h2f(kt[lane + 32 * d]);
+        s = warp_sum(s) * scale;
+        float mn = fmaxf(m, s), c = expf(m - mn), p = expf(s - mn);
+        l = l * c + p;
+        for (int d = 0; d < per; d++) acc[d] = acc[d] * c + p * h2f(vt[lane + 32 * d]);
+        m = mn;
+    }
+    if (lane == 0) { sm[w] = m; sl[w] = l; }
+    for (int d = 0; d < per; d++) sacc[w * hd + lane + 32 * d] = acc[d];
+    __syncthreads();
+    float M = -INFINITY;
+    for (int i = 0; i < nw; i++) M = fmaxf(M, sm[i]);
+    float L = 0.0f;
+    for (int i = 0; i < nw; i++) L += sl[i] * expf(sm[i] - M);
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float o = 0.0f;
+        for (int i = 0; i < nw; i++) o += sacc[i * hd + d] * expf(sm[i] - M);
+        out[h * hd + d] = o / L * sigmoid(qg[h * 2 * hd + hd + d]);
+    }
+}
+
+// ---- MoE ----
+
+// One warp: softmax over n logits (in place), top-k (ties to the lower index), renormalized weights.
+extern "C" __global__ void router_topk(float* p, int n, int k, float extra_scale, int* ids, float* wts) {
+    int lane = threadIdx.x;
+    float m = -INFINITY;
+    for (int i = lane; i < n; i += 32) m = fmaxf(m, p[i]);
+    m = warp_max(m);
+    float s = 0.0f;
+    for (int i = lane; i < n; i += 32) { float e = expf(p[i] - m); p[i] = e; s += e; }
+    s = warp_sum(s);
+    for (int i = lane; i < n; i += 32) p[i] /= s;
+    __syncwarp();
+    float sum = 0.0f;
+    for (int j = 0; j < k; j++) {
+        float bv = -1.0f; int bi = 0x7fffffff;
+        for (int i = lane; i < n; i += 32) {
+            bool taken = false;
+            for (int t = 0; t < j; t++) taken |= ids[t] == i;
+            if (!taken && (p[i] > bv || (p[i] == bv && i < bi))) { bv = p[i]; bi = i; }
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            float ov = __shfl_xor_sync(0xffffffff, bv, o);
+            int oi = __shfl_xor_sync(0xffffffff, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) { ids[j] = bi; wts[j] = bv; }
+        sum += bv;
+        __syncwarp();
+    }
+    float scale = 1.0f / fmaxf(sum, 6.103515625e-5f);
+    if (extra_scale != 0.0f) scale *= extra_scale;
+    if (lane < k) wts[lane] *= scale;
+}
+
+// x += sum_k w[k] * ye[k] + sigmoid(sg[0]) * sh + cpu (sh and cpu may be null).
+extern "C" __global__ void moe_combine(float* x, const float* ye, const float* w, int k, const float* sh,
+                                       const float* sg, const float* cpu, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float y = 0.0f;
+    for (int j = 0; j < k; j++) y += w[j] * ye[(size_t)j * n + i];
+    if (cpu) y += cpu[i];
+    if (sh) y += sigmoid(sg[0]) * sh[i];
+    x[i] += y;
+}
