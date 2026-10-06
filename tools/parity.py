@@ -10,6 +10,7 @@ ap.add_argument("model"); ap.add_argument("--n", type=int, default=32)
 ap.add_argument("--limit", type=int, default=20); ap.add_argument("--port", type=int, default=8199)
 ap.add_argument("--bin", default="target/release/strata"); ap.add_argument("--extra", default="")
 ap.add_argument("--tag", default="")
+ap.add_argument("--start", type=int, default=0, help="score only prompts from this index (resume)")
 a = ap.parse_args()
 root = pathlib.Path(__file__).resolve().parent.parent
 cache = root / "target/parity-ref.json"
@@ -33,7 +34,7 @@ for p in prompts:
 
 agree = total = 0
 rows = []
-for p in prompts:
+for p in prompts[a.start:]:
     ids, cont = ref[p]["ids"], ref[p]["cont"][: a.n]
     out = subprocess.run([str(root / a.bin), "score", "--model", a.model, "--input", "-", *a.extra.split()],
                          input=json.dumps({"prompt": ids, "continuation": cont}), capture_output=True, text=True, check=True)

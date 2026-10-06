@@ -186,7 +186,8 @@ impl Gpu {
     }
 
     pub fn deltanet_step(&self, y: u64, s: u64, beta: u64, g: u64, o: u64, nk: usize, nv: usize, dk: usize, dv: usize, scale: f32) -> anyhow::Result<()> {
-        launch!(self, "deltanet_step", cfg((nv as u32, 1), dv as u32, (2 * dk * 4) as u32),
+        anyhow::ensure!(dk % 32 == 0 && dk <= 256, "deltanet_step: head dim {dk} unsupported");
+        launch!(self, "deltanet_step", cfg((nv as u32, dv.div_ceil(8) as u32), 256, 0),
             y, s, beta, g, o, nk as i32, dk as i32, dv as i32, scale);
         Ok(())
     }
