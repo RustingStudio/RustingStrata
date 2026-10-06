@@ -371,13 +371,15 @@ __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a
 }
 __device__ __forceinline__ u32 h2pack(float a, float b) { return (u32)f2h(a) | ((u32)f2h(b) << 16); }
 
+// act: 0 = store, 1 = y = silu(y) * result (SwiGLU over a gate already in y), 2 = y += result.
+// tiles = null: one dense matrix wd over positions 0 .. nd, tile blockIdx.y = positions BM * blockIdx.y ...
 // BM positions x 64 rows per block, K in steps of BK; warps form a (BM / 32) x 2 grid, each owning 32 x 32 outputs.
 template <int T, int SBB, int BM, int BK>
-__device__ __forceinline__ void gemm_q(const GemmTile* tiles, const float* __restrict__ x, int x_stride, const int* xrow,
-                                       float* y, int y_stride, int rows, int nsb) {
+__device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int nd, const float* __restrict__ x, int x_stride,
+                                       const int* xrow, float* y, int y_stride, int rows, int nsb, int act) {
     constexpr int P = BK + 8, NT = BM * 2, SUBS = BK / 8;  // smem pitch in halves (padding: conflict-free fragments)
     __shared__ __align__(16) u16 xs[BM * P], ws[64 * P];
-    GemmTile tl = tiles[blockIdx.y];
+    GemmTile tl = tiles ? tiles[blockIdx.y] : GemmTile{wd, (int)blockIdx.y * BM, min(BM, nd - (int)blockIdx.y * BM)};
     int n0 = blockIdx.x * 64, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     int wm = (warp >> 1) * 32, wn = (warp & 1) * 32;
     const float* xr[BM * BK / 4 / NT];  // row pointers of the X elements this thread loads (null past cnt)
@@ -422,8 +424,11 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const float* __res
                 int r = wm + mt * 16 + g + 8 * h, n = n0 + wn + nt * 8 + 2 * t;
                 if (r >= tl.cnt) continue;
                 float* yr = y + (size_t)(tl.m0 + r) * y_stride;
-                if (n < rows) yr[n] = acc[mt][nt][2 * h];
-                if (n + 1 < rows) yr[n + 1] = acc[mt][nt][2 * h + 1];
+                for (int e = 0; e < 2; e++) {
+                    if (n + e >= rows) break;
+                    float v = acc[mt][nt][2 * h + e];
+                    yr[n + e] = act == 0 ? v : act == 1 ? silu(yr[n + e]) * v : yr[n + e] + v;
+                }
             }
 }
 
@@ -432,9 +437,9 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const float* __res
 #define GEMM_BK 64
 #endif
 #define DEF_GEMM(T, NAME, SBB)                                                                                    \
-    extern "C" __global__ void __launch_bounds__(GEMM_BM * 2) gemm_##NAME(const GemmTile* tiles, const float* x,   \
-            int x_stride, const int* xrow, float* y, int y_stride, int rows, int nsb) {                          \
-        gemm_q<T, SBB, GEMM_BM, GEMM_BK>(tiles, x, x_stride, xrow, y, y_stride, rows, nsb);                     \
+    extern "C" __global__ void __launch_bounds__(GEMM_BM * 2) gemm_##NAME(const GemmTile* tiles, const u8* wd, int nd, \
+            const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int nsb, int act) {  \
+        gemm_q<T, SBB, GEMM_BM, GEMM_BK>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, nsb, act);       \
     }
 QTYPES(DEF_GEMM)
 
@@ -450,9 +455,9 @@ extern "C" __global__ void rms_norm(const float* x, int x_stride, const float* w
     for (int i = threadIdx.x; i < n; i += blockDim.x) o[i] = xr[i] * sc * w[i];
 }
 
-// grid = rows, in place.
-extern "C" __global__ void l2_norm(float* x, int n, float eps) {
-    float* xr = x + (size_t)blockIdx.x * n;
+// grid = rows, in place. Row r is vector r % per of token r / per (tokens `stride` floats apart).
+extern "C" __global__ void l2_norm(float* x, int n, int per, int stride, float eps) {
+    float* xr = x + (size_t)(blockIdx.x / per) * stride + (size_t)(blockIdx.x % per) * n;
     float s = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) s += xr[i] * xr[i];
     float sc = 1.0f / fmaxf(sqrtf(block_sum(s)), eps);
@@ -461,9 +466,9 @@ extern "C" __global__ void l2_norm(float* x, int n, float eps) {
 
 // Per-token values live in device memory so a captured graph can replay: step[0] = position, step[1] = CPU worker seq.
 
-// grid = heads, block = n_rot / 2. NEOX pairs (i, i + n_rot/2).
-extern "C" __global__ void rope_neox(float* x, int stride, int n_rot, const int* step, float base) {
-    int pos = step[0];
+// grid = tokens * per heads, block = n_rot / 2. NEOX pairs (i, i + n_rot/2). Token t sits at position step[0] + t.
+extern "C" __global__ void rope_neox(float* x, int stride, int per, int n_rot, const int* step, float base) {
+    int pos = step[0] + blockIdx.x / per;
     float* h = x + (size_t)blockIdx.x * stride;
     int i = threadIdx.x, half = n_rot / 2;
     double theta = (double)pos * pow((double)base, -2.0 * i / n_rot);
@@ -484,9 +489,10 @@ extern "C" __global__ void swiglu(float* g, const float* u, int n) {
 
 // ---- Gated DeltaNet ----
 
-extern "C" __global__ void ssm_gates(float* beta, float* g, const float* dt_bias, const float* a, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) { beta[i] = sigmoid(beta[i]); g[i] = softplus(g[i] + dt_bias[i]) * a[i]; }
+// n = tokens * nv values; per-head parameters repeat every nv.
+extern "C" __global__ void ssm_gates(float* beta, float* g, const float* dt_bias, const float* a, int n, int nv) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x, h = i % nv;
+    if (i < n) { beta[i] = sigmoid(beta[i]); g[i] = softplus(g[i] + dt_bias[h]) * a[h]; }
 }
 
 // Causal depthwise conv over [state..., current] then SiLU; state keeps the last kw-1 inputs, oldest first.
@@ -501,22 +507,53 @@ extern "C" __global__ void conv_silu(const float* qkv, float* state, const float
     state[(kw - 2) * ch + c] = qkv[c];
 }
 
+// Parallel over tokens for a chunk: y[t] = silu(conv over inputs t-kw+1 .. t), inputs before the chunk from state.
+extern "C" __global__ void conv_seq(const float* qkv, const float* state, const float* w, float* y, int ch, int kw, int T) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * ch) return;
+    int t = i / ch, c = i % ch;
+    float acc = 0.0f;
+    for (int k = 0; k < kw; k++) {
+        int s = t - (kw - 1) + k;  // input index; < 0 reads state slot kw - 1 + s
+        acc += (s < 0 ? state[(kw - 1 + s) * ch + c] : qkv[(size_t)s * ch + c]) * w[c * kw + k];
+    }
+    y[i] = silu(acc);
+}
+
+// After conv_seq: state = last kw-1 inputs. One thread per channel, ascending slots read only higher ones.
+extern "C" __global__ void conv_state(const float* qkv, float* state, int ch, int kw, int T) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= ch) return;
+    for (int k = 0; k < kw - 1; k++) {
+        int s = T - (kw - 1) + k;
+        state[k * ch + c] = s < 0 ? state[(kw - 1 + s) * ch + c] : qkv[(size_t)s * ch + c];
+    }
+}
+
 // grid = (value heads, dv / 8), block = 256: warp w owns state row j = 8 * blockIdx.y + w (dk floats, dk <= 256,
-// multiple of 32), lane l holds elements l, l + 32, ... so row loads coalesce. y = [q | k | v] after conv and l2 norm.
+// multiple of 32) in registers, lane l holds elements l, l + 32, ... and scans the T tokens in order.
+// Token t: y + t * ych = [q | k | v] after conv and l2 norm; beta, g at t * nv; output at o + t * nv * dv.
+// ponytail: sequential scan (latency-bound per token); a chunked WY form would use tensor cores for long prompts.
 #define MAXK 8
-extern "C" __global__ void deltanet_step(const float* y, float* S, const float* beta, const float* g, float* o,
-                                         int nk, int dk, int dv, float scale) {
+extern "C" __global__ void deltanet_seq(const float* y, float* S, const float* beta, const float* g, float* o,
+                                        int nk, int nv, int dk, int dv, float scale, int T, int ych) {
     int vh = blockIdx.x, j = blockIdx.y * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31, kh = vh % nk, per = dk >> 5;
     if (j >= dv) return;
-    const float* q = y + kh * dk;
-    const float* k = y + nk * dk + kh * dk;
     float* row = S + ((size_t)vh * dv + j) * dk;
-    float decay = expf(g[vh]), r[MAXK], kk[MAXK], sk = 0.0f;
-    for (int t = 0; t < per; t++) { int i = lane + 32 * t; r[t] = row[i] * decay; kk[t] = k[i]; sk += r[t] * kk[t]; }
-    float d = beta[vh] * (y[2 * nk * dk + vh * dv + j] - warp_sum(sk)), oq = 0.0f;
-    for (int t = 0; t < per; t++) { int i = lane + 32 * t; float v = r[t] + d * kk[t]; row[i] = v; oq += v * q[i]; }
-    oq = warp_sum(oq);
-    if (lane == 0) o[vh * dv + j] = oq * scale;
+    float r[MAXK];
+    for (int t = 0; t < per; t++) r[t] = row[lane + 32 * t];
+    for (int tok = 0; tok < T; tok++) {
+        const float* yt = y + (size_t)tok * ych;
+        const float* q = yt + kh * dk;
+        const float* k = yt + nk * dk + kh * dk;
+        float decay = expf(g[tok * nv + vh]), kk[MAXK], sk = 0.0f;
+        for (int t = 0; t < per; t++) { int i = lane + 32 * t; r[t] *= decay; kk[t] = k[i]; sk += r[t] * kk[t]; }
+        float d = beta[tok * nv + vh] * (yt[2 * nk * dk + vh * dv + j] - warp_sum(sk)), oq = 0.0f;
+        for (int t = 0; t < per; t++) { r[t] += d * kk[t]; oq += r[t] * q[lane + 32 * t]; }
+        oq = warp_sum(oq);
+        if (lane == 0) o[(size_t)tok * nv * dv + vh * dv + j] = oq * scale;
+    }
+    for (int t = 0; t < per; t++) row[lane + 32 * t] = r[t];
 }
 
 // grid = heads: out = rmsnorm(o_h) * w * silu(z_h), in place on o.
@@ -531,9 +568,10 @@ extern "C" __global__ void norm_gate(float* o, const float* w, const float* z, i
 
 // ---- attention ----
 
-extern "C" __global__ void kv_store(const float* k, const float* v, u16* kc, u16* vc, int n, const int* step) {
+// Store `total` values (consecutive tokens of n each) starting at position step[0].
+extern "C" __global__ void kv_store(const float* k, const float* v, u16* kc, u16* vc, int n, int total, const int* step) {
     int i = blockIdx.x * blockDim.x + threadIdx.x, pos = step[0];
-    if (i < n) { kc[(size_t)pos * n + i] = f2h(k[i]); vc[(size_t)pos * n + i] = f2h(v[i]); }
+    if (i < total) { kc[(size_t)pos * n + i] = f2h(k[i]); vc[(size_t)pos * n + i] = f2h(v[i]); }
 }
 
 #define INFINITY __int_as_float(0x7f800000)
@@ -576,9 +614,11 @@ extern "C" __global__ void attn_decode(const float* q, const u16* kc, const u16*
 
 // ---- MoE ----
 
-// One warp: softmax over n logits (in place), top-k (ties to the lower index), renormalized weights.
+// One warp per token (grid = tokens): softmax over n logits (in place), top-k (ties to the lower index), renormalized
+// weights.
 extern "C" __global__ void router_topk(float* p, int n, int k, float extra_scale, int* ids, float* wts) {
     int lane = threadIdx.x;
+    p += (size_t)blockIdx.x * n; ids += blockIdx.x * k; wts += blockIdx.x * k;
     float m = -INFINITY;
     for (int i = lane; i < n; i += 32) m = fmaxf(m, p[i]);
     m = warp_max(m);
@@ -661,3 +701,114 @@ extern "C" __global__ void moe_combine(float* x, const float* ye, const float* w
     if (sh) y += sigmoid(sg[0]) * sh[i];
     x[i] += y;
 }
+
+// Prefill combine over T tokens: x[t] += sum_j wts[t, j] ye[inv[t, j]] + sigmoid(sg[t]) sh[t] (sh may be null).
+extern "C" __global__ void moe_combine_seq(float* x, const float* ye, const float* wts, const int* inv, int k,
+                                           const float* sh, const float* sg, int n, int T) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * n) return;
+    int t = i / n, d = i % n;
+    float y = 0.0f;
+    for (int j = 0; j < k; j++) y += wts[t * k + j] * ye[(size_t)inv[t * k + j] * n + d];
+    if (sh) y += sigmoid(sg[t]) * sh[i];
+    x[i] += y;
+}
+
+// ---- attention prefill (flash, tensor cores) ----
+
+// grid = (ceil(T / 64), heads), block = 128: warp w owns queries 16w .. 16w + 15 of the tile. Query t (position
+// step[0] + t) attends to cached keys 0 .. step[0] + t. q is [T, nh * HD] after rope, qg [T, nh * 2 * HD] holds the
+// gate at +HD per head; out [T, nh * HD] = softmax(q K^T * scale) V * sigmoid(gate). Shared: Q tile, K tile, V^T tile.
+#define FA_BQ 64
+#define FA_BK 32
+template <int HD>
+__device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, const u16* vc, const float* qg, float* out,
+                                               const int* step, int T, int nh, int nkv, float scale) {
+    constexpr int PQ = HD + 8, PV = FA_BK + 8;
+    extern __shared__ __align__(16) u16 fa_sm[];
+    u16 *qs = fa_sm, *ks = qs + FA_BQ * PQ, *vt = ks + FA_BK * PQ;
+    int pos0 = step[0], q0 = blockIdx.x * FA_BQ, h = blockIdx.y, kvh = h / (nh / nkv), kvd = nkv * HD;
+    int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
+    for (int i = tid; i < FA_BQ * HD / 4; i += 128) {
+        int r = i / (HD / 4), c = (i % (HD / 4)) * 4;
+        float4 v = q0 + r < T ? *(const float4*)(q + (size_t)(q0 + r) * nh * HD + h * HD + c) : make_float4(0.f, 0.f, 0.f, 0.f);
+        *(uint2*)(qs + r * PQ + c) = make_uint2(h2pack(v.x * scale, v.y * scale), h2pack(v.z * scale, v.w * scale));
+    }
+    int last = pos0 + min(q0 + FA_BQ, T) - 1;  // last key any query of the tile sees
+    int qp[2] = {pos0 + q0 + warp * 16 + g, pos0 + q0 + warp * 16 + g + 8};
+    float o[HD / 8][4] = {}, m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+    for (int k0 = 0; k0 <= last; k0 += FA_BK) {
+        __syncthreads();
+        for (int i = tid; i < FA_BK * HD / 8; i += 128) {
+            int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
+            uint4 kv = make_uint4(0, 0, 0, 0), vv = kv;
+            if (k0 + r <= last) {
+                size_t off = (size_t)(k0 + r) * kvd + kvh * HD + c;
+                kv = *(const uint4*)(kc + off); vv = *(const uint4*)(vc + off);
+            }
+            *(uint4*)(ks + r * PQ + c) = kv;
+            const u16* vp = (const u16*)&vv;
+            for (int e = 0; e < 8; e++) vt[(c + e) * PV + r] = vp[e];
+        }
+        __syncthreads();
+        float s[FA_BK / 8][4] = {};
+#pragma unroll
+        for (int kk = 0; kk < HD; kk += 16) {
+            const u16* p = qs + (warp * 16 + g) * PQ + kk + 2 * t4;
+            u32 a0 = ld_s32(p), a1 = ld_s32(p + 8 * PQ), a2 = ld_s32(p + 8), a3 = ld_s32(p + 8 * PQ + 8);
+            for (int nt = 0; nt < FA_BK / 8; nt++) {
+                const u16* b = ks + (nt * 8 + g) * PQ + kk + 2 * t4;
+                mma16816(s[nt], a0, a1, a2, a3, ld_s32(b), ld_s32(b + 8));
+            }
+        }
+        float mx[2] = {m[0], m[1]};
+        for (int nt = 0; nt < FA_BK / 8; nt++)
+            for (int e = 0; e < 4; e++) {
+                int key = k0 + nt * 8 + 2 * t4 + (e & 1), r = e >> 1;
+                if (key > qp[r]) s[nt][e] = -INFINITY;
+                mx[r] = fmaxf(mx[r], s[nt][e]);
+            }
+        float c[2];
+        for (int r = 0; r < 2; r++) {
+            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 1));
+            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 2));
+            c[r] = expf(m[r] - mx[r]);  // key 0 is in the first block, so mx is finite from then on
+            m[r] = mx[r];
+            l[r] *= c[r];
+        }
+        for (int nt = 0; nt < FA_BK / 8; nt++)
+            for (int e = 0; e < 4; e++) { float p = expf(s[nt][e] - m[e >> 1]); s[nt][e] = p; l[e >> 1] += p; }
+        for (int d = 0; d < HD / 8; d++) { o[d][0] *= c[0]; o[d][1] *= c[0]; o[d][2] *= c[1]; o[d][3] *= c[1]; }
+#pragma unroll
+        for (int kb = 0; kb < FA_BK / 16; kb++) {
+            u32 a0 = h2pack(s[2 * kb][0], s[2 * kb][1]), a1 = h2pack(s[2 * kb][2], s[2 * kb][3]);
+            u32 a2 = h2pack(s[2 * kb + 1][0], s[2 * kb + 1][1]), a3 = h2pack(s[2 * kb + 1][2], s[2 * kb + 1][3]);
+#pragma unroll
+            for (int d = 0; d < HD / 8; d++) {
+                const u16* b = vt + (d * 8 + g) * PV + kb * 16 + 2 * t4;
+                mma16816(o[d], a0, a1, a2, a3, ld_s32(b), ld_s32(b + 8));
+            }
+        }
+    }
+    for (int r = 0; r < 2; r++) {
+        l[r] += __shfl_xor_sync(0xffffffff, l[r], 1);
+        l[r] += __shfl_xor_sync(0xffffffff, l[r], 2);
+    }
+    for (int r = 0; r < 2; r++) {
+        int t = q0 + warp * 16 + g + 8 * r;
+        if (t >= T) continue;
+        float* orow = out + (size_t)t * nh * HD + h * HD;
+        const float* gate = qg + (size_t)t * nh * 2 * HD + h * 2 * HD + HD;
+        for (int d = 0; d < HD / 8; d++)
+            for (int e = 0; e < 2; e++) {
+                int col = d * 8 + 2 * t4 + e;
+                orow[col] = o[d][2 * r + e] / l[r] * sigmoid(gate[col]);
+            }
+    }
+}
+#define DEF_FA(HD) \
+    extern "C" __global__ void __launch_bounds__(128) attn_prefill_##HD(const float* q, const u16* kc, const u16* vc, \
+            const float* qg, float* out, const int* step, int T, int nh, int nkv, float scale) {                      \
+        attn_prefill_t<HD>(q, kc, vc, qg, out, step, T, nh, nkv, scale);                                            \
+    }
+DEF_FA(64) DEF_FA(128) DEF_FA(256)

@@ -21,6 +21,9 @@ struct Engine {
     /// GPU context length (KV cache size) in tokens.
     #[arg(long, default_value_t = 4096)]
     ctx: usize,
+    /// Prefill chunk in tokens (GPU; 0 = token by token).
+    #[arg(long, default_value_t = 1024)]
+    chunk: usize,
     /// VRAM left free after placing expert layers, in MB.
     #[arg(long, default_value_t = 512)]
     vram_margin: usize,
@@ -31,6 +34,13 @@ enum Runner<'a> { Cpu(&'a Model<'a>, State), Gpu(Box<GpuModel<'a>>) }
 impl Runner<'_> {
     fn step(&mut self, t: u32) -> anyhow::Result<Vec<f32>> {
         match self { Runner::Cpu(m, st) => Ok(m.step(st, t)), Runner::Gpu(g) => g.step(t) }
+    }
+    /// Feed a prompt; returns the logits after its last token.
+    fn prefill(&mut self, ts: &[u32]) -> anyhow::Result<Vec<f32>> {
+        match self {
+            Runner::Cpu(m, st) => Ok(ts.iter().map(|&t| m.step(st, t)).last().unwrap_or_default()),
+            Runner::Gpu(g) => g.prefill(ts),
+        }
     }
     /// Seconds spent waiting on CPU experts so far (GPU only).
     fn cpu_secs(&self) -> f64 { if let Runner::Gpu(g) = self { g.cpu_time.as_secs_f64() } else { 0.0 } }
@@ -48,7 +58,7 @@ impl Runner<'_> {
 impl Engine {
     fn runner<'a>(&self, m: &'a Model<'a>) -> anyhow::Result<Runner<'a>> {
         if !self.gpu { return Ok(Runner::Cpu(m, State::new(&m.cfg))); }
-        Ok(Runner::Gpu(Box::new(GpuModel::load(m, Gpu::new()?, self.ctx, self.vram_margin << 20)?)))
+        Ok(Runner::Gpu(Box::new(GpuModel::load(m, Gpu::new()?, self.ctx, self.chunk, self.vram_margin << 20)?)))
     }
 }
 
@@ -114,9 +124,9 @@ fn main() -> anyhow::Result<()> {
             let mut r = engine.runner(&m)?;
             let feed: Vec<u32> = prompt.iter().chain(&cont[..cont.len() - 1]).copied().collect();
             let (mut argmax, mut top5) = (Vec::new(), Vec::new());
-            for (i, &t) in feed.iter().enumerate() {
-                let logits = r.step(t)?;
-                if i + 1 < prompt.len() { continue; }
+            let mut logits = r.prefill(&prompt)?;
+            for i in prompt.len() - 1..feed.len() {
+                if i >= prompt.len() { logits = r.step(feed[i])?; }
                 let lse = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                 let lse = lse + logits.iter().map(|x| (x - lse).exp()).sum::<f32>().ln();
                 argmax.push(ops::argmax(&logits));
@@ -133,8 +143,7 @@ fn main() -> anyhow::Result<()> {
             let mut r = engine.runner(&m)?;
             let ids = tok.encode(&prompt)?;
             let t0 = Instant::now();
-            let mut logits = Vec::new();
-            for &t in &ids { logits = r.step(t)?; }
+            let mut logits = r.prefill(&ids)?;
             let t1 = Instant::now();
             let cpu0 = r.cpu_secs();
             let mut out = Vec::new();

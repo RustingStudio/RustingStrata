@@ -37,7 +37,8 @@ rows = []
 for p in prompts[a.start:]:
     ids, cont = ref[p]["ids"], ref[p]["cont"][: a.n]
     out = subprocess.run([str(root / a.bin), "score", "--model", a.model, "--input", "-", *a.extra.split()],
-                         input=json.dumps({"prompt": ids, "continuation": cont}), capture_output=True, text=True, check=True)
+                         input=json.dumps({"prompt": ids, "continuation": cont}), capture_output=True, text=True)
+    if out.returncode: sys.exit(f"strata score failed on {p.splitlines()[1][:50]!r}:\n{out.stderr[-2000:]}")
     res = json.loads(out.stdout)
     mine = res["argmax"]
     k = sum(x == y for x, y in zip(mine, cont))
