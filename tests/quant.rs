@@ -26,3 +26,28 @@ fn check(name: &str, ty: GgmlType) {
 #[test] fn iq2_xs() { check("IQ2_XS", GgmlType::IQ2XS) }
 #[test] fn iq3_xxs() { check("IQ3_XXS", GgmlType::IQ3XXS) }
 #[test] fn iq4_xs() { check("IQ4_XS", GgmlType::IQ4XS) }
+
+#[test]
+fn matvec_matches_rowwise_dequant() {
+    let Some(p) = common::model_path() else { return };
+    let g = rusting_strata::gguf::Gguf::open(&p).unwrap();
+    let w = rusting_strata::weights::Weights { g: &g };
+    w.validate().unwrap();
+    let t = w.layer(0, "ffn_down_exps.weight").unwrap().expert(7, 256); // IQ3_XXS, 2048 rows x 512
+    assert_eq!((t.rows, t.cols), (2048, 512));
+    let x: Vec<f32> = (0..512).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+    let mut y = vec![0f32; 2048];
+    t.matvec(&x, &mut y);
+    let mut row = vec![0f32; 512];
+    for r in [0, 1, 1000, 2047] {
+        t.row(r, &mut row);
+        let want: f32 = row.iter().zip(&x).map(|(a, b)| a * b).sum();
+        assert!((y[r] - want).abs() < 1e-4, "row {r}");
+    }
+    // Expert slice must point at the right bytes: expert 7 row 0 == full tensor row 7*2048.
+    let full = w.layer(0, "ffn_down_exps.weight").unwrap();
+    let mut a = vec![0f32; 512];
+    full.row(7 * 2048, &mut a);
+    t.row(0, &mut row);
+    assert_eq!(a, row);
+}
