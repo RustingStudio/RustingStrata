@@ -10,6 +10,8 @@ use cudarc::driver::{CudaGraph, CudaSlice, sys};
 use std::collections::HashMap;
 use std::time::Duration;
 
+mod prefill;
+
 enum Mixer {
     Delta {
         qkv: GpuTensor, gate: GpuTensor, beta: GpuTensor, alpha: GpuTensor, dt_bias: GpuTensor, a: GpuTensor,
@@ -53,10 +55,13 @@ pub struct GpuModel<'a> {
     pub misses: usize,
     /// Time the CPU worker spent computing missed experts (overlaps GPU work).
     pub cpu_time: Duration,
+    /// Prefill scratch (None: prompts go through `step`).
+    pf: Option<prefill::Scratch>,
 }
 
 impl<'a> GpuModel<'a> {
-    pub fn load(m: &'a Model<'a>, gpu: Gpu, ctx: usize, vram_margin: usize) -> anyhow::Result<GpuModel<'a>> {
+    /// `chunk`: prefill batch in tokens (0 = no batched prefill).
+    pub fn load(m: &'a Model<'a>, gpu: Gpu, ctx: usize, chunk: usize, vram_margin: usize) -> anyhow::Result<GpuModel<'a>> {
         let c = &m.cfg;
         let up = |name: &str| -> anyhow::Result<GpuTensor> { gpu.upload(&m.w.get(name)?) };
         let lt = |il: usize, s: &str| up(&format!("blk.{il}.{s}"));
@@ -109,6 +114,7 @@ impl<'a> GpuModel<'a> {
         let bufs = sizes.into_iter().map(|(name, n)| Ok((name, gpu.zeros::<f32>(n)?))).collect::<anyhow::Result<HashMap<_, _>>>()?;
         let (x, logits, ids) = (gpu.zeros(c.n_embd)?, gpu.zeros(c.n_vocab)?, gpu.zeros::<i32>(k)?);
         let (slots, step_buf) = (gpu.zeros::<i32>(k)?, gpu.zeros::<i32>(2)?);
+        let pf = if chunk > 0 { Some(prefill::Scratch::new(m, &gpu, chunk)?) } else { None };
         let (free1, _) = gpu.ctx.mem_get_info()?;
 
         let cache = if c.is_moe() {
@@ -118,12 +124,12 @@ impl<'a> GpuModel<'a> {
         let worker = if c.is_moe() { Some(CpuWorker::new(m, &gpu.ctx, (0..c.n_layer).collect())?) } else { None };
         let mb = |b: usize| b as f64 / 1048576.0;
         eprintln!(
-            "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {ctx} tokens), expert slots {:.0} MB, resident experts {}/{}",
-            mb(free0 - free1), mb(2 * 2 * ctx * kv * (c.n_layer / c.full_attention_interval)),
+            "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {ctx} tokens, prefill {:.0} MB), expert slots {:.0} MB, resident experts {}/{}",
+            mb(free0 - free1), mb(2 * 2 * ctx * kv * (c.n_layer / c.full_attention_interval)), mb(pf.as_ref().map_or(0, |p| p.bytes())),
             mb(cache.as_ref().map_or(0, |x| x.slot_bytes_total())),
             cache.as_ref().map_or(0, |x| x.resident_count()), cache.as_ref().map_or(0, |x| x.total_experts()),
         );
-        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, step_buf, graph: None, ctx, pos: 0, cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO })
+        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, step_buf, graph: None, ctx, pos: 0, cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO, pf })
     }
 
     /// Clear KV and recurrent state.
@@ -179,22 +185,22 @@ impl<'a> GpuModel<'a> {
                     g.gemv(gate, p("h"), p("z"))?;
                     g.gemv(beta, p("h"), p("beta"))?;
                     g.gemv(alpha, p("h"), p("g"))?;
-                    g.ssm_gates(p("beta"), p("g"), dt_bias.ptr, a.ptr, nv)?;
+                    g.ssm_gates(p("beta"), p("g"), dt_bias.ptr, a.ptr, nv, nv)?;
                     g.conv_silu(p("qkv"), g.ptr(conv), conv_w.ptr, p("y"), c.ssm_d_inner + 2 * nk * dk, c.ssm_conv)?;
-                    g.l2_norm(p("y"), dk, 2 * nk, eps)?;
-                    g.deltanet_step(p("y"), g.ptr(s), p("beta"), p("g"), p("o"), nk, nv, dk, dv, 1.0 / (dk as f32).sqrt())?;
+                    g.l2_norm(p("y"), dk, 2 * nk, 0, 2 * nk, eps)?;
+                    g.deltanet(p("y"), g.ptr(s), p("beta"), p("g"), p("o"), nk, nv, dk, dv, 1.0 / (dk as f32).sqrt(), 1, 0)?;
                     g.norm_gate(p("o"), norm.ptr, p("z"), dv, nv, eps)?;
                     g.gemv(out, p("o"), p("mix"))?;
                 }
                 Mixer::Attn { q, k, v, qn, kn, o, kc, vc } => {
                     g.gemv(q, p("h"), p("qg"))?;
                     g.rms_norm(p("qg"), 2 * hd, qn.ptr, p("q"), hd, hd, nh, eps)?;
-                    g.rope_neox(p("q"), hd, nh, c.n_rot, step, c.rope_base)?;
+                    g.rope_neox(p("q"), hd, nh, nh, c.n_rot, step, c.rope_base)?;
                     g.gemv(k, p("h"), p("kraw"))?;
                     g.gemv(v, p("h"), p("v"))?;
                     g.rms_norm(p("kraw"), hd, kn.ptr, p("k"), hd, hd, nkv, eps)?;
-                    g.rope_neox(p("k"), hd, nkv, c.n_rot, step, c.rope_base)?;
-                    g.kv_store(p("k"), p("v"), g.ptr(kc), g.ptr(vc), nkv * hd, step)?;
+                    g.rope_neox(p("k"), hd, nkv, nkv, c.n_rot, step, c.rope_base)?;
+                    g.kv_store(p("k"), p("v"), g.ptr(kc), g.ptr(vc), nkv * hd, 1, step)?;
                     g.attn_decode(p("q"), g.ptr(kc), g.ptr(vc), p("qg"), p("att"), step, nh, nkv, hd, 1.0 / (hd as f32).sqrt())?;
                     g.gemv(o, p("att"), p("mix"))?;
                 }
@@ -213,7 +219,7 @@ impl<'a> GpuModel<'a> {
                     let k = c.n_expert_used;
                     let ids = g.ptr(&self.ids);
                     g.gemv(router, p("h"), p("rl"))?;
-                    g.router_topk(p("rl"), c.n_expert, k, c.expert_weights_scale, ids, p("wts"))?;
+                    g.router_topk(p("rl"), c.n_expert, k, c.expert_weights_scale, ids, p("wts"), 1)?;
                     let cache = self.cache.as_ref().unwrap();
                     let lx = cache.layer(il).unwrap();
                     let (base, stride) = cache.base(g, lx);

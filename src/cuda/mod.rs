@@ -14,10 +14,10 @@ const QTYPES: [GgmlType; 11] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ2XS, IQ3XXS, IQ4XS]
 };
-const KERNELS: [&str; 15] = [
-    "rms_norm", "l2_norm", "rope_neox", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_step", "norm_gate",
-    "kv_store", "attn_decode", "router_topk", "moe_combine", "map_hits",
-    "moe_publish",
+const KERNELS: [&str; 21] = [
+    "rms_norm", "l2_norm", "rope_neox", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
+    "kv_store", "attn_decode", "router_topk", "moe_combine", "map_hits", "moe_publish", "conv_seq", "conv_state",
+    "moe_combine_seq", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256",
 ];
 
 /// Positions per GEMM tile (GEMM_BM in kernels.cu).
@@ -100,6 +100,9 @@ impl Gpu {
             .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "moe_gemv", "gemm"].map(|p| kname(p, t))));
         for n in names {
             let f = module.load_function(&n).with_context(|| format!("kernel {n}"))?;
+            if n.starts_with("attn_prefill") {
+                f.set_attribute(cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 96 << 10)?;
+            }
             fns.insert(n, f);
         }
         Ok(Gpu { ctx, stream, fns })
@@ -132,11 +135,21 @@ impl Gpu {
 
     /// Tensor-core GEMM over a tile list (see `GemmTile` in kernels.cu): for each tile, positions m0 .. m0 + cnt get
     /// y[m, 0..rows] = W_tile x[xrow[m]] (x row m when `xrow` is 0). `tiles` is a device array of [w, m0 | cnt << 32].
-    pub fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, xrow: u64, y: u64, y_stride: usize) -> anyhow::Result<()> {
+    /// `act`: 0 stores, 1 computes y = silu(y) * result (SwiGLU with the gate already in y), 2 adds to y.
+    pub fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
+        self.gemm_raw(ty, rows, cols, tiles, n_tiles, 0, 0, x, x_stride, xrow, y, y_stride, act)
+    }
+
+    /// y[m] (op) W x[m] for positions m < n, x and y rows `x_stride` / `y_stride` floats apart.
+    pub fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
+        self.gemm_raw(w.ty, w.rows, w.cols, 0, n.div_ceil(GEMM_BM), w.ptr, n, x, x_stride, 0, y, y_stride, act)
+    }
+
+    fn gemm_raw(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, wd: u64, nd: usize, x: u64, x_stride: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
         if cols % 256 != 0 { bail!("{} matrix with {cols} columns: GEMM needs a multiple of 256", ty.name()); }
         if n_tiles == 0 { return Ok(()); }
         launch!(self, &kname("gemm", ty), cfg((rows.div_ceil(64) as u32, n_tiles as u32), 2 * GEMM_BM as u32, 0),
-            tiles, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 256) as i32);
+            tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 256) as i32, act);
         Ok(())
     }
 
@@ -185,13 +198,15 @@ impl Gpu {
         Ok(())
     }
 
-    pub fn l2_norm(&self, x: u64, n: usize, rows: usize, eps: f32) -> anyhow::Result<()> {
-        launch!(self, "l2_norm", cfg((rows as u32, 1), 128, 0), x, n as i32, eps);
+    /// Row r: vector r % per (n floats) of token r / per, tokens `stride` floats apart.
+    pub fn l2_norm(&self, x: u64, n: usize, per: usize, stride: usize, rows: usize, eps: f32) -> anyhow::Result<()> {
+        launch!(self, "l2_norm", cfg((rows as u32, 1), 128, 0), x, n as i32, per as i32, stride as i32, eps);
         Ok(())
     }
 
-    pub fn rope_neox(&self, x: u64, stride: usize, heads: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
-        launch!(self, "rope_neox", cfg((heads as u32, 1), (n_rot / 2) as u32, 0), x, stride as i32, n_rot as i32, step, base);
+    /// `heads` rows of `stride` floats, `per` per token; token t is at position step[0] + t.
+    pub fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
+        launch!(self, "rope_neox", cfg((heads as u32, 1), (n_rot / 2) as u32, 0), x, stride as i32, per as i32, n_rot as i32, step, base);
         Ok(())
     }
 
@@ -207,8 +222,8 @@ impl Gpu {
         Ok(())
     }
 
-    pub fn ssm_gates(&self, beta: u64, g: u64, dt_bias: u64, a: u64, n: usize) -> anyhow::Result<()> {
-        launch!(self, "ssm_gates", Self::grid(n), beta, g, dt_bias, a, n as i32);
+    pub fn ssm_gates(&self, beta: u64, g: u64, dt_bias: u64, a: u64, n: usize, nv: usize) -> anyhow::Result<()> {
+        launch!(self, "ssm_gates", Self::grid(n), beta, g, dt_bias, a, n as i32, nv as i32);
         Ok(())
     }
 
@@ -217,10 +232,31 @@ impl Gpu {
         Ok(())
     }
 
-    pub fn deltanet_step(&self, y: u64, s: u64, beta: u64, g: u64, o: u64, nk: usize, nv: usize, dk: usize, dv: usize, scale: f32) -> anyhow::Result<()> {
-        anyhow::ensure!(dk % 32 == 0 && dk <= 256, "deltanet_step: head dim {dk} unsupported");
-        launch!(self, "deltanet_step", cfg((nv as u32, dv.div_ceil(8) as u32), 256, 0),
-            y, s, beta, g, o, nk as i32, dk as i32, dv as i32, scale);
+    /// Scan `t` tokens (rows of y `ych` floats apart) through the DeltaNet state `s`.
+    pub fn deltanet(&self, y: u64, s: u64, beta: u64, g: u64, o: u64, nk: usize, nv: usize, dk: usize, dv: usize, scale: f32, t: usize, ych: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(dk % 32 == 0 && dk <= 256, "deltanet: head dim {dk} unsupported");
+        launch!(self, "deltanet_seq", cfg((nv as u32, dv.div_ceil(8) as u32), 256, 0),
+            y, s, beta, g, o, nk as i32, nv as i32, dk as i32, dv as i32, scale, t as i32, ych as i32);
+        Ok(())
+    }
+
+    /// Causal conv + SiLU over `t` tokens of `ch` channels, then roll the conv state forward.
+    pub fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize) -> anyhow::Result<()> {
+        launch!(self, "conv_seq", Self::grid(t * ch), qkv, state, w, y, ch as i32, kw as i32, t as i32);
+        launch!(self, "conv_state", Self::grid(ch), qkv, state, ch as i32, kw as i32, t as i32);
+        Ok(())
+    }
+
+    pub fn attn_prefill(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
+        if !matches!(hd, 64 | 128 | 256) { bail!("attention prefill: head_dim {hd} unsupported (64, 128 or 256)"); }
+        let smem = (2 * ((64 + 32) * (hd + 8) + hd * 40)) as u32;
+        launch!(self, &format!("attn_prefill_{hd}"), cfg((t.div_ceil(64) as u32, nh as u32), 128, smem),
+            q, kc, vc, qg, out, step, t as i32, nh as i32, nkv as i32, scale);
+        Ok(())
+    }
+
+    pub fn moe_combine_seq(&self, x: u64, ye: u64, wts: u64, inv: u64, k: usize, sh: u64, sg: u64, n: usize, t: usize) -> anyhow::Result<()> {
+        launch!(self, "moe_combine_seq", Self::grid(n * t), x, ye, wts, inv, k as i32, sh, sg, n as i32, t as i32);
         Ok(())
     }
 
@@ -229,8 +265,9 @@ impl Gpu {
         Ok(())
     }
 
-    pub fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, step: u64) -> anyhow::Result<()> {
-        launch!(self, "kv_store", Self::grid(n), k, v, kc, vc, n as i32, step);
+    /// Store `t` tokens of `n` values at positions step[0] ...
+    pub fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64) -> anyhow::Result<()> {
+        launch!(self, "kv_store", Self::grid(n * t), k, v, kc, vc, n as i32, (n * t) as i32, step);
         Ok(())
     }
 
@@ -241,8 +278,9 @@ impl Gpu {
         Ok(())
     }
 
-    pub fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64) -> anyhow::Result<()> {
-        launch!(self, "router_topk", cfg((1, 1), 32, 0), p, n as i32, k as i32, extra_scale, ids, wts);
+    /// Route `t` tokens (logit rows of n, ids / wts rows of k).
+    pub fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()> {
+        launch!(self, "router_topk", cfg((t as u32, 1), 32, 0), p, n as i32, k as i32, extra_scale, ids, wts);
         Ok(())
     }
 
