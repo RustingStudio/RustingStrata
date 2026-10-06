@@ -1,5 +1,6 @@
 # M1 parity gate: llama.cpp greedy continuations, teacher-forced through `strata score`.
-# Usage: python -I tools/parity.py <model.gguf> [--n 32] [--limit 20] [--port 8199]
+# Usage: python -I tools/parity.py <model.gguf> [--n 32] [--limit 20] [--port 8199] [--bin target/release/strata]
+#        [--extra "--gpu"] [--tag gpu]  (result goes to target/parity-result[-tag].json)
 # Phase 1 needs llama-server running on --port (e.g. ~/llama.cpp/build/bin/llama-server -m M --port 8199);
 # its outputs are cached in target/parity-ref.json so phase 2 can run without it.
 import argparse, json, pathlib, subprocess, sys, urllib.request
@@ -7,6 +8,8 @@ import argparse, json, pathlib, subprocess, sys, urllib.request
 ap = argparse.ArgumentParser()
 ap.add_argument("model"); ap.add_argument("--n", type=int, default=32)
 ap.add_argument("--limit", type=int, default=20); ap.add_argument("--port", type=int, default=8199)
+ap.add_argument("--bin", default="target/release/strata"); ap.add_argument("--extra", default="")
+ap.add_argument("--tag", default="")
 a = ap.parse_args()
 root = pathlib.Path(__file__).resolve().parent.parent
 cache = root / "target/parity-ref.json"
@@ -32,7 +35,7 @@ agree = total = 0
 rows = []
 for p in prompts:
     ids, cont = ref[p]["ids"], ref[p]["cont"][: a.n]
-    out = subprocess.run([str(root / "target/release/strata"), "score", "--model", a.model, "--input", "-"],
+    out = subprocess.run([str(root / a.bin), "score", "--model", a.model, "--input", "-", *a.extra.split()],
                          input=json.dumps({"prompt": ids, "continuation": cont}), capture_output=True, text=True, check=True)
     res = json.loads(out.stdout)
     mine = res["argmax"]
@@ -46,5 +49,5 @@ for p in prompts:
     print(rows[-1], flush=True)
 pct = 100 * agree / total
 print(f"TOP1 AGREEMENT {agree}/{total} = {pct:.2f}%")
-json.dump({"rows": rows, "agree": agree, "total": total}, open(root / "target/parity-result.json", "w"), indent=1)
+json.dump({"rows": rows, "agree": agree, "total": total}, open(root / f"target/parity-result{'-' + a.tag if a.tag else ''}.json", "w"), indent=1)
 sys.exit(0 if agree >= 0.99 * total else 1)

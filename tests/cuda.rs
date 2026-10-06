@@ -61,16 +61,17 @@ fn moe_gemv_selects_experts() {
     let t = w.get("blk.0.ffn_gate_exps.weight").unwrap();
     let n_expert = g.tensors["blk.0.ffn_gate_exps.weight"].dims[2] as usize;
     let dt = gpu.upload(&t).unwrap();
-    let ids = [3i32, 200];
+    let ids = [3i32, -1, 200];
     let x = xs(t.cols);
     let (di, dx) = (gpu.stream.clone_htod(&ids).unwrap(), gpu.stream.clone_htod(&x).unwrap());
     let rows = t.rows / n_expert;
-    let dy = gpu.zeros::<f32>(2 * rows).unwrap();
-    gpu.moe_gemv(&dt, n_expert, gpu.ptr(&di), 2, gpu.ptr(&dx), 0, gpu.ptr(&dy)).unwrap();
+    let dy = gpu.zeros::<f32>(3 * rows).unwrap();
+    gpu.moe_gemv(t.ty, rows, t.cols, dt.ptr, dt.bytes() / n_expert, gpu.ptr(&di), 3, gpu.ptr(&dx), 0, gpu.ptr(&dy)).unwrap();
     let got = gpu.stream.clone_dtoh(&dy).unwrap();
     for (k, &e) in ids.iter().enumerate() {
         let mut want = vec![0f32; rows];
-        t.expert(e as usize, n_expert).matvec(&x, &mut want);
+        if e >= 0 { t.expert(e as usize, n_expert).matvec(&x, &mut want); }
+        else { assert!(got[k * rows..(k + 1) * rows].iter().all(|&v| v == 0.0), "skipped slot written"); continue; }
         let err = rel_l2(&got[k * rows..(k + 1) * rows], &want);
         assert!(err <= 1e-5, "expert {e}: rel err {err}");
     }

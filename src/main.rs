@@ -1,6 +1,7 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use anyhow::Context;
 use rusting_strata::model::{Model, State};
+use rusting_strata::{cuda::Gpu, gpu_model::GpuModel};
 use rusting_strata::{config::ModelConfig, gguf::Gguf, ops, quant::GgmlType, tokenizer::Tokenizer};
 use std::io::{Read, Write};
 use std::{collections::BTreeMap, path::PathBuf, time::Instant};
@@ -10,6 +11,45 @@ use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Args)]
+struct Engine {
+    /// Run on the GPU (static expert placement) instead of the CPU reference.
+    #[arg(long)]
+    gpu: bool,
+    /// GPU context length (KV cache size) in tokens.
+    #[arg(long, default_value_t = 4096)]
+    ctx: usize,
+    /// VRAM left free after placing expert layers, in MB.
+    #[arg(long, default_value_t = 512)]
+    vram_margin: usize,
+}
+
+enum Runner<'a> { Cpu(&'a Model<'a>, State), Gpu(Box<GpuModel<'a>>) }
+
+impl Runner<'_> {
+    fn step(&mut self, t: u32) -> anyhow::Result<Vec<f32>> {
+        match self { Runner::Cpu(m, st) => Ok(m.step(st, t)), Runner::Gpu(g) => g.step(t) }
+    }
+    /// Seconds spent waiting on CPU experts so far (GPU only).
+    fn cpu_secs(&self) -> f64 { if let Runner::Gpu(g) = self { g.cpu_time.as_secs_f64() } else { 0.0 } }
+    fn finish(&self) -> anyhow::Result<()> {
+        if let Runner::Gpu(g) = self {
+            let n = (g.hits + g.misses).max(1);
+            eprintln!("expert hit rate {:.1}% ({} misses), cache swaps {}", 100.0 * g.hits as f64 / n as f64, g.misses,
+                g.cache.as_ref().map_or(0, |c| c.swaps));
+            if let Some(c) = &g.cache { c.save_profile()?; }
+        }
+        Ok(())
+    }
+}
+
+impl Engine {
+    fn runner<'a>(&self, m: &'a Model<'a>) -> anyhow::Result<Runner<'a>> {
+        if !self.gpu { return Ok(Runner::Cpu(m, State::new(&m.cfg))); }
+        Ok(Runner::Gpu(Box::new(GpuModel::load(m, Gpu::new()?, self.ctx, self.vram_margin << 20)?)))
+    }
 }
 
 #[derive(Subcommand)]
@@ -26,8 +66,10 @@ enum Cmd {
         model: PathBuf,
         #[arg(long)]
         input: String,
+        #[command(flatten)]
+        engine: Engine,
     },
-    /// Greedy generation with the CPU reference forward.
+    /// Greedy generation.
     Generate {
         #[arg(long)]
         model: PathBuf,
@@ -35,6 +77,8 @@ enum Cmd {
         prompt: String,
         #[arg(short, default_value_t = 32)]
         n: usize,
+        #[command(flatten)]
+        engine: Engine,
     },
 }
 
@@ -50,7 +94,7 @@ fn main() -> anyhow::Result<()> {
             }
             for (ty, n) in hist { println!("{n:5} {ty}"); }
         }
-        Cmd::Score { model, input } => {
+        Cmd::Score { model, input, engine } => {
             let text = if input == "-" {
                 let mut s = String::new();
                 std::io::stdin().read_to_string(&mut s)?;
@@ -67,30 +111,32 @@ fn main() -> anyhow::Result<()> {
             anyhow::ensure!(!prompt.is_empty() && !cont.is_empty(), "empty prompt or continuation");
             let g = Gguf::open(&model)?;
             let m = Model::load(&g)?;
-            let mut st = State::new(&m.cfg);
+            let mut r = engine.runner(&m)?;
             let feed: Vec<u32> = prompt.iter().chain(&cont[..cont.len() - 1]).copied().collect();
             let (mut argmax, mut top5) = (Vec::new(), Vec::new());
             for (i, &t) in feed.iter().enumerate() {
-                let logits = m.step(&mut st, t);
+                let logits = r.step(t)?;
                 if i + 1 < prompt.len() { continue; }
                 let lse = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                 let lse = lse + logits.iter().map(|x| (x - lse).exp()).sum::<f32>().ln();
                 argmax.push(ops::argmax(&logits));
                 top5.push(ops::top_k(&logits, 5).into_iter().map(|j| (j, logits[j] - lse)).collect::<Vec<_>>());
             }
+            r.finish()?;
             println!("{}", serde_json::json!({"argmax": argmax, "top5": top5}));
         }
-        Cmd::Generate { model, prompt, n } => {
+        Cmd::Generate { model, prompt, n, engine } => {
             let g = Gguf::open(&model)?;
             let m = Model::load(&g)?;
             let tok = Tokenizer::from_gguf(&g)?;
             let eos = tok.eos_ids();
-            let mut st = State::new(&m.cfg);
+            let mut r = engine.runner(&m)?;
             let ids = tok.encode(&prompt)?;
             let t0 = Instant::now();
             let mut logits = Vec::new();
-            for &t in &ids { logits = m.step(&mut st, t); }
+            for &t in &ids { logits = r.step(t)?; }
             let t1 = Instant::now();
+            let cpu0 = r.cpu_secs();
             let mut out = Vec::new();
             let mut printed = 0;
             for _ in 0..n {
@@ -103,10 +149,12 @@ fn main() -> anyhow::Result<()> {
                     std::io::stdout().flush()?;
                     printed = s.len();
                 }
-                logits = m.step(&mut st, next);
+                logits = r.step(next)?;
             }
             let (pp, tg) = ((t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
             eprintln!("\nprompt {} tok {:.2} tok/s | gen {} tok {:.2} tok/s", ids.len(), ids.len() as f64 / pp, out.len(), out.len() as f64 / tg);
+            if engine.gpu { eprintln!("CPU expert compute, share of gen time: {:.1}%", 100.0 * (r.cpu_secs() - cpu0) / tg); }
+            r.finish()?;
         }
     }
     Ok(())
