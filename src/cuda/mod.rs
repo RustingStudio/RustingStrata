@@ -14,11 +14,14 @@ const QTYPES: [GgmlType; 11] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ2XS, IQ3XXS, IQ4XS]
 };
-const KERNELS: [&str; 21] = [
+const KERNELS: [&str; 22] = [
     "rms_norm", "l2_norm", "rope_neox", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
-    "kv_store", "attn_decode", "router_topk", "moe_combine", "map_hits", "moe_publish", "conv_seq", "conv_state",
+    "kv_store", "attn_decode", "attn_merge", "router_topk", "moe_combine", "map_hits", "moe_publish", "conv_seq", "conv_state",
     "moe_combine_seq", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256",
 ];
+
+/// Blocks per head in decode attention (positions split across them).
+pub const ATT_SPLITS: usize = 16;
 
 /// Positions per GEMM tile (GEMM_BM in kernels.cu).
 pub const GEMM_BM: usize = 128;
@@ -271,10 +274,13 @@ impl Gpu {
         Ok(())
     }
 
-    pub fn attn_decode(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
+    /// Decode attention over positions 0 ..= step[0], split across ATT_SPLITS blocks per head; `part` holds
+    /// `nh * ATT_SPLITS * (hd + 2)` floats.
+    pub fn attn_decode(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
         if hd % 32 != 0 || hd > 512 { bail!("attention head_dim {hd} unsupported (multiple of 32, at most 512)"); }
-        launch!(self, "attn_decode", cfg((nh as u32, 1), 256, (8 * hd * 4) as u32),
-            q, kc, vc, qg, out, step, nh as i32, nkv as i32, hd as i32, scale);
+        launch!(self, "attn_decode", cfg((nh as u32, ATT_SPLITS as u32), 256, (8 * hd * 4) as u32),
+            q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale);
+        launch!(self, "attn_merge", cfg((nh as u32, 1), 256, 0), part, qg, out, hd as i32, ATT_SPLITS as i32);
         Ok(())
     }
 
