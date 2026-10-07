@@ -41,6 +41,13 @@ impl State {
     }
 }
 
+/// MTP draft state: the KV cache of the nextn block.
+pub struct Mtp { pub kv: LayerState, pub pos: usize }
+
+impl Default for Mtp {
+    fn default() -> Mtp { Mtp { kv: LayerState::Attn { k: Vec::new(), v: Vec::new() }, pos: 0 } }
+}
+
 fn mv(t: &Tensor, x: &[f32]) -> Vec<f32> {
     let mut y = vec![0f32; t.rows];
     t.matvec(x, &mut y);
@@ -69,25 +76,51 @@ impl<'a> Model<'a> {
     }
 
     /// Run one token; returns logits over the vocabulary.
-    pub fn step(&self, st: &mut State, token: u32) -> Vec<f32> {
-        let c = &self.cfg;
+    pub fn step(&self, st: &mut State, token: u32) -> Vec<f32> { self.step_h(st, token).0 }
+
+    /// Run one token; returns logits and the last hidden state (before output_norm).
+    pub fn step_h(&self, st: &mut State, token: u32) -> (Vec<f32>, Vec<f32>) {
         let mut x = self.embed(token);
-        let mut h = vec![0f32; c.n_embd];
-        for il in 0..c.n_layer {
-            ops::rms_norm(&x, &self.f(il, "attn_norm.weight"), c.eps, &mut h);
-            let mix = match &mut st.layers[il] {
-                LayerState::Recurrent { conv, s } => self.deltanet(il, &h, conv, s),
-                LayerState::Attn { k, v } => self.attention(il, &h, k, v, st.pos),
-            };
-            for (a, b) in x.iter_mut().zip(&mix) { *a += b; }
-            ops::rms_norm(&x, &self.f(il, "post_attention_norm.weight"), c.eps, &mut h);
-            let ffn = if c.is_moe() { self.moe(il, &h) } else { self.dense_ffn(il, &h) };
-            for (a, b) in x.iter_mut().zip(&ffn) { *a += b; }
-        }
+        for il in 0..self.cfg.n_layer { self.block(il, &mut x, &mut st.layers[il], st.pos); }
         st.pos += 1;
-        ops::rms_norm(&x, &self.w.get("output_norm.weight").unwrap().to_f32(), c.eps, &mut h);
+        (self.head(&x, &self.w.get("output_norm.weight").unwrap().to_f32()), x)
+    }
+
+    /// One decoder block (mixer and FFN, each with residual) on x at position `pos`.
+    fn block(&self, il: usize, x: &mut [f32], ls: &mut LayerState, pos: usize) {
+        let c = &self.cfg;
+        let mut h = vec![0f32; c.n_embd];
+        ops::rms_norm(x, &self.f(il, "attn_norm.weight"), c.eps, &mut h);
+        let mix = match ls {
+            LayerState::Recurrent { conv, s } => self.deltanet(il, &h, conv, s),
+            LayerState::Attn { k, v } => self.attention(il, &h, k, v, pos),
+        };
+        for (a, b) in x.iter_mut().zip(&mix) { *a += b; }
+        ops::rms_norm(x, &self.f(il, "post_attention_norm.weight"), c.eps, &mut h);
+        let ffn = if c.is_moe() { self.moe(il, &h) } else { self.dense_ffn(il, &h) };
+        for (a, b) in x.iter_mut().zip(&ffn) { *a += b; }
+    }
+
+    /// Logits of the output head on rms_norm(x) with weights `norm`.
+    fn head(&self, x: &[f32], norm: &[f32]) -> Vec<f32> {
+        let mut h = vec![0f32; self.cfg.n_embd];
+        ops::rms_norm(x, norm, self.cfg.eps, &mut h);
         let head = self.w.get("output.weight").or_else(|_| self.w.get("token_embd.weight")).unwrap();
         mv(&head, &h)
+    }
+
+    /// MTP draft (`nextn` block, stored as layer n_layer): logits for the token after `token`, from `hid`, the main
+    /// model's last hidden state at the position that predicted `token`. Input is eh_proj [enorm(embed), hnorm(hid)].
+    pub fn mtp_step(&self, ms: &mut Mtp, hid: &[f32], token: u32) -> (Vec<f32>, Vec<f32>) {
+        let (c, il) = (&self.cfg, self.cfg.n_layer);
+        let n = c.n_embd;
+        let mut eh = vec![0f32; 2 * n];
+        ops::rms_norm(&self.embed(token), &self.f(il, "nextn.enorm.weight"), c.eps, &mut eh[..n]);
+        ops::rms_norm(hid, &self.f(il, "nextn.hnorm.weight"), c.eps, &mut eh[n..]);
+        let mut x = mv(&self.t(il, "nextn.eh_proj.weight"), &eh);
+        self.block(il, &mut x, &mut ms.kv, ms.pos);
+        ms.pos += 1;
+        (self.head(&x, &self.f(il, "nextn.shared_head_norm.weight")), x)
     }
 
     fn deltanet(&self, il: usize, h: &[f32], conv: &mut [f32], s: &mut [f32]) -> Vec<f32> {
