@@ -5,8 +5,8 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 ## State
 
 - Milestone: M2 done. M3 expert cache partly in (commit 90db54a). M4 first half (chunked GPU prefill) committed.
-- Speed at 4K (3 clean runs): prefill **1581 tok/s** (1538-1610; gate 1017, passed), decode **78.6 tok/s** (gate 67, passed).
-  Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 86 tok/s. 32K (31768-token prompt): prefill ~1290 tok/s, decode ~55 (llama.cpp -d 32768: pp512 814, tg128 56.4).
+- Speed at 4K (3 clean runs): prefill **1581 tok/s** (1538-1610; gate 1017, passed), prefill 1608 at 2dcae33, decode **80.5 tok/s** (gate 67, passed).
+  Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 86 tok/s. 32K (31768-token prompt): prefill ~1290 tok/s, decode best 62.5, noisy (llama.cpp -d 32768: pp512 814, tg128 56.4).
   See `docs/m4-results.md`.
 - Parity (20 prompts x 32, GPU, 3 runs): prefill 628/630/629 = mean 98.28% +- 0.16; token-by-token prompt
   (`--chunk 0`) 631/627/631 = mean 98.39% +- 0.36. Gate 99%. Decode is not deterministic run to run (adaptive
@@ -158,17 +158,36 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   Decode 76/76/48 (4K) and 61-74 short: CPU load (the short set had a 16 tok/s run); not attributable to this change,
   whose decode kernel got faster. Needs the quiet re-measure (candidate 1).
 
+### 2026-10-07 #12 — decode attention shares K/V across a GQA group (2dcae33)
+- GPU idle apart from short RustingEngine test runs; CPU loaded (load average 4-12, swap 14 GB).
+- Profile (b57b791, 32K): attn_decode 0.59 ms x 10 layers per token; each of the 16 query heads re-read the K/V of
+  its KV head (8 heads per KV head).
+- Change: one block per (KV head, split) computes all G query heads of that KV head; next K/V row prefetched;
+  per-head merge in the block. ATT_SPLITS 16 -> 64 to keep the grid full; attn_merge keeps split weights in shared
+  memory. Wrapper picks G from 8/4/2/1 with G*hd <= 2048.
+- Test: `attn_prefill_matches_decode` now loops (nh,nkv,hd) over (4,2,64), (4,2,128), (4,2,256), (16,2,256),
+  (8,8,128); rel err 6.1e-5 to 7.4e-5. Full cuda suite passes.
+- Files: `src/cuda/kernels.cu`, `src/cuda/mod.rs`, `tests/cuda.rs`.
+- After (nsys): attn_decode 32K 590 -> 314 us, 4K 88 -> 93 us (+3 us merge). 4K (3 clean): prefill 1561/1631/1633,
+  decode **79.8/80.7/80.9** (mean 80.5, was 78.6). 32K: decode 62.5 in the one undisturbed run (llama.cpp 56.4);
+  the other two (20, 12) ran under host load. Short decode 14-70, load noise; nsys shows attention is 0.6 ms of
+  19 ms GPU time per token there, and moe_combine 5.8 ms/token (it waits on CPU experts, 35% of gen time).
+- Parity 627/629/630 (98.23%), in band.
+
 ## Tried and rejected
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
   f32: 445/448 on prompts 0-13). Worse. Redo only with llama.cpp's exact dot-product kernels.
+- #12: first GQA version without prefetch and with merge weights in global memory: 32K 410 us, 4K 101 + 13 us.
+  Replaced by the committed version.
 - #8: nothing rejected. Not tried: choosing the split count from n_pos (needs a fixed grid for graph capture;
   could use a max grid and let extra blocks exit, which is what empty splits already do).
 
 ## Next candidates
 
-1. Quiet re-measure of 4K / short / 32K decode (machine loaded during #10 and #11). Cheap, do first when idle.
-2. 32K prefill (nsys, b57b791): attn_prefill_256 5.4 s, gemm_q5_k 4.9, gemm_iq2_xs 4.4, deltanet_seq 2.5,
+1. Quiet re-measure of 4K / short / 32K decode (machine loaded during #10 to #12). Cheap, do first when idle.
+2. Short decode: moe_combine 5.8 ms/token under load (1.1 ms when quiet); it spins on CPU expert results. Check
+   whether the wait sits in the kernel and whether CPU expert threads compete with the loaded host.
+3. 32K prefill (nsys, b57b791): attn_prefill_256 5.4 s, gemm_q5_k 4.9, gemm_iq2_xs 4.4, deltanet_seq 2.5,
    gemm_q6_k 2.0, gemm_iq3_xxs 2.0. GEMMs: cp.async double buffering / int8 MMQ. Attention: cp.async prefetch.
-3. 32K decode: attn_decode 0.59 ms x 10 = 5.9 ms/token; share K/V loads across the 8 query heads of a GQA group.
 4. Parity: score the 6 long prompts with the CPU f32 reference (~15 min CPU) to confirm their misses are shared.
