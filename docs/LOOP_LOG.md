@@ -4,7 +4,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 ## State
 
-- Milestone: M2 done. M3 expert cache partly in (commit 90db54a). M4 first half (chunked GPU prefill) committed. M5 started: MTP draft head in the CPU reference (6379338).
+- Milestone: M2 done. M3 expert cache partly in (commit 90db54a). M4 first half (chunked GPU prefill) committed. M5 started: MTP draft head in the CPU reference (6379338) and on the GPU (be8f72b, `GpuModel::mtp_draft`, not used by `generate` yet).
 - Speed at 4K (3 clean runs): prefill **1581 tok/s** (1538-1610; gate 1017, passed), prefill 1608 at 2dcae33, decode **81.0 tok/s** at a02b4ec (76.8-81.8; gate 67, passed).
   Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 88.1 tok/s at a02b4ec (88.06-88.22, 100% expert hits). 32K (31768-token prompt): prefill ~1290 tok/s, decode best 62.5, noisy (llama.cpp -d 32768: pp512 814, tg128 56.4).
   See `docs/m4-results.md`.
@@ -273,6 +273,22 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - Other tests: `greedy_continuation_is_sane` (Paris), `tests/gpu_model.rs` 2/2 pass.
 - Speed and parity unchanged (CPU reference only; GPU path untouched).
 
+### 2026-10-07 #20 — M5 step 1: MTP draft head on the GPU decode path (be8f72b)
+- GPU idle at start (gnome-clocks only); host load 6-13 (other loop's rustc).
+- Change: `GpuModel::load(.., mtp: bool)`. With it, blk.40 loads as an attention layer with its own KV cache and its
+  own `CpuWorker` (mailbox for layer 40 only); its Q2_K routed experts join the expert cache (`ExpertCache::new` takes
+  the layer count; a 40-layer profile is padded, a 41-layer one truncated). `mtp_draft(token)` runs enorm/hnorm,
+  eh_proj, the block and shared_head_norm + output head on the last step's hidden state, and records routing for
+  layer 40. The per-layer body of `forward()` moved into `layer()` (same kernel sequence). `main.rs` passes false.
+- Test `mtp_draft_matches_reference`: CPU `mtp_step` gets the GPU hidden state (`GpuModel::hidden`), so it checks the
+  head alone. 9/9 positions same draft token, max |dlogit| 0.16-0.24 (range 24-39). A first version fed the CPU its own
+  hidden state: main-model drift (up to 0.83) flipped a 0.26 top-2 gap at position 3.
+- GPU tests now hold `common::gpu_lock()`: with three GPU tests, parallel test threads loaded two models and the
+  second load failed (out of VRAM). Full suite passes.
+- Speed, MTP off (interleaved short decode, load 7-9, not clean): HEAD a02b4ec 61.9 / 68.5 / 74.9, this 70.6 / 73.6 /
+  75.2 tok/s. No regression. Parity not re-run: the main path issues the same kernels; `gpu_forward_matches_cpu_reference` passes.
+- Draft cost not measured yet (not graph-captured; one extra worker spin thread per draft).
+
 ## Tried and rejected
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
@@ -294,9 +310,9 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 ## Next candidates
 
-1. M5 on GPU, step 1: MTP draft step on the decode path (layer 40 attention with its own KV cache, its Q2_K experts in
-   the expert cache or CPU worker, eh_proj q8_0). Test: GPU draft logits vs `Model::mtp_step`. Step 2: verify 2 tokens
-   per forward (the 4K prefill path handles batches; needs DeltaNet/conv state snapshot per position for rollback).
-   With ~96% acceptance at k = 1, expect up to ~1.9 tokens per verify.
+1. M5 step 2: verify draft + next token in one 2-token forward (batched path), accept or roll back. Needs a DeltaNet
+   conv/state snapshot before the verify (state ~ 30 layers x (conv + 128 KB x 32 heads)), KV truncates by position.
+   Measure the draft cost first (expected: one attention layer + 8 Q2_K experts + 248K x 2048 head GEMV, ~1/10 of a
+   token). With 24/25 acceptance, up to ~1.8x decode if a 2-token verify costs close to one token.
 2. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs and q5_k.
 3. Decode GEMVs: quantize x once per token into global memory (<= 4% of GEMV time, see #17).
