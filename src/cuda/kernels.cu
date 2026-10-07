@@ -383,6 +383,7 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
     int n0 = blockIdx.x * 64, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     int wm = (warp >> 1) * 32, wn = (warp & 1) * 32;
     const float* xr[BM * BK / 4 / NT];  // row pointers of the X elements this thread loads (null past cnt)
+    #pragma unroll
     for (int q = 0; q < BM * BK / 4 / NT; q++) {
         int r = (tid + q * NT) / (BK / 4);
         xr[q] = r < tl.cnt ? x + (size_t)(xrow ? xrow[tl.m0 + r] : tl.m0 + r) * x_stride : nullptr;
@@ -390,12 +391,14 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
     float acc[2][4][4] = {};
     for (int kb = 0; kb < nsb * (256 / BK); kb++) {
         int sb = kb / (256 / BK), part = kb % (256 / BK);
+        #pragma unroll
         for (int i = tid; i < 64 * SUBS; i += NT) {
             int r = i / SUBS, j = i % SUBS;
             float v[8] = {};
             if (n0 + r < rows) deq8<T>(tl.w + ((size_t)(n0 + r) * nsb + sb) * SBB, part * SUBS + j, v);
             *(uint4*)(ws + r * P + j * 8) = make_uint4(h2pack(v[0], v[1]), h2pack(v[2], v[3]), h2pack(v[4], v[5]), h2pack(v[6], v[7]));
         }
+        #pragma unroll
         for (int q = 0; q < BM * BK / 4 / NT; q++) {
             int i = tid + q * NT, r = i / (BK / 4), c = (i % (BK / 4)) * 4;
             float4 v = xr[q] ? *(const float4*)(xr[q] + kb * BK + c) : make_float4(0.f, 0.f, 0.f, 0.f);
@@ -405,25 +408,33 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
 #pragma unroll
         for (int kk = 0; kk < BK; kk += 16) {
             u32 a[2][4], b[4][2];
+            #pragma unroll
             for (int mt = 0; mt < 2; mt++) {
                 const u16* p = xs + (wm + mt * 16 + g) * P + kk + 2 * t;
                 a[mt][0] = ld_s32(p); a[mt][1] = ld_s32(p + 8 * P); a[mt][2] = ld_s32(p + 8); a[mt][3] = ld_s32(p + 8 * P + 8);
             }
+            #pragma unroll
             for (int nt = 0; nt < 4; nt++) {
                 const u16* p = ws + (wn + nt * 8 + g) * P + kk + 2 * t;
                 b[nt][0] = ld_s32(p); b[nt][1] = ld_s32(p + 8);
             }
+            #pragma unroll
             for (int mt = 0; mt < 2; mt++)
+                #pragma unroll
                 for (int nt = 0; nt < 4; nt++) mma16816(acc[mt][nt], a[mt][0], a[mt][1], a[mt][2], a[mt][3], b[nt][0], b[nt][1]);
         }
         __syncthreads();
     }
+    #pragma unroll
     for (int mt = 0; mt < 2; mt++)
+        #pragma unroll
         for (int nt = 0; nt < 4; nt++)
+            #pragma unroll
             for (int h = 0; h < 2; h++) {
                 int r = wm + mt * 16 + g + 8 * h, n = n0 + wn + nt * 8 + 2 * t;
                 if (r >= tl.cnt) continue;
                 float* yr = y + (size_t)(tl.m0 + r) * y_stride;
+                #pragma unroll
                 for (int e = 0; e < 2; e++) {
                     if (n + e >= rows) break;
                     float v = acc[mt][nt][2 * h + e];
@@ -541,19 +552,23 @@ extern "C" __global__ void deltanet_seq(const float* y, float* S, const float* b
     if (j >= dv) return;
     float* row = S + ((size_t)vh * dv + j) * dk;
     float r[MAXK];
-    for (int t = 0; t < per; t++) r[t] = row[lane + 32 * t];
+#pragma unroll
+    for (int t = 0; t < MAXK; t++) if (t < per) r[t] = row[lane + 32 * t];
     for (int tok = 0; tok < T; tok++) {
         const float* yt = y + (size_t)tok * ych;
         const float* q = yt + kh * dk;
         const float* k = yt + nk * dk + kh * dk;
         float decay = expf(g[tok * nv + vh]), kk[MAXK], sk = 0.0f;
-        for (int t = 0; t < per; t++) { int i = lane + 32 * t; r[t] *= decay; kk[t] = k[i]; sk += r[t] * kk[t]; }
+#pragma unroll
+        for (int t = 0; t < MAXK; t++) if (t < per) { int i = lane + 32 * t; r[t] *= decay; kk[t] = k[i]; sk += r[t] * kk[t]; }
         float d = beta[tok * nv + vh] * (yt[2 * nk * dk + vh * dv + j] - warp_sum(sk)), oq = 0.0f;
-        for (int t = 0; t < per; t++) { r[t] += d * kk[t]; oq += r[t] * q[lane + 32 * t]; }
+#pragma unroll
+        for (int t = 0; t < MAXK; t++) if (t < per) { r[t] += d * kk[t]; oq += r[t] * q[lane + 32 * t]; }
         oq = warp_sum(oq);
         if (lane == 0) o[(size_t)tok * nv * dv + vh * dv + j] = oq * scale;
     }
-    for (int t = 0; t < per; t++) row[lane + 32 * t] = r[t];
+#pragma unroll
+    for (int t = 0; t < MAXK; t++) if (t < per) row[lane + 32 * t] = r[t];
 }
 
 // grid = heads: out = rmsnorm(o_h) * w * silu(z_h), in place on o.
