@@ -237,8 +237,9 @@ impl Gpu {
 
     /// Scan `t` tokens (rows of y `ych` floats apart) through the DeltaNet state `s`.
     pub fn deltanet(&self, y: u64, s: u64, beta: u64, g: u64, o: u64, nk: usize, nv: usize, dk: usize, dv: usize, scale: f32, t: usize, ych: usize) -> anyhow::Result<()> {
-        anyhow::ensure!(dk % 32 == 0 && dk <= 256, "deltanet: head dim {dk} unsupported");
-        launch!(self, "deltanet_seq", cfg((nv as u32, dv.div_ceil(8) as u32), 256, 0),
+        let rows = 512 / dk.max(1);  // state rows per warp
+        anyhow::ensure!(matches!(dk, 32 | 64 | 128 | 256) && dv % rows == 0, "deltanet: head dims {dk}/{dv} unsupported");
+        launch!(self, "deltanet_seq", cfg((nv as u32, dv.div_ceil(8 * rows) as u32), 256, 0),
             y, s, beta, g, o, nk as i32, nv as i32, dk as i32, dv as i32, scale, t as i32, ych as i32);
         Ok(())
     }
