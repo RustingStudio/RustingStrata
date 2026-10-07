@@ -81,14 +81,29 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - Correction to candidate 1 of #5: M2 found every GPU miss equals the CPU f32 reference miss (same position, same
   top-2 gap), so int8 decode error is not what separates us from llama.cpp. The 99% gap is llama.cpp's own numerics.
 
+### 2026-10-07 #7 — parity experiment: emulate llama.cpp activation quantization (rejected, no commit)
+- GPU busy (forever_bear 805 MiB). CPU-only experiment.
+- The reference came from `llama-server -ngl 99 --n-cpu-moe 20 -fa on` (plan M0/M1): llama.cpp quantizes matmul
+  activations to int8 (Q8_1, 32 per block, on CUDA; Q8_K, 256 per block, for the 20 CPU expert layers).
+- Temporary `STRATA_ACTQ=<block>` in `Tensor::matvec` (CPU reference) rounded x to int8 per block for every
+  quantized weight. 14 short prompts (index 0-13), 32 positions each, top-1 agreement with the reference:
+  f32 **445**/448 (misses: p4@0, p9@12, p13@17), block 32 443/448, block 256 439/448. Reverted.
+- GPU on the same 14 prompts: 441-446 (6 runs). The 6 long prompts: 186-187/192 every run, the same misses.
+- Reading: on short prompts GPU decode is within noise of f32; the f32 reference itself misses 3 of 448. Plain
+  activation rounding moves the model further from llama.cpp, not closer. Matching llama.cpp to 99% would need its
+  exact kernels (accumulation order, Q8 sums, per-layer CPU/GPU split), not just its rounding.
+- **Question for owner:** the f32 reference agrees 98.3-98.6% with this llama.cpp reference, and the GPU path the
+  same. Is the 99% gate meant against this llama.cpp run, or should parity use a reference with matching numerics
+  (e.g. a llama.cpp CPU-only run, or agreement with our own f32 reference)?
+
 ## Tried and rejected
 
-(none yet)
+- #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
+  f32: 445/448 on prompts 0-13). Worse. Redo only with llama.cpp's exact dot-product kernels.
 
 ## Next candidates
 
-1. Parity 98.1-98.4% vs 99%: misses are shared with the f32 CPU reference, so match llama.cpp numerics instead.
-   First find how the reference was produced (llama-server flags: CUDA MMQ with Q8_1 activations, or CPU with Q8_K),
-   then emulate that activation quantization in the CPU reference and see if misses go away (CPU-only experiment).
-2. Decode 49.6 vs 67 tok/s: nsys profile of one decode step (not done since M3). Needs idle GPU.
-3. deltanet_seq 0.77 s of 4.2 s prefill (sequential scan); chunked WY form. Needs idle GPU.
+1. Decode 49.6 vs 67 tok/s: nsys profile of one decode step (not done since M3). Needs idle GPU. Largest gap left.
+2. deltanet_seq 0.77 s of 4.2 s prefill (sequential scan); chunked WY form. Needs idle GPU.
+3. Parity: score the 6 long prompts with the CPU f32 reference (~15 min CPU) to confirm their misses are shared;
+   if so, parity work waits for the owner's answer above.
