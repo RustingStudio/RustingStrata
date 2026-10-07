@@ -60,6 +60,7 @@ pub fn host_ok(host: &str, bound: &str) -> bool {
 
 /// `Authorization` header check for `--api-key`, without an early exit on the first differing byte.
 pub fn key_ok(auth: &str, key: &str) -> bool {
+    if key.is_empty() { return false; }
     let a = auth.strip_prefix("Bearer ").unwrap_or("").as_bytes();
     a.len() == key.len() && a.iter().zip(key.as_bytes()).fold(0, |x, (p, q)| x | (p ^ q)) == 0
 }

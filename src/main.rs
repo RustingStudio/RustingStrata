@@ -155,7 +155,8 @@ enum Cmd {
         model: PathBuf,
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
-        /// Require `Authorization: Bearer <key>` on every request.
+        /// Require `Authorization: Bearer <key>` on every request [default: $STRATA_API_KEY, which keeps the key out
+        /// of the process list].
         #[arg(long)]
         api_key: Option<String>,
         #[command(flatten)]
@@ -316,6 +317,8 @@ fn main() -> anyhow::Result<()> {
             r.finish()?;
         }
         Cmd::Serve { model, addr, api_key, mut engine } => {
+            let api_key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
+            anyhow::ensure!(api_key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
             let g = Gguf::open(&model)?;
             let m = Model::load(&g)?;
             let tok = Tokenizer::from_gguf(&g)?;
