@@ -14,6 +14,7 @@ Model: Qwen3.6-35B-A3B-UD-Q2_K_XL, RTX 3060 12 GB, Ryzen 5 7600X. Prompt: 3970 t
 | b57b791 DeltaNet 16 floats per lane | **1581** (1538-1610) | 48-76 (loaded) | 98.44% (629-631) |
 | 2dcae33 GQA-shared decode attention | 1608 (1561-1633) | **80.5** (79.8-80.9) | 98.23% (627-630) |
 | e087210 min 16 positions per split | 1638 best (loaded) | 77.4 (75.7-80.5, loaded) | 98.07% (625-630) |
+| b9d9547 one-head attention below 4096 | 1652 best (loaded) | **80.4** (77.5-80.8) | 98.44% (627-632) |
 
 Short-prompt decode (8-token prompt, -n 128): 85.8 tok/s at 8d0c3c4, 83.3 at 1866f5e, 86.1 at 059fd1e (5 clean runs each); 65-77 at 2dcae33 (regression), 82.7 at e087210 (loaded host).
 
