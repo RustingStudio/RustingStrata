@@ -12,15 +12,22 @@ use std::time::{Duration, Instant};
 
 /// Word offsets inside one layer's mailbox. Flags sit on separate cache lines.
 pub const REQ: usize = 0;
+/// Tokens in the request (1 for decode, up to `TMAX` for a multi-token verify).
+pub const NTOK: usize = 1;
 pub const DONE: usize = 16;
 pub const IDS: usize = 32;
 
+/// Most tokens one request may carry.
+pub const TMAX: usize = 4;
+
+/// Per layer: ids, weights and slots for up to TMAX tokens of `k` entries (token t at t * k; the three arrays are
+/// each NTOK * k long), then TMAX activations of `n` floats at `h` and TMAX results at `y`.
 pub struct Mailbox { pub k: usize, pub n: usize, pub h: usize, pub y: usize, pub stride: usize }
 
 impl Mailbox {
     pub fn new(k: usize, n: usize) -> Mailbox {
-        let h = (IDS + 3 * k).next_multiple_of(16);
-        Mailbox { k, n, h, y: h + n, stride: (h + 2 * n).next_multiple_of(16) }
+        let h = (IDS + 3 * TMAX * k).next_multiple_of(16);
+        Mailbox { k, n, h, y: h + TMAX * n, stride: (h + 2 * TMAX * n).next_multiple_of(16) }
     }
 }
 
@@ -69,14 +76,16 @@ impl CpuWorker {
                     }
                     fence(Ordering::Acquire);
                     let t0 = Instant::now();
-                    let k = lay.k;
                     let rd = |o: usize| unsafe { at(o).read_volatile() };
-                    let sel: Vec<(usize, f32)> = (0..k).filter(|&j| (rd(IDS + 2 * k + j) as i32) < 0)
-                        .map(|j| (rd(IDS + j) as usize, f32::from_bits(rd(IDS + k + j)))).collect();
-                    if !sel.is_empty() {
-                        let h = unsafe { std::slice::from_raw_parts(at(lay.h) as *const f32, lay.n) }.to_vec();
+                    let nt = (rd(NTOK) as usize).clamp(1, TMAX);
+                    let (k, kt, n) = (lay.k, lay.k * nt, lay.n);
+                    for t in 0..nt {
+                        let sel: Vec<(usize, f32)> = (t * k..(t + 1) * k).filter(|&j| (rd(IDS + 2 * kt + j) as i32) < 0)
+                            .map(|j| (rd(IDS + j) as usize, f32::from_bits(rd(IDS + kt + j)))).collect();
+                        if sel.is_empty() { continue; }
+                        let h = unsafe { std::slice::from_raw_parts(at(lay.h + t * n) as *const f32, n) }.to_vec();
                         let y = crate::cpu_moe::experts(m, il, &h, &sel);
-                        unsafe { std::ptr::copy_nonoverlapping(y.as_ptr(), at(lay.y) as *mut f32, lay.n) };
+                        unsafe { std::ptr::copy_nonoverlapping(y.as_ptr(), at(lay.y + t * n) as *mut f32, n) };
                     }
                     fence(Ordering::Release);
                     unsafe { at(DONE).write_volatile(seq) };
@@ -94,10 +103,11 @@ impl CpuWorker {
         self.seq
     }
 
-    /// Routing of layer `il` from the last finished token: (expert id, routed weight, slot or -1).
+    /// Routing of layer `il` from the last finished request, all its tokens: (expert id, routed weight, slot or -1).
     pub fn routing(&self, il: usize) -> Vec<(i32, f32, i32)> {
-        let (k, b) = (self.layout.k, il * self.layout.stride);
+        let b = il * self.layout.stride;
         let rd = |o: usize| unsafe { (self.host as *const u32).add(b + o).read_volatile() };
+        let k = self.layout.k * (rd(NTOK) as usize).clamp(1, TMAX);
         (0..k).map(|j| (rd(IDS + j) as i32, f32::from_bits(rd(IDS + k + j)), rd(IDS + 2 * k + j) as i32)).collect()
     }
 
