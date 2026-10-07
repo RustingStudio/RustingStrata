@@ -343,6 +343,22 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   The 25K HtoD copies are expert uploads at load, not decode.
 - Parity not re-run: the plain decode path is unchanged.
 
+### 2026-10-07 #24 — draft vocab subset (rejected); verify and draft head graph-captured (eb7c540)
+- Host load 7-28 (other loops); GPU shared through the lock.
+- Tried: draft head scores only the first N vocab rows (low BPE ids taken as the frequent tokens), MTP short decode
+  -n 128, 2 runs each: 248K 80.9 / 80.2 tok/s, 81.7% accepted; 65K 78.7 / 79.2, 76.7%; 32K 78.2 / 81.4, 79.2%;
+  16K 73.3 / 74.1, 67.5%. The head time saved is lost to rejected drafts. Rejected; a subset needs real token
+  frequencies (calibration), not id order.
+- Change: `verify` keeps one CUDA graph per token count, the draft head one per (hidden row, output head on).
+- Speed (MTP, interleaved, 100% hits, load 9-20): no graph 79.9 / 72.7 / 78.8 (mean 77.1), graph 81.7 / 72.4 / 83.6
+  (mean 79.2), about +3%, inside the noise. Acceptance 58/71 in all six runs.
+- Test fix: `prefill_matches_reference` failed once in the full suite (prefill error 1.3997, identical to HEAD;
+  the decode yardstick moved to 1.2455 with adaptive expert moves). It now sets `adapt_every = 0`: full suite
+  5/5 twice, prefill 1.3997 vs decode 1.4964 (thin margin).
+- Parity not re-run: plain decode numerics unchanged (same kernels, now launched from a graph for nt > 1 only).
+- MTP k = 1 (~79) is still level with plain decode (~81-85). The per-cycle fixed costs remain: draft head 1.2 ms
+  and the second draft-block pass after an accept.
+
 ## Tried and rejected
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
@@ -359,12 +375,14 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   (6100-10100 / 2580-2940); `#pragma unroll 8` (6040 / 2720); 16 values per lane with half-warps on alternate
   super-blocks (5890 / 2700); warp copies 4 super-blocks of its row into shared memory with 16-byte loads, then
   decodes (6590 / 2840). Upper bound for quantizing x once instead of per block: ~4% (x loads zeroed: 5690 / 2380).
+- #24: draft head over the first N vocab rows (65K / 32K / 16K): acceptance drops 82% -> 77-68%, no speed gain.
 - #18: dense GEMV pairs in one launch (qkv + gate, beta + alpha, k + v, shared gate + up): 80 fewer launches per
   token, short decode 88.16 vs 88.14 at 100% hits. Graph launch gaps are not a cost at this size.
 
 ## Next candidates
 
-1. Cheaper draft head: argmax over a frequent-token subset of the output matrix (head is 1.15 ms of a ~1.6 ms draft).
-   Must keep greedy output identical (only the draft changes, verify uses the full head).
-2. Graph-capture verify (nt = 2) and the draft; then k = 2-3.
+1. MTP k = 2-3: chain drafts (the draft block's own hidden state feeds the next draft), verify 3-4 tokens. Partial
+   accepts need the DeltaNet state at an inner token: restore + re-verify the accepted prefix, or keep per-token
+   states in the scan. Amortizes the fixed costs that keep k = 1 level with plain decode.
+2. Cheaper draft head: only with a measured frequent-token list (id-order subset rejected in #24).
 3. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs and q5_k.
