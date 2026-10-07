@@ -379,6 +379,19 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   `self.k` (8), so the CLI asked for 9-token verifies. Tests set `gm.k` by hand and missed it; they now assert it.
 - Parity not re-run: plain decode numerics unchanged (snapshot writes are off with k = 0).
 
+### 2026-10-07 #26 — M6: `chat` and `serve` (8263342)
+- `strata chat`: stdin turns in the model's ChatML template. Thinking is off by default (`--think` on), and the
+  whole conversation is prefilled again each turn (no prefix reuse yet).
+- `strata serve`: OpenAI-compatible, std::net only (no new crate). POST /v1/chat/completions, streamed (SSE, final
+  chunk carries usage) or not; GET /v1/models; one request at a time (later ones wait in the listen backlog).
+  Greedy only: sampling fields are ignored. `chat_template_kwargs.enable_thinking` turns thinking on.
+- `generate`, `chat` and `serve` share one decode loop. `generate --mtp` text is byte-identical to the previous
+  binary (dragon prompt, 64 tokens).
+- Live check (GPU, `--mtp`): 2-turn chat "2+2" -> "4", "And times 3?" -> "12"; non-streamed and streamed
+  completions correct; 404 and 400 paths answer JSON errors. `tests/serve.rs` covers the template and request parsing.
+- Not done from the spec: sampling (temperature / top-k / top-p), prefix reuse, `--api-key`, HTTP 500 on a failed
+  request.
+
 ## Tried and rejected
 - #25: MTP k = 2-3 chained drafts: correct, but 70.4 / 63.5 tok/s vs 87.4 for k = 1 (acceptance 62% / 48%).
 
@@ -405,4 +418,5 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 1. Cheaper draft head: only with a measured frequent-token list (id-order subset rejected in #24). Also try not
    re-running the draft head for accepted drafts (reuse its KV from the draft pass) to make k = 2 pay.
 2. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs and q5_k.
-3. M6: `serve` (OpenAI-compatible HTTP with streaming, std::net only, no new crate), `chat`, `calibrate`.
+3. M6: `calibrate` (threads, chunk, MTP k, short-prompt threshold -> `strata-<model>.json`), then the v1 gate and
+   `docs/m6-results.md`. Server follow-ups: sampling, prefix reuse.
