@@ -16,7 +16,7 @@ Model: Qwen3.6-35B-A3B-UD-Q2_K_XL, RTX 3060 12 GB, Ryzen 5 7600X. Prompt: 3970 t
 | e087210 min 16 positions per split | 1638 best (loaded) | 77.4 (75.7-80.5, loaded) | 98.07% (625-630) |
 | b9d9547 one-head attention below 4096 | 1652 best (loaded) | **80.4** (77.5-80.8) | 98.44% (627-632) |
 
-Short-prompt decode (8-token prompt, -n 128): 85.8 tok/s at 8d0c3c4, 83.3 at 1866f5e, 86.1 at 059fd1e (5 clean runs each); 65-77 at 2dcae33 (regression), 82.7 at e087210 (loaded host).
+Short-prompt decode (8-token prompt, -n 128): 85.8 tok/s at 8d0c3c4, 83.3 at 1866f5e, 86.1 at 059fd1e (5 clean runs each); 65-77 at 2dcae33 (regression), 82.7 at e087210 (loaded host), 86.4-86.9 at b9d9547 (~100% expert hits).
 
 32K (31768-token prompt, `--ctx 32768`): 09edad5 prefill 1007/1204/1190 tok/s (was 818), decode ~55. b57b791: 1288 (under nsys). 2dcae33: decode best 62.5 (others 12-20 under host load 12), attn_decode 590 -> 314 us per call.
 llama.cpp `-d 32768`: pp512 814, tg128 56.4 (marginal rate at depth, not an average).
