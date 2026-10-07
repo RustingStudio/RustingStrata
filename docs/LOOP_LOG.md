@@ -5,7 +5,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 ## State
 
 - Milestone: M2 done. M3 expert cache partly in (commit 90db54a). M4 first half (chunked GPU prefill) committed.
-- Speed at 4K (3 clean runs): prefill **1581 tok/s** (1538-1610; gate 1017, passed), prefill 1608 at 2dcae33, decode **80.5 tok/s** (gate 67, passed).
+- Speed at 4K (3 clean runs): prefill **1581 tok/s** (1538-1610; gate 1017, passed), prefill 1608 at 2dcae33, decode **81.0 tok/s** at a02b4ec (76.8-81.8; gate 67, passed).
   Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 86.7 tok/s at b9d9547 (86.4-86.9, ~100% expert hits). 32K (31768-token prompt): prefill ~1290 tok/s, decode best 62.5, noisy (llama.cpp -d 32768: pp512 814, tg128 56.4).
   See `docs/m4-results.md`.
 - Parity (20 prompts x 32, GPU, 3 runs): prefill 628/630/629 = mean 98.28% +- 0.16; token-by-token prompt
@@ -233,6 +233,21 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   worker problem.
 - No code change. A fair thread-count test needs a fixed miss set (e.g. a flag that caps GPU expert slots).
 
+### 2026-10-07 #17 — decode GEMV bandwidth; MoE gate and up in one launch (a02b4ec)
+- GPU idle at the runs; host load 7-10.
+- Measured (nsys per launch, short prompt, -n 64): dense q5_k 226-257 GB/s, output head q4_k 252, ssm_out q6_k 185,
+  MoE iq2_xs / iq3_xxs experts ~122, small shared-expert matrices 114-129 (peak ~360). Per token: dense GEMVs
+  ~5.9 ms, MoE GEMVs ~2.55 ms. gemv_q5_k: 40-60 registers (full occupancy), ~55 SASS per 8 values per lane,
+  ~40% of issue rate, so neither occupancy nor issue alone explains it. ncu needs root (RmProfilingAdminOnly=1).
+- Change: `moe_gemv` takes `pair: Option<(w2, y2)>`; with it, grid.z = 2 and z = 1 blocks run the matrices at byte
+  offset w2 into the output at byte offset y2. The decode MoE step runs gate and up as one launch when both have the
+  same type and shape.
+- Test: `moe_gemv_selects_experts` also checks the paired launch against separate launches, bit for bit.
+- Files: `src/cuda/kernels.cu`, `src/cuda/mod.rs`, `src/gpu_model.rs`, `tests/cuda.rs`.
+- After: MoE GEMV 2530 -> 2405 us per token (interleaved nsys, 2 rounds: 2523/2532 vs 2373/2437). 4K (3 clean)
+  decode 76.8/81.0/81.8 (was 77.5/80.4/80.8), prefill 1199/1632/1641. Parity 629/630/632. Short decode 22-74
+  (host load 8, not usable).
+
 ## Tried and rejected
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
@@ -245,12 +260,17 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   registers whatever G a block takes. Fixed by a separate kernel.
 - #8: nothing rejected. Not tried: choosing the split count from n_pos (needs a fixed grid for graph capture;
   could use a max grid and let extra blocks exit, which is what empty splits already do).
+- #17 (decode GEMV, interleaved nsys, us per token dense / MoE, base ~5900 / ~2560): rows per warp 2 / 4 / 8
+  (6100-10100 / 2580-2940); `#pragma unroll 8` (6040 / 2720); 16 values per lane with half-warps on alternate
+  super-blocks (5890 / 2700); warp copies 4 super-blocks of its row into shared memory with 16-byte loads, then
+  decodes (6590 / 2840). Upper bound for quantizing x once instead of per block: ~4% (x loads zeroed: 5690 / 2380).
 
 ## Next candidates
 
 1. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs (expert
    GEMMs) and q5_k. Large; needs a parity test per type against the f16 GEMM.
-2. Decode GEMVs at short context (#12 nsys): gemv_q5_k 3.8 ms/token, q6_k 1.9, output head q4_k 1.3, gemv_f32 0.8.
-   Check achieved bandwidth per kernel against 360 GB/s.
+2. Decode GEMVs: pair the shared-expert gate and up (2 x 5.6 us per layer at ~129 GB/s) the same way; then quantize
+   x once per token into global memory (<= 4% of GEMV time, see #17). The MoE GEMVs stay at ~122 GB/s; llama.cpp's
+   mmvq layout (several warps per row, K split) is the untried structure.
 3. Expert placement robustness: hit rate drops to ~91% when VRAM is short at start, costing ~30% decode. A flag to cap
    GPU expert slots would make this measurable (and the thread-count test of #16 fair).
