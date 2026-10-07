@@ -1,7 +1,7 @@
 //! GPU decode forward for `qwen35` / `qwen35moe`. Routed experts resident in the expert cache run on the GPU; the
 //! rest run on the CPU (`cpu_moe`) while the GPU computes hits and the shared expert. Mirrors `model.rs`.
 
-use crate::cpu_worker::CpuWorker;
+use crate::cpu_worker::{CpuWorker, TMAX};
 use crate::cuda::{Gpu, GpuTensor};
 use crate::expert_cache::ExpertCache;
 use crate::model::Model;
@@ -52,6 +52,9 @@ pub struct GpuModel<'a> {
     step_buf: CudaSlice<i32>,
     /// The whole token forward, captured on the first step (None until then, or with STRATA_NO_GRAPH set).
     graph: Option<CudaGraph>,
+    /// DeltaNet (conv, s) copies per recurrent layer and the position, for `restore_state`.
+    saved: Vec<(CudaSlice<f32>, CudaSlice<f32>)>,
+    saved_pos: usize,
     ctx: usize,
     pub pos: usize,
     pub cache: Option<ExpertCache>,
@@ -125,9 +128,9 @@ impl<'a> GpuModel<'a> {
             ("ge", ff), ("ue", ff), ("ye", k * c.n_embd), ("shg", c.n_ff_shexp), ("shu", c.n_ff_shexp),
             ("shy", c.n_embd), ("sg", 1), ("wh", k), ("attp", c.n_head * crate::cuda::ATT_SPLITS * (c.head_dim + 2)),
         ];
-        let bufs = sizes.into_iter().map(|(name, n)| Ok((name, gpu.zeros::<f32>(n)?))).collect::<anyhow::Result<HashMap<_, _>>>()?;
-        let (x, logits, ids) = (gpu.zeros(c.n_embd)?, gpu.zeros(c.n_vocab)?, gpu.zeros::<i32>(k)?);
-        let (slots, step_buf) = (gpu.zeros::<i32>(k)?, gpu.zeros::<i32>(2)?);
+        let bufs = sizes.into_iter().map(|(name, n)| Ok((name, gpu.zeros::<f32>(TMAX * n)?))).collect::<anyhow::Result<HashMap<_, _>>>()?;
+        let (x, logits, ids) = (gpu.zeros(TMAX * c.n_embd)?, gpu.zeros(TMAX * c.n_vocab)?, gpu.zeros::<i32>(TMAX * k)?);
+        let (slots, step_buf) = (gpu.zeros::<i32>(TMAX * k)?, gpu.zeros::<i32>(2 * TMAX)?);
         let pf = if chunk > 0 { Some(prefill::Scratch::new(m, &gpu, chunk.min(ctx))?) } else { None };
         let (free1, _) = gpu.ctx.mem_get_info()?;
 
@@ -150,7 +153,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, step_buf, graph: None, ctx, pos: 0, cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO, pf, mtp })
+        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, step_buf, graph: None, ctx, pos: 0, saved: vec![], saved_pos: 0, cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO, pf, mtp })
     }
 
     /// Clear KV and recurrent state.
@@ -171,14 +174,15 @@ impl<'a> GpuModel<'a> {
         if self.pos >= self.ctx { bail!("context full ({} tokens)", self.ctx); }
         let seq = self.worker.as_mut().map_or(0, |w| w.begin());
         let g = &self.gpu;
-        g.stream.memcpy_htod(&self.m.embed(token), &mut self.x)?;
-        g.stream.memcpy_htod(&[self.pos as i32, seq as i32], &mut self.step_buf)?;
+        let ne = self.m.cfg.n_embd;
+        g.stream.memcpy_htod(&self.m.embed(token), &mut self.x.slice_mut(0..ne))?;
+        g.stream.memcpy_htod(&[self.pos as i32, seq as i32], &mut self.step_buf.slice_mut(0..2))?;
         match &self.graph {
             Some(graph) => graph.launch()?,
-            None if std::env::var_os("STRATA_NO_GRAPH").is_some() => self.forward()?,
+            None if std::env::var_os("STRATA_NO_GRAPH").is_some() => self.forward(1)?,
             None => {
                 g.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                let r = self.forward();
+                let r = self.forward(1);
                 let graph = g.stream.end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)?;
                 r?;
                 let graph = graph.ok_or_else(|| anyhow::anyhow!("empty CUDA graph"))?;
@@ -186,28 +190,86 @@ impl<'a> GpuModel<'a> {
                 self.graph = Some(graph);
             }
         }
-        let logits = self.gpu.stream.clone_dtoh(&self.logits)?;
-        self.after_forward(logits)
+        let logits = self.gpu.stream.clone_dtoh(&self.logits.slice(0..self.m.cfg.n_vocab))?;
+        self.after_forward(1)?;
+        Ok(logits)
     }
 
-    /// Enqueue (or record into a graph) the token forward; per-token values come from `step_buf`.
-    fn forward(&self) -> anyhow::Result<()> {
+    /// Run up to `TMAX` tokens at positions pos.. in one forward (each weight read once); returns logits per token.
+    /// Hidden state t stays in row t of `x` (see `mtp_draft`).
+    pub fn verify(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let nt = tokens.len();
+        if !(1..=TMAX).contains(&nt) { bail!("verify: {nt} tokens (1 to {TMAX})"); }
+        if self.pos + nt > self.ctx { bail!("context full ({} tokens)", self.ctx); }
+        let seq = self.worker.as_mut().map_or(0, |w| w.begin());
+        let (g, ne, nvoc) = (&self.gpu, self.m.cfg.n_embd, self.m.cfg.n_vocab);
+        let emb: Vec<f32> = tokens.iter().flat_map(|&t| self.m.embed(t)).collect();
+        g.stream.memcpy_htod(&emb, &mut self.x.slice_mut(0..nt * ne))?;
+        let steps: Vec<i32> = (0..nt).flat_map(|t| [(self.pos + t) as i32, seq as i32]).collect();
+        g.stream.memcpy_htod(&steps, &mut self.step_buf.slice_mut(0..2 * nt))?;
+        self.forward(nt)?;
+        let logits = g.stream.clone_dtoh(&self.logits.slice(0..nt * nvoc))?;
+        self.after_forward(nt)?;
+        Ok(logits.chunks(nvoc).map(|c| c.to_vec()).collect())
+    }
+
+    /// Save the DeltaNet and conv states (KV needs no copy: rewinding `pos` is enough).
+    pub fn save_state(&mut self) -> anyhow::Result<()> {
+        let g = &self.gpu;
+        if self.saved.is_empty() {
+            for l in &self.layers {
+                if let Mixer::Delta { conv, s, .. } = &l.mixer { self.saved.push((g.zeros(conv.len())?, g.zeros(s.len())?)); }
+            }
+        }
+        let mut it = self.saved.iter_mut();
+        for l in &self.layers {
+            if let Mixer::Delta { conv, s, .. } = &l.mixer {
+                let (bc, bs) = it.next().unwrap();
+                g.stream.memcpy_dtod(conv, bc)?;
+                g.stream.memcpy_dtod(s, bs)?;
+            }
+        }
+        self.saved_pos = self.pos;
+        Ok(())
+    }
+
+    /// Return to the state of the last `save_state`.
+    pub fn restore_state(&mut self) -> anyhow::Result<()> {
+        let g = &self.gpu;
+        let mut it = self.saved.iter();
+        for l in &mut self.layers {
+            if let Mixer::Delta { conv, s, .. } = &mut l.mixer {
+                let (bc, bs) = it.next().ok_or_else(|| anyhow::anyhow!("restore_state without save_state"))?;
+                g.stream.memcpy_dtod(bc, conv)?;
+                g.stream.memcpy_dtod(bs, s)?;
+            }
+        }
+        self.pos = self.saved_pos;
+        Ok(())
+    }
+
+    /// Enqueue (or record into a graph) the forward of `nt` tokens; per-token values come from `step_buf`.
+    fn forward(&self, nt: usize) -> anyhow::Result<()> {
         let c = &self.m.cfg;
         let (g, eps, ne, step) = (&self.gpu, c.eps, c.n_embd, self.gpu.ptr(&self.step_buf));
         let p = |n: &str| g.ptr(&self.bufs[n]);
         let x = g.ptr(&self.x);
-        for (il, l) in self.layers.iter().enumerate() { self.layer(il, l, x, step, self.worker.as_ref())?; }
-        g.rms_norm(x, 0, self.output_norm.ptr, p("h"), 0, ne, 1, eps)?;
-        g.gemv(&self.output, p("h"), g.ptr(&self.logits))?;
-        Ok(())
+        for (il, l) in self.layers.iter().enumerate() { self.layer(il, l, x, step, self.worker.as_ref(), nt)?; }
+        g.rms_norm(x, ne, self.output_norm.ptr, p("h"), ne, ne, nt, eps)?;
+        self.mv(&self.output, p("h"), ne, g.ptr(&self.logits), c.n_vocab, nt)
+    }
+
+    /// y[t] = W x[t] for t < nt (strides in floats).
+    fn mv(&self, w: &GpuTensor, x: u64, xs: usize, y: u64, ys: usize, nt: usize) -> anyhow::Result<()> {
+        if nt == 1 { self.gpu.gemv(w, x, y) } else { self.gpu.gemvn(w, x, xs, y, ys, nt) }
     }
 
     /// Last hidden state (before output_norm) of the last `step`.
-    pub fn hidden(&self) -> anyhow::Result<Vec<f32>> { Ok(self.gpu.stream.clone_dtoh(&self.x)?) }
+    pub fn hidden(&self) -> anyhow::Result<Vec<f32>> { Ok(self.gpu.stream.clone_dtoh(&self.x.slice(0..self.m.cfg.n_embd))?) }
 
-    /// MTP draft: logits for the token after `token`, from the hidden state of the last `step` (which predicted
-    /// `token`). Mirrors `Model::mtp_step`; the draft head keeps its own position and KV cache.
-    pub fn mtp_draft(&mut self, token: u32) -> anyhow::Result<Vec<f32>> {
+    /// MTP draft: logits for the token after `token`, from hidden state `row` of the last `step` or `verify` (the
+    /// position that predicted `token`). Mirrors `Model::mtp_step`; the draft head keeps its own position and KV cache.
+    pub fn mtp_draft(&mut self, token: u32, row: usize) -> anyhow::Result<Vec<f32>> {
         let c = &self.m.cfg;
         let Some(h) = self.mtp.as_mut() else { bail!("MTP head not loaded") };
         if h.pos >= self.ctx { bail!("context full ({} tokens)", self.ctx); }
@@ -219,12 +281,12 @@ impl<'a> GpuModel<'a> {
         let (eps, ne, hp) = (c.eps, c.n_embd, g.ptr(&self.bufs["h"]));
         let (eh, x) = (g.ptr(&h.eh), g.ptr(&h.x));
         g.rms_norm(g.ptr(&h.emb), 0, h.enorm.ptr, eh, 0, ne, 1, eps)?;
-        g.rms_norm(g.ptr(&self.x), 0, h.hnorm.ptr, eh + 4 * ne as u64, 0, ne, 1, eps)?;
+        g.rms_norm(g.ptr(&self.x) + 4 * (row * ne) as u64, 0, h.hnorm.ptr, eh + 4 * ne as u64, 0, ne, 1, eps)?;
         g.gemv(&h.eh_proj, eh, x)?;
-        self.layer(c.n_layer, &h.layer, x, g.ptr(&h.step_buf), Some(&h.worker))?;
+        self.layer(c.n_layer, &h.layer, x, g.ptr(&h.step_buf), Some(&h.worker), 1)?;
         g.rms_norm(x, 0, h.head_norm.ptr, hp, 0, ne, 1, eps)?;
         g.gemv(&self.output, hp, g.ptr(&self.logits))?;
-        let logits = g.stream.clone_dtoh(&self.logits)?;
+        let logits = g.stream.clone_dtoh(&self.logits.slice(0..c.n_vocab))?;
         let h = self.mtp.as_mut().unwrap();
         h.pos += 1;
         if let Some(cache) = self.cache.as_mut() {
@@ -233,57 +295,68 @@ impl<'a> GpuModel<'a> {
         Ok(logits)
     }
 
-    /// One decoder block on `x`; `step` points at [position, worker seq].
-    fn layer(&self, il: usize, l: &Layer, x: u64, step: u64, worker: Option<&CpuWorker>) -> anyhow::Result<()> {
+    /// One decoder block on `nt` tokens at `x` (rows of n_embd); `step` points at [position, worker seq] per token.
+    fn layer(&self, il: usize, l: &Layer, x: u64, step: u64, worker: Option<&CpuWorker>, nt: usize) -> anyhow::Result<()> {
         let c = &self.m.cfg;
         let (g, eps, ne) = (&self.gpu, c.eps, c.n_embd);
         let p = |n: &str| g.ptr(&self.bufs[n]);
+        let mv = |w: &GpuTensor, x: &str, xs: usize, y: &str, ys: usize| self.mv(w, p(x), xs, p(y), ys, nt);
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
-        let dv = c.ssm_d_inner / nv;
+        let (dv, channels) = (c.ssm_d_inner / nv, c.ssm_d_inner + 2 * nk * dk);
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
+        let kv = nkv * hd;
         {
-            g.rms_norm(x, 0, l.attn_norm.ptr, p("h"), 0, ne, 1, eps)?;
+            g.rms_norm(x, ne, l.attn_norm.ptr, p("h"), ne, ne, nt, eps)?;
             match &l.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s } => {
-                    g.gemv(qkv, p("h"), p("qkv"))?;
-                    g.gemv(gate, p("h"), p("z"))?;
-                    g.gemv(beta, p("h"), p("beta"))?;
-                    g.gemv(alpha, p("h"), p("g"))?;
-                    g.ssm_gates(p("beta"), p("g"), dt_bias.ptr, a.ptr, nv, nv)?;
-                    g.conv_silu(p("qkv"), g.ptr(conv), conv_w.ptr, p("y"), c.ssm_d_inner + 2 * nk * dk, c.ssm_conv)?;
-                    g.l2_norm(p("y"), dk, 2 * nk, 0, 2 * nk, eps)?;
-                    g.deltanet(p("y"), g.ptr(s), p("beta"), p("g"), p("o"), nk, nv, dk, dv, 1.0 / (dk as f32).sqrt(), 1, 0)?;
-                    g.norm_gate(p("o"), norm.ptr, p("z"), dv, nv, eps)?;
-                    g.gemv(out, p("o"), p("mix"))?;
+                    mv(qkv, "h", ne, "qkv", channels)?;
+                    mv(gate, "h", ne, "z", c.ssm_d_inner)?;
+                    mv(beta, "h", ne, "beta", nv)?;
+                    mv(alpha, "h", ne, "g", nv)?;
+                    g.ssm_gates(p("beta"), p("g"), dt_bias.ptr, a.ptr, nt * nv, nv)?;
+                    if nt == 1 {
+                        g.conv_silu(p("qkv"), g.ptr(conv), conv_w.ptr, p("y"), channels, c.ssm_conv)?;
+                    } else {
+                        g.conv_seq(p("qkv"), g.ptr(conv), conv_w.ptr, p("y"), channels, c.ssm_conv, nt)?;
+                    }
+                    g.l2_norm(p("y"), dk, 2 * nk, channels, nt * 2 * nk, eps)?;
+                    g.deltanet(p("y"), g.ptr(s), p("beta"), p("g"), p("o"), nk, nv, dk, dv, 1.0 / (dk as f32).sqrt(), nt, channels)?;
+                    g.norm_gate(p("o"), norm.ptr, p("z"), dv, nt * nv, eps)?;
+                    mv(out, "o", c.ssm_d_inner, "mix", ne)?;
                 }
                 Mixer::Attn { q, k, v, qn, kn, o, kc, vc } => {
-                    g.gemv(q, p("h"), p("qg"))?;
-                    g.rms_norm(p("qg"), 2 * hd, qn.ptr, p("q"), hd, hd, nh, eps)?;
-                    g.rope_neox(p("q"), hd, nh, nh, c.n_rot, step, c.rope_base)?;
-                    g.gemv(k, p("h"), p("kraw"))?;
-                    g.gemv(v, p("h"), p("v"))?;
-                    g.rms_norm(p("kraw"), hd, kn.ptr, p("k"), hd, hd, nkv, eps)?;
-                    g.rope_neox(p("k"), hd, nkv, nkv, c.n_rot, step, c.rope_base)?;
-                    g.kv_store(p("k"), p("v"), g.ptr(kc), g.ptr(vc), nkv * hd, 1, step)?;
-                    g.attn_decode(p("q"), g.ptr(kc), g.ptr(vc), p("qg"), p("att"), p("attp"), step, nh, nkv, hd, 1.0 / (hd as f32).sqrt())?;
-                    g.gemv(o, p("att"), p("mix"))?;
+                    mv(q, "h", ne, "qg", 2 * nh * hd)?;
+                    g.rms_norm(p("qg"), 2 * hd, qn.ptr, p("q"), hd, hd, nt * nh, eps)?;
+                    g.rope_neox(p("q"), hd, nt * nh, nh, c.n_rot, step, c.rope_base)?;
+                    mv(k, "h", ne, "kraw", kv)?;
+                    mv(v, "h", ne, "v", kv)?;
+                    g.rms_norm(p("kraw"), hd, kn.ptr, p("k"), hd, hd, nt * nkv, eps)?;
+                    g.rope_neox(p("k"), hd, nt * nkv, nkv, c.n_rot, step, c.rope_base)?;
+                    g.kv_store(p("k"), p("v"), g.ptr(kc), g.ptr(vc), kv, nt, step)?;
+                    for t in 0..nt as u64 {
+                        let (q4, a4) = (4 * t * (nh * hd) as u64, 4 * t * (2 * nh * hd) as u64);
+                        g.attn_decode(p("q") + q4, g.ptr(kc), g.ptr(vc), p("qg") + a4, p("att") + q4, p("attp"), step + 8 * t,
+                                      nh, nkv, hd, 1.0 / (hd as f32).sqrt())?;
+                    }
+                    mv(o, "att", nh * hd, "mix", ne)?;
                 }
             }
-            g.add(x, p("mix"), ne)?;
-            g.rms_norm(x, 0, l.post_norm.ptr, p("h"), 0, ne, 1, eps)?;
+            g.add(x, p("mix"), nt * ne)?;
+            g.rms_norm(x, ne, l.post_norm.ptr, p("h"), ne, ne, nt, eps)?;
             match &l.ffn {
                 Ffn::Dense { gate, up, down } => {
-                    g.gemv(gate, p("h"), p("ge"))?;
-                    g.gemv(up, p("h"), p("ue"))?;
-                    g.swiglu(p("ge"), p("ue"), c.n_ff)?;
-                    g.gemv(down, p("ge"), p("ye"))?;
-                    g.add(x, p("ye"), ne)?;
+                    mv(gate, "h", ne, "ge", c.n_ff)?;
+                    mv(up, "h", ne, "ue", c.n_ff)?;
+                    g.swiglu(p("ge"), p("ue"), nt * c.n_ff)?;
+                    mv(down, "ge", c.n_ff, "ye", ne)?;
+                    g.add(x, p("ye"), nt * ne)?;
                 }
                 Ffn::Moe { router, shared } => {
                     let k = c.n_expert_used;
+                    let kt = nt * k;
                     let ids = g.ptr(&self.ids);
-                    g.gemv(router, p("h"), p("rl"))?;
-                    g.router_topk(p("rl"), c.n_expert, k, c.expert_weights_scale, ids, p("wts"), 1)?;
+                    mv(router, "h", ne, "rl", c.n_expert)?;
+                    g.router_topk(p("rl"), c.n_expert, k, c.expert_weights_scale, ids, p("wts"), nt)?;
                     let cache = self.cache.as_ref().unwrap();
                     let lx = cache.layer(il).unwrap();
                     let (base, stride) = cache.base(g, lx);
@@ -291,29 +364,29 @@ impl<'a> GpuModel<'a> {
                     let slots = g.ptr(&self.slots);
                     let w = worker.unwrap();
                     let mb = w.dev + (4 * il * w.layout.stride) as u64;
-                    g.map_hits(ids, g.ptr(&lx.table_dev), slots, p("wts"), p("wh"), k)?;
-                    g.moe_publish(ids, p("wts"), slots, p("h"), mb, k, ne, w.layout.h, step)?;
+                    g.map_hits(ids, g.ptr(&lx.table_dev), slots, p("wts"), p("wh"), kt)?;
+                    g.moe_publish(ids, p("wts"), slots, p("h"), mb, k, ne, w.layout.h, step, nt)?;
                     if mg.ty == mu.ty && (mg.rows, mg.cols) == (mu.rows, mu.cols) {
                         let pair = (mu.off as i64 - mg.off as i64, p("ue") as i64 - p("ge") as i64);
-                        g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, k, p("h"), 0, p("ge"), Some(pair))?;
+                        g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, p("h"), ne, k, p("ge"), Some(pair))?;
                     } else {
-                        g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, k, p("h"), 0, p("ge"), None)?;
-                        g.moe_gemv(mu.ty, mu.rows, mu.cols, base + mu.off as u64, stride, slots, k, p("h"), 0, p("ue"), None)?;
+                        g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, p("h"), ne, k, p("ge"), None)?;
+                        g.moe_gemv(mu.ty, mu.rows, mu.cols, base + mu.off as u64, stride, slots, kt, p("h"), ne, k, p("ue"), None)?;
                     }
-                    g.swiglu(p("ge"), p("ue"), k * c.n_ff_exp)?;
-                    g.moe_gemv(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, k, p("ge"), c.n_ff_exp, p("ye"), None)?;
+                    g.swiglu(p("ge"), p("ue"), kt * c.n_ff_exp)?;
+                    g.moe_gemv(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, kt, p("ge"), c.n_ff_exp, 1, p("ye"), None)?;
                     let (sh, sg) = match shared {
                         Some(s) => {
-                            g.gemv(&s.gate_inp, p("h"), p("sg"))?;
-                            g.gemv(&s.gate, p("h"), p("shg"))?;
-                            g.gemv(&s.up, p("h"), p("shu"))?;
-                            g.swiglu(p("shg"), p("shu"), c.n_ff_shexp)?;
-                            g.gemv(&s.down, p("shg"), p("shy"))?;
+                            mv(&s.gate_inp, "h", ne, "sg", 1)?;
+                            mv(&s.gate, "h", ne, "shg", c.n_ff_shexp)?;
+                            mv(&s.up, "h", ne, "shu", c.n_ff_shexp)?;
+                            g.swiglu(p("shg"), p("shu"), nt * c.n_ff_shexp)?;
+                            mv(&s.down, "shg", c.n_ff_shexp, "shy", ne)?;
                             (p("shy"), p("sg"))
                         }
                         None => (0, 0),
                     };
-                    g.moe_combine(x, p("ye"), p("wh"), k, sh, sg, mb, w.layout.y, step, slots, ne)?;
+                    g.moe_combine(x, p("ye"), p("wh"), k, sh, sg, mb, w.layout.y, step, slots, ne, nt)?;
                 }
             }
         }
@@ -321,8 +394,8 @@ impl<'a> GpuModel<'a> {
     }
 
     /// Advance the position and update expert statistics and placement after a token.
-    fn after_forward(&mut self, logits: Vec<f32>) -> anyhow::Result<Vec<f32>> {
-        self.pos += 1;
+    fn after_forward(&mut self, nt: usize) -> anyhow::Result<()> {
+        self.pos += nt;
         if let (Some(cache), Some(w)) = (self.cache.as_mut(), self.worker.as_ref()) {
             for il in 0..self.layers.len() {
                 if cache.layer(il).is_none() { continue; }
@@ -333,8 +406,8 @@ impl<'a> GpuModel<'a> {
                 cache.record(il, &r.iter().map(|x| x.0).collect::<Vec<_>>());
             }
             self.cpu_time = w.busy();
-            if self.adapt_every > 0 && self.pos % self.adapt_every == 0 { cache.adapt(self.m, &self.gpu, 16)?; }
+            if self.adapt_every > 0 && (self.pos - nt) / self.adapt_every < self.pos / self.adapt_every { cache.adapt(self.m, &self.gpu, 16)?; }
         }
-        Ok(logits)
+        Ok(())
     }
 }
