@@ -5,8 +5,8 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 ## State
 
 - Milestone: M2 done. M3 expert cache partly in (commit 90db54a). M4 first half (chunked GPU prefill) committed.
-- Speed at 4K (3 clean runs): prefill **1366 tok/s** (1363-1369; gate 1017, passed), decode 60.9 tok/s (gate 67).
-  Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 83-86 tok/s, above the gate.
+- Speed at 4K (3 clean runs): prefill **1366 tok/s** (1363-1369; gate 1017, passed), decode **78.6 tok/s** (gate 67, passed).
+  Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 86 tok/s. Next: 32K context and MTP.
   See `docs/m4-results.md`.
 - Parity (20 prompts x 32, GPU, 3 runs): prefill 628/630/629 = mean 98.28% +- 0.16; token-by-token prompt
   (`--chunk 0`) 631/627/631 = mean 98.39% +- 0.36. Gate 99%. Decode is not deterministic run to run (adaptive
@@ -115,6 +115,20 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   noisy set of 5: 50-83); before 85.8. The ~3% short-context drop is at the edge of run-to-run noise (expert cache
   placement); the merge adds 10 small launches per token.
 
+### 2026-10-07 #9 — vector loads in decode attention (059fd1e)
+- GPU idle (gnome-clocks 41 MiB only).
+- Profile (nsys, 4K prompt + 128 decode, `--cuda-graph-trace=node`, per token): attn_decode 4.1 ms (408 us x 10)
+  of 16.4 ms, then gemv_q5_k 3.1 ms, gemv_q6_k 1.6, moe_gemv_iq2_xs 1.5, moe_combine 1.1, gemv_q4_k (output head)
+  1.1, moe_gemv_iq3_xxs 1.0, gemv_f32 0.7, rms_norm 0.6, router_topk 0.6.
+- Change: in `attn_decode` each lane owns hd/32 consecutive dims and loads K and V rows with one vector load
+  (`ldh_vec<PER>`, uint4 for hd 256) instead of hd/32 scalar f16 loads; kernel templated on PER, dispatch on hd
+  (64/128/256/512). attn_decode 408 -> 88 us per call.
+- Test: `attn_prefill_matches_decode` (hd 64/128/256) passes; full cuda suite passes.
+- Files: `src/cuda/kernels.cu`, `src/cuda/mod.rs`.
+- 4K (3 clean): decode **78.6** (76.9/79.0/80.0), was 60.9; prefill 1002/1350/1138 (kernel unchanged; machine
+  noise, load average 2-7, swap 14 GB). Parity 631/631/629 (98.49%). Short-prompt decode 86.1 (83.7-87.3, 5 clean).
+- Speed gate (decode > 67, prefill >= 1017 at 4K) now passed on both. Parity gate (99%) still open; see #7 question.
+
 ## Tried and rejected
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
@@ -124,8 +138,9 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 ## Next candidates
 
-1. 4K decode 60.9 vs 67: re-profile one 4K decode step with nsys. Short-context profile: gemv_q5_k 25%,
-   gemv_q6_k 13%, moe_gemv_iq2_xs 11%, output head gemv_q4_k 1.1 ms (9%); check these kernels against bandwidth.
-2. deltanet_seq 0.77 s of 4.2 s prefill (sequential scan); chunked WY form. Needs idle GPU.
-3. Parity: score the 6 long prompts with the CPU f32 reference (~15 min CPU) to confirm their misses are shared;
-   if so, parity work waits for the owner's answer above.
+1. 32K context: measure prefill and decode at 32K vs llama.cpp (`docs/baseline.md`); attention and deltanet costs
+   grow there. Needs idle GPU.
+2. deltanet_seq 0.66 s of ~3 s 4K prefill (sequential scan, 21.9 ms x 30 layers); chunked WY form.
+3. Decode GEMVs: gemv_q5_k 3.1 ms/token, gemv_q6_k 1.6, moe_combine 1.1 (28 us x 40, looks high for its work),
+   output head gemv_q4_k 1.1. Check each against memory bandwidth.
+4. Parity: score the 6 long prompts with the CPU f32 reference (~15 min CPU) to confirm their misses are shared.
