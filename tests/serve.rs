@@ -35,4 +35,5 @@ fn rejects_bad_hosts_and_huge_headers() {
 fn checks_api_key() {
     assert!(key_ok("Bearer s3cret", "s3cret"));
     assert!(!key_ok("Bearer s3cres", "s3cret") && !key_ok("Bearer s3cret2", "s3cret") && !key_ok("s3cret", "s3cret") && !key_ok("", "s3cret"));
+    assert!(!key_ok("", "") && !key_ok("Bearer ", ""));
 }
