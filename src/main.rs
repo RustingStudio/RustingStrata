@@ -5,7 +5,7 @@ use rusting_strata::{cuda::Gpu, gpu_model::GpuModel};
 use rusting_strata::{config::ModelConfig, gguf::Gguf, ops, quant::GgmlType, serve, tokenizer::Tokenizer};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::{collections::BTreeMap, net::{TcpListener, TcpStream}, path::PathBuf, time::{Instant, SystemTime}};
+use std::{collections::BTreeMap, net::{TcpListener, TcpStream}, path::PathBuf, time::{Duration, Instant, SystemTime}};
 
 #[derive(Parser)]
 #[command(name = "strata", about = "Rust inference engine for Qwen3.5/3.6-family GGUF models")]
@@ -223,7 +223,7 @@ fn main() -> anyhow::Result<()> {
             let listener = TcpListener::bind(&addr)?;
             eprintln!("listening on http://{addr}");
             for (i, conn) in listener.incoming().enumerate() {
-                let res = conn.map_err(Into::into).and_then(|c| handle(c, &mut r, &tok, &engine, &name, i));
+                let res = conn.map_err(Into::into).and_then(|c| handle(c, &mut r, &tok, &engine, &name, &addr, i));
                 if let Err(e) = res { eprintln!("request {i}: {e:#}"); }
             }
         }
@@ -262,20 +262,27 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, mut logits: Vec<f32>, n: u
     Ok((out, false))
 }
 
-/// Tokens left for a reply: `n`, capped by the GPU context after a `used`-token prompt.
-fn room(e: &Engine, used: usize, n: usize) -> usize { if e.gpu { n.min(e.ctx.saturating_sub(used)) } else { n } }
+/// Tokens left for a reply: `n`, capped by the context after a `used`-token prompt.
+fn room(e: &Engine, used: usize, n: usize) -> usize { n.min(e.ctx.saturating_sub(used)) }
 
 /// Reply text without the thinking part (the template drops it from history too).
 fn answer(s: &str) -> String { s.rsplit_once("</think>").map_or(s, |x| x.1).trim().to_string() }
 
-fn handle(c: TcpStream, r: &mut Runner, tok: &Tokenizer, e: &Engine, name: &str, i: usize) -> anyhow::Result<()> {
+fn handle(c: TcpStream, r: &mut Runner, tok: &Tokenizer, e: &Engine, name: &str, addr: &str, i: usize) -> anyhow::Result<()> {
+    // A stalled client must not hold the single request slot.
+    c.set_read_timeout(Some(Duration::from_secs(30)))?;
+    c.set_write_timeout(Some(Duration::from_secs(30)))?;
     let mut w = c.try_clone()?;
-    let (method, path, body) = serve::read_request(&mut BufReader::new(c))?;
+    let serve::Request { method, path, host, json, body } = serve::read_request(&mut BufReader::new(c))?;
     let send = |w: &mut TcpStream, status: &str, v: serde_json::Value| -> anyhow::Result<()> {
         let b = v.to_string();
         Ok(write!(w, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len())?)
     };
     let created = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+    // Browsers can reach a loopback server: the Host check stops DNS rebinding, and requiring a JSON content type
+    // makes a cross-site POST need a CORS preflight, which is never answered.
+    if !serve::host_ok(&host, addr) { return send(&mut w, "403 Forbidden", json!({"error": {"message": "bad Host header", "type": "forbidden"}})); }
+    if method == "POST" && !json { return send(&mut w, "415 Unsupported Media Type", json!({"error": {"message": "Content-Type must be application/json", "type": "invalid_request_error"}})); }
     match (method.as_str(), path.as_str()) {
         ("GET", "/v1/models") => send(&mut w, "200 OK", json!({"object": "list", "data": [{"id": name, "object": "model", "created": created, "owned_by": "strata"}]})),
         ("POST", "/v1/chat/completions") => {

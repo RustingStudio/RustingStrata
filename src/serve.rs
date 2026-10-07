@@ -2,7 +2,7 @@
 
 use anyhow::{Context, bail};
 use serde_json::Value;
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 
 /// ChatML prompt in the model's template: (role, content) turns, then the assistant header. `think` false
 /// appends the empty think block the template uses for `enable_thinking = false`.
@@ -12,24 +12,48 @@ pub fn chat_prompt(msgs: &[(String, String)], think: bool) -> String {
     s
 }
 
-/// Reads one request: method, path, body (Content-Length only, no chunked uploads).
-pub fn read_request(r: &mut impl BufRead) -> anyhow::Result<(String, String, Vec<u8>)> {
+pub struct Request {
+    pub method: String,
+    pub path: String,
+    pub host: String,
+    pub json: bool,
+    pub body: Vec<u8>,
+}
+
+/// Reads one request (Content-Length bodies only, no chunked uploads). Headers are capped at 64 KiB and the body at
+/// 8 MiB.
+pub fn read_request(r: &mut impl BufRead) -> anyhow::Result<Request> {
+    let mut h = r.take(64 << 10);
     let mut line = String::new();
-    r.read_line(&mut line)?;
+    h.read_line(&mut line)?;
     let mut it = line.split_whitespace();
     let (method, path) = (it.next().context("empty request")?.to_string(), it.next().context("no path")?.to_string());
-    let mut len = 0;
+    let (mut len, mut host, mut json) = (0, String::new(), false);
     loop {
         line.clear();
-        if r.read_line(&mut line)? == 0 { bail!("headers cut off"); }
+        if h.read_line(&mut line)? == 0 { bail!("headers cut off or too long"); }
         let l = line.trim_end();
         if l.is_empty() { break; }
-        if let Some((k, v)) = l.split_once(':') && k.eq_ignore_ascii_case("content-length") { len = v.trim().parse()?; }
+        let Some((k, v)) = l.split_once(':') else { continue };
+        let (k, v) = (k.to_ascii_lowercase(), v.trim());
+        match k.as_str() {
+            "content-length" => len = v.parse()?,
+            "host" => host = v.to_string(),
+            "content-type" => json = v.starts_with("application/json"),
+            _ => {}
+        }
     }
-    if len > 64 << 20 { bail!("body too large"); }
+    if len > 8 << 20 { bail!("body too large"); }
     let mut body = vec![0; len];
     r.read_exact(&mut body)?;
-    Ok((method, path, body))
+    Ok(Request { method, path, host, json, body })
+}
+
+/// Host header check against DNS rebinding: a loopback name, or the host the server was bound to.
+pub fn host_ok(host: &str, bound: &str) -> bool {
+    let name = |s: &str| s.rsplit_once(':').filter(|(_, p)| p.parse::<u16>().is_ok()).map_or(s, |x| x.0).to_ascii_lowercase();
+    let n = name(host);
+    matches!(n.as_str(), "localhost" | "127.0.0.1" | "[::1]") || n == name(bound)
 }
 
 /// The parts of an OpenAI chat completion request that strata uses. Decoding is greedy: sampling fields are ignored.
