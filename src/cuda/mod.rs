@@ -188,10 +188,13 @@ impl Gpu {
     }
 
     /// For j < k with ids[j] >= 0: y[j] = W_j x[j], where W_j is the `rows` x `cols` matrix at w + ids[j] * stride bytes.
-    pub fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, y: u64) -> anyhow::Result<()> {
+    /// `pair` = (w2, y2) also computes the same product for the matrices at byte offset w2 into the output at byte offset y2.
+    pub fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, y: u64, pair: Option<(i64, i64)>) -> anyhow::Result<()> {
         if cols % 256 != 0 { bail!("{} expert with {cols} columns: GEMV needs a multiple of 256", ty.name()); }
-        let (c, rpw) = Self::gemv_cfg(ty, rows, cols, k);
-        launch!(self, &kname("moe_gemv", ty), c, w, ids, stride as i64, x, x_stride as i32, y, rows as i32, (cols / 256) as i32, rpw);
+        let (mut c, rpw) = Self::gemv_cfg(ty, rows, cols, k);
+        let (w2, y2) = pair.unwrap_or((0, 0));
+        c.grid_dim.2 = if pair.is_some() { 2 } else { 1 };
+        launch!(self, &kname("moe_gemv", ty), c, w, ids, stride as i64, x, x_stride as i32, y, rows as i32, (cols / 256) as i32, rpw, w2, y2);
         Ok(())
     }
 

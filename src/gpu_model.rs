@@ -229,10 +229,15 @@ impl<'a> GpuModel<'a> {
                     let mb = w.dev + (4 * il * w.layout.stride) as u64;
                     g.map_hits(ids, g.ptr(&lx.table_dev), slots, p("wts"), p("wh"), k)?;
                     g.moe_publish(ids, p("wts"), slots, p("h"), mb, k, ne, w.layout.h, step)?;
-                    g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, k, p("h"), 0, p("ge"))?;
-                    g.moe_gemv(mu.ty, mu.rows, mu.cols, base + mu.off as u64, stride, slots, k, p("h"), 0, p("ue"))?;
+                    if mg.ty == mu.ty && (mg.rows, mg.cols) == (mu.rows, mu.cols) {
+                        let pair = (mu.off as i64 - mg.off as i64, p("ue") as i64 - p("ge") as i64);
+                        g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, k, p("h"), 0, p("ge"), Some(pair))?;
+                    } else {
+                        g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, k, p("h"), 0, p("ge"), None)?;
+                        g.moe_gemv(mu.ty, mu.rows, mu.cols, base + mu.off as u64, stride, slots, k, p("h"), 0, p("ue"), None)?;
+                    }
                     g.swiglu(p("ge"), p("ue"), k * c.n_ff_exp)?;
-                    g.moe_gemv(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, k, p("ge"), c.n_ff_exp, p("ye"))?;
+                    g.moe_gemv(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, k, p("ge"), c.n_ff_exp, p("ye"), None)?;
                     let (sh, sg) = match shared {
                         Some(s) => {
                             g.gemv(&s.gate_inp, p("h"), p("sg"))?;
