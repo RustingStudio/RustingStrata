@@ -114,7 +114,7 @@ impl<'a> GpuModel<'a> {
         let bufs = sizes.into_iter().map(|(name, n)| Ok((name, gpu.zeros::<f32>(n)?))).collect::<anyhow::Result<HashMap<_, _>>>()?;
         let (x, logits, ids) = (gpu.zeros(c.n_embd)?, gpu.zeros(c.n_vocab)?, gpu.zeros::<i32>(k)?);
         let (slots, step_buf) = (gpu.zeros::<i32>(k)?, gpu.zeros::<i32>(2)?);
-        let pf = if chunk > 0 { Some(prefill::Scratch::new(m, &gpu, chunk)?) } else { None };
+        let pf = if chunk > 0 { Some(prefill::Scratch::new(m, &gpu, chunk.min(ctx))?) } else { None };
         let (free1, _) = gpu.ctx.mem_get_info()?;
 
         let cache = if c.is_moe() {
