@@ -6,7 +6,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 - Milestone: M2 done. M3 expert cache partly in (commit 90db54a). M4 first half (chunked GPU prefill) committed.
 - Speed at 4K (3 clean runs): prefill **1581 tok/s** (1538-1610; gate 1017, passed), prefill 1608 at 2dcae33, decode **80.5 tok/s** (gate 67, passed).
-  Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 82.7 tok/s at e087210 (loaded host; 86 at 059fd1e). 32K (31768-token prompt): prefill ~1290 tok/s, decode best 62.5, noisy (llama.cpp -d 32768: pp512 814, tg128 56.4).
+  Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 86.7 tok/s at b9d9547 (86.4-86.9, ~100% expert hits). 32K (31768-token prompt): prefill ~1290 tok/s, decode best 62.5, noisy (llama.cpp -d 32768: pp512 814, tg128 56.4).
   See `docs/m4-results.md`.
 - Parity (20 prompts x 32, GPU, 3 runs): prefill 628/630/629 = mean 98.28% +- 0.16; token-by-token prompt
   (`--chunk 0`) 631/627/631 = mean 98.39% +- 0.36. Gate 99%. Decode is not deterministic run to run (adaptive
@@ -220,6 +220,19 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - After: short 27 -> 11.4 us, 4K ~98 -> ~102 us, 32K 319 us. 4K (3 clean) decode 77.5/80.4/80.8, prefill
   1251/1628/1652. Short decode 56-74 (host load 7.5, one prompt at 27 tok/s: not usable). Parity 627/632/631.
 
+### 2026-10-07 #16 — short decode re-measured; CPU expert threads (no code change)
+- GPU idle; host load 4-13 (other loop's rustc/rust-lld). Ryzen 5 7600X, 6 cores / 12 threads.
+- Question: does the CPU expert worker (rayon over all 12 threads, `batch_rows` par_chunks of 16 rows) lose time when
+  the host is loaded? A/B with `RAYON_NUM_THREADS` 12 (default) / 8 / 6 / 4 / 3 / 2, interleaved, short prompt -n 128.
+- Finding: the hit rate decides it, and it varies run to run: 97.2% -> 100% over consecutive runs, even with
+  `--vram-margin 2000` (181 -> 0 misses). Placement follows free VRAM at start, which other processes change.
+  The thread-count A/B is confounded by that and showed no consistent winner (per-run CPU share 0-9%).
+- Short decode at b9d9547 with <= 11 misses: 86.40 / 86.69 / 86.93 (12 / 6 / 3 threads), 85.5-86.7 in the first
+  set at 99.9% hits. Back to the 86.1 of 059fd1e; the #12 regression is fully gone.
+- The 5.8 ms/token moe_combine of #12 was a 91% hit-rate run (3864 misses), i.e. a VRAM-short start, not a
+  worker problem.
+- No code change. A fair thread-count test needs a fixed miss set (e.g. a flag that caps GPU expert slots).
+
 ## Tried and rejected
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
@@ -235,7 +248,9 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 ## Next candidates
 
-1. Quiet short-decode measurement for e087210/b9d9547 (host load 7-13 through #12-#15). Do when load < 2.
-2. Short decode: moe_combine waits on CPU experts (5.8 ms/token under load, 1.1 quiet). Check CPU worker threads
-   against host load (thread count, spinning vs futex).
-3. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs and q5_k.
+1. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs (expert
+   GEMMs) and q5_k. Large; needs a parity test per type against the f16 GEMM.
+2. Decode GEMVs at short context (#12 nsys): gemv_q5_k 3.8 ms/token, q6_k 1.9, output head q4_k 1.3, gemv_f32 0.8.
+   Check achieved bandwidth per kernel against 360 GB/s.
+3. Expert placement robustness: hit rate drops to ~91% when VRAM is short at start, costing ~30% decode. A flag to cap
+   GPU expert slots would make this measurable (and the thread-count test of #16 fair).
