@@ -12,10 +12,11 @@ Model: Qwen3.6-35B-A3B-UD-Q2_K_XL, RTX 3060 12 GB, Ryzen 5 7600X. Prompt: 3970 t
 | 059fd1e vector loads in decode attention | 1350 (noisy: 1002-1350) | **78.6** (76.9-80.0) | 98.49% (629-631) |
 | 09edad5 ldmatrix in prefill attention | 1434 (loaded machine: 835-1434) | 64-78 (loaded) | 98.13% (627-629) |
 | b57b791 DeltaNet 16 floats per lane | **1581** (1538-1610) | 48-76 (loaded) | 98.44% (629-631) |
+| 2dcae33 GQA-shared decode attention | 1608 (1561-1633) | **80.5** (79.8-80.9) | 98.23% (627-630) |
 
 Short-prompt decode (8-token prompt, -n 128): 85.8 tok/s at 8d0c3c4, 83.3 at 1866f5e, 86.1 at 059fd1e (5 clean runs each).
 
-32K (31768-token prompt, `--ctx 32768`): 09edad5 prefill 1007/1204/1190 tok/s (was 818), decode ~55. b57b791: 1288 (under nsys).
+32K (31768-token prompt, `--ctx 32768`): 09edad5 prefill 1007/1204/1190 tok/s (was 818), decode ~55. b57b791: 1288 (under nsys). 2dcae33: decode best 62.5 (others 12-20 under host load 12), attn_decode 590 -> 314 us per call.
 llama.cpp `-d 32768`: pp512 814, tg128 56.4 (marginal rate at depth, not an average).
 
 Gate: prefill >= 1017 tok/s at 4K, decode > 67 tok/s, parity >= 99%.
