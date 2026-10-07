@@ -19,7 +19,7 @@ fn gpu_forward_matches_cpu_reference() {
             Err(e) if format!("{e}") == "CUDA init" => { eprintln!("SKIP: no GPU: {e:#}"); return }
             Err(e) => panic!("{e:#}"),
         };
-        let mut gm = GpuModel::load(&m, gpu, 256, 0, margin, false).unwrap();
+        let mut gm = GpuModel::load(&m, gpu, 256, 0, margin, 0).unwrap();
         let t0 = std::time::Instant::now();
         for (i, (&t, w)) in ids.iter().zip(&want).enumerate() {
             let got = gm.step(t).unwrap();
@@ -60,7 +60,7 @@ fn prefill_matches_reference() {
     let next = ops::argmax(&cpu) as u32;
     let cpu2 = m.step(&mut st, next);
     let chunk = std::env::var("CHUNK").map_or(48, |v| v.parse().unwrap());
-    let mut gm = GpuModel::load(&m, gpu, 512, chunk, 512 << 20, false).unwrap();
+    let mut gm = GpuModel::load(&m, gpu, 512, chunk, 512 << 20, 0).unwrap();
     // Fixed expert placement: adaptive moves change the decode yardstick from run to run (it differed inside the
     // full suite and failed once).
     gm.adapt_every = 0;
@@ -98,7 +98,7 @@ fn mtp_draft_matches_reference() {
         Ok(g) => g,
         Err(e) => { eprintln!("SKIP: no GPU: {e:#}"); return }
     };
-    let mut gm = GpuModel::load(&m, gpu, 256, 0, 512 << 20, true).unwrap();
+    let mut gm = GpuModel::load(&m, gpu, 256, 0, 512 << 20, 1).unwrap();
     let mut ids = tok.encode("The capital of France is").unwrap();
     let (mut st, mut mtp) = (State::new(&m.cfg), Mtp::default());
     let mut bad = 0;
@@ -129,7 +129,7 @@ fn verify_matches_steps() {
         Ok(g) => g,
         Err(e) => { eprintln!("SKIP: no GPU: {e:#}"); return }
     };
-    let mut gm = GpuModel::load(&m, gpu, 256, 0, 512 << 20, false).unwrap();
+    let mut gm = GpuModel::load(&m, gpu, 256, 0, 512 << 20, 0).unwrap();
     let ids = tok.encode("The capital of France is Paris, and the capital of Spain is").unwrap();
     let (pre, rest) = ids.split_at(ids.len() - 4);
     for &t in pre { gm.step(t).unwrap(); }
@@ -159,7 +159,7 @@ fn verify_matches_steps() {
     }
 }
 
-/// Greedy decoding with MTP speculation (`spec_step`) gives the same tokens as plain steps. Same instance and fixed
+/// Greedy decoding with MTP speculation (`spec_step`, k = 1 to 3) gives the same tokens as plain steps. Same instance and fixed
 /// expert placement, so both runs see the same numerics.
 #[test]
 fn mtp_spec_matches_greedy() {
@@ -173,17 +173,19 @@ fn mtp_spec_matches_greedy() {
         Ok(g) => g,
         Err(e) => { eprintln!("SKIP: no GPU: {e:#}"); return }
     };
-    let mut gm = GpuModel::load(&m, gpu, 512, 0, 512 << 20, true).unwrap();
+    let mut gm = GpuModel::load(&m, gpu, 512, 0, 512 << 20, 3).unwrap();
+    assert_eq!(gm.k, 3);
     gm.adapt_every = 0;
     let ids = tok.encode("Write a short story about a dragon.").unwrap();
     let n = 64;
-    let mut run = |spec: bool| -> Vec<u32> {
+    let mut run = |k: usize| -> (Vec<u32>, (usize, usize)) {
+        (gm.k, gm.drafts) = (k.max(1), (0, 0));
         gm.reset().unwrap();
         let mut logits = gm.prefill(&ids).unwrap();
         let (mut out, mut row) = (vec![], 0);
         while out.len() < n {
             let t = ops::argmax(&logits) as u32;
-            if spec {
+            if k > 0 {
                 let (toks, l, r) = gm.spec_step(t, row).unwrap();
                 (logits, row) = (l, r);
                 out.extend(toks);
@@ -193,12 +195,42 @@ fn mtp_spec_matches_greedy() {
             }
         }
         out.truncate(n);
-        out
+        (out, gm.drafts)
     };
-    let plain = run(false);
-    let spec = run(true);
-    let (made, ok) = gm.drafts;
-    eprintln!("drafts accepted {ok}/{made}");
-    assert_eq!(spec, plain);
-    assert!(2 * ok >= made, "acceptance {ok}/{made}");
+    let plain = run(0).0;
+    for k in [1, 2, 3] {
+        let (spec, (made, ok)) = run(k);
+        eprintln!("k {k}: drafts accepted {ok}/{made}");
+        assert_eq!(spec, plain, "k {k}");
+        if k == 1 { assert!(2 * ok >= made, "acceptance {ok}/{made}"); }
+    }
+}
+
+/// `rollback` to the first token of a 2-token verify leaves the same state as stepping that token alone.
+#[test]
+fn rollback_matches_step() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    if m.cfg.n_nextn == 0 { eprintln!("SKIP: no nextn layer"); return }
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let gpu = match Gpu::new() {
+        Ok(g) => g,
+        Err(e) => { eprintln!("SKIP: no GPU: {e:#}"); return }
+    };
+    let mut gm = GpuModel::load(&m, gpu, 256, 0, 512 << 20, 1).unwrap();
+    gm.adapt_every = 0;
+    let ids = tok.encode("The capital of France is Paris, and the capital of Spain is").unwrap();
+    let (pre, rest) = ids.split_at(ids.len() - 3);
+    for &t in pre { gm.step(t).unwrap(); }
+    gm.save_state().unwrap();
+    gm.step(rest[0]).unwrap();
+    let want = gm.step(rest[2]).unwrap();
+    gm.restore_state().unwrap();
+    let start = gm.pos;
+    gm.verify(&rest[..2]).unwrap();
+    gm.rollback(start, 1).unwrap();
+    assert_eq!(gm.pos, start + 1);
+    assert_eq!(gm.step(rest[2]).unwrap(), want, "step after rollback");
 }
