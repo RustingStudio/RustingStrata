@@ -38,11 +38,11 @@ pub struct CpuWorker {
 }
 
 impl CpuWorker {
-    /// Safety: `m` must outlive the worker (it is joined on drop).
+    /// Mailboxes cover layers up to the largest of `moe_layers`. Safety: `m` must outlive the worker (it is joined on drop).
     pub fn new(m: &Model, ctx: &Arc<cudarc::driver::CudaContext>, moe_layers: Vec<usize>) -> anyhow::Result<CpuWorker> {
         let c = &m.cfg;
         let layout = Mailbox::new(c.n_expert_used, c.n_embd);
-        let len = layout.stride * c.n_layer;
+        let len = layout.stride * moe_layers.iter().max().map_or(0, |&il| il + 1);
         let flags = sys::CU_MEMHOSTALLOC_DEVICEMAP | sys::CU_MEMHOSTALLOC_PORTABLE;
         let mut mem = unsafe { ctx.alloc_pinned_with_flags::<u32>(len, flags)? };
         let host = mem.as_mut_ptr()? as usize;

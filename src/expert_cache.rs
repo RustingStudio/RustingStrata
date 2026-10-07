@@ -41,13 +41,14 @@ fn profile_path(m: &Model) -> PathBuf {
 }
 
 impl ExpertCache {
-    /// Allocate slots worth at most `budget` bytes and fill them from the saved routing profile, or in layer order.
-    pub fn new(m: &Model, gpu: &Gpu, budget: usize) -> anyhow::Result<ExpertCache> {
+    /// Allocate slots worth at most `budget` bytes for layers `0..n_layers` (n_layer, plus one with the MTP layer) and
+    /// fill them from the saved routing profile, or in layer order.
+    pub fn new(m: &Model, gpu: &Gpu, budget: usize, n_layers: usize) -> anyhow::Result<ExpertCache> {
         let c = &m.cfg;
         let n = c.n_expert;
         let mut layers: Vec<Option<(usize, [Mat; 3])>> = Vec::new();
         let mut classes = BTreeMap::<usize, usize>::new(); // slot bytes -> experts of that size
-        for il in 0..c.n_layer {
+        for il in 0..n_layers {
             if !c.is_moe() { layers.push(None); continue; }
             let mut off = 0;
             let mut mats = [Mat { ty: GgmlType::F32, rows: 0, cols: 0, off: 0, bytes: 0 }; 3];
@@ -63,9 +64,11 @@ impl ExpertCache {
         let frac = (budget as f64 / total.max(1) as f64).min(1.0);
         let profile = profile_path(m);
         let counts = std::fs::read(&profile).ok()
-            .filter(|b| b.len() == 4 * c.n_layer * n)
-            .map(|b| b.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect())
-            .unwrap_or_else(|| vec![0f32; c.n_layer * n]);
+            .filter(|b| b.len() >= 4 * c.n_layer * n)
+            .map(|b| b.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut counts = counts;
+        counts.resize(n_layers * n, 0.0);
 
         let mut pools = Vec::new();
         let mut out: Vec<Option<LayerExperts>> = Vec::new();
@@ -84,7 +87,7 @@ impl ExpertCache {
         }
         let mut cache = ExpertCache { pools, layers: out, n_expert: n, counts, profile, swaps: 0 };
         // Initial fill: hottest first by profile; ties (and no profile) keep layer order.
-        let mut order: Vec<usize> = (0..c.n_layer * n).filter(|&i| cache.layers[i / n].is_some()).collect();
+        let mut order: Vec<usize> = (0..n_layers * n).filter(|&i| cache.layers[i / n].is_some()).collect();
         order.sort_by(|&a, &b| cache.counts[b].total_cmp(&cache.counts[a]).then(a.cmp(&b)));
         for i in order {
             let p = cache.layers[i / n].as_ref().unwrap().pool;

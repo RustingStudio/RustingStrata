@@ -58,7 +58,7 @@ impl Runner<'_> {
 impl Engine {
     fn runner<'a>(&self, m: &'a Model<'a>) -> anyhow::Result<Runner<'a>> {
         if !self.gpu { return Ok(Runner::Cpu(m, State::new(&m.cfg))); }
-        Ok(Runner::Gpu(Box::new(GpuModel::load(m, Gpu::new()?, self.ctx, self.chunk, self.vram_margin << 20)?)))
+        Ok(Runner::Gpu(Box::new(GpuModel::load(m, Gpu::new()?, self.ctx, self.chunk, self.vram_margin << 20, false)?)))
     }
 }
 
