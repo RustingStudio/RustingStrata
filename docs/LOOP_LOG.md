@@ -4,7 +4,10 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 ## State
 
-- Milestone: M2 done. M3 expert cache partly in (commit 90db54a). M4 first half (chunked GPU prefill) committed. M5 started: MTP draft head in the CPU reference (6379338) and on the GPU (be8f72b, `GpuModel::mtp_draft`, not used by `generate` yet). Verify forward (5dd7576).
+- Milestone: M2-M5 done (MTP speculative decoding, `generate --mtp`, rollback snapshots). M6: `chat`, `serve`
+  (sampling, `--api-key`), `bench` and `calibrate` in (a336559). M6 left: full v1 gate run, `docs/m6-results.md`,
+  prefix/KV reuse across requests, thread and expert-split calibration. M3 expert cache adaptive.
+- MTP k = 1 decode ~87-92 tok/s (81.7% accepted, #25); k = 2-3 slower (rejected for now).
 - Speed at 4K (3 clean runs): prefill **1581 tok/s** (1538-1610; gate 1017, passed), prefill 1608 at 2dcae33, decode **81.0 tok/s** at a02b4ec (76.8-81.8; gate 67, passed).
   Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 88.1 tok/s at a02b4ec (88.06-88.22, 100% expert hits). 32K (31768-token prompt): prefill ~1290 tok/s, decode best 62.5, noisy (llama.cpp -d 32768: pp512 814, tg128 56.4).
   See `docs/m4-results.md`.
@@ -392,6 +395,26 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - Not done from the spec: sampling (temperature / top-k / top-p), prefix reuse, `--api-key`, HTTP 500 on a failed
   request.
 
+### 2026-10-08 #27 — M6: `calibrate`, `bench`, sampling, `--api-key` (a336559)
+- Found this work uncommitted from the previous session; finished, verified and committed it.
+- `strata calibrate`: times prefill chunk 512/1024/2048/4096 (best of 3), batched prefill vs steps for 8-128 token
+  prompts (sets `short`, the batched-prefill threshold, was a fixed 32), and decode at MTP k = 0..3 on a 128-token
+  greedy run. Writes `~/.cache/rusting_strata/strata-<model>.json`; `--chunk`, `--mtp`, `--threads` override it.
+  Result on the reference machine (load 1.5 -> 13 during the run): chunk 4096 (748 / 1075 / 1144 / 1544 tok/s),
+  short 16 (8 tok: steps 111 ms vs batched 146; 16 tok: 234 vs 184), mtp 1 (k0 78.0, k1 86.0, k2 83.3, k3 67.3).
+- Not calibrated: threads (rayon's global pool is fixed once built, so it needs one process per setting) and the
+  expert-cache split (placement is already VRAM-driven). Split out as a follow-up.
+- `strata bench --pp 512,4096 --tg 128 --reps 3`: prefill and decode tok/s mean (min-max); `--ctx` grows to fit.
+  First run at load 13 (other loop): pp512 559 (340-681), tg128 67.5 (62.6-74.9). Not a clean number.
+- Sampling (`ops::Sampler`): temperature, top-k, top-p, seed (xorshift). Greedy when temp is 0, which keeps the
+  MTP path; temp > 0 decodes one token per step. Test `sampler_cuts_and_matches_softmax` (20000 draws within 2% of
+  the softmax, top-p and top-k cuts). Live: seeds 1 and 2 at temp 1.2 give different text.
+- `serve`: request fields temperature / top_k / top_p / seed, `--api-key` (401 without `Bearer <key>`, constant-time
+  compare, test `checks_api_key`), HTTP 500 JSON on a failed non-streamed request. Live: 401 checked, greedy and
+  temp 0.8 completions correct.
+- GPU suite `tests/gpu_model.rs` 6/6 pass (incl. `mtp_spec_matches_greedy`). Parity not re-run: greedy picks are
+  `argmax` as before.
+
 ## Tried and rejected
 - #25: MTP k = 2-3 chained drafts: correct, but 70.4 / 63.5 tok/s vs 87.4 for k = 1 (acceptance 62% / 48%).
 
@@ -418,5 +441,5 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 1. Cheaper draft head: only with a measured frequent-token list (id-order subset rejected in #24). Also try not
    re-running the draft head for accepted drafts (reuse its KV from the draft pass) to make k = 2 pay.
 2. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs and q5_k.
-3. M6: `calibrate` (threads, chunk, MTP k, short-prompt threshold -> `strata-<model>.json`), then the v1 gate and
-   `docs/m6-results.md`. Server follow-ups: sampling, prefix reuse.
+3. M6: full v1 gate run with `strata bench` on a quiet machine, then `docs/m6-results.md`. Server prefix/KV reuse
+   (keep the previous prompt's state and prefill only the new suffix). `calibrate` threads (subprocess per setting).
