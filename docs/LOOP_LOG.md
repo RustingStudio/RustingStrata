@@ -438,6 +438,19 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   API key and one user, like llama.cpp's prompt cache. Documented in the README; no code change.
 - Host load 22-29 (another loop runs 5 `forever_bear` processes, swap 28.6 of 31 GB): no benchmarks taken.
 
+### 2026-10-08 #30 — prefill GEMM bound (ablation); cp.async f16 X (rejected, no code commit)
+- `gemm_throughput` ablation (2 runs each, load 21-36, ms for attn_gate Q5_K 4096x2048x4096 / ssm_out Q6_K /
+  ffn_down_exps IQ3_XXS): base 5.1-5.3 / 6.4-6.6 / 0.59; X loads replaced by constants 3.7-3.9 / 6.3-6.6 /
+  0.40-0.57; weight dequant replaced by constants 3.9-4.2 / 4.1-4.2 / 0.55-0.63; both 2.8-3.1 / 2.8-3.1 / 0.37
+  (22-25 TFLOP/s, the f16 mma peak of ~25.6). So f16 tensor cores are within 1.7-2.3x of the current kernel, and
+  X loads plus dequant are not hidden behind the mma.
+- Tried: X pre-converted to f16, double-buffered in shared memory with cp.async (46 KB smem per block). 9.7-13.7
+  TFLOP/s vs 10.4-14.5 base (3 runs, load 31): no gain, reverted. Register prefetch of the next X step re-measured:
+  8-12.7 TFLOP/s, slower again (as in #13).
+- Conclusion: the only lever left above ~25 TFLOP/s is int8 tensor cores (MMQ), which also removes the f32 -> f16
+  X conversion. Next: int8 MMQ, split into (a) X quantized to int8 per 32 with scale and sum, (b) one weight type
+  with a parity test against the f16 GEMM, (c) the other types.
+
 ## Tried and rejected
 - #25: MTP k = 2-3 chained drafts: correct, but 70.4 / 63.5 tok/s vs 87.4 for k = 1 (acceptance 62% / 48%).
 
@@ -447,6 +460,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   Replaced by the committed version.
 - #13: GEMM_BM 256 / 64, GEMM_BK 32, launch bounds (256, 2), register prefetch of the next K step. None beat
   128x64x64; prefetch was 1.6x slower. See the #13 entry.
+- #30: f16 X double-buffered with cp.async in the prefill GEMM: no gain (9.7-13.7 vs 10.4-14.5 TFLOP/s).
 - #15: runtime G = 1 inside the single GQA kernel at short context (31 us, worse than G = 8): the kernel keeps 247
   registers whatever G a block takes. Fixed by a separate kernel.
 - #8: nothing rejected. Not tried: choosing the split count from n_pos (needs a fixed grid for graph capture;
