@@ -6,7 +6,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 - Milestone: M2 done. M3 expert cache partly in (commit 90db54a). M4 first half (chunked GPU prefill) committed.
 - Speed at 4K (3 clean runs): prefill **1366 tok/s** (1363-1369; gate 1017, passed), decode **78.6 tok/s** (gate 67, passed).
-  Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 86 tok/s. Next: 32K context and MTP.
+  Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 86 tok/s. 32K (31768-token prompt): prefill ~1200 tok/s, decode ~55 (llama.cpp -d 32768: pp512 814, tg128 56.4).
   See `docs/m4-results.md`.
 - Parity (20 prompts x 32, GPU, 3 runs): prefill 628/630/629 = mean 98.28% +- 0.16; token-by-token prompt
   (`--chunk 0`) 631/627/631 = mean 98.39% +- 0.36. Gate 99%. Decode is not deterministic run to run (adaptive
@@ -129,6 +129,22 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   noise, load average 2-7, swap 14 GB). Parity 631/631/629 (98.49%). Short-prompt decode 86.1 (83.7-87.3, 5 clean).
 - Speed gate (decode > 67, prefill >= 1017 at 4K) now passed on both. Parity gate (99%) still open; see #7 question.
 
+### 2026-10-07 #10 — 32K measured; ldmatrix in prefill attention (f4cf273, 09edad5)
+- GPU idle at start; machine loaded during benches (another loop's rustc at 430% CPU, load average 5-14, swap 15 GB,
+  short GPU users that marked most runs dirty; 3 parity runs hit CUDA_ERROR_OUT_OF_MEMORY and were redone).
+- New: `strata generate --prompt -` reads stdin (32K prompt is over the 128 KiB argument limit). 32K prompt =
+  p4096 text x 8 = 31768 tokens, `--ctx 32768 -n 128`.
+- Before: 32K prefill 818 tok/s (average over the whole prompt; llama.cpp's 814 is pp512 at depth 32K, a marginal
+  rate, so ours is not directly comparable and is the harder number), decode 54.0 (llama 56.4). nsys: attn_prefill_256
+  16.3 s of ~39 s prefill; deltanet_seq 5.0 s, gemm_q5_k 4.9, gemm_iq2_xs 4.5; decode attn_decode 0.59 ms x 10.
+- Cause: V^T tile written with scalar u16 stores at a 640-byte thread stride (all one bank), mma fragments from 32-bit
+  shared loads. Change: V row-major like K, fragments via `ldmatrix` x4 (`.trans` for V); helpers `ldsm4`/`ldsm4t`.
+- Test: `attn_prefill_matches_decode` hd 64/128/256 unchanged errors (6.4-7.4e-5).
+- After: attn_prefill_256 5.4 s (~16 TFLOPS). Clean runs: 32K prefill 1007/1204/1190, decode 26.3/55.6/54.3 (noisy;
+  CPU expert work suffers under load); 4K prefill 835/1434/1220, decode 64-78. Parity 628/629/627 (98.13%).
+- Decode numbers this iteration are not trustworthy (load). Re-measure 4K and short decode when the machine is quiet;
+  the change does not touch the decode path.
+
 ## Tried and rejected
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
@@ -138,9 +154,8 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 ## Next candidates
 
-1. 32K context: measure prefill and decode at 32K vs llama.cpp (`docs/baseline.md`); attention and deltanet costs
-   grow there. Needs idle GPU.
-2. deltanet_seq 0.66 s of ~3 s 4K prefill (sequential scan, 21.9 ms x 30 layers); chunked WY form.
-3. Decode GEMVs: gemv_q5_k 3.1 ms/token, gemv_q6_k 1.6, moe_combine 1.1 (28 us x 40, looks high for its work),
-   output head gemv_q4_k 1.1. Check each against memory bandwidth.
+1. Quiet re-measure of 4K / short / 32K decode after #10 (machine was loaded). Cheap, do first when idle.
+2. 32K prefill: deltanet_seq 5.0 s (sequential scan; chunked WY form), gemm_q5_k 4.9 s, gemm_iq2_xs 4.5 s,
+   attn_prefill_256 5.4 s (cp.async prefetch of the next K/V tile; one block per SM at 67 KB shared).
+3. 32K decode: attn_decode 0.59 ms x 10 = 5.9 ms/token; share K/V loads across the 8 query heads of a GQA group.
 4. Parity: score the 6 long prompts with the CPU f32 reference (~15 min CPU) to confirm their misses are shared.
