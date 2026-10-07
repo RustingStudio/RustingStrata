@@ -64,7 +64,7 @@ impl GpuModel<'_> {
     /// loaded without a prefill chunk) go through the decode step.
     pub fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
         let Some(chunk) = self.pf.as_ref().map(|p| p.chunk) else { return self.step_all(tokens) };
-        if tokens.len() < 32 { return self.step_all(tokens); }
+        if tokens.len() < self.short { return self.step_all(tokens); }
         anyhow::ensure!(self.pos + tokens.len() <= self.ctx, "context full ({} tokens)", self.ctx);
         for ch in tokens.chunks(chunk) { self.prefill_chunk(ch)?; }
         let (g, ne) = (&self.gpu, self.m.cfg.n_embd);

@@ -46,3 +46,43 @@ pub fn top_k(p: &[f32], k: usize) -> Vec<usize> {
 pub fn argmax(x: &[f32]) -> usize {
     (1..x.len()).fold(0, |b, i| if x[i].total_cmp(&x[b]).is_gt() { i } else { b })
 }
+
+/// Token choice after the logits: greedy when `temp` is 0, else softmax(logits / temp) cut to the `top_k` most likely
+/// tokens (0 = no cut) and then to the smallest set whose probability reaches `top_p`.
+#[derive(Clone, Debug)]
+pub struct Sampler {
+    pub temp: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    /// xorshift64 state; must not be 0.
+    pub rng: u64,
+}
+
+impl Sampler {
+    pub fn greedy() -> Self { Sampler { temp: 0.0, top_k: 0, top_p: 1.0, rng: 1 } }
+
+    pub fn pick(&mut self, logits: &[f32]) -> usize {
+        if self.temp <= 0.0 { return argmax(logits); }
+        let m = logits[argmax(logits)];
+        // Tokens below e^-20 of the best one are dropped first so only a few are sorted, not the whole vocabulary.
+        let mut c: Vec<(usize, f32)> = logits.iter().enumerate()
+            .map(|(i, &l)| (i, (l - m) / self.temp)).filter(|x| x.1 > -20.0).map(|(i, x)| (i, x.exp())).collect();
+        c.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        if self.top_k > 0 { c.truncate(self.top_k); }
+        let total: f32 = c.iter().map(|x| x.1).sum();
+        let (mut acc, mut n) = (0.0, c.len());
+        for (j, x) in c.iter().enumerate() {
+            acc += x.1;
+            if acc >= self.top_p * total { n = j + 1; break; }
+        }
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        let mut r = (self.rng >> 40) as f32 / (1u64 << 24) as f32 * c[..n].iter().map(|x| x.1).sum::<f32>();
+        for &(i, p) in &c[..n] {
+            r -= p;
+            if r < 0.0 { return i; }
+        }
+        c[n - 1].0
+    }
+}

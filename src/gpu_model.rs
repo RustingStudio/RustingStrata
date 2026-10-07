@@ -76,6 +76,8 @@ pub struct GpuModel<'a> {
     pub drafts: (usize, usize),
     /// MTP drafts per speculative step (0 = no draft head). May be lowered after `load`, never raised.
     pub k: usize,
+    /// Prompts shorter than this go through `step` instead of the batched prefill.
+    pub short: usize,
     /// Prefill scratch (None: prompts go through `step`).
     pf: Option<prefill::Scratch>,
     mtp: Option<MtpHead>,
@@ -167,7 +169,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, step_buf, graphs: (0..=TMAX).map(|_| None).collect(), mtp_graphs: Default::default(), ctx, pos: 0, saved: vec![], saved_pos: 0, cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO, drafts: (0, 0), k, pf, mtp })
+        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, step_buf, graphs: (0..=TMAX).map(|_| None).collect(), mtp_graphs: Default::default(), ctx, pos: 0, saved: vec![], saved_pos: 0, cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO, drafts: (0, 0), k, short: 32, pf, mtp })
     }
 
     /// Clear KV and recurrent state.
