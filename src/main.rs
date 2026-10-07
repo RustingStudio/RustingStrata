@@ -83,6 +83,7 @@ enum Cmd {
     Generate {
         #[arg(long)]
         model: PathBuf,
+        /// Prompt text ("-" reads stdin; long prompts exceed the 128 KiB argument limit).
         #[arg(long)]
         prompt: String,
         #[arg(short, default_value_t = 32)]
@@ -141,6 +142,11 @@ fn main() -> anyhow::Result<()> {
             let tok = Tokenizer::from_gguf(&g)?;
             let eos = tok.eos_ids();
             let mut r = engine.runner(&m)?;
+            let prompt = if prompt == "-" {
+                let mut s = String::new();
+                std::io::stdin().read_to_string(&mut s)?;
+                s
+            } else { prompt };
             let ids = tok.encode(&prompt)?;
             let t0 = Instant::now();
             let mut logits = r.prefill(&ids)?;
