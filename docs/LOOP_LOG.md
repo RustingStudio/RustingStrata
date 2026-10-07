@@ -5,8 +5,8 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 ## State
 
 - Milestone: M2-M5 done (MTP speculative decoding, `generate --mtp`, rollback snapshots). M6: `chat`, `serve`
-  (sampling, `--api-key`), `bench` and `calibrate` in (a336559). M6 left: full v1 gate run, `docs/m6-results.md`,
-  prefix/KV reuse across requests, thread and expert-split calibration. M3 expert cache adaptive.
+  (sampling, `--api-key`, history reuse 99fbd11), `bench` and `calibrate` in (a336559). M6 left: full v1 gate run,
+  `docs/m6-results.md`, thread and expert-split calibration. M3 expert cache adaptive.
 - MTP k = 1 decode ~87-92 tok/s (81.7% accepted, #25); k = 2-3 slower (rejected for now).
 - Speed at 4K (3 clean runs): prefill **1581 tok/s** (1538-1610; gate 1017, passed), prefill 1608 at 2dcae33, decode **81.0 tok/s** at a02b4ec (76.8-81.8; gate 67, passed).
   Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 88.1 tok/s at a02b4ec (88.06-88.22, 100% expert hits). 32K (31768-token prompt): prefill ~1290 tok/s, decode best 62.5, noisy (llama.cpp -d 32768: pp512 814, tg128 56.4).
@@ -415,6 +415,22 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - GPU suite `tests/gpu_model.rs` 6/6 pass (incl. `mtp_spec_matches_greedy`). Parity not re-run: greedy picks are
   `argmax` as before.
 
+### 2026-10-08 #28 — security fix for `--api-key` (2e9bf2a); prefix reuse across requests (99fbd11)
+- Background security review of a336559: an empty `--api-key ""` matched requests with no `Authorization` header,
+  and a key on the command line shows in the process list. Fix: empty key refused (at start and in `key_ok`), key
+  also read from `STRATA_API_KEY`. Test `checks_api_key` covers the empty case.
+- Prefix reuse: `GpuModel::prefill_cached(tokens, keep)` saves the recurrent state (existing `save_state`) after
+  `tokens[..keep]`, the message history without the assistant header. The next call whose history starts with the
+  saved tokens restores it and prefills only the rest (KV entries before the saved position are untouched by the
+  reply; the draft head restarts at 0). `reset` forgets the saved prefix because it zeroes the KV. A hybrid model
+  cannot rewind its recurrent state to an arbitrary token, so reuse works only at this saved point.
+- `chat` and `serve` use it; `serve` reports `usage.prompt_tokens_details.cached_tokens`.
+- Test `prefill_cached_reuses_history`: logits bit-identical to a fresh run split at the same points, with decode
+  steps between calls; a prompt that does not extend the saved history starts over. GPU suite 7/7 pass.
+- Live (serve, `max_tokens` 1, load 28): 2320-token second turn with 2295 reused 0.52 / 0.38 / 0.56 s, the same
+  request fresh 1.96 / 1.95 / 1.97 s.
+- Parity not re-run: plain prefill and decode are unchanged.
+
 ## Tried and rejected
 - #25: MTP k = 2-3 chained drafts: correct, but 70.4 / 63.5 tok/s vs 87.4 for k = 1 (acceptance 62% / 48%).
 
@@ -441,5 +457,4 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 1. Cheaper draft head: only with a measured frequent-token list (id-order subset rejected in #24). Also try not
    re-running the draft head for accepted drafts (reuse its KV from the draft pass) to make k = 2 pay.
 2. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs and q5_k.
-3. M6: full v1 gate run with `strata bench` on a quiet machine, then `docs/m6-results.md`. Server prefix/KV reuse
-   (keep the previous prompt's state and prefill only the new suffix). `calibrate` threads (subprocess per setting).
+3. M6: full v1 gate run with `strata bench` on a quiet machine, then `docs/m6-results.md`. `calibrate` threads (subprocess per setting).
