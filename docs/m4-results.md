@@ -23,3 +23,5 @@ Short-prompt decode (8-token prompt, -n 128): 85.8 tok/s at 8d0c3c4, 83.3 at 186
 llama.cpp `-d 32768`: pp512 814, tg128 56.4 (marginal rate at depth, not an average).
 
 Gate: prefill >= 1017 tok/s at 4K, decode > 67 tok/s, parity >= 99%.
+
+M5 (MTP): CPU reference draft acceptance 24/25 greedy (6379338). GPU draft head matches it (be8f72b); speculative decode not wired into `generate` yet, so no speed change.
