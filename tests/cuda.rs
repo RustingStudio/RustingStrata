@@ -272,7 +272,8 @@ fn attn_prefill_matches_decode() {
     }
 }
 
-/// DeltaNet scan over a chunk of T tokens equals T single-token scans and a CPU scan (output and final state).
+/// DeltaNet scan over a chunk of T tokens equals T single-token scans and a CPU scan (output and final state), and
+/// its snapshots equal the states after the first single-token scans.
 #[test]
 fn deltanet_chunk_matches_steps() {
     let Some(gpu) = gpu() else { return };
@@ -283,21 +284,26 @@ fn deltanet_chunk_matches_steps() {
     let g: Vec<f32> = xs(t * nv + 1)[1..].iter().map(|v| -0.2 * v.abs()).collect();
     let s0: Vec<f32> = xs(nv * dv * dk + 2)[2..].iter().map(|v| 0.1 * v).collect();
     let (dy, db, dg) = (gpu.stream.clone_htod(&y).unwrap(), gpu.stream.clone_htod(&beta).unwrap(), gpu.stream.clone_htod(&g).unwrap());
+    let (ns, len) = (3, nv * dv * dk);
     let run = |chunk: bool| {
         let ds = gpu.stream.clone_htod(&s0).unwrap();
         let o = gpu.zeros::<f32>(t * nv * dv).unwrap();
+        let snap = gpu.zeros::<f32>(ns * len).unwrap();
         let p = |d: u64, per: usize, i: usize| d + (i * per * 4) as u64;
         let steps: Vec<(usize, usize)> = if chunk { vec![(0, t)] } else { (0..t).map(|i| (i, 1)).collect() };
+        let mut snaps = vec![];
         for (i, n) in steps {
             gpu.deltanet(p(gpu.ptr(&dy), ych, i), gpu.ptr(&ds), p(gpu.ptr(&db), nv, i), p(gpu.ptr(&dg), nv, i),
-                         p(gpu.ptr(&o), nv * dv, i), nk, nv, dk, dv, 0.5, n, ych).unwrap();
+                         p(gpu.ptr(&o), nv * dv, i), nk, nv, dk, dv, 0.5, n, ych, gpu.ptr(&snap), ns).unwrap();
+            if !chunk && i < ns { snaps.extend(gpu.stream.clone_dtoh(&ds).unwrap()); }
         }
-        (gpu.stream.clone_dtoh(&o).unwrap(), gpu.stream.clone_dtoh(&ds).unwrap())
+        if chunk { snaps = gpu.stream.clone_dtoh(&snap).unwrap(); }
+        (gpu.stream.clone_dtoh(&o).unwrap(), gpu.stream.clone_dtoh(&ds).unwrap(), snaps)
     };
-    let ((o1, s1), (o2, s2)) = (run(true), run(false));
-    let (eo, es) = (rel_l2(&o1, &o2), rel_l2(&s1, &s2));
-    eprintln!("deltanet chunk vs steps: out {eo:.2e}, state {es:.2e}");
-    assert!(eo <= 1e-5 && es <= 1e-5, "out {eo}, state {es}");
+    let ((o1, s1, n1), (o2, s2, n2)) = (run(true), run(false));
+    let (eo, es, en) = (rel_l2(&o1, &o2), rel_l2(&s1, &s2), rel_l2(&n1, &n2));
+    eprintln!("deltanet chunk vs steps: out {eo:.2e}, state {es:.2e}, snapshots {en:.2e}");
+    assert!(eo <= 1e-5 && es <= 1e-5 && en <= 1e-5, "out {eo}, state {es}, snapshots {en}");
     // CPU: S_j = decay * S_j; d = beta (v_j - S_j . k); S_j += d k; o_j = scale * S_j . q
     let (mut sc, mut oc) = (s0.clone(), vec![0.0f32; t * nv * dv]);
     for tok in 0..t {
@@ -332,13 +338,18 @@ fn conv_seq_matches_steps() {
         let (dw, dx) = (gpu.stream.clone_htod(&w).unwrap(), gpu.stream.clone_htod(&x).unwrap());
         let (s1, s2) = (gpu.stream.clone_htod(&st0).unwrap(), gpu.stream.clone_htod(&st0).unwrap());
         let (y1, y2) = (gpu.zeros::<f32>(t * ch).unwrap(), gpu.zeros::<f32>(t * ch).unwrap());
-        gpu.conv_seq(gpu.ptr(&dx), gpu.ptr(&s1), gpu.ptr(&dw), gpu.ptr(&y1), ch, kw, t).unwrap();
+        let ns = 3;
+        let snap = gpu.zeros::<f32>(ns * (kw - 1) * ch).unwrap();
+        gpu.conv_seq(gpu.ptr(&dx), gpu.ptr(&s1), gpu.ptr(&dw), gpu.ptr(&y1), ch, kw, t, gpu.ptr(&snap), ns).unwrap();
+        let d = |a: &cudarc::driver::CudaSlice<f32>| gpu.stream.clone_dtoh(a).unwrap();
+        let mut snaps = vec![];
         for i in 0..t {
             let off = (i * ch * 4) as u64;
             gpu.conv_silu(gpu.ptr(&dx) + off, gpu.ptr(&s2), gpu.ptr(&dw), gpu.ptr(&y2) + off, ch, kw).unwrap();
+            if i + 1 < t && i < ns { snaps.extend(d(&s2)); }
         }
-        let d = |a: &cudarc::driver::CudaSlice<f32>| gpu.stream.clone_dtoh(a).unwrap();
         let (ey, es) = (rel_l2(&d(&y1), &d(&y2)), rel_l2(&d(&s1), &d(&s2)));
         assert!(ey <= 1e-6 && es == 0.0, "T {t}: y {ey}, state {es}");
+        assert_eq!(d(&snap)[..snaps.len()], snaps[..], "T {t}: snapshots");
     }
 }

@@ -102,16 +102,16 @@ impl GpuModel<'_> {
         for (il, ly) in self.layers.iter().enumerate() {
             g.rms_norm(x, ne, ly.attn_norm.ptr, h, ne, ne, t, eps)?;
             match &ly.mixer {
-                Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s } => {
+                Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, .. } => {
                     let (eb, eg) = (at(l.e), at(l.e + n * nv));
                     g.gemm_dense(qkv, t, h, ne, at(l.a), channels, 0)?;
                     g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, 0)?;
                     g.gemm_dense(beta, t, h, ne, eb, nv, 0)?;
                     g.gemm_dense(alpha, t, h, ne, eg, nv, 0)?;
                     g.ssm_gates(eb, eg, dt_bias.ptr, a.ptr, t * nv, nv)?;
-                    g.conv_seq(at(l.a), g.ptr(conv), conv_w.ptr, at(l.c), channels, c.ssm_conv, t)?;
+                    g.conv_seq(at(l.a), g.ptr(conv), conv_w.ptr, at(l.c), channels, c.ssm_conv, t, 0, 0)?;
                     g.l2_norm(at(l.c), dk, 2 * nk, channels, t * 2 * nk, eps)?;
-                    g.deltanet(at(l.c), g.ptr(s), eb, eg, at(l.d), nk, nv, dk, dv, 1.0 / (dk as f32).sqrt(), t, channels)?;
+                    g.deltanet(at(l.c), g.ptr(s), eb, eg, at(l.d), nk, nv, dk, dv, 1.0 / (dk as f32).sqrt(), t, channels, 0, 0)?;
                     g.norm_gate(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps)?;
                     g.gemm_dense(out, t, at(l.d), c.ssm_d_inner, x, ne, 2)?;
                 }
