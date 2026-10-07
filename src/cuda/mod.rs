@@ -21,7 +21,8 @@ const KERNELS: [&str; 22] = [
 ];
 
 /// Blocks per head in decode attention (positions split across them).
-pub const ATT_SPLITS: usize = 16;
+pub const ATT_SPLITS: usize = 64;
+const _: () = assert!(ATT_SPLITS <= 256);  // attn_merge keeps one weight per split in a 256-thread block
 
 /// Positions per GEMM tile (GEMM_BM in kernels.cu).
 pub const GEMM_BM: usize = 128;
@@ -279,7 +280,9 @@ impl Gpu {
     /// `nh * ATT_SPLITS * (hd + 2)` floats.
     pub fn attn_decode(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
         if ![64, 128, 256, 512].contains(&hd) { bail!("attention head_dim {hd} unsupported (64, 128, 256 or 512)"); }
-        launch!(self, "attn_decode", cfg((nh as u32, ATT_SPLITS as u32), 256, (8 * hd * 4) as u32),
+        let group = nh / nkv;  // query heads per KV head, served by one block (up to 8, G * hd <= 2048)
+        let g = [8, 4, 2, 1].into_iter().find(|&g| group % g == 0 && g * hd <= 2048).unwrap();
+        launch!(self, "attn_decode", cfg(((nh / g) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4) as u32),
             q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale);
         launch!(self, "attn_merge", cfg((nh as u32, 1), 256, 0), part, qg, out, hd as i32, ATT_SPLITS as i32);
         Ok(())

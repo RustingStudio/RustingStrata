@@ -627,10 +627,11 @@ template <int PER> __device__ __forceinline__ void ldh_vec(const u16* p, float* 
     }
 }
 
-// Split-position decode attention. grid = (query heads, ns splits): block (h, s) covers an ns-th of the positions,
-// each warp walks its share with online softmax (lane owns PER = hd / 32 consecutive dims), warps merge, and the
-// block writes its unnormalized partial [acc (hd) | max | sum] to part; attn_merge combines the splits.
-template <int PER>
+// Split-position decode attention. grid = (nh / G, ns splits): block (b, s) serves the G query heads b*G .. b*G+G-1
+// (one KV head) over an ns-th of the positions, so each K/V row is read once for all G heads. Each warp walks its
+// share with online softmax (lane owns PER = hd / 32 consecutive dims), warps merge head by head, and the block
+// writes per head its unnormalized partial [acc (hd) | max | sum] to part; attn_merge combines the splits.
+template <int PER, int G>
 __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
                               int nh, int nkv, float scale) {
     constexpr int hd = PER * 32;
@@ -638,48 +639,74 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
     int p0 = blockIdx.y * per_s, p1 = min(n_pos, p0 + per_s);
     extern __shared__ float sacc[];  // nw * hd
     __shared__ float sm[32], sl[32];
-    int h = blockIdx.x, g = h / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
-    float qv[PER], acc[PER], kv[PER], m = -INFINITY, l = 0.0f;
-    for (int d = 0; d < PER; d++) { qv[d] = q[h * hd + lane * PER + d]; acc[d] = 0.0f; }
+    int h0 = blockIdx.x * G, g = h0 / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    float qv[G][PER], acc[G][PER], kv[PER], vv[PER], kn[PER], vn[PER], m[G], l[G];
+#pragma unroll
+    for (int i = 0; i < G; i++) {
+        m[i] = -INFINITY; l[i] = 0.0f;
+        for (int d = 0; d < PER; d++) { qv[i][d] = q[(h0 + i) * hd + lane * PER + d]; acc[i][d] = 0.0f; }
+    }
+    auto row = [&](int t) { return ((size_t)t * nkv + g) * hd + lane * PER; };
+    if (p0 + w < p1) { ldh_vec<PER>(kc + row(p0 + w), kn); ldh_vec<PER>(vc + row(p0 + w), vn); }
     for (int t = p0 + w; t < p1; t += nw) {
-        size_t off = ((size_t)t * nkv + g) * hd + lane * PER;
-        ldh_vec<PER>(kc + off, kv);
-        float s = 0.0f;
-        for (int d = 0; d < PER; d++) s += qv[d] * kv[d];
-        s = warp_sum(s) * scale;
-        float mn = fmaxf(m, s), c = expf(m - mn), p = expf(s - mn);
-        l = l * c + p;
-        ldh_vec<PER>(vc + off, kv);
-        for (int d = 0; d < PER; d++) acc[d] = acc[d] * c + p * kv[d];
-        m = mn;
+        for (int d = 0; d < PER; d++) { kv[d] = kn[d]; vv[d] = vn[d]; }
+        if (t + nw < p1) { ldh_vec<PER>(kc + row(t + nw), kn); ldh_vec<PER>(vc + row(t + nw), vn); }  // prefetch
+        float c[G], p[G];
+#pragma unroll
+        for (int i = 0; i < G; i++) {
+            float s = 0.0f;
+            for (int d = 0; d < PER; d++) s += qv[i][d] * kv[d];
+            p[i] = s;
+        }
+#pragma unroll
+        for (int i = 0; i < G; i++) {
+            float s = warp_sum(p[i]) * scale, mn = fmaxf(m[i], s);
+            c[i] = expf(m[i] - mn); p[i] = expf(s - mn);
+            l[i] = l[i] * c[i] + p[i]; m[i] = mn;
+        }
+#pragma unroll
+        for (int i = 0; i < G; i++)
+            for (int d = 0; d < PER; d++) acc[i][d] = acc[i][d] * c[i] + p[i] * vv[d];
     }
-    if (lane == 0) { sm[w] = m; sl[w] = l; }
-    for (int d = 0; d < PER; d++) sacc[w * hd + lane * PER + d] = acc[d];
-    __syncthreads();
-    float* pp = part + ((size_t)h * ns + blockIdx.y) * (hd + 2);
-    float M = -INFINITY;
-    for (int i = 0; i < nw; i++) M = fmaxf(M, sm[i]);
-    if (M == -INFINITY) {  // empty split (fewer positions than splits)
-        for (int d = threadIdx.x; d < hd + 2; d += blockDim.x) pp[d] = d == hd ? -INFINITY : 0.0f;
-        return;
+#pragma unroll
+    for (int i = 0; i < G; i++) {
+        if (lane == 0) { sm[w] = m[i]; sl[w] = l[i]; }
+        for (int d = 0; d < PER; d++) sacc[w * hd + lane * PER + d] = acc[i][d];
+        __syncthreads();
+        float* pp = part + ((size_t)(h0 + i) * ns + blockIdx.y) * (hd + 2);
+        float M = -INFINITY;
+        for (int k = 0; k < nw; k++) M = fmaxf(M, sm[k]);
+        if (M == -INFINITY) {  // empty split (fewer positions than splits)
+            for (int d = threadIdx.x; d < hd + 2; d += blockDim.x) pp[d] = d == hd ? -INFINITY : 0.0f;
+        } else {
+            float L = 0.0f;
+            for (int k = 0; k < nw; k++) L += sl[k] * expf(sm[k] - M);
+            for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+                float o = 0.0f;
+                for (int k = 0; k < nw; k++) o += sacc[k * hd + d] * expf(sm[k] - M);
+                pp[d] = o;
+            }
+            if (threadIdx.x == 0) { pp[hd] = M; pp[hd + 1] = L; }
+        }
+        __syncthreads();
     }
-    float L = 0.0f;
-    for (int i = 0; i < nw; i++) L += sl[i] * expf(sm[i] - M);
-    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
-        float o = 0.0f;
-        for (int i = 0; i < nw; i++) o += sacc[i * hd + d] * expf(sm[i] - M);
-        pp[d] = o;
-    }
-    if (threadIdx.x == 0) { pp[hd] = M; pp[hd + 1] = L; }
 }
 
+// G = nh / gridDim.x heads per block (1, 2, 4 or 8; G * hd <= 2048).
+#define ATT_G(PER)                                                                             \
+    switch (nh / gridDim.x) {                                                                  \
+        case 1: attn_decode_t<PER, 1>(q, kc, vc, part, step, nh, nkv, scale); break;           \
+        case 2: attn_decode_t<PER, 2>(q, kc, vc, part, step, nh, nkv, scale); break;           \
+        case 4: if constexpr (PER <= 16) attn_decode_t<PER, 4>(q, kc, vc, part, step, nh, nkv, scale); break; \
+        case 8: if constexpr (PER <= 8) attn_decode_t<PER, 8>(q, kc, vc, part, step, nh, nkv, scale); break;  \
+    }
 extern "C" __global__ void attn_decode(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
                                        int nh, int nkv, int hd, float scale) {
     switch (hd) {
-        case 64: attn_decode_t<2>(q, kc, vc, part, step, nh, nkv, scale); break;
-        case 128: attn_decode_t<4>(q, kc, vc, part, step, nh, nkv, scale); break;
-        case 256: attn_decode_t<8>(q, kc, vc, part, step, nh, nkv, scale); break;
-        case 512: attn_decode_t<16>(q, kc, vc, part, step, nh, nkv, scale); break;
+        case 64: ATT_G(2) break;
+        case 128: ATT_G(4) break;
+        case 256: ATT_G(8) break;
+        case 512: ATT_G(16) break;
     }
 }
 
@@ -687,12 +714,18 @@ extern "C" __global__ void attn_decode(const float* q, const u16* kc, const u16*
 extern "C" __global__ void attn_merge(const float* part, const float* qg, float* out, int hd, int ns) {
     int h = blockIdx.x;
     const float* pp = part + (size_t)h * ns * (hd + 2);
+    __shared__ float ws[256];  // split max, then split weight (ns <= blockDim.x <= 256)
+    if (threadIdx.x < ns) ws[threadIdx.x] = pp[threadIdx.x * (hd + 2) + hd];
+    __syncthreads();
     float M = -INFINITY, L = 0.0f;
-    for (int s = 0; s < ns; s++) M = fmaxf(M, pp[s * (hd + 2) + hd]);
-    for (int s = 0; s < ns; s++) L += pp[s * (hd + 2) + hd + 1] * expf(pp[s * (hd + 2) + hd] - M);
+    for (int s = 0; s < ns; s++) M = fmaxf(M, ws[s]);
+    __syncthreads();
+    if (threadIdx.x < ns) ws[threadIdx.x] = expf(ws[threadIdx.x] - M);
+    __syncthreads();
+    for (int s = 0; s < ns; s++) L += pp[s * (hd + 2) + hd + 1] * ws[s];
     for (int d = threadIdx.x; d < hd; d += blockDim.x) {
         float o = 0.0f;
-        for (int s = 0; s < ns; s++) o += pp[s * (hd + 2) + d] * expf(pp[s * (hd + 2) + hd] - M);
+        for (int s = 0; s < ns; s++) o += pp[s * (hd + 2) + d] * ws[s];
         out[h * hd + d] = o / L * sigmoid(qg[h * 2 * hd + hd + d]);
     }
 }
