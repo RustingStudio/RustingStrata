@@ -6,7 +6,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 - Milestone: M2 done. M3 expert cache partly in (commit 90db54a). M4 first half (chunked GPU prefill) committed.
 - Speed at 4K (3 clean runs): prefill **1581 tok/s** (1538-1610; gate 1017, passed), prefill 1608 at 2dcae33, decode **81.0 tok/s** at a02b4ec (76.8-81.8; gate 67, passed).
-  Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 86.7 tok/s at b9d9547 (86.4-86.9, ~100% expert hits). 32K (31768-token prompt): prefill ~1290 tok/s, decode best 62.5, noisy (llama.cpp -d 32768: pp512 814, tg128 56.4).
+  Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 88.1 tok/s at a02b4ec (88.06-88.22, 100% expert hits). 32K (31768-token prompt): prefill ~1290 tok/s, decode best 62.5, noisy (llama.cpp -d 32768: pp512 814, tg128 56.4).
   See `docs/m4-results.md`.
 - Parity (20 prompts x 32, GPU, 3 runs): prefill 628/630/629 = mean 98.28% +- 0.16; token-by-token prompt
   (`--chunk 0`) 631/627/631 = mean 98.39% +- 0.36. Gate 99%. Decode is not deterministic run to run (adaptive
@@ -248,6 +248,17 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   decode 76.8/81.0/81.8 (was 77.5/80.4/80.8), prefill 1199/1632/1641. Parity 629/630/632. Short decode 22-74
   (host load 8, not usable).
 
+### 2026-10-07 #18 — paired dense GEMVs (rejected); clean short decode 88.1 (no code change)
+- GPU idle; host load 2.7-3.2 for the A/B, then 5-12.
+- Tried: `Gpu::gemv2` runs two quantized matrices with the same type and columns as one launch (grid.y = 2, extra
+  blocks exit), used for DeltaNet qkv + gate and beta + alpha, attention k + v, shared-expert gate + up. 80 fewer
+  launches per token (1062 -> 982), bit-identical outputs (test passed).
+- Result: no gain. Interleaved nsys dense GEMV 5946-6012 vs 5878-5998 us per token. Interleaved short decode without
+  the profiler, 8 rounds: 4 rounds at 100% hits give 88.08/88.20/88.06/88.22 (base) vs 88.16/88.23/88.06/88.18;
+  earlier rounds with 4-131 misses 86.2-87.9 for both. Reverted.
+- Short decode at a02b4ec (100% hits, load ~2.8): **88.1 tok/s** (88.06-88.22, 4 runs). Was 86.7 at b9d9547.
+- 32K at a02b4ec (3 clean): prefill 1228/1051/1050, decode 60.3/8.1/60.1 (the 8.1 run under host load 12).
+
 ## Tried and rejected
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
@@ -264,13 +275,15 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   (6100-10100 / 2580-2940); `#pragma unroll 8` (6040 / 2720); 16 values per lane with half-warps on alternate
   super-blocks (5890 / 2700); warp copies 4 super-blocks of its row into shared memory with 16-byte loads, then
   decodes (6590 / 2840). Upper bound for quantizing x once instead of per block: ~4% (x loads zeroed: 5690 / 2380).
+- #18: dense GEMV pairs in one launch (qkv + gate, beta + alpha, k + v, shared gate + up): 80 fewer launches per
+  token, short decode 88.16 vs 88.14 at 100% hits. Graph launch gaps are not a cost at this size.
 
 ## Next candidates
 
 1. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs (expert
    GEMMs) and q5_k. Large; needs a parity test per type against the f16 GEMM.
-2. Decode GEMVs: pair the shared-expert gate and up (2 x 5.6 us per layer at ~129 GB/s) the same way; then quantize
-   x once per token into global memory (<= 4% of GEMV time, see #17). The MoE GEMVs stay at ~122 GB/s; llama.cpp's
+2. Decode GEMVs: quantize x once per token into global memory (<= 4% of GEMV time, see #17; pairing launches gave
+   nothing, #18). The MoE GEMVs stay at ~122 GB/s; llama.cpp's
    mmvq layout (several warps per row, K split) is the untried structure.
 3. Expert placement robustness: hit rate drops to ~91% when VRAM is short at start, costing ~30% decode. A flag to cap
    GPU expert slots would make this measurable (and the thread-count test of #16 fair).
