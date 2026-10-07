@@ -22,7 +22,7 @@ struct Engine {
     #[arg(long, default_value_t = 4096)]
     ctx: usize,
     /// Prefill chunk in tokens (GPU; 0 = token by token).
-    #[arg(long, default_value_t = 1024)]
+    #[arg(long, default_value_t = 4096)]
     chunk: usize,
     /// VRAM left free after placing expert layers, in MB.
     #[arg(long, default_value_t = 512)]
