@@ -52,6 +52,9 @@ STRATA_API_KEY=secret target/release/strata serve --model $M --gpu --addr 127.0.
 It runs one request at a time. `temperature`, `top_k`, `top_p` and `seed` are honored, and decoding is greedy when
 they are left out. When a request repeats the previous request's messages and adds new ones, only the new part is
 prefilled (`usage.prompt_tokens_details.cached_tokens`).
+The server has one key and treats all clients as one user: the cached-token count and the response time show
+whether the previous request started with the same messages, so do not share one server between people who must
+not learn each other's prompts.
 
 Useful flags: `--ctx` (KV cache size, default 4096), `--mtp [N]` (speculative decoding with the model's draft
 head; only greedy decoding uses it), `--chunk`, `--threads`, `--vram-margin`. Without `--gpu` everything runs on
