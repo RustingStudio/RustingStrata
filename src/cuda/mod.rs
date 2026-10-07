@@ -277,7 +277,7 @@ impl Gpu {
     /// Decode attention over positions 0 ..= step[0], split across ATT_SPLITS blocks per head; `part` holds
     /// `nh * ATT_SPLITS * (hd + 2)` floats.
     pub fn attn_decode(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
-        if hd % 32 != 0 || hd > 512 { bail!("attention head_dim {hd} unsupported (multiple of 32, at most 512)"); }
+        if ![64, 128, 256, 512].contains(&hd) { bail!("attention head_dim {hd} unsupported (64, 128, 256 or 512)"); }
         launch!(self, "attn_decode", cfg((nh as u32, ATT_SPLITS as u32), 256, (8 * hd * 4) as u32),
             q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale);
         launch!(self, "attn_merge", cfg((nh as u32, 1), 256, 0), part, qg, out, hd as i32, ATT_SPLITS as i32);
