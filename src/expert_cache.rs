@@ -33,11 +33,16 @@ pub struct ExpertCache {
     pub swaps: usize,
 }
 
+/// Where routing profiles and calibration files live.
+pub fn cache_dir() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"))
+        .join("rusting_strata")
+}
+
 fn profile_path(m: &Model) -> PathBuf {
-    let dir = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"));
     let (c, n) = (&m.cfg, m.w.g.tensors.len());
-    dir.join("rusting_strata").join(format!("profile-{}-{}x{}-{n}.f32", c.arch, c.n_layer, c.n_expert))
+    cache_dir().join(format!("profile-{}-{}x{}-{n}.f32", c.arch, c.n_layer, c.n_expert))
 }
 
 impl ExpertCache {

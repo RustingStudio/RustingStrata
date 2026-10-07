@@ -39,3 +39,16 @@ fn softmax_sums_to_one() {
     softmax(&mut x);
     assert!((x.iter().sum::<f32>() - 1.0).abs() < 1e-6 && x[2] > x[1]);
 }
+#[test]
+fn sampler_cuts_and_matches_softmax() {
+    let l = [2.0f32.ln(), 1.0f32.ln(), 1.0f32.ln(), -50.0]; // probabilities 1/2, 1/4, 1/4, ~0
+    assert_eq!(Sampler::greedy().pick(&l), 0);
+    let mut s = Sampler { temp: 1.0, top_k: 0, top_p: 1.0, rng: 7 };
+    let mut n = [0usize; 4];
+    for _ in 0..20000 { n[s.pick(&l)] += 1; }
+    assert!(n[3] == 0 && (n[0] as f32 / 20000.0 - 0.5).abs() < 0.02 && (n[1] as f32 / 20000.0 - 0.25).abs() < 0.02, "{n:?}");
+    let mut s = Sampler { temp: 1.0, top_k: 0, top_p: 0.5, rng: 7 };
+    assert!((0..100).all(|_| s.pick(&l) == 0));
+    let mut s = Sampler { temp: 1.0, top_k: 2, top_p: 1.0, rng: 7 };
+    assert!((0..100).all(|_| s.pick(&l) < 2));
+}
