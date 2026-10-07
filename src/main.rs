@@ -27,6 +27,9 @@ struct Engine {
     /// VRAM left free after placing expert layers, in MB.
     #[arg(long, default_value_t = 512)]
     vram_margin: usize,
+    /// Speculative decoding with the model's MTP draft head (GPU, greedy output unchanged).
+    #[arg(long)]
+    mtp: bool,
 }
 
 enum Runner<'a> { Cpu(&'a Model<'a>, State), Gpu(Box<GpuModel<'a>>) }
@@ -47,6 +50,7 @@ impl Runner<'_> {
     fn finish(&self) -> anyhow::Result<()> {
         if let Runner::Gpu(g) = self {
             let n = (g.hits + g.misses).max(1);
+            if g.drafts.0 > 0 { eprintln!("MTP drafts accepted {}/{} ({:.1}%)", g.drafts.1, g.drafts.0, 100.0 * g.drafts.1 as f64 / g.drafts.0 as f64); }
             eprintln!("expert hit rate {:.1}% ({} misses), cache swaps {}", 100.0 * g.hits as f64 / n as f64, g.misses,
                 g.cache.as_ref().map_or(0, |c| c.swaps));
             if let Some(c) = &g.cache { c.save_profile()?; }
@@ -58,7 +62,7 @@ impl Runner<'_> {
 impl Engine {
     fn runner<'a>(&self, m: &'a Model<'a>) -> anyhow::Result<Runner<'a>> {
         if !self.gpu { return Ok(Runner::Cpu(m, State::new(&m.cfg))); }
-        Ok(Runner::Gpu(Box::new(GpuModel::load(m, Gpu::new()?, self.ctx, self.chunk, self.vram_margin << 20, false)?)))
+        Ok(Runner::Gpu(Box::new(GpuModel::load(m, Gpu::new()?, self.ctx, self.chunk, self.vram_margin << 20, self.mtp)?)))
     }
 }
 
@@ -154,17 +158,28 @@ fn main() -> anyhow::Result<()> {
             let cpu0 = r.cpu_secs();
             let mut out = Vec::new();
             let mut printed = 0;
-            for _ in 0..n {
+            let mut row = 0;
+            'decode: while out.len() < n {
                 let next = ops::argmax(&logits) as u32;
                 if eos.contains(&next) { break; }
-                out.push(next);
-                let s = tok.decode(&out)?;
-                if !s.ends_with('\u{fffd}') {
-                    print!("{}", &s[printed..]);
-                    std::io::stdout().flush()?;
-                    printed = s.len();
+                let toks = match &mut r {
+                    Runner::Gpu(g) if engine.mtp => {
+                        let (toks, l, rw) = g.spec_step(next, row)?;
+                        (logits, row) = (l, rw);
+                        toks
+                    }
+                    _ => { logits = r.step(next)?; vec![next] }
+                };
+                for t in toks {
+                    if eos.contains(&t) || out.len() == n { break 'decode; }
+                    out.push(t);
+                    let s = tok.decode(&out)?;
+                    if !s.ends_with('\u{fffd}') {
+                        print!("{}", &s[printed..]);
+                        std::io::stdout().flush()?;
+                        printed = s.len();
+                    }
                 }
-                logits = r.step(next)?;
             }
             let (pp, tg) = ((t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
             eprintln!("\nprompt {} tok {:.2} tok/s | gen {} tok {:.2} tok/s", ids.len(), ids.len() as f64 / pp, out.len(), out.len() as f64 / tg);

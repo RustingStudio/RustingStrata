@@ -70,9 +70,11 @@ impl GpuModel<'_> {
         let (g, ne) = (&self.gpu, self.m.cfg.n_embd);
         let last = g.ptr(&self.pf.as_ref().unwrap().slab) + (4 * ne * ((tokens.len() - 1) % chunk)) as u64;
         let h = g.ptr(&self.bufs["h"]);
+        // Row 0 of `x` holds the last hidden state, as after `step` (the MTP draft reads it).
+        g.stream.memcpy_dtod(&self.pf.as_ref().unwrap().slab.slice(ne * ((tokens.len() - 1) % chunk)..ne * ((tokens.len() - 1) % chunk + 1)), &mut self.x.slice_mut(0..ne))?;
         g.rms_norm(last, 0, self.output_norm.ptr, h, 0, ne, 1, self.m.cfg.eps)?;
         g.gemv(&self.output, h, g.ptr(&self.logits))?;
-        Ok(g.stream.clone_dtoh(&self.logits)?)
+        Ok(g.stream.clone_dtoh(&self.logits.slice(0..self.m.cfg.n_vocab))?)
     }
 
     fn step_all(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
