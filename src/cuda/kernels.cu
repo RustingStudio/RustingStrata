@@ -590,33 +590,52 @@ extern "C" __global__ void kv_store(const float* k, const float* v, u16* kc, u16
 }
 
 #define INFINITY __int_as_float(0x7f800000)
-#define MAXD 16  // head_dim <= 512
+// PER consecutive f16 values to f32 with one vector load (p aligned to 2 * PER bytes).
+template <int PER> __device__ __forceinline__ void ldh_vec(const u16* p, float* o) {
+    if constexpr (PER >= 8) {
+        for (int c = 0; c < PER / 8; c++) {
+            uint4 v = ((const uint4*)p)[c];
+            const u16* h = (const u16*)&v;
+            for (int i = 0; i < 8; i++) o[c * 8 + i] = h2f(h[i]);
+        }
+    } else if constexpr (PER == 4) {
+        uint2 v = *(const uint2*)p;
+        const u16* h = (const u16*)&v;
+        for (int i = 0; i < 4; i++) o[i] = h2f(h[i]);
+    } else {
+        unsigned v = *(const unsigned*)p;
+        o[0] = h2f((u16)v); o[1] = h2f((u16)(v >> 16));
+    }
+}
+
 // Split-position decode attention. grid = (query heads, ns splits): block (h, s) covers an ns-th of the positions,
-// each warp walks its share with online softmax, warps merge, and the block writes its unnormalized partial
-// [acc (hd) | max | sum] to part; attn_merge combines the splits. qg holds [q | gate] per head (2*hd).
-extern "C" __global__ void attn_decode(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
-                                       int nh, int nkv, int hd, float scale) {
+// each warp walks its share with online softmax (lane owns PER = hd / 32 consecutive dims), warps merge, and the
+// block writes its unnormalized partial [acc (hd) | max | sum] to part; attn_merge combines the splits.
+template <int PER>
+__device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
+                              int nh, int nkv, float scale) {
+    constexpr int hd = PER * 32;
     int n_pos = step[0] + 1, ns = gridDim.y, per_s = (n_pos + ns - 1) / ns;
     int p0 = blockIdx.y * per_s, p1 = min(n_pos, p0 + per_s);
     extern __shared__ float sacc[];  // nw * hd
     __shared__ float sm[32], sl[32];
     int h = blockIdx.x, g = h / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
-    int per = hd >> 5;
-    float qv[MAXD], acc[MAXD], m = -INFINITY, l = 0.0f;
-    for (int d = 0; d < per; d++) { qv[d] = q[h * hd + lane + 32 * d]; acc[d] = 0.0f; }
+    float qv[PER], acc[PER], kv[PER], m = -INFINITY, l = 0.0f;
+    for (int d = 0; d < PER; d++) { qv[d] = q[h * hd + lane * PER + d]; acc[d] = 0.0f; }
     for (int t = p0 + w; t < p1; t += nw) {
-        const u16* kt = kc + ((size_t)t * nkv + g) * hd;
-        const u16* vt = vc + ((size_t)t * nkv + g) * hd;
+        size_t off = ((size_t)t * nkv + g) * hd + lane * PER;
+        ldh_vec<PER>(kc + off, kv);
         float s = 0.0f;
-        for (int d = 0; d < per; d++) s += qv[d] * h2f(kt[lane + 32 * d]);
+        for (int d = 0; d < PER; d++) s += qv[d] * kv[d];
         s = warp_sum(s) * scale;
         float mn = fmaxf(m, s), c = expf(m - mn), p = expf(s - mn);
         l = l * c + p;
-        for (int d = 0; d < per; d++) acc[d] = acc[d] * c + p * h2f(vt[lane + 32 * d]);
+        ldh_vec<PER>(vc + off, kv);
+        for (int d = 0; d < PER; d++) acc[d] = acc[d] * c + p * kv[d];
         m = mn;
     }
     if (lane == 0) { sm[w] = m; sl[w] = l; }
-    for (int d = 0; d < per; d++) sacc[w * hd + lane + 32 * d] = acc[d];
+    for (int d = 0; d < PER; d++) sacc[w * hd + lane * PER + d] = acc[d];
     __syncthreads();
     float* pp = part + ((size_t)h * ns + blockIdx.y) * (hd + 2);
     float M = -INFINITY;
@@ -633,6 +652,16 @@ extern "C" __global__ void attn_decode(const float* q, const u16* kc, const u16*
         pp[d] = o;
     }
     if (threadIdx.x == 0) { pp[hd] = M; pp[hd + 1] = L; }
+}
+
+extern "C" __global__ void attn_decode(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
+                                       int nh, int nkv, int hd, float scale) {
+    switch (hd) {
+        case 64: attn_decode_t<2>(q, kc, vc, part, step, nh, nkv, scale); break;
+        case 128: attn_decode_t<4>(q, kc, vc, part, step, nh, nkv, scale); break;
+        case 256: attn_decode_t<8>(q, kc, vc, part, step, nh, nkv, scale); break;
+        case 512: attn_decode_t<16>(q, kc, vc, part, step, nh, nkv, scale); break;
+    }
 }
 
 // grid = query heads: out = (sum of split partials) / (sum of split sums) * sigmoid(gate). Split 0 is never empty.
