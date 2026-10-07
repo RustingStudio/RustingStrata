@@ -64,6 +64,8 @@ pub struct GpuModel<'a> {
     pub misses: usize,
     /// Time the CPU worker spent computing missed experts (overlaps GPU work).
     pub cpu_time: Duration,
+    /// MTP drafts (made, accepted).
+    pub drafts: (usize, usize),
     /// Prefill scratch (None: prompts go through `step`).
     pf: Option<prefill::Scratch>,
     mtp: Option<MtpHead>,
@@ -153,7 +155,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, step_buf, graph: None, ctx, pos: 0, saved: vec![], saved_pos: 0, cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO, pf, mtp })
+        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, step_buf, graph: None, ctx, pos: 0, saved: vec![], saved_pos: 0, cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO, drafts: (0, 0), pf, mtp })
     }
 
     /// Clear KV and recurrent state.
@@ -269,7 +271,31 @@ impl<'a> GpuModel<'a> {
 
     /// MTP draft: logits for the token after `token`, from hidden state `row` of the last `step` or `verify` (the
     /// position that predicted `token`). Mirrors `Model::mtp_step`; the draft head keeps its own position and KV cache.
-    pub fn mtp_draft(&mut self, token: u32, row: usize) -> anyhow::Result<Vec<f32>> {
+    pub fn mtp_draft(&mut self, token: u32, row: usize) -> anyhow::Result<Vec<f32>> { self.mtp_run(token, row, true) }
+
+    /// Speculative decode with MTP k = 1. `t` is the next token (argmax of the last logits), predicted by hidden
+    /// row `row`. Drafts the token after `t`, verifies [t, draft] in one forward and keeps the draft if the main model
+    /// agrees; otherwise rolls back and steps `t` alone. Returns the accepted tokens, the logits after the last one
+    /// and its hidden row. Greedy output equals plain `step` decoding (verify is bit-identical to steps).
+    pub fn spec_step(&mut self, t: u32, row: usize) -> anyhow::Result<(Vec<u32>, Vec<f32>, usize)> {
+        let d = crate::ops::argmax(&self.mtp_run(t, row, true)?) as u32;
+        if self.pos + 2 > self.ctx { return Ok((vec![t], self.step(t)?, 0)); }
+        self.save_state()?;
+        let mut v = self.verify(&[t, d])?;
+        if crate::ops::argmax(&v[0]) as u32 == d {
+            // The draft head needs an entry for every position: add the one for d (its logits are not used).
+            self.mtp_run(d, 0, false)?;
+            self.drafts.1 += 1;
+            self.drafts.0 += 1;
+            return Ok((vec![t, d], v.pop().unwrap(), 1));
+        }
+        self.drafts.0 += 1;
+        self.restore_state()?;
+        Ok((vec![t], self.step(t)?, 0))
+    }
+
+    /// Draft head on (`token`, hidden row `row`); `head` = false skips the output head and returns no logits.
+    fn mtp_run(&mut self, token: u32, row: usize, head: bool) -> anyhow::Result<Vec<f32>> {
         let c = &self.m.cfg;
         let Some(h) = self.mtp.as_mut() else { bail!("MTP head not loaded") };
         if h.pos >= self.ctx { bail!("context full ({} tokens)", self.ctx); }
@@ -284,9 +310,11 @@ impl<'a> GpuModel<'a> {
         g.rms_norm(g.ptr(&self.x) + 4 * (row * ne) as u64, 0, h.hnorm.ptr, eh + 4 * ne as u64, 0, ne, 1, eps)?;
         g.gemv(&h.eh_proj, eh, x)?;
         self.layer(c.n_layer, &h.layer, x, g.ptr(&h.step_buf), Some(&h.worker), 1)?;
-        g.rms_norm(x, 0, h.head_norm.ptr, hp, 0, ne, 1, eps)?;
-        g.gemv(&self.output, hp, g.ptr(&self.logits))?;
-        let logits = g.stream.clone_dtoh(&self.logits.slice(0..c.n_vocab))?;
+        let logits = if head {
+            g.rms_norm(x, 0, h.head_norm.ptr, hp, 0, ne, 1, eps)?;
+            g.gemv(&self.output, hp, g.ptr(&self.logits))?;
+            g.stream.clone_dtoh(&self.logits.slice(0..c.n_vocab))?
+        } else { g.stream.synchronize()?; vec![] };
         let h = self.mtp.as_mut().unwrap();
         h.pos += 1;
         if let Some(cache) = self.cache.as_mut() {
