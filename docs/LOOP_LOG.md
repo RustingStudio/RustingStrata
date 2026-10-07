@@ -41,7 +41,8 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   swallowed; not reproduced on retry; forever_bear held 795 MiB at the time).
 - Prefill speed not benchmarked: forever_bear on the GPU. Test timing only: 73 tokens in 1.06 s (cold).
 - The new prefill kernels (attn_prefill, deltanet_seq, conv_seq/conv_state, moe_combine_seq, gemm act 1/2) are covered
-  only end to end by `prefill_matches_reference`, not by per-kernel tests. Debt.
+  only end to end by `prefill_matches_reference`, not by per-kernel tests. Debt (paid in #6 except moe_combine_seq
+  and gemm act 1/2).
 
 ### 2026-10-07 #4 — GEMM accumulators and DeltaNet state kept in registers (76a57e2)
 - Profile (nsys, 4K prefill): kernels 8.6 s of 8.9 s wall; gemm_iq2_xs 2.87 s, gemm_q5_k 1.92, gemm_iq3_xxs 1.30,
@@ -71,14 +72,23 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - 4 parity runs died with `CUDA_ERROR_OUT_OF_MEMORY` while forever_bear and a RustingEngine test held VRAM (both
   chunk sizes). Load plans from free VRAM at start; a process that arrives later can starve us. Not fixed.
 
+### 2026-10-07 #6 — per-kernel tests for prefill kernels (7352742)
+- GPU busy at start (forever_bear 803 MiB): no benchmarks or parity; only sub-second kernel tests.
+- `tests/cuda.rs`: `attn_prefill_matches_decode` (hd 64/128/256, 40 cached keys, 100-token chunk; rel err 5.1e-5,
+  7.1e-5, 6.4e-5, limit 5e-4), `deltanet_chunk_matches_steps` (37 tokens vs 37 single steps: bit-exact output and
+  state), `conv_seq_matches_steps` (T = 2 and 10 vs conv_silu steps: exact). Full `cuda` suite passes.
+- No speed or parity change.
+- Correction to candidate 1 of #5: M2 found every GPU miss equals the CPU f32 reference miss (same position, same
+  top-2 gap), so int8 decode error is not what separates us from llama.cpp. The 99% gap is llama.cpp's own numerics.
+
 ## Tried and rejected
 
 (none yet)
 
 ## Next candidates
 
-1. Decode accuracy (parity 98.1-98.4% vs gate 99%): int8 activations in decode give 1.9-2.3 logit error vs 0.4 for the
-   f16 prefill path; results also depend on which experts are resident. Try Q8_1-with-sum like llama.cpp or f16
-   activations for the GEMVs; measure with `gpu_forward_matches_cpu_reference` dlogit first.
-2. Decode 49.6 vs 67 tok/s: profile one decode step with nsys (not yet done since M3).
-3. deltanet_seq 0.77 s of 4.2 s prefill (sequential scan); chunked WY form. Plus per-kernel tests for prefill kernels.
+1. Parity 98.1-98.4% vs 99%: misses are shared with the f32 CPU reference, so match llama.cpp numerics instead.
+   First find how the reference was produced (llama-server flags: CUDA MMQ with Q8_1 activations, or CPU with Q8_K),
+   then emulate that activation quantization in the CPU reference and see if misses go away (CPU-only experiment).
+2. Decode 49.6 vs 67 tok/s: nsys profile of one decode step (not done since M3). Needs idle GPU.
+3. deltanet_seq 0.77 s of 4.2 s prefill (sequential scan); chunked WY form. Needs idle GPU.
