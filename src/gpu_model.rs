@@ -29,6 +29,12 @@ enum Ffn {
 
 struct Layer { attn_norm: GpuTensor, post_norm: GpuTensor, mixer: Mixer, ffn: Ffn }
 
+/// MTP draft head: the `nextn` block (layer n_layer) with its own KV cache and CPU worker.
+struct MtpHead {
+    layer: Layer, eh_proj: GpuTensor, enorm: GpuTensor, hnorm: GpuTensor, head_norm: GpuTensor,
+    worker: CpuWorker, step_buf: CudaSlice<i32>, emb: CudaSlice<f32>, eh: CudaSlice<f32>, x: CudaSlice<f32>, pos: usize,
+}
+
 pub struct GpuModel<'a> {
     m: &'a Model<'a>,
     pub gpu: Gpu,
@@ -57,11 +63,12 @@ pub struct GpuModel<'a> {
     pub cpu_time: Duration,
     /// Prefill scratch (None: prompts go through `step`).
     pf: Option<prefill::Scratch>,
+    mtp: Option<MtpHead>,
 }
 
 impl<'a> GpuModel<'a> {
-    /// `chunk`: prefill batch in tokens (0 = no batched prefill).
-    pub fn load(m: &'a Model<'a>, gpu: Gpu, ctx: usize, chunk: usize, vram_margin: usize) -> anyhow::Result<GpuModel<'a>> {
+    /// `chunk`: prefill batch in tokens (0 = no batched prefill). `mtp`: load the MTP draft head (needs `nextn`).
+    pub fn load(m: &'a Model<'a>, gpu: Gpu, ctx: usize, chunk: usize, vram_margin: usize, mtp: bool) -> anyhow::Result<GpuModel<'a>> {
         let c = &m.cfg;
         let up = |name: &str| -> anyhow::Result<GpuTensor> { gpu.upload(&m.w.get(name)?) };
         let lt = |il: usize, s: &str| up(&format!("blk.{il}.{s}"));
@@ -70,9 +77,9 @@ impl<'a> GpuModel<'a> {
         let channels = c.ssm_d_inner + 2 * nk * dk;
         let kv = c.n_head_kv * c.head_dim;
 
-        let mut layers = Vec::with_capacity(c.n_layer);
-        for il in 0..c.n_layer {
-            let mixer = if c.is_recurrent(il) {
+        let mtp = mtp && c.n_nextn > 0;
+        let load_layer = |il: usize, recurrent: bool| -> anyhow::Result<Layer> {
+            let mixer = if recurrent {
                 Mixer::Delta {
                     qkv: lt(il, "attn_qkv.weight")?, gate: lt(il, "attn_gate.weight")?, beta: lt(il, "ssm_beta.weight")?,
                     alpha: lt(il, "ssm_alpha.weight")?, dt_bias: lt(il, "ssm_dt.bias")?, a: lt(il, "ssm_a")?,
@@ -97,8 +104,15 @@ impl<'a> GpuModel<'a> {
             } else {
                 Ffn::Dense { gate: lt(il, "ffn_gate.weight")?, up: lt(il, "ffn_up.weight")?, down: lt(il, "ffn_down.weight")? }
             };
-            layers.push(Layer { attn_norm: lt(il, "attn_norm.weight")?, post_norm: lt(il, "post_attention_norm.weight")?, mixer, ffn });
-        }
+            Ok(Layer { attn_norm: lt(il, "attn_norm.weight")?, post_norm: lt(il, "post_attention_norm.weight")?, mixer, ffn })
+        };
+        let layers = (0..c.n_layer).map(|il| load_layer(il, c.is_recurrent(il))).collect::<anyhow::Result<Vec<_>>>()?;
+        let mtp_parts = if mtp {
+            let il = c.n_layer;
+            Some((load_layer(il, false)?, lt(il, "nextn.eh_proj.weight")?, lt(il, "nextn.enorm.weight")?,
+                  lt(il, "nextn.hnorm.weight")?, lt(il, "nextn.shared_head_norm.weight")?,
+                  gpu.zeros::<i32>(2)?, gpu.zeros(c.n_embd)?, gpu.zeros(2 * c.n_embd)?, gpu.zeros(c.n_embd)?))
+        } else { None };
         let output_norm = up("output_norm.weight")?;
         let output = up("output.weight").or_else(|_| up("token_embd.weight"))?;
 
@@ -119,7 +133,7 @@ impl<'a> GpuModel<'a> {
 
         let cache = if c.is_moe() {
             let budget = free1.saturating_sub(vram_margin);
-            Some(ExpertCache::new(m, &gpu, budget)?)
+            Some(ExpertCache::new(m, &gpu, budget, c.n_layer + mtp as usize)?)
         } else { None };
         let worker = if c.is_moe() { Some(CpuWorker::new(m, &gpu.ctx, (0..c.n_layer).collect())?) } else { None };
         let mb = |b: usize| b as f64 / 1048576.0;
@@ -129,12 +143,20 @@ impl<'a> GpuModel<'a> {
             mb(cache.as_ref().map_or(0, |x| x.slot_bytes_total())),
             cache.as_ref().map_or(0, |x| x.resident_count()), cache.as_ref().map_or(0, |x| x.total_experts()),
         );
-        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, step_buf, graph: None, ctx, pos: 0, cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO, pf })
+        let mtp = match mtp_parts {
+            Some((layer, eh_proj, enorm, hnorm, head_norm, step_buf, emb, eh, x)) => Some(MtpHead {
+                layer, eh_proj, enorm, hnorm, head_norm, worker: CpuWorker::new(m, &gpu.ctx, vec![c.n_layer])?,
+                step_buf, emb, eh, x, pos: 0,
+            }),
+            None => None,
+        };
+        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, step_buf, graph: None, ctx, pos: 0, cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO, pf, mtp })
     }
 
     /// Clear KV and recurrent state.
     pub fn reset(&mut self) -> anyhow::Result<()> {
-        for l in &mut self.layers {
+        if let Some(h) = self.mtp.as_mut() { h.pos = 0; }
+        for l in self.layers.iter_mut().chain(self.mtp.as_mut().map(|h| &mut h.layer)) {
             match &mut l.mixer {
                 Mixer::Delta { conv, s, .. } => { self.gpu.stream.memset_zeros(conv)?; self.gpu.stream.memset_zeros(s)?; }
                 Mixer::Attn { kc, vc, .. } => { self.gpu.stream.memset_zeros(kc)?; self.gpu.stream.memset_zeros(vc)?; }
@@ -174,10 +196,52 @@ impl<'a> GpuModel<'a> {
         let (g, eps, ne, step) = (&self.gpu, c.eps, c.n_embd, self.gpu.ptr(&self.step_buf));
         let p = |n: &str| g.ptr(&self.bufs[n]);
         let x = g.ptr(&self.x);
+        for (il, l) in self.layers.iter().enumerate() { self.layer(il, l, x, step, self.worker.as_ref())?; }
+        g.rms_norm(x, 0, self.output_norm.ptr, p("h"), 0, ne, 1, eps)?;
+        g.gemv(&self.output, p("h"), g.ptr(&self.logits))?;
+        Ok(())
+    }
+
+    /// Last hidden state (before output_norm) of the last `step`.
+    pub fn hidden(&self) -> anyhow::Result<Vec<f32>> { Ok(self.gpu.stream.clone_dtoh(&self.x)?) }
+
+    /// MTP draft: logits for the token after `token`, from the hidden state of the last `step` (which predicted
+    /// `token`). Mirrors `Model::mtp_step`; the draft head keeps its own position and KV cache.
+    pub fn mtp_draft(&mut self, token: u32) -> anyhow::Result<Vec<f32>> {
+        let c = &self.m.cfg;
+        let Some(h) = self.mtp.as_mut() else { bail!("MTP head not loaded") };
+        if h.pos >= self.ctx { bail!("context full ({} tokens)", self.ctx); }
+        let seq = h.worker.begin();
+        let g = &self.gpu;
+        g.stream.memcpy_htod(&self.m.embed(token), &mut h.emb)?;
+        g.stream.memcpy_htod(&[h.pos as i32, seq as i32], &mut h.step_buf)?;
+        let h = self.mtp.as_ref().unwrap();
+        let (eps, ne, hp) = (c.eps, c.n_embd, g.ptr(&self.bufs["h"]));
+        let (eh, x) = (g.ptr(&h.eh), g.ptr(&h.x));
+        g.rms_norm(g.ptr(&h.emb), 0, h.enorm.ptr, eh, 0, ne, 1, eps)?;
+        g.rms_norm(g.ptr(&self.x), 0, h.hnorm.ptr, eh + 4 * ne as u64, 0, ne, 1, eps)?;
+        g.gemv(&h.eh_proj, eh, x)?;
+        self.layer(c.n_layer, &h.layer, x, g.ptr(&h.step_buf), Some(&h.worker))?;
+        g.rms_norm(x, 0, h.head_norm.ptr, hp, 0, ne, 1, eps)?;
+        g.gemv(&self.output, hp, g.ptr(&self.logits))?;
+        let logits = g.stream.clone_dtoh(&self.logits)?;
+        let h = self.mtp.as_mut().unwrap();
+        h.pos += 1;
+        if let Some(cache) = self.cache.as_mut() {
+            cache.record(c.n_layer, &h.worker.routing(c.n_layer).iter().map(|x| x.0).collect::<Vec<_>>());
+        }
+        Ok(logits)
+    }
+
+    /// One decoder block on `x`; `step` points at [position, worker seq].
+    fn layer(&self, il: usize, l: &Layer, x: u64, step: u64, worker: Option<&CpuWorker>) -> anyhow::Result<()> {
+        let c = &self.m.cfg;
+        let (g, eps, ne) = (&self.gpu, c.eps, c.n_embd);
+        let p = |n: &str| g.ptr(&self.bufs[n]);
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
         let dv = c.ssm_d_inner / nv;
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
-        for (il, l) in self.layers.iter().enumerate() {
+        {
             g.rms_norm(x, 0, l.attn_norm.ptr, p("h"), 0, ne, 1, eps)?;
             match &l.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s } => {
@@ -225,7 +289,7 @@ impl<'a> GpuModel<'a> {
                     let (base, stride) = cache.base(g, lx);
                     let [mg, mu, md] = lx.mats;
                     let slots = g.ptr(&self.slots);
-                    let w = self.worker.as_ref().unwrap();
+                    let w = worker.unwrap();
                     let mb = w.dev + (4 * il * w.layout.stride) as u64;
                     g.map_hits(ids, g.ptr(&lx.table_dev), slots, p("wts"), p("wh"), k)?;
                     g.moe_publish(ids, p("wts"), slots, p("h"), mb, k, ne, w.layout.h, step)?;
@@ -253,8 +317,6 @@ impl<'a> GpuModel<'a> {
                 }
             }
         }
-        g.rms_norm(x, 0, self.output_norm.ptr, p("h"), 0, ne, 1, eps)?;
-        g.gemv(&self.output, p("h"), g.ptr(&self.logits))?;
         Ok(())
     }
 

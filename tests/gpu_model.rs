@@ -4,6 +4,7 @@ use rusting_strata::{cuda::Gpu, gguf::Gguf, gpu_model::GpuModel, model::{Model, 
 /// GPU forward matches the CPU reference per position, with all routed experts on the CPU and with the default placement.
 #[test]
 fn gpu_forward_matches_cpu_reference() {
+    let _gpu = common::gpu_lock();
     let Some(p) = common::model_path() else { return };
     let g = Gguf::open(&p).unwrap();
     let m = Model::load(&g).unwrap();
@@ -18,7 +19,7 @@ fn gpu_forward_matches_cpu_reference() {
             Err(e) if format!("{e}") == "CUDA init" => { eprintln!("SKIP: no GPU: {e:#}"); return }
             Err(e) => panic!("{e:#}"),
         };
-        let mut gm = GpuModel::load(&m, gpu, 256, 0, margin).unwrap();
+        let mut gm = GpuModel::load(&m, gpu, 256, 0, margin, false).unwrap();
         let t0 = std::time::Instant::now();
         for (i, (&t, w)) in ids.iter().zip(&want).enumerate() {
             let got = gm.step(t).unwrap();
@@ -38,6 +39,7 @@ fn gpu_forward_matches_cpu_reference() {
 /// activations drift further from f32 over a long prompt than the f16 prefill GEMMs do.
 #[test]
 fn prefill_matches_reference() {
+    let _gpu = common::gpu_lock();
     let Some(p) = common::model_path() else { return };
     let g = Gguf::open(&p).unwrap();
     let m = Model::load(&g).unwrap();
@@ -58,7 +60,7 @@ fn prefill_matches_reference() {
     let next = ops::argmax(&cpu) as u32;
     let cpu2 = m.step(&mut st, next);
     let chunk = std::env::var("CHUNK").map_or(48, |v| v.parse().unwrap());
-    let mut gm = GpuModel::load(&m, gpu, 512, chunk, 512 << 20).unwrap();
+    let mut gm = GpuModel::load(&m, gpu, 512, chunk, 512 << 20, false).unwrap();
     let t0 = std::time::Instant::now();
     let pre = gm.prefill(&ids).unwrap();
     eprintln!("prefill {} tokens in {:?}", ids.len(), t0.elapsed());
@@ -74,5 +76,37 @@ fn prefill_matches_reference() {
                   ops::argmax(pf), ops::argmax(dc), ops::argmax(want));
         assert_eq!(ops::argmax(pf), ops::argmax(want), "{name}");
         assert!(dp <= dd.max(0.5), "{name}: prefill error {dp} above decode error {dd}");
+    }
+}
+
+/// GPU MTP draft head matches `Model::mtp_step` per position (prompt plus a few greedy tokens). Both get the GPU's
+/// hidden state, so the check covers the head alone, not the main model's drift.
+#[test]
+fn mtp_draft_matches_reference() {
+    use rusting_strata::model::Mtp;
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    if m.cfg.n_nextn == 0 { eprintln!("SKIP: no nextn layer"); return }
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let gpu = match Gpu::new() {
+        Ok(g) => g,
+        Err(e) => { eprintln!("SKIP: no GPU: {e:#}"); return }
+    };
+    let mut gm = GpuModel::load(&m, gpu, 256, 0, 512 << 20, true).unwrap();
+    let mut ids = tok.encode("The capital of France is").unwrap();
+    let (mut st, mut mtp) = (State::new(&m.cfg), Mtp::default());
+    for i in 0..ids.len() + 4 {
+        let logits = m.step(&mut st, ids[i]);
+        gm.step(ids[i]).unwrap();
+        if i + 1 == ids.len() { ids.push(ops::argmax(&logits) as u32); }
+        let want = m.mtp_step(&mut mtp, &gm.hidden().unwrap(), ids[i + 1]).0;
+        let got = gm.mtp_draft(ids[i + 1]).unwrap();
+        let range = want.iter().fold(f32::MIN, |a, &b| a.max(b)) - want.iter().fold(f32::MAX, |a, &b| a.min(b));
+        let diff = got.iter().zip(&want).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+        eprintln!("pos {i}: draft {} vs {}, max |dlogit| {diff:.4} (range {range:.2})", ops::argmax(&got), ops::argmax(&want));
+        assert_eq!(ops::argmax(&got), ops::argmax(&want), "pos {i}");
+        assert!(diff <= 0.05 * range, "pos {i}: {diff} vs range {range}");
     }
 }
