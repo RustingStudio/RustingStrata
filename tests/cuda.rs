@@ -228,7 +228,7 @@ fn attn_prefill_matches_decode() {
     }
 }
 
-/// DeltaNet scan over a chunk of T tokens equals T single-token scans (output and final state).
+/// DeltaNet scan over a chunk of T tokens equals T single-token scans and a CPU scan (output and final state).
 #[test]
 fn deltanet_chunk_matches_steps() {
     let Some(gpu) = gpu() else { return };
@@ -254,6 +254,26 @@ fn deltanet_chunk_matches_steps() {
     let (eo, es) = (rel_l2(&o1, &o2), rel_l2(&s1, &s2));
     eprintln!("deltanet chunk vs steps: out {eo:.2e}, state {es:.2e}");
     assert!(eo <= 1e-5 && es <= 1e-5, "out {eo}, state {es}");
+    // CPU: S_j = decay * S_j; d = beta (v_j - S_j . k); S_j += d k; o_j = scale * S_j . q
+    let (mut sc, mut oc) = (s0.clone(), vec![0.0f32; t * nv * dv]);
+    for tok in 0..t {
+        let yt = &y[tok * ych..];
+        for vh in 0..nv {
+            let kh = vh % nk;
+            let (q, k) = (&yt[kh * dk..][..dk], &yt[nk * dk + kh * dk..][..dk]);
+            let (decay, b) = (g[tok * nv + vh].exp(), beta[tok * nv + vh]);
+            for j in 0..dv {
+                let row = &mut sc[(vh * dv + j) * dk..][..dk];
+                row.iter_mut().for_each(|x| *x *= decay);
+                let d = b * (yt[2 * nk * dk + vh * dv + j] - row.iter().zip(k).map(|(a, b)| a * b).sum::<f32>());
+                row.iter_mut().zip(k).for_each(|(x, k)| *x += d * k);
+                oc[tok * nv * dv + vh * dv + j] = 0.5 * row.iter().zip(q).map(|(a, b)| a * b).sum::<f32>();
+            }
+        }
+    }
+    let (eo, es) = (rel_l2(&o1, &oc), rel_l2(&s1, &sc));
+    eprintln!("deltanet vs CPU: out {eo:.2e}, state {es:.2e}");
+    assert!(eo <= 1e-5 && es <= 1e-5, "vs CPU: out {eo}, state {es}");
 }
 
 /// Chunked causal conv (conv_seq + conv_state) equals T single-token conv_silu steps, also for T < kernel width - 1.

@@ -552,34 +552,42 @@ extern "C" __global__ void conv_state(const float* qkv, float* state, int ch, in
     }
 }
 
-// grid = (value heads, dv / 8), block = 256: warp w owns state row j = 8 * blockIdx.y + w (dk floats, dk <= 256,
-// multiple of 32) in registers, lane l holds elements l, l + 32, ... and scans the T tokens in order.
+// grid = (value heads, dv / (8 * R)), block = 256. Each state row (dk floats, dk in 32/64/128/256) lives in the
+// registers of L = dk / 16 lanes, 16 floats each (float4 chunks s, s + L, ...), so a warp holds R = 32 / L rows and
+// row dot products reduce over L lanes. The warp scans the T tokens in order.
 // Token t: y + t * ych = [q | k | v] after conv and l2 norm; beta, g at t * nv; output at o + t * nv * dv.
 // ponytail: sequential scan (latency-bound per token); a chunked WY form would use tensor cores for long prompts.
-#define MAXK 8
 extern "C" __global__ void deltanet_seq(const float* y, float* S, const float* beta, const float* g, float* o,
                                         int nk, int nv, int dk, int dv, float scale, int T, int ych) {
-    int vh = blockIdx.x, j = blockIdx.y * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31, kh = vh % nk, per = dk >> 5;
-    if (j >= dv) return;
-    float* row = S + ((size_t)vh * dv + j) * dk;
-    float r[MAXK];
+    int L = dk >> 4, R = 32 / L, lane = threadIdx.x & 31, s = lane % L, vh = blockIdx.x, kh = vh % nk;
+    int j0 = (blockIdx.y * 8 + (threadIdx.x >> 5)) * R, j = j0 + lane / L;
+    if (j0 >= dv) return;  // whole warp past the end (R divides dv)
+    float4* row = (float4*)(S + ((size_t)vh * dv + j) * dk);
+    float r[16];
 #pragma unroll
-    for (int t = 0; t < MAXK; t++) if (t < per) r[t] = row[lane + 32 * t];
+    for (int i = 0; i < 4; i++) { float4 v = row[s + L * i]; r[4 * i] = v.x; r[4 * i + 1] = v.y; r[4 * i + 2] = v.z; r[4 * i + 3] = v.w; }
     for (int tok = 0; tok < T; tok++) {
         const float* yt = y + (size_t)tok * ych;
-        const float* q = yt + kh * dk;
-        const float* k = yt + nk * dk + kh * dk;
-        float decay = expf(g[tok * nv + vh]), kk[MAXK], sk = 0.0f;
+        const float4* q4 = (const float4*)(yt + kh * dk);
+        const float4* k4 = (const float4*)(yt + nk * dk + kh * dk);
+        float decay = expf(g[tok * nv + vh]), kk[16], sk = 0.0f, oq = 0.0f;
 #pragma unroll
-        for (int t = 0; t < MAXK; t++) if (t < per) { int i = lane + 32 * t; r[t] *= decay; kk[t] = k[i]; sk += r[t] * kk[t]; }
-        float d = beta[tok * nv + vh] * (yt[2 * nk * dk + vh * dv + j] - warp_sum(sk)), oq = 0.0f;
+        for (int i = 0; i < 4; i++) { float4 v = k4[s + L * i]; kk[4 * i] = v.x; kk[4 * i + 1] = v.y; kk[4 * i + 2] = v.z; kk[4 * i + 3] = v.w; }
 #pragma unroll
-        for (int t = 0; t < MAXK; t++) if (t < per) { r[t] += d * kk[t]; oq += r[t] * q[lane + 32 * t]; }
-        oq = warp_sum(oq);
-        if (lane == 0) o[(size_t)tok * nv * dv + vh * dv + j] = oq * scale;
+        for (int e = 0; e < 16; e++) { r[e] *= decay; sk += r[e] * kk[e]; }
+        for (int off = L >> 1; off; off >>= 1) sk += __shfl_xor_sync(0xffffffff, sk, off);
+        float d = beta[tok * nv + vh] * (yt[2 * nk * dk + vh * dv + j] - sk);
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            float4 v = q4[s + L * i];
+            float qv[4] = {v.x, v.y, v.z, v.w};
+            for (int e = 0; e < 4; e++) { r[4 * i + e] += d * kk[4 * i + e]; oq += r[4 * i + e] * qv[e]; }
+        }
+        for (int off = L >> 1; off; off >>= 1) oq += __shfl_xor_sync(0xffffffff, oq, off);
+        if (s == 0) o[(size_t)tok * nv * dv + vh * dv + j] = oq * scale;
     }
 #pragma unroll
-    for (int t = 0; t < MAXK; t++) if (t < per) row[lane + 32 * t] = r[t];
+    for (int i = 0; i < 4; i++) row[s + L * i] = make_float4(r[4 * i], r[4 * i + 1], r[4 * i + 2], r[4 * i + 3]);
 }
 
 // grid = heads: out = rmsnorm(o_h) * w * silu(z_h), in place on o.
