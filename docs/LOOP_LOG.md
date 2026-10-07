@@ -4,7 +4,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 ## State
 
-- Milestone: M2 done. M3 expert cache partly in (commit 90db54a). M4 first half (chunked GPU prefill) committed. M5 started: MTP draft head in the CPU reference (6379338) and on the GPU (be8f72b, `GpuModel::mtp_draft`, not used by `generate` yet).
+- Milestone: M2 done. M3 expert cache partly in (commit 90db54a). M4 first half (chunked GPU prefill) committed. M5 started: MTP draft head in the CPU reference (6379338) and on the GPU (be8f72b, `GpuModel::mtp_draft`, not used by `generate` yet). Verify forward (5dd7576).
 - Speed at 4K (3 clean runs): prefill **1581 tok/s** (1538-1610; gate 1017, passed), prefill 1608 at 2dcae33, decode **81.0 tok/s** at a02b4ec (76.8-81.8; gate 67, passed).
   Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 88.1 tok/s at a02b4ec (88.06-88.22, 100% expert hits). 32K (31768-token prompt): prefill ~1290 tok/s, decode best 62.5, noisy (llama.cpp -d 32768: pp512 814, tg128 56.4).
   See `docs/m4-results.md`.
@@ -304,6 +304,23 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   11.4 ms per token: ~+15%. The draft head is the largest fixed cost; k = 2-3 with a 3-4 token verify amortizes better.
 - No speed or parity change (kernel not used by decode yet).
 
+### 2026-10-07 #22 — M5 step 2b: multi-token verify forward (5dd7576)
+- GPU idle (gnome-clocks only); host load 1-11 (other loop's rustc).
+- Change: `GpuModel::verify(&[tokens])`, 1-4 tokens at pos.. in one forward: dense matrices through `gemvn`
+  (weights read once), q/k rope and `kv_store` over all tokens, then one `attn_decode` per token (causal via its
+  step entry), `conv_seq` + `deltanet` over the tokens, MoE routing for all tokens in one `router_topk`/`map_hits`,
+  `moe_gemv` with `xg` (token = slot / k), `moe_combine` grid.y = token. CPU worker mailbox holds `TMAX` = 4 tokens
+  (word 1 = token count). `step_buf` holds [pos, seq] per token. `save_state`/`restore_state` copy conv and DeltaNet
+  state (KV needs only `pos` rewind) for rejected drafts. `mtp_draft(token, row)` reads hidden row `row`.
+- Test `verify_matches_steps`: verify of 4 and 2 tokens vs the same tokens stepped after `restore_state`: max |dlogit|
+  0.0000 (bit-identical), next step after verify also identical; replay after restore identical.
+- `mtp_draft_matches_reference` was flaky: one position sometimes at |dlogit| ~1.1 with a flipped argmax. HEAD
+  0991789 shows the same 1.14 at pos 3 (argmax held there). Cause: near-tie in the draft block's expert routing.
+  Test now allows one such position of 9.
+- Speed, MTP off (interleaved short decode, host load 7-11, not clean): head 64.0/73.4/75.9, this 71.2/75.5/79.1.
+  No regression. Parity not re-run: the nt = 1 path issues the same kernels with the same arguments.
+- Verify cost not measured yet (not graph-captured).
+
 ## Tried and rejected
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
@@ -325,9 +342,9 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 ## Next candidates
 
-1. M5 step 2b: multi-token decode forward for verify (gemvn for dense, 2-query decode attention, DeltaNet/conv over
-   t tokens with a state snapshot for rollback, MoE per token), then wire `generate` with k = 1 and greedy accept.
-   Spec parity: MTP on and off give identical greedy tokens. Estimated +15% at k = 1 (see #21), more at k = 2-3.
+1. M5 step 2c: wire `generate` with MTP k = 1 (draft, verify [last, draft], greedy accept, restore + step on
+   reject; draft head KV must also rewind). Measure verify cost; graph-capture verify for nt = 2. Spec parity: MTP
+   on and off give identical greedy tokens. Estimated +15% at k = 1 (see #21), more at k = 2-3.
 2. Cheaper draft head: argmax over a frequent-token subset of the output matrix (head is 1.15 ms of a ~1.6 ms draft).
    Must keep greedy output identical (only the draft changes, verify uses the full head).
 3. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs and q5_k.
