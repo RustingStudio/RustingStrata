@@ -289,6 +289,21 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   75.2 tok/s. No regression. Parity not re-run: the main path issues the same kernels; `gpu_forward_matches_cpu_reference` passes.
 - Draft cost not measured yet (not graph-captured; one extra worker spin thread per draft).
 
+### 2026-10-07 #21 — M5 step 2a: gemvn, one weight pass for up to 4 GEMV inputs (0991789)
+- GPU idle at start (gnome-clocks only); host load 4-6.
+- Why: a 2-token verify forward only pays if each weight is read once for both tokens. Decode GEMVs are ~70% of a token.
+- Change: `Gpu::gemvn(w, x, x_stride, y, y_stride, nt)`, nt 1-4: integer types quantize all inputs into shared memory,
+  decode each weight block once and dp4a it against every input (nt is a template argument; a first version with a
+  runtime nt and `unroll 2` was ~10% slower at nt 2). Float types (bf16 router, f32) run nt plain GEMVs.
+- Test `gemvn_matches_gemv`: nt 1-4 bit for bit equal to per-input `gemv`, every 2-D integer type in the model.
+- Timing (`gemv_bandwidth`, us for 1 / 2 / 3 / 4 inputs): q5_k 4096x2048 24.5 / 34.9 / 37.2 / 43.8; q6_k 2048x512
+  7.4 / 9.1 / 10.6 / 12.1; q8_0 512x2048 5.3 / 6.7 / 7.9 / 9.1; q4_k head 248320x2048 1147 / 1645 / 2028 / 2376.
+  So 2 tokens cost ~1.42x one token in dense GEMVs, 4 tokens ~1.8-2.1x.
+- Estimate for k = 1 (2-token verify): dense GEMV 5.9 -> ~8.4 ms, MoE ~2.4 -> up to 4.8 (expert union, no sharing
+  yet), rest ~3 -> ~4.5, plus the draft (~1.6 ms, of which the 248K-row head is 1.15) = ~19 ms per ~1.92 tokens vs
+  11.4 ms per token: ~+15%. The draft head is the largest fixed cost; k = 2-3 with a 3-4 token verify amortizes better.
+- No speed or parity change (kernel not used by decode yet).
+
 ## Tried and rejected
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
@@ -310,9 +325,9 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 ## Next candidates
 
-1. M5 step 2: verify draft + next token in one 2-token forward (batched path), accept or roll back. Needs a DeltaNet
-   conv/state snapshot before the verify (state ~ 30 layers x (conv + 128 KB x 32 heads)), KV truncates by position.
-   Measure the draft cost first (expected: one attention layer + 8 Q2_K experts + 248K x 2048 head GEMV, ~1/10 of a
-   token). With 24/25 acceptance, up to ~1.8x decode if a 2-token verify costs close to one token.
-2. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs and q5_k.
-3. Decode GEMVs: quantize x once per token into global memory (<= 4% of GEMV time, see #17).
+1. M5 step 2b: multi-token decode forward for verify (gemvn for dense, 2-query decode attention, DeltaNet/conv over
+   t tokens with a state snapshot for rollback, MoE per token), then wire `generate` with k = 1 and greedy accept.
+   Spec parity: MTP on and off give identical greedy tokens. Estimated +15% at k = 1 (see #21), more at k = 2-3.
+2. Cheaper draft head: argmax over a frequent-token subset of the output matrix (head is 1.15 ms of a ~1.6 ms draft).
+   Must keep greedy output identical (only the draft changes, verify uses the full head).
+3. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs and q5_k.
