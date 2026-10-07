@@ -10,12 +10,17 @@ use cudarc::driver::{CudaGraph, CudaSlice, sys};
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// `mtp_run` row that takes the hidden state from the draft head's own last output (chained drafts).
+const CHAIN: usize = usize::MAX;
+
 mod prefill;
 
 enum Mixer {
     Delta {
         qkv: GpuTensor, gate: GpuTensor, beta: GpuTensor, alpha: GpuTensor, dt_bias: GpuTensor, a: GpuTensor,
         conv_w: GpuTensor, norm: GpuTensor, out: GpuTensor, conv: CudaSlice<f32>, s: CudaSlice<f32>,
+        /// Conv and DeltaNet states after each of the first `k` verify tokens (MTP only), for `rollback`.
+        snap: Option<(CudaSlice<f32>, CudaSlice<f32>)>,
     },
     Attn { q: GpuTensor, k: GpuTensor, v: GpuTensor, qn: GpuTensor, kn: GpuTensor, o: GpuTensor, kc: CudaSlice<u16>, vc: CudaSlice<u16> },
 }
@@ -69,6 +74,8 @@ pub struct GpuModel<'a> {
     pub cpu_time: Duration,
     /// MTP drafts (made, accepted).
     pub drafts: (usize, usize),
+    /// MTP drafts per speculative step (0 = no draft head). May be lowered after `load`, never raised.
+    pub k: usize,
     /// Prefill scratch (None: prompts go through `step`).
     pf: Option<prefill::Scratch>,
     mtp: Option<MtpHead>,
@@ -76,7 +83,7 @@ pub struct GpuModel<'a> {
 
 impl<'a> GpuModel<'a> {
     /// `chunk`: prefill batch in tokens (0 = no batched prefill). `mtp`: load the MTP draft head (needs `nextn`).
-    pub fn load(m: &'a Model<'a>, gpu: Gpu, ctx: usize, chunk: usize, vram_margin: usize, mtp: bool) -> anyhow::Result<GpuModel<'a>> {
+    pub fn load(m: &'a Model<'a>, gpu: Gpu, ctx: usize, chunk: usize, vram_margin: usize, k: usize) -> anyhow::Result<GpuModel<'a>> {
         let c = &m.cfg;
         let up = |name: &str| -> anyhow::Result<GpuTensor> { gpu.upload(&m.w.get(name)?) };
         let lt = |il: usize, s: &str| up(&format!("blk.{il}.{s}"));
@@ -85,7 +92,8 @@ impl<'a> GpuModel<'a> {
         let channels = c.ssm_d_inner + 2 * nk * dk;
         let kv = c.n_head_kv * c.head_dim;
 
-        let mtp = mtp && c.n_nextn > 0;
+        let k = if c.n_nextn > 0 { k.min(TMAX - 1) } else { 0 };
+        let mtp = k > 0;
         let load_layer = |il: usize, recurrent: bool| -> anyhow::Result<Layer> {
             let mixer = if recurrent {
                 Mixer::Delta {
@@ -93,6 +101,7 @@ impl<'a> GpuModel<'a> {
                     alpha: lt(il, "ssm_alpha.weight")?, dt_bias: lt(il, "ssm_dt.bias")?, a: lt(il, "ssm_a")?,
                     conv_w: lt(il, "ssm_conv1d.weight")?, norm: lt(il, "ssm_norm.weight")?, out: lt(il, "ssm_out.weight")?,
                     conv: gpu.zeros((c.ssm_conv - 1) * channels)?, s: gpu.zeros(nv * (c.ssm_d_inner / nv) * dk)?,
+                    snap: if mtp { Some((gpu.zeros(k * (c.ssm_conv - 1) * channels)?, gpu.zeros(k * c.ssm_d_inner * dk)?)) } else { None },
                 }
             } else {
                 Mixer::Attn {
@@ -124,18 +133,18 @@ impl<'a> GpuModel<'a> {
         let output_norm = up("output_norm.weight")?;
         let output = up("output.weight").or_else(|_| up("token_embd.weight"))?;
 
-        let k = c.n_expert_used.max(1);
-        let ff = (k * c.n_ff_exp).max(c.n_ff);
+        let ke = c.n_expert_used.max(1);
+        let ff = (ke * c.n_ff_exp).max(c.n_ff);
         let sizes: [(&'static str, usize); 25] = [
             ("h", c.n_embd), ("mix", c.n_embd), ("qkv", channels), ("z", c.ssm_d_inner), ("beta", nv), ("g", nv),
             ("y", channels), ("o", c.ssm_d_inner), ("qg", c.n_head * 2 * c.head_dim), ("q", c.n_head * c.head_dim),
-            ("kraw", kv), ("k", kv), ("v", kv), ("att", c.n_head * c.head_dim), ("rl", c.n_expert), ("wts", k),
-            ("ge", ff), ("ue", ff), ("ye", k * c.n_embd), ("shg", c.n_ff_shexp), ("shu", c.n_ff_shexp),
-            ("shy", c.n_embd), ("sg", 1), ("wh", k), ("attp", c.n_head * crate::cuda::ATT_SPLITS * (c.head_dim + 2)),
+            ("kraw", kv), ("k", kv), ("v", kv), ("att", c.n_head * c.head_dim), ("rl", c.n_expert), ("wts", ke),
+            ("ge", ff), ("ue", ff), ("ye", ke * c.n_embd), ("shg", c.n_ff_shexp), ("shu", c.n_ff_shexp),
+            ("shy", c.n_embd), ("sg", 1), ("wh", ke), ("attp", c.n_head * crate::cuda::ATT_SPLITS * (c.head_dim + 2)),
         ];
         let bufs = sizes.into_iter().map(|(name, n)| Ok((name, gpu.zeros::<f32>(TMAX * n)?))).collect::<anyhow::Result<HashMap<_, _>>>()?;
-        let (x, logits, ids) = (gpu.zeros(TMAX * c.n_embd)?, gpu.zeros(TMAX * c.n_vocab)?, gpu.zeros::<i32>(TMAX * k)?);
-        let (slots, step_buf) = (gpu.zeros::<i32>(TMAX * k)?, gpu.zeros::<i32>(2 * TMAX)?);
+        let (x, logits, ids) = (gpu.zeros(TMAX * c.n_embd)?, gpu.zeros(TMAX * c.n_vocab)?, gpu.zeros::<i32>(TMAX * ke)?);
+        let (slots, step_buf) = (gpu.zeros::<i32>(TMAX * ke)?, gpu.zeros::<i32>(2 * TMAX)?);
         let pf = if chunk > 0 { Some(prefill::Scratch::new(m, &gpu, chunk.min(ctx))?) } else { None };
         let (free1, _) = gpu.ctx.mem_get_info()?;
 
@@ -158,7 +167,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, step_buf, graphs: (0..=TMAX).map(|_| None).collect(), mtp_graphs: Default::default(), ctx, pos: 0, saved: vec![], saved_pos: 0, cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO, drafts: (0, 0), pf, mtp })
+        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, step_buf, graphs: (0..=TMAX).map(|_| None).collect(), mtp_graphs: Default::default(), ctx, pos: 0, saved: vec![], saved_pos: 0, cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO, drafts: (0, 0), k, pf, mtp })
     }
 
     /// Clear KV and recurrent state.
@@ -226,6 +235,22 @@ impl<'a> GpuModel<'a> {
         Ok(())
     }
 
+    /// Keep only the first `keep` tokens of the last `verify`, which started at position `start` (1 <= keep <= `k`):
+    /// recurrent states come from the snapshots it wrote, KV entries past them are dropped by rewinding `pos`.
+    pub fn rollback(&mut self, start: usize, keep: usize) -> anyhow::Result<()> {
+        if !(1..=self.k).contains(&keep) || start + keep > self.pos { bail!("rollback: keep {keep} of verify at {start}"); }
+        let g = &self.gpu;
+        for l in &mut self.layers {
+            if let Mixer::Delta { conv, s, snap: Some((sc, ss)), .. } = &mut l.mixer {
+                let (nc, ns) = (conv.len(), s.len());
+                g.stream.memcpy_dtod(&sc.slice((keep - 1) * nc..keep * nc), conv)?;
+                g.stream.memcpy_dtod(&ss.slice((keep - 1) * ns..keep * ns), s)?;
+            }
+        }
+        self.pos = start + keep;
+        Ok(())
+    }
+
     /// Return to the state of the last `save_state`.
     pub fn restore_state(&mut self) -> anyhow::Result<()> {
         let g = &self.gpu;
@@ -283,25 +308,31 @@ impl<'a> GpuModel<'a> {
     /// position that predicted `token`). Mirrors `Model::mtp_step`; the draft head keeps its own position and KV cache.
     pub fn mtp_draft(&mut self, token: u32, row: usize) -> anyhow::Result<Vec<f32>> { self.mtp_run(token, row, true) }
 
-    /// Speculative decode with MTP k = 1. `t` is the next token (argmax of the last logits), predicted by hidden
-    /// row `row`. Drafts the token after `t`, verifies [t, draft] in one forward and keeps the draft if the main model
-    /// agrees; otherwise rolls back and steps `t` alone. Returns the accepted tokens, the logits after the last one
-    /// and its hidden row. Greedy output equals plain `step` decoding (verify is bit-identical to steps).
+    /// Speculative decode with MTP. `t` is the next token (argmax of the last logits), predicted by hidden row `row`.
+    /// Drafts `k` tokens after `t` (each from the previous draft's hidden state), verifies [t, drafts..] in one forward
+    /// and keeps the drafts up to the first one the main model disagrees with (`rollback`). Returns the accepted tokens,
+    /// the logits after the last one and its hidden row. Greedy output equals plain `step` decoding (verify is
+    /// bit-identical to steps).
     pub fn spec_step(&mut self, t: u32, row: usize) -> anyhow::Result<(Vec<u32>, Vec<f32>, usize)> {
-        let d = crate::ops::argmax(&self.mtp_run(t, row, true)?) as u32;
-        if self.pos + 2 > self.ctx { return Ok((vec![t], self.step(t)?, 0)); }
-        self.save_state()?;
-        let mut v = self.verify(&[t, d])?;
-        if crate::ops::argmax(&v[0]) as u32 == d {
-            // The draft head needs an entry for every position: add the one for d (its logits are not used).
-            self.mtp_run(d, 0, false)?;
-            self.drafts.1 += 1;
-            self.drafts.0 += 1;
-            return Ok((vec![t, d], v.pop().unwrap(), 1));
+        let k = self.k;
+        if self.pos + k + 1 > self.ctx { return Ok((vec![t], self.step(t)?, 0)); }
+        let hp = self.mtp.as_ref().map_or(0, |h| h.pos);
+        let mut toks = vec![t];
+        for i in 0..k {
+            let d = crate::ops::argmax(&self.mtp_run(toks[i], if i == 0 { row } else { CHAIN }, true)?) as u32;
+            toks.push(d);
         }
-        self.drafts.0 += 1;
-        self.restore_state()?;
-        Ok((vec![t], self.step(t)?, 0))
+        let start = self.pos;
+        let mut v = self.verify(&toks)?;
+        let n = (0..k).take_while(|&i| crate::ops::argmax(&v[i]) as u32 == toks[i + 1]).count();
+        self.drafts.0 += k;
+        self.drafts.1 += n;
+        if n < k { self.rollback(start, n + 1)?; }
+        // Draft head entries past t were made from draft hidden states: redo them from the main model's rows.
+        self.mtp.as_mut().unwrap().pos = hp + 1;
+        for i in 0..n { self.mtp_run(toks[i + 1], i, false)?; }
+        toks.truncate(n + 1);
+        Ok((toks, v.swap_remove(n), n))
     }
 
     /// Draft head on (`token`, hidden row `row`); `head` = false skips the output head and returns no logits.
@@ -340,7 +371,8 @@ impl<'a> GpuModel<'a> {
         let (eps, ne, hp) = (c.eps, c.n_embd, g.ptr(&self.bufs["h"]));
         let (eh, x) = (g.ptr(&h.eh), g.ptr(&h.x));
         g.rms_norm(g.ptr(&h.emb), 0, h.enorm.ptr, eh, 0, ne, 1, eps)?;
-        g.rms_norm(g.ptr(&self.x) + 4 * (row * ne) as u64, 0, h.hnorm.ptr, eh + 4 * ne as u64, 0, ne, 1, eps)?;
+        let hid = if row == CHAIN { x } else { g.ptr(&self.x) + 4 * (row * ne) as u64 };
+        g.rms_norm(hid, 0, h.hnorm.ptr, eh + 4 * ne as u64, 0, ne, 1, eps)?;
         g.gemv(&h.eh_proj, eh, x)?;
         self.layer(c.n_layer, &h.layer, x, g.ptr(&h.step_buf), Some(&h.worker), 1)?;
         if head {
@@ -363,7 +395,8 @@ impl<'a> GpuModel<'a> {
         {
             g.rms_norm(x, ne, l.attn_norm.ptr, p("h"), ne, ne, nt, eps)?;
             match &l.mixer {
-                Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s } => {
+                Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, snap } => {
+                    let (sc, ss, ns) = snap.as_ref().map_or((0, 0, 0), |(a, b)| (g.ptr(a), g.ptr(b), self.k));
                     mv(qkv, "h", ne, "qkv", channels)?;
                     mv(gate, "h", ne, "z", c.ssm_d_inner)?;
                     mv(beta, "h", ne, "beta", nv)?;
@@ -372,10 +405,10 @@ impl<'a> GpuModel<'a> {
                     if nt == 1 {
                         g.conv_silu(p("qkv"), g.ptr(conv), conv_w.ptr, p("y"), channels, c.ssm_conv)?;
                     } else {
-                        g.conv_seq(p("qkv"), g.ptr(conv), conv_w.ptr, p("y"), channels, c.ssm_conv, nt)?;
+                        g.conv_seq(p("qkv"), g.ptr(conv), conv_w.ptr, p("y"), channels, c.ssm_conv, nt, sc, ns)?;
                     }
                     g.l2_norm(p("y"), dk, 2 * nk, channels, nt * 2 * nk, eps)?;
-                    g.deltanet(p("y"), g.ptr(s), p("beta"), p("g"), p("o"), nk, nv, dk, dv, 1.0 / (dk as f32).sqrt(), nt, channels)?;
+                    g.deltanet(p("y"), g.ptr(s), p("beta"), p("g"), p("o"), nk, nv, dk, dv, 1.0 / (dk as f32).sqrt(), nt, channels, ss, ns)?;
                     g.norm_gate(p("o"), norm.ptr, p("z"), dv, nt * nv, eps)?;
                     mv(out, "o", c.ssm_d_inner, "mix", ne)?;
                 }

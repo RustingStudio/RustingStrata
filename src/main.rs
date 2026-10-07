@@ -27,9 +27,9 @@ struct Engine {
     /// VRAM left free after placing expert layers, in MB.
     #[arg(long, default_value_t = 512)]
     vram_margin: usize,
-    /// Speculative decoding with the model's MTP draft head (GPU, greedy output unchanged).
-    #[arg(long)]
-    mtp: bool,
+    /// Speculative decoding with the model's MTP draft head, N drafts per step (GPU, greedy output unchanged).
+    #[arg(long, value_name = "N", default_value_t = 0, default_missing_value = "1", num_args = 0..=1)]
+    mtp: usize,
 }
 
 enum Runner<'a> { Cpu(&'a Model<'a>, State), Gpu(Box<GpuModel<'a>>) }
@@ -163,7 +163,7 @@ fn main() -> anyhow::Result<()> {
                 let next = ops::argmax(&logits) as u32;
                 if eos.contains(&next) { break; }
                 let toks = match &mut r {
-                    Runner::Gpu(g) if engine.mtp => {
+                    Runner::Gpu(g) if engine.mtp > 0 => {
                         let (toks, l, rw) = g.spec_step(next, row)?;
                         (logits, row) = (l, rw);
                         toks

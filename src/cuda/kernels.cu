@@ -588,9 +588,15 @@ extern "C" __global__ void conv_seq(const float* qkv, const float* state, const 
 }
 
 // After conv_seq: state = last kw-1 inputs. One thread per channel, ascending slots read only higher ones.
-extern "C" __global__ void conv_state(const float* qkv, float* state, int ch, int kw, int T) {
+// Also writes the state after each of the first min(nsnap, T - 1) tokens to snap (one state each), for rollback.
+extern "C" __global__ void conv_state(const float* qkv, float* state, int ch, int kw, int T, float* snap, int nsnap) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= ch) return;
+    for (int n = 1; n <= min(nsnap, T - 1); n++)
+        for (int k = 0; k < kw - 1; k++) {
+            int s = n - (kw - 1) + k;
+            snap[((size_t)(n - 1) * (kw - 1) + k) * ch + c] = s < 0 ? state[(kw - 1 + s) * ch + c] : qkv[(size_t)s * ch + c];
+        }
     for (int k = 0; k < kw - 1; k++) {
         int s = T - (kw - 1) + k;
         state[k * ch + c] = s < 0 ? state[(kw - 1 + s) * ch + c] : qkv[(size_t)s * ch + c];
@@ -601,9 +607,10 @@ extern "C" __global__ void conv_state(const float* qkv, float* state, int ch, in
 // registers of L = dk / 16 lanes, 16 floats each (float4 chunks s, s + L, ...), so a warp holds R = 32 / L rows and
 // row dot products reduce over L lanes. The warp scans the T tokens in order.
 // Token t: y + t * ych = [q | k | v] after conv and l2 norm; beta, g at t * nv; output at o + t * nv * dv.
+// The state after each of the first min(nsnap, T - 1) tokens also goes to snap (S's layout, one state each).
 // ponytail: sequential scan (latency-bound per token); a chunked WY form would use tensor cores for long prompts.
 extern "C" __global__ void deltanet_seq(const float* y, float* S, const float* beta, const float* g, float* o,
-                                        int nk, int nv, int dk, int dv, float scale, int T, int ych) {
+                                        int nk, int nv, int dk, int dv, float scale, int T, int ych, float* snap, int nsnap) {
     int L = dk >> 4, R = 32 / L, lane = threadIdx.x & 31, s = lane % L, vh = blockIdx.x, kh = vh % nk;
     int j0 = (blockIdx.y * 8 + (threadIdx.x >> 5)) * R, j = j0 + lane / L;
     if (j0 >= dv) return;  // whole warp past the end (R divides dv)
@@ -630,6 +637,11 @@ extern "C" __global__ void deltanet_seq(const float* y, float* S, const float* b
         }
         for (int off = L >> 1; off; off >>= 1) oq += __shfl_xor_sync(0xffffffff, oq, off);
         if (s == 0) o[(size_t)tok * nv * dv + vh * dv + j] = oq * scale;
+        if (tok < min(nsnap, T - 1)) {
+            float4* sr = (float4*)(snap + (size_t)tok * nv * dv * dk + ((size_t)vh * dv + j) * dk);
+#pragma unroll
+            for (int i = 0; i < 4; i++) sr[s + L * i] = make_float4(r[4 * i], r[4 * i + 1], r[4 * i + 2], r[4 * i + 3]);
+        }
     }
 #pragma unroll
     for (int i = 0; i < 4; i++) row[s + L * i] = make_float4(r[4 * i], r[4 * i + 1], r[4 * i + 2], r[4 * i + 3]);
