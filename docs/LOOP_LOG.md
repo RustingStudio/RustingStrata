@@ -359,7 +359,28 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - MTP k = 1 (~79) is still level with plain decode (~81-85). The per-cycle fixed costs remain: draft head 1.2 ms
   and the second draft-block pass after an accept.
 
+### 2026-10-07 #25 — MTP rollback from state snapshots; k chained drafts (6bd2b7c)
+- Host load 4-25 (other loops); GPU shared through the lock.
+- Verify cost at load 3.8: 1 token 11.81 ms (best 11.52), 2 tokens 16.25, 3 tokens 20.67, 4 tokens 25.21. That is
+  linear at +4.45 ms per extra token. The draft head is 1.94 ms at best.
+- Change 1: during `verify`, `conv_state` and `deltanet_seq` write the recurrent state after each of the first k
+  tokens into per-layer snapshot buffers. `rollback(start, keep)` copies snapshot keep-1 back. This replaces
+  restore plus re-stepping the accepted tokens. Kernel tests check the snapshots (deltanet: 0.00e0 vs steps);
+  new `rollback_matches_step` test.
+- Speed, `--mtp 1`, dragon prompt -n 128, 3 interleaved runs each: old 83.7 / 67.0 / 80.7 (mean 77.1), rollback
+  93.8 / 87.2 / 94.4 (mean 91.8), plain 78.5 / 85.7 / 74.6 (mean 79.6). Acceptance 58/71 (81.7%) in every MTP run.
+- Change 2: `--mtp N` chains N drafts (each from the draft head's own hidden state) and verifies N+1 tokens.
+  `mtp_spec_matches_greedy` checks k = 1, 2, 3 against plain greedy (equal); acceptance 28/36, 35/58, 39/75.
+- Speed per k (3 interleaved runs, load 7-22): k0 87.4 / 75.1 / 76.7 (mean 79.7); k1 97.4 / 85.1 / 79.7 (87.4);
+  k2 64.1 / 73.1 / 74.1 (70.4, 62% accepted); k3 62.6 / 64.8 / 63.1 (63.5, 48% accepted). k >= 2 also touches more
+  experts (one k2 run had 32 misses, one k3 run 110). Acceptance falls faster than verify cost per token, and each
+  accepted draft re-runs the draft head. k = 1 stays the default; k = 2-3 stay available.
+- Bug found by the k bench: in `load`, `let k = n_expert_used` shadowed the draft count and was stored as
+  `self.k` (8), so the CLI asked for 9-token verifies. Tests set `gm.k` by hand and missed it; they now assert it.
+- Parity not re-run: plain decode numerics unchanged (snapshot writes are off with k = 0).
+
 ## Tried and rejected
+- #25: MTP k = 2-3 chained drafts: correct, but 70.4 / 63.5 tok/s vs 87.4 for k = 1 (acceptance 62% / 48%).
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
   f32: 445/448 on prompts 0-13). Worse. Redo only with llama.cpp's exact dot-product kernels.
@@ -381,8 +402,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 ## Next candidates
 
-1. MTP k = 2-3: chain drafts (the draft block's own hidden state feeds the next draft), verify 3-4 tokens. Partial
-   accepts need the DeltaNet state at an inner token: restore + re-verify the accepted prefix, or keep per-token
-   states in the scan. Amortizes the fixed costs that keep k = 1 level with plain decode.
-2. Cheaper draft head: only with a measured frequent-token list (id-order subset rejected in #24).
-3. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs and q5_k.
+1. Cheaper draft head: only with a measured frequent-token list (id-order subset rejected in #24). Also try not
+   re-running the draft head for accepted drafts (reuse its KV from the draft pass) to make k = 2 pay.
+2. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs and q5_k.
+3. M6: `serve` (OpenAI-compatible HTTP with streaming, std::net only, no new crate), `chat`, `calibrate`.
