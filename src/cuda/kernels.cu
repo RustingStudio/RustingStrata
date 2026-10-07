@@ -335,7 +335,7 @@ FTYPES(DEF_FGEMV)
 // Quantized types: dynamic shared memory holds x as int8 (256 * nsb bytes) then its scales (8 * nsb floats).
 // Each block covers 8 * rpw rows (warp w: rows w, w + 8, ...) so small matrices amortize the x quantization.
 // moe_gemv: grid.y = k; weights at w + ids[k] * stride (skipped when ids[k] < 0), input x + k * x_stride,
-// output y + k * rows.
+// output y + k * rows. grid.z = 2 also runs a second matrix at byte offset w2 into output at byte offset y2.
 #define DEF_IGEMV(T, NAME, SBB)                                                                                   \
     extern "C" __global__ void gemv_##NAME(const u8* w, const float* x, float* y, int rows, int nsb, int rpw) { \
         extern __shared__ __align__(16) signed char xs[];                                                       \
@@ -345,13 +345,15 @@ FTYPES(DEF_FGEMV)
         for (int row = r0; row < r1; row += 8) gemv_row_q<T, SBB>(w + (size_t)row * nsb * SBB, xs, xd, y, row, nsb); \
     }                                                                                                           \
     extern "C" __global__ void moe_gemv_##NAME(const u8* w, const int* ids, long long stride, const float* x,  \
-                                               int x_stride, float* y, int rows, int nsb, int rpw) {            \
+                                               int x_stride, float* y, int rows, int nsb, int rpw,              \
+                                               long long w2, long long y2) {                                   \
         extern __shared__ __align__(16) signed char xs[];                                                       \
         int k = blockIdx.y, e = ids[k];                                                                         \
         if (e < 0) return;                                                                                      \
         float* xd = (float*)(xs + 256 * nsb);                                                                   \
         quant_x(x + (size_t)k * x_stride, 256 * nsb, xs, xd);                                                   \
-        const u8* we = w + e * stride;                                                                          \
+        const u8* we = w + e * stride + blockIdx.z * w2;                                                        \
+        y = (float*)((char*)y + blockIdx.z * y2);                                                               \
         int r0 = blockIdx.x * 8 * rpw + (threadIdx.x >> 5), r1 = min(rows, r0 - (threadIdx.x >> 5) + 8 * rpw);  \
         for (int row = r0; row < r1; row += 8)                                                                  \
             gemv_row_q<T, SBB>(we + (size_t)row * nsb * SBB, xs, xd, y + (size_t)k * rows, row, nsb);           \

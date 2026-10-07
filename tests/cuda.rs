@@ -76,7 +76,7 @@ fn moe_gemv_selects_experts() {
     let (di, dx) = (gpu.stream.clone_htod(&ids).unwrap(), gpu.stream.clone_htod(&x).unwrap());
     let rows = t.rows / n_expert;
     let dy = gpu.zeros::<f32>(3 * rows).unwrap();
-    gpu.moe_gemv(t.ty, rows, t.cols, dt.ptr, dt.bytes() / n_expert, gpu.ptr(&di), 3, gpu.ptr(&dx), 0, gpu.ptr(&dy)).unwrap();
+    gpu.moe_gemv(t.ty, rows, t.cols, dt.ptr, dt.bytes() / n_expert, gpu.ptr(&di), 3, gpu.ptr(&dx), 0, gpu.ptr(&dy), None).unwrap();
     let got = gpu.stream.clone_dtoh(&dy).unwrap();
     for (k, &e) in ids.iter().enumerate() {
         let mut want = vec![0f32; rows];
@@ -85,6 +85,14 @@ fn moe_gemv_selects_experts() {
         let err = rel_l2(&got[k * rows..(k + 1) * rows], &want);
         assert!(err <= 1e-4, "expert {e}: rel err {err}");
     }
+    // The paired launch (gate and up in one) matches a separate launch of the up matrices bit for bit.
+    let u = gpu.upload(&w.get("blk.0.ffn_up_exps.weight").unwrap()).unwrap();
+    let (dg, du) = (gpu.zeros::<f32>(3 * rows).unwrap(), gpu.zeros::<f32>(3 * rows).unwrap());
+    let pair = (u.ptr as i64 - dt.ptr as i64, gpu.ptr(&du) as i64 - gpu.ptr(&dg) as i64);
+    gpu.moe_gemv(t.ty, rows, t.cols, dt.ptr, dt.bytes() / n_expert, gpu.ptr(&di), 3, gpu.ptr(&dx), 0, gpu.ptr(&dg), Some(pair)).unwrap();
+    gpu.moe_gemv(u.ty, rows, u.cols, u.ptr, u.bytes() / n_expert, gpu.ptr(&di), 3, gpu.ptr(&dx), 0, gpu.ptr(&dy), None).unwrap();
+    assert_eq!(gpu.stream.clone_dtoh(&dg).unwrap(), got, "paired gate");
+    assert_eq!(gpu.stream.clone_dtoh(&du).unwrap(), gpu.stream.clone_dtoh(&dy).unwrap(), "paired up");
 }
 
 /// Achieved GEMV bandwidth per type (one dense matrix per type, plus 8-expert MoE GEMVs). Run with --ignored.
@@ -116,7 +124,7 @@ fn gemv_bandwidth() {
             let n = info.dims[2] as usize;
             let ids = gpu.stream.clone_htod(&[3i32, 17, 40, 77, 101, 150, 200, 255]).unwrap();
             let rows = t.rows / n;
-            (time(&|| gpu.moe_gemv(t.ty, rows, t.cols, dt.ptr, dt.bytes() / n, gpu.ptr(&ids), 8, gpu.ptr(&x), 0, gpu.ptr(&y)).unwrap()),
+            (time(&|| gpu.moe_gemv(t.ty, rows, t.cols, dt.ptr, dt.bytes() / n, gpu.ptr(&ids), 8, gpu.ptr(&x), 0, gpu.ptr(&y), None).unwrap()),
              8 * dt.bytes() / info.dims[2] as usize)
         } else {
             (time(&|| gpu.gemv(&dt, gpu.ptr(&x), gpu.ptr(&y)).unwrap()), dt.bytes())
