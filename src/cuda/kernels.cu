@@ -349,17 +349,17 @@ QTYPES(DEF_DEQUANT)
         if (row < rows) gemv_row<T, SBB>(w + (size_t)row * nsb * SBB, x, y, row, nsb);                         \
     }                                                                                                           \
     extern "C" __global__ void moe_gemv_##NAME(const u8* w, const int* ids, long long stride, const float* x,  \
-                                               int x_stride, float* y, int rows, int nsb, int) {              \
+                                               int x_stride, int xg, float* y, int rows, int nsb, int) {      \
         int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, k = blockIdx.y;                                 \
         if (row < rows && ids[k] >= 0)                                                                          \
-            gemv_row<T, SBB>(w + ids[k] * stride + (size_t)row * nsb * SBB, x + (size_t)k * x_stride,           \
+            gemv_row<T, SBB>(w + ids[k] * stride + (size_t)row * nsb * SBB, x + (size_t)(k / xg) * x_stride,    \
                              y + (size_t)k * rows, row, nsb);                                                   \
     }
 FTYPES(DEF_FGEMV)
 
 // Quantized types: dynamic shared memory holds x as int8 (256 * nsb bytes) then its scales (8 * nsb floats).
 // Each block covers 8 * rpw rows (warp w: rows w, w + 8, ...) so small matrices amortize the x quantization.
-// moe_gemv: grid.y = k; weights at w + ids[k] * stride (skipped when ids[k] < 0), input x + k * x_stride,
+// moe_gemv: grid.y = k; weights at w + ids[k] * stride (skipped when ids[k] < 0), input x + (k / xg) * x_stride,
 // output y + k * rows. grid.z = 2 also runs a second matrix at byte offset w2 into output at byte offset y2.
 #define DEF_IGEMV(T, NAME, SBB)                                                                                   \
     extern "C" __global__ void gemv_##NAME(const u8* w, const float* x, float* y, int rows, int nsb, int rpw) { \
@@ -370,13 +370,13 @@ FTYPES(DEF_FGEMV)
         for (int row = r0; row < r1; row += 8) gemv_row_q<T, SBB>(w + (size_t)row * nsb * SBB, xs, xd, y, row, nsb); \
     }                                                                                                           \
     extern "C" __global__ void moe_gemv_##NAME(const u8* w, const int* ids, long long stride, const float* x,  \
-                                               int x_stride, float* y, int rows, int nsb, int rpw,              \
+                                               int x_stride, int xg, float* y, int rows, int nsb, int rpw,      \
                                                long long w2, long long y2) {                                   \
         extern __shared__ __align__(16) signed char xs[];                                                       \
         int k = blockIdx.y, e = ids[k];                                                                         \
         if (e < 0) return;                                                                                      \
         float* xd = (float*)(xs + 256 * nsb);                                                                   \
-        quant_x(x + (size_t)k * x_stride, 256 * nsb, xs, xd);                                                   \
+        quant_x(x + (size_t)(k / xg) * x_stride, 256 * nsb, xs, xd);                                            \
         const u8* we = w + e * stride + blockIdx.z * w2;                                                        \
         y = (float*)((char*)y + blockIdx.z * y2);                                                               \
         int r0 = blockIdx.x * 8 * rpw + (threadIdx.x >> 5), r1 = min(rows, r0 - (threadIdx.x >> 5) + 8 * rpw);  \
@@ -833,25 +833,30 @@ extern "C" __global__ void map_hits(const int* ids, const int* table, int* slots
     wh[j] = s >= 0 ? wts[j] : 0.0f;
 }
 
-// Copy one layer's routing to the host-mapped mailbox `mb` (activation only if an expert missed), then raise the
-// request flag. One block.
+// Copy one layer's routing for T tokens (k entries each) to the host-mapped mailbox `mb` (activations only if an
+// expert missed), store T in word 1, then raise the request flag. One block.
 extern "C" __global__ void moe_publish(const int* ids, const float* wts, const int* slots, const float* h,
-                                       unsigned int* mb, int k, int n, int h_off, const int* step) {
-    int t = threadIdx.x;
+                                       unsigned int* mb, int k, int n, int h_off, const int* step, int T) {
+    int t = threadIdx.x, kt = k * T;
     unsigned int seq = step[1];
-    int miss = __syncthreads_or(t < k && slots[t] < 0);
-    if (t < k) { mb[32 + t] = ids[t]; mb[32 + k + t] = __float_as_uint(wts[t]); mb[32 + 2 * k + t] = slots[t]; }
-    if (miss) for (int i = t; i < n; i += blockDim.x) mb[h_off + i] = __float_as_uint(h[i]);
+    int miss = __syncthreads_or(t < kt && slots[t] < 0);
+    if (t < kt) { mb[32 + t] = ids[t]; mb[32 + kt + t] = __float_as_uint(wts[t]); mb[32 + 2 * kt + t] = slots[t]; }
+    if (miss) for (int i = t; i < n * T; i += blockDim.x) mb[h_off + i] = __float_as_uint(h[i]);
+    if (t == 0) mb[1] = T;
     __threadfence_system();
     __syncthreads();
     if (t == 0) *(volatile unsigned int*)mb = seq;
 }
 
 // x += sum_j w[j] ye[j] + sigmoid(sg) sh + cpu. If a slot missed, wait for the CPU worker's done flag first.
+// grid.y = token: x, ye, w, slots, sh, sg and the CPU result advance by one token's worth.
 extern "C" __global__ void moe_combine(float* x, const float* ye, const float* w, int k, const float* sh,
                                        const float* sg, const unsigned int* mb, int y_off, const int* step,
                                        const int* slots, int n) {
     unsigned int seq = step[1];
+    int tk = blockIdx.y;
+    x += (size_t)tk * n; ye += (size_t)tk * k * n; w += tk * k; slots += tk * k; y_off += tk * n;
+    if (sh) { sh += (size_t)tk * n; sg += tk; }
     __shared__ int miss;
     if (threadIdx.x == 0) {
         int m = 0;
