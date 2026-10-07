@@ -304,6 +304,31 @@ __device__ __forceinline__ void gemv_row_q(const u8* __restrict__ w, const signe
     if (lane == 0) y[row] = acc;
 }
 
+// gemv_row_q for nt <= 4 inputs: x t is qs + t * 256 * nsb with scales xd + t * 8 * nsb; y t is y + t * ys.
+template <int T, int SBB, int NT>
+__device__ __forceinline__ void gemv_row_qn(const u8* __restrict__ w, const signed char* qs, const float* xd, float* y, int ys,
+                                            int row, int nsb) {
+    int lane = threadIdx.x & 31;
+    float acc[NT] = {};
+#pragma unroll 4
+    for (int s = 0; s < nsb; s++) {
+        int lo, hi; float d, m = 0.0f;
+        QI<T>::get(w + (size_t)s * SBB, lane, lo, hi, d, m);
+#pragma unroll
+        for (int t = 0; t < NT; t++) {
+            int2 xq = *(const int2*)(qs + (t * nsb + s) * 256 + lane * 8);
+            float dx = xd[(t * nsb + s) * 8 + (lane >> 2)];
+            acc[t] += d * dx * (float)__dp4a(lo, xq.x, __dp4a(hi, xq.y, 0));
+            if (QI<T>::MIN) acc[t] -= m * dx * (float)__dp4a(0x01010101, xq.x, __dp4a(0x01010101, xq.y, 0));
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NT; t++) {
+        float a = warp_sum(acc[t]);
+        if (lane == 0) y[(size_t)t * ys + row] = a;
+    }
+}
+
 #define FTYPES(X) X(0, f32, 1024) X(30, bf16, 512)
 #define ITYPES(X) X(8, q8_0, 272) X(10, q2_k, 84) X(11, q3_k, 110) X(12, q4_k, 144) X(13, q5_k, 176) X(14, q6_k, 210) \
     X(17, iq2_xs, 74) X(18, iq3_xxs, 98) X(23, iq4_xs, 136)
@@ -359,6 +384,24 @@ FTYPES(DEF_FGEMV)
             gemv_row_q<T, SBB>(we + (size_t)row * nsb * SBB, xs, xd, y + (size_t)k * rows, row, nsb);           \
     }
 ITYPES(DEF_IGEMV)
+
+// gemvn: y[t] = W x[t] for t < nt <= 4 (x t at x + t * xs, y t at y + t * ys); each weight block is read once.
+#define DEF_IGEMVN(T, NAME, SBB)                                                                                  \
+    extern "C" __global__ void gemvn_##NAME(const u8* w, const float* x, int xs_, float* y, int ys, int rows, int nsb, \
+                                            int rpw, int nt) {                                                    \
+        extern __shared__ __align__(16) signed char xs[];                                                       \
+        float* xd = (float*)(xs + nt * 256 * nsb);                                                              \
+        for (int t = 0; t < nt; t++) quant_x(x + (size_t)t * xs_, 256 * nsb, xs + t * 256 * nsb, xd + t * 8 * nsb); \
+        int r0 = blockIdx.x * 8 * rpw + (threadIdx.x >> 5), r1 = min(rows, r0 - (threadIdx.x >> 5) + 8 * rpw);  \
+        for (int row = r0; row < r1; row += 8) {                                                               \
+            const u8* wr = w + (size_t)row * nsb * SBB;                                                         \
+            if (nt == 2) gemv_row_qn<T, SBB, 2>(wr, xs, xd, y, ys, row, nsb);                                    \
+            else if (nt == 3) gemv_row_qn<T, SBB, 3>(wr, xs, xd, y, ys, row, nsb);                               \
+            else if (nt == 4) gemv_row_qn<T, SBB, 4>(wr, xs, xd, y, ys, row, nsb);                               \
+            else gemv_row_qn<T, SBB, 1>(wr, xs, xd, y, ys, row, nsb);                                            \
+        }                                                                                                       \
+    }
+ITYPES(DEF_IGEMVN)
 
 // ---- prefill GEMM: Y[m, n] = sum_k X[m, k] W[n, k] on tensor cores (fp16 inputs, fp32 accumulate) ----
 // Work is a list of tiles of up to GEMM_BM consecutive positions m0 .. m0 + cnt, each with its own weight matrix (so one
