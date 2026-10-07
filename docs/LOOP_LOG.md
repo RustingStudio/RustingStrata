@@ -5,7 +5,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 ## State
 
 - Milestone: M2 done. M3 expert cache partly in (commit 90db54a). M4 first half (chunked GPU prefill) committed.
-- Speed at 4K (3 clean runs): prefill 1001 tok/s (961-1022; gate 1017), decode 49.6 tok/s (49.1-49.9; gate 67).
+- Speed at 4K (3 clean runs): prefill **1366 tok/s** (1363-1369; gate 1017, passed), decode 49.6 tok/s (gate 67).
   See `docs/m4-results.md`.
 - Parity (20 prompts x 32, GPU, 3 runs): prefill 628/630/629 = mean 98.28% +- 0.16; token-by-token prompt
   (`--chunk 0`) 631/627/631 = mean 98.39% +- 0.36. Gate 99%. Decode is not deterministic run to run (adaptive
@@ -56,13 +56,29 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - Benchmark method: `bench.sh`-style wait for an idle GPU and a watcher that marks a run dirty if any other process
   touches the GPU during it; dirty runs are discarded. All 3 runs were clean.
 
+### 2026-10-07 #5 — default prefill chunk 4096 (8d0c3c4)
+- Profile (nsys, 4K prefill after #4): kernels 4.2 s; gemm_iq2_xs 1.22 s, gemm_q5_k 0.79, deltanet_seq 0.77,
+  gemm_iq3_xxs 0.53, attn_prefill_256 0.29, gemm_q6_k 0.29. H2D in the prefill window 80 ms GPU time.
+- Expert gate/up GEMMs ran at ~4.4 TFLOP/s against ~13 in the dense `gemm_throughput` test: at chunk 1024 each expert
+  gets ~32 positions, so 128-position tiles are mostly empty. Larger chunk fills them.
+- Clean 4K runs (3 each, idle GPU): chunk 1024 919/1012/1013, 2048 1222/1221/1218, **4096 1368/1363/1369** tok/s.
+  Decode 49-50 tok/s in all. Default `--chunk` now 4096; `GpuModel::load` caps it at `ctx`. Scratch 118 to 470 MB.
+  Loads and runs at `--ctx 32768` (resident experts 8160/10240, prefill 1331 tok/s single run).
+- Parity, interleaved runs: chunk 4096 627/624/627/630/627/632 (mean 98.09%), chunk 1024 630/629/629/633/628
+  (mean 98.41%; earlier runs 628-630). Difference ~1.4 misses, inside the 624-633 run-to-run range; the only prompt
+  whose prefill changes (1367 tokens, now one chunk) scored the same. Several runs had forever_bear on the GPU, which
+  changes expert placement. Accepted as noise; recheck when decode accuracy work lands.
+- 4 parity runs died with `CUDA_ERROR_OUT_OF_MEMORY` while forever_bear and a RustingEngine test held VRAM (both
+  chunk sizes). Load plans from free VRAM at start; a process that arrives later can starve us. Not fixed.
+
 ## Tried and rejected
 
 (none yet)
 
 ## Next candidates
 
-1. Prefill GEMMs still ~70% of prefill time (re-profile first). Options: cp.async double buffering of the weight
-   tiles; int8 mma (m16n8k32) over Q8-quantized X like llama.cpp MMQ. Gate 1017 is ~2% away.
-2. Decode 49.6 vs 67 tok/s: profile one decode step (CPU expert share was ~28% before).
-3. Per-kernel tests for prefill kernels (attn_prefill vs attn_decode; deltanet_seq vs T decode steps). Rule debt.
+1. Decode accuracy (parity 98.1-98.4% vs gate 99%): int8 activations in decode give 1.9-2.3 logit error vs 0.4 for the
+   f16 prefill path; results also depend on which experts are resident. Try Q8_1-with-sum like llama.cpp or f16
+   activations for the GEMVs; measure with `gpu_forward_matches_cpu_reference` dlogit first.
+2. Decode 49.6 vs 67 tok/s: profile one decode step with nsys (not yet done since M3).
+3. deltanet_seq 0.77 s of 4.2 s prefill (sequential scan); chunked WY form. Plus per-kernel tests for prefill kernels.
