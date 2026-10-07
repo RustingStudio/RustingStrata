@@ -105,7 +105,8 @@ impl Gpu {
         let module = ctx.load_module(ptx(&source(), arch)?).context("load PTX")?;
         let mut fns = HashMap::new();
         let names = KERNELS.iter().map(|s| s.to_string())
-            .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "moe_gemv", "gemm"].map(|p| kname(p, t))));
+            .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "moe_gemv", "gemm"].map(|p| kname(p, t))))
+            .chain(QTYPES.iter().filter(|&&t| !Self::float_ty(t)).map(|&t| kname("gemvn", t)));
         for n in names {
             let f = module.load_function(&n).with_context(|| format!("kernel {n}"))?;
             if n.starts_with("attn_prefill") {
@@ -184,6 +185,21 @@ impl Gpu {
         let nsb = Self::nsb(w)?;
         let (c, rpw) = Self::gemv_cfg(w.ty, w.rows, w.cols, 1);
         launch!(self, &kname("gemv", w.ty), c, w.ptr, x, y, w.rows as i32, nsb, rpw);
+        Ok(())
+    }
+
+    /// y[t] = W x[t] for t < nt (x[t] at x + 4 * t * x_stride bytes, y[t] at y + 4 * t * y_stride). Integer types read
+    /// each weight block once for all nt; float types run nt GEMVs.
+    pub fn gemvn(&self, w: &GpuTensor, x: u64, x_stride: usize, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
+        if !(1..=4).contains(&nt) { bail!("gemvn: {nt} inputs (1 to 4)"); }
+        if Self::float_ty(w.ty) {
+            for t in 0..nt as u64 { self.gemv(w, x + 4 * t * x_stride as u64, y + 4 * t * y_stride as u64)?; }
+            return Ok(());
+        }
+        let nsb = Self::nsb(w)?;
+        let (mut c, rpw) = Self::gemv_cfg(w.ty, w.rows, w.cols, 1);
+        c.shared_mem_bytes *= nt as u32;
+        launch!(self, &kname("gemvn", w.ty), c, w.ptr, x, x_stride as i32, y, y_stride as i32, w.rows as i32, nsb, rpw, nt as i32);
         Ok(())
     }
 
