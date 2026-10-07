@@ -10,3 +10,4 @@ pub mod gpu_model;
 pub mod cpu_moe;
 pub mod expert_cache;
 pub mod cpu_worker;
+pub mod serve;
