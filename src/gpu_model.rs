@@ -51,7 +51,10 @@ pub struct GpuModel<'a> {
     /// [position, CPU worker seq] for the current token, read by kernels so the graph can replay.
     step_buf: CudaSlice<i32>,
     /// The whole token forward, captured on the first step (None until then, or with STRATA_NO_GRAPH set).
-    graph: Option<CudaGraph>,
+    /// Captured forward per token count (index nt).
+    graphs: Vec<Option<CudaGraph>>,
+    /// Captured draft head per (hidden row, output head on).
+    mtp_graphs: std::collections::HashMap<(usize, bool), CudaGraph>,
     /// DeltaNet (conv, s) copies per recurrent layer and the position, for `restore_state`.
     saved: Vec<(CudaSlice<f32>, CudaSlice<f32>)>,
     saved_pos: usize,
@@ -155,7 +158,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, step_buf, graph: None, ctx, pos: 0, saved: vec![], saved_pos: 0, cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO, drafts: (0, 0), pf, mtp })
+        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, step_buf, graphs: (0..=TMAX).map(|_| None).collect(), mtp_graphs: Default::default(), ctx, pos: 0, saved: vec![], saved_pos: 0, cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO, drafts: (0, 0), pf, mtp })
     }
 
     /// Clear KV and recurrent state.
@@ -179,19 +182,7 @@ impl<'a> GpuModel<'a> {
         let ne = self.m.cfg.n_embd;
         g.stream.memcpy_htod(&self.m.embed(token), &mut self.x.slice_mut(0..ne))?;
         g.stream.memcpy_htod(&[self.pos as i32, seq as i32], &mut self.step_buf.slice_mut(0..2))?;
-        match &self.graph {
-            Some(graph) => graph.launch()?,
-            None if std::env::var_os("STRATA_NO_GRAPH").is_some() => self.forward(1)?,
-            None => {
-                g.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                let r = self.forward(1);
-                let graph = g.stream.end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)?;
-                r?;
-                let graph = graph.ok_or_else(|| anyhow::anyhow!("empty CUDA graph"))?;
-                graph.launch()?;
-                self.graph = Some(graph);
-            }
-        }
+        self.run(1)?;
         let logits = self.gpu.stream.clone_dtoh(&self.logits.slice(0..self.m.cfg.n_vocab))?;
         self.after_forward(1)?;
         Ok(logits)
@@ -209,8 +200,8 @@ impl<'a> GpuModel<'a> {
         g.stream.memcpy_htod(&emb, &mut self.x.slice_mut(0..nt * ne))?;
         let steps: Vec<i32> = (0..nt).flat_map(|t| [(self.pos + t) as i32, seq as i32]).collect();
         g.stream.memcpy_htod(&steps, &mut self.step_buf.slice_mut(0..2 * nt))?;
-        self.forward(nt)?;
-        let logits = g.stream.clone_dtoh(&self.logits.slice(0..nt * nvoc))?;
+        self.run(nt)?;
+        let logits = self.gpu.stream.clone_dtoh(&self.logits.slice(0..nt * nvoc))?;
         self.after_forward(nt)?;
         Ok(logits.chunks(nvoc).map(|c| c.to_vec()).collect())
     }
@@ -247,6 +238,25 @@ impl<'a> GpuModel<'a> {
             }
         }
         self.pos = self.saved_pos;
+        Ok(())
+    }
+
+    /// Launch the forward of `nt` tokens as a CUDA graph, capturing it on first use.
+    fn run(&mut self, nt: usize) -> anyhow::Result<()> {
+        let g = &self.gpu;
+        match &self.graphs[nt] {
+            Some(graph) => graph.launch()?,
+            None if std::env::var_os("STRATA_NO_GRAPH").is_some() => self.forward(nt)?,
+            None => {
+                g.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                let r = self.forward(nt);
+                let graph = g.stream.end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)?;
+                r?;
+                let graph = graph.ok_or_else(|| anyhow::anyhow!("empty CUDA graph"))?;
+                graph.launch()?;
+                self.graphs[nt] = Some(graph);
+            }
+        }
         Ok(())
     }
 
@@ -303,24 +313,41 @@ impl<'a> GpuModel<'a> {
         let g = &self.gpu;
         g.stream.memcpy_htod(&self.m.embed(token), &mut h.emb)?;
         g.stream.memcpy_htod(&[h.pos as i32, seq as i32], &mut h.step_buf)?;
-        let h = self.mtp.as_ref().unwrap();
-        let (eps, ne, hp) = (c.eps, c.n_embd, g.ptr(&self.bufs["h"]));
-        let (eh, x) = (g.ptr(&h.eh), g.ptr(&h.x));
-        g.rms_norm(g.ptr(&h.emb), 0, h.enorm.ptr, eh, 0, ne, 1, eps)?;
-        g.rms_norm(g.ptr(&self.x) + 4 * (row * ne) as u64, 0, h.hnorm.ptr, eh + 4 * ne as u64, 0, ne, 1, eps)?;
-        g.gemv(&h.eh_proj, eh, x)?;
-        self.layer(c.n_layer, &h.layer, x, g.ptr(&h.step_buf), Some(&h.worker), 1)?;
-        let logits = if head {
-            g.rms_norm(x, 0, h.head_norm.ptr, hp, 0, ne, 1, eps)?;
-            g.gemv(&self.output, hp, g.ptr(&self.logits))?;
-            g.stream.clone_dtoh(&self.logits.slice(0..c.n_vocab))?
-        } else { g.stream.synchronize()?; vec![] };
+        let key = (row, head);
+        if let Some(graph) = self.mtp_graphs.get(&key) { graph.launch()?; } else {
+            g.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+            let r = self.mtp_forward(row, head);
+            let graph = g.stream.end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)?;
+            r?;
+            let graph = graph.ok_or_else(|| anyhow::anyhow!("empty CUDA graph"))?;
+            graph.launch()?;
+            self.mtp_graphs.insert(key, graph);
+        }
+        let g = &self.gpu;
+        let logits = if head { g.stream.clone_dtoh(&self.logits.slice(0..c.n_vocab))? }
+                     else { g.stream.synchronize()?; vec![] };
         let h = self.mtp.as_mut().unwrap();
         h.pos += 1;
         if let Some(cache) = self.cache.as_mut() {
             cache.record(c.n_layer, &h.worker.routing(c.n_layer).iter().map(|x| x.0).collect::<Vec<_>>());
         }
         Ok(logits)
+    }
+
+    /// Enqueue the draft head (see `mtp_run`).
+    fn mtp_forward(&self, row: usize, head: bool) -> anyhow::Result<()> {
+        let (c, g, h) = (&self.m.cfg, &self.gpu, self.mtp.as_ref().unwrap());
+        let (eps, ne, hp) = (c.eps, c.n_embd, g.ptr(&self.bufs["h"]));
+        let (eh, x) = (g.ptr(&h.eh), g.ptr(&h.x));
+        g.rms_norm(g.ptr(&h.emb), 0, h.enorm.ptr, eh, 0, ne, 1, eps)?;
+        g.rms_norm(g.ptr(&self.x) + 4 * (row * ne) as u64, 0, h.hnorm.ptr, eh + 4 * ne as u64, 0, ne, 1, eps)?;
+        g.gemv(&h.eh_proj, eh, x)?;
+        self.layer(c.n_layer, &h.layer, x, g.ptr(&h.step_buf), Some(&h.worker), 1)?;
+        if head {
+            g.rms_norm(x, 0, h.head_norm.ptr, hp, 0, ne, 1, eps)?;
+            g.gemv(&self.output, hp, g.ptr(&self.logits))?;
+        }
+        Ok(())
     }
 
     /// One decoder block on `nt` tokens at `x` (rows of n_embd); `step` points at [position, worker seq] per token.

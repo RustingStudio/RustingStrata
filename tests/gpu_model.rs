@@ -61,6 +61,9 @@ fn prefill_matches_reference() {
     let cpu2 = m.step(&mut st, next);
     let chunk = std::env::var("CHUNK").map_or(48, |v| v.parse().unwrap());
     let mut gm = GpuModel::load(&m, gpu, 512, chunk, 512 << 20, false).unwrap();
+    // Fixed expert placement: adaptive moves change the decode yardstick from run to run (it differed inside the
+    // full suite and failed once).
+    gm.adapt_every = 0;
     let t0 = std::time::Instant::now();
     let pre = gm.prefill(&ids).unwrap();
     eprintln!("prefill {} tokens in {:?}", ids.len(), t0.elapsed());
