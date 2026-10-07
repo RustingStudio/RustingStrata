@@ -234,3 +234,43 @@ fn rollback_matches_step() {
     assert_eq!(gm.pos, start + 1);
     assert_eq!(gm.step(rest[2]).unwrap(), want, "step after rollback");
 }
+
+/// `prefill_cached` restarts from the saved history state: the logits equal a fresh run split at the same points,
+/// with decode steps in between that must not leak into the next prompt.
+#[test]
+fn prefill_cached_reuses_history() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let gpu = match Gpu::new() {
+        Ok(g) => g,
+        Err(e) => { eprintln!("SKIP: no GPU: {e:#}"); return }
+    };
+    let mut gm = GpuModel::load(&m, gpu, 512, 128, 512 << 20, 0).unwrap();
+    gm.adapt_every = 0;
+    let enc = |s: &str| tok.encode(s).unwrap();
+    let h1 = enc("<|im_start|>user\nTell me about rivers, the ways they carve valleys over thousands of years, and why towns grow on their banks.<|im_end|>\n");
+    let h2 = [h1.clone(), enc("<|im_start|>assistant\nRivers move water and sediment downhill.<|im_end|>\n<|im_start|>user\nAnd lakes?<|im_end|>\n")].concat();
+    let tail = enc("<|im_start|>assistant\n");
+    let fresh = |gm: &mut GpuModel, parts: &[&[u32]]| {
+        gm.reset().unwrap();
+        parts.iter().map(|p| gm.prefill(p).unwrap()).last().unwrap()
+    };
+
+    let p1 = [&h1[..], &tail].concat();
+    let want1 = fresh(&mut gm, &[&h1, &tail]);
+    let (got1, r1) = gm.prefill_cached(&p1, h1.len()).unwrap();
+    assert_eq!((r1, &got1), (0, &want1));
+    for t in [11u32, 22, 33] { gm.step(t).unwrap(); } // a reply that the next prompt does not contain
+
+    let p2 = [&h2[..], &tail].concat();
+    let (got2, r2) = gm.prefill_cached(&p2, h2.len()).unwrap();
+    assert_eq!(r2, h1.len());
+    // A prompt that does not extend the saved history (now h2) starts over.
+    let (got3, r3) = gm.prefill_cached(&p1, h1.len()).unwrap();
+    assert_eq!((r3, &got3), (0, &want1));
+    let want2 = fresh(&mut gm, &[&h1, &h2[h1.len()..], &tail]);
+    assert_eq!(got2, want2, "reused prefix");
+}
