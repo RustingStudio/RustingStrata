@@ -7,9 +7,14 @@ use std::io::{BufRead, Read};
 /// ChatML prompt in the model's template: (role, content) turns, then the assistant header. `think` false
 /// appends the empty think block the template uses for `enable_thinking = false`.
 pub fn chat_prompt(msgs: &[(String, String)], think: bool) -> String {
-    let mut s: String = msgs.iter().map(|(r, c)| format!("<|im_start|>{r}\n{c}<|im_end|>\n")).collect();
+    let mut s = chat_history(msgs);
     s += if think { "<|im_start|>assistant\n<think>\n" } else { "<|im_start|>assistant\n<think>\n\n</think>\n\n" };
     s
+}
+
+/// The messages part of `chat_prompt`, without the assistant header. The next turn's prompt starts with it.
+pub fn chat_history(msgs: &[(String, String)]) -> String {
+    msgs.iter().map(|(r, c)| format!("<|im_start|>{r}\n{c}<|im_end|>\n")).collect()
 }
 
 pub struct Request {

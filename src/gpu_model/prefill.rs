@@ -77,6 +77,28 @@ impl GpuModel<'_> {
         Ok(g.stream.clone_dtoh(&self.logits.slice(0..self.m.cfg.n_vocab))?)
     }
 
+    /// A fresh sequence: `prefill(tokens)` from position 0, reusing earlier work. The state after `tokens[..keep]` is
+    /// saved; when the saved tokens are a prefix of the next call's `tokens[..keep]`, that call starts from them
+    /// (KV past them is rewritten, the recurrent state is copied back). Returns the logits and the tokens reused.
+    pub fn prefill_cached(&mut self, tokens: &[u32], keep: usize) -> anyhow::Result<(Vec<f32>, usize)> {
+        anyhow::ensure!(keep < tokens.len(), "prefill_cached: keep {keep} of {} tokens", tokens.len());
+        let hit = self.saved_ids.len();
+        let reused = if hit > 0 && tokens[..keep].starts_with(&self.saved_ids) {
+            self.restore_state()?;
+            if let Some(h) = self.mtp.as_mut() { h.pos = 0; }
+            hit
+        } else {
+            self.reset()?;
+            0
+        };
+        if keep > reused {
+            self.prefill(&tokens[reused..keep])?;
+            self.save_state()?;
+            self.saved_ids = tokens[..keep].to_vec();
+        }
+        Ok((self.prefill(&tokens[keep..])?, reused))
+    }
+
     fn step_all(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
         let mut logits = Vec::new();
         for &t in tokens { logits = self.step(t)?; }

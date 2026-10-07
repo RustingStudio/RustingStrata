@@ -64,6 +64,18 @@ impl Runner<'_> {
             Runner::Gpu(g) => g.prefill(ts),
         }
     }
+    /// Feed a chat prompt as a fresh sequence, reusing the earlier request's state for the shared message history
+    /// (GPU). Returns the logits and the number of tokens reused.
+    fn chat(&mut self, tok: &Tokenizer, msgs: &[(String, String)], think: bool) -> anyhow::Result<(Vec<u32>, Vec<f32>, usize)> {
+        let ids = tok.encode(&serve::chat_prompt(msgs, think))?;
+        let h = tok.encode(&serve::chat_history(msgs))?;
+        let keep = if ids.starts_with(&h) { h.len() } else { 0 };
+        let (logits, reused) = match self {
+            Runner::Gpu(g) => g.prefill_cached(&ids, keep)?,
+            _ => { self.reset()?; (self.prefill(&ids)?, 0) }
+        };
+        Ok((ids, logits, reused))
+    }
     /// Forget the sequence so far.
     fn reset(&mut self) -> anyhow::Result<()> {
         match self { Runner::Cpu(m, st) => { *st = State::new(&m.cfg); Ok(()) } Runner::Gpu(g) => g.reset() }
@@ -133,7 +145,7 @@ enum Cmd {
         #[command(flatten)]
         engine: Engine,
     },
-    /// Interactive chat on stdin (greedy unless --temp; the whole conversation is prefilled again each turn).
+    /// Interactive chat on stdin (greedy unless --temp; on the GPU each turn prefills only what follows the previous turn's messages).
     Chat {
         #[arg(long)]
         model: PathBuf,
@@ -149,7 +161,8 @@ enum Cmd {
         engine: Engine,
     },
     /// OpenAI-compatible HTTP server: POST /v1/chat/completions (streaming or not), GET /v1/models.
-    /// One request at a time; temperature, top_k, top_p and seed are honored, greedy when left out.
+    /// One request at a time; temperature, top_k, top_p and seed are honored, greedy when left out. A request that
+    /// extends the previous one's messages prefills only the new part (usage.prompt_tokens_details.cached_tokens).
     Serve {
         #[arg(long)]
         model: PathBuf,
@@ -307,9 +320,7 @@ fn main() -> anyhow::Result<()> {
                 if stdin.lock().read_line(&mut line)? == 0 { break; }
                 if line.trim().is_empty() { continue; }
                 msgs.push(("user".into(), line.trim_end().into()));
-                let ids = tok.encode(&serve::chat_prompt(&msgs, think))?;
-                r.reset()?;
-                let logits = r.prefill(&ids)?;
+                let (ids, logits, _) = r.chat(&tok, &msgs, think)?;
                 let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut smp, logits, room(&engine, ids.len(), n), &mut |t| { print!("{t}"); Ok(std::io::stdout().flush()?) })?;
                 println!();
                 msgs.push(("assistant".into(), answer(&tok.decode(&out)?)));
@@ -480,6 +491,7 @@ fn handle(c: TcpStream, r: &mut Runner, tok: &Tokenizer, e: &Engine, name: &str,
                 Ok(q) => q,
                 Err(err) => return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
             };
+            // Room is checked on the full prompt before any state changes.
             let ids = tok.encode(&serve::chat_prompt(&req.messages, req.think))?;
             let mut smp = e.sampler();
             smp.temp = req.temperature.unwrap_or(smp.temp);
@@ -491,9 +503,10 @@ fn handle(c: TcpStream, r: &mut Runner, tok: &Tokenizer, e: &Engine, name: &str,
             let id = format!("chatcmpl-{i}");
             let chunk = |delta: serde_json::Value, finish: Option<&str>| json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": name,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
+            let mut cached = 0;
             let res = (|| -> anyhow::Result<(Vec<u32>, bool, String)> {
-                r.reset()?;
-                let logits = r.prefill(&ids)?;
+                let logits;
+                (_, logits, cached) = r.chat(tok, &req.messages, req.think)?;
                 if req.stream {
                     write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
                     write!(w, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), None))?;
@@ -505,14 +518,15 @@ fn handle(c: TcpStream, r: &mut Runner, tok: &Tokenizer, e: &Engine, name: &str,
                     Ok((out, stop, text))
                 }
             })();
-            // The next request resets the state first. A stream that already started is just cut off.
+            // The next request starts from the saved history state or from scratch. A stream that already started is just cut off.
             let (out, stop, text) = match res {
                 Ok(x) => x,
                 Err(err) if !req.stream => return send(&mut w, "500 Internal Server Error", json!({"error": {"message": format!("{err:#}"), "type": "server_error"}})),
                 Err(err) => return Err(err),
             };
             let finish = if stop { "stop" } else { "length" };
-            let usage = json!({"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len()});
+            let usage = json!({"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len(),
+                "prompt_tokens_details": {"cached_tokens": cached}});
             if req.stream {
                 let mut last = chunk(json!({}), Some(finish));
                 last["usage"] = usage;
