@@ -252,7 +252,7 @@ impl Gpu {
 
     pub fn attn_prefill(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
         if !matches!(hd, 64 | 128 | 256) { bail!("attention prefill: head_dim {hd} unsupported (64, 128 or 256)"); }
-        let smem = (2 * ((64 + 32) * (hd + 8) + hd * 40)) as u32;
+        let smem = (2 * (64 + 32 + 32) * (hd + 8)) as u32;
         launch!(self, &format!("attn_prefill_{hd}"), cfg((t.div_ceil(64) as u32, nh as u32), 128, smem),
             q, kc, vc, qg, out, step, t as i32, nh as i32, nkv as i32, scale);
         Ok(())
