@@ -6,7 +6,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 - Milestone: M2 done. M3 expert cache partly in (commit 90db54a). M4 first half (chunked GPU prefill) committed.
 - Speed at 4K (3 clean runs): prefill **1581 tok/s** (1538-1610; gate 1017, passed), prefill 1608 at 2dcae33, decode **80.5 tok/s** (gate 67, passed).
-  Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 86 tok/s. 32K (31768-token prompt): prefill ~1290 tok/s, decode best 62.5, noisy (llama.cpp -d 32768: pp512 814, tg128 56.4).
+  Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 82.7 tok/s at e087210 (loaded host; 86 at 059fd1e). 32K (31768-token prompt): prefill ~1290 tok/s, decode best 62.5, noisy (llama.cpp -d 32768: pp512 814, tg128 56.4).
   See `docs/m4-results.md`.
 - Parity (20 prompts x 32, GPU, 3 runs): prefill 628/630/629 = mean 98.28% +- 0.16; token-by-token prompt
   (`--chunk 0`) 631/627/631 = mean 98.39% +- 0.36. Gate 99%. Decode is not deterministic run to run (adaptive
@@ -189,6 +189,20 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - Conclusion: the 128x64x64 tile is at its local optimum. Further prefill GEMM gains need a different kernel
   (int8 MMQ with weights kept quantized in shared memory, as llama.cpp does), not tile tuning.
 
+### 2026-10-07 #14 — short-context regression from #12 fixed (e087210)
+- GPU idle; host load 1-13 (other loop's rustc, swap 22-25 GB). Quiet re-measure first (candidate 1): 4K decode
+  76.7/77.6 (+ one 38.8), short 58-77, 32K 11-60. Short decode was below the 86 of #9, so A/B under nsys.
+- Profile: attn_decode per call at a short prompt (~136 positions) was 7.9 us at 228b148 and 50 us at 2dcae33.
+  64 splits x 8 heads per block spread 2-3 positions per block, and every block paid the 8-head merge.
+- Change: a split covers at least 16 positions; empty splits write their empty partial and exit. Minimums 16/32/64
+  gave 22/23/25 us. 4K and longer are unaffected (64 splits already hold >= 64 positions there).
+- Files: `src/cuda/kernels.cu`. Test `attn_prefill_matches_decode` (up to 105 positions: full, partial and empty
+  splits) passes.
+- After: attn_decode short 50 -> 22 us, 4K 96 -> 91 us, 32K 315 us. Short decode (5 clean) 6.4 (load spike), 78.6,
+  81.5, 82.7, 82.9. 4K clean 75.7/77.4/80.5 decode, 1144-1638 prefill (loaded). Parity 625/627/630 (one OOM rerun).
+- Still 14 us slower than 228b148 at short context (~0.14 ms/token over 10 layers); the 8-head merge is serial.
+  Worth it for 32K (590 -> 315 us).
+
 ## Tried and rejected
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
@@ -202,10 +216,9 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 ## Next candidates
 
-1. Quiet re-measure of 4K / short / 32K decode (machine loaded during #10 to #13). Cheap, do first when idle.
-2. Short decode: moe_combine 5.8 ms/token under load (1.1 ms when quiet); it spins on CPU expert results. Check
-   whether CPU expert threads compete with the loaded host (thread count, pinning).
-3. Prefill GEMM as int8 MMQ: weights stay quantized in shared memory, activations quantized to int8 once per
-   chunk, mma m16n8k32 s8. Large (new kernel per quant type, parity test each); GEMMs are ~75% of 4K prefill.
-   Start with iq2_xs (expert GEMMs) and q5_k.
-4. Parity: score the 6 long prompts with the CPU f32 reference (~15 min CPU) to confirm their misses are shared.
+1. Short decode attention: the G-head merge does G rounds of shared-memory reduction with two barriers each
+   (22 us vs 7.9 us before #12). Merge all G heads in one round (warp-level reduction over warps per head), or fall
+   back to G = 1 when n_pos is small (both kernels in the graph, the unused one exits at once).
+2. Short decode: moe_combine waits on CPU experts (5.8 ms/token under load, 1.1 quiet). Check CPU worker threads
+   against host load.
+3. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs and q5_k.
