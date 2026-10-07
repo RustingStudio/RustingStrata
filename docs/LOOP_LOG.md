@@ -203,6 +203,23 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - Still 14 us slower than 228b148 at short context (~0.14 ms/token over 10 layers); the 8-head merge is serial.
   Worth it for 32K (590 -> 315 us).
 
+### 2026-10-07 #15 — one-head decode attention below 4096 positions (b9d9547)
+- GPU idle; host load 7-13. Kernel times from nsys (`--cuda-graph-trace=node`).
+- Profile: after #14 short-prompt attention was still 22 + 5 us per layer and token (228b148: 7.9 + 3.2).
+  `ptxas -v`: attn_decode used 247 registers (the G = 8 instantiation), so one 256-thread block per SM; a short
+  context paid for waves of near-empty blocks. Forcing G = 1 inside the same kernel did not help (31 us), since the
+  register count is per kernel.
+- Change: separate entry points. `attn_decode` (one head per block, 16 splits, 104 registers) works below
+  ATT_GQA_MIN = 4096 positions; `attn_decode_gqa` (G heads per block, 64 splits) from there on. Both are launched
+  in the graph; the idle one exits (~2 us). attn_merge picks the split count from the step.
+  `Gpu::attn_decode_gq` takes the threshold so the test can force either kernel.
+- Threshold: at 4K the two are even (gqa 92.8 + 7.1 + 1.9 idle vs one-head 98 + 3.8 + 2 us); at 32K one-head with 64
+  splits was 689 us vs gqa 319.
+- Test: `attn_prefill_matches_decode` runs every (nh, nkv, hd) case with both kernels; rel err 6.1e-5 to 7.4e-5.
+- Files: `src/cuda/kernels.cu`, `src/cuda/mod.rs`, `tests/cuda.rs`.
+- After: short 27 -> 11.4 us, 4K ~98 -> ~102 us, 32K 319 us. 4K (3 clean) decode 77.5/80.4/80.8, prefill
+  1251/1628/1652. Short decode 56-74 (host load 7.5, one prompt at 27 tok/s: not usable). Parity 627/632/631.
+
 ## Tried and rejected
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
@@ -211,14 +228,14 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   Replaced by the committed version.
 - #13: GEMM_BM 256 / 64, GEMM_BK 32, launch bounds (256, 2), register prefetch of the next K step. None beat
   128x64x64; prefetch was 1.6x slower. See the #13 entry.
+- #15: runtime G = 1 inside the single GQA kernel at short context (31 us, worse than G = 8): the kernel keeps 247
+  registers whatever G a block takes. Fixed by a separate kernel.
 - #8: nothing rejected. Not tried: choosing the split count from n_pos (needs a fixed grid for graph capture;
   could use a max grid and let extra blocks exit, which is what empty splits already do).
 
 ## Next candidates
 
-1. Short decode attention: the G-head merge does G rounds of shared-memory reduction with two barriers each
-   (22 us vs 7.9 us before #12). Merge all G heads in one round (warp-level reduction over warps per head), or fall
-   back to G = 1 when n_pos is small (both kernels in the graph, the unused one exits at once).
+1. Quiet short-decode measurement for e087210/b9d9547 (host load 7-13 through #12-#15). Do when load < 2.
 2. Short decode: moe_combine waits on CPU experts (5.8 ms/token under load, 1.1 quiet). Check CPU worker threads
-   against host load.
+   against host load (thread count, spinning vs futex).
 3. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs and q5_k.
