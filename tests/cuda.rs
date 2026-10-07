@@ -192,3 +192,87 @@ fn gemm_throughput() {
         eprintln!("{:8} {name:28} {rows:6}x{:5} x {m}: {:8.2} ms  {:6.2} TFLOP/s", t.ty.name(), t.cols, s * 1e3, 2.0 * (m * rows * t.cols) as f64 / s / 1e12);
     }
 }
+
+/// Prefill attention (tensor cores, f16 Q and P, 64-query tiles) matches decode attention at every position, with
+/// keys cached before the chunk and a chunk that does not fill its last tile.
+#[test]
+fn attn_prefill_matches_decode() {
+    let Some(gpu) = gpu() else { return };
+    let (nh, nkv, pos0, t) = (4, 2, 40, 100);
+    let h16 = |v: Vec<f32>| -> Vec<u16> { v.iter().map(|x| half::f16::from_f32(*x).to_bits()).collect() };
+    for hd in [64, 128, 256] {
+        let n = (pos0 + t) * nkv * hd;
+        let (kc, vc) = (h16(xs(n)), h16(xs(n + 5)[5..].to_vec()));
+        let q: Vec<f32> = xs(t * nh * hd + 3)[3..].iter().map(|v| 4.0 * v).collect();
+        let qg = xs(t * nh * 2 * hd);
+        let (dk, dv, dq, dg) = (gpu.stream.clone_htod(&kc).unwrap(), gpu.stream.clone_htod(&vc).unwrap(),
+                                gpu.stream.clone_htod(&q).unwrap(), gpu.stream.clone_htod(&qg).unwrap());
+        let scale = 1.0 / (hd as f32).sqrt();
+        let step = gpu.stream.clone_htod(&[pos0 as i32]).unwrap();
+        let dout = gpu.zeros::<f32>(t * nh * hd).unwrap();
+        gpu.attn_prefill(gpu.ptr(&dq), gpu.ptr(&dk), gpu.ptr(&dv), gpu.ptr(&dg), gpu.ptr(&dout), gpu.ptr(&step), t, nh, nkv, hd, scale).unwrap();
+        let got = gpu.stream.clone_dtoh(&dout).unwrap();
+        let ddec = gpu.zeros::<f32>(t * nh * hd).unwrap();
+        for i in 0..t {
+            let s = gpu.stream.clone_htod(&[(pos0 + i) as i32]).unwrap();
+            let off = |p: u64, per: usize| p + (i * per * 4) as u64;
+            gpu.attn_decode(off(gpu.ptr(&dq), nh * hd), gpu.ptr(&dk), gpu.ptr(&dv), off(gpu.ptr(&dg), nh * 2 * hd),
+                            off(gpu.ptr(&ddec), nh * hd), gpu.ptr(&s), nh, nkv, hd, scale).unwrap();
+        }
+        let want = gpu.stream.clone_dtoh(&ddec).unwrap();
+        let e = rel_l2(&got, &want);
+        eprintln!("attn_prefill_{hd}: rel err vs decode {e:.2e}");
+        assert!(e <= 5e-4, "attn_prefill_{hd}: rel err {e}");
+    }
+}
+
+/// DeltaNet scan over a chunk of T tokens equals T single-token scans (output and final state).
+#[test]
+fn deltanet_chunk_matches_steps() {
+    let Some(gpu) = gpu() else { return };
+    let (nk, nv, dk, dv, t) = (2, 4, 128, 128, 37);
+    let ych = 2 * nk * dk + nv * dv;
+    let y: Vec<f32> = xs(t * ych).iter().map(|v| 0.1 * v).collect();
+    let beta: Vec<f32> = xs(t * nv).iter().map(|v| 0.5 + 0.4 * v).collect();
+    let g: Vec<f32> = xs(t * nv + 1)[1..].iter().map(|v| -0.2 * v.abs()).collect();
+    let s0: Vec<f32> = xs(nv * dv * dk + 2)[2..].iter().map(|v| 0.1 * v).collect();
+    let (dy, db, dg) = (gpu.stream.clone_htod(&y).unwrap(), gpu.stream.clone_htod(&beta).unwrap(), gpu.stream.clone_htod(&g).unwrap());
+    let run = |chunk: bool| {
+        let ds = gpu.stream.clone_htod(&s0).unwrap();
+        let o = gpu.zeros::<f32>(t * nv * dv).unwrap();
+        let p = |d: u64, per: usize, i: usize| d + (i * per * 4) as u64;
+        let steps: Vec<(usize, usize)> = if chunk { vec![(0, t)] } else { (0..t).map(|i| (i, 1)).collect() };
+        for (i, n) in steps {
+            gpu.deltanet(p(gpu.ptr(&dy), ych, i), gpu.ptr(&ds), p(gpu.ptr(&db), nv, i), p(gpu.ptr(&dg), nv, i),
+                         p(gpu.ptr(&o), nv * dv, i), nk, nv, dk, dv, 0.5, n, ych).unwrap();
+        }
+        (gpu.stream.clone_dtoh(&o).unwrap(), gpu.stream.clone_dtoh(&ds).unwrap())
+    };
+    let ((o1, s1), (o2, s2)) = (run(true), run(false));
+    let (eo, es) = (rel_l2(&o1, &o2), rel_l2(&s1, &s2));
+    eprintln!("deltanet chunk vs steps: out {eo:.2e}, state {es:.2e}");
+    assert!(eo <= 1e-5 && es <= 1e-5, "out {eo}, state {es}");
+}
+
+/// Chunked causal conv (conv_seq + conv_state) equals T single-token conv_silu steps, also for T < kernel width - 1.
+#[test]
+fn conv_seq_matches_steps() {
+    let Some(gpu) = gpu() else { return };
+    let (ch, kw) = (96, 4);
+    let w = xs(ch * kw);
+    let st0 = xs((kw - 1) * ch + 9)[9..].to_vec();
+    for t in [2, 10] {
+        let x = xs(t * ch + 4)[4..].to_vec();
+        let (dw, dx) = (gpu.stream.clone_htod(&w).unwrap(), gpu.stream.clone_htod(&x).unwrap());
+        let (s1, s2) = (gpu.stream.clone_htod(&st0).unwrap(), gpu.stream.clone_htod(&st0).unwrap());
+        let (y1, y2) = (gpu.zeros::<f32>(t * ch).unwrap(), gpu.zeros::<f32>(t * ch).unwrap());
+        gpu.conv_seq(gpu.ptr(&dx), gpu.ptr(&s1), gpu.ptr(&dw), gpu.ptr(&y1), ch, kw, t).unwrap();
+        for i in 0..t {
+            let off = (i * ch * 4) as u64;
+            gpu.conv_silu(gpu.ptr(&dx) + off, gpu.ptr(&s2), gpu.ptr(&dw), gpu.ptr(&y2) + off, ch, kw).unwrap();
+        }
+        let d = |a: &cudarc::driver::CudaSlice<f32>| gpu.stream.clone_dtoh(a).unwrap();
+        let (ey, es) = (rel_l2(&d(&y1), &d(&y2)), rel_l2(&d(&s1), &d(&s2)));
+        assert!(ey <= 1e-6 && es == 0.0, "T {t}: y {ey}, state {es}");
+    }
+}
