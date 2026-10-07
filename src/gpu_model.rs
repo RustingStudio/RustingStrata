@@ -63,6 +63,8 @@ pub struct GpuModel<'a> {
     /// DeltaNet (conv, s) copies per recurrent layer and the position, for `restore_state`.
     saved: Vec<(CudaSlice<f32>, CudaSlice<f32>)>,
     saved_pos: usize,
+    /// The tokens behind the saved state when `prefill_cached` saved it (else empty).
+    saved_ids: Vec<u32>,
     ctx: usize,
     pub pos: usize,
     pub cache: Option<ExpertCache>,
@@ -169,11 +171,12 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, step_buf, graphs: (0..=TMAX).map(|_| None).collect(), mtp_graphs: Default::default(), ctx, pos: 0, saved: vec![], saved_pos: 0, cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO, drafts: (0, 0), k, short: 32, pf, mtp })
+        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, step_buf, graphs: (0..=TMAX).map(|_| None).collect(), mtp_graphs: Default::default(), ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO, drafts: (0, 0), k, short: 32, pf, mtp })
     }
 
-    /// Clear KV and recurrent state.
+    /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
     pub fn reset(&mut self) -> anyhow::Result<()> {
+        self.saved_ids.clear();
         if let Some(h) = self.mtp.as_mut() { h.pos = 0; }
         for l in self.layers.iter_mut().chain(self.mtp.as_mut().map(|h| &mut h.layer)) {
             match &mut l.mixer {
@@ -234,6 +237,7 @@ impl<'a> GpuModel<'a> {
             }
         }
         self.saved_pos = self.pos;
+        self.saved_ids.clear();
         Ok(())
     }
 
