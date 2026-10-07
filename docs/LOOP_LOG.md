@@ -431,6 +431,13 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   request fresh 1.96 / 1.95 / 1.97 s.
 - Parity not re-run: plain prefill and decode are unchanged.
 
+### 2026-10-08 #29 — README (35f81d4); security review note on prefix reuse
+- README with build, usage, and the measured numbers vs llama.cpp (from this log and `docs/m4-results.md`).
+- Background security review of 99fbd11: prefix reuse is a cross-request side channel (`cached_tokens` and the
+  response time show whether the previous request had the same history). Accepted as designed: the server has one
+  API key and one user, like llama.cpp's prompt cache. Documented in the README; no code change.
+- Host load 22-29 (another loop runs 5 `forever_bear` processes, swap 28.6 of 31 GB): no benchmarks taken.
+
 ## Tried and rejected
 - #25: MTP k = 2-3 chained drafts: correct, but 70.4 / 63.5 tok/s vs 87.4 for k = 1 (acceptance 62% / 48%).
 
