@@ -215,16 +215,18 @@ fn attn_prefill_matches_decode() {
         let got = gpu.stream.clone_dtoh(&dout).unwrap();
         let ddec = gpu.zeros::<f32>(t * nh * hd).unwrap();
         let part = gpu.zeros::<f32>(nh * rusting_strata::cuda::ATT_SPLITS * (hd + 2)).unwrap();
-        for i in 0..t {
-            let s = gpu.stream.clone_htod(&[(pos0 + i) as i32]).unwrap();
-            let off = |p: u64, per: usize| p + (i * per * 4) as u64;
-            gpu.attn_decode(off(gpu.ptr(&dq), nh * hd), gpu.ptr(&dk), gpu.ptr(&dv), off(gpu.ptr(&dg), nh * 2 * hd),
-                            off(gpu.ptr(&ddec), nh * hd), gpu.ptr(&part), gpu.ptr(&s), nh, nkv, hd, scale).unwrap();
+        for gq_min in [rusting_strata::cuda::ATT_GQA_MIN, 0] {
+            for i in 0..t {
+                let s = gpu.stream.clone_htod(&[(pos0 + i) as i32]).unwrap();
+                let off = |p: u64, per: usize| p + (i * per * 4) as u64;
+                gpu.attn_decode_gq(off(gpu.ptr(&dq), nh * hd), gpu.ptr(&dk), gpu.ptr(&dv), off(gpu.ptr(&dg), nh * 2 * hd),
+                                   off(gpu.ptr(&ddec), nh * hd), gpu.ptr(&part), gpu.ptr(&s), nh, nkv, hd, scale, gq_min).unwrap();
+            }
+            let want = gpu.stream.clone_dtoh(&ddec).unwrap();
+            let e = rel_l2(&got, &want);
+            eprintln!("attn_prefill_{hd} nh {nh} nkv {nkv} gq_min {gq_min}: rel err vs decode {e:.2e}");
+            assert!(e <= 5e-4, "attn_prefill_{hd} nh {nh} nkv {nkv} gq_min {gq_min}: rel err {e}");
         }
-        let want = gpu.stream.clone_dtoh(&ddec).unwrap();
-        let e = rel_l2(&got, &want);
-        eprintln!("attn_prefill_{hd} nh {nh} nkv {nkv}: rel err vs decode {e:.2e}");
-        assert!(e <= 5e-4, "attn_prefill_{hd} nh {nh} nkv {nkv}: rel err {e}");
     }
 }
 

@@ -14,14 +14,18 @@ const QTYPES: [GgmlType; 11] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ2XS, IQ3XXS, IQ4XS]
 };
-const KERNELS: [&str; 22] = [
+const KERNELS: [&str; 23] = [
     "rms_norm", "l2_norm", "rope_neox", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
-    "kv_store", "attn_decode", "attn_merge", "router_topk", "moe_combine", "map_hits", "moe_publish", "conv_seq", "conv_state",
+    "kv_store", "attn_decode", "attn_decode_gqa", "attn_merge", "router_topk", "moe_combine", "map_hits", "moe_publish", "conv_seq", "conv_state",
     "moe_combine_seq", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256",
 ];
 
 /// Blocks per head in decode attention (positions split across them).
 pub const ATT_SPLITS: usize = 64;
+/// Splits of the one-head-per-block decode attention used below ATT_GQA_MIN positions.
+const ATT_SPLITS_1: usize = 16;
+/// Positions from which decode attention shares K/V loads across a GQA group (break-even measured near 4K).
+pub const ATT_GQA_MIN: i32 = 4096;
 const _: () = assert!(ATT_SPLITS <= 256);  // attn_merge keeps one weight per split in a 256-thread block
 
 /// Positions per GEMM tile (GEMM_BM in kernels.cu).
@@ -276,15 +280,24 @@ impl Gpu {
         Ok(())
     }
 
-    /// Decode attention over positions 0 ..= step[0], split across ATT_SPLITS blocks per head; `part` holds
-    /// `nh * ATT_SPLITS * (hd + 2)` floats.
+    /// Decode attention over positions 0 ..= step[0]; `part` holds `nh * ATT_SPLITS * (hd + 2)` floats. Below
+    /// ATT_GQA_MIN positions one block serves one head (ATT_SPLITS_1 splits), from it on one block serves all query
+    /// heads of a KV head (ATT_SPLITS splits). Both kernels are launched; the step decides which one works.
     pub fn attn_decode(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
+        self.attn_decode_gq(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, ATT_GQA_MIN)
+    }
+
+    /// `attn_decode` with an explicit GQA threshold (tests use 0 to force the GQA kernel).
+    pub fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32) -> anyhow::Result<()> {
         if ![64, 128, 256, 512].contains(&hd) { bail!("attention head_dim {hd} unsupported (64, 128, 256 or 512)"); }
         let group = nh / nkv;  // query heads per KV head, served by one block (up to 8, G * hd <= 2048)
         let g = [8, 4, 2, 1].into_iter().find(|&g| group % g == 0 && g * hd <= 2048).unwrap();
-        launch!(self, "attn_decode", cfg(((nh / g) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4) as u32),
-            q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale);
-        launch!(self, "attn_merge", cfg((nh as u32, 1), 256, 0), part, qg, out, hd as i32, ATT_SPLITS as i32);
+        launch!(self, "attn_decode", cfg((nh as u32, ATT_SPLITS_1 as u32), 256, (8 * hd * 4) as u32),
+            q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min);
+        launch!(self, "attn_decode_gqa", cfg(((nh / g) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4) as u32),
+            q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min);
+        launch!(self, "attn_merge", cfg((nh as u32, 1), 256, 0), part, qg, out, hd as i32, ATT_SPLITS as i32, step,
+            ATT_SPLITS_1 as i32, gq_min);
         Ok(())
     }
 
