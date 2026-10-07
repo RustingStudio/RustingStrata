@@ -321,6 +321,28 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   No regression. Parity not re-run: the nt = 1 path issues the same kernels with the same arguments.
 - Verify cost not measured yet (not graph-captured).
 
+### 2026-10-07 #23 — M5 step 2c: `generate --mtp`, speculative decoding k = 1 (8c53c70)
+- Host load 4-11 (other loops), GPU shared through the lock.
+- Change: `GpuModel::spec_step(t, row)`: MTP draft from hidden row `row`, `save_state`, verify [t, draft]. Accept:
+  run the draft block on the draft token without the output head (fills its KV entry), next draft reads row 1.
+  Reject: `restore_state` + plain step. Falls back to a plain step at the context end. `generate --mtp` uses it and
+  prints the acceptance. Counter `drafts: (made, accepted)`.
+- Fix: `prefill` returned 4 x vocab logits since 5dd7576 (logits buffer grew for verify); now sliced to n_vocab, and
+  the last hidden state goes to row 0 for the first draft.
+- Fix (hypothesis): two early runs died with `CUDA_ERROR_LAUNCH_FAILED` (first run of a batch, ~96% expert hits).
+  Likely path: the CPU worker is preempted, the GPU moves on and overwrites a later layer's request with a newer
+  seq, the worker spins forever on the old seq, and the next miss traps in `moe_combine`'s wait. The worker now skips
+  a layer whose request is newer than its seq. Not reproduced since (6 warm runs, 3 with the model evicted from the
+  page cache); compute-sanitizer showed 0 memory errors. Not proven.
+- Test `mtp_spec_matches_greedy`: 64 greedy tokens with spec equal plain steps on the same instance (adapt off),
+  28/36 drafts accepted. All gpu_model tests and the cuda suite pass.
+- Speed (short dragon prompt, -n 128, interleaved, 100% hits): plain 81.6 / 84.9 / 65.9 (load) / 84.5, MTP 78.8 /
+  47.6 (load 10) / 75.9 / 75.5. Acceptance 81.7-85.5%. MTP k = 1 is ~10% slower than plain for now.
+- nsys of an MTP run: GPU busy 86% of the decode window (gaps 14%: verify and draft run uncaptured). Largest MTP
+  costs: the 248K-row draft head (gemv_q4_k, 1.2 ms per draft) and the 2-token verify head (gemvn_q4_k, 1.6 ms).
+  The 25K HtoD copies are expert uploads at load, not decode.
+- Parity not re-run: the plain decode path is unchanged.
+
 ## Tried and rejected
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
@@ -342,9 +364,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 ## Next candidates
 
-1. M5 step 2c: wire `generate` with MTP k = 1 (draft, verify [last, draft], greedy accept, restore + step on
-   reject; draft head KV must also rewind). Measure verify cost; graph-capture verify for nt = 2. Spec parity: MTP
-   on and off give identical greedy tokens. Estimated +15% at k = 1 (see #21), more at k = 2-3.
-2. Cheaper draft head: argmax over a frequent-token subset of the output matrix (head is 1.15 ms of a ~1.6 ms draft).
+1. Cheaper draft head: argmax over a frequent-token subset of the output matrix (head is 1.15 ms of a ~1.6 ms draft).
    Must keep greedy output identical (only the draft changes, verify uses the full head).
+2. Graph-capture verify (nt = 2) and the draft; then k = 2-3.
 3. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs and q5_k.
