@@ -5,7 +5,8 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 ## State
 
 - Milestone: M2 done. M3 expert cache partly in (commit 90db54a). M4 first half (chunked GPU prefill) committed.
-- Speed at 4K (3 clean runs): prefill **1366 tok/s** (1363-1369; gate 1017, passed), decode 49.6 tok/s (gate 67).
+- Speed at 4K (3 clean runs): prefill **1366 tok/s** (1363-1369; gate 1017, passed), decode 60.9 tok/s (gate 67).
+  Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 83-86 tok/s, above the gate.
   See `docs/m4-results.md`.
 - Parity (20 prompts x 32, GPU, 3 runs): prefill 628/630/629 = mean 98.28% +- 0.16; token-by-token prompt
   (`--chunk 0`) 631/627/631 = mean 98.39% +- 0.36. Gate 99%. Decode is not deterministic run to run (adaptive
@@ -96,14 +97,35 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   same. Is the 99% gate meant against this llama.cpp run, or should parity use a reference with matching numerics
   (e.g. a llama.cpp CPU-only run, or agreement with our own f32 reference)?
 
+### 2026-10-07 #8 — split decode attention across position blocks (1866f5e)
+- GPU idle (gnome-clocks 41 MiB only).
+- Profile first. Short-prompt decode (5 clean runs, "Write a long story about a dragon.", -n 128): **85.8 tok/s**
+  (84.9-86.6), already above the 67 gate under llama tg128 conditions. After the 4K prompt decode is 47-50. nsys at
+  4K (`--cuda-graph-trace=node`): `attn_decode` 0.87 ms x 10 layers = 8.7 ms per token, 20% of GPU time; grid was
+  one block per query head (32 blocks on a 28-SM GPU, warps walking positions).
+- Change: `attn_decode` grid (heads, 16); block s covers ceil(n_pos/16) positions and writes unnormalized
+  [acc | max | sum] to a new `attp` scratch; new `attn_merge` kernel combines the splits and applies the gate. Split
+  size comes from step[0] inside the kernel, so the decode CUDA graph still captures once. Empty splits write
+  max = -inf, sum = 0.
+- Test: `attn_prefill_matches_decode` now starts at position 5, so early decode steps have empty splits; rel err
+  6.4-7.4e-5. Full cuda suite passes.
+- Files: `src/cuda/kernels.cu`, `src/cuda/mod.rs`, `src/gpu_model.rs`, `tests/cuda.rs`.
+- 4K (3 clean): prefill 1026/1316/1360 (first run cold page cache), decode **60.9** (59.8/60.4/62.4), was 49.6.
+  Parity 630/628/629 (98.28%), same band as before. Short-prompt decode 83.3 (81.3-84.6, 5 clean runs after one
+  noisy set of 5: 50-83); before 85.8. The ~3% short-context drop is at the edge of run-to-run noise (expert cache
+  placement); the merge adds 10 small launches per token.
+
 ## Tried and rejected
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
   f32: 445/448 on prompts 0-13). Worse. Redo only with llama.cpp's exact dot-product kernels.
+- #8: nothing rejected. Not tried: choosing the split count from n_pos (needs a fixed grid for graph capture;
+  could use a max grid and let extra blocks exit, which is what empty splits already do).
 
 ## Next candidates
 
-1. Decode 49.6 vs 67 tok/s: nsys profile of one decode step (not done since M3). Needs idle GPU. Largest gap left.
+1. 4K decode 60.9 vs 67: re-profile one 4K decode step with nsys. Short-context profile: gemv_q5_k 25%,
+   gemv_q6_k 13%, moe_gemv_iq2_xs 11%, output head gemv_q4_k 1.1 ms (9%); check these kernels against bandwidth.
 2. deltanet_seq 0.77 s of 4.2 s prefill (sequential scan); chunked WY form. Needs idle GPU.
 3. Parity: score the 6 long prompts with the CPU f32 reference (~15 min CPU) to confirm their misses are shared;
    if so, parity work waits for the owner's answer above.
