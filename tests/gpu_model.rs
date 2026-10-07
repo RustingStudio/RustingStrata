@@ -155,3 +155,47 @@ fn verify_matches_steps() {
         }
     }
 }
+
+/// Greedy decoding with MTP speculation (`spec_step`) gives the same tokens as plain steps. Same instance and fixed
+/// expert placement, so both runs see the same numerics.
+#[test]
+fn mtp_spec_matches_greedy() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    if m.cfg.n_nextn == 0 { eprintln!("SKIP: no nextn layer"); return }
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let gpu = match Gpu::new() {
+        Ok(g) => g,
+        Err(e) => { eprintln!("SKIP: no GPU: {e:#}"); return }
+    };
+    let mut gm = GpuModel::load(&m, gpu, 512, 0, 512 << 20, true).unwrap();
+    gm.adapt_every = 0;
+    let ids = tok.encode("Write a short story about a dragon.").unwrap();
+    let n = 64;
+    let mut run = |spec: bool| -> Vec<u32> {
+        gm.reset().unwrap();
+        let mut logits = gm.prefill(&ids).unwrap();
+        let (mut out, mut row) = (vec![], 0);
+        while out.len() < n {
+            let t = ops::argmax(&logits) as u32;
+            if spec {
+                let (toks, l, r) = gm.spec_step(t, row).unwrap();
+                (logits, row) = (l, r);
+                out.extend(toks);
+            } else {
+                out.push(t);
+                logits = gm.step(t).unwrap();
+            }
+        }
+        out.truncate(n);
+        out
+    };
+    let plain = run(false);
+    let spec = run(true);
+    let (made, ok) = gm.drafts;
+    eprintln!("drafts accepted {ok}/{made}");
+    assert_eq!(spec, plain);
+    assert!(2 * ok >= made, "acceptance {ok}/{made}");
+}

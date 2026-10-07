@@ -70,10 +70,15 @@ impl CpuWorker {
                 for &il in &moe_layers {
                     let b = il * lay.stride;
                     let at = |o: usize| (w(b + o)) as *mut u32;
-                    while unsafe { at(REQ).read_volatile() } != seq {
+                    // A newer seq here means the GPU already moved on to the next token, so it did not wait for this
+                    // layer (no miss): skip it. Waiting for the old seq would hang, and the next miss would trap.
+                    let mut r;
+                    while { r = unsafe { at(REQ).read_volatile() }; r != seq } {
                         if st.load(Ordering::Relaxed) { return; }
+                        if r != 0 && (r.wrapping_sub(seq) as i32) > 0 { break; }
                         std::hint::spin_loop();
                     }
+                    if r != seq { continue; }
                     fence(Ordering::Acquire);
                     let t0 = Instant::now();
                     let rd = |o: usize| unsafe { at(o).read_volatile() };
