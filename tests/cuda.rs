@@ -96,6 +96,35 @@ fn moe_gemv_selects_experts() {
 }
 
 /// Achieved GEMV bandwidth per type (one dense matrix per type, plus 8-expert MoE GEMVs). Run with --ignored.
+/// gemvn over 1 to 4 inputs equals gemv per input, bit for bit, for every integer type.
+#[test]
+fn gemvn_matches_gemv() {
+    let (Some(p), Some(gpu)) = (common::model_path(), gpu()) else { return };
+    let g = Gguf::open(&p).unwrap();
+    let w = Weights { g: &g };
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, info) in &g.tensors {
+        let ty = GgmlType::from_u32(info.ty).unwrap();
+        if info.dims.len() != 2 || info.dims[0] % 256 != 0 || !seen.insert(ty.name()) { continue; }
+        let t = w.get(name).unwrap();
+        let dt = gpu.upload(&t).unwrap();
+        let x: Vec<f32> = (0..4).flat_map(|i| xs(t.cols + i).into_iter().skip(i)).collect();
+        let dx = gpu.stream.clone_htod(&x).unwrap();
+        let mut want = vec![];
+        for i in 0..4u64 {
+            let dy = gpu.zeros::<f32>(t.rows).unwrap();
+            gpu.gemv(&dt, gpu.ptr(&dx) + 4 * i * t.cols as u64, gpu.ptr(&dy)).unwrap();
+            want.extend(gpu.stream.clone_dtoh(&dy).unwrap());
+        }
+        for nt in 1..=4 {
+            let dy = gpu.zeros::<f32>(nt * t.rows).unwrap();
+            gpu.gemvn(&dt, gpu.ptr(&dx), t.cols, gpu.ptr(&dy), t.rows, nt).unwrap();
+            assert_eq!(gpu.stream.clone_dtoh(&dy).unwrap(), want[..nt * t.rows], "{} {name} nt {nt}", ty.name());
+        }
+    }
+    assert!(seen.len() >= 5, "types covered: {seen:?}");
+}
+
 #[test]
 #[ignore]
 fn gemv_bandwidth() {
@@ -129,6 +158,11 @@ fn gemv_bandwidth() {
         } else {
             (time(&|| gpu.gemv(&dt, gpu.ptr(&x), gpu.ptr(&y)).unwrap()), dt.bytes())
         };
+        if !moe {
+            let (x4, y4) = (gpu.stream.clone_htod(&xs(4 * t.cols)).unwrap(), gpu.zeros::<f32>(4 * t.rows).unwrap());
+            let tn: Vec<String> = (2..=4).map(|nt| format!("{:.1}", 1e6 * time(&|| gpu.gemvn(&dt, gpu.ptr(&x4), t.cols, gpu.ptr(&y4), t.rows, nt).unwrap()))).collect();
+            eprintln!("  gemvn 2/3/4 inputs: {} us", tn.join(" / "));
+        }
         let (s, bytes) = run();
         eprintln!("{:8} {:5} {name:32} {:6}x{:5}  {:7.1} us  {:6.1} GB/s", ty.name(), if moe { "moe8" } else { "" },
             t.rows, t.cols, s * 1e6, bytes as f64 / s / 1e9);
