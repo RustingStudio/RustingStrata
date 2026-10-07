@@ -199,9 +199,9 @@ fn gemm_throughput() {
 #[test]
 fn attn_prefill_matches_decode() {
     let Some(gpu) = gpu() else { return };
-    let (nh, nkv, pos0, t) = (4, 2, 5, 100);
+    let (pos0, t) = (5, 100);
     let h16 = |v: Vec<f32>| -> Vec<u16> { v.iter().map(|x| half::f16::from_f32(*x).to_bits()).collect() };
-    for hd in [64, 128, 256] {
+    for (nh, nkv, hd) in [(4, 2, 64), (4, 2, 128), (4, 2, 256), (16, 2, 256), (8, 8, 128)] {
         let n = (pos0 + t) * nkv * hd;
         let (kc, vc) = (h16(xs(n)), h16(xs(n + 5)[5..].to_vec()));
         let q: Vec<f32> = xs(t * nh * hd + 3)[3..].iter().map(|v| 4.0 * v).collect();
@@ -223,8 +223,8 @@ fn attn_prefill_matches_decode() {
         }
         let want = gpu.stream.clone_dtoh(&ddec).unwrap();
         let e = rel_l2(&got, &want);
-        eprintln!("attn_prefill_{hd}: rel err vs decode {e:.2e}");
-        assert!(e <= 5e-4, "attn_prefill_{hd}: rel err {e}");
+        eprintln!("attn_prefill_{hd} nh {nh} nkv {nkv}: rel err vs decode {e:.2e}");
+        assert!(e <= 5e-4, "attn_prefill_{hd} nh {nh} nkv {nkv}: rel err {e}");
     }
 }
 
