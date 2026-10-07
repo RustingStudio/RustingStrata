@@ -365,6 +365,17 @@ ITYPES(DEF_IGEMV)
 struct GemmTile { const u8* w; int m0, cnt; };
 
 __device__ __forceinline__ u32 ld_s32(const u16* p) { return *(const u32*)p; }
+// Four 8x8 f16 matrices from shared memory; lane l gives the row address for matrix l / 8 (.trans transposes each).
+__device__ __forceinline__ void ldsm4(u32* r, const u16* p) {
+    unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ void ldsm4t(u32* r, const u16* p) {
+    unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
 __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
@@ -784,17 +795,19 @@ extern "C" __global__ void moe_combine_seq(float* x, const float* ye, const floa
 
 // grid = (ceil(T / 64), heads), block = 128: warp w owns queries 16w .. 16w + 15 of the tile. Query t (position
 // step[0] + t) attends to cached keys 0 .. step[0] + t. q is [T, nh * HD] after rope, qg [T, nh * 2 * HD] holds the
-// gate at +HD per head; out [T, nh * HD] = softmax(q K^T * scale) V * sigmoid(gate). Shared: Q tile, K tile, V^T tile.
+// gate at +HD per head; out [T, nh * HD] = softmax(q K^T * scale) V * sigmoid(gate). Shared: Q, K and V tiles, all
+// row-major; mma fragments come from ldmatrix (.trans for V).
 #define FA_BQ 64
 #define FA_BK 32
 template <int HD>
 __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, const u16* vc, const float* qg, float* out,
                                                const int* step, int T, int nh, int nkv, float scale) {
-    constexpr int PQ = HD + 8, PV = FA_BK + 8;
+    constexpr int PQ = HD + 8;
     extern __shared__ __align__(16) u16 fa_sm[];
-    u16 *qs = fa_sm, *ks = qs + FA_BQ * PQ, *vt = ks + FA_BK * PQ;
+    u16 *qs = fa_sm, *ks = qs + FA_BQ * PQ, *vs = ks + FA_BK * PQ;
     int pos0 = step[0], q0 = blockIdx.x * FA_BQ, h = blockIdx.y, kvh = h / (nh / nkv), kvd = nkv * HD;
     int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
+    int lr = (lane & 7) + ((lane >> 3) & 1) * 8, lc = (lane >> 4) * 8;  // ldmatrix row / column offsets of this lane
     for (int i = tid; i < FA_BQ * HD / 4; i += 128) {
         int r = i / (HD / 4), c = (i % (HD / 4)) * 4;
         float4 v = q0 + r < T ? *(const float4*)(q + (size_t)(q0 + r) * nh * HD + h * HD + c) : make_float4(0.f, 0.f, 0.f, 0.f);
@@ -813,18 +826,19 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
                 kv = *(const uint4*)(kc + off); vv = *(const uint4*)(vc + off);
             }
             *(uint4*)(ks + r * PQ + c) = kv;
-            const u16* vp = (const u16*)&vv;
-            for (int e = 0; e < 8; e++) vt[(c + e) * PV + r] = vp[e];
+            *(uint4*)(vs + r * PQ + c) = vv;
         }
         __syncthreads();
         float s[FA_BK / 8][4] = {};
 #pragma unroll
         for (int kk = 0; kk < HD; kk += 16) {
-            const u16* p = qs + (warp * 16 + g) * PQ + kk + 2 * t4;
-            u32 a0 = ld_s32(p), a1 = ld_s32(p + 8 * PQ), a2 = ld_s32(p + 8), a3 = ld_s32(p + 8 * PQ + 8);
-            for (int nt = 0; nt < FA_BK / 8; nt++) {
-                const u16* b = ks + (nt * 8 + g) * PQ + kk + 2 * t4;
-                mma16816(s[nt], a0, a1, a2, a3, ld_s32(b), ld_s32(b + 8));
+            u32 a[4], b[4];
+            ldsm4(a, qs + (warp * 16 + lr) * PQ + kk + lc);
+            for (int nt = 0; nt < FA_BK / 8; nt += 2) {
+                // matrices: keys nt*8 / dims kk, keys nt*8 / dims kk+8, keys nt*8+8 / dims kk, keys nt*8+8 / dims kk+8
+                ldsm4(b, ks + (nt * 8 + (lane & 7) + (lane >> 4) * 8) * PQ + kk + ((lane >> 3) & 1) * 8);
+                mma16816(s[nt], a[0], a[1], a[2], a[3], b[0], b[1]);
+                mma16816(s[nt + 1], a[0], a[1], a[2], a[3], b[2], b[3]);
             }
         }
         float mx[2] = {m[0], m[1]};
@@ -850,9 +864,11 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
             u32 a0 = h2pack(s[2 * kb][0], s[2 * kb][1]), a1 = h2pack(s[2 * kb][2], s[2 * kb][3]);
             u32 a2 = h2pack(s[2 * kb + 1][0], s[2 * kb + 1][1]), a3 = h2pack(s[2 * kb + 1][2], s[2 * kb + 1][3]);
 #pragma unroll
-            for (int d = 0; d < HD / 8; d++) {
-                const u16* b = vt + (d * 8 + g) * PV + kb * 16 + 2 * t4;
-                mma16816(o[d], a0, a1, a2, a3, ld_s32(b), ld_s32(b + 8));
+            for (int d = 0; d < HD / 8; d += 2) {
+                u32 b[4];  // transposed: keys kb*16 / dims d*8, keys +8 / dims d*8, keys / dims d*8+8, keys +8 / dims d*8+8
+                ldsm4t(b, vs + (kb * 16 + lr) * PQ + d * 8 + lc);
+                mma16816(o[d], a0, a1, a2, a3, b[0], b[1]);
+                mma16816(o[d + 1], a0, a1, a2, a3, b[2], b[3]);
             }
         }
     }
