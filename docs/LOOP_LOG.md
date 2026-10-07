@@ -174,20 +174,38 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   19 ms GPU time per token there, and moe_combine 5.8 ms/token (it waits on CPU experts, 35% of gen time).
 - Parity 627/629/630 (98.23%), in band.
 
+### 2026-10-07 #13 — prefill GEMM tile experiments (rejected, no commit)
+- GPU idle apart from short bursts from other processes; host load 11-18, swap 22 GB. Wall clock unusable, so all
+  numbers are nsys GEMM kernel totals for one 4K prefill (3971 tokens, -n 4), A/B runs interleaved by
+  `ab.sh` in the scratchpad, each run waiting for an idle GPU.
+- Baseline (7cdc0fc): GEMM total 1759/1839/1953/1779/1947 ms (q5_k 635-824, iq2_xs 561-582, iq3_xxs ~259,
+  q6_k ~260). GEMMs are ~75% of 4K prefill GPU time.
+- Tried, all with GEMM_BM/BK edits only or a small K-loop change:
+  - GEMM_BM 256 (512 threads, 46 KB smem): 2549 ms. iq2_xs 978, iq3_xxs 460 (expert tiles half empty).
+  - GEMM_BM 64: 2082 ms (q6_k 461).
+  - Register prefetch of the next K step (dequantized weights as packed halves + raw float4 activations held across
+    the MMA loop): 2884/2753/3312 ms. Likely register pressure / spills; 1.6x slower.
+  - GEMM_BK 32: 2066/1789 ms. `__launch_bounds__(256, 2)`: 2038/1929 ms. Inside the noise, no gain.
+- Conclusion: the 128x64x64 tile is at its local optimum. Further prefill GEMM gains need a different kernel
+  (int8 MMQ with weights kept quantized in shared memory, as llama.cpp does), not tile tuning.
+
 ## Tried and rejected
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
   f32: 445/448 on prompts 0-13). Worse. Redo only with llama.cpp's exact dot-product kernels.
 - #12: first GQA version without prefetch and with merge weights in global memory: 32K 410 us, 4K 101 + 13 us.
   Replaced by the committed version.
+- #13: GEMM_BM 256 / 64, GEMM_BK 32, launch bounds (256, 2), register prefetch of the next K step. None beat
+  128x64x64; prefetch was 1.6x slower. See the #13 entry.
 - #8: nothing rejected. Not tried: choosing the split count from n_pos (needs a fixed grid for graph capture;
   could use a max grid and let extra blocks exit, which is what empty splits already do).
 
 ## Next candidates
 
-1. Quiet re-measure of 4K / short / 32K decode (machine loaded during #10 to #12). Cheap, do first when idle.
+1. Quiet re-measure of 4K / short / 32K decode (machine loaded during #10 to #13). Cheap, do first when idle.
 2. Short decode: moe_combine 5.8 ms/token under load (1.1 ms when quiet); it spins on CPU expert results. Check
-   whether the wait sits in the kernel and whether CPU expert threads compete with the loaded host.
-3. 32K prefill (nsys, b57b791): attn_prefill_256 5.4 s, gemm_q5_k 4.9, gemm_iq2_xs 4.4, deltanet_seq 2.5,
-   gemm_q6_k 2.0, gemm_iq3_xxs 2.0. GEMMs: cp.async double buffering / int8 MMQ. Attention: cp.async prefetch.
+   whether CPU expert threads compete with the loaded host (thread count, pinning).
+3. Prefill GEMM as int8 MMQ: weights stay quantized in shared memory, activations quantized to int8 once per
+   chunk, mma m16n8k32 s8. Large (new kernel per quant type, parity test each); GEMMs are ~75% of 4K prefill.
+   Start with iq2_xs (expert GEMMs) and q5_k.
 4. Parity: score the 6 long prompts with the CPU f32 reference (~15 min CPU) to confirm their misses are shared.
