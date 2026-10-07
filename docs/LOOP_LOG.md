@@ -4,7 +4,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 ## State
 
-- Milestone: M2 done. M3 expert cache partly in (commit 90db54a). M4 first half (chunked GPU prefill) committed.
+- Milestone: M2 done. M3 expert cache partly in (commit 90db54a). M4 first half (chunked GPU prefill) committed. M5 started: MTP draft head in the CPU reference (6379338).
 - Speed at 4K (3 clean runs): prefill **1581 tok/s** (1538-1610; gate 1017, passed), prefill 1608 at 2dcae33, decode **81.0 tok/s** at a02b4ec (76.8-81.8; gate 67, passed).
   Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 88.1 tok/s at a02b4ec (88.06-88.22, 100% expert hits). 32K (31768-token prompt): prefill ~1290 tok/s, decode best 62.5, noisy (llama.cpp -d 32768: pp512 814, tg128 56.4).
   See `docs/m4-results.md`.
@@ -259,6 +259,20 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - Short decode at a02b4ec (100% hits, load ~2.8): **88.1 tok/s** (88.06-88.22, 4 runs). Was 86.7 at b9d9547.
 - 32K at a02b4ec (3 clean): prefill 1228/1051/1050, decode 60.3/8.1/60.1 (the 8.1 run under host load 12).
 
+### 2026-10-07 #19 — M5 start: MTP draft head in the CPU reference (6379338)
+- GPU idle at start (forever_bear joined during the last test); host load 3.5.
+- GGUF: block_count 41, nextn_predict_layers 1. blk.40 is a full-attention block (q 8192 with gate, k/v 512,
+  q5_k / q6_k) with Q2_K experts (gate/up/down type 10, router bf16), plus nextn.eh_proj (q8_0, 4096 -> 2048),
+  nextn.enorm, nextn.hnorm, nextn.shared_head_norm. No separate embedding or head: uses token_embd and output.
+- Change: `Model::mtp_step(&mut Mtp, hidden, token)`: x = eh_proj [enorm(embed(token)), hnorm(hidden)], then the
+  block (own KV cache in `Mtp`, position counter), shared_head_norm, output head. `step_h` also returns the last hidden
+  state (before output_norm). `block` and `head` factored out of `step` (same arithmetic).
+- Test: ignored `mtp_draft_acceptance` (CPU, ~35 s): greedy, 24 generated tokens of "Write a short story about a
+  dragon.": **24/25 drafts** equal the main model's next-next token. Feeding the post-output_norm hidden state also
+  gave 24/25 (hnorm absorbs the difference), so the pre-norm state is used. Asserts >= 60%.
+- Other tests: `greedy_continuation_is_sane` (Paris), `tests/gpu_model.rs` 2/2 pass.
+- Speed and parity unchanged (CPU reference only; GPU path untouched).
+
 ## Tried and rejected
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
@@ -280,10 +294,9 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 ## Next candidates
 
-1. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs (expert
-   GEMMs) and q5_k. Large; needs a parity test per type against the f16 GEMM.
-2. Decode GEMVs: quantize x once per token into global memory (<= 4% of GEMV time, see #17; pairing launches gave
-   nothing, #18). The MoE GEMVs stay at ~122 GB/s; llama.cpp's
-   mmvq layout (several warps per row, K split) is the untried structure.
-3. Expert placement robustness: hit rate drops to ~91% when VRAM is short at start, costing ~30% decode. A flag to cap
-   GPU expert slots would make this measurable (and the thread-count test of #16 fair).
+1. M5 on GPU, step 1: MTP draft step on the decode path (layer 40 attention with its own KV cache, its Q2_K experts in
+   the expert cache or CPU worker, eh_proj q8_0). Test: GPU draft logits vs `Model::mtp_step`. Step 2: verify 2 tokens
+   per forward (the 4K prefill path handles batches; needs DeltaNet/conv state snapshot per position for rollback).
+   With ~96% acceptance at k = 1, expect up to ~1.9 tokens per verify.
+2. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs and q5_k.
+3. Decode GEMVs: quantize x once per token into global memory (<= 4% of GEMV time, see #17).
