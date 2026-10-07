@@ -591,18 +591,20 @@ extern "C" __global__ void kv_store(const float* k, const float* v, u16* kc, u16
 
 #define INFINITY __int_as_float(0x7f800000)
 #define MAXD 16  // head_dim <= 512
-// grid = query heads; each warp walks positions warp, warp+nw, ... with online softmax; warps merge at the end.
-// qg holds [q | gate] per head (2*hd); output is softmax(qK)V * sigmoid(gate).
-extern "C" __global__ void attn_decode(const float* q, const u16* kc, const u16* vc, const float* qg, float* out,
-                                       const int* step, int nh, int nkv, int hd, float scale) {
-    int n_pos = step[0] + 1;
+// Split-position decode attention. grid = (query heads, ns splits): block (h, s) covers an ns-th of the positions,
+// each warp walks its share with online softmax, warps merge, and the block writes its unnormalized partial
+// [acc (hd) | max | sum] to part; attn_merge combines the splits. qg holds [q | gate] per head (2*hd).
+extern "C" __global__ void attn_decode(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
+                                       int nh, int nkv, int hd, float scale) {
+    int n_pos = step[0] + 1, ns = gridDim.y, per_s = (n_pos + ns - 1) / ns;
+    int p0 = blockIdx.y * per_s, p1 = min(n_pos, p0 + per_s);
     extern __shared__ float sacc[];  // nw * hd
     __shared__ float sm[32], sl[32];
     int h = blockIdx.x, g = h / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
     int per = hd >> 5;
     float qv[MAXD], acc[MAXD], m = -INFINITY, l = 0.0f;
     for (int d = 0; d < per; d++) { qv[d] = q[h * hd + lane + 32 * d]; acc[d] = 0.0f; }
-    for (int t = w; t < n_pos; t += nw) {
+    for (int t = p0 + w; t < p1; t += nw) {
         const u16* kt = kc + ((size_t)t * nkv + g) * hd;
         const u16* vt = vc + ((size_t)t * nkv + g) * hd;
         float s = 0.0f;
@@ -616,13 +618,33 @@ extern "C" __global__ void attn_decode(const float* q, const u16* kc, const u16*
     if (lane == 0) { sm[w] = m; sl[w] = l; }
     for (int d = 0; d < per; d++) sacc[w * hd + lane + 32 * d] = acc[d];
     __syncthreads();
+    float* pp = part + ((size_t)h * ns + blockIdx.y) * (hd + 2);
     float M = -INFINITY;
     for (int i = 0; i < nw; i++) M = fmaxf(M, sm[i]);
+    if (M == -INFINITY) {  // empty split (fewer positions than splits)
+        for (int d = threadIdx.x; d < hd + 2; d += blockDim.x) pp[d] = d == hd ? -INFINITY : 0.0f;
+        return;
+    }
     float L = 0.0f;
     for (int i = 0; i < nw; i++) L += sl[i] * expf(sm[i] - M);
     for (int d = threadIdx.x; d < hd; d += blockDim.x) {
         float o = 0.0f;
         for (int i = 0; i < nw; i++) o += sacc[i * hd + d] * expf(sm[i] - M);
+        pp[d] = o;
+    }
+    if (threadIdx.x == 0) { pp[hd] = M; pp[hd + 1] = L; }
+}
+
+// grid = query heads: out = (sum of split partials) / (sum of split sums) * sigmoid(gate). Split 0 is never empty.
+extern "C" __global__ void attn_merge(const float* part, const float* qg, float* out, int hd, int ns) {
+    int h = blockIdx.x;
+    const float* pp = part + (size_t)h * ns * (hd + 2);
+    float M = -INFINITY, L = 0.0f;
+    for (int s = 0; s < ns; s++) M = fmaxf(M, pp[s * (hd + 2) + hd]);
+    for (int s = 0; s < ns; s++) L += pp[s * (hd + 2) + hd + 1] * expf(pp[s * (hd + 2) + hd] - M);
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float o = 0.0f;
+        for (int s = 0; s < ns; s++) o += pp[s * (hd + 2) + d] * expf(pp[s * (hd + 2) + hd] - M);
         out[h * hd + d] = o / L * sigmoid(qg[h * 2 * hd + hd + d]);
     }
 }

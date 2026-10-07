@@ -194,11 +194,12 @@ fn gemm_throughput() {
 }
 
 /// Prefill attention (tensor cores, f16 Q and P, 64-query tiles) matches decode attention at every position, with
-/// keys cached before the chunk and a chunk that does not fill its last tile.
+/// keys cached before the chunk, a chunk that does not fill its last tile, and early positions that leave decode
+/// splits empty.
 #[test]
 fn attn_prefill_matches_decode() {
     let Some(gpu) = gpu() else { return };
-    let (nh, nkv, pos0, t) = (4, 2, 40, 100);
+    let (nh, nkv, pos0, t) = (4, 2, 5, 100);
     let h16 = |v: Vec<f32>| -> Vec<u16> { v.iter().map(|x| half::f16::from_f32(*x).to_bits()).collect() };
     for hd in [64, 128, 256] {
         let n = (pos0 + t) * nkv * hd;
@@ -213,11 +214,12 @@ fn attn_prefill_matches_decode() {
         gpu.attn_prefill(gpu.ptr(&dq), gpu.ptr(&dk), gpu.ptr(&dv), gpu.ptr(&dg), gpu.ptr(&dout), gpu.ptr(&step), t, nh, nkv, hd, scale).unwrap();
         let got = gpu.stream.clone_dtoh(&dout).unwrap();
         let ddec = gpu.zeros::<f32>(t * nh * hd).unwrap();
+        let part = gpu.zeros::<f32>(nh * rusting_strata::cuda::ATT_SPLITS * (hd + 2)).unwrap();
         for i in 0..t {
             let s = gpu.stream.clone_htod(&[(pos0 + i) as i32]).unwrap();
             let off = |p: u64, per: usize| p + (i * per * 4) as u64;
             gpu.attn_decode(off(gpu.ptr(&dq), nh * hd), gpu.ptr(&dk), gpu.ptr(&dv), off(gpu.ptr(&dg), nh * 2 * hd),
-                            off(gpu.ptr(&ddec), nh * hd), gpu.ptr(&s), nh, nkv, hd, scale).unwrap();
+                            off(gpu.ptr(&ddec), nh * hd), gpu.ptr(&part), gpu.ptr(&s), nh, nkv, hd, scale).unwrap();
         }
         let want = gpu.stream.clone_dtoh(&ddec).unwrap();
         let e = rel_l2(&got, &want);

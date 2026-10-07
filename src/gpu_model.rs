@@ -104,12 +104,12 @@ impl<'a> GpuModel<'a> {
 
         let k = c.n_expert_used.max(1);
         let ff = (k * c.n_ff_exp).max(c.n_ff);
-        let sizes: [(&'static str, usize); 24] = [
+        let sizes: [(&'static str, usize); 25] = [
             ("h", c.n_embd), ("mix", c.n_embd), ("qkv", channels), ("z", c.ssm_d_inner), ("beta", nv), ("g", nv),
             ("y", channels), ("o", c.ssm_d_inner), ("qg", c.n_head * 2 * c.head_dim), ("q", c.n_head * c.head_dim),
             ("kraw", kv), ("k", kv), ("v", kv), ("att", c.n_head * c.head_dim), ("rl", c.n_expert), ("wts", k),
             ("ge", ff), ("ue", ff), ("ye", k * c.n_embd), ("shg", c.n_ff_shexp), ("shu", c.n_ff_shexp),
-            ("shy", c.n_embd), ("sg", 1), ("wh", k),
+            ("shy", c.n_embd), ("sg", 1), ("wh", k), ("attp", c.n_head * crate::cuda::ATT_SPLITS * (c.head_dim + 2)),
         ];
         let bufs = sizes.into_iter().map(|(name, n)| Ok((name, gpu.zeros::<f32>(n)?))).collect::<anyhow::Result<HashMap<_, _>>>()?;
         let (x, logits, ids) = (gpu.zeros(c.n_embd)?, gpu.zeros(c.n_vocab)?, gpu.zeros::<i32>(k)?);
@@ -201,7 +201,7 @@ impl<'a> GpuModel<'a> {
                     g.rms_norm(p("kraw"), hd, kn.ptr, p("k"), hd, hd, nkv, eps)?;
                     g.rope_neox(p("k"), hd, nkv, nkv, c.n_rot, step, c.rope_base)?;
                     g.kv_store(p("k"), p("v"), g.ptr(kc), g.ptr(vc), nkv * hd, 1, step)?;
-                    g.attn_decode(p("q"), g.ptr(kc), g.ptr(vc), p("qg"), p("att"), step, nh, nkv, hd, 1.0 / (hd as f32).sqrt())?;
+                    g.attn_decode(p("q"), g.ptr(kc), g.ptr(vc), p("qg"), p("att"), p("attp"), step, nh, nkv, hd, 1.0 / (hd as f32).sqrt())?;
                     g.gemv(o, p("att"), p("mix"))?;
                 }
             }
