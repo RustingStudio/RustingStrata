@@ -12,7 +12,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - Speed at 4K (3 clean runs): prefill 1581 tok/s (1538-1610; gate 1017, passed), prefill 1608 at 2dcae33, decode **81.0 tok/s** at a02b4ec (76.8-81.8; gate 67, passed).
   Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 88.1 tok/s at a02b4ec (88.06-88.22, 100% expert hits). 32K (31768-token prompt): prefill ~1290 tok/s, decode best 62.5, noisy (llama.cpp -d 32768: pp512 814, tg128 56.4).
   See `docs/m4-results.md`.
-- Parity: MMQ prefill 630/640 = 98.44% (#32, one run; f16 629 in the same session). Earlier (20 prompts x 32, GPU,
+- Parity: MMQ prefill mean 98.39% +- 0.32 over 6 runs (#32; f16 98.28% +- 0.20 interleaved). Earlier (20 prompts x 32, GPU,
   3 runs): prefill 628/630/629 = mean 98.28% +- 0.16; token-by-token prompt
   (`--chunk 0`) 631/627/631 = mean 98.39% +- 0.36. Gate 99%. Decode is not deterministic run to run (adaptive
   cache moves experts between GPU int8 and CPU kernels), so single parity runs move by +-2 misses.
@@ -463,14 +463,18 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   shared memory, dp4a (`gemmi_*`). IQ2_XS stays on f16 (`Gpu::mmq`). `STRATA_MMQ=<types>|none` overrides,
   `STRATA_LLAMA_NUMERICS=1` uses llama.cpp's activation scales and puts IQ2_XS on MMQ too.
 - CUDA tests 7 pass (incl. `gemm_matches_reference_for_every_type` against the f16 GEMM).
-- Parity (GPU, same session, load 2-6): f16 629/640 = 98.28%; MMQ 630/640 = **98.44%**; llama numerics 627/640
-  = 97.97% (worse, stays opt-in, off by default).
+- Parity (GPU, 6 runs each, f16 and MMQ interleaved in 20:22-20:39, load 1-6): f16 629/628/631/628/628/630 =
+  mean 98.28% +- 0.20; MMQ 626/629/630/630/632/631 = mean **98.39% +- 0.32**. Same prompts miss in both (9, 15,
+  17, 19 most). Llama numerics 627/640 = 97.97% (one run, stays opt-in).
+- IQ2_XS on MMQ too (`STRATA_MMQ=<all types>`): 628/628/628 = 98.12% (adds 2 misses on prompt 18 every run),
+  prefill 1808.0 (1802.3-1811.1) vs 1744.5 (1730.4-1752.5) default at 20:31. Rejected for parity.
 - 4K bench (`--pp 4096 --tg 64 --reps 3`, 20:25, load 2.2-1.8): prefill f16 1609.3 (1572.7-1630.0), MMQ
   **1745.4** (1736.2-1753.1, +8.5%), llama numerics 1795.3 (1788.5-1798.8). Decode 62.3 / 66.4 / 60.5 tok/s at
   tg 64 (short run, not comparable with the 81.0 decode number; decode does not use this GEMM).
 
 ## Tried and rejected
-- #32: `STRATA_LLAMA_NUMERICS` as default: parity 97.97% vs 98.44%.
+- #32: `STRATA_LLAMA_NUMERICS` as default: parity 97.97% vs 98.39%. IQ2_XS on MMQ: 98.12% (3 runs), +3.6%
+  prefill.
 - #25: MTP k = 2-3 chained drafts: correct, but 70.4 / 63.5 tok/s vs 87.4 for k = 1 (acceptance 62% / 48%).
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
@@ -496,7 +500,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 1. Cheaper draft head: only with a measured frequent-token list (id-order subset rejected in #24). Also try not
    re-running the draft head for accepted drafts (reuse its KV from the draft pass) to make k = 2 pay.
-2. MMQ for IQ2_XS (llama path is faster: 1795 tok/s) with parity kept; then MMQ tile tuning toward 2000 tok/s.
+2. MMQ tile tuning toward 2000 tok/s (IQ2_XS on MMQ costs parity, #32).
 4. Parity: CPU reference with llama.cpp activation rounding (`STRATA_Q8` patch, q8_K on CPU-side experts, q8_1
    on CUDA, f16 KV) to find which matmuls cause the misses.
 3. M6: full v1 gate run with `strata bench` on a quiet machine, then `docs/m6-results.md`. `calibrate` threads (subprocess per setting).
