@@ -593,6 +593,25 @@ A/B, 3 interleaved rounds, MTP k = 1, decode tok/s (`--reps 2`):
 
 Every round improved. MTP now breaks even at 8K and still loses at 32K (66.3 vs 67.8).
 
+### 2026-10-08 #39 — MTP off above a context length: rejected (no code commit)
+
+Sweep at 8e2b27e, `bench --gpu --pp 4096,8192,12288,16384 --ctx 16896 --tg 128 --reps 2`, 2 rounds per mode
+(load 1.4-4.8 at the start of round 1, 1.4-2.0 after), decode tok/s:
+
+| Prompt | MTP off | MTP k = 1 |
+|---|---|---|
+| 4096 | 81.4 (81.3-81.5) | 79.6 (79.4-79.7) |
+| 8192 | 79.2 (79.0-79.4) | 79.4 (79.3-79.5) |
+| 12288 | 77.1 (77.0-77.1) | 78.6 (78.2-78.9) |
+| 16384 | 75.2 (75.0-75.3) | 74.6 (73.7-75.5) |
+
+Accepted 61.5-63.2%. With `--ctx 16896` MTP loses at 4K, where it won by 1.8 with `--ctx 4096`: the larger KV
+leaves fewer resident experts, and a 2-token verify touches ~2x the experts, so misses cost MTP more. It wins at
+12K. The payoff follows acceptance and expert hits, not position, so a fixed length gate would be wrong for some
+prompts. Cost model from #37/#38: a k = 1 step costs 1.475 plain tokens at 512 and 1.66 at 32K, so MTP pays above
+~48% acceptance short and ~66% at 32K. An adaptive gate (time MTP steps against occasional plain steps, keep the
+faster) would follow both; candidate 5 now says that.
+
 ## Tried and rejected
 - #32: `STRATA_LLAMA_NUMERICS` as default: parity 97.97% vs 98.39%. IQ2_XS on MMQ: 98.12% (3 runs), +3.6%
   prefill.
@@ -626,8 +645,8 @@ Every round improved. MTP now breaks even at 8K and still loses at 32K (66.3 vs 
    on CUDA, f16 KV) to find which matmuls cause the misses.
 3. VRAM for more resident experts: the margin floor is the driver reserve (#36). Remaining levers: smaller prefill
    scratch (470 MB at chunk 4096) or KV in fewer bytes.
-5. MTP at long context: drafts cost more than they save at 32K (64.9 vs 67.8). Gate MTP off above a context length,
-   or make the draft head's attention cheaper.
+5. MTP at long context: still loses at 32K (66.3 vs 67.8). A fixed length gate is wrong (#39); an adaptive gate
+   would time MTP steps against occasional plain steps and keep the faster mode.
 
 ## Questions for owner
 
