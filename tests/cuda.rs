@@ -382,3 +382,26 @@ fn argmax_rows_matches_ops_argmax() {
     assert_eq!(got, want);
     assert_eq!(want[1..], [1000, n as i32 - 1, 77]);
 }
+
+#[test]
+fn router_topk_matches_ops_top_k() {
+    let Some(gpu) = gpu() else { return };
+    let (n, k, t) = (256, 8, 3);
+    // Token 1 has a tie between experts 7 and 200 (lower index first), token 2 a tie at the k-th place.
+    let mut x: Vec<f32> = xs(n * t).iter().map(|v| v * 4.0).collect();
+    x[n + 7] = 9.0; x[n + 200] = 9.0;
+    x[2 * n + 30] = 5.0; x[2 * n + 31] = 5.0; x[2 * n + 255] = 5.0;
+    let dx = gpu.stream.clone_htod(&x).unwrap();
+    let (dids, dw) = (gpu.zeros::<i32>(k * t).unwrap(), gpu.zeros::<f32>(k * t).unwrap());
+    gpu.router_topk(gpu.ptr(&dx), n, k, 2.5, gpu.ptr(&dids), gpu.ptr(&dw), t).unwrap();
+    let (ids, w) = (gpu.stream.clone_dtoh(&dids).unwrap(), gpu.stream.clone_dtoh(&dw).unwrap());
+    for r in 0..t {
+        let mut p = x[r * n..(r + 1) * n].to_vec();
+        rusting_strata::ops::softmax(&mut p);
+        let want = rusting_strata::ops::top_k(&p, k);
+        assert_eq!(ids[r * k..(r + 1) * k].iter().map(|&i| i as usize).collect::<Vec<_>>(), want, "token {r}");
+        let s: f32 = want.iter().map(|&i| p[i]).sum();
+        for (j, &i) in want.iter().enumerate() { assert!((w[r * k + j] - p[i] / s * 2.5).abs() < 1e-5, "token {r} {j}"); }
+    }
+    assert_eq!(ids[k..k + 2], [7, 200]);
+}
