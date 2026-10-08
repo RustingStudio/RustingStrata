@@ -357,3 +357,21 @@ fn conv_seq_matches_steps() {
         assert_eq!(d(&snap)[..snaps.len()], snaps[..], "T {t}: snapshots");
     }
 }
+
+#[test]
+fn argmax_rows_matches_ops_argmax() {
+    let Some(gpu) = gpu() else { return };
+    let n = 248_320;
+    // Row 0 generic, row 1 a tie (first index wins), row 2 the maximum in the last element, row 3 all -inf but one.
+    let mut x: Vec<f32> = (0..4).flat_map(|r| xs(n + r).into_iter().skip(r)).collect();
+    x[n + 1000] = 9.0; x[n + 200_000] = 9.0;
+    x[3 * n - 1] = 5.0;
+    x[3 * n..].fill(f32::NEG_INFINITY); x[3 * n + 77] = -1.0;
+    let dx = gpu.stream.clone_htod(&x).unwrap();
+    let dout = gpu.zeros::<i32>(4).unwrap();
+    gpu.argmax_rows(gpu.ptr(&dx), n, 4, gpu.ptr(&dout)).unwrap();
+    let got = gpu.stream.clone_dtoh(&dout).unwrap();
+    let want: Vec<i32> = x.chunks(n).map(|r| rusting_strata::ops::argmax(r) as i32).collect();
+    assert_eq!(got, want);
+    assert_eq!(want[1..], [1000, n as i32 - 1, 77]);
+}

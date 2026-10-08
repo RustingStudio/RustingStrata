@@ -14,8 +14,8 @@ const QTYPES: [GgmlType; 11] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ2XS, IQ3XXS, IQ4XS]
 };
-const KERNELS: [&str; 24] = [
-    "rms_norm", "l2_norm", "rope_neox", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
+const KERNELS: [&str; 25] = [
+    "rms_norm", "argmax_rows", "l2_norm", "rope_neox", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_decode", "attn_decode_gqa", "attn_merge", "router_topk", "moe_combine", "map_hits", "moe_publish", "conv_seq", "conv_state",
     "moe_combine_seq", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
 ];
@@ -249,6 +249,12 @@ impl Gpu {
     /// `rows` rows: out[r] = rmsnorm(x[r]) * w.
     pub fn rms_norm(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32) -> anyhow::Result<()> {
         launch!(self, "rms_norm", cfg((rows as u32, 1), 256, 0), x, x_stride as i32, w, out, out_stride as i32, n as i32, eps);
+        Ok(())
+    }
+
+    /// out[r] = argmax of row r of x (`rows` rows of n floats), first index on ties.
+    pub fn argmax_rows(&self, x: u64, n: usize, rows: usize, out: u64) -> anyhow::Result<()> {
+        launch!(self, "argmax_rows", cfg((rows as u32, 1), 1024, 0), x, n as i32, out);
         Ok(())
     }
 
