@@ -171,8 +171,8 @@ fn gemv_bandwidth() {
 
 fn f16r(v: f32) -> f32 { half::f16::from_f32(v).to_f32() }
 
-/// Tensor-core GEMM over a tile list matches per-row dot products of fp16-rounded inputs, for every type, with a
-/// gathered X and partial tiles.
+/// Tensor-core GEMM over a tile list matches per-row dot products, for every type, with a gathered X and partial
+/// tiles. Types on the int8 path (`Gpu::mmq`) see X as int8 per 32 (as the GEMV path does), the others fp16 inputs.
 #[test]
 fn gemm_matches_reference_for_every_type() {
     let (Some(p), Some(gpu)) = (common::model_path(), gpu()) else { return };
@@ -191,7 +191,7 @@ fn gemm_matches_reference_for_every_type() {
         let tiles: Vec<u64> = [(0u64, 128u64), (128, 16), (144, 26)].iter().flat_map(|&(m0, c)| [dt.ptr, m0 | c << 32]).collect();
         let (dtl, dx, dr) = (gpu.stream.clone_htod(&tiles).unwrap(), gpu.stream.clone_htod(&x).unwrap(), gpu.stream.clone_htod(&xrow).unwrap());
         let dy = gpu.zeros::<f32>(m * rows).unwrap();
-        gpu.gemm(t.ty, rows, t.cols, gpu.ptr(&dtl), 3, gpu.ptr(&dx), t.cols, gpu.ptr(&dr), gpu.ptr(&dy), rows, 0).unwrap();
+        gpu.gemm(t.ty, rows, t.cols, gpu.ptr(&dtl), 3, gpu.ptr(&dx), t.cols, n_x, gpu.ptr(&dr), gpu.ptr(&dy), rows, 0).unwrap();
         let got = gpu.stream.clone_dtoh(&dy).unwrap();
         let mut wr = vec![0f32; t.cols];
         let mut want = vec![0f32; m * rows];
@@ -199,7 +199,11 @@ fn gemm_matches_reference_for_every_type() {
             t.row(r, &mut wr);
             for (i, &xr) in xrow.iter().enumerate() {
                 let xv = &x[xr as usize * t.cols..][..t.cols];
-                want[i * rows + r] = wr.iter().zip(xv).map(|(a, b)| f16r(*a) * f16r(*b)).sum();
+                want[i * rows + r] = if Gpu::mmq(t.ty) {
+                    wr.iter().zip(as_seen(t.ty, xv)).map(|(a, b)| a * b).sum()
+                } else {
+                    wr.iter().zip(xv).map(|(a, b)| f16r(*a) * f16r(*b)).sum()
+                };
             }
         }
         let e = rel_l2(&got, &want);
@@ -224,7 +228,7 @@ fn gemm_throughput() {
         let tiles: Vec<u64> = (0..m / bm).flat_map(|i| [dt.ptr, (bm * i) as u64 | (bm as u64) << 32]).collect();
         let (dtl, dx) = (gpu.stream.clone_htod(&tiles).unwrap(), gpu.stream.clone_htod(&xs(m * t.cols)).unwrap());
         let dy = gpu.zeros::<f32>(m * rows).unwrap();
-        let run = || gpu.gemm(t.ty, rows, t.cols, gpu.ptr(&dtl), m / bm, gpu.ptr(&dx), t.cols, 0, gpu.ptr(&dy), rows, 0).unwrap();
+        let run = || gpu.gemm(t.ty, rows, t.cols, gpu.ptr(&dtl), m / bm, gpu.ptr(&dx), t.cols, m, 0, gpu.ptr(&dy), rows, 0).unwrap();
         for _ in 0..3 { run(); }
         gpu.stream.synchronize().unwrap();
         let t0 = std::time::Instant::now();

@@ -234,9 +234,9 @@ impl GpuModel<'_> {
                             }
                         }
                         let sp = spans[gi];
-                        g.gemm(mg.ty, mg.rows, mg.cols, tp(sp[0].0), sp[0].1, h, ne, xrow_d, at(l.ge), c.n_ff_exp, 0)?;
-                        g.gemm(mu.ty, mu.rows, mu.cols, tp(sp[1].0), sp[1].1, h, ne, xrow_d, at(l.ge), c.n_ff_exp, 1)?;
-                        g.gemm(md.ty, md.rows, md.cols, tp(sp[2].0), sp[2].1, at(l.ge), c.n_ff_exp, 0, at(l.ye), ne, 0)?;
+                        g.gemm(mg.ty, mg.rows, mg.cols, tp(sp[0].0), sp[0].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 0)?;
+                        g.gemm(mu.ty, mu.rows, mu.cols, tp(sp[1].0), sp[1].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1)?;
+                        g.gemm(md.ty, md.rows, md.cols, tp(sp[2].0), sp[2].1, at(l.ge), c.n_ff_exp, t * k, 0, at(l.ye), ne, 0)?;
                     }
                     g.moe_combine_seq(x, at(l.ye), at(l.wts), g.ptr(&pf.ints) + 4 * (2 * n * k) as u64, k, sh, sg, ne, t)?;
                 }
