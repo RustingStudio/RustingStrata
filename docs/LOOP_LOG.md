@@ -540,6 +540,33 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - So the plan already accounts for Strata's own memory; the floor is the driver reserve plus ~40 MB of runtime
   growth. 256 MB is the practical minimum margin; 512 stays the default (#35). No VRAM to reclaim here.
 
+### 2026-10-08 #37 — MTP step profile; one attention launch for verify (6438b34)
+
+Profile (nsys, `bench --pp 512 --tg 256`, MTP k = 1, 82.9% accepted): a verify step of 2 tokens costs 21.1 ms of
+GPU kernel time against 12.2 ms for one plain token, so each accepted draft saves less than it should. Most of the
+extra is MoE: two tokens route to ~2x the experts (IQ2_XS expert GEMV 2.6 vs 1.3 ms, IQ3_XXS 1.8 vs 1.0 ms), which
+is inherent to speculative decoding on a MoE. The draft head's full-vocab output GEMV costs 1.1 ms per step.
+`moe_combine` looked 3x dearer, but its median is unchanged (3.0 vs 3.2 us); the mean is skewed by spin waits on
+CPU expert misses (max 9.3 ms). `deltanet_seq` median 19.4 vs 10.4 us for 2 tokens, as expected.
+
+Change: verify called `attn_decode` (decode, GQA and merge kernels) once per token. Now one launch with grid.z =
+tokens serves all of them, so their blocks read the same K/V rows close in time (L2), with 3 launches per
+attention layer instead of 3 per token. Test: `attn_prefill_matches_decode` also runs the batched launch and
+asserts bit-identical output against per-token launches. cuda and gpu_model suites pass.
+
+A/B, 3 interleaved rounds, `bench --gpu --mtp 1 --tg 128` (3 reps short, 2 reps 32K), load 0.8-1.4:
+
+| Decode after | caa5f4b | 6438b34 |
+|---|---|---|
+| 512 | 91.5 (91.3-91.8) | 92.6 (92.0-93.3) |
+| 4096 | 83.1 (83.0-83.1; r1 warm-up 79.5 left out) | 83.3 (83.3-83.3) |
+| 32768 | 64.4 (63.9-65.2) | 65.1 (64.8-65.3) |
+
+Prefill unchanged. The 32K gain is smaller than the ~2 ms per step that reading the KV once would save; L2 (3 MB)
+shares little of a 65 MB-per-layer KV between the two tokens. Reading each K/V row once for both tokens needs both
+queries in one block, which doubles the GQA kernel's registers (~250 already). MTP still loses at 32K (65.1 vs
+67.8 without), so next candidate 5 stands.
+
 ## Tried and rejected
 - #32: `STRATA_LLAMA_NUMERICS` as default: parity 97.97% vs 98.39%. IQ2_XS on MMQ: 98.12% (3 runs), +3.6%
   prefill.
