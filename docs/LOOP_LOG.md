@@ -633,6 +633,22 @@ A/B, 3 interleaved rounds, `bench --gpu --pp 4096 --tg 1 --reps 3 --mtp 0`, load
 Rejected, same session: the same pipelining in the f16 `gemm_q` (IQ2_XS experts). W and X both through registers
 (24 more per thread): 1594.4 vs 1821.4 (-12.5%, occupancy). W only (8 registers): 1798.5 vs 1823.3 (-1.4%).
 
+### 2026-10-08 #41 — deltanet_seq prefetches the next token's inputs (216468b)
+
+`deltanet_seq` took 395 ms of a 4K prefill rep (#40 profile, 13.2 ms per layer call, ~3.2 us per token): each
+token of the serial scan waited on global loads of k, q, gate, beta and v before its math. Those loads do not
+depend on the state, so token t + 1's now load into registers while token t computes. Same arithmetic in the same
+order; `deltanet_chunk_matches_steps`, cuda and gpu_model suites pass.
+
+A/B against b91e912, 3 interleaved rounds, `bench --gpu --pp 4096 --tg 1 --reps 3 --mtp 0`, load ~1.0:
+
+| | b91e912 | 216468b |
+|---|---|---|
+| 4K prefill | 1822.8 (1818.7-1826.3) | **1977.9** (1972.3-1984.9) |
+
+2 rounds, `--pp 512,32768 --ctx 33280 --tg 128 --reps 2`: 512 prefill 857.7 vs 886.7, 32K prefill 1435.2 vs
+**1532.9** (+6.8%), decode unchanged (86.2 vs 86.2 short, 67.4 vs 67.3 after 32K).
+
 ## Tried and rejected
 
 - #40: register pipelining of W (and X) loads in the f16 prefill `gemm_q`: -1.4% (W) and -12.5% (W + X).
