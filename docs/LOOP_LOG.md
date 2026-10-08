@@ -5,8 +5,8 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 ## State
 
 - Milestone: M2-M5 done (MTP speculative decoding, `generate --mtp`, rollback snapshots). M6: `chat`, `serve`
-  (sampling, `--api-key`, history reuse 99fbd11), `bench` and `calibrate` in (a336559). M6 left: full v1 gate run,
-  `docs/m6-results.md`, thread and expert-split calibration. M3 expert cache adaptive.
+  (sampling, `--api-key`, history reuse 99fbd11), `bench` and `calibrate` in (a336559). v1 gate run done
+  (#34, `docs/m6-results.md`). M6 left: thread and expert-split calibration. M3 expert cache adaptive.
 - MTP k = 1 decode ~87-92 tok/s (81.7% accepted, #25); k = 2-3 slower (rejected for now).
 - 4K prefill with int8 MMQ: **1745 tok/s** (1736-1753, #32, 3754e65).
 - Speed at 4K (3 clean runs): prefill 1581 tok/s (1538-1610; gate 1017, passed), prefill 1608 at 2dcae33, decode **81.0 tok/s** at a02b4ec (76.8-81.8; gate 67, passed).
@@ -17,6 +17,8 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   (`--chunk 0`) 631/627/631 = mean 98.39% +- 0.36. Gate 99%. Decode is not deterministic run to run (adaptive
   cache moves experts between GPU int8 and CPU kernels), so single parity runs move by +-2 misses.
 - Parity ceiling: llama.cpp batch vs its own token-by-token reference is 98.28% (#33); Strata vs reference-or-batch 99.17%.
+  The reference is llama.cpp's CPU build; against its CUDA build Strata scores 97.34% (#34).
+- MTP k = 1 with GPU argmax: 92.4 tok/s after a 512-token prompt (caa5f4b).
 
 ## Iterations
 
@@ -492,6 +494,27 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   top 32K 84.2% (id order 81.7%), top 32K plus prompt and generated tokens 86.1%. Only 2.5 points over the id
   order subset rejected in #24; the uk/ru/zh prompts fall outside any such list. Rejected without a GPU run.
 
+### 2026-10-08 #34 — M6 v1 gate run; parity reference was llama.cpp CPU; GPU argmax for MTP (caa5f4b)
+- Gate run (21:38-21:46, `docs/m6-results.md`), Strata at 671050e vs llama-bench (CUDA build 5d8ccdf9d), same
+  session, 3 reps each. Strata: 4K prefill 1715.6 (1618.4-1765.5), decode after 512 81.7 (80.0-83.3), MTP k = 1
+  88.9 (85.7-90.8); 32K prefill 1413.0, decode 67.8 (MTP 64.9). llama.cpp n-cpu-moe 10: pp512 1046.4, pp4096
+  1048.1, tg128 69.8; n-cpu-moe 14 at d32768: pp512 775.7, tg128 57.9. Speed gate passed (1.64x prefill, 1.17x
+  decode). MTP helps only at short context (+7.2 / +0.4 / -2.9 tok/s at 512 / 4K / 32K).
+- Found: `~/llama.cpp/build` is a CPU-only build ("no usable GPU found, --gpu-layers option will be ignored").
+  The first gate script used its llama-bench (pp512 55 tok/s, killed and rerun on `build-cuda`). Every parity
+  reference so far (`target/parity-ref.json`, #33 self-parity) came from that build's llama-server, so the 99%
+  gate has been measured against llama.cpp's CPU numerics.
+- New reference from the CUDA build (`tools/parity.py --ref target/parity-ref-cuda.json`, same flags): its greedy
+  continuations match the CPU reference at 459/640 positions (divergence carries forward). Strata GPU vs the CUDA
+  reference: 624 / 621 / 624 = mean 97.34%, vs 98.39% against the CPU reference. Strata is closer to llama.cpp
+  CPU, so the CPU reference stays the gate yardstick; the owner question below now covers both.
+- GPU argmax (caa5f4b): `argmax_rows` kernel after the draft head and verify; copy one int per row instead of
+  248K-float rows. MTP k = 1, `bench --pp 512 --tg 128 --reps 3`, interleaved: HEAD 92.2 / 91.0 / 90.2 (mean
+  91.1), argmax 92.5 / 93.0 / 91.7 (mean 92.4, +1.4%). New test `argmax_rows_matches_ops_argmax`; all cuda and
+  gpu_model tests pass, including `mtp_spec_matches_greedy`. `prefill_matches_reference` failed on its error
+  bound at HEAD code paths (prefill 1.67-1.74 vs decode 1.43-1.97, argmax equal): int8 MMQ prefill; bound now
+  1.5x decode error. First attempt used `INFINITY`, which NVRTC does not define before line 898.
+
 ## Tried and rejected
 - #32: `STRATA_LLAMA_NUMERICS` as default: parity 97.97% vs 98.39%. IQ2_XS on MMQ: 98.12% (3 runs), +3.6%
   prefill.
@@ -523,7 +546,9 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 2. MMQ tile tuning toward 2000 tok/s (IQ2_XS on MMQ costs parity, #32).
 4. Parity: CPU reference with llama.cpp activation rounding (`STRATA_Q8` patch, q8_K on CPU-side experts, q8_1
    on CUDA, f16 KV) to find which matmuls cause the misses.
-3. M6: full v1 gate run with `strata bench` on a quiet machine, then `docs/m6-results.md`. `calibrate` threads (subprocess per setting).
+3. M6: gate run done (#34). Left: `calibrate` threads and expert split (subprocess per setting).
+5. MTP at long context: drafts cost more than they save at 32K (64.9 vs 67.8). Gate MTP off above a context length,
+   or make the draft head's attention cheaper.
 
 ## Questions for owner
 
@@ -538,3 +563,5 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   the same reference, and 99.17% when a token counts if it matches either llama.cpp mode. Proposal: score the
   gate against both llama.cpp modes (or count misses whose llama.cpp top-2 gap is under 0.1 nats as ties, per the
   spec's logit-delta report). Which definition should v1 use?
+  Update #34: that reference came from a CPU-only llama.cpp build. Against the CUDA build's reference Strata scores
+  97.34%. Which llama.cpp backend should the gate use?
