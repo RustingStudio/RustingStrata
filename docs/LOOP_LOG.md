@@ -725,6 +725,26 @@ Kernel: 178.1 -> 39.7 us in `gemv_bandwidth` (20 -> 91 GB/s); in the MTP profile
 End to end that is ~0.6% of an MTP step. Whole-bench A/B runs at 23:30-23:39 were too noisy to show it (desktop in
 use, 22 GB swapped, decode spreads of 70-85 tok/s for both binaries), so no end-to-end number is claimed.
 
+### 2026-10-08 #47 — float GEMVs one row per block (03bf6d7)
+
+Decode profile by shape at 871aa18: `gemv_f32` 0.79 ms per token, of which ssm alpha and beta (32 x 2048, 60 calls
+per token) 4.2 us each at grid 4 (4 SMs, ~62 GB/s), the router (256 x 2048) 8.5 us at grid 32, the shared-expert
+gate (1 x 2048) 2.8 us.
+
+Change: float GEMVs launch one 32-thread block per row (was 8 rows per 256-thread block). Same per-row
+arithmetic; cuda and gpu_model suites pass.
+
+nsys, `bench --pp 512 --tg 256 --mtp 0`, median per call (total per token):
+
+| Shape | 23a5912 | 2 rows per block | 03bf6d7 |
+|---|---|---|---|
+| 32 x 2048 | 4.22 us (0.304 ms) | 3.01 us (0.195 ms) | 3.04 us (0.187 ms) |
+| 256 x 2048 | 8.48 us (0.371 ms) | 7.65 us (0.350 ms) | 7.58 us (0.326 ms) |
+| 1 x 2048 | 2.75 us (0.119 ms) | 2.82 us (0.121 ms) | 2.82 us (0.118 ms) |
+
+0.79 -> 0.63 ms of GPU time per token (~1.3% of a decode step). The desktop was in use (swap 22 GB), so whole-bench
+A/B numbers were too noisy to report; see #46.
+
 ## Tried and rejected
 
 - #43: deltanet_seq with 8 state floats per lane (16 before; twice the warps, shorter dependency chains):
