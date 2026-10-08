@@ -857,23 +857,31 @@ extern "C" __global__ void deltanet_seq(const float* y, float* S, const float* b
     float r[16];
 #pragma unroll
     for (int i = 0; i < 4; i++) { float4 v = row[s + L * i]; r[4 * i] = v.x; r[4 * i + 1] = v.y; r[4 * i + 2] = v.z; r[4 * i + 3] = v.w; }
-    for (int tok = 0; tok < T; tok++) {
+    // Token inputs do not depend on the state: token tok + 1's are loaded while token tok computes.
+    float nk_[16], nq[16], ng, nb, nvv;
+    auto ld = [&](int tok) {
         const float* yt = y + (size_t)tok * ych;
         const float4* q4 = (const float4*)(yt + kh * dk);
         const float4* k4 = (const float4*)(yt + nk * dk + kh * dk);
-        float decay = expf(g[tok * nv + vh]), kk[16], sk = 0.0f, oq = 0.0f;
 #pragma unroll
-        for (int i = 0; i < 4; i++) { float4 v = k4[s + L * i]; kk[4 * i] = v.x; kk[4 * i + 1] = v.y; kk[4 * i + 2] = v.z; kk[4 * i + 3] = v.w; }
+        for (int i = 0; i < 4; i++) {
+            float4 v = k4[s + L * i]; nk_[4 * i] = v.x; nk_[4 * i + 1] = v.y; nk_[4 * i + 2] = v.z; nk_[4 * i + 3] = v.w;
+            v = q4[s + L * i]; nq[4 * i] = v.x; nq[4 * i + 1] = v.y; nq[4 * i + 2] = v.z; nq[4 * i + 3] = v.w;
+        }
+        ng = g[tok * nv + vh]; nb = beta[tok * nv + vh]; nvv = yt[2 * nk * dk + vh * dv + j];
+    };
+    ld(0);
+    for (int tok = 0; tok < T; tok++) {
+        float kk[16], qv[16], decay = expf(ng), bt = nb, vt = nvv, sk = 0.0f, oq = 0.0f;
+#pragma unroll
+        for (int e = 0; e < 16; e++) { kk[e] = nk_[e]; qv[e] = nq[e]; }
+        if (tok + 1 < T) ld(tok + 1);
 #pragma unroll
         for (int e = 0; e < 16; e++) { r[e] *= decay; sk += r[e] * kk[e]; }
         for (int off = L >> 1; off; off >>= 1) sk += __shfl_xor_sync(0xffffffff, sk, off);
-        float d = beta[tok * nv + vh] * (yt[2 * nk * dk + vh * dv + j] - sk);
+        float d = bt * (vt - sk);
 #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            float4 v = q4[s + L * i];
-            float qv[4] = {v.x, v.y, v.z, v.w};
-            for (int e = 0; e < 4; e++) { r[4 * i + e] += d * kk[4 * i + e]; oq += r[4 * i + e] * qv[e]; }
-        }
+        for (int e = 0; e < 16; e++) { r[e] += d * kk[e]; oq += r[e] * qv[e]; }
         for (int off = L >> 1; off; off >>= 1) oq += __shfl_xor_sync(0xffffffff, oq, off);
         if (s == 0) o[(size_t)tok * nv * dv + vh * dv + j] = oq * scale;
         if (tok < min(nsnap, T - 1)) {
