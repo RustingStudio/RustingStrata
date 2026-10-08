@@ -649,6 +649,19 @@ A/B against b91e912, 3 interleaved rounds, `bench --gpu --pp 4096 --tg 1 --reps 
 2 rounds, `--pp 512,32768 --ctx 33280 --tg 128 --reps 2`: 512 prefill 857.7 vs 886.7, 32K prefill 1435.2 vs
 **1532.9** (+6.8%), decode unchanged (86.2 vs 86.2 short, 67.4 vs 67.3 after 32K).
 
+### 2026-10-08 #42 — rope_neox angles once per token (8dbdfed)
+
+Profile at 216468b (4K prefill): `deltanet_seq` now 6.9 ms per call (was 13.2), `rope_neox` 1.86 ms per call for
+~64 MB of traffic. The rotation angles use f64 `pow`, `sin` and `cos` (1/64 rate on GA106) and were computed in
+every head's block. Now one block per token computes them once and rotates all heads of that token (16 for q, 2
+for k). Same values; cuda and gpu_model suites pass.
+
+A/B against 216468b, 3 interleaved rounds, `bench --gpu --pp 4096 --tg 1 --reps 3 --mtp 0`, load 0.7-0.9:
+
+| | 216468b | 8dbdfed |
+|---|---|---|
+| 4K prefill | 1962.4 (1952.7-1973.9) | **1997.5** (1994.5-2003.1) |
+
 ## Tried and rejected
 
 - #40: register pipelining of W (and X) loads in the f16 prefill `gemm_q`: -1.4% (W) and -12.5% (W + X).
