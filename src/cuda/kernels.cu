@@ -270,15 +270,44 @@ template <> struct QI<23> {  // IQ4_XS (136 bytes)
     }
 };
 
+#ifndef LLAMA_Q8
+#define LLAMA_Q8 0
+#endif
+// q8_K scale over the lanes that share one 256-block (all 32 for 8 values per lane, the 16 of a half-warp for 16):
+// lane holds candidate value v at index i (largest |v| of its values, lowest index); the block keeps the largest
+// |v|, lowest index on ties, as llama.cpp's quantize_row_q8_K does. id = -127 / v, d = 1 / id.
+// |id v| <= 127 for every value of the block, so llama.cpp's clamp to 127 never fires and is left out.
+template <int LANES = 32>
+__device__ __forceinline__ void q8k_scale(float v, int i, float& d, float& id) {
+    unsigned mask = __activemask();  // quant_q8 can leave a half-warp idle
+    #pragma unroll
+    for (int o = 1; o < LANES; o <<= 1) {
+        float ov = __shfl_xor_sync(mask, v, o); int oi = __shfl_xor_sync(mask, i, o);
+        if (fabsf(ov) > fabsf(v) || (fabsf(ov) == fabsf(v) && oi < i)) { v = ov; i = oi; }
+    }
+    id = v != 0.0f ? -127.0f / v : 0.0f;
+    d = v != 0.0f ? 1.0f / id : 0.0f;
+}
+
 // Quantize x[0, n) into shared int8 qs[n] and per-32 scales xd[n / 32]; the whole block participates.
 __device__ __forceinline__ void quant_x(const float* __restrict__ x, int n, signed char* qs, float* xd) {
     for (int i = threadIdx.x * 8; i < n; i += blockDim.x * 8) {
         float4 a = *(const float4*)(x + i), c = *(const float4*)(x + i + 4);
         float mx = fmaxf(fmaxf(fmaxf(fabsf(a.x), fabsf(a.y)), fmaxf(fabsf(a.z), fabsf(a.w))),
                          fmaxf(fmaxf(fabsf(c.x), fabsf(c.y)), fmaxf(fabsf(c.z), fabsf(c.w))));
+#if LLAMA_Q8
+        float d, id;
+        {  // llama.cpp q8_K: one scale per 256 (the warp), -127 / the signed value of largest magnitude
+            float sv = 0.f; int si = 1 << 30;
+            float vv[8] = {a.x, a.y, a.z, a.w, c.x, c.y, c.z, c.w};
+            for (int j = 0; j < 8; j++) if (fabsf(vv[j]) == mx && si > i + j) { sv = vv[j]; si = i + j; }
+            q8k_scale(sv, si, d, id);
+        }
+#else
         mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 1));
         mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
         float d = mx / 127.0f, id = mx > 0.0f ? 127.0f / mx : 0.0f;
+#endif
         int2 q = make_int2(pack4(__float2int_rn(a.x * id), __float2int_rn(a.y * id), __float2int_rn(a.z * id), __float2int_rn(a.w * id)),
                            pack4(__float2int_rn(c.x * id), __float2int_rn(c.y * id), __float2int_rn(c.z * id), __float2int_rn(c.w * id)));
         *(int2*)(qs + i) = q;
@@ -509,6 +538,184 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
         gemm_q<T, SBB, GEMM_BM, GEMM_BK>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, nsb, act);       \
     }
 QTYPES(DEF_GEMM)
+
+// ---- prefill GEMM on int8 tensor cores (integer weight types) ----
+// X is first quantized by quant_q8 into q8 rows: cols int8, then cols / 32 f32 scales, then cols / 16 f32 sums of the
+// dequantized values (row bytes Q8_ROW(cols)). Weights come from QI<T> as int8 with a scale (and min) per 16, and each
+// 16-deep int32 mma result is scaled into f32 accumulators: y += dx dw sum(qx qw) - m_w sum(dx qx).
+// Same tiles, grid and block as gemm_q; K steps of 64 with X double-buffered by cp.async.
+#define Q8_ROW(cols) ((cols) + (cols) / 8 + (cols) / 4)
+
+// grid = rows of x, block = 256: q8 row r of out = x row r.
+extern "C" __global__ void quant_q8(const float* x, int x_stride, u8* out, int cols) {
+    const float* xr = x + (size_t)blockIdx.x * x_stride;
+    u8* o = out + (size_t)blockIdx.x * Q8_ROW(cols);
+    for (int i = threadIdx.x * 16; i < cols; i += blockDim.x * 16) {
+        float v[16];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) *(float4*)(v + 4 * j) = *(const float4*)(xr + i + 4 * j);
+        float mx = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) mx = fmaxf(mx, fabsf(v[j]));
+#if LLAMA_Q8
+        float d, id;
+        {
+            float sv = 0.f; int si = 1 << 30;
+            for (int j = 0; j < 16; j++) if (fabsf(v[j]) == mx && si > i + j) { sv = v[j]; si = i + j; }
+            q8k_scale<16>(sv, si, d, id);
+        }
+#else
+        mx = fmaxf(mx, __shfl_xor_sync(__activemask(), mx, 1));  // lanes 2k, 2k + 1 share one 32-block
+        float d = mx / 127.0f, id = mx > 0.0f ? 127.0f / mx : 0.0f;
+#endif
+        int q[16], sum = 0;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) { q[j] = __float2int_rn(v[j] * id); sum += q[j]; }
+        *(int4*)(o + i) = make_int4(pack4(q[0], q[1], q[2], q[3]), pack4(q[4], q[5], q[6], q[7]),
+                                    pack4(q[8], q[9], q[10], q[11]), pack4(q[12], q[13], q[14], q[15]));
+        if (!(threadIdx.x & 1)) ((float*)(o + cols))[i / 32] = d;
+        ((float*)(o + cols + cols / 8))[i / 16] = d * (float)sum;
+    }
+}
+
+__device__ __forceinline__ void mma_s8_16816(int* c, u32 a0, u32 a1, u32 b0) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(b0));
+}
+__device__ __forceinline__ void mma_s8_16832(int* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+// int -> float for |c| < 2^22 without the quarter-rate I2F: 2^23 + 2^22 + c has c in its low mantissa bits.
+__device__ __forceinline__ float i2f_small(int c) { return __int_as_float(0x4B400000 + c) - 12582912.0f; }
+// Weight types whose scale (and min) is constant over 32 weights: one 32-deep mma per scale.
+template <int T> __host__ __device__ constexpr bool scale32() { return T == 8 || T == 12 || T == 13 || T == 18 || T == 23; }
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok) {
+    unsigned d = (unsigned)__cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(ok ? 16 : 0));
+}
+__device__ __forceinline__ void cp_async8(void* dst, const void* src, bool ok) {
+    unsigned d = (unsigned)__cvta_generic_to_shared(dst);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(d), "l"(src), "r"(ok ? 8 : 0));
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
+template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;" :: "n"(N)); }
+
+template <int T, int SBB, int BM>
+__device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int nd, const u8* __restrict__ x,
+                                        const int* xrow, float* y, int y_stride, int rows, int nsb, int act) {
+    constexpr int P = 80;  // smem pitch in bytes: 64 int8 + padding (conflict-free fragments, 16-byte aligned rows)
+    static_assert(BM == 128, "one X row half per thread");
+    __shared__ __align__(16) signed char xq[2][BM * P], wq[64 * P];
+    __shared__ __align__(16) float xd[2][BM][2], xsum[2][BM][4];
+    __shared__ float wsc[64][4], wmn[64][4];
+    GemmTile tl = tiles ? tiles[blockIdx.y] : GemmTile{wd, (int)blockIdx.y * BM, min(BM, nd - (int)blockIdx.y * BM)};
+    int n0 = blockIdx.x * 64, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    int wm = (warp >> 1) * 32, wn = (warp & 1) * 32, cols = nsb * 256;
+    // X: thread copies 32 int8 (half of the row's 64) of row xr_, plus the row's scales (xh = 0) or sums (xh = 1).
+    int xr_ = tid >> 1, xh = tid & 1;
+    bool xok = xr_ < tl.cnt;
+    const u8* xp = x + (size_t)(xok ? (xrow ? xrow[tl.m0 + xr_] : tl.m0 + xr_) : 0) * Q8_ROW(cols);
+    auto ldx = [&](int kb) {
+        int b = kb & 1;
+        cp_async16(&xq[b][xr_ * P + xh * 32], xp + kb * 64 + xh * 32, xok);
+        cp_async16(&xq[b][xr_ * P + xh * 32 + 16], xp + kb * 64 + xh * 32 + 16, xok);
+        if (xh) cp_async16(&xsum[b][xr_][0], xp + cols + cols / 8 + kb * 16, xok);
+        else cp_async8(&xd[b][xr_][0], xp + cols + kb * 8, xok);
+        cp_async_commit();
+    };
+    // W: thread decodes the 16 weights (subs 2 wi, 2 wi + 1 of the step) of row wr_.
+    int wr_ = tid >> 2, wi = tid & 3;
+    const u8* wp = n0 + wr_ < rows ? tl.w + (size_t)(n0 + wr_) * nsb * SBB : nullptr;
+    float acc[2][4][4] = {};
+    const int nk = nsb * 4;
+    ldx(0);
+    for (int kb = 0; kb < nk; kb++) {
+        if (kb + 1 < nk) ldx(kb + 1);
+        {
+            int lo0 = 0, hi0 = 0, lo1 = 0, hi1 = 0; float d = 0.f, m = 0.f, d1, m1;
+            if (wp) {
+                const u8* sbp = wp + (size_t)(kb >> 2) * SBB;
+                int sub = (kb & 3) * 8 + 2 * wi;
+                QI<T>::get(sbp, sub, lo0, hi0, d, m);
+                QI<T>::get(sbp, sub + 1, lo1, hi1, d1, m1);
+            }
+            *(int4*)(wq + wr_ * P + wi * 16) = make_int4(lo0, hi0, lo1, hi1);
+            wsc[wr_][wi] = d; wmn[wr_][wi] = m;
+        }
+        if (kb + 1 < nk) cp_async_wait<1>(); else cp_async_wait<0>();
+        __syncthreads();
+        const int b = kb & 1;
+        constexpr int KS = scale32<T>() ? 32 : 16;  // depth of one mma (one weight scale)
+        #pragma unroll
+        for (int h = 0; h < 64 / KS; h++) {
+            u32 a[2][4], bw[4][2];
+            float da[2][2], sa[2][2], dbv[4][2], mb[4][2];
+            #pragma unroll
+            for (int mt = 0; mt < 2; mt++) {
+                int r = wm + mt * 16 + g;
+                const signed char* p = &xq[b][r * P + h * KS + 4 * t];
+                a[mt][0] = *(const u32*)p; a[mt][1] = *(const u32*)(p + 8 * P);
+                if (KS == 32) { a[mt][2] = *(const u32*)(p + 16); a[mt][3] = *(const u32*)(p + 8 * P + 16); }
+                da[mt][0] = xd[b][r][h * KS / 32]; da[mt][1] = xd[b][r + 8][h * KS / 32];
+                if (QI<T>::MIN) {
+                    sa[mt][0] = KS == 32 ? xsum[b][r][2 * h] + xsum[b][r][2 * h + 1] : xsum[b][r][h];
+                    sa[mt][1] = KS == 32 ? xsum[b][r + 8][2 * h] + xsum[b][r + 8][2 * h + 1] : xsum[b][r + 8][h];
+                }
+            }
+            #pragma unroll
+            for (int nt = 0; nt < 4; nt++) {
+                int n = wn + nt * 8;
+                const signed char* p = wq + (n + g) * P + h * KS + 4 * t;
+                bw[nt][0] = *(const u32*)p;
+                if (KS == 32) bw[nt][1] = *(const u32*)(p + 16);
+                #pragma unroll
+                for (int e = 0; e < 2; e++) {
+                    dbv[nt][e] = wsc[n + 2 * t + e][h * KS / 16];
+                    if (QI<T>::MIN) mb[nt][e] = wmn[n + 2 * t + e][h * KS / 16];
+                }
+            }
+            #pragma unroll
+            for (int mt = 0; mt < 2; mt++)
+                #pragma unroll
+                for (int nt = 0; nt < 4; nt++) {
+                    int c[4] = {0, 0, 0, 0};
+                    if (KS == 32) mma_s8_16832(c, a[mt][0], a[mt][1], a[mt][2], a[mt][3], bw[nt][0], bw[nt][1]);
+                    else mma_s8_16816(c, a[mt][0], a[mt][1], bw[nt][0]);
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        float f = i2f_small(c[i]) * (da[mt][i >> 1] * dbv[nt][i & 1]);
+                        if (QI<T>::MIN) f -= sa[mt][i >> 1] * mb[nt][i & 1];
+                        acc[mt][nt][i] += f;
+                    }
+                }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int mt = 0; mt < 2; mt++)
+        #pragma unroll
+        for (int nt = 0; nt < 4; nt++)
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                int r = wm + mt * 16 + g + 8 * h, n = n0 + wn + nt * 8 + 2 * t;
+                if (r >= tl.cnt) continue;
+                float* yr = y + (size_t)(tl.m0 + r) * y_stride;
+                #pragma unroll
+                for (int e = 0; e < 2; e++) {
+                    if (n + e >= rows) break;
+                    float v = acc[mt][nt][2 * h + e];
+                    yr[n + e] = act == 0 ? v : act == 1 ? silu(yr[n + e]) * v : yr[n + e] + v;
+                }
+            }
+}
+
+#define DEF_GEMMI(T, NAME, SBB)                                                                                   \
+    extern "C" __global__ void __launch_bounds__(256) gemmi_##NAME(const GemmTile* tiles, const u8* wd, int nd,    \
+            const u8* x, const int* xrow, float* y, int y_stride, int rows, int nsb, int act) {                    \
+        gemmi_q<T, SBB, 128>(tiles, wd, nd, x, xrow, y, y_stride, rows, nsb, act);                              \
+    }
+ITYPES(DEF_GEMMI)
 
 // ---- elementwise / norm ----
 
