@@ -530,6 +530,16 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - Default stays 512 MB: 256 gains +0.9-2.3% prefill but leaves little room for desktop VRAM that grows mid-run.
   `--vram-margin 256` is the documented option for a dedicated GPU.
 
+### 2026-10-08 #36 — VRAM outside the plan: driver reserve, not Strata (no code commit)
+- Question from #35: why does `--vram-margin 128` fail at load? Temporary `mem_get_info` prints (reverted):
+  after load free 508 MB at margin 512; after the 512 and 4096 prefill+decode runs 500 / 468 MB (MTP on: 498 /
+  466). Strata grows only ~40 MB after load (CUDA graphs, attention splits).
+- The OOM is in `ExpertCache::new`, third pool: 291 MB requested with 444 MB free fails; 280 MB with 796 MB free
+  works. Per-layer `table_dev` allocations cost 0 MB (checked by charging them to the budget first). The driver
+  refuses allocations that would leave roughly 150 MB or less free on this GPU (it also drives the desktop).
+- So the plan already accounts for Strata's own memory; the floor is the driver reserve plus ~40 MB of runtime
+  growth. 256 MB is the practical minimum margin; 512 stays the default (#35). No VRAM to reclaim here.
+
 ## Tried and rejected
 - #32: `STRATA_LLAMA_NUMERICS` as default: parity 97.97% vs 98.39%. IQ2_XS on MMQ: 98.12% (3 runs), +3.6%
   prefill.
@@ -561,8 +571,8 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 2. MMQ tile tuning toward 2000 tok/s (IQ2_XS on MMQ costs parity, #32).
 4. Parity: CPU reference with llama.cpp activation rounding (`STRATA_Q8` patch, q8_K on CPU-side experts, q8_1
    on CUDA, f16 KV) to find which matmuls cause the misses.
-3. VRAM: find the 128-256 MB of allocations outside the plan (#35 OOM at margin 128); accounting for them would
-   let the default margin drop and keep ~260 more experts resident.
+3. VRAM for more resident experts: the margin floor is the driver reserve (#36). Remaining levers: smaller prefill
+   scratch (470 MB at chunk 4096) or KV in fewer bytes.
 5. MTP at long context: drafts cost more than they save at 32K (64.9 vs 67.8). Gate MTP off above a context length,
    or make the draft head's attention cheaper.
 
