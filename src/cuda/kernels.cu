@@ -920,7 +920,7 @@ template <int PER> __device__ __forceinline__ void ldh_vec(const u16* p, float* 
 // writes per head its unnormalized partial [acc (hd) | max | sum] to part; attn_merge combines the splits.
 template <int PER, int G>
 __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
-                              int nh, int nkv, float scale) {
+                              int nh, int nkv, float scale, int bx) {
     constexpr int hd = PER * 32;
     // At least 16 positions per split: short contexts use few blocks instead of many near-empty ones.
     int n_pos = step[0] + 1, ns = gridDim.y, per_s = max((n_pos + ns - 1) / ns, 16);
@@ -928,12 +928,12 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
     if (p0 >= n_pos) {  // empty split
         for (int i = 0; i < G; i++)
             for (int d = threadIdx.x; d < hd + 2; d += blockDim.x)
-                part[((size_t)(blockIdx.x * G + i) * ns + blockIdx.y) * (hd + 2) + d] = d == hd ? -INFINITY : 0.0f;
+                part[((size_t)(bx * G + i) * ns + blockIdx.y) * (hd + 2) + d] = d == hd ? -INFINITY : 0.0f;
         return;
     }
     extern __shared__ float sacc[];  // nw * hd
     __shared__ float sm[32], sl[32];
-    int h0 = blockIdx.x * G, g = h0 / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    int h0 = bx * G, g = h0 / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
     float qv[G][PER], acc[G][PER], kv[PER], vv[PER], kn[PER], vn[PER], m[G], l[G];
 #pragma unroll
     for (int i = 0; i < G; i++) {
@@ -983,28 +983,31 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
 }
 
 // Two kernels, both in the decode graph; exactly one does work for a given context length. Below gq_min positions,
-// grid.z = query tokens: token z reads q, part and step at its own offsets (part holds pz floats per token).
+// nt query tokens: block x serves token x % nt and head block x / nt (tokens side by side, so their blocks run at
+// the same time and share K/V rows in L2), with q, part and step at that token's offsets (pz part floats per token).
 // attn_decode (grid (nh, ns1 splits)) serves one head per block. From gq_min on, attn_decode_gqa (grid (nh / G, splits))
 // serves the G query heads of a KV head per block, reading each K/V row once; it needs ~250 registers per thread,
 // so it is a separate entry point to keep attn_decode's occupancy.
 #define ATT_PER(F) switch (hd) { case 64: F(2) break; case 128: F(4) break; case 256: F(8) break; case 512: F(16) break; }
-#define ATT_1(PER) attn_decode_t<PER, 1>(q, kc, vc, part, step, nh, nkv, scale);
+#define ATT_1(PER) attn_decode_t<PER, 1>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt);
 extern "C" __global__ void attn_decode(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
-                                       int nh, int nkv, int hd, float scale, int gq_min, int pz) {
-    q += (size_t)blockIdx.z * nh * hd; part += (size_t)blockIdx.z * pz; step += 2 * blockIdx.z;
+                                       int nh, int nkv, int hd, float scale, int gq_min, int pz, int nt) {
+    int t = blockIdx.x % nt;
+    q += (size_t)t * nh * hd; part += (size_t)t * pz; step += 2 * t;
     if (step[0] + 1 >= gq_min) return;
     ATT_PER(ATT_1)
 }
 #define ATT_G(PER)                                                                             \
-    switch (nh / gridDim.x) {                                                                  \
-        case 1: attn_decode_t<PER, 1>(q, kc, vc, part, step, nh, nkv, scale); break;           \
-        case 2: attn_decode_t<PER, 2>(q, kc, vc, part, step, nh, nkv, scale); break;           \
-        case 4: if constexpr (PER <= 16) attn_decode_t<PER, 4>(q, kc, vc, part, step, nh, nkv, scale); break; \
-        case 8: if constexpr (PER <= 8) attn_decode_t<PER, 8>(q, kc, vc, part, step, nh, nkv, scale); break;  \
+    switch (nh * nt / gridDim.x) {                                                             \
+        case 1: attn_decode_t<PER, 1>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt); break;           \
+        case 2: attn_decode_t<PER, 2>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt); break;           \
+        case 4: if constexpr (PER <= 16) attn_decode_t<PER, 4>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt); break; \
+        case 8: if constexpr (PER <= 8) attn_decode_t<PER, 8>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt); break;  \
     }
 extern "C" __global__ void attn_decode_gqa(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
-                                           int nh, int nkv, int hd, float scale, int gq_min, int pz) {
-    q += (size_t)blockIdx.z * nh * hd; part += (size_t)blockIdx.z * pz; step += 2 * blockIdx.z;
+                                           int nh, int nkv, int hd, float scale, int gq_min, int pz, int nt) {
+    int t = blockIdx.x % nt;
+    q += (size_t)t * nh * hd; part += (size_t)t * pz; step += 2 * t;
     if (step[0] + 1 < gq_min) return;
     ATT_PER(ATT_G)
 }
