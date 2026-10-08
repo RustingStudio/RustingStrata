@@ -664,6 +664,9 @@ A/B against 216468b, 3 interleaved rounds, `bench --gpu --pp 4096 --tg 1 --reps 
 
 ## Tried and rejected
 
+- #43: deltanet_seq with 8 state floats per lane (16 before; twice the warps, shorter dependency chains):
+  4K prefill 1903.5 vs 1995.9 at 8dbdfed (3 interleaved rounds). Splitting its dot products into 4 partial sums:
+  2002 vs 1993, noise. Both reverted.
 - #40: register pipelining of W (and X) loads in the f16 prefill `gemm_q`: -1.4% (W) and -12.5% (W + X).
 - #32: `STRATA_LLAMA_NUMERICS` as default: parity 97.97% vs 98.39%. IQ2_XS on MMQ: 98.12% (3 runs), +3.6%
   prefill.
