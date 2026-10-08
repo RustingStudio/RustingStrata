@@ -334,8 +334,8 @@ impl Gpu {
     }
 
     /// Decode attention for `nt` query tokens, token t over positions 0 ..= step[2 t] (rows of q, qg, out and step
-    /// per token, `part` holds `nh * ATT_SPLITS * (hd + 2)` floats per token). One launch serves all tokens, so their
-    /// blocks read the same K/V rows close in time. Below ATT_GQA_MIN positions one block serves one head
+    /// per token, `part` holds `nh * ATT_SPLITS * (hd + 2)` floats per token). One launch serves all tokens, their
+    /// blocks side by side, so they read the same K/V rows from L2. Below ATT_GQA_MIN positions one block serves one head
     /// (ATT_SPLITS_1 splits), from it on one block serves all query heads of a KV head (ATT_SPLITS splits). Both
     /// kernels are launched; the step decides which one works.
     pub fn attn_decode(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize) -> anyhow::Result<()> {
@@ -348,10 +348,9 @@ impl Gpu {
         let group = nh / nkv;  // query heads per KV head, served by one block (up to 8, G * hd <= 2048)
         let g = [8, 4, 2, 1].into_iter().find(|&g| group % g == 0 && g * hd <= 2048).unwrap();
         let pz = (nh * ATT_SPLITS * (hd + 2)) as i32;
-        let cfg3 = |x: usize, y: usize, smem: usize| LaunchConfig { grid_dim: (x as u32, y as u32, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: smem as u32 };
-        launch!(self, "attn_decode", cfg3(nh, ATT_SPLITS_1, 8 * hd * 4), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz);
-        launch!(self, "attn_decode_gqa", cfg3(nh / g, ATT_SPLITS, 8 * hd * 4), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz);
-        launch!(self, "attn_merge", cfg3(nh, 1, 0), part, qg, out, hd as i32, ATT_SPLITS as i32, step, ATT_SPLITS_1 as i32, gq_min);
+        launch!(self, "attn_decode", cfg(((nh * nt) as u32, ATT_SPLITS_1 as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32);
+        launch!(self, "attn_decode_gqa", cfg(((nh / g * nt) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32);
+        launch!(self, "attn_merge", LaunchConfig { grid_dim: (nh as u32, 1, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, part, qg, out, hd as i32, ATT_SPLITS as i32, step, ATT_SPLITS_1 as i32, gq_min);
         Ok(())
     }
 
