@@ -266,9 +266,16 @@ fn attn_prefill_matches_decode() {
                 let s = gpu.stream.clone_htod(&[(pos0 + i) as i32]).unwrap();
                 let off = |p: u64, per: usize| p + (i * per * 4) as u64;
                 gpu.attn_decode_gq(off(gpu.ptr(&dq), nh * hd), gpu.ptr(&dk), gpu.ptr(&dv), off(gpu.ptr(&dg), nh * 2 * hd),
-                                   off(gpu.ptr(&ddec), nh * hd), gpu.ptr(&part), gpu.ptr(&s), nh, nkv, hd, scale, gq_min).unwrap();
+                                   off(gpu.ptr(&ddec), nh * hd), gpu.ptr(&part), gpu.ptr(&s), nh, nkv, hd, scale, gq_min, 1).unwrap();
             }
             let want = gpu.stream.clone_dtoh(&ddec).unwrap();
+            // One launch for all t tokens (the MTP verify path) gives the same bits as t launches.
+            let steps: Vec<i32> = (0..t).flat_map(|i| [(pos0 + i) as i32, 0]).collect();
+            let ds = gpu.stream.clone_htod(&steps).unwrap();
+            let (dbat, pbat) = (gpu.zeros::<f32>(t * nh * hd).unwrap(), gpu.zeros::<f32>(t * nh * rusting_strata::cuda::ATT_SPLITS * (hd + 2)).unwrap());
+            gpu.attn_decode_gq(gpu.ptr(&dq), gpu.ptr(&dk), gpu.ptr(&dv), gpu.ptr(&dg), gpu.ptr(&dbat), gpu.ptr(&pbat), gpu.ptr(&ds),
+                               nh, nkv, hd, scale, gq_min, t).unwrap();
+            assert_eq!(gpu.stream.clone_dtoh(&dbat).unwrap(), want, "attn_decode batched nh {nh} nkv {nkv} hd {hd} gq_min {gq_min}");
             let e = rel_l2(&got, &want);
             eprintln!("attn_prefill_{hd} nh {nh} nkv {nkv} gq_min {gq_min}: rel err vs decode {e:.2e}");
             assert!(e <= 5e-4, "attn_prefill_{hd} nh {nh} nkv {nkv} gq_min {gq_min}: rel err {e}");

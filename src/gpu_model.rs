@@ -452,11 +452,8 @@ impl<'a> GpuModel<'a> {
                     g.rms_norm(p("kraw"), hd, kn.ptr, p("k"), hd, hd, nt * nkv, eps)?;
                     g.rope_neox(p("k"), hd, nt * nkv, nkv, c.n_rot, step, c.rope_base)?;
                     g.kv_store(p("k"), p("v"), g.ptr(kc), g.ptr(vc), kv, nt, step)?;
-                    for t in 0..nt as u64 {
-                        let (q4, a4) = (4 * t * (nh * hd) as u64, 4 * t * (2 * nh * hd) as u64);
-                        g.attn_decode(p("q") + q4, g.ptr(kc), g.ptr(vc), p("qg") + a4, p("att") + q4, p("attp"), step + 8 * t,
-                                      nh, nkv, hd, 1.0 / (hd as f32).sqrt())?;
-                    }
+                    g.attn_decode(p("q"), g.ptr(kc), g.ptr(vc), p("qg"), p("att"), p("attp"), step, nh, nkv, hd,
+                                  1.0 / (hd as f32).sqrt(), nt)?;
                     mv(o, "att", nh * hd, "mix", ne)?;
                 }
             }

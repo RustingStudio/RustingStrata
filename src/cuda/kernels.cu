@@ -983,13 +983,15 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
 }
 
 // Two kernels, both in the decode graph; exactly one does work for a given context length. Below gq_min positions,
+// grid.z = query tokens: token z reads q, part and step at its own offsets (part holds pz floats per token).
 // attn_decode (grid (nh, ns1 splits)) serves one head per block. From gq_min on, attn_decode_gqa (grid (nh / G, splits))
 // serves the G query heads of a KV head per block, reading each K/V row once; it needs ~250 registers per thread,
 // so it is a separate entry point to keep attn_decode's occupancy.
 #define ATT_PER(F) switch (hd) { case 64: F(2) break; case 128: F(4) break; case 256: F(8) break; case 512: F(16) break; }
 #define ATT_1(PER) attn_decode_t<PER, 1>(q, kc, vc, part, step, nh, nkv, scale);
 extern "C" __global__ void attn_decode(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
-                                       int nh, int nkv, int hd, float scale, int gq_min) {
+                                       int nh, int nkv, int hd, float scale, int gq_min, int pz) {
+    q += (size_t)blockIdx.z * nh * hd; part += (size_t)blockIdx.z * pz; step += 2 * blockIdx.z;
     if (step[0] + 1 >= gq_min) return;
     ATT_PER(ATT_1)
 }
@@ -1001,7 +1003,8 @@ extern "C" __global__ void attn_decode(const float* q, const u16* kc, const u16*
         case 8: if constexpr (PER <= 8) attn_decode_t<PER, 8>(q, kc, vc, part, step, nh, nkv, scale); break;  \
     }
 extern "C" __global__ void attn_decode_gqa(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
-                                           int nh, int nkv, int hd, float scale, int gq_min) {
+                                           int nh, int nkv, int hd, float scale, int gq_min, int pz) {
+    q += (size_t)blockIdx.z * nh * hd; part += (size_t)blockIdx.z * pz; step += 2 * blockIdx.z;
     if (step[0] + 1 < gq_min) return;
     ATT_PER(ATT_G)
 }
@@ -1010,6 +1013,8 @@ extern "C" __global__ void attn_decode_gqa(const float* q, const u16* kc, const 
 extern "C" __global__ void attn_merge(const float* part, const float* qg, float* out, int hd, int ns, const int* step,
                                        int ns1, int gq_min) {
     int h = blockIdx.x;
+    part += (size_t)blockIdx.z * gridDim.x * ns * (hd + 2); step += 2 * blockIdx.z;
+    qg += (size_t)blockIdx.z * gridDim.x * 2 * hd; out += (size_t)blockIdx.z * gridDim.x * hd;
     if (step[0] + 1 < gq_min) ns = ns1;  // attn_decode ran, not attn_decode_gqa
     const float* pp = part + (size_t)h * ns * (hd + 2);
     __shared__ float ws[256];  // split max, then split weight (ns <= blockDim.x <= 256)
