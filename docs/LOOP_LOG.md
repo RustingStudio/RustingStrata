@@ -6,7 +6,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 - Milestone: M2-M5 done (MTP speculative decoding, `generate --mtp`, rollback snapshots). M6: `chat`, `serve`
   (sampling, `--api-key`, history reuse 99fbd11), `bench` and `calibrate` in (a336559). v1 gate run done
-  (#34, `docs/m6-results.md`). M6 left: thread and expert-split calibration. M3 expert cache adaptive.
+  (#34, `docs/m6-results.md`). M6 done (calibration measured in #35, defaults kept). M3 expert cache adaptive.
 - MTP k = 1 decode ~87-92 tok/s (81.7% accepted, #25); k = 2-3 slower (rejected for now).
 - 4K prefill with int8 MMQ: **1745 tok/s** (1736-1753, #32, 3754e65).
 - Speed at 4K (3 clean runs): prefill 1581 tok/s (1538-1610; gate 1017, passed), prefill 1608 at 2dcae33, decode **81.0 tok/s** at a02b4ec (76.8-81.8; gate 67, passed).
@@ -515,6 +515,21 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   bound at HEAD code paths (prefill 1.67-1.74 vs decode 1.43-1.97, argmax equal): int8 MMQ prefill; bound now
   1.5x decode error. First attempt used `INFINITY`, which NVRTC does not define before line 898.
 
+### 2026-10-08 #35 — M6 calibration: threads and expert split measured; defaults kept (no code commit)
+- Sweep at caa5f4b, `bench --pp 512,4096 --tg 128 --reps 3 --mtp 0`, two rounds, load 1.4-3.2. Round 1 is skewed
+  by the adaptive expert cache warming up (hit rate 97.3% -> 100%); round 2 numbers below.
+- `--threads` 4 / 6 / 8 / 12: prefill 512 907.4 / 907.1 / 907.0 / 907.7, 4K 1799.6 / 1789.0 / 1797.3 / 1795.3,
+  decode after 4K 81.6 / 81.2 / 81.5 / 81.4. All within 0.6%: with ~100% expert hits the CPU does almost no
+  expert work. No thread calibration added.
+- `--vram-margin` (the expert split) 256 / 512 (default, threads rows) / 1024 / 2048 MB: resident experts
+  8906 / 8644 / 8109 / 7071 of 10240; prefill 512 928.1 / ~907 / 877.5 / 800.8, 4K 1812.9 / ~1795 / 1767.9 /
+  1708.9; decode 81.5 / ~81.4 / 81.3 / 81.0. More resident experts help prefill only.
+- 32K (`--ctx 33280 --mtp 1 --reps 2`, two rounds): margin 512 prefill 1420.5 / 1424.3, decode 64.3 / 66.5;
+  256 prefill 1432.2 / 1432.5, decode 65.9 / 65.9. Margin 128: CUDA_ERROR_OUT_OF_MEMORY at load, at 4K and 32K
+  (desktop using 899 MiB), so 128-256 MB of allocations sit outside the plan.
+- Default stays 512 MB: 256 gains +0.9-2.3% prefill but leaves little room for desktop VRAM that grows mid-run.
+  `--vram-margin 256` is the documented option for a dedicated GPU.
+
 ## Tried and rejected
 - #32: `STRATA_LLAMA_NUMERICS` as default: parity 97.97% vs 98.39%. IQ2_XS on MMQ: 98.12% (3 runs), +3.6%
   prefill.
@@ -546,7 +561,8 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 2. MMQ tile tuning toward 2000 tok/s (IQ2_XS on MMQ costs parity, #32).
 4. Parity: CPU reference with llama.cpp activation rounding (`STRATA_Q8` patch, q8_K on CPU-side experts, q8_1
    on CUDA, f16 KV) to find which matmuls cause the misses.
-3. M6: gate run done (#34). Left: `calibrate` threads and expert split (subprocess per setting).
+3. VRAM: find the 128-256 MB of allocations outside the plan (#35 OOM at margin 128); accounting for them would
+   let the default margin drop and keep ~260 more experts resident.
 5. MTP at long context: drafts cost more than they save at 32K (64.9 vs 67.8). Gate MTP off above a context length,
    or make the draft head's attention cheaper.
 

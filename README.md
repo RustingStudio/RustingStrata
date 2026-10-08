@@ -57,8 +57,9 @@ whether the previous request started with the same messages, so do not share one
 not learn each other's prompts.
 
 Useful flags: `--ctx` (KV cache size, default 4096), `--mtp [N]` (speculative decoding with the model's draft
-head; only greedy decoding uses it), `--chunk`, `--threads`, `--vram-margin`. Without `--gpu` everything runs on
-the CPU reference, which is slow and meant for checking.
+head; only greedy decoding uses it), `--chunk`, `--threads`, `--vram-margin`. On a GPU that drives no display,
+`--vram-margin 256` keeps more experts resident (+1-2% prefill); 128 runs out of memory. Without `--gpu`
+everything runs on the CPU reference, which is slow and meant for checking.
 
 ## Tests
 
