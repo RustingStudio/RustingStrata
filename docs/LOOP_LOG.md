@@ -16,6 +16,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   3 runs): prefill 628/630/629 = mean 98.28% +- 0.16; token-by-token prompt
   (`--chunk 0`) 631/627/631 = mean 98.39% +- 0.36. Gate 99%. Decode is not deterministic run to run (adaptive
   cache moves experts between GPU int8 and CPU kernels), so single parity runs move by +-2 misses.
+- Parity ceiling: llama.cpp batch vs its own token-by-token reference is 98.28% (#33); Strata vs reference-or-batch 99.17%.
 
 ## Iterations
 
@@ -472,6 +473,25 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   **1745.4** (1736.2-1753.1, +8.5%), llama numerics 1795.3 (1788.5-1798.8). Decode 62.3 / 66.4 / 60.5 tok/s at
   tg 64 (short run, not comparable with the 81.0 decode number; decode does not use this GEMM).
 
+### 2026-10-08 #33 — llama.cpp parity ceiling measured; frequency draft vocab rejected (no code commit)
+- Question: is 99% top-1 agreement reachable at all against the token-by-token llama-server reference?
+- Method (`selfparity.py`, scratchpad): llama-server (same build and flags as the reference: `-ngl 99 --n-cpu-moe 20
+  -fa on`) re-scored all 640 continuation positions with the whole context as one prompt batch (`cache_prompt`
+  off, `n_predict 1`). 2 positions refused by the server's output-format check (HTTP 500), excluded.
+  Saved as `target/llama-batch-argmax.json`.
+- **llama.cpp batch vs its own token-by-token reference: 627 / 638 = 98.28%.** llama.cpp does not reach 99%
+  against itself; the misses are near-ties that flip with the batch shape (prompt 13: 29/32, prompt 19: 30/32).
+- Strata (#32 runs) vs llama batch: MMQ 623 / 626 / 629 / 627 / 629 / 626 of 638 (mean 98.22%), f16 625-626
+  (98.04%), all-MMQ 621-622.
+- Strata matches the reference **or** llama batch: MMQ 631 / 634 / 636 / 635 / 637 / 635 of 640 (mean 99.17%),
+  f16 634 / 633.
+- So Strata's 98.39% against the reference already exceeds llama.cpp's own 98.28% run-mode consistency. The
+  remaining misses sit inside llama.cpp's numerical noise. See "Questions for owner".
+- Draft-head vocab subset by measured frequency (Next candidate 1), checked offline first: corpus of 3.09M tokens
+  (local docs and code, 44K distinct). Coverage of the reference continuations: top 16K 77.5% (id order 75.6%),
+  top 32K 84.2% (id order 81.7%), top 32K plus prompt and generated tokens 86.1%. Only 2.5 points over the id
+  order subset rejected in #24; the uk/ru/zh prompts fall outside any such list. Rejected without a GPU run.
+
 ## Tried and rejected
 - #32: `STRATA_LLAMA_NUMERICS` as default: parity 97.97% vs 98.39%. IQ2_XS on MMQ: 98.12% (3 runs), +3.6%
   prefill.
@@ -498,8 +518,8 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 ## Next candidates
 
-1. Cheaper draft head: only with a measured frequent-token list (id-order subset rejected in #24). Also try not
-   re-running the draft head for accepted drafts (reuse its KV from the draft pass) to make k = 2 pay.
+1. Draft head: reuse its KV from the draft pass for accepted drafts (no second pass) to make k = 2 pay.
+   Vocab subsets are out (#24 id order, #33 frequency).
 2. MMQ tile tuning toward 2000 tok/s (IQ2_XS on MMQ costs parity, #32).
 4. Parity: CPU reference with llama.cpp activation rounding (`STRATA_Q8` patch, q8_K on CPU-side experts, q8_1
    on CUDA, f16 KV) to find which matmuls cause the misses.
@@ -512,3 +532,9 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   The inner flock waits for the lock its own parent holds, so it waits forever, and every other loop waits behind
   it. The GPU itself was idle. The Strata loop was not allowed to run without the lock or to kill the other loop's
   processes. Please kill PID 3495422 (or 3491381), and make the other loop not take the lock twice.
+
+- 2026-10-08 21:40: the 99% parity gate is above llama.cpp's own consistency. llama.cpp scored against its own
+  token-by-token reference, with the context run as one batch, gives 98.28% (#33). Strata gives 98.39% against
+  the same reference, and 99.17% when a token counts if it matches either llama.cpp mode. Proposal: score the
+  gate against both llama.cpp modes (or count misses whose llama.cpp top-2 gap is under 0.1 nats as ties, per the
+  spec's logit-delta report). Which definition should v1 use?
