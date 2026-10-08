@@ -182,19 +182,20 @@ template <> struct QI<10> {  // Q2_K (84 bytes: rows 4-aligned)
         lo = (int)((ldu32(q) >> (2 * j)) & 0x03030303u); hi = (int)((ldu32(q + 4) >> (2 * j)) & 0x03030303u);
     }
 };
-template <> struct QI<11> {  // Q3_K
+template <> struct QI<11> {  // Q3_K (110 bytes: rows 2-aligned)
     static constexpr bool MIN = false;
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
-        float v[8];
-        deq8<11>(b, sub, v);  // ponytail: via floats; Q3_K is rare in the target quants
         int e = sub * 8, n = e >> 7, r = e & 127, j = r >> 5, i0 = r & 31, is = n * 8 + j * 2 + (i0 >> 4);
         const u8* sc = b + 96;
         int low = is < 8 ? (sc[is] & 0xF) : (sc[is - 8] >> 4);
         int hs = (sc[8 + (is & 3)] >> (2 * (is >> 2))) & 3;
         d = ldh(b + 108) * (float)((low | (hs << 4)) - 32);
-        int q[8];
-        for (int i = 0; i < 8; i++) q[i] = d != 0.0f ? __float2int_rn(v[i] / d) : 0;
-        lo = pack4(q[0], q[1], q[2], q[3]); hi = pack4(q[4], q[5], q[6], q[7]);
+        const u8 *q = b + 32 + 32 * n + i0, *h = b + i0;
+        u32 q0 = ld16(q) | (ld16(q + 2) << 16), q1 = ld16(q + 4) | (ld16(q + 6) << 16);
+        u32 h0 = ld16(h) | (ld16(h + 2) << 16), h1 = ld16(h + 4) | (ld16(h + 6) << 16);
+        int qs = 2 * j, hb = 4 * n + j;  // value = 2 low bits + 4 * high bit - 4
+        lo = (int)__vsub4(((q0 >> qs) & 0x03030303u) | (((h0 >> hb) & 0x01010101u) << 2), 0x04040404u);
+        hi = (int)__vsub4(((q1 >> qs) & 0x03030303u) | (((h1 >> hb) & 0x01010101u) << 2), 0x04040404u);
     }
 };
 template <> struct QI<12> {  // Q4_K (144 bytes)
