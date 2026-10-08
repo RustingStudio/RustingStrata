@@ -356,6 +356,7 @@ impl Gpu {
 
     /// Route `t` tokens (logit rows of n, ids / wts rows of k).
     pub fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(n <= 512 && k <= 32, "router_topk: {n} experts, top {k}");
         launch!(self, "router_topk", cfg((t as u32, 1), 32, 0), p, n as i32, k as i32, extra_scale, ids, wts);
         Ok(())
     }
