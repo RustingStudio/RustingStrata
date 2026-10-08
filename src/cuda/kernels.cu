@@ -1060,37 +1060,43 @@ extern "C" __global__ void attn_merge(const float* part, const float* qg, float*
 
 // One warp per token (grid = tokens): softmax over n logits (in place), top-k (ties to the lower index), renormalized
 // weights.
+// One warp per token; the n <= 32 * TOPK_R logits stay in registers (lane holds i = lane + 32 r).
+#define TOPK_R 16
 extern "C" __global__ void router_topk(float* p, int n, int k, float extra_scale, int* ids, float* wts) {
     int lane = threadIdx.x;
     p += (size_t)blockIdx.x * n; ids += blockIdx.x * k; wts += blockIdx.x * k;
+    float v[TOPK_R];
     float m = -INFINITY;
-    for (int i = lane; i < n; i += 32) m = fmaxf(m, p[i]);
+#pragma unroll
+    for (int r = 0; r < TOPK_R; r++) { int i = lane + 32 * r; v[r] = i < n ? p[i] : -INFINITY; m = fmaxf(m, v[r]); }
     m = warp_max(m);
     float s = 0.0f;
-    for (int i = lane; i < n; i += 32) { float e = expf(p[i] - m); p[i] = e; s += e; }
+#pragma unroll
+    for (int r = 0; r < TOPK_R; r++) if (lane + 32 * r < n) { v[r] = expf(v[r] - m); s += v[r]; }
     s = warp_sum(s);
-    for (int i = lane; i < n; i += 32) p[i] /= s;
-    __syncwarp();
-    float sum = 0.0f;
+#pragma unroll
+    for (int r = 0; r < TOPK_R; r++) v[r] /= s;
+    unsigned taken = 0;
+    float sum = 0.0f, mine = 0.0f;
     for (int j = 0; j < k; j++) {
         float bv = -1.0f; int bi = 0x7fffffff;
-        for (int i = lane; i < n; i += 32) {
-            bool taken = false;
-            for (int t = 0; t < j; t++) taken |= ids[t] == i;
-            if (!taken && (p[i] > bv || (p[i] == bv && i < bi))) { bv = p[i]; bi = i; }
+#pragma unroll
+        for (int r = 0; r < TOPK_R; r++) {
+            int i = lane + 32 * r;
+            if (i < n && !(taken >> r & 1) && v[r] > bv) { bv = v[r]; bi = i; }
         }
         for (int o = 16; o > 0; o >>= 1) {
             float ov = __shfl_xor_sync(0xffffffff, bv, o);
             int oi = __shfl_xor_sync(0xffffffff, bi, o);
             if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
-        if (lane == 0) { ids[j] = bi; wts[j] = bv; }
+        if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
+        if (lane == j) { ids[j] = bi; mine = bv; }
         sum += bv;
-        __syncwarp();
     }
     float scale = 1.0f / fmaxf(sum, 6.103515625e-5f);
     if (extra_scale != 0.0f) scale *= extra_scale;
-    if (lane < k) wts[lane] *= scale;
+    if (lane < k) wts[lane] = mine * scale;
 }
 
 // x += sum_k w[k] * ye[k] + sigmoid(sg[0]) * sh + cpu (sh and cpu may be null).
