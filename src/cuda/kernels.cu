@@ -729,6 +729,29 @@ extern "C" __global__ void rms_norm(const float* x, int x_stride, const float* w
     for (int i = threadIdx.x; i < n; i += blockDim.x) o[i] = xr[i] * sc * w[i];
 }
 
+// grid = rows, block 1024. out[r] = index of the largest x in row r (first one on ties, like ops::argmax).
+extern "C" __global__ void argmax_rows(const float* x, int n, int* out) {
+    const float* xr = x + (size_t)blockIdx.x * n;
+    float b = __int_as_float(0xff800000); int bi = n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) if (xr[i] > b || bi == n) { b = xr[i]; bi = i; }
+    for (int o = 16; o > 0; o >>= 1) {
+        float v = __shfl_xor_sync(0xffffffff, b, o); int vi = __shfl_xor_sync(0xffffffff, bi, o);
+        if (v > b || (v == b && vi < bi)) { b = v; bi = vi; }
+    }
+    __shared__ float sv[32]; __shared__ int si[32];
+    int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    if (lane == 0) { sv[w] = b; si[w] = bi; }
+    __syncthreads();
+    if (w == 0) {
+        b = lane < (blockDim.x >> 5) ? sv[lane] : __int_as_float(0xff800000); bi = lane < (blockDim.x >> 5) ? si[lane] : n;
+        for (int o = 16; o > 0; o >>= 1) {
+            float v = __shfl_xor_sync(0xffffffff, b, o); int vi = __shfl_xor_sync(0xffffffff, bi, o);
+            if (v > b || (v == b && vi < bi)) { b = v; bi = vi; }
+        }
+        if (lane == 0) out[blockIdx.x] = bi;
+    }
+}
+
 // grid = rows, in place. Row r is vector r % per of token r / per (tokens `stride` floats apart).
 extern "C" __global__ void l2_norm(float* x, int n, int per, int stride, float eps) {
     float* xr = x + (size_t)(blockIdx.x / per) * stride + (size_t)(blockIdx.x % per) * n;
