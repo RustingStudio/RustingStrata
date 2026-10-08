@@ -196,16 +196,18 @@ impl Gpu {
 
     fn float_ty(ty: GgmlType) -> bool { matches!(ty, GgmlType::F32 | GgmlType::BF16) }
 
-    /// Rows per warp for the integer GEMV: about 8 super-blocks of work per warp (env STRATA_RPW overrides).
-    fn rpw(cols: usize) -> usize {
-        std::env::var("STRATA_RPW").ok().and_then(|v| v.parse().ok()).unwrap_or((2048 / cols).max(1))
+    /// Rows per warp for the integer GEMV (env STRATA_RPW overrides). Experts: about 8 super-blocks of work per
+    /// warp. Dense: 2 from 2048 rows, else 1 (fewer blocks hurt small matrices; measured in LOOP_LOG #50).
+    fn rpw(rows: usize, cols: usize, k: usize) -> usize {
+        let d = if k > 1 { (2048 / cols).max(1) } else if rows >= 2048 { 2 } else { 1 };
+        std::env::var("STRATA_RPW").ok().and_then(|v| v.parse().ok()).unwrap_or(d)
     }
 
     /// Launch config and rows-per-warp argument for a GEMV with `rows` x `cols` per matrix and `k` matrices.
     fn gemv_cfg(ty: GgmlType, rows: usize, cols: usize, k: usize) -> (LaunchConfig, i32) {
         // Float types: one warp per row and block, so small matrices (32 rows) still spread over many SMs.
         if Self::float_ty(ty) { return (cfg((rows as u32, k as u32), 32, 0), 1); }
-        let rpw = Self::rpw(cols);
+        let rpw = Self::rpw(rows, cols, k);
         (cfg((rows.div_ceil(8 * rpw) as u32, k as u32), 256, Self::xq_smem(ty, cols)), rpw as i32)
     }
 
