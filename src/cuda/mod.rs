@@ -234,7 +234,9 @@ impl Gpu {
     /// `pair` = (w2, y2) also computes the same product for the matrices at byte offset w2 into the output at byte offset y2.
     pub fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>) -> anyhow::Result<()> {
         if cols % 256 != 0 { bail!("{} expert with {cols} columns: GEMV needs a multiple of 256", ty.name()); }
-        let (mut c, rpw) = Self::gemv_cfg(ty, rows, cols, k);
+        let (mut c, mut rpw) = Self::gemv_cfg(ty, rows, cols, k);
+        // At least 2 rows per warp: an expert's x quantization (once per block) then covers 16 rows.
+        if rpw == 1 && !Self::float_ty(ty) { rpw = 2; c.grid_dim.0 = rows.div_ceil(16) as u32; }
         let (w2, y2) = pair.unwrap_or((0, 0));
         c.grid_dim.2 = if pair.is_some() { 2 } else { 1 };
         launch!(self, &kname("moe_gemv", ty), c, w, ids, stride as i64, x, x_stride as i32, xg as i32, y, rows as i32, (cols / 256) as i32, rpw, w2, y2);
