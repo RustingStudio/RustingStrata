@@ -47,8 +47,8 @@ for p in prompts[a.start:]:
     gap = None if bad is None else round(res["top5"][bad][0][1] - res["top5"][bad][1][1], 4)
     agree += k; total += len(cont)
     rows.append({"prompt": p.split("\n")[1][:50], "prompt_tokens": len(ids), "agree": k, "n": len(cont),
-                 "first_miss": bad, "top2_gap_at_miss": gap})
-    print(rows[-1], flush=True)
+                 "first_miss": bad, "top2_gap_at_miss": gap, "argmax": mine})
+    print({k: v for k, v in rows[-1].items() if k != "argmax"}, flush=True)
 pct = 100 * agree / total
 print(f"TOP1 AGREEMENT {agree}/{total} = {pct:.2f}%")
 json.dump({"rows": rows, "agree": agree, "total": total}, open(root / f"target/parity-result{'-' + a.tag if a.tag else ''}.json", "w"), indent=1)

@@ -14,10 +14,10 @@ const QTYPES: [GgmlType; 11] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ2XS, IQ3XXS, IQ4XS]
 };
-const KERNELS: [&str; 23] = [
+const KERNELS: [&str; 24] = [
     "rms_norm", "l2_norm", "rope_neox", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_decode", "attn_decode_gqa", "attn_merge", "router_topk", "moe_combine", "map_hits", "moe_publish", "conv_seq", "conv_state",
-    "moe_combine_seq", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256",
+    "moe_combine_seq", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
 ];
 
 /// Blocks per head in decode attention (positions split across them).
@@ -47,7 +47,12 @@ pub struct Gpu {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
     fns: HashMap<String, CudaFunction>,
+    /// q8 rows of the last integer GEMM's X (see quant_q8 in kernels.cu), grown on demand.
+    q8: std::sync::Mutex<CudaSlice<u8>>,
 }
+
+/// `--llama-numerics`: quantize activations like llama.cpp's CPU q8_K (one scale per 256) for every integer matmul.
+pub fn llama_numerics() -> bool { std::env::var_os("STRATA_LLAMA_NUMERICS").is_some() }
 
 fn source() -> String {
     let join = |v: Vec<String>| v.join(",");
@@ -55,11 +60,12 @@ fn source() -> String {
         "__device__ const unsigned long long iq2xs_grid[512] = {{{}}};\n\
          __device__ const unsigned int iq3xxs_grid[256] = {{{}}};\n\
          __device__ const unsigned char ksigns_iq2xs[128] = {{{}}};\n\
-         __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n{}",
+         __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n#define LLAMA_Q8 {}\n{}",
         join(IQ2XS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ3XXS_GRID.iter().map(|v| format!("{v:#x}u")).collect()),
         join(KSIGNS_IQ2XS.iter().map(|v| v.to_string()).collect()),
         join(KVALUES_IQ4NL.iter().map(|v| v.to_string()).collect()),
+        llama_numerics() as u8,
         include_str!("kernels.cu"),
     )
 }
@@ -106,7 +112,7 @@ impl Gpu {
         let mut fns = HashMap::new();
         let names = KERNELS.iter().map(|s| s.to_string())
             .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "moe_gemv", "gemm"].map(|p| kname(p, t))))
-            .chain(QTYPES.iter().filter(|&&t| !Self::float_ty(t)).map(|&t| kname("gemvn", t)));
+            .chain(QTYPES.iter().filter(|&&t| !Self::float_ty(t)).flat_map(|&t| ["gemvn", "gemmi"].map(|p| kname(p, t))));
         for n in names {
             let f = module.load_function(&n).with_context(|| format!("kernel {n}"))?;
             if n.starts_with("attn_prefill") {
@@ -114,7 +120,8 @@ impl Gpu {
             }
             fns.insert(n, f);
         }
-        Ok(Gpu { ctx, stream, fns })
+        let q8 = std::sync::Mutex::new(stream.alloc_zeros::<u8>(1)?);
+        Ok(Gpu { ctx, stream, fns, q8 })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -145,20 +152,40 @@ impl Gpu {
     /// Tensor-core GEMM over a tile list (see `GemmTile` in kernels.cu): for each tile, positions m0 .. m0 + cnt get
     /// y[m, 0..rows] = W_tile x[xrow[m]] (x row m when `xrow` is 0). `tiles` is a device array of [w, m0 | cnt << 32].
     /// `act`: 0 stores, 1 computes y = silu(y) * result (SwiGLU with the gate already in y), 2 adds to y.
-    pub fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
-        self.gemm_raw(ty, rows, cols, tiles, n_tiles, 0, 0, x, x_stride, xrow, y, y_stride, act)
+    /// `n_x`: rows of x the tiles read (integer weight types quantize them to int8 first).
+    pub fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
+        self.gemm_raw(ty, rows, cols, tiles, n_tiles, 0, 0, x, x_stride, n_x, xrow, y, y_stride, act)
     }
 
     /// y[m] (op) W x[m] for positions m < n, x and y rows `x_stride` / `y_stride` floats apart.
     pub fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
-        self.gemm_raw(w.ty, w.rows, w.cols, 0, n.div_ceil(GEMM_BM), w.ptr, n, x, x_stride, 0, y, y_stride, act)
+        self.gemm_raw(w.ty, w.rows, w.cols, 0, n.div_ceil(GEMM_BM), w.ptr, n, x, x_stride, n, 0, y, y_stride, act)
     }
 
-    fn gemm_raw(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, wd: u64, nd: usize, x: u64, x_stride: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
+    /// Whether the prefill GEMM for `ty` runs on int8 tensor cores (X quantized to int8 per 32) rather than f16.
+    /// `STRATA_MMQ=q5_k,q6_k,..` overrides the default list.
+    pub fn mmq(ty: GgmlType) -> bool {
+        // IQ2_XS has a scale per 16: its int8 path spends as long scaling mma results as in the mma, and loses to f16 (#31).
+        !Self::float_ty(ty) && std::env::var("STRATA_MMQ").map(|v| v.split(',').any(|t| t == ty.name())).unwrap_or(ty != GgmlType::IQ2XS || llama_numerics())
+    }
+
+    fn gemm_raw(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, wd: u64, nd: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
         if cols % 256 != 0 { bail!("{} matrix with {cols} columns: GEMM needs a multiple of 256", ty.name()); }
         if n_tiles == 0 { return Ok(()); }
-        launch!(self, &kname("gemm", ty), cfg((rows.div_ceil(64) as u32, n_tiles as u32), 2 * GEMM_BM as u32, 0),
-            tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 256) as i32, act);
+        let grid = (rows.div_ceil(64) as u32, n_tiles as u32);
+        if !Self::mmq(ty) {
+            launch!(self, &kname("gemm", ty), cfg(grid, 2 * GEMM_BM as u32, 0),
+                tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 256) as i32, act);
+            return Ok(());
+        }
+        // ponytail: X is quantized on every call, also when several GEMMs read the same x; reuse if it shows in profiles.
+        let mut q8 = self.q8.lock().unwrap();
+        let need = n_x * (cols + cols / 8 + cols / 4);
+        if q8.len() < need { *q8 = self.stream.alloc_zeros::<u8>(need)?; }
+        let xq = self.ptr(&*q8);
+        launch!(self, "quant_q8", cfg((n_x as u32, 1), 256, 0), x, x_stride as i32, xq, cols as i32);
+        launch!(self, &kname("gemmi", ty), cfg(grid, 2 * GEMM_BM as u32, 0),
+            tiles, wd, nd as i32, xq, xrow, y, y_stride as i32, rows as i32, (cols / 256) as i32, act);
         Ok(())
     }
 
