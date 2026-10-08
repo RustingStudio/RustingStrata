@@ -629,22 +629,30 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
     const u8* wp = n0 + wr_ < rows ? tl.w + (size_t)(n0 + wr_) * nsb * SBB : nullptr;
     float acc[2][4][4] = {};
     const int nk = nsb * 4;
+    // W step kb is decoded into registers during step kb - 1's mma and stored after it.
+    int lo0, hi0, lo1, hi1; float wd0, wm0;
+    auto ldw = [&](int kb) {
+        lo0 = hi0 = lo1 = hi1 = 0; wd0 = wm0 = 0.f;
+        float d1, m1;
+        if (wp) {
+            const u8* sbp = wp + (size_t)(kb >> 2) * SBB;
+            int sub = (kb & 3) * 8 + 2 * wi;
+            QI<T>::get(sbp, sub, lo0, hi0, wd0, wm0);
+            QI<T>::get(sbp, sub + 1, lo1, hi1, d1, m1);
+        }
+    };
+    auto stw = [&]() {
+        *(int4*)(wq + wr_ * P + wi * 16) = make_int4(lo0, hi0, lo1, hi1);
+        wsc[wr_][wi] = wd0; wmn[wr_][wi] = wm0;
+    };
     ldx(0);
+    ldw(0);
+    stw();
     for (int kb = 0; kb < nk; kb++) {
         if (kb + 1 < nk) ldx(kb + 1);
-        {
-            int lo0 = 0, hi0 = 0, lo1 = 0, hi1 = 0; float d = 0.f, m = 0.f, d1, m1;
-            if (wp) {
-                const u8* sbp = wp + (size_t)(kb >> 2) * SBB;
-                int sub = (kb & 3) * 8 + 2 * wi;
-                QI<T>::get(sbp, sub, lo0, hi0, d, m);
-                QI<T>::get(sbp, sub + 1, lo1, hi1, d1, m1);
-            }
-            *(int4*)(wq + wr_ * P + wi * 16) = make_int4(lo0, hi0, lo1, hi1);
-            wsc[wr_][wi] = d; wmn[wr_][wi] = m;
-        }
         if (kb + 1 < nk) cp_async_wait<1>(); else cp_async_wait<0>();
         __syncthreads();
+        if (kb + 1 < nk) ldw(kb + 1);
         const int b = kb & 1;
         constexpr int KS = scale32<T>() ? 32 : 16;  // depth of one mma (one weight scale)
         #pragma unroll
@@ -691,6 +699,7 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
                 }
         }
         __syncthreads();
+        if (kb + 1 < nk) stw();
     }
     #pragma unroll
     for (int mt = 0; mt < 2; mt++)
