@@ -19,6 +19,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - Parity ceiling: llama.cpp batch vs its own token-by-token reference is 98.28% (#33); Strata vs reference-or-batch 99.17%.
   The reference is llama.cpp's CPU build; against its CUDA build Strata scores 97.34% (#34).
 - MTP k = 1 with GPU argmax: 92.4 tok/s after a 512-token prompt (caa5f4b).
+- At 78732c3 (#48): decode 92.5 after 512, 86.1 after 4096; MTP k = 1 95.2 / 85.1; 4K prefill 2044 tok/s.
 
 ## Iterations
 
@@ -744,6 +745,39 @@ nsys, `bench --pp 512 --tg 256 --mtp 0`, median per call (total per token):
 
 0.79 -> 0.63 ms of GPU time per token (~1.3% of a decode step). The desktop was in use (swap 22 GB), so whole-bench
 A/B numbers were too noisy to report; see #46.
+
+### 2026-10-09 #48 — Q6_K and Q3_K GEMVs with 4-byte loads (78732c3)
+
+`gemv_bandwidth` per shape at 720031d (it now times every distinct shape, not the first tensor of each type):
+Q6_K `ssm_out` (2048 x 4096) 194 GB/s and `attn_q` (8192 x 2048) 219 GB/s, against 226-260 GB/s for Q5_K at the
+same shapes. Q6_K (210 bytes) and Q3_K (110 bytes) superblocks are only 2-aligned, so `QI<14>` and `QI<11>` read
+their quants with 8 two-byte loads per lane.
+
+Change: `ld8a2` reads 8 bytes with two 4-byte loads when the address is 4-aligned, else three 4-byte loads around
+it and a funnel shift. The alignment is the superblock's, so the branch is uniform across a warp. Same integers:
+GEMV error unchanged (Q6_K 4.18e-7, Q3_K 3.68e-7); cuda and gpu_model suites pass.
+
+`gemv_bandwidth`, 3 interleaved rounds (identical across rounds to 0.4 us):
+
+| Tensor | 720031d | 78732c3 |
+|---|---|---|
+| Q6_K ssm_out 2048 x 4096 | 35.5 us | **27.8 us** (246 GB/s) |
+| Q6_K attn_q 8192 x 2048 | 62.8 us | **48.7 us** (283 GB/s) |
+| Q6_K 2048 x 512 / 512 x 2048 | 7.4 / 7.1 us | 6.1 / 5.7 us |
+| Q3_K experts (moe8) | 39.2 us | 34.7 us |
+
+`bench --gpu --pp 512,4096 --tg 128 --reps 3`, 3 interleaved rounds, load 4.3-6.4 (old round 3 ran at load 12.6
+with 50-85 tok/s spreads and is left out; the new round 3 ran at load 15-20):
+
+| | 720031d | 78732c3 |
+|---|---|---|
+| Decode after 512 | 89.9 (89.9-89.9) | **92.5** (91.8-92.9) |
+| Decode after 4096 | 84.5 (84.4-84.5) | **86.1** (85.5-86.4) |
+| Decode after 512, MTP k = 1 | 95.9 (95.3-96.5) | 95.2 (94.6-96.2) |
+| Decode after 4096, MTP k = 1 | 82.4 (80.5-84.3) | **85.1** (83.4-86.0) |
+| 4K prefill | 2014.4 (2009.7-2019.1) | **2044.4** (2034.9-2049.7) |
+
+Prefill gains too: the MMQ prefill GEMM reads Q6_K through the same `QI<14>::get`.
 
 ## Tried and rejected
 
