@@ -78,7 +78,8 @@ fn prefill_matches_reference() {
         eprintln!("{name}: argmax prefill {} decode {} CPU {}, max |dlogit| prefill {dp:.4} decode {dd:.4}",
                   ops::argmax(pf), ops::argmax(dc), ops::argmax(want));
         assert_eq!(ops::argmax(pf), ops::argmax(want), "{name}");
-        assert!(dp <= dd.max(0.5), "{name}: prefill error {dp} above decode error {dd}");
+        // int8 MMQ prefill GEMMs (3754e65) quantize activations, decode does not: allow 1.5x (seen 1.17x).
+        assert!(dp <= (1.5 * dd).max(0.5), "{name}: prefill error {dp} above 1.5x decode error {dd}");
     }
 }
 

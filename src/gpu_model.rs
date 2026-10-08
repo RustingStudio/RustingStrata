@@ -51,6 +51,8 @@ pub struct GpuModel<'a> {
     x: CudaSlice<f32>,
     worker: Option<CpuWorker>,
     logits: CudaSlice<f32>,
+    /// Argmax of each logits row (greedy MTP: no full logits copy).
+    amax: CudaSlice<i32>,
     ids: CudaSlice<i32>,
     slots: CudaSlice<i32>,
     /// [position, CPU worker seq] for the current token, read by kernels so the graph can replay.
@@ -148,6 +150,7 @@ impl<'a> GpuModel<'a> {
         ];
         let bufs = sizes.into_iter().map(|(name, n)| Ok((name, gpu.zeros::<f32>(TMAX * n)?))).collect::<anyhow::Result<HashMap<_, _>>>()?;
         let (x, logits, ids) = (gpu.zeros(TMAX * c.n_embd)?, gpu.zeros(TMAX * c.n_vocab)?, gpu.zeros::<i32>(TMAX * ke)?);
+        let amax = gpu.zeros::<i32>(TMAX)?;
         let (slots, step_buf) = (gpu.zeros::<i32>(TMAX * ke)?, gpu.zeros::<i32>(2 * TMAX)?);
         let pf = if chunk > 0 { Some(prefill::Scratch::new(m, &gpu, chunk.min(ctx))?) } else { None };
         let (free1, _) = gpu.ctx.mem_get_info()?;
@@ -171,7 +174,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, ids, slots, step_buf, graphs: (0..=TMAX).map(|_| None).collect(), mtp_graphs: Default::default(), ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO, drafts: (0, 0), k, short: 32, pf, mtp })
+        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, amax, ids, slots, step_buf, graphs: (0..=TMAX).map(|_| None).collect(), mtp_graphs: Default::default(), ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], cache, adapt_every: 32, hits: 0, misses: 0, cpu_time: Duration::ZERO, drafts: (0, 0), k, short: 32, pf, mtp })
     }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
@@ -205,19 +208,38 @@ impl<'a> GpuModel<'a> {
     /// Run up to `TMAX` tokens at positions pos.. in one forward (each weight read once); returns logits per token.
     /// Hidden state t stays in row t of `x` (see `mtp_draft`).
     pub fn verify(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let nvoc = self.m.cfg.n_vocab;
+        self.verify_run(tokens)?;
+        let logits = self.gpu.stream.clone_dtoh(&self.logits.slice(0..tokens.len() * nvoc))?;
+        self.after_forward(tokens.len())?;
+        Ok(logits.chunks(nvoc).map(|c| c.to_vec()).collect())
+    }
+
+    /// `verify` for greedy speculation: `keep` gets the argmax of every row; returns its row n and that row's logits.
+    fn verify_greedy(&mut self, tokens: &[u32], keep: impl FnOnce(&[u32]) -> usize) -> anyhow::Result<(usize, Vec<f32>)> {
+        let (nt, nvoc) = (tokens.len(), self.m.cfg.n_vocab);
+        self.verify_run(tokens)?;
+        let g = &self.gpu;
+        g.argmax_rows(g.ptr(&self.logits), nvoc, nt, g.ptr(&self.amax))?;
+        let am: Vec<u32> = g.stream.clone_dtoh(&self.amax.slice(0..nt))?.into_iter().map(|x| x as u32).collect();
+        let n = keep(&am);
+        let logits = g.stream.clone_dtoh(&self.logits.slice(n * nvoc..(n + 1) * nvoc))?;
+        self.after_forward(nt)?;
+        Ok((n, logits))
+    }
+
+    /// Enqueue the forward of `verify` (no logits copy).
+    fn verify_run(&mut self, tokens: &[u32]) -> anyhow::Result<()> {
         let nt = tokens.len();
         if !(1..=TMAX).contains(&nt) { bail!("verify: {nt} tokens (1 to {TMAX})"); }
         if self.pos + nt > self.ctx { bail!("context full ({} tokens)", self.ctx); }
         let seq = self.worker.as_mut().map_or(0, |w| w.begin());
-        let (g, ne, nvoc) = (&self.gpu, self.m.cfg.n_embd, self.m.cfg.n_vocab);
+        let (g, ne) = (&self.gpu, self.m.cfg.n_embd);
         let emb: Vec<f32> = tokens.iter().flat_map(|&t| self.m.embed(t)).collect();
         g.stream.memcpy_htod(&emb, &mut self.x.slice_mut(0..nt * ne))?;
         let steps: Vec<i32> = (0..nt).flat_map(|t| [(self.pos + t) as i32, seq as i32]).collect();
         g.stream.memcpy_htod(&steps, &mut self.step_buf.slice_mut(0..2 * nt))?;
-        self.run(nt)?;
-        let logits = self.gpu.stream.clone_dtoh(&self.logits.slice(0..nt * nvoc))?;
-        self.after_forward(nt)?;
-        Ok(logits.chunks(nvoc).map(|c| c.to_vec()).collect())
+        self.run(nt)
     }
 
     /// Save the DeltaNet and conv states (KV needs no copy: rewinding `pos` is enough).
@@ -312,7 +334,10 @@ impl<'a> GpuModel<'a> {
 
     /// MTP draft: logits for the token after `token`, from hidden state `row` of the last `step` or `verify` (the
     /// position that predicted `token`). Mirrors `Model::mtp_step`; the draft head keeps its own position and KV cache.
-    pub fn mtp_draft(&mut self, token: u32, row: usize) -> anyhow::Result<Vec<f32>> { self.mtp_run(token, row, true) }
+    pub fn mtp_draft(&mut self, token: u32, row: usize) -> anyhow::Result<Vec<f32>> {
+        self.mtp_run(token, row, true)?;
+        Ok(self.gpu.stream.clone_dtoh(&self.logits.slice(0..self.m.cfg.n_vocab))?)
+    }
 
     /// Speculative decode with MTP. `t` is the next token (argmax of the last logits), predicted by hidden row `row`.
     /// Drafts `k` tokens after `t` (each from the previous draft's hidden state), verifies [t, drafts..] in one forward
@@ -325,12 +350,11 @@ impl<'a> GpuModel<'a> {
         let hp = self.mtp.as_ref().map_or(0, |h| h.pos);
         let mut toks = vec![t];
         for i in 0..k {
-            let d = crate::ops::argmax(&self.mtp_run(toks[i], if i == 0 { row } else { CHAIN }, true)?) as u32;
+            let d = self.mtp_run(toks[i], if i == 0 { row } else { CHAIN }, true)?;
             toks.push(d);
         }
         let start = self.pos;
-        let mut v = self.verify(&toks)?;
-        let n = (0..k).take_while(|&i| crate::ops::argmax(&v[i]) as u32 == toks[i + 1]).count();
+        let (n, logits) = self.verify_greedy(&toks, |am| (0..k).take_while(|&i| am[i] == toks[i + 1]).count())?;
         self.drafts.0 += k;
         self.drafts.1 += n;
         if n < k { self.rollback(start, n + 1)?; }
@@ -338,11 +362,12 @@ impl<'a> GpuModel<'a> {
         self.mtp.as_mut().unwrap().pos = hp + 1;
         for i in 0..n { self.mtp_run(toks[i + 1], i, false)?; }
         toks.truncate(n + 1);
-        Ok((toks, v.swap_remove(n), n))
+        Ok((toks, logits, n))
     }
 
-    /// Draft head on (`token`, hidden row `row`); `head` = false skips the output head and returns no logits.
-    fn mtp_run(&mut self, token: u32, row: usize, head: bool) -> anyhow::Result<Vec<f32>> {
+    /// Draft head on (`token`, hidden row `row`); returns the argmax of its logits (left in `logits` row 0), or 0 when
+    /// `head` = false skips the output head.
+    fn mtp_run(&mut self, token: u32, row: usize, head: bool) -> anyhow::Result<u32> {
         let c = &self.m.cfg;
         let Some(h) = self.mtp.as_mut() else { bail!("MTP head not loaded") };
         if h.pos >= self.ctx { bail!("context full ({} tokens)", self.ctx); }
@@ -361,14 +386,13 @@ impl<'a> GpuModel<'a> {
             self.mtp_graphs.insert(key, graph);
         }
         let g = &self.gpu;
-        let logits = if head { g.stream.clone_dtoh(&self.logits.slice(0..c.n_vocab))? }
-                     else { g.stream.synchronize()?; vec![] };
+        let d = if head { g.stream.clone_dtoh(&self.amax.slice(0..1))?[0] as u32 } else { g.stream.synchronize()?; 0 };
         let h = self.mtp.as_mut().unwrap();
         h.pos += 1;
         if let Some(cache) = self.cache.as_mut() {
             cache.record(c.n_layer, &h.worker.routing(c.n_layer).iter().map(|x| x.0).collect::<Vec<_>>());
         }
-        Ok(logits)
+        Ok(d)
     }
 
     /// Enqueue the draft head (see `mtp_run`).
@@ -384,6 +408,7 @@ impl<'a> GpuModel<'a> {
         if head {
             g.rms_norm(x, 0, h.head_norm.ptr, hp, 0, ne, 1, eps)?;
             g.gemv(&self.output, hp, g.ptr(&self.logits))?;
+            g.argmax_rows(g.ptr(&self.logits), c.n_vocab, 1, g.ptr(&self.amax))?;
         }
         Ok(())
     }
