@@ -710,6 +710,21 @@ A/B against 5dfb5d3, 3 interleaved rounds, `bench --gpu --pp 512,4096 --tg 128 -
 | after 512, MTP k = 1 | 92.6 (92.2-92.9) | **93.8** (93.7-94.1) |
 | after 4096, MTP k = 1 | 81.9 (80.6-82.6) | **82.8** (82.1-83.2) |
 
+### 2026-10-08 #46 — integer Q3_K GEMV decode (23a5912)
+
+MTP step profile at 871aa18 (nsys, `bench --pp 512 --tg 256 --mtp 1`, 82.9% accepted), per step (~21.7 ms GPU):
+verify output head `gemvn_q4_k` 1.6 ms for 2 tokens, draft head output `gemv_q4_k` 1.1 ms, draft head down experts
+`moe_gemv_q3_k` 166 us. `gemv_bandwidth` showed Q3_K experts at 20 GB/s (178 us): its `QI<11>::get` dequantized to
+floats and divided by the scale to recover the integers (marked ponytail).
+
+Change: `QI<11>::get` builds the integers from the 2 low bits and the high-bit mask with byte-wise SIMD, like Q6_K.
+Same integers: `dequant_and_gemv_match_reference_for_every_type` gives the same Q3_K GEMV error before and after
+(3.68e-7). cuda and gpu_model suites pass.
+
+Kernel: 178.1 -> 39.7 us in `gemv_bandwidth` (20 -> 91 GB/s); in the MTP profile 166 -> 39 us per draft step.
+End to end that is ~0.6% of an MTP step. Whole-bench A/B runs at 23:30-23:39 were too noisy to show it (desktop in
+use, 22 GB swapped, decode spreads of 70-85 tok/s for both binaries), so no end-to-end number is claimed.
+
 ## Tried and rejected
 
 - #43: deltanet_seq with 8 state floats per lane (16 before; twice the warps, shorter dependency chains):
