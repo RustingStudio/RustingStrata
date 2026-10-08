@@ -19,7 +19,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - Parity ceiling: llama.cpp batch vs its own token-by-token reference is 98.28% (#33); Strata vs reference-or-batch 99.17%.
   The reference is llama.cpp's CPU build; against its CUDA build Strata scores 97.34% (#34).
 - MTP k = 1 with GPU argmax: 92.4 tok/s after a 512-token prompt (caa5f4b).
-- At 78422f8 (#49): decode 96.1 after 512, 90.4 after 4096; MTP k = 1 100.5 / 90.7; 4K prefill 2086 tok/s.
+- At d24402d (#50): decode 99.1 after 512, 91.6 after 4096; MTP k = 1 105.1 / 94.0; 4K prefill ~2070 tok/s.
   Parity 98.59% (3 runs).
 
 ## Iterations
@@ -814,6 +814,31 @@ gpu_model suites pass.
 
 Parity at 78422f8 (`tools/parity.py --extra=--gpu`, 3 runs, 00:56-01:20, load 1.5-6.6): 633 / 629 / 631 of 640 =
 mean **98.59%**, not below #44's 98.44%.
+
+### 2026-10-09 #50 — dense GEMV rows per warp by row count (d24402d)
+
+`STRATA_RPW` sweep (1, 2, 4) at 78422f8 with `gemv_bandwidth`, 2 rounds: after #48-#49 the GEMVs are less
+load-bound, and 2 rows per warp now wins on matrices with 2048 rows or more (output head 954 -> 912-922 us,
+2048 x 4096 Q6_K / Q5_K 27.6 / 23.8 -> 26.2 / 22.7 us, 2048 x 512 Q6_K / Q8_0 5.3-5.8 / 4.1-4.3 -> 5.2 / 3.9 us)
+and loses on 512-row matrices (Q6_K attn_k 5.6 -> 6.4 us, Q5_K shared gate 4.9 -> 5.6 us). The old default was
+2048 / cols (1 for 2048 columns and more, 4 for 512).
+
+Change: dense GEMVs (and gemvn) use 2 rows per warp from 2048 rows, else 1. Expert GEMVs keep their rule (#45).
+cuda and gpu_model suites pass; per-row arithmetic unchanged.
+
+`gemv_bandwidth`, 2 interleaved rounds: output head 954-961 -> 918 us, its 2-input gemvn (MTP verify)
+1369-1373 -> 1156 us, Q5_K attn_qkv gemvn 2 inputs 57.1 -> 50.9 us.
+
+`bench --gpu --pp 512,4096 --tg 128 --reps 3`, 3 interleaved rounds, load 4.0-17.3:
+
+| | 780367d | d24402d |
+|---|---|---|
+| Decode after 512 | 97.6 (96.2-98.4) | **99.1** (99.1-99.2) |
+| Decode after 4096 | 89.7 (89.0-91.1) | **91.6** (91.1-91.9) |
+| Decode after 512, MTP k = 1 | 101.7 (100.7-103.5) | **105.1** (105.0-105.3) |
+| Decode after 4096, MTP k = 1 | 90.8 (89.4-91.5) | **94.0** (93.8-94.1) |
+
+Prefill unchanged (4K ~2050-2077 in both).
 
 ## Tried and rejected
 
