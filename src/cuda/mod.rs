@@ -266,7 +266,7 @@ impl Gpu {
 
     /// `heads` rows of `stride` floats, `per` per token; token t is at position step[0] + t.
     pub fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
-        launch!(self, "rope_neox", cfg((heads as u32, 1), (n_rot / 2) as u32, 0), x, stride as i32, per as i32, n_rot as i32, step, base);
+        launch!(self, "rope_neox", cfg(((heads / per) as u32, 1), (n_rot / 2) as u32, 0), x, stride as i32, per as i32, n_rot as i32, step, base);
         Ok(())
     }
 
