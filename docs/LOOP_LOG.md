@@ -612,7 +612,30 @@ prompts. Cost model from #37/#38: a k = 1 step costs 1.475 plain tokens at 512 a
 ~48% acceptance short and ~66% at 32K. An adaptive gate (time MTP steps against occasional plain steps, keep the
 faster) would follow both; candidate 5 now says that.
 
+### 2026-10-08 #40 — gemmi decodes the next weight step during the mma (b91e912)
+
+4K prefill profile at 8e2b27e (nsys, `--pp 4096 --tg 1 --reps 3`), GPU time per 4096-token rep: `gemm_iq2_xs`
+(f16, experts) 548 ms, `gemmi_q5_k` 503 ms (17.8 TOP/s), `deltanet_seq` 395 ms, `gemmi_q6_k` 209 ms,
+`gemmi_iq3_xxs` 199 ms, `attn_prefill_256` 106 ms, `quant_q8` 61 ms. Sum ~2.2 s, so prefill is GPU-bound.
+2000 tok/s needs ~190 ms less per rep.
+
+`gemmi_q` loaded X with cp.async double buffering but read and decoded the weights synchronously at the top of
+each 64-deep k-step. Change: step kb + 1's weights are decoded into 8 registers right after the sync that opens
+step kb, so their global loads overlap step kb's mma, and are stored to shared memory after the closing sync.
+Same arithmetic; `gemm_matches_reference_for_every_type`, cuda and gpu_model suites pass.
+
+A/B, 3 interleaved rounds, `bench --gpu --pp 4096 --tg 1 --reps 3 --mtp 0`, load 2.9-5.5 (falling):
+
+| | 8e2b27e | b91e912 |
+|---|---|---|
+| 4K prefill | 1787.5 (1787.4-1787.6; r1 warm-up 1690.5 left out) | **1817.2** (1816.4-1817.8) |
+
+Rejected, same session: the same pipelining in the f16 `gemm_q` (IQ2_XS experts). W and X both through registers
+(24 more per thread): 1594.4 vs 1821.4 (-12.5%, occupancy). W only (8 registers): 1798.5 vs 1823.3 (-1.4%).
+
 ## Tried and rejected
+
+- #40: register pipelining of W (and X) loads in the f16 prefill `gemm_q`: -1.4% (W) and -12.5% (W + X).
 - #32: `STRATA_LLAMA_NUMERICS` as default: parity 97.97% vs 98.39%. IQ2_XS on MMQ: 98.12% (3 runs), +3.6%
   prefill.
 - #25: MTP k = 2-3 chained drafts: correct, but 70.4 / 63.5 tok/s vs 87.4 for k = 1 (acceptance 62% / 48%).
