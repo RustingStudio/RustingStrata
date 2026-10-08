@@ -8,7 +8,7 @@ typedef unsigned long long u64;
 
 __device__ __forceinline__ float h2f(u16 h) { float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f; }
 __device__ __forceinline__ u16 f2h(float f) { u16 h; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f)); return h; }
-__device__ __forceinline__ u32 ld16(const u8* p) { return p[0] | (p[1] << 8); }
+__device__ __forceinline__ u32 ld16(const u8* p) { return *(const u16*)p; }  // 2-aligned only (every quant field is)
 __device__ __forceinline__ u32 ld32(const u8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((u32)p[3] << 24); }
 __device__ __forceinline__ float ldh(const u8* p) { return h2f((u16)ld16(p)); }
 __device__ __forceinline__ float silu(float x) { return x / (1.0f + expf(-x)); }
@@ -169,6 +169,20 @@ __device__ __forceinline__ uint2 ld8a2(const u8* p) {
 __device__ __forceinline__ u32 smask4(u32 s) { return ((s * 0x00204081u) & 0x01010101u) * 0xFFu; }
 __device__ __forceinline__ int apply_signs(u32 g, u32 s) { u32 m = smask4(s); return (int)__vsub4(g ^ m, m); }
 
+// QI form of scale_min_k4: d and dmin from one 4-byte load at b; with WORDS the 12 scale bytes from three 4-byte
+// loads too (faster for the Q4_K output head in gemv_bandwidth, slower for the Q5_K shapes).
+template <bool WORDS>
+__device__ __forceinline__ void k4_dm(const u8* b, int j, float& d, float& m) {
+    u32 dm = ldu32(b); int s, mi;
+    if (WORDS) {
+        u32 sh = 8 * (j & 3), a = (ldu32(b + 4) >> sh) & 255, c = (ldu32(b + 8) >> sh) & 255, e = (ldu32(b + 12) >> sh) & 255;
+        if (j < 4) { s = a & 63; mi = c & 63; }
+        else { s = (e & 0xF) | ((a >> 6) << 4); mi = (e >> 4) | ((c >> 6) << 4); }
+    } else {
+        scale_min_k4(j, b + 4, s, mi);
+    }
+    d = h2f((u16)dm) * (float)s; m = h2f((u16)(dm >> 16)) * (float)mi;
+}
 template <int T> struct QI;
 template <> struct QI<8> {  // Q8_0, 8 blocks of 34
     static constexpr bool MIN = false;
@@ -208,9 +222,8 @@ template <> struct QI<11> {  // Q3_K (110 bytes: rows 2-aligned)
 template <> struct QI<12> {  // Q4_K (144 bytes)
     static constexpr bool MIN = true;
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
-        int e = sub * 8, j = e >> 6, h = (e >> 5) & 1, l = e & 31, s, mi;
-        scale_min_k4(2 * j + h, b + 4, s, mi);
-        d = ldh(b) * (float)s; m = ldh(b + 2) * (float)mi;
+        int e = sub * 8, j = e >> 6, h = (e >> 5) & 1, l = e & 31;
+        k4_dm<true>(b, 2 * j + h, d, m);
         const u8* q = b + 16 + 32 * j + l;
         lo = (int)((ldu32(q) >> (4 * h)) & 0x0F0F0F0Fu); hi = (int)((ldu32(q + 4) >> (4 * h)) & 0x0F0F0F0Fu);
     }
@@ -218,9 +231,8 @@ template <> struct QI<12> {  // Q4_K (144 bytes)
 template <> struct QI<13> {  // Q5_K (176 bytes)
     static constexpr bool MIN = true;
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
-        int e = sub * 8, j = e >> 6, h = (e >> 5) & 1, l = e & 31, s, mi, bit = 2 * j + h;
-        scale_min_k4(bit, b + 4, s, mi);
-        d = ldh(b) * (float)s; m = ldh(b + 2) * (float)mi;
+        int e = sub * 8, j = e >> 6, h = (e >> 5) & 1, l = e & 31, bit = 2 * j + h;
+        k4_dm<false>(b, bit, d, m);
         const u8* qh = b + 16 + l;
         const u8* q = b + 48 + 32 * j + l;
         lo = (int)(((ldu32(q) >> (4 * h)) & 0x0F0F0F0Fu) | (((ldu32(qh) >> bit) & 0x01010101u) << 4));
