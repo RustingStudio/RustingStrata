@@ -144,7 +144,7 @@ fn gemv_bandwidth() {
     for (name, info) in &g.tensors {
         let ty = GgmlType::from_u32(info.ty).unwrap();
         let moe = info.dims.len() == 3;
-        if info.dims.len() < 2 || info.dims[0] % 256 != 0 || !seen.insert((ty.name(), moe)) { continue; }
+        if info.dims.len() < 2 || info.dims[0] % 256 != 0 || !seen.insert((ty.name(), info.dims.clone())) { continue; }
         let t = w.get(name).unwrap();
         let dt = gpu.upload(&t).unwrap();
         let x = gpu.stream.clone_htod(&xs(t.cols)).unwrap();

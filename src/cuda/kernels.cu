@@ -158,6 +158,13 @@ __device__ __forceinline__ void gemv_row(const u8* __restrict__ w, const float* 
 
 __device__ __forceinline__ int pack4(int a, int b, int c, int d) { return (a & 255) | ((b & 255) << 8) | ((c & 255) << 16) | (d << 24); }
 __device__ __forceinline__ u32 ldu32(const u8* p) { return *(const u32*)p; }  // 4-byte aligned only
+// 8 bytes at 2-aligned p with 4-byte loads: at p when 4-aligned, else at p - 2, p + 2, p + 6 and shifted (so the
+// 2 bytes either side must be readable). Superblock offsets keep p's alignment uniform across a warp.
+__device__ __forceinline__ uint2 ld8a2(const u8* p) {
+    if (((size_t)p & 3) == 0) return make_uint2(ldu32(p), ldu32(p + 4));
+    u32 a0 = ldu32(p - 2), a1 = ldu32(p + 2), a2 = ldu32(p + 6);
+    return make_uint2(__funnelshift_r(a0, a1, 16), __funnelshift_r(a1, a2, 16));
+}
 // Byte j of the result is 0xFF when bit j of s is set (j < 4).
 __device__ __forceinline__ u32 smask4(u32 s) { return ((s * 0x00204081u) & 0x01010101u) * 0xFFu; }
 __device__ __forceinline__ int apply_signs(u32 g, u32 s) { u32 m = smask4(s); return (int)__vsub4(g ^ m, m); }
@@ -191,8 +198,8 @@ template <> struct QI<11> {  // Q3_K (110 bytes: rows 2-aligned)
         int hs = (sc[8 + (is & 3)] >> (2 * (is >> 2))) & 3;
         d = ldh(b + 108) * (float)((low | (hs << 4)) - 32);
         const u8 *q = b + 32 + 32 * n + i0, *h = b + i0;
-        u32 q0 = ld16(q) | (ld16(q + 2) << 16), q1 = ld16(q + 4) | (ld16(q + 6) << 16);
-        u32 h0 = ld16(h) | (ld16(h + 2) << 16), h1 = ld16(h + 4) | (ld16(h + 6) << 16);
+        uint2 Q = ld8a2(q), H = ld8a2(h);
+        u32 q0 = Q.x, q1 = Q.y, h0 = H.x, h1 = H.y;
         int qs = 2 * j, hb = 4 * n + j;  // value = 2 low bits + 4 * high bit - 4
         lo = (int)__vsub4(((q0 >> qs) & 0x03030303u) | (((h0 >> hb) & 0x01010101u) << 2), 0x04040404u);
         hi = (int)__vsub4(((q1 >> qs) & 0x03030303u) | (((h1 >> hb) & 0x01010101u) << 2), 0x04040404u);
@@ -227,8 +234,8 @@ template <> struct QI<14> {  // Q6_K (210 bytes: rows 2-aligned)
         const u8* ql = b + 64 * n + (qt & 1) * 32 + l;
         const u8* qh = b + 128 + 32 * n + l;
         d = ldh(b + 208) * (float)((const signed char*)b)[192 + 8 * n + (l >> 4) + 2 * qt];
-        u32 l0 = ld16(ql) | (ld16(ql + 2) << 16), l1 = ld16(ql + 4) | (ld16(ql + 6) << 16);
-        u32 h0 = ld16(qh) | (ld16(qh + 2) << 16), h1 = ld16(qh + 4) | (ld16(qh + 6) << 16);
+        uint2 L = ld8a2(ql), H = ld8a2(qh);
+        u32 l0 = L.x, l1 = L.y, h0 = H.x, h1 = H.y;
         int ns = 4 * (qt >> 1), hs = 2 * qt;
         u32 a = ((l0 >> ns) & 0x0F0F0F0Fu) | (((h0 >> hs) & 0x03030303u) << 4);
         u32 c = ((l1 >> ns) & 0x0F0F0F0Fu) | (((h1 >> hs) & 0x03030303u) << 4);
