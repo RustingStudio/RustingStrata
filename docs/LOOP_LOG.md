@@ -8,10 +8,12 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   (sampling, `--api-key`, history reuse 99fbd11), `bench` and `calibrate` in (a336559). M6 left: full v1 gate run,
   `docs/m6-results.md`, thread and expert-split calibration. M3 expert cache adaptive.
 - MTP k = 1 decode ~87-92 tok/s (81.7% accepted, #25); k = 2-3 slower (rejected for now).
-- Speed at 4K (3 clean runs): prefill **1581 tok/s** (1538-1610; gate 1017, passed), prefill 1608 at 2dcae33, decode **81.0 tok/s** at a02b4ec (76.8-81.8; gate 67, passed).
+- 4K prefill with int8 MMQ: **1745 tok/s** (1736-1753, #32, 3754e65).
+- Speed at 4K (3 clean runs): prefill 1581 tok/s (1538-1610; gate 1017, passed), prefill 1608 at 2dcae33, decode **81.0 tok/s** at a02b4ec (76.8-81.8; gate 67, passed).
   Short-prompt decode (8-token prompt, -n 128, like llama-bench tg128): 88.1 tok/s at a02b4ec (88.06-88.22, 100% expert hits). 32K (31768-token prompt): prefill ~1290 tok/s, decode best 62.5, noisy (llama.cpp -d 32768: pp512 814, tg128 56.4).
   See `docs/m4-results.md`.
-- Parity (20 prompts x 32, GPU, 3 runs): prefill 628/630/629 = mean 98.28% +- 0.16; token-by-token prompt
+- Parity: MMQ prefill 630/640 = 98.44% (#32, one run; f16 629 in the same session). Earlier (20 prompts x 32, GPU,
+  3 runs): prefill 628/630/629 = mean 98.28% +- 0.16; token-by-token prompt
   (`--chunk 0`) 631/627/631 = mean 98.39% +- 0.36. Gate 99%. Decode is not deterministic run to run (adaptive
   cache moves experts between GPU int8 and CPU kernels), so single parity runs move by +-2 misses.
 
@@ -451,7 +453,24 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   X conversion. Next: int8 MMQ, split into (a) X quantized to int8 per 32 with scale and sum, (b) one weight type
   with a parity test against the f16 GEMM, (c) the other types.
 
+### 2026-10-08 #31 — GPU held by YOLO training; parity reference lost (no commit)
+- `target/` was deleted at 18:17 (disk 90% full), with `target/parity-ref.json` and all cached parity results.
+- GPU held from 18:47 to ~19:55 by `flock .gpu.lock yolo detect train` (~/cs2), then by RustingCS2 `train-bc` runs.
+
+### 2026-10-08 #32 — int8 MMQ prefill GEMM (3754e65)
+- Reference rebuilt 20:04-20:11: `llama-server -ngl 99 --n-cpu-moe 20 -fa on`, 20 prompts x 32 tokens.
+- Prefill GEMM for quantized weights: X quantized once to q8_1 per 32 (`quant_q8`), weights decoded to int8 in
+  shared memory, dp4a (`gemmi_*`). IQ2_XS stays on f16 (`Gpu::mmq`). `STRATA_MMQ=<types>|none` overrides,
+  `STRATA_LLAMA_NUMERICS=1` uses llama.cpp's activation scales and puts IQ2_XS on MMQ too.
+- CUDA tests 7 pass (incl. `gemm_matches_reference_for_every_type` against the f16 GEMM).
+- Parity (GPU, same session, load 2-6): f16 629/640 = 98.28%; MMQ 630/640 = **98.44%**; llama numerics 627/640
+  = 97.97% (worse, stays opt-in, off by default).
+- 4K bench (`--pp 4096 --tg 64 --reps 3`, 20:25, load 2.2-1.8): prefill f16 1609.3 (1572.7-1630.0), MMQ
+  **1745.4** (1736.2-1753.1, +8.5%), llama numerics 1795.3 (1788.5-1798.8). Decode 62.3 / 66.4 / 60.5 tok/s at
+  tg 64 (short run, not comparable with the 81.0 decode number; decode does not use this GEMM).
+
 ## Tried and rejected
+- #32: `STRATA_LLAMA_NUMERICS` as default: parity 97.97% vs 98.44%.
 - #25: MTP k = 2-3 chained drafts: correct, but 70.4 / 63.5 tok/s vs 87.4 for k = 1 (acceptance 62% / 48%).
 
 - #7: int8 activation rounding in the CPU reference to mimic llama.cpp (block 32: 443/448, block 256: 439/448,
@@ -477,5 +496,15 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 1. Cheaper draft head: only with a measured frequent-token list (id-order subset rejected in #24). Also try not
    re-running the draft head for accepted drafts (reuse its KV from the draft pass) to make k = 2 pay.
-2. Prefill GEMM as int8 MMQ (GEMMs ~75% of 4K prefill; tile tuning exhausted in #13). Start with iq2_xs and q5_k.
+2. MMQ for IQ2_XS (llama path is faster: 1795 tok/s) with parity kept; then MMQ tile tuning toward 2000 tok/s.
+4. Parity: CPU reference with llama.cpp activation rounding (`STRATA_Q8` patch, q8_K on CPU-side experts, q8_1
+   on CUDA, f16 KV) to find which matmuls cause the misses.
 3. M6: full v1 gate run with `strata bench` on a quiet machine, then `docs/m6-results.md`. `calibrate` threads (subprocess per setting).
+
+## Questions for owner
+
+- 2026-10-08 10:20: the GPU lock deadlocked. Another loop ran `flock .gpu.lock rusting test --release --json`
+  (PID 3491381), which started `flock .gpu.lock cargo test --release --features cuda --lib prompt` (PID 3495422).
+  The inner flock waits for the lock its own parent holds, so it waits forever, and every other loop waits behind
+  it. The GPU itself was idle. The Strata loop was not allowed to run without the lock or to kill the other loop's
+  processes. Please kill PID 3495422 (or 3491381), and make the other loop not take the lock twice.
