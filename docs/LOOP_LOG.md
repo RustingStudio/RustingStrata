@@ -842,6 +842,9 @@ Prefill unchanged (4K ~2050-2077 in both).
 
 ## Tried and rejected
 
+- #51 (measured, not built): expert GEMVs with the per-block x quantization removed (upper bound for quantizing
+  x once per token) in `gemv_bandwidth`: IQ2_XS gate+up 17.0 -> 14.9 us, IQ3_XXS down 24.2 -> 21.6 us, others
+  within noise. At most ~0.15 ms per token (~1.5% of decode) before the cost of reading int8 x back; skipped.
 - #43: deltanet_seq with 8 state floats per lane (16 before; twice the warps, shorter dependency chains):
   4K prefill 1903.5 vs 1995.9 at 8dbdfed (3 interleaved rounds). Splitting its dot products into 4 partial sums:
   2002 vs 1993, noise. Both reverted.
