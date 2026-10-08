@@ -567,6 +567,32 @@ shares little of a 65 MB-per-layer KV between the two tokens. Reading each K/V r
 queries in one block, which doubles the GQA kernel's registers (~250 already). MTP still loses at 32K (65.1 vs
 67.8 without), so next candidate 5 stands.
 
+### 2026-10-08 #38 — MTP break-even by context; verify attention blocks side by side (8e2b27e)
+
+Break-even sweep at d5b4ba7 (`bench --gpu --tg 128 --reps 2`, 2 rounds, load 0.8-1.4), decode tok/s:
+
+| Prompt | MTP off | MTP k = 1 | Accepted |
+|---|---|---|---|
+| 8192 | 79.2 (79.1-79.3) | 77.1 (77.1-77.1) | 60-61% |
+| 16384 | 75.2 (75.1-75.3) | 72.7 (72.2-73.2) | 60-62% |
+| 24576 | 71.8 (71.7-71.8) | 69.6 (68.7-70.4) | 62-66% |
+
+MTP already lost at 8K. nsys at 8K: the batched verify attention (#37) cost 1.85x a single token per launch. The
+GQA block uses ~250 registers x 256 threads, a whole SM, so with tokens in grid.z all of token 0's blocks ran
+before any of token 1's and K/V came from DRAM twice. Change: the token index is the fastest part of grid.x
+(block x = head block x / nt, token x % nt), so both tokens' blocks for a split run together and share K/V rows in
+L2. Bit-identical (same test as #37); cuda and gpu_model suites pass.
+
+A/B, 3 interleaved rounds, MTP k = 1, decode tok/s (`--reps 2`):
+
+| Prompt | d5b4ba7 | 8e2b27e |
+|---|---|---|
+| 512 | 91.5 (91.3-91.6) | 91.9 (91.7-92.0) |
+| 8192 | 78.9 (78.4-79.3) | 79.8 (79.7-79.9) |
+| 32768 | 65.7 (65.2-65.9) | 66.3 (65.8-66.6) |
+
+Every round improved. MTP now breaks even at 8K and still loses at 32K (66.3 vs 67.8).
+
 ## Tried and rejected
 - #32: `STRATA_LLAMA_NUMERICS` as default: parity 97.97% vs 98.39%. IQ2_XS on MMQ: 98.12% (3 runs), +3.6%
   prefill.
