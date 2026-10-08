@@ -662,6 +662,34 @@ A/B against 216468b, 3 interleaved rounds, `bench --gpu --pp 4096 --tg 1 --reps 
 |---|---|---|
 | 4K prefill | 1962.4 (1952.7-1973.9) | **1997.5** (1994.5-2003.1) |
 
+### 2026-10-08 #44 — parity check; router_topk in registers (5dfb5d3)
+
+Parity at 8dbdfed (`tools/parity.py --extra=--gpu`, 3 runs, 23:07-23:10, load 0.8-1.5): 629 / 631 / 630 of 640 =
+mean **98.44%**, not below #32's 98.39%. The #40-#42 kernel changes keep parity.
+
+Decode profile (nsys, `bench --pp 512 --tg 256 --mtp 0`, 99.6% expert hits), GPU time per token: `gemv_q5_k` 3.09
+ms (~754 MB, ~244 GB/s), `gemv_q6_k` 1.63 ms (~259 MB, ~159 GB/s), expert GEMVs 2.35 ms, output `gemv_q4_k` 1.13
+ms, `gemv_f32` 0.71 ms, `router_topk` 0.54 ms (13.4 us per call for top 8 of 256), `deltanet_seq` 0.43 ms,
+`rms_norm` 0.41 ms. Ideal at 360 GB/s for the ~1.73 GB read per token: ~4.8 ms; measured ~11.9 ms.
+
+Change: `router_topk` re-read all logits and the taken ids from global memory for each of the k picks. Each lane
+now keeps its logits in registers (expert lane + 32 r, up to 512 experts) with a taken bitmask. Same arithmetic
+and tie order: a temporary test showed bit-identical ids and weights against the old kernel over 4096 tokens. New
+test `router_topk_matches_ops_top_k` checks ids and weights against `ops::softmax` + `ops::top_k`, ties included.
+cuda (9) and gpu_model (7) suites pass.
+
+A/B against 8dbdfed, 3 interleaved rounds, `bench --gpu --pp 512,4096 --tg 128 --reps 3`, load 1.4-2.5 (r1 of
+8dbdfed plain was cold, left out):
+
+| Decode | 8dbdfed | 5dfb5d3 |
+|---|---|---|
+| after 512 | 86.8 (86.7-86.8) | **89.5** (88.9-90.3) |
+| after 4096 | 81.2 (81.1-81.2) | **83.3** (82.9-83.7) |
+| after 512, MTP k = 1 | 90.9 (90.0-91.5) | **93.0** (92.9-93.2) |
+| after 4096, MTP k = 1 | 80.8 (80.4-81.4) | **82.0** (80.7-82.6) |
+
+Prefill unchanged (4K ~2000-2020 in both).
+
 ## Tried and rejected
 
 - #43: deltanet_seq with 8 state floats per lane (16 before; twice the warps, shorter dependency chains):
