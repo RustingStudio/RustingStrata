@@ -19,7 +19,8 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - Parity ceiling: llama.cpp batch vs its own token-by-token reference is 98.28% (#33); Strata vs reference-or-batch 99.17%.
   The reference is llama.cpp's CPU build; against its CUDA build Strata scores 97.34% (#34).
 - MTP k = 1 with GPU argmax: 92.4 tok/s after a 512-token prompt (caa5f4b).
-- At 78732c3 (#48): decode 92.5 after 512, 86.1 after 4096; MTP k = 1 95.2 / 85.1; 4K prefill 2044 tok/s.
+- At 78422f8 (#49): decode 96.1 after 512, 90.4 after 4096; MTP k = 1 100.5 / 90.7; 4K prefill 2086 tok/s.
+  Parity 98.59% (3 runs).
 
 ## Iterations
 
@@ -778,6 +779,41 @@ with 50-85 tok/s spreads and is left out; the new round 3 ran at load 15-20):
 | 4K prefill | 2014.4 (2009.7-2019.1) | **2044.4** (2034.9-2049.7) |
 
 Prefill gains too: the MMQ prefill GEMM reads Q6_K through the same `QI<14>::get`.
+
+### 2026-10-09 #49 — 16-bit and 32-bit loads for quant headers (78422f8)
+
+`ld16` built 2 bytes from two byte loads (`p[0] | p[1] << 8`), so every half-precision scale (`ldh`) and every
+2-byte quant read cost two loads. Every field it reads sits at an even offset in a superblock with an even size,
+so it is now one 16-bit load. Q4_K and Q5_K also read d and dmin with one 4-byte load (`k4_dm`); Q4_K reads its 12
+scale bytes as three 4-byte loads too (in `gemv_bandwidth` that helps the Q4_K output head, 975 -> 948-960 us, and
+slows the Q5_K shapes, so Q5_K keeps byte loads for scales). GEMV error is unchanged for all 11 types; cuda and
+gpu_model suites pass.
+
+`gemv_bandwidth`, 2 interleaved rounds, us:
+
+| Tensor | e1a1aa0 | 16-bit `ld16` | 78422f8 |
+|---|---|---|---|
+| Q4_K output 248320 x 2048 | 1150 | 976 | **948-960** (~300 GB/s) |
+| Q5_K token_embd 248320 x 2048 | 1287 | 1169 | 1129-1139 |
+| Q5_K attn_qkv 8192 x 2048 | 44.5-44.8 | 41.5 | 40.8 |
+| Q5_K attn_gate 4096 x 2048 | 24.4 | 22.9 | 22.7 |
+| Q5_K attn_output 2048 x 4096 | 25.7 | 24.1 | 23.8 |
+| IQ3_XXS gate experts | 24.0 | 19.4 | 19.4 |
+| IQ2_XS gate experts | 18.7 | 17.0 | 17.0 |
+| Q8_0 / BF16 512-256 rows | 5.3 / 5.2 | 4.1-4.3 / 4.1 | same |
+
+`bench --gpu --pp 512,4096 --tg 128 --reps 3`, 3 interleaved rounds, load 2.0-14.5:
+
+| | e1a1aa0 | 78422f8 |
+|---|---|---|
+| Decode after 512 | 93.0 (92.7-93.4) | **96.1** (94.5-97.0) |
+| Decode after 4096 | 86.5 (86.0-86.9) | **90.4** (89.5-91.2) |
+| Decode after 512, MTP k = 1 | 95.5 (92.7-97.0) | **100.5** (98.3-102.3) |
+| Decode after 4096, MTP k = 1 | 84.7 (79.7-87.2) | **90.7** (88.7-91.8) |
+| 4K prefill | 2061.9 (2057.6-2070.4) | **2085.7** (2077.5-2095.5) |
+
+Parity at 78422f8 (`tools/parity.py --extra=--gpu`, 3 runs, 00:56-01:20, load 1.5-6.6): 633 / 629 / 631 of 640 =
+mean **98.59%**, not below #44's 98.44%.
 
 ## Tried and rejected
 
