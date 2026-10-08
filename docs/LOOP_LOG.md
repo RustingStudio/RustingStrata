@@ -690,6 +690,26 @@ A/B against 8dbdfed, 3 interleaved rounds, `bench --gpu --pp 512,4096 --tg 128 -
 
 Prefill unchanged (4K ~2000-2020 in both).
 
+### 2026-10-08 #45 — expert GEMVs with 2 rows per warp (871aa18)
+
+Per-shape decode profile at 8dbdfed: expert GEMVs run at ~140 GB/s (IQ2_XS gate + up, 34.4 us for 8 experts x 2
+matrices, ~4.9 MB) and ~125 GB/s (IQ3_XXS down), against ~245-265 GB/s for the large dense Q5_K GEMVs.
+`gemv_q6_k` on `ssm_out` (2048 x 4096) runs at ~190 GB/s. `STRATA_RPW` sweep for all GEMVs (1, 2, 4): the default
+(2048 / cols) stays best (89.4 vs 88.1 / 87.7 / 79.8 decode after 512).
+
+Change: gate/up expert GEMVs (cols 2048, so 1 row per warp, 8 per block) quantized an 8 KB x per block for 4.7 KB
+of weights. Expert GEMVs now take at least 2 rows per warp. Rows per warp 4 for gate/up and 2 or 8 for down
+(default 4) were no better in a sweep. cuda and gpu_model suites pass; arithmetic per row unchanged.
+
+A/B against 5dfb5d3, 3 interleaved rounds, `bench --gpu --pp 512,4096 --tg 128 --reps 3`, load 1.2-1.5:
+
+| Decode | 5dfb5d3 | 871aa18 |
+|---|---|---|
+| after 512 | 89.2 (88.7-89.5) | 89.7 (89.6-89.9) |
+| after 4096 | 82.9 (82.2-83.3) | 83.4 (83.0-83.7) |
+| after 512, MTP k = 1 | 92.6 (92.2-92.9) | **93.8** (93.7-94.1) |
+| after 4096, MTP k = 1 | 81.9 (80.6-82.6) | **82.8** (82.1-83.2) |
+
 ## Tried and rejected
 
 - #43: deltanet_seq with 8 state floats per lane (16 before; twice the warps, shorter dependency chains):
