@@ -1012,6 +1012,60 @@ template <int N, int S = N / 2> __device__ __forceinline__ float warp_sum_scatte
     }
 }
 
+// --llama-numerics decode attention, as llama.cpp's CPU flash_attn_ext_f16_one_chunk computes it: q rounded to f16,
+// positions in order, the V accumulator rounded to f16 after every scale and add. The KV length is padded to 256 and,
+// from 512 on, split into LLAMA_NTH equal chunks (one per CPU thread) merged in f32; split s of the grid takes chunk s.
+// Slow (one position at a time); for parity runs only.
+#define LLAMA_NTH 6
+__device__ __forceinline__ float rh(float x) { return h2f(f2h(x)); }
+template <int HD, int G>
+__device__ void attn_decode_llama(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
+                                  int nh, int nkv, float scale, int bx) {
+    constexpr int R = (HD + 255) / 256;
+    int n_pos = step[0] + 1, ns = gridDim.y, n_kv = (n_pos + 255) / 256 * 256;
+    int nc = n_kv >= 512 ? LLAMA_NTH : 1, cs = (n_kv + nc - 1) / nc;
+    int p0 = blockIdx.y * cs, p1 = blockIdx.y < nc ? min(n_pos, p0 + cs) : 0;
+    int h0 = bx * G, g = h0 / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    extern __shared__ float sqh[];  // G * HD rounded query values (the launch gives 8 * hd floats)
+    __shared__ float ss[G][32];
+    for (int i = threadIdx.x; i < G * HD; i += blockDim.x) sqh[i] = rh(q[h0 * HD + i]);
+    float acc[G][R], m[G], l[G];
+    for (int i = 0; i < G; i++) { m[i] = -INFINITY; l[i] = 0.0f; for (int r = 0; r < R; r++) acc[i][r] = 0.0f; }
+    __syncthreads();
+    for (int t0 = p0; t0 < p1; t0 += 32) {
+        int n = min(32, p1 - t0);
+        for (int j = w; j < n; j += nw) {
+            const u16* kr = kc + ((size_t)(t0 + j) * nkv + g) * HD;
+            for (int i = 0; i < G; i++) {
+                float s = 0.0f;
+                for (int d = lane; d < HD; d += 32) s += sqh[i * HD + d] * h2f(kr[d]);
+                s = warp_sum(s);
+                if (lane == 0) ss[i][j] = s * scale;
+            }
+        }
+        __syncthreads();
+        for (int j = 0; j < n; j++) {
+            const u16* vr = vc + ((size_t)(t0 + j) * nkv + g) * HD;
+            for (int i = 0; i < G; i++) {
+                float s = ss[i][j], ms = 1.0f, vs = 1.0f;
+                if (s > m[i]) { ms = expf(m[i] - s); m[i] = s; for (int r = 0; r < R; r++) acc[i][r] = rh(acc[i][r] * ms); }
+                else vs = expf(s - m[i]);
+                for (int r = 0; r < R; r++) {
+                    int d = threadIdx.x + 256 * r;
+                    if (d < HD) acc[i][r] = rh(fmaf(h2f(vr[d]), vs, acc[i][r]));
+                }
+                l[i] = l[i] * ms + vs;
+            }
+        }
+        __syncthreads();
+    }
+    for (int i = 0; i < G; i++) {
+        float* pp = part + ((size_t)(h0 + i) * ns + blockIdx.y) * (HD + 2);
+        for (int r = 0; r < R; r++) { int d = threadIdx.x + 256 * r; if (d < HD) pp[d] = acc[i][r]; }
+        if (threadIdx.x == 0) { pp[HD] = m[i]; pp[HD + 1] = l[i]; }
+    }
+}
+
 // Split-position decode attention. grid = (nh / G, ns splits): block (b, s) serves the G query heads b*G .. b*G+G-1
 // (one KV head) over an ns-th of the positions, so each K/V row is read once for all G heads. The block walks its
 // share in chunks of 32 positions (4 per warp, lane owns PER = hd / 32 consecutive dims): warps compute the chunk's
@@ -1022,6 +1076,9 @@ template <int PER, int G>
 __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
                               int nh, int nkv, float scale, int bx) {
     constexpr int hd = PER * 32, C = 32, J = C / 8;  // positions per chunk, per warp
+#if LLAMA_Q8
+    return attn_decode_llama<hd, G>(q, kc, vc, part, step, nh, nkv, scale, bx);
+#endif
     // At least 16 positions per split: short contexts use few blocks instead of many near-empty ones.
     int n_pos = step[0] + 1, ns = gridDim.y, per_s = max((n_pos + ns - 1) / ns, 16);
     int p0 = blockIdx.y * per_s, p1 = min(n_pos, p0 + per_s);
@@ -1376,9 +1433,55 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
             }
     }
 }
+// --llama-numerics prefill attention: f32 throughout, like llama.cpp's CPU tiled path (the tensor-core kernel above
+// rounds q and the softmax weights to f16). One query at a time per block; slow, for parity runs only.
+template <int HD>
+__device__ void attn_prefill_llama(const float* q, const u16* kc, const u16* vc, const float* qg, float* out,
+                                   const int* step, int T, int nh, int nkv, float scale) {
+    constexpr int R = (HD + 127) / 128;
+    extern __shared__ __align__(16) u16 fa_sm[];
+    float *sq = (float*)fa_sm, *sc = sq + HD;
+    int h = blockIdx.y, kvh = h / (nh / nkv), tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+    for (int t = blockIdx.x * FA_BQ; t < min(T, blockIdx.x * FA_BQ + FA_BQ); t++) {
+        int p = step[0] + t;
+        __syncthreads();
+        for (int d = tid; d < HD; d += 128) sq[d] = q[(size_t)t * nh * HD + h * HD + d];
+        float acc[R] = {}, m = -INFINITY, l = 0.0f;
+        for (int k0 = 0; k0 <= p; k0 += 32) {
+            int n = min(32, p + 1 - k0);
+            __syncthreads();
+            for (int j = w; j < n; j += 4) {
+                const u16* kr = kc + ((size_t)(k0 + j) * nkv + kvh) * HD;
+                float s = 0.0f;
+                for (int d = lane; d < HD; d += 32) s += sq[d] * h2f(kr[d]);
+                s = warp_sum(s);
+                if (lane == 0) sc[j] = s * scale;
+            }
+            __syncthreads();
+            float mn = m;
+            for (int j = 0; j < n; j++) mn = fmaxf(mn, sc[j]);
+            float cs = expf(m - mn);
+            l *= cs;
+            for (int r = 0; r < R; r++) acc[r] *= cs;
+            for (int j = 0; j < n; j++) {
+                float e = expf(sc[j] - mn);
+                l += e;
+                const u16* vr = vc + ((size_t)(k0 + j) * nkv + kvh) * HD;
+                for (int r = 0; r < R; r++) if (tid + 128 * r < HD) acc[r] += e * h2f(vr[tid + 128 * r]);
+            }
+            m = mn;
+        }
+        const float* gate = qg + (size_t)t * nh * 2 * HD + h * 2 * HD + HD;
+        for (int r = 0; r < R; r++) {
+            int d = tid + 128 * r;
+            if (d < HD) out[(size_t)t * nh * HD + h * HD + d] = acc[r] / l * sigmoid(gate[d]);
+        }
+    }
+}
 #define DEF_FA(HD) \
     extern "C" __global__ void __launch_bounds__(128) attn_prefill_##HD(const float* q, const u16* kc, const u16* vc, \
             const float* qg, float* out, const int* step, int T, int nh, int nkv, float scale) {                      \
-        attn_prefill_t<HD>(q, kc, vc, qg, out, step, T, nh, nkv, scale);                                            \
+        if (LLAMA_Q8) attn_prefill_llama<HD>(q, kc, vc, qg, out, step, T, nh, nkv, scale);                           \
+        else attn_prefill_t<HD>(q, kc, vc, qg, out, step, T, nh, nkv, scale);                                       \
     }
 DEF_FA(64) DEF_FA(128) DEF_FA(256)
