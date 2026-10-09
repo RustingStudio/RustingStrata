@@ -146,7 +146,7 @@ impl GpuModel<'_> {
                     g.gemm_dense(v, t, h, ne, vv, kv, 0)?;
                     g.rms_norm(kraw, hd, kn.ptr, kk, hd, hd, t * nkv, eps)?;
                     g.rope_neox(kk, hd, t * nkv, nkv, c.n_rot, step, c.rope_base)?;
-                    g.kv_store(kk, vv, g.ptr(kc), g.ptr(vc), kv, t, step)?;
+                    g.kv_store(kk, vv, g.ptr(kc), g.ptr(vc), kv, t, step, hd)?;
                     g.attn_prefill(at(l.b), g.ptr(kc), g.ptr(vc), at(l.a), at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt())?;
                     g.gemm_dense(o, t, at(l.d), nh * hd, x, ne, 2)?;
                 }
