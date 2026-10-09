@@ -87,19 +87,31 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
     let v: Value = serde_json::from_slice(body)?;
     let messages = v["messages"].as_array().context("missing messages")?.iter().map(|m| {
         let role = m["role"].as_str().context("message without role")?;
-        // content is a string or a list of {"type": "text", "text": ..} parts
+        // The role goes into the template verbatim, so only the template's roles pass.
+        if !["system", "user", "assistant", "tool"].contains(&role) { bail!("unknown role {role:?}"); }
+        // content is a string or a list of {"type": "text", "text": ..} parts; only assistant turns may leave it out
         let content = match &m["content"] {
             Value::String(s) => s.clone(),
             Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect(),
-            Value::Null => String::new(),
+            Value::Null if role == "assistant" => String::new(),
+            Value::Null => bail!("{role} message without content"),
             _ => bail!("bad content"),
         };
         Ok((role.to_string(), content))
     }).collect::<anyhow::Result<Vec<_>>>()?;
     if messages.is_empty() { bail!("no messages"); }
-    let max_tokens = v["max_completion_tokens"].as_u64().or(v["max_tokens"].as_u64()).map(|n| n as usize);
+    // Optional fields: absent or null means the default, anything else must be valid.
+    let int = |k: &str, min: u64| match &v[k] {
+        Value::Null => Ok(None),
+        x => x.as_u64().filter(|&n| n >= min).map(Some).with_context(|| format!("{k} must be an integer >= {min}")),
+    };
+    let num = |k: &str, ok: fn(f64) -> bool, want: &str| match &v[k] {
+        Value::Null => Ok(None),
+        x => x.as_f64().filter(|&f| ok(f)).map(|f| Some(f as f32)).with_context(|| format!("{k} must be {want}")),
+    };
+    let max_tokens = int("max_completion_tokens", 1)?.or(int("max_tokens", 1)?).map(|n| n as usize);
     let think = v["chat_template_kwargs"]["enable_thinking"].as_bool().unwrap_or(false);
-    let f = |k: &str| v[k].as_f64().map(|x| x as f32);
     Ok(ChatRequest { messages, max_tokens, stream: v["stream"].as_bool().unwrap_or(false), think,
-        temperature: f("temperature"), top_k: v["top_k"].as_u64().map(|n| n as usize), top_p: f("top_p"), seed: v["seed"].as_u64() })
+        temperature: num("temperature", |f| f >= 0.0, "a number >= 0")?, top_k: int("top_k", 0)?.map(|n| n as usize),
+        top_p: num("top_p", |f| f > 0.0 && f <= 1.0, "a number in (0, 1]")?, seed: int("seed", 0)? })
 }
