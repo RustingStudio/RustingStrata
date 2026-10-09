@@ -1259,6 +1259,12 @@ positions (us, 1 / 2 tokens, g1 vs gqa: 768 27.7/49.2 vs 26.5/43.2; 1024 31.0/52
    scratch (470 MB at chunk 4096) or KV in fewer bytes.
 5. MTP at long context: now wins at 32K (82.7 vs 78.8, see the 32K note under #59). An adaptive gate is not needed
    unless a later change makes MTP lose there again.
+6. Decode profile at 144b43b (nsys, 4K prompt, 512 tokens, us per token; nsys slows the CPU expert threads, so
+   moe_combine's wait is not real): gemvn_q5_k 2514 (147 calls), moe_gemv_iq2_xs 1167, gemv_q6_k 1085,
+   moe_gemv_iq3_xxs 933, LM head gemvn_q4_k 877 (bandwidth bound), attn_decode_gqa 646, gemvn_f32 626 (140 calls,
+   router and SSM projections kept f32 like llama.cpp), rms_norm 495 (100 calls, 4.9 us each), moe_publish 249,
+   router_topk 219, gemv_q5_k 205; about 1.5 ms of small launch-bound kernels in all. Fusing rms_norm into the
+   following GEMV and the router GEMV with router_topk are the next levers.
 
 ## Questions for owner
 
