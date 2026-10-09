@@ -46,6 +46,10 @@ struct Engine {
     /// CPU threads for expert work [default: calibrated, else all logical cores].
     #[arg(long)]
     threads: Option<usize>,
+    /// Match llama.cpp's CPU numerics on the GPU (q8_K activations, f32 prefill attention, f16 decode attention
+    /// accumulator) for parity runs; attention gets much slower.
+    #[arg(long)]
+    llama_numerics: bool,
     /// Prompts shorter than this skip the batched prefill (from `strata calibrate`, else 32).
     #[arg(skip)]
     short: usize,
@@ -106,6 +110,7 @@ impl Engine {
         self.short = get("short").unwrap_or(32);
         if let Some(n) = self.threads.or(get("threads")) { rayon::ThreadPoolBuilder::new().num_threads(n).build_global()?; }
         if !self.gpu { return Ok(Runner::Cpu(m, State::new(&m.cfg))); }
+        if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
         let mut g = GpuModel::load(m, Gpu::new()?, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp())?;
         g.short = self.short;
         Ok(Runner::Gpu(Box::new(g)))
