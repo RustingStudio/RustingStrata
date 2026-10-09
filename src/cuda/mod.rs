@@ -10,9 +10,9 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-const QTYPES: [GgmlType; 11] = {
+const QTYPES: [GgmlType; 12] = {
     use GgmlType::*;
-    [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ2XS, IQ3XXS, IQ4XS]
+    [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ2XS, IQ3XXS, IQ3S, IQ4XS]
 };
 const KERNELS: [&str; 26] = [
     "rms_norm", "quant_xq", "argmax_rows", "l2_norm", "rope_neox", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
@@ -60,10 +60,12 @@ fn source() -> String {
     format!(
         "__device__ const unsigned long long iq2xs_grid[512] = {{{}}};\n\
          __device__ const unsigned int iq3xxs_grid[256] = {{{}}};\n\
+         __device__ const unsigned int iq3s_grid[512] = {{{}}};\n\
          __device__ const unsigned char ksigns_iq2xs[128] = {{{}}};\n\
          __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n#define LLAMA_Q8 {}\n{}",
         join(IQ2XS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ3XXS_GRID.iter().map(|v| format!("{v:#x}u")).collect()),
+        join(IQ3S_GRID.iter().map(|v| format!("{v:#x}u")).collect()),
         join(KSIGNS_IQ2XS.iter().map(|v| v.to_string()).collect()),
         join(KVALUES_IQ4NL.iter().map(|v| v.to_string()).collect()),
         llama_numerics() as u8,
