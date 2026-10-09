@@ -2,7 +2,7 @@
 //! rest run on the CPU (`cpu_moe`) while the GPU computes hits and the shared expert. Mirrors `model.rs`.
 
 use crate::cpu_worker::{CpuWorker, TMAX};
-use crate::cuda::{Gpu, GpuTensor, kv_words};
+use crate::cuda::{Gpu, GpuTensor};
 use crate::expert_cache::ExpertCache;
 use crate::model::Model;
 use anyhow::bail;
@@ -114,7 +114,7 @@ impl<'a> GpuModel<'a> {
                 Mixer::Attn {
                     q: lt(il, "attn_q.weight")?, k: lt(il, "attn_k.weight")?, v: lt(il, "attn_v.weight")?,
                     qn: lt(il, "attn_q_norm.weight")?, kn: lt(il, "attn_k_norm.weight")?, o: lt(il, "attn_output.weight")?,
-                    kc: gpu.zeros(kv_words(ctx * kv))?, vc: gpu.zeros(kv_words(ctx * kv))?,
+                    kc: gpu.zeros(gpu.kv_words(ctx * kv))?, vc: gpu.zeros(gpu.kv_words(ctx * kv))?,
                 }
             };
             let ffn = if c.is_moe() {
@@ -164,7 +164,7 @@ impl<'a> GpuModel<'a> {
         let mb = |b: usize| b as f64 / 1048576.0;
         eprintln!(
             "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {ctx} tokens, prefill {:.0} MB), expert slots {:.0} MB, resident experts {}/{}",
-            mb(free0 - free1), mb(2 * 2 * kv_words(ctx * kv) * (c.n_layer / c.full_attention_interval)), mb(pf.as_ref().map_or(0, |p| p.bytes())),
+            mb(free0 - free1), mb(2 * 2 * gpu.kv_words(ctx * kv) * (c.n_layer / c.full_attention_interval)), mb(pf.as_ref().map_or(0, |p| p.bytes())),
             mb(cache.as_ref().map_or(0, |x| x.slot_bytes_total())),
             cache.as_ref().map_or(0, |x| x.resident_count()), cache.as_ref().map_or(0, |x| x.total_experts()),
         );

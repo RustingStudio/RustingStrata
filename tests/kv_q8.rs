@@ -24,9 +24,8 @@ fn q8_kv_attention_matches_f16() {
         }
     };
     let Some(g8) = mk(true) else { return };
-    let words = rusting_strata::cuda::kv_words(64);
     let gf = mk(false).unwrap();
-    assert_eq!(words, 34);
+    assert_eq!((g8.kv_words(64), gf.kv_words(64)), (34, 64));
     let (pos0, t) = (5, 100);
     for (nh, nkv, hd) in [(4, 2, 64), (4, 2, 128), (16, 2, 256), (8, 8, 128)] {
         let n = (pos0 + t) * nkv * hd;
@@ -64,7 +63,7 @@ fn q8_kv_attention_matches_f16() {
             (g.stream.clone_dtoh(&dout).unwrap(), dec)
         };
         let (pf, df) = run(&gf, n);
-        let (p8, d8) = run(&g8, n * 17 / 32);
+        let (p8, d8) = run(&g8, g8.kv_words(n));
         for (j, (a, b)) in d8.iter().zip(&df).enumerate() {
             let e = rel_l2(a, b);
             eprintln!("nh {nh} nkv {nkv} hd {hd} kernel {j}: q8 vs f16 decode {e:.2e}, q8 prefill vs decode {:.2e}", rel_l2(&p8, a));
