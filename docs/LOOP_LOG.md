@@ -1033,6 +1033,9 @@ tokens and every head_dim).
 - Bench `--mtp 1`, interleaved against 245dd92, 3 rounds `--reps 3`, load 2.9-6.7: 4096 99.5 / 99.8 / 99.9 vs
   100.8 / 100.4 / 100.3 (+0.8%); 512 112.4 / 113.2 / 112.6 vs 113.7 / 113.6 / 113.2 (+0.7%).
 - 4K decode with MTP is now at the 100 tok/s target on this machine (100.5 mean).
+- 32K at b0006cb (`--pp 32768 --tg 128 --reps 3`, load 1.6-2.7): `--mtp 0` prefill 1582 (1567-1591), decode 78.8
+  (77.2-79.6); `--mtp 1` decode 82.7 (80.1-84.0), 62.0% accepted. The 32K decode target (70) is met, and MTP now
+  wins at 32K (it lost 66.3 vs 67.8 before #52-#59).
 
 ## Next candidates
 
@@ -1043,8 +1046,8 @@ tokens and every head_dim).
    on CUDA, f16 KV) to find which matmuls cause the misses.
 3. VRAM for more resident experts: the margin floor is the driver reserve (#36). Remaining levers: smaller prefill
    scratch (470 MB at chunk 4096) or KV in fewer bytes.
-5. MTP at long context: still loses at 32K (66.3 vs 67.8). A fixed length gate is wrong (#39); an adaptive gate
-   would time MTP steps against occasional plain steps and keep the faster mode.
+5. MTP at long context: now wins at 32K (82.7 vs 78.8, see the 32K note under #59). An adaptive gate is not needed
+   unless a later change makes MTP lose there again.
 
 ## Questions for owner
 
