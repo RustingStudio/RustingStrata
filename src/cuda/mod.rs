@@ -55,6 +55,12 @@ pub struct Gpu {
 /// and run attention as its CPU flash attention does (LLAMA_Q8 in kernels.cu).
 pub fn llama_numerics() -> bool { std::env::var_os("STRATA_LLAMA_NUMERICS").is_some() }
 
+/// `--kv q8`: KV cache rows in ggml q8_0 form (KV_Q8 in kernels.cu).
+pub fn kv_q8() -> bool { std::env::var_os("STRATA_KV_Q8").is_some() }
+
+/// u16 words of a KV cache for `n` values (n a multiple of 32): f16, or q8 with one f16 scale per 32 values.
+pub fn kv_words(n: usize) -> usize { if kv_q8() { n * 17 / 32 } else { n } }
+
 fn source() -> String {
     let join = |v: Vec<String>| v.join(",");
     format!(
@@ -65,7 +71,7 @@ fn source() -> String {
          __device__ const unsigned int iq3xxs_grid[256] = {{{}}};\n\
          __device__ const unsigned int iq3s_grid[512] = {{{}}};\n\
          __device__ const unsigned char ksigns_iq2xs[128] = {{{}}};\n\
-         __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n#define LLAMA_Q8 {}\n{}",
+         __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n#define LLAMA_Q8 {}\n#define KV_Q8 {}\n{}",
         join(IQ2XS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ2XXS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ2S_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
@@ -75,6 +81,7 @@ fn source() -> String {
         join(KSIGNS_IQ2XS.iter().map(|v| v.to_string()).collect()),
         join(KVALUES_IQ4NL.iter().map(|v| v.to_string()).collect()),
         llama_numerics() as u8,
+        kv_q8() as u8,
         include_str!("kernels.cu"),
     )
 }
@@ -127,6 +134,7 @@ fn kname(prefix: &str, ty: GgmlType) -> String { format!("{prefix}_{}", ty.name(
 
 impl Gpu {
     pub fn new() -> anyhow::Result<Gpu> {
+        anyhow::ensure!(!(kv_q8() && llama_numerics()), "--kv q8 does not combine with --llama-numerics (its attention reads f16 KV)");
         let ctx = CudaContext::new(0).context("CUDA init")?;
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream()?;
@@ -375,8 +383,8 @@ impl Gpu {
     }
 
     /// Store `t` tokens of `n` values at positions step[0] ...
-    pub fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64) -> anyhow::Result<()> {
-        launch!(self, "kv_store", Self::grid(n * t), k, v, kc, vc, n as i32, (n * t) as i32, step);
+    pub fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()> {
+        launch!(self, "kv_store", Self::grid(n * t), k, v, kc, vc, n as i32, (n * t) as i32, step, hd as i32);
         Ok(())
     }
 

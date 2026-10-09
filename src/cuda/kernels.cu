@@ -1063,10 +1063,26 @@ extern "C" __global__ void norm_gate(float* o, const float* w, const float* z, i
 
 // ---- attention ----
 
-// Store `total` values (consecutive tokens of n each) starting at position step[0].
-extern "C" __global__ void kv_store(const float* k, const float* v, u16* kc, u16* vc, int n, int total, const int* step) {
+// KV cache rows (one per position and KV head) hold hd f16 values, or with KV_Q8 (`--kv q8`) hd int8 values followed
+// by hd / 32 f16 scales, quantized like ggml's q8_0 (d = amax / 127 per 32 values). Offsets below count values.
+#if KV_Q8
+// Quantize x into the cache at value offset e; the 32 lanes of the warp hold one 32-value block.
+__device__ __forceinline__ void kv_put(u16* c, size_t e, int hd, float x) {
+    float d = warp_max(fabsf(x)) / 127.0f;
+    int w = e % hd;
+    char* r = (char*)c + e / hd * (hd + hd / 16);
+    r[w] = (signed char)(d == 0.0f ? 0.0f : roundf(x / d));
+    if ((w & 31) == 0) *(u16*)(r + hd + 2 * (w / 32)) = f2h(d);
+}
+#else
+__device__ __forceinline__ void kv_put(u16* c, size_t e, int, float x) { c[e] = f2h(x); }
+#endif
+
+// Store `total` values (consecutive tokens of n each, n a multiple of 32) starting at position step[0].
+extern "C" __global__ void kv_store(const float* k, const float* v, u16* kc, u16* vc, int n, int total, const int* step,
+                                    int hd) {
     int i = blockIdx.x * blockDim.x + threadIdx.x, pos = step[0];
-    if (i < total) { kc[(size_t)pos * n + i] = f2h(k[i]); vc[(size_t)pos * n + i] = f2h(v[i]); }
+    if (i < total) { kv_put(kc, (size_t)pos * n + i, hd, k[i]); kv_put(vc, (size_t)pos * n + i, hd, v[i]); }
 }
 
 #define INFINITY __int_as_float(0x7f800000)
@@ -1083,6 +1099,23 @@ template <int PER> __device__ __forceinline__ void ldh_raw(const u16* p, unsigne
     } else {
         o[0] = *(const unsigned*)p;
     }
+}
+// PER consecutive cache values from value offset off (off a multiple of PER, PER <= 32) as f16 words, like ldh_raw.
+template <int PER> __device__ __forceinline__ void ldkv(const u16* c, size_t off, int hd, unsigned* o) {
+#if KV_Q8
+    int w = off % hd;
+    const char* r = (const char*)c + off / hd * (hd + hd / 16);
+    float d = h2f(*(const u16*)(r + hd + 2 * (w / 32)));
+    signed char b[PER];
+    if constexpr (PER % 4 == 0) {
+        for (int i = 0; i < PER / 4; i++) *(int*)&b[4 * i] = ((const int*)(r + w))[i];
+    } else {
+        for (int i = 0; i < PER; i++) b[i] = r[w + i];
+    }
+    for (int i = 0; i < PER; i += 2) o[i / 2] = h2pack(d * b[i], d * b[i + 1]);
+#else
+    ldh_raw<PER>(c + off, o);
+#endif
 }
 // f16 value d of words loaded by ldh_raw.
 __device__ __forceinline__ float hraw(const unsigned* r, int d) { return h2f((u16)(r[d >> 1] >> (16 * (d & 1)))); }
@@ -1199,7 +1232,7 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
             int t = c0 + w * J + j;
             if (t < p1) {
                 size_t r = ((size_t)t * nkv + g) * hd + lane * PER;
-                ldh_raw<PER>(kc + r, kr[j]); ldh_raw<PER>(vc + r, vr[j]);
+                ldkv<PER>(kc, r, hd, kr[j]); ldkv<PER>(vc, r, hd, vr[j]);
             } else {
                 for (int d = 0; d < PER / 2; d++) kr[j][d] = vr[j][d] = 0;
             }
@@ -1463,7 +1496,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
             uint4 kv = make_uint4(0, 0, 0, 0), vv = kv;
             if (k0 + r <= last) {
                 size_t off = (size_t)(k0 + r) * kvd + kvh * HD + c;
-                kv = *(const uint4*)(kc + off); vv = *(const uint4*)(vc + off);
+                ldkv<8>(kc, off, HD, (unsigned*)&kv); ldkv<8>(vc, off, HD, (unsigned*)&vv);
             }
             *(uint4*)(ks + r * PQ + c) = kv;
             *(uint4*)(vs + r * PQ + c) = vv;
