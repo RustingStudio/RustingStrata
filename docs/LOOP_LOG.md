@@ -1368,6 +1368,19 @@ is not why q8 is slower. Both prefill variants have a 528-byte stack frame (a lo
 in f16 too; worth a look as a separate prefill item. Remaining q8 ideas: copy raw int8 tiles to shared memory and
 dequantize there, or convert straight to f32 in decode.
 
+### 2026-10-09 #80 — prefill attention accumulator back in registers (1fbf113)
+
+ptxas showed `attn_prefill_256` with a 528-byte stack frame (272 at head_dim 128): the rescale and output loops
+indexed `o[d]` without `#pragma unroll`, so the 512-byte accumulator lived in local memory. Unrolling them (and the
+row loop of the output) gives 0 stack frame, 0 spills for both KV formats. nsys at 32K prefill, f16, alternating,
+load 5-12: `attn_prefill_256` 69.35 / 69.77 ms per call vs 70.62 ms before (about -1.5%; the kernel is ~28% of
+32K prefill, so end to end it is lost in noise). End-to-end benches this hour were too noisy to read (load 4-8 from
+other work; the same binary gave 1576 and 1499 at 32K prefill).
+
+Parity: 632/640 for both this commit and the previous binary (e1d933c) on rerun, where e1d933c gave 633 an hour
+earlier, so the parity run itself moves by one token between runs; the `--llama-numerics` path does not use this
+kernel. Tests all pass.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
