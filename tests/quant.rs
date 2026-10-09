@@ -22,7 +22,7 @@ fn check(name: &str, ty: GgmlType) {
 #[test] fn q4_k() { check("Q4_K", GgmlType::Q4K) }
 #[test] fn q5_k() { check("Q5_K", GgmlType::Q5K) }
 #[test] fn q6_k() { check("Q6_K", GgmlType::Q6K) }
-#[test] fn rejects_unknown() { assert!(GgmlType::from_u32(16).is_err()); } // IQ2_XXS is not in v1
+#[test] fn rejects_unknown() { assert!(GgmlType::from_u32(20).is_err()); } // IQ4_NL is not supported
 #[test] fn iq2_xs() { check("IQ2_XS", GgmlType::IQ2XS) }
 #[test] fn iq3_xxs() { check("IQ3_XXS", GgmlType::IQ3XXS) }
 #[test] fn iq4_xs() { check("IQ4_XS", GgmlType::IQ4XS) }

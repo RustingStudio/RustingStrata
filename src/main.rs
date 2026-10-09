@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::{collections::BTreeMap, net::{TcpListener, TcpStream}, path::{Path, PathBuf}, time::{Duration, Instant, SystemTime}};
 
 #[derive(Parser)]
-#[command(name = "strata", about = "Rust inference engine for Qwen3.5/3.6-family GGUF models")]
+#[command(name = "strata", version, about = "Rust inference engine for Qwen3.5/3.6-family GGUF models")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
