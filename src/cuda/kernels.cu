@@ -1540,6 +1540,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
         }
         for (int nt = 0; nt < FA_BK / 8; nt++)
             for (int e = 0; e < 4; e++) { float p = expf(s[nt][e] - m[e >> 1]); s[nt][e] = p; l[e >> 1] += p; }
+#pragma unroll
         for (int d = 0; d < HD / 8; d++) { o[d][0] *= c[0]; o[d][1] *= c[0]; o[d][2] *= c[1]; o[d][3] *= c[1]; }
 #pragma unroll
         for (int kb = 0; kb < FA_BK / 16; kb++) {
@@ -1558,11 +1559,13 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
         l[r] += __shfl_xor_sync(0xffffffff, l[r], 1);
         l[r] += __shfl_xor_sync(0xffffffff, l[r], 2);
     }
+#pragma unroll
     for (int r = 0; r < 2; r++) {
         int t = q0 + warp * 16 + g + 8 * r;
         if (t >= T) continue;
         float* orow = out + (size_t)t * nh * HD + h * HD;
         const float* gate = qg + (size_t)t * nh * 2 * HD + h * 2 * HD + HD;
+#pragma unroll
         for (int d = 0; d < HD / 8; d++)
             for (int e = 0; e < 2; e++) {
                 int col = d * 8 + 2 * t4 + e;
