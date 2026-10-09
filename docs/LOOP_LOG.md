@@ -1078,6 +1078,12 @@ experts in layer order, never swaps, and neither reads nor writes the profile.
   no row lost.
 - `--gpu --fixed-experts` default mode (load 4.3 / 19.5): 629 -> 629/640 (98.28%), unchanged.
 
+### 2026-10-09 #63 — rejected: batched prefill for every prompt in llama mode
+
+llama-server batches every prompt; Strata steps prompts under 32 tokens (`short`). Setting `short = 0` under
+`--llama-numerics` (`--fixed-experts`, load 8.0): 633 -> 633/640. Prompt 9 (31 tokens) gained one token, prompt 7
+(23 tokens) lost one. No net change, reverted.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
