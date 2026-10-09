@@ -1115,6 +1115,20 @@ llama-server batches every prompt; Strata steps prompts under 32 tokens (`short`
 - Side result: 4K prefill in the quieter rounds 2030.6 (2011-2046) and 2072.0 (2070-2073) tok/s, above the 2000
   target; 1865 in round 1 at load 4.4-5.6 with other loops starting.
 
+### 2026-10-09 #66 — IQ3_S (type 21): 9B IQ3_M and 35B IQ4_XS now load (795a93b)
+
+Both models failed before with `unsupported quant type id 21`. Added the 512-entry grid, the CPU dequant and the
+GPU `deq8`/`QI` paths (types now 12).
+
+- Every-type test on the 9B (`STRATA_MODEL`): IQ3_S dequant max diff 0, gemv rel err 1.13e-6.
+- Greedy, "The capital of France is", 24 tokens: llama.cpp, Strata `--gpu` and Strata CPU give identical text on
+  both models. 9B `--gpu` decodes at 48.8 tok/s. 35B IQ4_XS `--gpu` decodes at 14.4 tok/s: 5806/10240 experts fit,
+  hit rate 56.8%, and CPU experts take 84.7% of decode, because the CPU int dot has no IQ3_S kernel and falls back
+  to the f32 matvec.
+- Main model unchanged: cuda 10 pass / 3 ignored, gpu_model 7 pass, llama_numerics 1 pass.
+- Next: an AVX2 IQ3_S int dot for the CPU expert path; IQ2_XXS, IQ2_S, IQ1_S, IQ1_M for the 27B
+  (Qwen3.8-27B-UD-IQ3_XXS, which stops at type 19).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
