@@ -21,6 +21,9 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - MTP k = 1 with GPU argmax: 92.4 tok/s after a 512-token prompt (caa5f4b).
 - At d24402d (#50): decode 99.1 after 512, 91.6 after 4096; MTP k = 1 105.1 / 94.0; 4K prefill ~2070 tok/s.
   Parity 98.59% (3 runs).
+- At 2a51d2e (#52): decode after 4096 93.9, MTP k = 1 94.5; after 16384 87.0. Parity 98.36% over 6 runs, with an
+  interleaved control showing ec8200a at 98.28% under the same conditions. Parity gate per change: interleaved
+  3-run control against the previous binary, since single 3-run means move by +-0.3%.
 
 ## Iterations
 
@@ -839,6 +842,49 @@ cuda and gpu_model suites pass; per-row arithmetic unchanged.
 | Decode after 4096, MTP k = 1 | 90.8 (89.4-91.5) | **94.0** (93.8-94.1) |
 
 Prefill unchanged (4K ~2050-2077 in both).
+
+### 2026-10-09 #52 — chunked decode attention (2a51d2e)
+
+Profile at ec8200a (4K prompt, MTP k = 1): `attn_decode_gqa` 167 us per call, ~12 calls per step (~1.7 ms of
+~18.9 ms). New ignored test `attn_decode_bandwidth` (16 query heads, 2 KV heads, head_dim 256, both kernels,
+300 ms warm-up) showed it far from bandwidth at every length (4K, 1 / 2 query tokens: 102 / 183 us; 8 MB of K/V
+is ~23 us at 360 GB/s), and 2 query tokens cost twice 1 token, so the limit was per-block work, not DRAM.
+
+Change: positions in chunks of 32 (4 per warp). Warps compute the chunk's scores for all G heads, reading q from
+shared memory once per chunk and reducing the 32 (position, head) partials with one scatter reduction (31
+shuffles instead of 160); warp h then runs the online softmax of head h over the chunk; warps add the weighted V
+rows. All warps share the running max, so the end-of-block merge is a plain sum (no expf). The first version
+kept the scatter's array in local memory (392 LDL/STL in SASS, the loop with a halving counter did not unroll);
+recursion on a template parameter fixed it. `ATT_GQA_MIN` 4096 -> 2048 (new break-even: 2K g1 51.9 / gqa 49.8 us).
+
+`attn_decode_bandwidth`, gqa kernel, 1 / 2 query tokens (us):
+
+| Positions | ec8200a | 2a51d2e |
+|---|---|---|
+| 4096 | 97-102 / 177-183 | 64-68 / 107-121 |
+| 16384 | 199-200 / 367-368 | 154-158 / 253-257 |
+| 32768 | 332-336 / 620 | 257-261 / 423-427 |
+
+Rejected variants: next-chunk register prefetch (no gain, registers 168 -> 252), G <= 4 per block (slower at
+every length), `__launch_bounds__(256, 2)` (spills; only 32K with 2 tokens gains).
+
+`bench --gpu --pp 512,4096 --tg 128 --reps 3`, 3 interleaved rounds, load 4.6-21.4; round 2 hit a load spike
+(MTP spreads 54-107), so the means are rounds 1 and 3:
+
+| | ec8200a | 2a51d2e |
+|---|---|---|
+| Decode after 4096 | 91.6 (91.3-91.8) | **93.9** (93.8-93.9) |
+| Decode after 4096, MTP k = 1 | 91.8 (91.6-91.9) | **94.5** (93.8-95.1) |
+| Decode after 512 (both MTP modes), 4K prefill | unchanged | unchanged |
+
+`--pp 16384 --tg 128 --reps 3`, 2 rounds: decode 81.9 (80.8-82.9) -> **87.0** (86.7-87.3); MTP k = 1 noisy
+(old 80.3 / 81.0, new 63.7 / 82.5, spreads up to 57-77) and not above MTP off at 16K for either binary.
+
+Parity: new binary 628 / 631 / 632 = 98.49%, below the 98.59% logged at #49. Interleaved control under the same
+conditions (04:17-04:23): ec8200a 628 / 632 / 627 = 98.28%, 2a51d2e 628 / 629 / 629 = 98.23%. Equal within run-to-run
+noise (single runs of the unchanged binary span 627-633); the 98.59% at #49 was a high draw. New binary over 6
+runs: 3777 / 3840 = 98.36%. cuda and gpu_model suites pass (attention parity test covers both kernels, batched
+tokens and every head_dim).
 
 ## Tried and rejected
 
