@@ -96,7 +96,7 @@ fn moe_gemv_selects_experts() {
 }
 
 /// Achieved GEMV bandwidth per type (one dense matrix per type, plus 8-expert MoE GEMVs). Run with --ignored.
-/// gemvn over 1 to 4 inputs equals gemv per input, bit for bit, for every integer type.
+/// gemvn over 1 to 4 inputs equals gemv per input, bit for bit, for every type.
 #[test]
 fn gemvn_matches_gemv() {
     let (Some(p), Some(gpu)) = (common::model_path(), gpu()) else { return };
