@@ -1307,6 +1307,34 @@ below the noise. Reverted (diff kept out of the tree). Fusing launch-bound kerne
 memory traffic or a serial dependency with real work, so the rms_norm/router fusions in candidate 6 should be
 judged by their kernel time, not by launch count.
 
+### 2026-10-09 #77 — `--kv q8` KV cache option (d02ac75)
+
+The spec's `--kv q8|f16`. With q8 a cache row holds hd int8 values, then hd/32 f16 scales (ggml q8_0, roundf);
+`kv_store` quantizes one 32-value block per warp, and one loader (`ldkv`) gives the decode and tensor-core prefill
+attention the same f16 words an f16 cache holds, so the attention math is unchanged. Refused together with
+`--llama-numerics`. New test `tests/kv_q8.rs` (own process, since the module is compiled per KV format): q8 vs f16
+attention rel err 1.6-2.1e-3, q8 prefill vs decode <= 7.7e-5, batched decode bit-identical; a planted scale-index
+bug fails it (0.07).
+
+Parity (load 3.6-4.8): default f16 with `--llama-numerics --fixed-experts` 633/640 (unchanged). Without
+`--llama-numerics` (`--fixed-experts`): f16 629/640, q8 631/640, so q8 costs no measurable agreement.
+
+| `--reps 3`, load 1.2-6.6 | f16 | q8 |
+|---|---|---|
+| KV at 4224 / 33280 tokens | 82 / 650 MB | 44 / 345 MB |
+| resident experts at 32K, mtp 0 | 8428 | 8724 |
+| 4K decode mtp 0 (r1/r2/r3) | 98.2 / 98.3 / 98.3 | 97.5 / 97.4 / 97.3 |
+| 4K decode mtp 1 | 103.1 / 104.0 / 104.0 | 103.6 / 102.5 / 102.4 |
+| 4K prefill | 2037 / 2068 / 2077 | 2022 / 2026 / 2034 |
+| 32K decode mtp 0 (r1/r2) | 80.4 / 81.6 | 76.3 / 76.2 |
+| 32K decode mtp 1 | 86.2 / 84.8 | 78.7 / 78.5 |
+| 32K prefill | 1593 / 1608 | 1371 / 1372 |
+
+q8 halves KV memory but is slower: the dequantize per value (byte extract, scale multiply, f16 pack) and the
+separate 2-byte scale load cost more than the halved K/V bytes save, most visibly in the 32K prefill (-14%). So f16
+stays the default, q8 is the low-VRAM option. Follow-up if q8 should win: dequantize K/V tiles once into shared
+memory in prefill, and in decode convert q8 directly to f32 instead of round-tripping through f16 words.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
