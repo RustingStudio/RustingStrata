@@ -1171,6 +1171,23 @@ The dense 27B (arch qwen35) stopped at `unsupported quant type id 19`. That erro
 - Every GGUF type in the local Qwen3.5/3.6/3.8 files now loads. Not yet supported: F16, Q4_0/Q4_1/Q5_0/Q5_1,
   IQ4_NL, TQ*, MXFP4.
 
+### 2026-10-09 #69 — README numbers refreshed (3f78cf6)
+
+At 654a270, `bench --gpu --pp 512,4096 --tg 128 --reps 3`, 3 interleaved rounds of `--mtp 0` and `--mtp 1`
+(load 4.4-6.7):
+
+| | mtp 0, r1 / r2 / r3 | mtp 1, r1 / r2 / r3 |
+|---|---|---|
+| 512 prefill | 918.1 / 1016.0 / 1014.3 | 993.7 / 983.8 / 991.9 |
+| 4K prefill | 2094.9 / 2095.5 / 2088.8 | 2076.4 / 2066.4 / 2056.4 |
+| decode after 512 | 100.6 / 101.5 / 101.4 | 111.7 / 108.2 / 112.7 |
+| decode after 4K | 95.8 / 95.7 / 95.4 | 100.4 / 98.2 / 98.4 (63.1% accepted) |
+
+32K (`--pp 32768 --ctx 33280`, one round, load 4.0-4.3): prefill 1561.6 / 1548.5, decode 77.4 (mtp 0) / 80.8
+(mtp 1, 62.0% accepted). README now has these, the agreement numbers from #60-#62, the other-model table from
+#66-#68 and the supported type list. The old README said 82% MTP acceptance; it is 63% on this bench text.
+Target check: 4K prefill (2000) and 32K decode (70) are met; 4K decode with MTP is 98-100, just under 100.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
