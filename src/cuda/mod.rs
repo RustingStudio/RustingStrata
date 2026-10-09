@@ -10,9 +10,9 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-const QTYPES: [GgmlType; 14] = {
+const QTYPES: [GgmlType; 16] = {
     use GgmlType::*;
-    [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS]
+    [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS]
 };
 const KERNELS: [&str; 26] = [
     "rms_norm", "quant_xq", "argmax_rows", "l2_norm", "rope_neox", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
@@ -61,6 +61,7 @@ fn source() -> String {
         "__device__ const unsigned long long iq2xs_grid[512] = {{{}}};\n\
          __device__ const unsigned long long iq2xxs_grid[256] = {{{}}};\n\
          __device__ const unsigned long long iq2s_grid[1024] = {{{}}};\n\
+         __device__ const unsigned long long iq1s_grid[2048] = {{{}}};\n\
          __device__ const unsigned int iq3xxs_grid[256] = {{{}}};\n\
          __device__ const unsigned int iq3s_grid[512] = {{{}}};\n\
          __device__ const unsigned char ksigns_iq2xs[128] = {{{}}};\n\
@@ -68,6 +69,7 @@ fn source() -> String {
         join(IQ2XS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ2XXS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ2S_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
+        join(IQ1S_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ3XXS_GRID.iter().map(|v| format!("{v:#x}u")).collect()),
         join(IQ3S_GRID.iter().map(|v| format!("{v:#x}u")).collect()),
         join(KSIGNS_IQ2XS.iter().map(|v| v.to_string()).collect()),

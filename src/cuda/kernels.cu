@@ -109,6 +109,30 @@ template <> __device__ __forceinline__ void deq8<14>(const u8* b, int sub, float
         o[i] = d * (float)(q - 32);
     }
 }
+// IQ1_S / IQ1_M: grid bytes are -1, 0, 1 and the sub-block offset is +-1/8 (IQ1S_DELTA).
+__device__ __forceinline__ void iq1_sub(const u8* b, int ib, int l, int& idx, float& dl, bool& neg) {
+    // IQ1_M: d is split over the top nibbles of the four scale words.
+    u32 s0 = ld16(b + 48), s1 = ld16(b + 50), s2 = ld16(b + 52), s3 = ld16(b + 54);
+    float d = h2f((u16)((s0 >> 12) | ((s1 >> 8) & 0xF0) | ((s2 >> 4) & 0xF00) | (s3 & 0xF000)));
+    u32 sc = ld16(b + 48 + 2 * (ib / 2)), qh = b[32 + 2 * ib + l / 2] >> (4 * (l & 1));
+    dl = d * (float)(2 * ((sc >> (6 * (ib & 1) + 3 * (l >> 1))) & 7) + 1);
+    idx = b[4 * ib + l] | ((qh & 7) << 8);
+    neg = qh & 8;
+}
+__device__ __forceinline__ void iq1s_sub(const u8* b, int ib, int l, int& idx, float& dl, bool& neg) {
+    u32 qh = ld16(b + 34 + 2 * ib);
+    dl = ldh(b) * (float)(2 * ((qh >> 12) & 7) + 1);
+    idx = b[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8);
+    neg = qh & 0x8000;
+}
+template <int T> __device__ __forceinline__ void deq8_iq1(const u8* b, int sub, float* o) {
+    int idx; float dl; bool neg;
+    if (T == 19) iq1s_sub(b, sub >> 2, sub & 3, idx, dl, neg); else iq1_sub(b, sub >> 2, sub & 3, idx, dl, neg);
+    u64 g = iq1s_grid[idx];
+    for (int j = 0; j < 8; j++) o[j] = dl * ((float)(signed char)(g >> (8 * j)) + (neg ? -0.125f : 0.125f));
+}
+template <> __device__ __forceinline__ void deq8<19>(const u8* b, int sub, float* o) { deq8_iq1<19>(b, sub, o); }  // IQ1_S
+template <> __device__ __forceinline__ void deq8<29>(const u8* b, int sub, float* o) { deq8_iq1<29>(b, sub, o); }  // IQ1_M
 template <> __device__ __forceinline__ void deq8<16>(const u8* b, int sub, float* o) {  // IQ2_XXS
     int ib = sub >> 2, l = sub & 3;
     u32 aux = ld16(b + 6 + 8 * ib) | (ld16(b + 8 + 8 * ib) << 16);
@@ -287,6 +311,20 @@ template <> struct QI<14> {  // Q6_K (210 bytes: rows 2-aligned)
         lo = (int)__vsub4(a, 0x20202020u); hi = (int)__vsub4(c, 0x20202020u);
     }
 };
+// IQ1: weight = dl * (g +- 1/8) = (dl / 8) * (8 g +- 1), an exact int8 in {-9, -7, -1, 1, 7, 9}.
+template <int T> struct QI1 {
+    static constexpr bool MIN = false;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        int idx; float dl; bool neg;
+        if (T == 19) iq1s_sub(b, sub >> 2, sub & 3, idx, dl, neg); else iq1_sub(b, sub >> 2, sub & 3, idx, dl, neg);
+        u64 g = iq1s_grid[idx];
+        u32 s = neg ? 0xFFFFFFFFu : 0x01010101u;
+        d = dl * 0.125f;
+        lo = (int)__vadd4(((u32)g << 3) & 0xF8F8F8F8u, s); hi = (int)__vadd4(((u32)(g >> 32) << 3) & 0xF8F8F8F8u, s);
+    }
+};
+template <> struct QI<19> : QI1<19> {};  // IQ1_S (50 bytes: rows 2-aligned)
+template <> struct QI<29> : QI1<29> {};  // IQ1_M (56 bytes)
 template <> struct QI<16> {  // IQ2_XXS (66 bytes: rows 2-aligned)
     static constexpr bool MIN = false;
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
@@ -451,7 +489,7 @@ __device__ __forceinline__ void gemv_row_qn(const u8* __restrict__ w, const sign
 
 #define FTYPES(X) X(0, f32, 1024) X(30, bf16, 512)
 #define ITYPES(X) X(8, q8_0, 272) X(10, q2_k, 84) X(11, q3_k, 110) X(12, q4_k, 144) X(13, q5_k, 176) X(14, q6_k, 210) \
-    X(16, iq2_xxs, 66) X(17, iq2_xs, 74) X(22, iq2_s, 82) X(18, iq3_xxs, 98) X(21, iq3_s, 110) X(23, iq4_xs, 136)
+    X(19, iq1_s, 50) X(29, iq1_m, 56) X(16, iq2_xxs, 66) X(17, iq2_xs, 74) X(22, iq2_s, 82) X(18, iq3_xxs, 98) X(21, iq3_s, 110) X(23, iq4_xs, 136)
 #define QTYPES(X) FTYPES(X) ITYPES(X)
 
 #define DEF_DEQUANT(T, NAME, SBB)                                                                                 \
@@ -699,7 +737,7 @@ __device__ __forceinline__ void mma_s8_16832(int* c, u32 a0, u32 a1, u32 a2, u32
 // int -> float for |c| < 2^22 without the quarter-rate I2F: 2^23 + 2^22 + c has c in its low mantissa bits.
 __device__ __forceinline__ float i2f_small(int c) { return __int_as_float(0x4B400000 + c) - 12582912.0f; }
 // Weight types whose scale (and min) is constant over 32 weights: one 32-deep mma per scale.
-template <int T> __host__ __device__ constexpr bool scale32() { return T == 8 || T == 12 || T == 13 || T == 16 || T == 18 || T == 21 || T == 23; }
+template <int T> __host__ __device__ constexpr bool scale32() { return T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23; }
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok) {
     unsigned d = (unsigned)__cvta_generic_to_shared(dst);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(ok ? 16 : 0));
