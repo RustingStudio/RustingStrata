@@ -7,21 +7,21 @@ use half::{bf16, f16};
 use tables::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GgmlType { F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS }
+pub enum GgmlType { F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS }
 use GgmlType::*;
 
 impl GgmlType {
     pub fn from_u32(id: u32) -> anyhow::Result<Self> {
         Ok(match id {
             0 => F32, 30 => BF16, 8 => Q8_0, 10 => Q2K, 11 => Q3K, 12 => Q4K, 13 => Q5K, 14 => Q6K,
-            16 => IQ2XXS, 17 => IQ2XS, 18 => IQ3XXS, 21 => IQ3S, 22 => IQ2S, 23 => IQ4XS,
+            16 => IQ2XXS, 17 => IQ2XS, 19 => IQ1S, 29 => IQ1M, 18 => IQ3XXS, 21 => IQ3S, 22 => IQ2S, 23 => IQ4XS,
             _ => {
                 const NAMES: [&str; 40] = ["F32", "F16", "Q4_0", "Q4_1", "", "", "Q5_0", "Q5_1", "Q8_0", "Q8_1", "Q2_K",
                     "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_K", "IQ2_XXS", "IQ2_XS", "IQ3_XXS", "IQ1_S", "IQ4_NL", "IQ3_S",
                     "IQ2_S", "IQ4_XS", "I8", "I16", "I32", "I64", "F64", "IQ1_M", "BF16", "", "", "", "TQ1_0", "TQ2_0",
                     "", "", "", "MXFP4"];
                 let name = NAMES.get(id as usize).filter(|n| !n.is_empty()).unwrap_or(&"unknown");
-                anyhow::bail!("unsupported quant type {name} (ggml type id {id}); supported: F32 BF16 Q8_0 Q2_K-Q6_K IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_XS")
+                anyhow::bail!("unsupported quant type {name} (ggml type id {id}); supported: F32 BF16 Q8_0 Q2_K-Q6_K IQ1_S IQ1_M IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_XS")
             }
         })
     }
@@ -29,14 +29,14 @@ impl GgmlType {
     pub fn block_bytes(self) -> usize {
         match self {
             F32 => 4, BF16 => 2, Q8_0 => 34, Q2K => 84, Q3K => 110, Q4K => 144, Q5K => 176, Q6K => 210,
-            IQ2XXS => 66, IQ2XS => 74, IQ2S => 82, IQ3XXS => 98, IQ3S => 110, IQ4XS => 136,
+            IQ1S => 50, IQ1M => 56, IQ2XXS => 66, IQ2XS => 74, IQ2S => 82, IQ3XXS => 98, IQ3S => 110, IQ4XS => 136,
         }
     }
     pub fn row_bytes(self, n: u64) -> usize { n as usize / self.block_elems() * self.block_bytes() }
     pub fn name(self) -> &'static str {
         match self {
             F32 => "F32", BF16 => "BF16", Q8_0 => "Q8_0", Q2K => "Q2_K", Q3K => "Q3_K", Q4K => "Q4_K",
-            Q5K => "Q5_K", Q6K => "Q6_K", IQ2XXS => "IQ2_XXS", IQ2XS => "IQ2_XS", IQ2S => "IQ2_S", IQ3XXS => "IQ3_XXS", IQ3S => "IQ3_S", IQ4XS => "IQ4_XS",
+            Q5K => "Q5_K", Q6K => "Q6_K", IQ1S => "IQ1_S", IQ1M => "IQ1_M", IQ2XXS => "IQ2_XXS", IQ2XS => "IQ2_XS", IQ2S => "IQ2_S", IQ3XXS => "IQ3_XXS", IQ3S => "IQ3_S", IQ4XS => "IQ4_XS",
         }
     }
 }
@@ -59,7 +59,7 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) {
             BF16 => y[0] = bf16::from_le_bytes([blk[0], blk[1]]).to_f32(),
             Q8_0 => { let d = h(blk, 0); for j in 0..32 { y[j] = blk[2 + j] as i8 as f32 * d; } }
             Q2K => q2k(blk, y), Q3K => q3k(blk, y), Q4K => q4k(blk, y), Q5K => q5k(blk, y), Q6K => q6k(blk, y),
-            IQ2XXS => iq2xxs(blk, y), IQ2XS => iq2xs(blk, y), IQ2S => iq2s(blk, y), IQ3XXS => iq3xxs(blk, y), IQ3S => iq3s(blk, y), IQ4XS => iq4xs(blk, y),
+            IQ1S => iq1s(blk, y), IQ1M => iq1m(blk, y), IQ2XXS => iq2xxs(blk, y), IQ2XS => iq2xs(blk, y), IQ2S => iq2s(blk, y), IQ3XXS => iq3xxs(blk, y), IQ3S => iq3s(blk, y), IQ4XS => iq4xs(blk, y),
         }
     }
 }
@@ -162,6 +162,33 @@ fn q6k(b: &[u8], y: &mut [f32]) {
 }
 
 fn sign(signs: u8, j: usize) -> f32 { if signs & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 } }
+
+fn iq1s(b: &[u8], y: &mut [f32]) {
+    let d = h(b, 0);
+    for ib in 0..8 {
+        let qh = u16::from_le_bytes([b[34 + 2 * ib], b[35 + 2 * ib]]) as usize;
+        let dl = d * (2 * ((qh >> 12) & 7) + 1) as f32;
+        let delta = if qh & 0x8000 != 0 { -0.125 } else { 0.125 };
+        for l in 0..4 {
+            let grid = IQ1S_GRID[b[2 + 4 * ib + l] as usize | (((qh >> (3 * l)) & 7) << 8)].to_le_bytes();
+            for j in 0..8 { y[32 * ib + 8 * l + j] = dl * (grid[j] as i8 as f32 + delta); }
+        }
+    }
+}
+
+fn iq1m(b: &[u8], y: &mut [f32]) {
+    let sc: [usize; 4] = std::array::from_fn(|i| u16::from_le_bytes([b[48 + 2 * i], b[49 + 2 * i]]) as usize);
+    let d = f16::from_bits(((sc[0] >> 12) | ((sc[1] >> 8) & 0xF0) | ((sc[2] >> 4) & 0xF00) | (sc[3] & 0xF000)) as u16).to_f32();
+    for ib in 0..8 {
+        for l in 0..4 {
+            let dl = d * (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3 * (l / 2))) & 7) + 1) as f32;
+            let qh = b[32 + 2 * ib + l / 2] as usize >> (4 * (l % 2));
+            let grid = IQ1S_GRID[b[4 * ib + l] as usize | ((qh & 7) << 8)].to_le_bytes();
+            let delta = if qh & 8 != 0 { -0.125 } else { 0.125 };
+            for j in 0..8 { y[32 * ib + 8 * l + j] = dl * (grid[j] as i8 as f32 + delta); }
+        }
+    }
+}
 
 fn iq2xxs(b: &[u8], y: &mut [f32]) {
     let d = h(b, 0);
