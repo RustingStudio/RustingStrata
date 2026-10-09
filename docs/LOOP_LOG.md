@@ -1247,6 +1247,15 @@ positions (us, 1 / 2 tokens, g1 vs gqa: 768 27.7/49.2 vs 26.5/43.2; 1024 31.0/52
 --reps 3` (3 interleaved rounds, load 4.3-16.8) showed no gain: mtp 0 99.4 -> 98.9, mtp 1 102.9 -> 103.5 tok/s
 (means, spread 0.5-2.3). Kept 2048. Redo only with a profile showing attention at 1-2K as a real cost.
 
+### 2026-10-09 #73 — rms_norm with 512 threads (rejected for parity, no commit)
+
+nsys (512 prompt, 256 decode tokens): \`rms_norm\` 4.47 us per call with 256 threads, 3.11 with 512, 2.98 with 1024
+(~100 calls per token). With 512: full suite passes; bench (3 interleaved rounds, load 5.7-16.3) decode after 512
+101.0-101.3 -> 102.3-102.7 tok/s (+1.3%), after 4K and at 32K inside the noise. Parity (\`--llama-numerics
+--fixed-experts\`, interleaved, load 1.8-2.2): 633 -> 628/640. The block sum order changes with the block size, and
+that moves 5 greedy tokens. Reverted per the parity rule. Redo only together with a change that restores parity, or
+keep 256 threads for the sum and use the extra threads only for the scaling and quantization.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
