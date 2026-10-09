@@ -1411,6 +1411,17 @@ not ordered by frequency. Cutting to 64K rows would save ~0.65 ms per draft (~5%
 reference token past the cut is a sure miss, costing about as much acceptance (~62% now). Not built; a hot set
 counted from generated tokens at run time could work, but needs its own measurement.
 
+### 2026-10-09 #83 — serve request validation (9f4af2a)
+
+Probed `strata serve --gpu` with malformed requests. Fine before: bad JSON, missing or non-array `messages`, a
+prompt over `--ctx`, huge `max_tokens` (stops at the context). Fixed: an unknown role (`"wizard"`) was accepted and
+written into the ChatML template verbatim, so a role string could inject template text; a user message without
+`content` became an empty turn and the model made up a reply; `max_tokens` -5 or 2.5, `temperature` -1 or "x",
+`top_k` -3 and `top_p` 5 were silently replaced by defaults; `max_tokens` 0 failed with "prompt of 13 tokens fills the
+context". Each is now a 400 naming the field (`unknown role "wizard"`, `user message without content`,
+`max_tokens must be an integer >= 1`, ...). Null still means "use the default", and an assistant turn may omit
+content. tests/serve.rs covers each case; removing the role check fails it.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
