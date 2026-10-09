@@ -405,3 +405,33 @@ fn router_topk_matches_ops_top_k() {
     }
     assert_eq!(ids[k..k + 2], [7, 200]);
 }
+
+/// Decode attention time per call for the model's shape (16 query heads, 2 KV heads, head_dim 256), both kernels.
+#[test]
+#[ignore]
+fn attn_decode_bandwidth() {
+    let Some(gpu) = gpu() else { return };
+    let (nh, nkv, hd) = (16, 2, 256);
+    for n_pos in [1024, 2048, 4096, 16384, 32768] {
+        let n = n_pos * nkv * hd;
+        let h16: Vec<u16> = xs(n).iter().map(|x| half::f16::from_f32(*x).to_bits()).collect();
+        let (dk, dv) = (gpu.stream.clone_htod(&h16).unwrap(), gpu.stream.clone_htod(&h16).unwrap());
+        for nt in [1, 2] {
+            let (dq, dg) = (gpu.stream.clone_htod(&xs(nt * nh * hd)).unwrap(), gpu.stream.clone_htod(&xs(nt * nh * 2 * hd)).unwrap());
+            let steps: Vec<i32> = (0..nt).flat_map(|i| [(n_pos - nt + i) as i32, 0]).collect();
+            let ds = gpu.stream.clone_htod(&steps).unwrap();
+            let (dout, part) = (gpu.zeros::<f32>(nt * nh * hd).unwrap(), gpu.zeros::<f32>(nt * nh * rusting_strata::cuda::ATT_SPLITS * (hd + 2)).unwrap());
+            for gq_min in [i32::MAX, 0] {
+                let run = || gpu.attn_decode_gq(gpu.ptr(&dq), gpu.ptr(&dk), gpu.ptr(&dv), gpu.ptr(&dg), gpu.ptr(&dout), gpu.ptr(&part), gpu.ptr(&ds),
+                                                nh, nkv, hd, 0.0625, gq_min, nt).unwrap();
+                let t0 = std::time::Instant::now();  // warm up long enough for the clocks to rise
+                while t0.elapsed().as_millis() < 300 { run(); gpu.stream.synchronize().unwrap(); }
+                let t0 = std::time::Instant::now();
+                for _ in 0..200 { run(); }
+                gpu.stream.synchronize().unwrap();
+                let s = t0.elapsed().as_secs_f64() / 200.0;
+                eprintln!("pos {n_pos:6} nt {nt} {}: {:7.1} us  {:5.0} GB/s", if gq_min == 0 { "gqa" } else { "g1 " }, s * 1e6, (2 * n * 2) as f64 / s / 1e9);
+            }
+        }
+    }
+}
