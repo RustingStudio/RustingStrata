@@ -280,7 +280,7 @@ impl Gpu {
 
     /// `rms_norm` that also writes its output quantized as `quant_xq` does to `xq` (when not 0).
     pub fn rms_norm_q(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32, xq: u64) -> anyhow::Result<()> {
-        launch!(self, "rms_norm", cfg((rows as u32, 1), 256, 0), x, x_stride as i32, w, out, out_stride as i32, n as i32, eps, xq);
+        launch!(self, "rms_norm", cfg((rows as u32, 1), 512, 0), x, x_stride as i32, w, out, out_stride as i32, n as i32, eps, xq);
         Ok(())
     }
 
