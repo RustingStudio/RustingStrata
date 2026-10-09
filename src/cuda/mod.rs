@@ -51,7 +51,8 @@ pub struct Gpu {
     q8: std::sync::Mutex<CudaSlice<u8>>,
 }
 
-/// `--llama-numerics`: quantize activations like llama.cpp's CPU q8_K (one scale per 256) for every integer matmul.
+/// `--llama-numerics`: quantize activations like llama.cpp's CPU q8_K (one scale per 256) for every integer matmul,
+/// and run attention as its CPU flash attention does (LLAMA_Q8 in kernels.cu).
 pub fn llama_numerics() -> bool { std::env::var_os("STRATA_LLAMA_NUMERICS").is_some() }
 
 fn source() -> String {
