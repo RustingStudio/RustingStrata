@@ -64,6 +64,17 @@ fn dequant_and_gemv_match_reference_for_every_type() {
 }
 
 #[test]
+fn rms_norm_q_matches_quant_xq() {
+    let Some(gpu) = gpu() else { return };
+    let (n, rows) = (2048, 3);
+    let (x, w) = (gpu.stream.clone_htod(&xs(rows * n)).unwrap(), gpu.stream.clone_htod(&xs(n + 7)[7..]).unwrap());
+    let (out, q1, q2) = (gpu.zeros::<f32>(rows * n).unwrap(), gpu.zeros::<u8>(rows * n * 9 / 8).unwrap(), gpu.zeros::<u8>(rows * n * 9 / 8).unwrap());
+    gpu.rms_norm_q(gpu.ptr(&x), n, gpu.ptr(&w), gpu.ptr(&out), n, n, rows, 1e-6, gpu.ptr(&q1)).unwrap();
+    gpu.quant_xq(gpu.ptr(&out), n, n, rows, gpu.ptr(&q2)).unwrap();
+    assert_eq!(gpu.stream.clone_dtoh(&q1).unwrap(), gpu.stream.clone_dtoh(&q2).unwrap());
+}
+
+#[test]
 fn moe_gemv_selects_experts() {
     let (Some(p), Some(gpu)) = (common::model_path(), gpu()) else { return };
     let g = Gguf::open(&p).unwrap();
