@@ -137,20 +137,28 @@ template <> __device__ __forceinline__ void deq8<23>(const u8* b, int sub, float
     for (int i = 0; i < 8; i++) o[i] = dl * (float)kvalues_iq4nl[r < 16 ? q[i] & 0xF : q[i] >> 4];
 }
 
-// One warp per output row; lane `l` covers elements [8l, 8l+8) of every super-block.
-template <int T, int SBB>
-__device__ __forceinline__ void gemv_row(const u8* __restrict__ w, const float* __restrict__ x, float* y, int row, int nsb) {
+// One warp per output row; lane `l` covers elements [8l, 8l+8) of every super-block. NT inputs (x + t * xst) share
+// each weight load; output t goes to y + t * yst.
+template <int T, int SBB, int NT = 1>
+__device__ __forceinline__ void gemv_row(const u8* __restrict__ w, const float* __restrict__ x, float* y, int row, int nsb,
+                                         int xst = 0, int yst = 0) {
     int lane = threadIdx.x & 31;
-    float acc = 0.0f, v[8];
+    float acc[NT] = {}, v[8];
 #pragma unroll 4
     for (int s = 0; s < nsb; s++) {
         deq8<T>(w + (size_t)s * SBB, lane, v);
-        const float4* xs = (const float4*)(x + s * 256 + lane * 8);
-        float4 a = xs[0], c = xs[1];
-        acc += v[0] * a.x + v[1] * a.y + v[2] * a.z + v[3] * a.w + v[4] * c.x + v[5] * c.y + v[6] * c.z + v[7] * c.w;
+#pragma unroll
+        for (int t = 0; t < NT; t++) {
+            const float4* xs = (const float4*)(x + (size_t)t * xst + s * 256 + lane * 8);
+            float4 a = xs[0], c = xs[1];
+            acc[t] += v[0] * a.x + v[1] * a.y + v[2] * a.z + v[3] * a.w + v[4] * c.x + v[5] * c.y + v[6] * c.z + v[7] * c.w;
+        }
     }
-    acc = warp_sum(acc);
-    if (lane == 0) y[row] = acc;
+#pragma unroll
+    for (int t = 0; t < NT; t++) {
+        float a = warp_sum(acc[t]);
+        if (lane == 0) y[(size_t)t * yst + row] = a;
+    }
 }
 
 // ---- integer path: 8 weights of a super-block as int8 (two packed words), with dequant value = d * q - m ----
@@ -403,6 +411,16 @@ QTYPES(DEF_DEQUANT)
         if (row < rows && ids[k] >= 0)                                                                          \
             gemv_row<T, SBB>(w + ids[k] * stride + (size_t)row * nsb * SBB, x + (size_t)(k / xg) * x_stride,    \
                              y + (size_t)k * rows, row, nsb);                                                   \
+    }                                                                                                           \
+    extern "C" __global__ void gemvn_##NAME(const u8* w, const float* x, int xs, float* y, int ys, int rows, int nsb, \
+                                            int, int nt) {                                                      \
+        int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;                                                 \
+        if (row >= rows) return;                                                                                \
+        const u8* wr = w + (size_t)row * nsb * SBB;                                                             \
+        if (nt == 2) gemv_row<T, SBB, 2>(wr, x, y, row, nsb, xs, ys);                                           \
+        else if (nt == 3) gemv_row<T, SBB, 3>(wr, x, y, row, nsb, xs, ys);                                      \
+        else if (nt == 4) gemv_row<T, SBB, 4>(wr, x, y, row, nsb, xs, ys);                                      \
+        else gemv_row<T, SBB, 1>(wr, x, y, row, nsb, xs, ys);                                                   \
     }
 FTYPES(DEF_FGEMV)
 
