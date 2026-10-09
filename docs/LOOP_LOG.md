@@ -1084,13 +1084,29 @@ llama-server batches every prompt; Strata steps prompts under 32 tokens (`short`
 `--llama-numerics` (`--fixed-experts`, load 8.0): 633 -> 633/640. Prompt 9 (31 tokens) gained one token, prompt 7
 (23 tokens) lost one. No net change, reverted.
 
+### 2026-10-09 #64 — probe: expert placement vs parity; DeltaNet prefill already matches
+
+- `--llama-numerics --fixed-experts --vram-margin 20000` (nearly every routed expert on the CPU kernels, load 3.5):
+  626/640, vs 633 with the default fixed placement. Seven prompts change by one or two tokens each, in both
+  directions.
+- The CPU kernels match llama.cpp's AVX2 code (q8_K activations, ties-to-even since #62, the same int sums and
+  `fmadd` + `hsum` order). The only non-integer expert types are in layer 40 (MTP, Q2_K/Q3_K), which scoring does
+  not use. So the drop is float-level perturbation (SwiGLU `expf`, the order of the weighted sum), not a wrong
+  algorithm.
+- llama.cpp's CPU build runs DeltaNet as the fused sequential f32 recurrence in prefill too (`fused_gdn_ch`), and so
+  does `deltanet_seq`. The "DeltaNet prefill algorithm" candidate is moot.
+- Conclusion: at 633/640 every ulp-level change flips one or two prompts either way (#63, this probe). One more
+  agreeing token would pass 99% (634), but there is no remaining algorithmic difference to fix. Parity work stops
+  here unless a llama.cpp tensor dump (`GGML_SCHED` eval callback) shows a real divergence.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
    pass is now batched (#53). Vocab subsets are out (#24 id order, #33 frequency).
 2. MMQ tile tuning toward 2000 tok/s (IQ2_XS on MMQ costs parity, #32).
 4. Parity (`--llama-numerics`, 98.62% at #60; 633/640 with `--fixed-experts` at #62, the baseline for single
-   changes): the DeltaNet prefill algorithm.
+   changes): no algorithmic difference left (#64). Next step only with a llama.cpp per-layer tensor dump to find a
+   real divergence.
 3. VRAM for more resident experts: the margin floor is the driver reserve (#36). Remaining levers: smaller prefill
    scratch (470 MB at chunk 4096) or KV in fewer bytes.
 5. MTP at long context: now wins at 32K (82.7 vs 78.8, see the 32K note under #59). An adaptive gate is not needed
