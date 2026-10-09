@@ -15,7 +15,14 @@ impl GgmlType {
         Ok(match id {
             0 => F32, 30 => BF16, 8 => Q8_0, 10 => Q2K, 11 => Q3K, 12 => Q4K, 13 => Q5K, 14 => Q6K,
             17 => IQ2XS, 18 => IQ3XXS, 21 => IQ3S, 23 => IQ4XS,
-            _ => anyhow::bail!("unsupported quant type id {id}"),
+            _ => {
+                const NAMES: [&str; 40] = ["F32", "F16", "Q4_0", "Q4_1", "", "", "Q5_0", "Q5_1", "Q8_0", "Q8_1", "Q2_K",
+                    "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_K", "IQ2_XXS", "IQ2_XS", "IQ3_XXS", "IQ1_S", "IQ4_NL", "IQ3_S",
+                    "IQ2_S", "IQ4_XS", "I8", "I16", "I32", "I64", "F64", "IQ1_M", "BF16", "", "", "", "TQ1_0", "TQ2_0",
+                    "", "", "", "MXFP4"];
+                let name = NAMES.get(id as usize).filter(|n| !n.is_empty()).unwrap_or(&"unknown");
+                anyhow::bail!("unsupported quant type {name} (ggml type id {id}); supported: F32 BF16 Q8_0 Q2_K-Q6_K IQ2_XS IQ3_XXS IQ3_S IQ4_XS")
+            }
         })
     }
     pub fn block_elems(self) -> usize { match self { F32 | BF16 => 1, Q8_0 => 32, _ => 256 } }
