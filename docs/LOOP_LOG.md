@@ -1037,13 +1037,35 @@ tokens and every head_dim).
   (77.2-79.6); `--mtp 1` decode 82.7 (80.1-84.0), 62.0% accepted. The 32K decode target (70) is met, and MTP now
   wins at 32K (it lost 66.3 vs 67.8 before #52-#59).
 
+### 2026-10-09 #60 — `--llama-numerics` flag; llama.cpp CPU attention numerics in that mode (d6d4bf1)
+
+- The mode existed only as `STRATA_LLAMA_NUMERICS`; `--llama-numerics` now sets it (goal 2 asks for the flag).
+- llama.cpp's CPU decode attention (`flash_attn_ext_f16_one_chunk`, used token by token for the reference
+  continuations) rounds q to f16, walks positions in order and keeps the V accumulator in f16; the KV length is
+  padded to 256 and, from 512 positions, split into one chunk per thread (6 here) merged in f32. Its prefill path
+  (tiled) is f32. Strata used f32 decode and f16 tensor-core prefill (q and softmax weights rounded to f16).
+- Change, only under `LLAMA_Q8`: `attn_decode_llama` reproduces the decode algorithm; `attn_prefill_llama` is an
+  f32 prefill attention. Both are slow (one position or one query at a time), for parity runs.
+- Test `tests/llama_numerics.rs` (own binary, so the env var cannot leak into other tests): decode is 1.5-5e-5 from
+  a CPU model of llama.cpp's algorithm vs 3-6e-4 for the default kernel; prefill is ~2e-7 from f64 vs 6-7e-5 for the
+  tensor-core kernel. cuda 10/10, gpu_model 7/7. The default path is unchanged (compiled out).
+- Parity (3 runs per binary, interleaved, load 1.6-11.8), `--llama-numerics`: before 629 / 627 / 630 and
+  629 / 628 / 625 (mean 98.07%); with both kernels 634 / 630 / 629 and 633 / 631 / 630 (mean **98.62%**, best
+  99.06%). Decode attention alone: 628 / 628 / 629, no measurable change. Default mode in the same session:
+  627 / 630 / 628 (98.18%).
+- Rejected: f32 GEMV instead of the f16 GEMM for float weights in prefill (router, DeltaNet alpha / beta), as
+  llama.cpp's CPU does: 627 / 627 / 629 vs 633 / 631 / 630 for the binary without it. Within noise, but not better.
+- Misses move between prompts from run to run (adaptive expert cache: GPU int8 vs CPU kernels), so a 3-run mean
+  moves by about +-0.3%. 99% is not yet reached on average.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
    pass is now batched (#53). Vocab subsets are out (#24 id order, #33 frequency).
 2. MMQ tile tuning toward 2000 tok/s (IQ2_XS on MMQ costs parity, #32).
-4. Parity: CPU reference with llama.cpp activation rounding (`STRATA_Q8` patch, q8_K on CPU-side experts, q8_1
-   on CUDA, f16 KV) to find which matmuls cause the misses.
+4. Parity (`--llama-numerics`, 98.62% at #60): make decode deterministic (pin the expert split for parity runs) so
+   single changes can be measured; then the CPU expert kernels' rounding (`.round()` vs llama.cpp's ties-to-even)
+   and the DeltaNet prefill algorithm.
 3. VRAM for more resident experts: the margin floor is the driver reserve (#36). Remaining levers: smaller prefill
    scratch (470 MB at chunk 4096) or KV in fewer bytes.
 5. MTP at long context: now wins at 32K (82.7 vs 78.8, see the 32K note under #59). An adaptive gate is not needed
