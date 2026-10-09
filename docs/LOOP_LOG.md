@@ -1282,6 +1282,14 @@ from the routing profile in `~/.cache/rusting_strata`, which every bench run rew
 depended on what ran before. It now sets `STRATA_FIXED_EXPERTS` (layer-order placement); passes at both commits
 with identical numbers.
 
+### 2026-10-09 #75 — PTX cache pruning (5881050)
+
+`~/.cache/rusting_strata` held 113 PTX files, 385 MB, one per kernels.cu edit, and nothing ever deleted them. A
+cache hit now refreshes the file's mtime; a miss first deletes `.ptx` files not used for 7 days, then compiles.
+Seven days keeps the PTX of every binary an interleaved bench alternates between, so no recompile thrash. Unit test
+`prune_ptx_drops_only_stale_ptx` (old .ptx removed, recent .ptx and non-PTX files kept). Checked on the GPU: a hit
+refreshed the mtime (09:34 -> 11:00), the run worked. No kernel or numeric change, so no parity or bench rerun.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
