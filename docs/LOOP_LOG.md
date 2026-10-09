@@ -975,6 +975,20 @@ tokens and every head_dim).
 - Remaining host idle: the verify launch after each draft (needs the draft token's embedding on the GPU to enqueue
   draft and verify back to back) and the rollback copies (the next forward could read the snapshot in place).
 
+### 2026-10-09 #56 — rejected: GPU-side token embedding for back-to-back draft and verify
+
+- Idea from #55: embed token ids on the GPU so the draft token never goes to the host, and launch the verify graph
+  right after the draft graph without a sync. `embed_<type>` kernel (grid = tokens) read `token_embd` (Q5_K,
+  ~350 MB) zero-copy from page-locked host memory; drafts were copied device to device into the verify's token
+  buffer. The GPU rows were bit-identical to the CPU `row` (new test), and gpu_model passed 7/7.
+- `cuMemHostRegister` refuses the GGUF mmap and the `READ_ONLY` flag on this machine (`CUDA_ERROR_NOT_SUPPORTED`),
+  so the tensor had to be copied into an owned 350 MB pinned buffer.
+- Bench `--mtp 1`, interleaved against 2f416f9, 3 rounds `--reps 3`, load 2.4-3.5: 4096 99.5 / 99.3 / 98.2 vs
+  99.6 / 99.2 / 97.9; 512 112.0 / 112.2 / 111.6 vs 112.3 / 112.1 / 108.4. An earlier run at load 4-15 was also
+  flat (4096 97.4 vs 97.2). There is no gain to pay for 350 MB of pinned RAM and the extra code, so it is reverted
+  (the diff is not kept in the tree). The ~170 µs gap after the draft is likely hidden already: the host builds the
+  verify inputs while the draft graph runs, so the launch cost overlaps GPU work.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
