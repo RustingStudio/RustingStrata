@@ -1069,14 +1069,22 @@ experts in layer order, never swaps, and neither reads nor writes the profile.
 - Default runs are unchanged (flag off). gpu_model tests 7 passed.
 - Single numerics changes can now be measured with one run each against 632.
 
+### 2026-10-09 #62 — CPU q8_K activations round ties to even (3ce7f84)
+
+`quantize_q8k` in src/cpu_moe.rs used `.round()` (ties away from zero). llama.cpp's `nearest_int` and the GPU's
+`__float2int_rn` round ties to even. Now `round_ties_even()`.
+
+- `--gpu --llama-numerics --fixed-experts` (load 6.2): 632 -> 633/640 (98.91%), one token gained on prompt 6,
+  no row lost.
+- `--gpu --fixed-experts` default mode (load 4.3 / 19.5): 629 -> 629/640 (98.28%), unchanged.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
    pass is now batched (#53). Vocab subsets are out (#24 id order, #33 frequency).
 2. MMQ tile tuning toward 2000 tok/s (IQ2_XS on MMQ costs parity, #32).
-4. Parity (`--llama-numerics`, 98.62% at #60; 632/640 with `--fixed-experts`, #61, the baseline for single
-   changes): the CPU expert kernels' rounding (`.round()` vs llama.cpp's ties-to-even)
-   and the DeltaNet prefill algorithm.
+4. Parity (`--llama-numerics`, 98.62% at #60; 633/640 with `--fixed-experts` at #62, the baseline for single
+   changes): the DeltaNet prefill algorithm.
 3. VRAM for more resident experts: the margin floor is the driver reserve (#36). Remaining levers: smaller prefill
    scratch (470 MB at chunk 4096) or KV in fewer bytes.
 5. MTP at long context: now wins at 32K (82.7 vs 78.8, see the 32K note under #59). An adaptive gate is not needed
