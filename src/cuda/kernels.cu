@@ -782,14 +782,19 @@ ITYPES(DEF_GEMMI)
 
 // ---- elementwise / norm ----
 
-// grid = rows. out[r] = rmsnorm(x[r]) * w (same w for every row).
-extern "C" __global__ void rms_norm(const float* x, int x_stride, const float* w, float* out, int out_stride, int n, float eps) {
+// grid = rows. out[r] = rmsnorm(x[r]) * w (same w for every row). xq (optional): out also quantized as quant_xq does.
+extern "C" __global__ void rms_norm(const float* x, int x_stride, const float* w, float* out, int out_stride, int n, float eps,
+                                    signed char* xq) {
     const float* xr = x + (size_t)blockIdx.x * x_stride;
     float* o = out + (size_t)blockIdx.x * out_stride;
     float s = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) s += xr[i] * xr[i];
     float sc = 1.0f / sqrtf(block_sum(s) / (float)n + eps);
     for (int i = threadIdx.x; i < n; i += blockDim.x) o[i] = xr[i] * sc * w[i];
+    if (xq) {
+        __syncthreads();
+        quant_x(o, n, xq + (size_t)blockIdx.x * n, (float*)(xq + (size_t)gridDim.x * n) + blockIdx.x * (n / 32));
+    }
 }
 
 // grid = rows, block 1024. out[r] = index of the largest x in row r (first one on ties, like ops::argmax).
