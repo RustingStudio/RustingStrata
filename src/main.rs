@@ -54,6 +54,10 @@ struct Engine {
     /// repeat exactly.
     #[arg(long)]
     fixed_experts: bool,
+    /// KV cache format (GPU): f16, or q8 (q8_0 blocks, half the KV memory; numerics differ slightly from llama.cpp's
+    /// default f16 cache).
+    #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
+    kv: String,
     /// Prompts shorter than this skip the batched prefill (from `strata calibrate`, else 32).
     #[arg(skip)]
     short: usize,
@@ -116,6 +120,7 @@ impl Engine {
         if !self.gpu { return Ok(Runner::Cpu(m, State::new(&m.cfg))); }
         if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
+        if self.kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new
         let mut g = GpuModel::load(m, Gpu::new()?, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp())?;
         g.short = self.short;
         Ok(Runner::Gpu(Box::new(g)))
