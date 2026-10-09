@@ -1099,6 +1099,22 @@ llama-server batches every prompt; Strata steps prompts under 32 tokens (`short`
   agreeing token would pass 99% (634), but there is no remaining algorithmic difference to fix. Parity work stops
   here unless a llama.cpp tensor dump (`GGML_SCHED` eval callback) shows a real divergence.
 
+### 2026-10-09 #65 — MTP k = 2 measured again at 010f0e4: still loses (no code commit)
+
+`bench --gpu --pp 512,4096 --tg 128 --reps 3`, 3 interleaved rounds (load 4.4-20.9; round 3 quietest at 7-9):
+
+| decode tok/s | k = 1 | k = 2 |
+|---|---|---|
+| 512, r1 / r2 / r3 | 105.0 / 107.0 / 113.8 | 96.8 / 102.0 / 102.3 |
+| 4096, r1 / r2 / r3 | 86.6 / 88.9 / 101.5 | 68.5 / 86.8 / 89.2 |
+| drafts accepted | 297-300 of 468-471 (63-64%) | 384 of 780 (49.2%) |
+
+- k = 2 gains 0.98 tokens per verify against 0.63 for k = 1, so it needs a step at most 1.22x as dear to win.
+  It costs ~1.35x (the third verify token routes to a third expert set). A cheaper draft head cannot close that.
+  k = 1 stays the default; the "retry k = 2" goal is answered unless verify cost per token drops.
+- Side result: 4K prefill in the quieter rounds 2030.6 (2011-2046) and 2072.0 (2070-2073) tok/s, above the 2000
+  target; 1865 in round 1 at load 4.4-5.6 with other loops starting.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
