@@ -1290,6 +1290,23 @@ Seven days keeps the PTX of every binary an interleaved bench alternates between
 `prune_ptx_drops_only_stale_ptx` (old .ptx removed, recent .ptx and non-PTX files kept). Checked on the GPU: a hit
 refreshed the mtime (09:34 -> 11:00), the run worked. No kernel or numeric change, so no parity or bench rerun.
 
+### 2026-10-09 #76 — router_topk with map_hits fused: rejected
+
+Folded the expert cache lookup (`map_hits`, one 32-thread launch per MoE layer) into `router_topk` and deleted
+`map_hits`; extended `router_topk_matches_ops_top_k` to check slots and hit weights. Tests passed, parity 633/640
+both. Bench vs 16ca272 (3 interleaved rounds, load 2.7-6.1, `--reps 3`):
+
+| | 16ca272 r1 / r2 / r3 | fused r1 / r2 / r3 |
+|---|---|---|
+| decode after 512, mtp 0 | 103.4 / 103.2 / 102.4 | 103.4 / 102.6 / 101.6 |
+| decode after 4K, mtp 0 | 98.6 / 98.3 / 98.4 | 98.5 / 98.1 / 97.8 |
+| decode after 4K, mtp 1 | 105.8 / 105.0 / 106.2 | 105.2 / 105.6 / 103.1 |
+
+No gain: inside a CUDA graph a dependent tiny launch costs well under 1 us, so removing 40 of them per token is
+below the noise. Reverted (diff kept out of the tree). Fusing launch-bound kernels only pays when it also removes
+memory traffic or a serial dependency with real work, so the rms_norm/router fusions in candidate 6 should be
+judged by their kernel time, not by launch count.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
