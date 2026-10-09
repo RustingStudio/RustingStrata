@@ -918,10 +918,34 @@ tokens and every head_dim).
 - #18: dense GEMV pairs in one launch (qkv + gate, beta + alpha, k + v, shared gate + up): 80 fewer launches per
   token, short decode 88.16 vs 88.14 at 100% hits. Graph launch gaps are not a cost at this size.
 
+### 2026-10-09 #53 — accepted drafts join the next draft pass (1b4dba2)
+
+- Before: after an accepted draft, `spec_step` re-ran the draft block once per accepted token (no output head, one
+  sync each) to rebuild its draft head entry from the main model's hidden row. Now those tokens wait in
+  `MtpHead::pend`. The next `spec_step` runs them with the new token as one nt = n + 1 batch over main rows 0..=n,
+  with the output head on the last row only. If an intervening `step` or prefill overwrote the rows, the pending
+  entries are dropped.
+- Draft numerics are unchanged (acceptance is equal: k1 297/471 in both binaries), and greedy output is unchanged
+  (`mtp_spec_matches_greedy` k = 1-3 passes; gpu_model 7/7). Main model kernels are unchanged, so parity was not
+  re-run.
+- Bench, `--pp 512,4096 --tg 128 --reps 3`, 3 interleaved rounds against 2a51d2e. Round 1 ran at load 3.4-5.3 and
+  was noisy; rounds 2-3 ran at load 2.0-2.9. Decode tok/s, rounds 2-3:
+
+| | 2a51d2e | 1b4dba2 |
+|---|---|---|
+| k1, 512 | 106.4 / 106.2 | 107.0 / 107.0 |
+| k1, 4096 | 94.9 / 94.6 | 95.2 / 95.2 |
+| k2, 512 | 99.5 / 99.6 | 99.0 / 98.8 |
+| k2, 4096 | 85.0 / 85.1 | 85.8 / 85.9 |
+
+- The gain is small (+0.6% for k = 1): a 2-token draft block reads two expert sets, so the batch saves only the
+  attention and dense weight reads plus one sync. k = 2 still loses to k = 1 (49% accepted). 4K with MTP: 95.2;
+  the 100 tok/s target is not met.
+
 ## Next candidates
 
-1. Draft head: reuse its KV from the draft pass for accepted drafts (no second pass) to make k = 2 pay.
-   Vocab subsets are out (#24 id order, #33 frequency).
+1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
+   pass is now batched (#53). Vocab subsets are out (#24 id order, #33 frequency).
 2. MMQ tile tuning toward 2000 tok/s (IQ2_XS on MMQ costs parity, #32).
 4. Parity: CPU reference with llama.cpp activation rounding (`STRATA_Q8` patch, q8_K on CPU-side experts, q8_1
    on CUDA, f16 KV) to find which matmuls cause the misses.
