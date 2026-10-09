@@ -14,8 +14,8 @@ const QTYPES: [GgmlType; 11] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ2XS, IQ3XXS, IQ4XS]
 };
-const KERNELS: [&str; 25] = [
-    "rms_norm", "argmax_rows", "l2_norm", "rope_neox", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
+const KERNELS: [&str; 26] = [
+    "rms_norm", "quant_xq", "argmax_rows", "l2_norm", "rope_neox", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_decode", "attn_decode_gqa", "attn_merge", "router_topk", "moe_combine", "map_hits", "moe_publish", "conv_seq", "conv_state",
     "moe_combine_seq", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
 ];
@@ -223,24 +223,38 @@ impl Gpu {
     /// y[t] = W x[t] for t < nt (x[t] at x + 4 * t * x_stride bytes, y[t] at y + 4 * t * y_stride); each weight
     /// block is read once for all nt.
     pub fn gemvn(&self, w: &GpuTensor, x: u64, x_stride: usize, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
+        self.gemvq(w, x, x_stride, 0, y, y_stride, nt)
+    }
+
+    /// `gemvn` that reads x pre-quantized by `quant_xq` at `xq` (0 = quantize x per block; float weights read x).
+    pub fn gemvq(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
         if !(1..=4).contains(&nt) { bail!("gemvn: {nt} inputs (1 to 4)"); }
         let nsb = Self::nsb(w)?;
         let (mut c, rpw) = Self::gemv_cfg(w.ty, w.rows, w.cols, 1);
-        c.shared_mem_bytes *= nt as u32;
-        launch!(self, &kname("gemvn", w.ty), c, w.ptr, x, x_stride as i32, y, y_stride as i32, w.rows as i32, nsb, rpw, nt as i32);
+        c.shared_mem_bytes = if xq == 0 { c.shared_mem_bytes * nt as u32 } else { 0 };
+        launch!(self, &kname("gemvn", w.ty), c, w.ptr, x, x_stride as i32, y, y_stride as i32, w.rows as i32, nsb, rpw, nt as i32, xq);
+        Ok(())
+    }
+
+    /// Quantize `nt` rows of n floats (row t at x + 4 * t * x_stride bytes) for `gemvq` / `moe_gemv` into `out`
+    /// (n + n / 8 bytes per row).
+    pub fn quant_xq(&self, x: u64, x_stride: usize, n: usize, nt: usize, out: u64) -> anyhow::Result<()> {
+        launch!(self, "quant_xq", cfg((nt as u32, 1), 256, 0), x, x_stride as i32, n as i32, out);
         Ok(())
     }
 
     /// For j < k with ids[j] >= 0: y[j] = W_j x[j / xg], where W_j is the `rows` x `cols` matrix at w + ids[j] * stride bytes.
     /// `pair` = (w2, y2) also computes the same product for the matrices at byte offset w2 into the output at byte offset y2.
-    pub fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>) -> anyhow::Result<()> {
+    /// `xq` (not 0): x pre-quantized by `quant_xq` (k / xg rows), read in place of x.
+    pub fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()> {
         if cols % 256 != 0 { bail!("{} expert with {cols} columns: GEMV needs a multiple of 256", ty.name()); }
         let (mut c, mut rpw) = Self::gemv_cfg(ty, rows, cols, k);
         // At least 2 rows per warp: an expert's x quantization (once per block) then covers 16 rows.
         if rpw == 1 && !Self::float_ty(ty) { rpw = 2; c.grid_dim.0 = rows.div_ceil(16) as u32; }
         let (w2, y2) = pair.unwrap_or((0, 0));
         c.grid_dim.2 = if pair.is_some() { 2 } else { 1 };
-        launch!(self, &kname("moe_gemv", ty), c, w, ids, stride as i64, x, x_stride as i32, xg as i32, y, rows as i32, (cols / 256) as i32, rpw, w2, y2);
+        if xq != 0 { c.shared_mem_bytes = 0; }
+        launch!(self, &kname("moe_gemv", ty), c, w, ids, stride as i64, x, x_stride as i32, xg as i32, y, rows as i32, (cols / 256) as i32, rpw, w2, y2, xq);
         Ok(())
     }
 
