@@ -959,6 +959,22 @@ tokens and every head_dim).
 
   +2.6% at 512 and +1.8% at 4K. Acceptance is the same (297/471).
 
+### 2026-10-09 #55 — greedy spec_step skips the logits copy (2f416f9)
+
+- Graph-level nsys of 4K MTP decode at 0272e25 (`--cuda-graph-trace=graph`): per verify cycle the GPU runs
+  ~16.8 ms and sits idle ~750 µs (4.5%). The idle time is ~170 µs after each draft graph (mostly the verify
+  `cuGraphLaunch`, 140 µs) and ~540 µs on average after each verify (median 382). That second gap covers the
+  argmax read, the 1 MB logits row copy, expert-cache bookkeeping and, on rejects, the 30 × 2 MB DeltaNet rollback
+  copies. Node-level tracing inflates `cuGraphLaunch` to ~370 µs, so launch costs come from graph-level traces only.
+- Change: `spec_step` returns the argmax of row n (already on the host) and no longer copies that row's logits.
+  `decode` uses it as the next token. Greedy `Sampler::pick` is `ops::argmax`, and `argmax_rows` breaks ties the
+  same way (tested). gpu_model 7/7.
+- Bench `--mtp 1`, interleaved against 0272e25: 512, 3 rounds, `--reps 3`: 110.1 / 110.7 / 110.5 vs
+  111.9 / 111.8 / 111.4 (+1.2%). 4096, 3 rounds, `--reps 5`, load 2.0-4.7: 97.4 / 97.6 / 97.6 vs
+  98.3 / 98.5 / 98.4 (+0.9%).
+- Remaining host idle: the verify launch after each draft (needs the draft token's embedding on the GPU to enqueue
+  draft and verify back to back) and the rollback copies (the next forward could read the snapshot in place).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
