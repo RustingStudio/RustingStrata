@@ -1241,10 +1241,10 @@ kernel starts). Full test suite passes.
 
 ### 2026-10-09 #72 — GQA attention threshold 2048 -> 1024 (rejected, no commit)
 
-With 32 splits (#71) \`attn_decode_bandwidth\` puts the GQA kernel at or below the one-head kernel from ~768
+With 32 splits (#71) `attn_decode_bandwidth` puts the GQA kernel at or below the one-head kernel from ~768
 positions (us, 1 / 2 tokens, g1 vs gqa: 768 27.7/49.2 vs 26.5/43.2; 1024 31.0/52.9 vs 29.6/45.3; 1536 41.5/75.9 vs
-36.6/54.5; 512 21.2/35.3 vs 26.0/40.3). \`ATT_GQA_MIN\` 1024 passed the full suite, but \`bench --pp 1280 --tg 128
---reps 3\` (3 interleaved rounds, load 4.3-16.8) showed no gain: mtp 0 99.4 -> 98.9, mtp 1 102.9 -> 103.5 tok/s
+36.6/54.5; 512 21.2/35.3 vs 26.0/40.3). `ATT_GQA_MIN` 1024 passed the full suite, but `bench --pp 1280 --tg 128
+--reps 3` (3 interleaved rounds, load 4.3-16.8) showed no gain: mtp 0 99.4 -> 98.9, mtp 1 102.9 -> 103.5 tok/s
 (means, spread 0.5-2.3). Kept 2048. Redo only with a profile showing attention at 1-2K as a real cost.
 
 ## Next candidates
