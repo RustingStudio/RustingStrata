@@ -1353,6 +1353,21 @@ environment separately for the kernel compile and for the cache size, so a libra
 `STRATA_KV_Q8` between the two could size an f16 cache as q8 and write out of bounds. `Gpu::new` now reads it once
 into `Gpu::kv_q8`, sizes come from `Gpu::kv_words`, and `kv_store` refuses a q8 head_dim that is not a multiple of 32.
 
+### 2026-10-09 #79 — rejected: 8-byte q8 KV loads
+
+Tried `ldkv<PER, hd>` with head_dim at compile time and `uint2` loads where the row layout allows them. The q8 test
+passed, but nsys at 32K (`--kv q8`, load 1.1-1.4) showed no gain, so it was reverted (no commit):
+
+| per call | f16 | q8 (e1d933c) |
+|---|---|---|
+| attn_prefill_256 | 71.1 ms | 108.9 ms |
+| attn_decode_gqa | 274 µs | 322 µs |
+
+ptxas: q8 uses fewer registers than f16 (prefill 178 vs 232, decode 204 vs 227), 0 spills, so register pressure
+is not why q8 is slower. Both prefill variants have a 528-byte stack frame (a local array, likely the `o` accumulator),
+in f16 too; worth a look as a separate prefill item. Remaining q8 ideas: copy raw int8 tiles to shared memory and
+dequantize there, or convert straight to f32 in decode.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
