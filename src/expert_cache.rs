@@ -29,7 +29,8 @@ pub struct ExpertCache {
     n_expert: usize,
     /// Decayed routing counts, [layer * n_expert + expert].
     counts: Vec<f32>,
-    profile: PathBuf,
+    /// None under `STRATA_FIXED_EXPERTS`: placement ignores and keeps the saved profile and never adapts.
+    profile: Option<PathBuf>,
     pub swaps: usize,
 }
 
@@ -67,8 +68,8 @@ impl ExpertCache {
         }
         let total: usize = classes.iter().map(|(b, k)| b * k).sum();
         let frac = (budget as f64 / total.max(1) as f64).min(1.0);
-        let profile = profile_path(m);
-        let counts = std::fs::read(&profile).ok()
+        let profile = std::env::var_os("STRATA_FIXED_EXPERTS").is_none().then(|| profile_path(m));
+        let counts = profile.as_ref().and_then(|p| std::fs::read(p).ok())
             .filter(|b| b.len() >= 4 * c.n_layer * n)
             .map(|b| b.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect::<Vec<_>>())
             .unwrap_or_default();
@@ -143,6 +144,7 @@ impl ExpertCache {
 
     /// Decay counts, then per pool swap up to `max_swaps` cold residents for clearly hotter missed experts.
     pub fn adapt(&mut self, m: &Model, gpu: &Gpu, max_swaps: usize) -> anyhow::Result<()> {
+        if self.profile.is_none() { return Ok(()); }
         for c in &mut self.counts { *c *= 0.95; }
         let n = self.n_expert;
         for p in 0..self.pools.len() {
@@ -170,8 +172,9 @@ impl ExpertCache {
     }
 
     pub fn save_profile(&self) -> anyhow::Result<()> {
-        std::fs::create_dir_all(self.profile.parent().unwrap())?;
-        std::fs::write(&self.profile, self.counts.iter().flat_map(|c| c.to_le_bytes()).collect::<Vec<u8>>())?;
+        let Some(profile) = &self.profile else { return Ok(()) };
+        std::fs::create_dir_all(profile.parent().unwrap())?;
+        std::fs::write(profile, self.counts.iter().flat_map(|c| c.to_le_bytes()).collect::<Vec<u8>>())?;
         Ok(())
     }
 }
