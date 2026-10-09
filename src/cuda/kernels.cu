@@ -882,7 +882,8 @@ extern "C" __global__ void rms_norm(const float* x, int x_stride, const float* w
     const float* xr = x + (size_t)blockIdx.x * x_stride;
     float* o = out + (size_t)blockIdx.x * out_stride;
     float s = 0.0f;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) s += xr[i] * xr[i];
+    // The sum keeps the order of a 256-thread block (bit-identical results); all threads scale.
+    if (threadIdx.x < 256) for (int i = threadIdx.x; i < n; i += 256) s += xr[i] * xr[i];
     float sc = 1.0f / sqrtf(block_sum(s) / (float)n + eps);
     for (int i = threadIdx.x; i < n; i += blockDim.x) o[i] = xr[i] * sc * w[i];
     if (xq) {
