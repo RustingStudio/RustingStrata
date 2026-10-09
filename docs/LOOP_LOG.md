@@ -1191,6 +1191,24 @@ At 654a270, `bench --gpu --pp 512,4096 --tg 128 --reps 3`, 3 interleaved rounds 
 #66-#68 and the supported type list. The old README said 82% MTP acceptance; it is 63% on this bench text.
 Target check: 4K prefill (2000) and 32K decode (70) are met; 4K decode with MTP is 98-100, just under 100.
 
+### 2026-10-09 #70 — Q6_K integer CPU dot (a992641)
+
+The 35B IQ4_XS file has Q6_K `ffn_down_exps` in 3 of 40 layers, which fell back to f32 dequantization on the CPU
+expert path. Added a scalar Q6_K x Q8_K dot (llama.cpp generic layout) to `src/cpu_moe.rs`; the compiler
+vectorizes it well enough that no AVX2 version was needed. `int_dots_match_dequant` now covers Q6_K, and a
+planted shift bug in the high bits makes it fail.
+
+35B IQ4_XS, `generate -n 64 --gpu --fixed-experts`, 3 interleaved rounds (load 8.0-10.2, another loop busy):
+
+| | r1 | r2 | r3 |
+|---|---|---|---|
+| 654a270 decode | 23.6 (cold page cache) | 48.8 | 48.9 |
+| a992641 decode | 54.3 | 54.1 | 53.7 |
+| CPU expert share, old / new | 75.1% / 43.7% | 49.4% / 43.9% | 49.2% / 44.2% |
+
+Warm decode 48.9 -> 54.0 tok/s (+11%). The 24-token text is unchanged and still equals llama.cpp. The main model
+has no Q6_K experts (one Q2_K/Q3_K layer, which still uses the fallback), so it is unaffected.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
