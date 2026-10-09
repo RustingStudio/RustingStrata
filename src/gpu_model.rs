@@ -320,8 +320,7 @@ impl<'a> GpuModel<'a> {
         let p = |n: &str| g.ptr(&self.bufs[n]);
         let x = g.ptr(&self.x);
         for (il, l) in self.layers.iter().enumerate() { self.layer(il, l, x, step, self.worker.as_ref(), nt)?; }
-        g.rms_norm(x, ne, self.output_norm.ptr, p("h"), ne, ne, nt, eps)?;
-        g.quant_xq(p("h"), ne, ne, nt, p("hq"))?;
+        g.rms_norm_q(x, ne, self.output_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"))?;
         g.gemvq(&self.output, p("h"), ne, p("hq"), g.ptr(&self.logits), c.n_vocab, nt)
     }
 
@@ -441,8 +440,7 @@ impl<'a> GpuModel<'a> {
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
         let kv = nkv * hd;
         {
-            g.rms_norm(x, ne, l.attn_norm.ptr, p("h"), ne, ne, nt, eps)?;
-            g.quant_xq(p("h"), ne, ne, nt, p("hq"))?;
+            g.rms_norm_q(x, ne, l.attn_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"))?;
             match &l.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, snap } => {
                     let (sc, ss, ns) = snap.as_ref().map_or((0, 0, 0), |(a, b)| (g.ptr(a), g.ptr(b), self.k));
@@ -476,8 +474,7 @@ impl<'a> GpuModel<'a> {
                 }
             }
             g.add(x, p("mix"), nt * ne)?;
-            g.rms_norm(x, ne, l.post_norm.ptr, p("h"), ne, ne, nt, eps)?;
-            g.quant_xq(p("h"), ne, ne, nt, p("hq"))?;
+            g.rms_norm_q(x, ne, l.post_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"))?;
             match &l.ffn {
                 Ffn::Dense { gate, up, down } => {
                     mv(gate, "h", ne, "ge", c.n_ff)?;
