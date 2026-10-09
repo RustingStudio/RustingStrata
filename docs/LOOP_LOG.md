@@ -1256,6 +1256,32 @@ nsys (512 prompt, 256 decode tokens): `rms_norm` 4.47 us per call with 256 threa
 that moves 5 greedy tokens. Reverted per the parity rule. Redo only together with a change that restores parity, or
 keep 256 threads for the sum and use the extra threads only for the scaling and quantization.
 
+### 2026-10-09 #74 — rms_norm with 512 threads, same bits (90c1b9d); flaky prefill test fixed (abcfdaf)
+
+Follow-up to #73: 512 threads per block, but only the first 256 accumulate the sum of squares with the 256-thread
+stride, so the sum (and the block_sum tree, where the extra warps add zeros) is bit-identical; all 512 threads
+scale. nsys: 3.06 us per call (256 threads: 4.47, plain 512: 3.11), so the gain was in the scaling phase.
+
+Parity (`--llama-numerics --fixed-experts`, interleaved, load 8.1-14.3): 633/640 before and after. Bench (3
+interleaved rounds, load 1.6-3.5, `--reps 3`):
+
+| | ca47f5e r1 / r2 / r3 | 90c1b9d r1 / r2 / r3 |
+|---|---|---|
+| decode after 512, mtp 0 | 101.2 / 101.4 / 101.5 | 102.8 / 103.0 / 103.0 |
+| decode after 4K, mtp 0 | 97.2 / 96.9 / 97.0 | 98.3 / 98.4 / 98.5 |
+| decode after 512, mtp 1 | 113.4 / 113.0 / 113.1 | 115.7 / 114.3 / 115.1 |
+| decode after 4K, mtp 1 | 105.1 / 105.7 / 105.8 | 105.3 / 106.8 / 107.6 (65.2% accepted) |
+| 4K prefill | 2077 / 2076 / 2089 | 2067 / 2089 / 2090 |
+| 32K decode mtp 0 / 1 | 79.3 / 85.7 | 81.6 / 84.9 |
+
+Decode +1.5% after 512 and after 4K. With a quiet host, 4K decode with MTP is now 105-108, above the 100 target.
+
+`prefill_matches_reference` failed at both ca47f5e and 90c1b9d with the same numbers (prefill error 1.62 above 1.5x
+the decode error 0.82), although it passed at 144b43b. The test loads with a 512 MB expert budget and placed experts
+from the routing profile in `~/.cache/rusting_strata`, which every bench run rewrites, so its decode yardstick
+depended on what ran before. It now sets `STRATA_FIXED_EXPERTS` (layer-order placement); passes at both commits
+with identical numbers.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
