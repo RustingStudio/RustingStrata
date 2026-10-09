@@ -1105,14 +1105,23 @@ template <int PER> __device__ __forceinline__ void ldkv(const u16* c, size_t off
 #if KV_Q8
     int w = off % hd;
     const char* r = (const char*)c + off / hd * (hd + hd / 16);
-    float d = h2f(*(const u16*)(r + hd + 2 * (w / 32)));
-    signed char b[PER];
+    unsigned d = *(const u16*)(r + hd + 2 * (w / 32)) * 0x10001u;  // scale in both halves
+    // Byte q (flipped to q + 128) under exponent byte 0x64 is the f16 1024 + q + 128; minus 1152 gives q exactly, and
+    // q * d rounded once to f16 equals f2h((float)q * d).
+    auto deq = [&](unsigned x, unsigned sel) {
+        unsigned h = __byte_perm(x ^ 0x80808080u, 0x64646464u, sel), r;
+        asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(h) : "r"(h), "r"(0x64806480u));
+        asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(h), "r"(d));
+        return r;
+    };
     if constexpr (PER % 4 == 0) {
-        for (int i = 0; i < PER / 4; i++) *(int*)&b[4 * i] = ((const int*)(r + w))[i];
+        for (int i = 0; i < PER / 4; i++) {
+            unsigned x = ((const unsigned*)(r + w))[i];
+            o[2 * i] = deq(x, 0x4140); o[2 * i + 1] = deq(x, 0x4342);
+        }
     } else {
-        for (int i = 0; i < PER; i++) b[i] = r[w + i];
+        for (int i = 0; i < PER / 2; i++) o[i] = deq(*(const u16*)(r + w + 2 * i), 0x4140);
     }
-    for (int i = 0; i < PER; i += 2) o[i / 2] = h2pack(d * b[i], d * b[i + 1]);
 #else
     ldh_raw<PER>(c + off, o);
 #endif

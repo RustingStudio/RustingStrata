@@ -49,19 +49,18 @@ pub struct Gpu {
     fns: HashMap<String, CudaFunction>,
     /// q8 rows of the last integer GEMM's X (see quant_q8 in kernels.cu), grown on demand.
     q8: std::sync::Mutex<CudaSlice<u8>>,
+    /// The kernels were compiled for a q8 KV cache (`--kv q8`).
+    pub kv_q8: bool,
 }
 
 /// `--llama-numerics`: quantize activations like llama.cpp's CPU q8_K (one scale per 256) for every integer matmul,
 /// and run attention as its CPU flash attention does (LLAMA_Q8 in kernels.cu).
 pub fn llama_numerics() -> bool { std::env::var_os("STRATA_LLAMA_NUMERICS").is_some() }
 
-/// `--kv q8`: KV cache rows in ggml q8_0 form (KV_Q8 in kernels.cu).
-pub fn kv_q8() -> bool { std::env::var_os("STRATA_KV_Q8").is_some() }
+/// `--kv q8`: KV cache rows in ggml q8_0 form (KV_Q8 in kernels.cu), read once by Gpu::new.
+fn kv_q8() -> bool { std::env::var_os("STRATA_KV_Q8").is_some() }
 
-/// u16 words of a KV cache for `n` values (n a multiple of 32): f16, or q8 with one f16 scale per 32 values.
-pub fn kv_words(n: usize) -> usize { if kv_q8() { n * 17 / 32 } else { n } }
-
-fn source() -> String {
+fn source(kv_q8: bool) -> String {
     let join = |v: Vec<String>| v.join(",");
     format!(
         "__device__ const unsigned long long iq2xs_grid[512] = {{{}}};\n\
@@ -81,7 +80,7 @@ fn source() -> String {
         join(KSIGNS_IQ2XS.iter().map(|v| v.to_string()).collect()),
         join(KVALUES_IQ4NL.iter().map(|v| v.to_string()).collect()),
         llama_numerics() as u8,
-        kv_q8() as u8,
+        kv_q8 as u8,
         include_str!("kernels.cu"),
     )
 }
@@ -134,13 +133,14 @@ fn kname(prefix: &str, ty: GgmlType) -> String { format!("{prefix}_{}", ty.name(
 
 impl Gpu {
     pub fn new() -> anyhow::Result<Gpu> {
-        anyhow::ensure!(!(kv_q8() && llama_numerics()), "--kv q8 does not combine with --llama-numerics (its attention reads f16 KV)");
+        let kv_q8 = kv_q8();
+        anyhow::ensure!(!(kv_q8 && llama_numerics()), "--kv q8 does not combine with --llama-numerics (its attention reads f16 KV)");
         let ctx = CudaContext::new(0).context("CUDA init")?;
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream()?;
         let (maj, min) = ctx.compute_capability()?;
         let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
-        let module = ctx.load_module(ptx(&source(), arch)?).context("load PTX")?;
+        let module = ctx.load_module(ptx(&source(kv_q8), arch)?).context("load PTX")?;
         let mut fns = HashMap::new();
         let names = KERNELS.iter().map(|s| s.to_string())
             .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm"].map(|p| kname(p, t))))
@@ -154,7 +154,7 @@ impl Gpu {
             fns.insert(n, f);
         }
         let q8 = std::sync::Mutex::new(stream.alloc_zeros::<u8>(1)?);
-        Ok(Gpu { ctx, stream, fns, q8 })
+        Ok(Gpu { ctx, stream, fns, q8, kv_q8 })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -383,7 +383,12 @@ impl Gpu {
     }
 
     /// Store `t` tokens of `n` values at positions step[0] ...
+    /// u16 words of a KV cache for `n` values: f16, or q8 with one f16 scale per 32 values.
+    pub fn kv_words(&self, n: usize) -> usize { if self.kv_q8 { n * 17 / 32 } else { n } }
+
     pub fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()> {
+        // q8: each warp quantizes one 32-value block of one row.
+        anyhow::ensure!(!self.kv_q8 || (hd % 32 == 0 && n % hd == 0), "q8 KV cache: head_dim {hd} is not a multiple of 32");
         launch!(self, "kv_store", Self::grid(n * t), k, v, kc, vc, n as i32, (n * t) as i32, step, hd as i32);
         Ok(())
     }
