@@ -11,6 +11,9 @@ ap.add_argument("--limit", type=int, default=20); ap.add_argument("--port", type
 ap.add_argument("--bin", default="target/release/strata"); ap.add_argument("--extra", default="")
 ap.add_argument("--tag", default="")
 ap.add_argument("--ref", default="target/parity-ref.json", help="reference cache (per llama.cpp build)")
+ap.add_argument("--alt", default="target/llama-batch-argmax.json",
+                help="llama.cpp argmax with the context run as one batch (tools/selfparity.py); the v1 gate counts a "
+                     "token if it matches either llama.cpp mode")
 ap.add_argument("--start", type=int, default=0, help="score only prompts from this index (resume)")
 a = ap.parse_args()
 root = pathlib.Path(__file__).resolve().parent.parent
@@ -33,9 +36,10 @@ for p in prompts:
     json.dump(ref, open(cache, "w"))
     print("ref", len(ids), "prompt tokens ->", len(r["tokens"]), flush=True)
 
-agree = total = 0
+alt = json.load(open(root / a.alt)) if (root / a.alt).exists() else None
+agree = either = total = 0
 rows = []
-for p in prompts[a.start:]:
+for pi, p in enumerate(prompts[a.start:], a.start):
     ids, cont = ref[p]["ids"], ref[p]["cont"][: a.n]
     out = subprocess.run([str(root / a.bin), "score", "--model", a.model, "--input", "-", *a.extra.split()],
                          input=json.dumps({"prompt": ids, "continuation": cont}), capture_output=True, text=True)
@@ -46,11 +50,13 @@ for p in prompts[a.start:]:
     # First disagreement and our top-2 logprob gap there (small gap = near-tie).
     bad = next((i for i, (x, y) in enumerate(zip(mine, cont)) if x != y), None)
     gap = None if bad is None else round(res["top5"][bad][0][1] - res["top5"][bad][1][1], 4)
-    agree += k; total += len(cont)
+    e = sum(x == y or (alt is not None and x == alt[pi][i]) for i, (x, y) in enumerate(zip(mine, cont)))
+    agree += k; either += e; total += len(cont)
     rows.append({"prompt": p.split("\n")[1][:50], "prompt_tokens": len(ids), "agree": k, "n": len(cont),
                  "first_miss": bad, "top2_gap_at_miss": gap, "argmax": mine})
     print({k: v for k, v in rows[-1].items() if k != "argmax"}, flush=True)
 pct = 100 * agree / total
 print(f"TOP1 AGREEMENT {agree}/{total} = {pct:.2f}%")
-json.dump({"rows": rows, "agree": agree, "total": total}, open(root / f"target/parity-result{'-' + a.tag if a.tag else ''}.json", "w"), indent=1)
-sys.exit(0 if agree >= 0.99 * total else 1)
+if alt is not None: print(f"EITHER LLAMA MODE {either}/{total} = {100 * either / total:.2f}% (v1 gate)")
+json.dump({"rows": rows, "agree": agree, "either": either if alt else None, "total": total}, open(root / f"target/parity-result{'-' + a.tag if a.tag else ''}.json", "w"), indent=1)
+sys.exit(0 if (either if alt else agree) >= 0.99 * total else 1)
