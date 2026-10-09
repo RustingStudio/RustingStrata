@@ -216,17 +216,16 @@ impl<'a> GpuModel<'a> {
         Ok(logits.chunks(nvoc).map(|c| c.to_vec()).collect())
     }
 
-    /// `verify` for greedy speculation: `keep` gets the argmax of every row; returns its row n and that row's logits.
-    fn verify_greedy(&mut self, tokens: &[u32], keep: impl FnOnce(&[u32]) -> usize) -> anyhow::Result<(usize, Vec<f32>)> {
+    /// `verify` for greedy speculation: `keep` gets the argmax of every row; returns its row n and that row's argmax.
+    fn verify_greedy(&mut self, tokens: &[u32], keep: impl FnOnce(&[u32]) -> usize) -> anyhow::Result<(usize, u32)> {
         let (nt, nvoc) = (tokens.len(), self.m.cfg.n_vocab);
         self.verify_run(tokens)?;
         let g = &self.gpu;
         g.argmax_rows(g.ptr(&self.logits), nvoc, nt, g.ptr(&self.amax))?;
         let am: Vec<u32> = g.stream.clone_dtoh(&self.amax.slice(0..nt))?.into_iter().map(|x| x as u32).collect();
         let n = keep(&am);
-        let logits = g.stream.clone_dtoh(&self.logits.slice(n * nvoc..(n + 1) * nvoc))?;
         self.after_forward(nt)?;
-        Ok((n, logits))
+        Ok((n, am[n]))
     }
 
     /// Enqueue the forward of `verify` (no logits copy).
@@ -343,12 +342,12 @@ impl<'a> GpuModel<'a> {
     /// Speculative decode with MTP. `t` is the next token (argmax of the last logits), predicted by hidden row `row`.
     /// Drafts `k` tokens after `t` (each from the previous draft's hidden state), verifies [t, drafts..] in one forward
     /// and keeps the drafts up to the first one the main model disagrees with (`rollback`). Returns the accepted tokens,
-    /// the logits after the last one and its hidden row. Greedy output equals plain `step` decoding (verify is
+    /// the greedy token after the last one (argmax of its logits, first on ties) and its hidden row. Greedy output equals plain `step` decoding (verify is
     /// bit-identical to steps). The draft head entries of accepted drafts wait for the next call's first draft pass,
     /// which runs them with `t` in one batch (their main model rows 0..n precede `t`'s row n).
-    pub fn spec_step(&mut self, t: u32, row: usize) -> anyhow::Result<(Vec<u32>, Vec<f32>, usize)> {
+    pub fn spec_step(&mut self, t: u32, row: usize) -> anyhow::Result<(Vec<u32>, u32, usize)> {
         let k = self.k;
-        if self.pos + k + 1 > self.ctx { return Ok((vec![t], self.step(t)?, 0)); }
+        if self.pos + k + 1 > self.ctx { return Ok((vec![t], crate::ops::argmax(&self.step(t)?) as u32, 0)); }
         let h = self.mtp.as_mut().unwrap();
         let mut first = std::mem::take(&mut h.pend);
         if first.len() != row { first.clear(); }
@@ -363,7 +362,7 @@ impl<'a> GpuModel<'a> {
             toks.push(d);
         }
         let start = self.pos;
-        let (n, logits) = self.verify_greedy(&toks, |am| (0..k).take_while(|&i| am[i] == toks[i + 1]).count())?;
+        let (n, next) = self.verify_greedy(&toks, |am| (0..k).take_while(|&i| am[i] == toks[i + 1]).count())?;
         self.drafts.0 += k;
         self.drafts.1 += n;
         if n < k { self.rollback(start, n + 1)?; }
@@ -372,7 +371,7 @@ impl<'a> GpuModel<'a> {
         h.pos = hp + 1;
         h.pend = toks[1..=n].to_vec();
         toks.truncate(n + 1);
-        Ok((toks, logits, n))
+        Ok((toks, next, n))
     }
 
     /// Address of hidden row `row` of the last `step` or `verify`.

@@ -435,15 +435,16 @@ fn calibrate(model: &Path, ctx: usize, margin: usize) -> anyhow::Result<()> {
 fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut logits: Vec<f32>, n: usize,
           emit: &mut dyn FnMut(&str) -> anyhow::Result<()>) -> anyhow::Result<(Vec<u32>, bool)> {
     let eos = tok.eos_ids();
-    let (mut out, mut printed, mut row) = (Vec::new(), 0, 0);
+    // `ahead`: the next token when `spec_step` already picked it (greedy) without copying logits back.
+    let (mut out, mut printed, mut row, mut ahead) = (Vec::new(), 0, 0, None);
     while out.len() < n {
-        let next = smp.pick(&logits) as u32;
+        let next = match ahead.take() { Some(t) => t, None => smp.pick(&logits) as u32 };
         if eos.contains(&next) { return Ok((out, true)); }
         let toks = match r {
             // ponytail: MTP drafts are checked greedily, so sampling decodes one token per step
             Runner::Gpu(g) if mtp && smp.temp <= 0.0 => {
-                let (toks, l, rw) = g.spec_step(next, row)?;
-                (logits, row) = (l, rw);
+                let (toks, nx, rw) = g.spec_step(next, row)?;
+                (ahead, row) = (Some(nx), rw);
                 toks
             }
             _ => { logits = r.step(next)?; vec![next] }

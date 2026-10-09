@@ -182,17 +182,16 @@ fn mtp_spec_matches_greedy() {
     let mut run = |k: usize| -> (Vec<u32>, (usize, usize)) {
         (gm.k, gm.drafts) = (k.max(1), (0, 0));
         gm.reset().unwrap();
-        let mut logits = gm.prefill(&ids).unwrap();
+        let mut t = ops::argmax(&gm.prefill(&ids).unwrap()) as u32;
         let (mut out, mut row) = (vec![], 0);
         while out.len() < n {
-            let t = ops::argmax(&logits) as u32;
             if k > 0 {
-                let (toks, l, r) = gm.spec_step(t, row).unwrap();
-                (logits, row) = (l, r);
+                let (toks, nx, r) = gm.spec_step(t, row).unwrap();
+                (t, row) = (nx, r);
                 out.extend(toks);
             } else {
                 out.push(t);
-                logits = gm.step(t).unwrap();
+                t = ops::argmax(&gm.step(t).unwrap()) as u32;
             }
         }
         out.truncate(n);
