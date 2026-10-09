@@ -4,7 +4,7 @@ A pure-Rust inference engine for the Qwen3.5/3.6 hybrid model family (`qwen35moe
 are compiled at run time with NVRTC through cudarc: no C++ build step, no ggml. Experts that do not fit in VRAM run
 on the CPU at the same time as the GPU work, and the expert placement adapts to the routing it sees.
 
-Status: v1 milestones M0-M5 are done, M6 (server, chat, calibration, bench) is mostly done.
+Status: v1 milestones M0-M6 are done (M6: server, chat, calibration, bench).
 `docs/LOOP_LOG.md` has every change with its measurements.
 
 ## Numbers
