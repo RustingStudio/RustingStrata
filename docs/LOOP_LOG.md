@@ -1393,6 +1393,10 @@ experts are in layer 40, the MTP layer, which `score` does not run. On an idle G
 gave 633 every time this session. Parity and benchmark numbers taken while another program holds VRAM are not
 comparable; `plan: ... resident experts` in the run log tells.
 
+Recheck once VRAM use fell below 1.2 GB (load 4.0): 1fbf113 gave 633/640, so the gate holds. e1d933c run right after
+gave 631 while other programs took VRAM again (2.0 GB used at the end, 7349 resident experts in a check run), which
+fits the explanation above.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
