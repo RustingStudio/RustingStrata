@@ -109,6 +109,21 @@ template <> __device__ __forceinline__ void deq8<14>(const u8* b, int sub, float
         o[i] = d * (float)(q - 32);
     }
 }
+template <> __device__ __forceinline__ void deq8<16>(const u8* b, int sub, float* o) {  // IQ2_XXS
+    int ib = sub >> 2, l = sub & 3;
+    u32 aux = ld16(b + 6 + 8 * ib) | (ld16(b + 8 + 8 * ib) << 16);
+    u64 g = iq2xxs_grid[b[2 + 8 * ib + l]];
+    u8 sg = ksigns_iq2xs[(aux >> (7 * l)) & 127];
+    float db = ldh(b) * (0.5f + (float)(aux >> 28)) * 0.25f;
+    for (int j = 0; j < 8; j++) o[j] = db * (float)((g >> (8 * j)) & 0xFF) * ((sg >> j) & 1 ? -1.0f : 1.0f);
+}
+template <> __device__ __forceinline__ void deq8<22>(const u8* b, int sub, float* o) {  // IQ2_S
+    int ib = sub >> 2, l = sub & 3;
+    u64 g = iq2s_grid[b[2 + 4 * ib + l] | ((b[66 + ib] << (8 - 2 * l)) & 0x300)];
+    u8 sg = b[34 + 4 * ib + l], sc = b[74 + ib];
+    float db = ldh(b) * (0.5f + (float)(l < 2 ? sc & 0xF : sc >> 4)) * 0.25f;
+    for (int j = 0; j < 8; j++) o[j] = db * (float)((g >> (8 * j)) & 0xFF) * ((sg >> j) & 1 ? -1.0f : 1.0f);
+}
 template <> __device__ __forceinline__ void deq8<17>(const u8* b, int sub, float* o) {  // IQ2_XS
     int ib = sub >> 2, l = sub & 3;
     u32 q = ld16(b + 2 + 2 * (4 * ib + l));
@@ -272,6 +287,27 @@ template <> struct QI<14> {  // Q6_K (210 bytes: rows 2-aligned)
         lo = (int)__vsub4(a, 0x20202020u); hi = (int)__vsub4(c, 0x20202020u);
     }
 };
+template <> struct QI<16> {  // IQ2_XXS (66 bytes: rows 2-aligned)
+    static constexpr bool MIN = false;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        int ib = sub >> 2, l = sub & 3;
+        u32 aux = ld16(b + 6 + 8 * ib) | (ld16(b + 8 + 8 * ib) << 16);
+        d = ldh(b) * (0.5f + (float)(aux >> 28)) * 0.25f;
+        u64 g = iq2xxs_grid[b[2 + 8 * ib + l]];
+        u32 sg = ksigns_iq2xs[(aux >> (7 * l)) & 127];
+        lo = apply_signs((u32)g, sg & 15); hi = apply_signs((u32)(g >> 32), sg >> 4);
+    }
+};
+template <> struct QI<22> {  // IQ2_S (82 bytes: rows 2-aligned)
+    static constexpr bool MIN = false;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        int ib = sub >> 2, l = sub & 3;
+        u64 g = iq2s_grid[b[2 + 4 * ib + l] | ((b[66 + ib] << (8 - 2 * l)) & 0x300)];
+        u32 sg = b[34 + 4 * ib + l], sc = b[74 + ib];
+        d = ldh(b) * (0.5f + (float)(l < 2 ? sc & 0xF : sc >> 4)) * 0.25f;
+        lo = apply_signs((u32)g, sg & 15); hi = apply_signs((u32)(g >> 32), sg >> 4);
+    }
+};
 template <> struct QI<17> {  // IQ2_XS (74 bytes: rows 2-aligned)
     static constexpr bool MIN = false;
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
@@ -415,7 +451,7 @@ __device__ __forceinline__ void gemv_row_qn(const u8* __restrict__ w, const sign
 
 #define FTYPES(X) X(0, f32, 1024) X(30, bf16, 512)
 #define ITYPES(X) X(8, q8_0, 272) X(10, q2_k, 84) X(11, q3_k, 110) X(12, q4_k, 144) X(13, q5_k, 176) X(14, q6_k, 210) \
-    X(17, iq2_xs, 74) X(18, iq3_xxs, 98) X(21, iq3_s, 110) X(23, iq4_xs, 136)
+    X(16, iq2_xxs, 66) X(17, iq2_xs, 74) X(22, iq2_s, 82) X(18, iq3_xxs, 98) X(21, iq3_s, 110) X(23, iq4_xs, 136)
 #define QTYPES(X) FTYPES(X) ITYPES(X)
 
 #define DEF_DEQUANT(T, NAME, SBB)                                                                                 \
@@ -663,7 +699,7 @@ __device__ __forceinline__ void mma_s8_16832(int* c, u32 a0, u32 a1, u32 a2, u32
 // int -> float for |c| < 2^22 without the quarter-rate I2F: 2^23 + 2^22 + c has c in its low mantissa bits.
 __device__ __forceinline__ float i2f_small(int c) { return __int_as_float(0x4B400000 + c) - 12582912.0f; }
 // Weight types whose scale (and min) is constant over 32 weights: one 32-deep mma per scale.
-template <int T> __host__ __device__ constexpr bool scale32() { return T == 8 || T == 12 || T == 13 || T == 18 || T == 21 || T == 23; }
+template <int T> __host__ __device__ constexpr bool scale32() { return T == 8 || T == 12 || T == 13 || T == 16 || T == 18 || T == 21 || T == 23; }
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok) {
     unsigned d = (unsigned)__cvta_generic_to_shared(dst);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(ok ? 16 : 0));

@@ -10,9 +10,9 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-const QTYPES: [GgmlType; 12] = {
+const QTYPES: [GgmlType; 14] = {
     use GgmlType::*;
-    [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ2XS, IQ3XXS, IQ3S, IQ4XS]
+    [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS]
 };
 const KERNELS: [&str; 26] = [
     "rms_norm", "quant_xq", "argmax_rows", "l2_norm", "rope_neox", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
@@ -59,11 +59,15 @@ fn source() -> String {
     let join = |v: Vec<String>| v.join(",");
     format!(
         "__device__ const unsigned long long iq2xs_grid[512] = {{{}}};\n\
+         __device__ const unsigned long long iq2xxs_grid[256] = {{{}}};\n\
+         __device__ const unsigned long long iq2s_grid[1024] = {{{}}};\n\
          __device__ const unsigned int iq3xxs_grid[256] = {{{}}};\n\
          __device__ const unsigned int iq3s_grid[512] = {{{}}};\n\
          __device__ const unsigned char ksigns_iq2xs[128] = {{{}}};\n\
          __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n#define LLAMA_Q8 {}\n{}",
         join(IQ2XS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
+        join(IQ2XXS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
+        join(IQ2S_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ3XXS_GRID.iter().map(|v| format!("{v:#x}u")).collect()),
         join(IQ3S_GRID.iter().map(|v| format!("{v:#x}u")).collect()),
         join(KSIGNS_IQ2XS.iter().map(|v| v.to_string()).collect()),
@@ -118,7 +122,8 @@ impl Gpu {
             .chain(QTYPES.iter().filter(|&&t| !Self::float_ty(t)).map(|&t| kname("gemmi", t)));
         for n in names {
             let f = module.load_function(&n).with_context(|| format!("kernel {n}"))?;
-            if n.starts_with("attn_prefill") {
+            // gemvn caches nt quantized inputs: 4 x 17408 columns (Qwen3.8-27B ffn_down) need 77 KB.
+            if n.starts_with("attn_prefill") || n.starts_with("gemvn") {
                 f.set_attribute(cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 96 << 10)?;
             }
             fns.insert(n, f);
@@ -168,8 +173,8 @@ impl Gpu {
     /// Whether the prefill GEMM for `ty` runs on int8 tensor cores (X quantized to int8 per 32) rather than f16.
     /// `STRATA_MMQ=q5_k,q6_k,..` overrides the default list.
     pub fn mmq(ty: GgmlType) -> bool {
-        // IQ2_XS has a scale per 16: its int8 path spends as long scaling mma results as in the mma, and loses to f16 (#31).
-        !Self::float_ty(ty) && std::env::var("STRATA_MMQ").map(|v| v.split(',').any(|t| t == ty.name())).unwrap_or(ty != GgmlType::IQ2XS || llama_numerics())
+        // IQ2_XS (and IQ2_S) has a scale per 16: its int8 path spends as long scaling mma results as in the mma, and loses to f16 (#31).
+        !Self::float_ty(ty) && std::env::var("STRATA_MMQ").map(|v| v.split(',').any(|t| t == ty.name())).unwrap_or(!matches!(ty, GgmlType::IQ2XS | GgmlType::IQ2S) || llama_numerics())
     }
 
     fn gemm_raw(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, wd: u64, nd: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {

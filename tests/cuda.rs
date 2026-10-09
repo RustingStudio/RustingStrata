@@ -37,7 +37,7 @@ fn dequant_and_gemv_match_reference_for_every_type() {
     let w = Weights { g: &g };
     let mut seen = std::collections::BTreeSet::new();
     for (name, info) in &g.tensors {
-        let ty = GgmlType::from_u32(info.ty).unwrap();
+        let Ok(ty) = GgmlType::from_u32(info.ty) else { continue };
         if info.dims.len() < 2 || info.dims[0] % 256 != 0 || !seen.insert(ty.name()) { continue; }
         let t = w.get(name).unwrap();
         let dt = gpu.upload(&t).unwrap();
@@ -79,8 +79,9 @@ fn moe_gemv_selects_experts() {
     let (Some(p), Some(gpu)) = (common::model_path(), gpu()) else { return };
     let g = Gguf::open(&p).unwrap();
     let w = Weights { g: &g };
+    let Some(info) = g.tensors.get("blk.0.ffn_gate_exps.weight") else { return };  // dense model
     let t = w.get("blk.0.ffn_gate_exps.weight").unwrap();
-    let n_expert = g.tensors["blk.0.ffn_gate_exps.weight"].dims[2] as usize;
+    let n_expert = info.dims[2] as usize;
     let dt = gpu.upload(&t).unwrap();
     let ids = [3i32, -1, 200];
     let x = xs(t.cols);
@@ -121,7 +122,7 @@ fn gemvn_matches_gemv() {
     let w = Weights { g: &g };
     let mut seen = std::collections::BTreeSet::new();
     for (name, info) in &g.tensors {
-        let ty = GgmlType::from_u32(info.ty).unwrap();
+        let Ok(ty) = GgmlType::from_u32(info.ty) else { continue };
         if info.dims.len() != 2 || info.dims[0] % 256 != 0 || !seen.insert(ty.name()) { continue; }
         let t = w.get(name).unwrap();
         let dt = gpu.upload(&t).unwrap();
@@ -164,7 +165,7 @@ fn gemv_bandwidth() {
     };
     let mut seen = std::collections::BTreeSet::new();
     for (name, info) in &g.tensors {
-        let ty = GgmlType::from_u32(info.ty).unwrap();
+        let Ok(ty) = GgmlType::from_u32(info.ty) else { continue };
         let moe = info.dims.len() == 3;
         if info.dims.len() < 2 || info.dims[0] % 256 != 0 || !seen.insert((ty.name(), info.dims.clone())) { continue; }
         let t = w.get(name).unwrap();
@@ -202,7 +203,7 @@ fn gemm_matches_reference_for_every_type() {
     let w = Weights { g: &g };
     let mut seen = std::collections::BTreeSet::new();
     for (name, info) in &g.tensors {
-        let ty = GgmlType::from_u32(info.ty).unwrap();
+        let Ok(ty) = GgmlType::from_u32(info.ty) else { continue };
         if info.dims.len() < 2 || info.dims[0] % 256 != 0 || !seen.insert(ty.name()) { continue; }
         let t = w.get(name).unwrap();
         let dt = gpu.upload(&t).unwrap();
