@@ -1209,6 +1209,36 @@ planted shift bug in the high bits makes it fail.
 Warm decode 48.9 -> 54.0 tok/s (+11%). The 24-token text is unchanged and still equals llama.cpp. The main model
 has no Q6_K experts (one Q2_K/Q3_K layer, which still uses the fallback), so it is unaffected.
 
+### 2026-10-09 #71 — 32 decode attention splits (144b43b)
+
+Profile (nsys, `--cuda-graph-trace=node`, bench --pp 4096 --tg 128): decode attention grows from 21 us per layer
+after 512 tokens to 69 us after 4096 (`attn_decode_gqa`, 8 MB of K/V, ~120 GB/s). The grid was 2 KV heads x 64
+splits = 128 blocks of one block per SM (~230 registers), 64 positions each. `attn_decode_bandwidth` with
+`ATT_SPLITS` 128 / 64 / 32 / 16 (us, 1 / 2 query tokens; includes attn_merge):
+
+| Positions | 128 | 64 | 32 | 16 |
+|---|---|---|---|---|
+| 4096 | 91 / 157 | 64 / 107 | 58.5 / 81 | 62 / 79 |
+| 16384 | 200 / 293 | 153 / 255 | 151 / 216 | 179 / 237 |
+| 32768 | 308 / 474 | 257 / 425 | 272 / 386 | 331 / 440 |
+
+Change: `ATT_SPLITS` 64 -> 32. A split count chosen per token count (64 for 1 token, 32 for 2) was faster still
+for 1 token at 32K, but `attn_prefill_matches_decode` requires one batched launch to give the same bits as single
+launches, which keeps greedy output equal with MTP on and off; the split count changes the summation order, so it
+must be the same for every token count. Rejected for that reason.
+
+Bench (`--pp 4096 --tg 128 --reps 3`, 3 interleaved rounds, load 5.4-14.3; 32K one round, `--reps 2`):
+
+| | a992641 r1 / r2 / r3 | 144b43b r1 / r2 / r3 |
+|---|---|---|
+| decode after 4K, mtp 0 | 95.2 / 95.9 / 92.4 (mean 94.5) | 96.4 / 96.0 / 96.0 (mean 96.1) |
+| decode after 4K, mtp 1 | 95.3 / 97.8 / 97.4 (mean 96.8) | 101.1 / 99.3 / 98.6 (mean 99.7) |
+| 32K decode, mtp 0 / 1 | 70.1 / 77.1 (load 8.5-13.4) | 80.2 / 81.1 (load 3.6-4.4) |
+
+MTP acceptance in this bench 58.0% -> 60.0-60.7% (the attention sum order changed). Parity (`--llama-numerics
+--fixed-experts`, interleaved): 633/640 both (the parity prompts stay below the 2048 positions where the GQA
+kernel starts). Full test suite passes.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
