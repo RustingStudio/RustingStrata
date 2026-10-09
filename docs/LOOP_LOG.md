@@ -1397,6 +1397,20 @@ Recheck once VRAM use fell below 1.2 GB (load 4.0): 1fbf113 gave 633/640, so the
 gave 631 while other programs took VRAM again (2.0 GB used at the end, 7349 resident experts in a check run), which
 fits the explanation above.
 
+### 2026-10-09 #82 — input errors; MTP draft vocabulary cut judged not worth it (e5e27df, 4fa3297)
+
+`strata score` took raw token ids without a range check: an id at or past n_vocab panicked in the embedding lookup
+(`range start index 1407999998592 out of range`), and an id above u32::MAX was truncated silently. Both are now
+errors (`token id 999999999 out of range (vocabulary has 248320 tokens)`, `bad id`). Context-full errors on the GPU
+now say to raise `--ctx`. Probed and fine: missing file, non-GGUF file, truncated GGUF, empty prompt, `--ctx 16`,
+`--ctx 40` with `--mtp 2` and with `--chunk 7`.
+
+Also looked at a smaller draft LM head (only the first N vocabulary rows, like FR-Spec without a corpus): of the 640
+llama.cpp reference tokens only 81.7% are below 32768, 86.6% below 65536 and 92.7% below 100000, since Qwen ids are
+not ordered by frequency. Cutting to 64K rows would save ~0.65 ms per draft (~5% of an MTP step at 4K) but every
+reference token past the cut is a sure miss, costing about as much acceptance (~62% now). Not built; a hot set
+counted from generated tokens at run time could work, but needs its own measurement.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
