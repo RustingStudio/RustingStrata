@@ -87,11 +87,26 @@ fn ptx(src: &str, arch: &'static str) -> anyhow::Result<Ptx> {
         .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"))
         .join("rusting_strata");
     let path = dir.join(format!("{:016x}.ptx", h.finish()));
-    if let Ok(s) = std::fs::read_to_string(&path) { return Ok(Ptx::from_src(s)); }
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        // Refresh mtime so pruning below keeps PTX that is still in use.
+        let _ = std::fs::File::options().append(true).open(&path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        return Ok(Ptx::from_src(s));
+    }
+    prune_ptx(&dir, std::time::Duration::from_secs(7 * 86400));
     let opts = CompileOptions { arch: Some(arch), options: vec!["-std=c++17".into()], ..Default::default() };
     let p = compile_ptx_with_opts(src, opts).map_err(|e| anyhow::anyhow!("NVRTC compile of kernels.cu failed: {e}"))?;
     let _ = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, p.to_src()));
     Ok(p)
+}
+
+/// Delete cached `.ptx` files in `dir` not used for `age`; every kernel edit leaves a stale ~4 MB file behind.
+fn prune_ptx(dir: &std::path::Path, age: std::time::Duration) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|d| d > age);
+        if old && p.extension().is_some_and(|x| x == "ptx") { let _ = std::fs::remove_file(p); }
+    }
 }
 
 pub fn cfg(grid: (u32, u32), block: u32, smem: u32) -> LaunchConfig {
@@ -405,5 +420,24 @@ impl Gpu {
         c.grid_dim.1 = t as u32;
         launch!(self, "moe_combine", c, x, ye, w, k as i32, sh, sg, mb, y_off as i32, step, slots, n as i32);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn prune_ptx_drops_only_stale_ptx() {
+        let d = std::env::temp_dir().join(format!("strata_prune_{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let day = std::time::Duration::from_secs(86400);
+        for (n, ago) in [("old.ptx", 8), ("new.ptx", 1), ("old.txt", 8)] {
+            let f = std::fs::File::create(d.join(n)).unwrap();
+            f.set_modified(std::time::SystemTime::now() - day * ago).unwrap();
+        }
+        super::prune_ptx(&d, day * 7);
+        let mut left: Vec<_> = std::fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        std::fs::remove_dir_all(&d).unwrap();
+        assert_eq!(left, ["new.ptx", "old.txt"]);
     }
 }
