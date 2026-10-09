@@ -15,15 +15,28 @@ does not fit in VRAM). llama.cpp is tuned for the same file (`--n-cpu-moe 10`, f
 
 | | RustingStrata | llama.cpp |
 |---|---|---|
-| Prefill, 4K prompt | **1581 tok/s** (1538-1610) | 1017 |
-| Decode after 4K prompt | **81.0 tok/s** (76.8-81.8) | 65.8 |
-| Decode, short prompt (like tg128) | **88.1 tok/s** | 65.8 |
-| Decode with MTP drafts (k = 1, greedy) | **~87-92 tok/s**, 82% of drafts accepted | 61.6 (its MTP is slower) |
-| 32K: prefill / decode | ~1290 / ~62 tok/s | 814 (pp512 at depth) / 56.4 |
-| Greedy top-1 agreement with llama.cpp (20 prompts x 32 tokens) | 98.3% | - |
+| Prefill, 4K prompt | **2093 tok/s** (2089-2096) | 1017 |
+| Decode after 4K prompt | **95.6 tok/s** (95.4-95.8) | 65.8 |
+| Decode, short prompt (like tg128) | **101.2 tok/s** (100.6-101.5) | 65.8 |
+| Decode with MTP drafts (`--mtp 1`, greedy), short / after 4K | **110.9 / 99.0 tok/s**, 63% of drafts accepted | 61.6 (its MTP is slower) |
+| 32K: prefill / decode / decode with MTP | **1562 / 77.4 / 80.8 tok/s** | 814 (pp512 at depth) / 56.4 |
+| Greedy top-1 agreement with llama.cpp (20 prompts x 32 tokens) | 98.3%; 98.9% with `--llama-numerics --fixed-experts` | - |
 
-Agreement is below the 99% v1 target: the remaining misses are mostly near-ties where llama.cpp's int8 activation
-rounding and this engine's kernels pick different tokens. MTP on and off give identical greedy tokens.
+Measured 2026-10-09 at 654a270: `strata bench --gpu --pp 512,4096 --tg 128 --reps 3`, mean of 3 rounds (range of
+the round means in brackets), CPU load 4-7 from other jobs; 32K is one round of 3 reps with `--ctx 33280`.
+Agreement is below the 99% v1 target: the remaining misses are near-ties where float rounding order picks a
+different token (`docs/LOOP_LOG.md` #60-#64). MTP on and off give identical greedy tokens.
+
+Other models, greedy "The capital of France is" with `--gpu` (output identical to llama.cpp for 24 tokens):
+
+| Model | Types | Decode |
+|---|---|---|
+| Qwen3.5-2B Q4_K_M | Q4_K, Q6_K, ... | 182 tok/s |
+| Qwen3.5-9B IQ3_M | IQ3_S, Q4_K, BF16 | 48.8 tok/s |
+| Qwen3.8-27B UD-IQ3_XXS (dense, 10.8 GB on GPU) | IQ1_S to IQ4_XS, Q2_K to Q8_0 | 19.3 tok/s |
+| Qwen3.6-35B-A3B UD-IQ4_XS (57% of experts fit in VRAM) | IQ3_S, IQ4_XS, Q6_K, Q8_0 | 34-47 tok/s cold, 83 tok/s once the placement has adapted |
+
+Supported GGUF types: F32, BF16, Q8_0, Q2_K-Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS.
 
 ## Build
 
