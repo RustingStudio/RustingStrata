@@ -194,7 +194,7 @@ impl<'a> GpuModel<'a> {
 
     /// Run one token; returns logits over the vocabulary.
     pub fn step(&mut self, token: u32) -> anyhow::Result<Vec<f32>> {
-        if self.pos >= self.ctx { bail!("context full ({} tokens)", self.ctx); }
+        if self.pos >= self.ctx { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
         let seq = self.worker.as_mut().map_or(0, |w| w.begin());
         let g = &self.gpu;
         let ne = self.m.cfg.n_embd;
@@ -232,7 +232,7 @@ impl<'a> GpuModel<'a> {
     fn verify_run(&mut self, tokens: &[u32]) -> anyhow::Result<()> {
         let nt = tokens.len();
         if !(1..=TMAX).contains(&nt) { bail!("verify: {nt} tokens (1 to {TMAX})"); }
-        if self.pos + nt > self.ctx { bail!("context full ({} tokens)", self.ctx); }
+        if self.pos + nt > self.ctx { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
         let seq = self.worker.as_mut().map_or(0, |w| w.begin());
         let (g, ne) = (&self.gpu, self.m.cfg.n_embd);
         let emb: Vec<f32> = tokens.iter().flat_map(|&t| self.m.embed(t)).collect();
@@ -383,7 +383,7 @@ impl<'a> GpuModel<'a> {
         let nt = tokens.len();
         let c = &self.m.cfg;
         let Some(h) = self.mtp.as_mut() else { bail!("MTP head not loaded") };
-        if h.pos + nt > self.ctx { bail!("context full ({} tokens)", self.ctx); }
+        if h.pos + nt > self.ctx { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
         let seq = h.worker.begin();
         let g = &self.gpu;
         let emb: Vec<f32> = tokens.iter().flat_map(|&t| self.m.embed(t)).collect();
