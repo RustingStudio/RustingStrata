@@ -936,32 +936,53 @@ extern "C" __global__ void kv_store(const float* k, const float* v, u16* kc, u16
 }
 
 #define INFINITY __int_as_float(0x7f800000)
-// PER consecutive f16 values to f32 with one vector load (p aligned to 2 * PER bytes).
-template <int PER> __device__ __forceinline__ void ldh_vec(const u16* p, float* o) {
+// PER consecutive f16 values (p aligned to 2 * PER bytes) as PER / 2 words, with vector loads.
+template <int PER> __device__ __forceinline__ void ldh_raw(const u16* p, unsigned* o) {
     if constexpr (PER >= 8) {
         for (int c = 0; c < PER / 8; c++) {
             uint4 v = ((const uint4*)p)[c];
-            const u16* h = (const u16*)&v;
-            for (int i = 0; i < 8; i++) o[c * 8 + i] = h2f(h[i]);
+            o[4 * c] = v.x; o[4 * c + 1] = v.y; o[4 * c + 2] = v.z; o[4 * c + 3] = v.w;
         }
     } else if constexpr (PER == 4) {
         uint2 v = *(const uint2*)p;
-        const u16* h = (const u16*)&v;
-        for (int i = 0; i < 4; i++) o[i] = h2f(h[i]);
+        o[0] = v.x; o[1] = v.y;
     } else {
-        unsigned v = *(const unsigned*)p;
-        o[0] = h2f((u16)v); o[1] = h2f((u16)(v >> 16));
+        o[0] = *(const unsigned*)p;
+    }
+}
+// f16 value d of words loaded by ldh_raw.
+__device__ __forceinline__ float hraw(const unsigned* r, int d) { return h2f((u16)(r[d >> 1] >> (16 * (d & 1)))); }
+
+// Sum v[0 .. N) over the warp; lane l returns the sum of v[l / (32 / N)]. Lanes trade halves of v instead of
+// reducing each value alone: 31 shuffles for N = 32 instead of 160. Recursion on the half size S keeps every
+// index constant, so v stays in registers.
+template <int N, int S = N / 2> __device__ __forceinline__ float warp_sum_scatter(float* v) {
+    if constexpr (S >= 1) {
+        bool hi = threadIdx.x & (S * 32 / N);
+#pragma unroll
+        for (int i = 0; i < S; i++) {
+            float keep = hi ? v[i + S] : v[i], send = hi ? v[i] : v[i + S];
+            v[i] = keep + __shfl_xor_sync(0xffffffff, send, S * 32 / N);
+        }
+        return warp_sum_scatter<N, S / 2>(v);
+    } else {
+        float r = v[0];
+#pragma unroll
+        for (int o = 16 / N; o >= 1; o /= 2) r += __shfl_xor_sync(0xffffffff, r, o);
+        return r;
     }
 }
 
 // Split-position decode attention. grid = (nh / G, ns splits): block (b, s) serves the G query heads b*G .. b*G+G-1
-// (one KV head) over an ns-th of the positions, so each K/V row is read once for all G heads. Each warp walks its
-// share with online softmax (lane owns PER = hd / 32 consecutive dims), warps merge head by head, and the block
-// writes per head its unnormalized partial [acc (hd) | max | sum] to part; attn_merge combines the splits.
+// (one KV head) over an ns-th of the positions, so each K/V row is read once for all G heads. The block walks its
+// share in chunks of 32 positions (4 per warp, lane owns PER = hd / 32 consecutive dims): warps compute the chunk's
+// scores, warp h runs the online softmax of head h over the chunk, then warps add the weighted V rows. All warps
+// share one running max per head, so their partials just add up. The block writes per head its unnormalized partial
+// [acc (hd) | max | sum] to part; attn_merge combines the splits.
 template <int PER, int G>
 __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
                               int nh, int nkv, float scale, int bx) {
-    constexpr int hd = PER * 32;
+    constexpr int hd = PER * 32, C = 32, J = C / 8;  // positions per chunk, per warp
     // At least 16 positions per split: short contexts use few blocks instead of many near-empty ones.
     int n_pos = step[0] + 1, ns = gridDim.y, per_s = max((n_pos + ns - 1) / ns, 16);
     int p0 = blockIdx.y * per_s, p1 = min(n_pos, p0 + per_s);
@@ -971,53 +992,83 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
                 part[((size_t)(bx * G + i) * ns + blockIdx.y) * (hd + 2) + d] = d == hd ? -INFINITY : 0.0f;
         return;
     }
-    extern __shared__ float sacc[];  // nw * hd
-    __shared__ float sm[32], sl[32];
+    extern __shared__ float sq[];  // G * hd query values, then nw * hd warp partials
+    __shared__ float ss[G][C], sc[G], sm[G], sl[G];
     int h0 = bx * G, g = h0 / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
-    float qv[G][PER], acc[G][PER], kv[PER], vv[PER], kn[PER], vn[PER], m[G], l[G];
+    for (int i = threadIdx.x; i < G * hd; i += blockDim.x) sq[i] = q[h0 * hd + i];
+    float acc[G][PER], m = -INFINITY, l = 0.0f;  // m, l: running max and sum of head w (warps w < G)
 #pragma unroll
-    for (int i = 0; i < G; i++) {
-        m[i] = -INFINITY; l[i] = 0.0f;
-        for (int d = 0; d < PER; d++) { qv[i][d] = q[(h0 + i) * hd + lane * PER + d]; acc[i][d] = 0.0f; }
-    }
-    auto row = [&](int t) { return ((size_t)t * nkv + g) * hd + lane * PER; };
-    if (p0 + w < p1) { ldh_vec<PER>(kc + row(p0 + w), kn); ldh_vec<PER>(vc + row(p0 + w), vn); }
-    for (int t = p0 + w; t < p1; t += nw) {
-        for (int d = 0; d < PER; d++) { kv[d] = kn[d]; vv[d] = vn[d]; }
-        if (t + nw < p1) { ldh_vec<PER>(kc + row(t + nw), kn); ldh_vec<PER>(vc + row(t + nw), vn); }  // prefetch
-        float c[G], p[G];
+    for (int i = 0; i < G; i++)
+        for (int d = 0; d < PER; d++) acc[i][d] = 0.0f;
+    __syncthreads();
+    for (int c0 = p0; c0 < p1; c0 += C) {
+        unsigned kr[J][PER / 2], vr[J][PER / 2];
+#pragma unroll
+        for (int j = 0; j < J; j++) {
+            int t = c0 + w * J + j;
+            if (t < p1) {
+                size_t r = ((size_t)t * nkv + g) * hd + lane * PER;
+                ldh_raw<PER>(kc + r, kr[j]); ldh_raw<PER>(vc + r, vr[j]);
+            } else {
+                for (int d = 0; d < PER / 2; d++) kr[j][d] = vr[j][d] = 0;
+            }
+        }
+        float kf[J][PER], p[J * G];
+#pragma unroll
+        for (int j = 0; j < J; j++)
+            for (int d = 0; d < PER; d++) kf[j][d] = hraw(kr[j], d);
 #pragma unroll
         for (int i = 0; i < G; i++) {
-            float s = 0.0f;
-            for (int d = 0; d < PER; d++) s += qv[i][d] * kv[d];
-            p[i] = s;
+            float qv[PER];
+            for (int d = 0; d < PER; d += 2) *(float2*)&qv[d] = *(const float2*)&sq[i * hd + lane * PER + d];
+#pragma unroll
+            for (int j = 0; j < J; j++) {
+                float s = 0.0f;
+                for (int d = 0; d < PER; d++) s += qv[d] * kf[j][d];
+                p[j * G + i] = s;
+            }
         }
+        {
+            constexpr int L = 32 / (J * G);  // lanes holding each score
+            float s = warp_sum_scatter<J * G>(p);
+            int k = lane / L, j = k / G;
+            if (lane % L == 0) ss[k % G][w * J + j] = c0 + w * J + j < p1 ? s * scale : -INFINITY;
+        }
+        __syncthreads();
+        if (w < G) {  // the chunk holds at least one position, so mn is finite
+            float s = ss[w][lane], mn = fmaxf(m, warp_max(s)), e = expf(s - mn), cs = expf(m - mn);
+            ss[w][lane] = e;
+            l = l * cs + warp_sum(e); m = mn;
+            if (lane == 0) sc[w] = cs;
+        }
+        __syncthreads();
 #pragma unroll
         for (int i = 0; i < G; i++) {
-            float s = warp_sum(p[i]) * scale, mn = fmaxf(m[i], s);
-            c[i] = expf(m[i] - mn); p[i] = expf(s - mn);
-            l[i] = l[i] * c[i] + p[i]; m[i] = mn;
+            float cs = sc[i];
+            for (int d = 0; d < PER; d++) acc[i][d] *= cs;
         }
 #pragma unroll
-        for (int i = 0; i < G; i++)
-            for (int d = 0; d < PER; d++) acc[i][d] = acc[i][d] * c[i] + p[i] * vv[d];
+        for (int j = 0; j < J; j++)
+#pragma unroll
+            for (int i = 0; i < G; i++) {
+                float e = ss[i][w * J + j];
+                for (int d = 0; d < PER; d++) acc[i][d] += e * hraw(vr[j], d);
+            }
+        __syncthreads();
     }
+    if (w < G && lane == 0) { sm[w] = m; sl[w] = l; }
+    float* sacc = sq;  // the queries are no longer needed (the loop ends on a barrier)
 #pragma unroll
     for (int i = 0; i < G; i++) {
-        if (lane == 0) { sm[w] = m[i]; sl[w] = l[i]; }
         for (int d = 0; d < PER; d++) sacc[w * hd + lane * PER + d] = acc[i][d];
         __syncthreads();
         float* pp = part + ((size_t)(h0 + i) * ns + blockIdx.y) * (hd + 2);
-        float M = -INFINITY;
-        for (int k = 0; k < nw; k++) M = fmaxf(M, sm[k]);
-        float L = 0.0f;
-        for (int k = 0; k < nw; k++) L += sl[k] * expf(sm[k] - M);
         for (int d = threadIdx.x; d < hd; d += blockDim.x) {
             float o = 0.0f;
-            for (int k = 0; k < nw; k++) o += sacc[k * hd + d] * expf(sm[k] - M);
+            for (int k = 0; k < nw; k++) o += sacc[k * hd + d];
             pp[d] = o;
         }
-        if (threadIdx.x == 0) { pp[hd] = M; pp[hd + 1] = L; }
+        if (threadIdx.x == 0) { pp[hd] = sm[i]; pp[hd + 1] = sl[i]; }
         __syncthreads();
     }
 }
@@ -1026,7 +1077,7 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
 // nt query tokens: block x serves token x % nt and head block x / nt (tokens side by side, so their blocks run at
 // the same time and share K/V rows in L2), with q, part and step at that token's offsets (pz part floats per token).
 // attn_decode (grid (nh, ns1 splits)) serves one head per block. From gq_min on, attn_decode_gqa (grid (nh / G, splits))
-// serves the G query heads of a KV head per block, reading each K/V row once; it needs ~250 registers per thread,
+// serves the G query heads of a KV head per block, reading each K/V row once; it needs ~230 registers per thread,
 // so it is a separate entry point to keep attn_decode's occupancy.
 #define ATT_PER(F) switch (hd) { case 64: F(2) break; case 128: F(4) break; case 256: F(8) break; case 512: F(16) break; }
 #define ATT_1(PER) attn_decode_t<PER, 1>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt);

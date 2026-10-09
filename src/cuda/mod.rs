@@ -24,8 +24,8 @@ const KERNELS: [&str; 25] = [
 pub const ATT_SPLITS: usize = 64;
 /// Splits of the one-head-per-block decode attention used below ATT_GQA_MIN positions.
 const ATT_SPLITS_1: usize = 16;
-/// Positions from which decode attention shares K/V loads across a GQA group (break-even measured near 4K).
-pub const ATT_GQA_MIN: i32 = 4096;
+/// Positions from which decode attention shares K/V loads across a GQA group (break-even measured near 2K).
+pub const ATT_GQA_MIN: i32 = 2048;
 const _: () = assert!(ATT_SPLITS <= 256);  // attn_merge keeps one weight per split in a 256-thread block
 
 /// Positions per GEMM tile (GEMM_BM in kernels.cu).
