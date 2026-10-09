@@ -1381,6 +1381,18 @@ Parity: 632/640 for both this commit and the previous binary (e1d933c) on rerun,
 earlier, so the parity run itself moves by one token between runs; the `--llama-numerics` path does not use this
 kernel. Tests all pass.
 
+### 2026-10-09 #81 — parity drift traced to free VRAM (note, no code)
+
+The 632 vs 633 in #80 is not a code change: two parity runs of one binary agree on the total but differ on five
+prompts, and three `strata score` runs of one prompt give top-1 logprobs that differ by up to 0.1. The `plan:` line
+shows why: resident experts were 3719, 3971 and (with `--vram-margin 3000`) 1170, because a game held ~4 GB of VRAM
+during these runs. `--fixed-experts` fixes the order of placement but not the count, which comes from free VRAM, and
+an expert on the CPU (integer q8_K dot, per-block float sum) does not round like the same expert in the GPU MMQ
+kernel, so a different split gives slightly different logits. Expert types are not the cause: the only Q2_K/Q3_K
+experts are in layer 40, the MTP layer, which `score` does not run. On an idle GPU the split is stable and parity
+gave 633 every time this session. Parity and benchmark numbers taken while another program holds VRAM are not
+comparable; `plan: ... resident experts` in the run log tells.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
@@ -1401,6 +1413,10 @@ kernel. Tests all pass.
    following GEMV and the router GEMV with router_topk are the next levers.
 
 ## Questions for owner
+
+- (#81) GPU runs only check for Dota 2. CS2 (and any game) also takes VRAM and GPU time, which moved parity by one
+  token and made benches unreadable. Should the loop also stop GPU work while `cs2` (or any process holding over
+  1 GB of VRAM outside the lock) is running?
 
 - 2026-10-08 10:20: the GPU lock deadlocked. Another loop ran `flock .gpu.lock rusting test --release --json`
   (PID 3491381), which started `flock .gpu.lock cargo test --release --features cuda --lib prompt` (PID 3495422).
