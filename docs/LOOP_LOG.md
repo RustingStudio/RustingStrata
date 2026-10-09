@@ -989,6 +989,21 @@ tokens and every head_dim).
   (the diff is not kept in the tree). The ~170 µs gap after the draft is likely hidden already: the host builds the
   verify inputs while the draft graph runs, so the launch cost overlaps GPU work.
 
+### 2026-10-09 #57 — vocab head GEMV takes 8 rows per warp (3e2ad06)
+
+- `gemv_bandwidth` (load ~5): gemvn costs 25% more with 2 inputs than with 1 (output head Q4_K 915 -> 1158 us,
+  attn_qkv 41 -> 51 us), although both read the weights once. Each block quantizes all nt inputs into shared memory
+  before it starts, and the output head runs 15520 blocks of 16 rows.
+- `STRATA_RPW` sweep, output head nt = 2: rpw 2 / 4 / 8 / 16 = 1158 / 1062 / 1027 / 1008 us; nt = 1 stays
+  915-920 up to rpw 8 (942 at 16). The layer matrices (2048-8192 rows) get slower above rpw 2-4 (ssm_out 26 -> 46 us
+  at rpw 8), so only matrices with 65536 rows or more take rpw 8.
+- Row results are bit-identical (same warp code and order; only the block assignment changes). cuda 9/9,
+  gpu_model 7/7. Parity not re-run.
+- Bench `--mtp 1`, interleaved against 2f416f9, 3 rounds `--reps 3`, load 4-9: 4096 96.7 / 98.7 / 98.5 vs
+  99.3 / 99.4 / 99.5 (+0.8% on the quiet rounds 2-3); 512 110.4 / 111.3 / 111.0 vs 111.6 / 111.9 / 111.9 (+0.7%).
+- Next lever in the same place: quantize x once per launch into global memory instead of once per block. That would
+  remove the per-block quantize and `__syncthreads` from every quantized GEMV, small layer matrices included.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
