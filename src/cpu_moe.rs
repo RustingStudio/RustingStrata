@@ -79,6 +79,27 @@ fn dot_iq3xxs(row: &[u8], xq: &[Q8K]) -> f32 {
     0.25 * sumf
 }
 
+fn dot_iq3s(row: &[u8], xq: &[Q8K]) -> f32 {
+    let mut sumf = 0.0;
+    for (b, y) in row.chunks_exact(110).zip(xq) {
+        let (qs, qh, signs, sc) = (&b[2..66], &b[66..74], &b[74..106], &b[106..110]);
+        let mut bsum = 0i32;
+        for ib in 0..8 {
+            let mut s = 0i32;
+            for l in 0..4 {
+                let g = |k: usize, sh: usize| IQ3S_GRID[(qs[8 * ib + 2 * l + k] as usize) | ((qh[ib] as usize) << sh & 256)].to_le_bytes();
+                let (g1, g2) = (g(0, 8 - 2 * l), g(1, 7 - 2 * l));
+                let g = [g1[0], g1[1], g1[2], g1[3], g2[0], g2[1], g2[2], g2[3]];
+                let sg: [i8; 8] = std::array::from_fn(|j| if signs[4 * ib + l] >> j & 1 != 0 { -1 } else { 1 });
+                s += dot8(g, &sg, &y.qs[32 * ib + 8 * l..]);
+            }
+            bsum += s * (2 * (sc[ib / 2] >> (4 * (ib % 2)) & 0xF) as i32 + 1);
+        }
+        sumf += d16(b) * y.d * bsum as f32;
+    }
+    sumf
+}
+
 fn dot_iq4xs(row: &[u8], xq: &[Q8K]) -> f32 {
     let mut sumf = 0.0;
     for (b, y) in row.chunks_exact(136).zip(xq) {
@@ -159,6 +180,31 @@ mod avx2 {
         }
     }
 
+    pub fn dot_iq3s(row: &[u8], xq: &[Q8K]) -> f32 {
+        unsafe {
+            // Byte k of a lane picks sign byte k / 8, then bit k % 8 (llama.cpp k_mask1 / k_mask2).
+            let m1 = _mm256_set_epi64x(0x0303030303030303, 0x0202020202020202, 0x0101010101010101, 0);
+            let m2 = _mm256_set1_epi64x(0x8040201008040201u64 as i64);
+            let mut acc = _mm256_setzero_ps();
+            for (b, y) in row.chunks_exact(110).zip(xq) {
+                let (qs, qh) = (&b[2..66], &b[66..74]);
+                let mut sumi = _mm256_setzero_si256();
+                for ib in 0..8 {
+                    let g = |i: usize| IQ3S_GRID[qs[8 * ib + i] as usize | ((qh[ib] as usize) << (8 - i) & 256)] as i32;
+                    let grid = _mm256_set_epi32(g(7), g(6), g(5), g(4), g(3), g(2), g(1), g(0));
+                    let sb = i32::from_le_bytes(b[74 + 4 * ib..78 + 4 * ib].try_into().unwrap());
+                    let s = _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32(sb), m1), m2), m2);
+                    let q8 = _mm256_loadu_si256(y.qs.as_ptr().add(32 * ib) as *const __m256i);
+                    let dot = _mm256_maddubs_epi16(grid, _mm256_sub_epi8(_mm256_xor_si256(s, q8), s));
+                    let ls = 2 * (b[106 + ib / 2] >> (4 * (ib % 2)) & 0xF) as i16 + 1;
+                    sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(dot, _mm256_set1_epi16(ls)));
+                }
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(sumi), acc);
+            }
+            hsum(acc)
+        }
+    }
+
     pub fn dot_iq4xs(row: &[u8], xq: &[Q8K]) -> f32 {
         unsafe {
             let values = _mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i);
@@ -186,9 +232,9 @@ mod avx2 {
 fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
     #[cfg(target_feature = "avx2")]
     if std::env::var_os("STRATA_SCALAR").is_none() {
-        return match ty { GgmlType::IQ2XS => Some(avx2::dot_iq2xs), GgmlType::IQ3XXS => Some(avx2::dot_iq3xxs), GgmlType::IQ4XS => Some(avx2::dot_iq4xs), _ => None };
+        return match ty { GgmlType::IQ2XS => Some(avx2::dot_iq2xs), GgmlType::IQ3XXS => Some(avx2::dot_iq3xxs), GgmlType::IQ4XS => Some(avx2::dot_iq4xs), GgmlType::IQ3S => Some(avx2::dot_iq3s), _ => None };
     }
-    match ty { GgmlType::IQ2XS => Some(dot_iq2xs), GgmlType::IQ3XXS => Some(dot_iq3xxs), GgmlType::IQ4XS => Some(dot_iq4xs), _ => None }
+    match ty { GgmlType::IQ2XS => Some(dot_iq2xs), GgmlType::IQ3XXS => Some(dot_iq3xxs), GgmlType::IQ4XS => Some(dot_iq4xs), GgmlType::IQ3S => Some(dot_iq3s), _ => None }
 }
 
 /// y = t · x for every row, using the integer kernel when the type has one.
@@ -246,4 +292,29 @@ pub fn experts(m: &Model, il: usize, h: &[f32], sel: &[(usize, f32)]) -> Vec<f32
         for (yy, oo) in y.iter_mut().zip(oj) { *yy += w * oo; }
     }
     y
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every integer kernel (scalar and, when built, AVX2) equals the f32 dequantized dot on random blocks.
+    #[test]
+    fn int_dots_match_dequant() {
+        let mut r = 0x9E3779B97F4A7C15u64;
+        let mut rnd = || { r ^= r << 13; r ^= r >> 7; r ^= r << 17; r as u8 };
+        let x: Vec<f32> = (0..1024).map(|i| ((i as f32 * 0.7548777).fract() - 0.5) * 2.0).collect();
+        let xq = quantize_q8k(&x);
+        for ty in [GgmlType::IQ2XS, GgmlType::IQ3XXS, GgmlType::IQ3S, GgmlType::IQ4XS] {
+            let mut row: Vec<u8> = (0..4 * ty.block_bytes()).map(|_| rnd()).collect();
+            for b in row.chunks_exact_mut(ty.block_bytes()) { b[..2].copy_from_slice(&f16::from_f32(0.01).to_le_bytes()); }
+            let mut w = vec![0f32; 1024];
+            crate::quant::dequant_row(ty, &row, &mut w);
+            let want: f64 = w.iter().enumerate().map(|(i, &v)| v as f64 * (xq[i / 256].d * xq[i / 256].qs[i % 256] as f32) as f64).sum();
+            let scalar = match ty { GgmlType::IQ2XS => dot_iq2xs, GgmlType::IQ3XXS => dot_iq3xxs, GgmlType::IQ3S => dot_iq3s, _ => dot_iq4xs };
+            for got in [scalar(&row, &xq), int_dot(ty).unwrap()(&row, &xq)] {
+                assert!(((got as f64 - want) / want.abs().max(1e-3)).abs() < 1e-5, "{}: {got} vs {want}", ty.name());
+            }
+        }
+    }
 }
