@@ -1058,13 +1058,24 @@ tokens and every head_dim).
 - Misses move between prompts from run to run (adaptive expert cache: GPU int8 vs CPU kernels), so a 3-run mean
   moves by about +-0.3%. 99% is not yet reached on average.
 
+### 2026-10-09 #61 — `--fixed-experts`: repeatable parity runs (f687b4b)
+
+Parity misses moved between prompts from run to run because the adaptive expert cache swaps experts between the
+GPU and the CPU kernels, and each run reads and rewrites the shared routing profile. `--fixed-experts` places
+experts in layer order, never swaps, and neither reads nor writes the profile.
+
+- `--gpu --llama-numerics --fixed-experts`, 3 runs (load 3.3-4.4): 632/632/632 of 640 (98.75%), per-prompt rows
+  identical in all three. Before (adaptive): 634/630/629 and 633/631/630, spread 5 tokens.
+- Default runs are unchanged (flag off). gpu_model tests 7 passed.
+- Single numerics changes can now be measured with one run each against 632.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
    pass is now batched (#53). Vocab subsets are out (#24 id order, #33 frequency).
 2. MMQ tile tuning toward 2000 tok/s (IQ2_XS on MMQ costs parity, #32).
-4. Parity (`--llama-numerics`, 98.62% at #60): make decode deterministic (pin the expert split for parity runs) so
-   single changes can be measured; then the CPU expert kernels' rounding (`.round()` vs llama.cpp's ties-to-even)
+4. Parity (`--llama-numerics`, 98.62% at #60; 632/640 with `--fixed-experts`, #61, the baseline for single
+   changes): the CPU expert kernels' rounding (`.round()` vs llama.cpp's ties-to-even)
    and the DeltaNet prefill algorithm.
 3. VRAM for more resident experts: the margin floor is the driver reserve (#36). Remaining levers: smaller prefill
    scratch (470 MB at chunk 4096) or KV in fewer bytes.
