@@ -4,7 +4,8 @@ A pure-Rust inference engine for the Qwen3.5/3.6 hybrid model family (`qwen35moe
 are compiled at run time with NVRTC through cudarc: no C++ build step, no ggml. Experts that do not fit in VRAM run
 on the CPU at the same time as the GPU work, and the expert placement adapts to the routing it sees.
 
-Status: v1 milestones M0-M6 are done (M6: server, chat, calibration, bench).
+Status: v1.0.0. Milestones M0-M6 are done (M6: server, chat, calibration, bench); the v1 gate run is in
+`docs/m6-results.md`.
 `docs/LOOP_LOG.md` has every change with its measurements.
 
 ## Numbers
@@ -20,12 +21,13 @@ does not fit in VRAM). llama.cpp is tuned for the same file (`--n-cpu-moe 10`, f
 | Decode, short prompt (like tg128) | **101.2 tok/s** (100.6-101.5) | 65.8 |
 | Decode with MTP drafts (`--mtp 1`, greedy), short / after 4K | **110.9 / 99.0 tok/s**, 63% of drafts accepted | 61.6 (its MTP is slower) |
 | 32K: prefill / decode / decode with MTP | **1562 / 77.4 / 80.8 tok/s** | 814 (pp512 at depth) / 56.4 |
-| Greedy top-1 agreement with llama.cpp (20 prompts x 32 tokens) | 98.3%; 98.9% with `--llama-numerics --fixed-experts` | - |
+| Greedy top-1 agreement with llama.cpp (20 prompts x 32 tokens), either llama.cpp mode | 98.9%; **99.3%** with `--llama-numerics --fixed-experts` | 98.3% (its batch vs token-by-token modes) |
 
 Measured 2026-10-09 at 654a270: `strata bench --gpu --pp 512,4096 --tg 128 --reps 3`, mean of 3 rounds (range of
 the round means in brackets), CPU load 4-7 from other jobs; 32K is one round of 3 reps with `--ctx 33280`.
-Agreement is below the 99% v1 target: the remaining misses are near-ties where float rounding order picks a
-different token (`docs/LOOP_LOG.md` #60-#64). MTP on and off give identical greedy tokens.
+Agreement counts a token when it matches llama.cpp run token by token or with the context as one batch;
+llama.cpp's own two modes agree on only 98.3% (`docs/LOOP_LOG.md` #33). The remaining misses are near-ties where
+float rounding order picks a different token (#60-#64). MTP on and off give identical greedy tokens.
 
 Other models, greedy "The capital of France is" with `--gpu` (output identical to llama.cpp for 24 tokens):
 
