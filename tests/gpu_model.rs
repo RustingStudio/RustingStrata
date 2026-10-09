@@ -40,6 +40,9 @@ fn gpu_forward_matches_cpu_reference() {
 #[test]
 fn prefill_matches_reference() {
     let _gpu = common::gpu_lock();
+    // Place experts in layer order, not from the routing profile that every earlier run rewrites (with it the
+    // decode yardstick, and so this test's outcome, depended on what ran before).
+    unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") }
     let Some(p) = common::model_path() else { return };
     let g = Gguf::open(&p).unwrap();
     let m = Model::load(&g).unwrap();
