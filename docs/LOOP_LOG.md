@@ -1004,6 +1004,25 @@ tokens and every head_dim).
 - Next lever in the same place: quantize x once per launch into global memory instead of once per block. That would
   remove the per-block quantize and `__syncthreads` from every quantized GEMV, small layer matrices included.
 
+### 2026-10-09 #58 — norm outputs are quantized once, not per GEMV block (245dd92)
+
+- Measurement (`gemv_bandwidth` with `quant_x` stubbed out, load ~3): gemvn with 2 inputs drops 10-22% (attn_qkv
+  50.3 -> 44.3 us, attn_output 28.3 -> 23.6, attn_k 6.9 -> 5.4, output head 1027 -> 950); MoE expert GEMVs with
+  1 input drop 8-9% (IQ2_XS gate 16.9 -> 15.4, IQ3_XXS down 24.1 -> 22.2).
+- Change: new `quant_xq` kernel (one block per token, same `quant_x` code) writes `h` into a "hq" buffer after the
+  attention norm, the post norm and the output norm. `gemvn` and `moe_gemv` take an optional `xq` pointer and
+  skip their per-block quantize and its `__syncthreads`. Every GEMV fed from `h` uses it, including nt = 1 steps
+  (through gemvn, which equals gemv bit for bit). Inputs not from `h` (DeltaNet and attention outputs, expert
+  down projections) still quantize per block.
+- Tests: `gemvn_matches_gemv` and `moe_gemv_selects_experts` assert the `xq` path is bit-identical for every type.
+  cuda 9/9, gpu_model 7/7. Parity not re-run (bit-identical).
+- Bench `--mtp 1`, interleaved against 3e2ad06, 3 rounds `--reps 3`, load 5-15: 4096 99.3 / 99.1 / 99.1 vs
+  99.8 / 99.7 / 99.7 (+0.6%); 512 112.4 / 111.9 / 111.7 vs 112.8 / 112.5 / 112.5 (+0.5%). A first run (load up to
+  28 in rounds 2-3) agreed on its clean round: `--mtp 0` 4096 94.1 -> 94.5, 512 99.2 -> 99.7.
+- The gain is about a third of the stub's upper bound: the 2 extra launches per layer (81 per forward) cost part of it. Folding
+  the quantize into `rms_norm` (one kernel) would remove them; the DeltaNet `o` and attention `att` inputs could
+  get the same treatment from `norm_gate` and the attention kernel.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
