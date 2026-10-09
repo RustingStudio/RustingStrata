@@ -28,7 +28,7 @@ pub fn quantize_q8k(x: &[f32]) -> Vec<Q8K> {
         let max = b.iter().fold(0f32, |m, &v| if v.abs() > m.abs() { v } else { m });
         if max == 0.0 { return Q8K { d: 0.0, qs: [0; 256] }; }
         let is = -127.0 / max;
-        Q8K { d: 1.0 / is, qs: std::array::from_fn(|j| ((is * b[j]).round() as i32).min(127) as i8) }
+        Q8K { d: 1.0 / is, qs: std::array::from_fn(|j| ((is * b[j]).round_ties_even() as i32).min(127) as i8) }
     }).collect()
 }
 
