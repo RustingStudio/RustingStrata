@@ -1335,6 +1335,24 @@ separate 2-byte scale load cost more than the halved K/V bytes save, most visibl
 stays the default, q8 is the low-VRAM option. Follow-up if q8 should win: dequantize K/V tiles once into shared
 memory in prefill, and in decode convert q8 directly to f32 instead of round-tripping through f16 words.
 
+### 2026-10-09 #78 — faster q8 KV dequant, KV format fixed per Gpu (e1d933c)
+
+`ldkv` now makes f16 pairs from four int8 values with a byte permute under exponent 0x64, one f16x2 subtract (1152)
+and one f16x2 multiply by the scale. int8 and the f16 scale are exact in f16, so the product rounds once and the words
+equal the earlier `f2h((float)q * d)` (same test errors, q8 parity 631/640 both). `--kv q8`, interleaved, load
+1.2-2.6:
+
+| | d02ac75 r1 / r2 | e1d933c r1 / r2 |
+|---|---|---|
+| 32K decode mtp 0 | 75.9 / 76.2 | 78.3 / 78.2 |
+| 32K prefill | 1381 / 1374 | 1406 / 1404 |
+| 4K decode mtp 0 | 97.8 / 97.5 | 97.8 / 97.9 |
+
+Still below f16 (81.6 / 1600 at 32K). Also from a commit security review: the KV format was read from the
+environment separately for the kernel compile and for the cache size, so a library caller changing
+`STRATA_KV_Q8` between the two could size an f16 cache as q8 and write out of bounds. `Gpu::new` now reads it once
+into `Gpu::kv_q8`, sizes come from `Gpu::kv_words`, and `kv_store` refuses a q8 head_dim that is not a multiple of 32.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
