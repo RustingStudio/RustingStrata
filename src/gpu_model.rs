@@ -10,8 +10,6 @@ use cudarc::driver::{CudaGraph, CudaSlice, sys};
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// `mtp_run` row that takes the hidden state from the draft head's own last output (chained drafts).
-const CHAIN: usize = usize::MAX;
 
 mod prefill;
 
@@ -38,6 +36,9 @@ struct Layer { attn_norm: GpuTensor, post_norm: GpuTensor, mixer: Mixer, ffn: Ff
 struct MtpHead {
     layer: Layer, eh_proj: GpuTensor, enorm: GpuTensor, hnorm: GpuTensor, head_norm: GpuTensor,
     worker: CpuWorker, step_buf: CudaSlice<i32>, emb: CudaSlice<f32>, eh: CudaSlice<f32>, x: CudaSlice<f32>, pos: usize,
+    /// Accepted drafts of the last `spec_step` whose draft head entries (from the main model's hidden rows 0..) are
+    /// still to be written; the next `spec_step` writes them in its first draft pass.
+    pend: Vec<u32>,
 }
 
 pub struct GpuModel<'a> {
@@ -60,8 +61,8 @@ pub struct GpuModel<'a> {
     /// The whole token forward, captured on the first step (None until then, or with STRATA_NO_GRAPH set).
     /// Captured forward per token count (index nt).
     graphs: Vec<Option<CudaGraph>>,
-    /// Captured draft head per (hidden row, output head on).
-    mtp_graphs: std::collections::HashMap<(usize, bool), CudaGraph>,
+    /// Captured draft head per (hidden state address, token count, output head on).
+    mtp_graphs: std::collections::HashMap<(u64, usize, bool), CudaGraph>,
     /// DeltaNet (conv, s) copies per recurrent layer and the position, for `restore_state`.
     saved: Vec<(CudaSlice<f32>, CudaSlice<f32>)>,
     saved_pos: usize,
@@ -134,7 +135,7 @@ impl<'a> GpuModel<'a> {
             let il = c.n_layer;
             Some((load_layer(il, false)?, lt(il, "nextn.eh_proj.weight")?, lt(il, "nextn.enorm.weight")?,
                   lt(il, "nextn.hnorm.weight")?, lt(il, "nextn.shared_head_norm.weight")?,
-                  gpu.zeros::<i32>(2)?, gpu.zeros(c.n_embd)?, gpu.zeros(2 * c.n_embd)?, gpu.zeros(c.n_embd)?))
+                  gpu.zeros::<i32>(2 * TMAX)?, gpu.zeros(TMAX * c.n_embd)?, gpu.zeros(TMAX * 2 * c.n_embd)?, gpu.zeros(TMAX * c.n_embd)?))
         } else { None };
         let output_norm = up("output_norm.weight")?;
         let output = up("output.weight").or_else(|_| up("token_embd.weight"))?;
@@ -170,7 +171,7 @@ impl<'a> GpuModel<'a> {
         let mtp = match mtp_parts {
             Some((layer, eh_proj, enorm, hnorm, head_norm, step_buf, emb, eh, x)) => Some(MtpHead {
                 layer, eh_proj, enorm, hnorm, head_norm, worker: CpuWorker::new(m, &gpu.ctx, vec![c.n_layer])?,
-                step_buf, emb, eh, x, pos: 0,
+                step_buf, emb, eh, x, pos: 0, pend: vec![],
             }),
             None => None,
         };
@@ -180,7 +181,7 @@ impl<'a> GpuModel<'a> {
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
     pub fn reset(&mut self) -> anyhow::Result<()> {
         self.saved_ids.clear();
-        if let Some(h) = self.mtp.as_mut() { h.pos = 0; }
+        if let Some(h) = self.mtp.as_mut() { h.pos = 0; h.pend.clear(); }
         for l in self.layers.iter_mut().chain(self.mtp.as_mut().map(|h| &mut h.layer)) {
             match &mut l.mixer {
                 Mixer::Delta { conv, s, .. } => { self.gpu.stream.memset_zeros(conv)?; self.gpu.stream.memset_zeros(s)?; }
@@ -335,7 +336,7 @@ impl<'a> GpuModel<'a> {
     /// MTP draft: logits for the token after `token`, from hidden state `row` of the last `step` or `verify` (the
     /// position that predicted `token`). Mirrors `Model::mtp_step`; the draft head keeps its own position and KV cache.
     pub fn mtp_draft(&mut self, token: u32, row: usize) -> anyhow::Result<Vec<f32>> {
-        self.mtp_run(token, row, true)?;
+        self.mtp_run(&[token], self.row_ptr(row), true)?;
         Ok(self.gpu.stream.clone_dtoh(&self.logits.slice(0..self.m.cfg.n_vocab))?)
     }
 
@@ -343,14 +344,22 @@ impl<'a> GpuModel<'a> {
     /// Drafts `k` tokens after `t` (each from the previous draft's hidden state), verifies [t, drafts..] in one forward
     /// and keeps the drafts up to the first one the main model disagrees with (`rollback`). Returns the accepted tokens,
     /// the logits after the last one and its hidden row. Greedy output equals plain `step` decoding (verify is
-    /// bit-identical to steps).
+    /// bit-identical to steps). The draft head entries of accepted drafts wait for the next call's first draft pass,
+    /// which runs them with `t` in one batch (their main model rows 0..n precede `t`'s row n).
     pub fn spec_step(&mut self, t: u32, row: usize) -> anyhow::Result<(Vec<u32>, Vec<f32>, usize)> {
         let k = self.k;
         if self.pos + k + 1 > self.ctx { return Ok((vec![t], self.step(t)?, 0)); }
-        let hp = self.mtp.as_ref().map_or(0, |h| h.pos);
+        let h = self.mtp.as_mut().unwrap();
+        let mut first = std::mem::take(&mut h.pend);
+        if first.len() != row { first.clear(); }
+        first.push(t);
+        let nf = first.len();
+        let hp = h.pos + nf - 1;
         let mut toks = vec![t];
+        let mut hid = self.row_ptr(row + 1 - nf);
         for i in 0..k {
-            let d = self.mtp_run(toks[i], if i == 0 { row } else { CHAIN }, true)?;
+            let d = if i == 0 { self.mtp_run(&first, hid, true)? } else { self.mtp_run(&toks[i..=i], hid, true)? };
+            hid = self.gpu.ptr(&self.mtp.as_ref().unwrap().x) + 4 * ((if i == 0 { nf } else { 1 } - 1) * self.m.cfg.n_embd) as u64;
             toks.push(d);
         }
         let start = self.pos;
@@ -358,27 +367,34 @@ impl<'a> GpuModel<'a> {
         self.drafts.0 += k;
         self.drafts.1 += n;
         if n < k { self.rollback(start, n + 1)?; }
-        // Draft head entries past t were made from draft hidden states: redo them from the main model's rows.
-        self.mtp.as_mut().unwrap().pos = hp + 1;
-        for i in 0..n { self.mtp_run(toks[i + 1], i, false)?; }
+        // Draft head entries past t were made from draft hidden states: the next call redoes them from main rows.
+        let h = self.mtp.as_mut().unwrap();
+        h.pos = hp + 1;
+        h.pend = toks[1..=n].to_vec();
         toks.truncate(n + 1);
         Ok((toks, logits, n))
     }
 
-    /// Draft head on (`token`, hidden row `row`); returns the argmax of its logits (left in `logits` row 0), or 0 when
-    /// `head` = false skips the output head.
-    fn mtp_run(&mut self, token: u32, row: usize, head: bool) -> anyhow::Result<u32> {
+    /// Address of hidden row `row` of the last `step` or `verify`.
+    fn row_ptr(&self, row: usize) -> u64 { self.gpu.ptr(&self.x) + 4 * (row * self.m.cfg.n_embd) as u64 }
+
+    /// Draft head on `tokens` with hidden states at `hid` (rows of n_embd), as one batch at the next draft positions;
+    /// returns the argmax of the last token's logits (left in `logits` row 0), or 0 when `head` = false skips the head.
+    fn mtp_run(&mut self, tokens: &[u32], hid: u64, head: bool) -> anyhow::Result<u32> {
+        let nt = tokens.len();
         let c = &self.m.cfg;
         let Some(h) = self.mtp.as_mut() else { bail!("MTP head not loaded") };
-        if h.pos >= self.ctx { bail!("context full ({} tokens)", self.ctx); }
+        if h.pos + nt > self.ctx { bail!("context full ({} tokens)", self.ctx); }
         let seq = h.worker.begin();
         let g = &self.gpu;
-        g.stream.memcpy_htod(&self.m.embed(token), &mut h.emb)?;
-        g.stream.memcpy_htod(&[h.pos as i32, seq as i32], &mut h.step_buf)?;
-        let key = (row, head);
+        let emb: Vec<f32> = tokens.iter().flat_map(|&t| self.m.embed(t)).collect();
+        g.stream.memcpy_htod(&emb, &mut h.emb.slice_mut(0..emb.len()))?;
+        let steps: Vec<i32> = (0..nt).flat_map(|t| [(h.pos + t) as i32, seq as i32]).collect();
+        g.stream.memcpy_htod(&steps, &mut h.step_buf.slice_mut(0..2 * nt))?;
+        let key = (hid, nt, head);
         if let Some(graph) = self.mtp_graphs.get(&key) { graph.launch()?; } else {
             g.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-            let r = self.mtp_forward(row, head);
+            let r = self.mtp_forward(hid, nt, head);
             let graph = g.stream.end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)?;
             r?;
             let graph = graph.ok_or_else(|| anyhow::anyhow!("empty CUDA graph"))?;
@@ -388,7 +404,7 @@ impl<'a> GpuModel<'a> {
         let g = &self.gpu;
         let d = if head { g.stream.clone_dtoh(&self.amax.slice(0..1))?[0] as u32 } else { g.stream.synchronize()?; 0 };
         let h = self.mtp.as_mut().unwrap();
-        h.pos += 1;
+        h.pos += nt;
         if let Some(cache) = self.cache.as_mut() {
             cache.record(c.n_layer, &h.worker.routing(c.n_layer).iter().map(|x| x.0).collect::<Vec<_>>());
         }
@@ -396,17 +412,16 @@ impl<'a> GpuModel<'a> {
     }
 
     /// Enqueue the draft head (see `mtp_run`).
-    fn mtp_forward(&self, row: usize, head: bool) -> anyhow::Result<()> {
+    fn mtp_forward(&self, hid: u64, nt: usize, head: bool) -> anyhow::Result<()> {
         let (c, g, h) = (&self.m.cfg, &self.gpu, self.mtp.as_ref().unwrap());
         let (eps, ne, hp) = (c.eps, c.n_embd, g.ptr(&self.bufs["h"]));
         let (eh, x) = (g.ptr(&h.eh), g.ptr(&h.x));
-        g.rms_norm(g.ptr(&h.emb), 0, h.enorm.ptr, eh, 0, ne, 1, eps)?;
-        let hid = if row == CHAIN { x } else { g.ptr(&self.x) + 4 * (row * ne) as u64 };
-        g.rms_norm(hid, 0, h.hnorm.ptr, eh + 4 * ne as u64, 0, ne, 1, eps)?;
-        g.gemv(&h.eh_proj, eh, x)?;
-        self.layer(c.n_layer, &h.layer, x, g.ptr(&h.step_buf), Some(&h.worker), 1)?;
+        g.rms_norm(g.ptr(&h.emb), ne, h.enorm.ptr, eh, 2 * ne, ne, nt, eps)?;
+        g.rms_norm(hid, ne, h.hnorm.ptr, eh + 4 * ne as u64, 2 * ne, ne, nt, eps)?;
+        self.mv(&h.eh_proj, eh, 2 * ne, x, ne, nt)?;
+        self.layer(c.n_layer, &h.layer, x, g.ptr(&h.step_buf), Some(&h.worker), nt)?;
         if head {
-            g.rms_norm(x, 0, h.head_norm.ptr, hp, 0, ne, 1, eps)?;
+            g.rms_norm(x + 4 * ((nt - 1) * ne) as u64, 0, h.head_norm.ptr, hp, 0, ne, 1, eps)?;
             g.gemv(&self.output, hp, g.ptr(&self.logits))?;
             g.argmax_rows(g.ptr(&self.logits), c.n_vocab, 1, g.ptr(&self.amax))?;
         }
