@@ -85,7 +85,7 @@ impl GpuModel<'_> {
         let hit = self.saved_ids.len();
         let reused = if hit > 0 && tokens[..keep].starts_with(&self.saved_ids) {
             self.restore_state()?;
-            if let Some(h) = self.mtp.as_mut() { h.pos = 0; }
+            if let Some(h) = self.mtp.as_mut() { h.pos = 0; h.pend.clear(); }
             hit
         } else {
             self.reset()?;
