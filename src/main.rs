@@ -252,12 +252,15 @@ fn main() -> anyhow::Result<()> {
             let v: serde_json::Value = serde_json::from_str(&text)?;
             let ids = |k: &str| -> anyhow::Result<Vec<u32>> {
                 v[k].as_array().with_context(|| format!("missing {k}"))?
-                    .iter().map(|x| x.as_u64().map(|x| x as u32).context("bad id")).collect()
+                    .iter().map(|x| x.as_u64().and_then(|x| u32::try_from(x).ok()).context("bad id")).collect()
             };
             let (prompt, cont) = (ids("prompt")?, ids("continuation")?);
             anyhow::ensure!(!prompt.is_empty() && !cont.is_empty(), "empty prompt or continuation");
             let g = Gguf::open(&model)?;
             let m = Model::load(&g)?;
+            if let Some(&t) = prompt.iter().chain(&cont).find(|&&t| t as usize >= m.cfg.n_vocab) {
+                anyhow::bail!("token id {t} out of range (vocabulary has {} tokens)", m.cfg.n_vocab);
+            }
             let mut r = engine.runner(&m, &model)?;
             let feed: Vec<u32> = prompt.iter().chain(&cont[..cont.len() - 1]).copied().collect();
             let (mut argmax, mut top5) = (Vec::new(), Vec::new());
