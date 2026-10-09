@@ -24,7 +24,9 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - At 2a51d2e (#52): decode after 4096 93.9, MTP k = 1 94.5; after 16384 87.0. Parity 98.36% over 6 runs, with an
   interleaved control showing ec8200a at 98.28% under the same conditions. Parity gate per change: interleaved
   3-run control against the previous binary, since single 3-run means move by +-0.3%.
-- At 654a270 (#69, current): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
+- v1.0.0 (#84): gate passed. 4K prefill 2016, decode 100.7 / 96.0 after 512 / 4K, MTP 109.9; parity 99.32%
+  either llama.cpp mode in parity mode, 98.85% default.
+- At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
 
@@ -1421,6 +1423,26 @@ written into the ChatML template verbatim, so a role string could inject templat
 context". Each is now a 400 naming the field (`unknown role "wizard"`, `user message without content`,
 `max_tokens must be an integer >= 1`, ...). Null still means "use the default", and an assistant turn may omit
 content. tests/serve.rs covers each case; removing the role check fails it.
+
+### 2026-10-10 #84 — v1.0.0: gate run, parity definition (5957785, release commit)
+
+The owner asked to finish v1.0.0 and left the parity definition to the loop. Chosen: a token agrees when it matches
+llama.cpp in either of its own run modes (token by token, the reference, or the context as one batch,
+`target/llama-batch-argmax.json`). llama.cpp's two modes agree with each other on only 98.28% (#33), so the strict
+99% gate was above llama.cpp's own consistency. `tools/parity.py` prints both numbers and gates on the second
+(5957785); offline it reproduces #33 (631-637 of 640 on the #32 runs).
+
+Gate run at 9f4af2a, all under the GPU lock (`docs/m6-results.md`):
+- Strata, load 2.6-4.1: 4K prefill 2016.3 (2013.0-2019.8), decode after 512 100.7 (100.5-101.0), after 4K 96.0
+  (95.0-96.6); MTP k = 1 109.9 / 96.7. 32K (load 21-24 from another loop's rustc): prefill 1540.8, decode 77.0,
+  MTP 79.1.
+- llama-bench (CUDA 5d8ccdf9d), load 4.3-7.5: pp512 1077.7, pp4096 1059.5, tg128 61.6; at d32768 pp512 808.6,
+  tg128 50.4. Strata 1.90x prefill, 1.63x decode. Short-prompt prefill still 0.85x llama.cpp.
+- Parity, either mode: `--llama-numerics --fixed-experts` 637 / 635 / 635 = **99.32%** (strict 634 / 633 / 632);
+  default `--gpu` 633 / 634 / 631 = 98.85% (strict 628 / 630 / 625, load 4-11). Gate passed in parity mode.
+- Found while testing the release: `tests/quant.rs` `rejects_unknown` still expected type 16 (IQ2_XXS) to fail,
+  broken since IQ2_XXS support landed. Now checks IQ4_NL (20). All 47 tests pass.
+- Release: version 1.0.0 in Cargo.toml, `strata --version`, README status and agreement row, local tag v1.0.0.
 
 ## Next candidates
 
