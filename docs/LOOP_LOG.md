@@ -1023,6 +1023,17 @@ tokens and every head_dim).
   the quantize into `rms_norm` (one kernel) would remove them; the DeltaNet `o` and attention `att` inputs could
   get the same treatment from `norm_gate` and the attention kernel.
 
+### 2026-10-09 #59 — rms_norm writes the quantized copy itself (b0006cb)
+
+- Follow-up to #58: `rms_norm` takes an optional `xq` pointer and, after a block barrier, runs `quant_x` on the row
+  it just wrote. The attention norm, post norm and output norm use it (`rms_norm_q`), so the 81 `quant_xq`
+  launches per forward are gone. `quant_xq` stays as the reference in tests.
+- Test `rms_norm_q_matches_quant_xq`: the fused bytes equal `rms_norm` then `quant_xq`. cuda 10/10, gpu_model 7/7.
+  Bit-identical, so parity was not re-run.
+- Bench `--mtp 1`, interleaved against 245dd92, 3 rounds `--reps 3`, load 2.9-6.7: 4096 99.5 / 99.8 / 99.9 vs
+  100.8 / 100.4 / 100.3 (+0.8%); 512 112.4 / 113.2 / 112.6 vs 113.7 / 113.6 / 113.2 (+0.7%).
+- 4K decode with MTP is now at the 100 tok/s target on this machine (100.5 mean).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
