@@ -1129,6 +1129,24 @@ GPU `deq8`/`QI` paths (types now 12).
 - Next: an AVX2 IQ3_S int dot for the CPU expert path; IQ2_XXS, IQ2_S, IQ1_S, IQ1_M for the 27B
   (Qwen3.8-27B-UD-IQ3_XXS, which stops at type 19).
 
+### 2026-10-09 #67 — IQ3_S integer dot for CPU experts (b2578c9)
+
+Qwen3.6-35B IQ4_XS keeps gate/up experts in IQ3_S, and only 5806 of 10240 experts fit in VRAM. Before this change
+those CPU experts used the f32 dequant fallback. Added scalar and AVX2 ports of `ggml_vec_dot_iq3_s_q8_K`.
+
+- Single-thread `kernel_throughput`, blk.0 gate IQ3_S: 1206.8 us (0.87 Gweights/s) before, 81.2 us (12.91) after.
+  8 experts of one layer (`fast_experts_match_reference`): 3.09 / 2.93 ms before, 0.48 / 0.47 ms after.
+- Decode, "The capital of France is", `-n 64 --gpu --fixed-experts`, 3 interleaved rounds, load 6.9-10.5:
+  11.0-13.3 tok/s (CPU experts 86-89% of decode) before, 33.6 / 47.3 / 36.2 tok/s (51-64%) after.
+- New unit test `int_dots_match_dequant` checks all four integer kernels (scalar and AVX2) against the dequantized
+  f32 dot on random blocks. A one-character shift bug in the AVX2 IQ3_S index made it fail (23.2 vs 46.3).
+- 64-token greedy text: llama.cpp and Strata match for the first ~30 tokens, then differ ("cuisine, fashion" vs
+  "vibrant culture"). The 24-token check of #66 still matches. Mixed GPU/CPU expert numerics on this model; the
+  main model has no IQ3_S tensors and is untouched (cpu_moe tests pass).
+- Without `--fixed-experts` the adaptive placement learns the hot experts across runs: 30.8, 72.3, 83.1 tok/s on
+  three successive runs of the old binary (CPU share 65%, 14%, 1%).
+- Next on this model: layer 39 down is Q6_K and has no integer kernel (1390 us per expert matvec).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
