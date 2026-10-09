@@ -24,6 +24,9 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - At 2a51d2e (#52): decode after 4096 93.9, MTP k = 1 94.5; after 16384 87.0. Parity 98.36% over 6 runs, with an
   interleaved control showing ec8200a at 98.28% under the same conditions. Parity gate per change: interleaved
   3-run control against the previous binary, since single 3-run means move by +-0.3%.
+- At 654a270 (#69, current): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
+  99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
+  `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
 
 ## Iterations
 
