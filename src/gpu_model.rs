@@ -142,8 +142,8 @@ impl<'a> GpuModel<'a> {
 
         let ke = c.n_expert_used.max(1);
         let ff = (ke * c.n_ff_exp).max(c.n_ff);
-        let sizes: [(&'static str, usize); 25] = [
-            ("h", c.n_embd), ("mix", c.n_embd), ("qkv", channels), ("z", c.ssm_d_inner), ("beta", nv), ("g", nv),
+        let sizes: [(&'static str, usize); 26] = [
+            ("h", c.n_embd), ("hq", c.n_embd * 9 / 32), ("mix", c.n_embd), ("qkv", channels), ("z", c.ssm_d_inner), ("beta", nv), ("g", nv),
             ("y", channels), ("o", c.ssm_d_inner), ("qg", c.n_head * 2 * c.head_dim), ("q", c.n_head * c.head_dim),
             ("kraw", kv), ("k", kv), ("v", kv), ("att", c.n_head * c.head_dim), ("rl", c.n_expert), ("wts", ke),
             ("ge", ff), ("ue", ff), ("ye", ke * c.n_embd), ("shg", c.n_ff_shexp), ("shu", c.n_ff_shexp),
@@ -321,7 +321,8 @@ impl<'a> GpuModel<'a> {
         let x = g.ptr(&self.x);
         for (il, l) in self.layers.iter().enumerate() { self.layer(il, l, x, step, self.worker.as_ref(), nt)?; }
         g.rms_norm(x, ne, self.output_norm.ptr, p("h"), ne, ne, nt, eps)?;
-        self.mv(&self.output, p("h"), ne, g.ptr(&self.logits), c.n_vocab, nt)
+        g.quant_xq(p("h"), ne, ne, nt, p("hq"))?;
+        g.gemvq(&self.output, p("h"), ne, p("hq"), g.ptr(&self.logits), c.n_vocab, nt)
     }
 
     /// y[t] = W x[t] for t < nt (strides in floats).
@@ -432,13 +433,16 @@ impl<'a> GpuModel<'a> {
         let c = &self.m.cfg;
         let (g, eps, ne) = (&self.gpu, c.eps, c.n_embd);
         let p = |n: &str| g.ptr(&self.bufs[n]);
-        let mv = |w: &GpuTensor, x: &str, xs: usize, y: &str, ys: usize| self.mv(w, p(x), xs, p(y), ys, nt);
+        // Inputs from "h" are quantized once ("hq", after each norm) instead of once per GEMV block.
+        let mv = |w: &GpuTensor, x: &str, xs: usize, y: &str, ys: usize|
+            if x == "h" { g.gemvq(w, p(x), xs, p("hq"), p(y), ys, nt) } else { self.mv(w, p(x), xs, p(y), ys, nt) };
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
         let (dv, channels) = (c.ssm_d_inner / nv, c.ssm_d_inner + 2 * nk * dk);
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
         let kv = nkv * hd;
         {
             g.rms_norm(x, ne, l.attn_norm.ptr, p("h"), ne, ne, nt, eps)?;
+            g.quant_xq(p("h"), ne, ne, nt, p("hq"))?;
             match &l.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, snap } => {
                     let (sc, ss, ns) = snap.as_ref().map_or((0, 0, 0), |(a, b)| (g.ptr(a), g.ptr(b), self.k));
@@ -473,6 +477,7 @@ impl<'a> GpuModel<'a> {
             }
             g.add(x, p("mix"), nt * ne)?;
             g.rms_norm(x, ne, l.post_norm.ptr, p("h"), ne, ne, nt, eps)?;
+            g.quant_xq(p("h"), ne, ne, nt, p("hq"))?;
             match &l.ffn {
                 Ffn::Dense { gate, up, down } => {
                     mv(gate, "h", ne, "ge", c.n_ff)?;
@@ -498,13 +503,13 @@ impl<'a> GpuModel<'a> {
                     g.moe_publish(ids, p("wts"), slots, p("h"), mb, k, ne, w.layout.h, step, nt)?;
                     if mg.ty == mu.ty && (mg.rows, mg.cols) == (mu.rows, mu.cols) {
                         let pair = (mu.off as i64 - mg.off as i64, p("ue") as i64 - p("ge") as i64);
-                        g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, p("h"), ne, k, p("ge"), Some(pair))?;
+                        g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, p("h"), ne, k, p("ge"), Some(pair), p("hq"))?;
                     } else {
-                        g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, p("h"), ne, k, p("ge"), None)?;
-                        g.moe_gemv(mu.ty, mu.rows, mu.cols, base + mu.off as u64, stride, slots, kt, p("h"), ne, k, p("ue"), None)?;
+                        g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, p("h"), ne, k, p("ge"), None, p("hq"))?;
+                        g.moe_gemv(mu.ty, mu.rows, mu.cols, base + mu.off as u64, stride, slots, kt, p("h"), ne, k, p("ue"), None, p("hq"))?;
                     }
                     g.swiglu(p("ge"), p("ue"), kt * c.n_ff_exp)?;
-                    g.moe_gemv(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, kt, p("ge"), c.n_ff_exp, 1, p("ye"), None)?;
+                    g.moe_gemv(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, kt, p("ge"), c.n_ff_exp, 1, p("ye"), None, 0)?;
                     let (sh, sg) = match shared {
                         Some(s) => {
                             mv(&s.gate_inp, "h", ne, "sg", 1)?;

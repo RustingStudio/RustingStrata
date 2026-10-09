@@ -344,6 +344,13 @@ __device__ __forceinline__ void quant_x(const float* __restrict__ x, int n, sign
     __syncthreads();
 }
 
+// quant_xq: quant_x of nt rows (row t at x + t * xs, block t) into the gemvn shared-memory layout at out: all int8 rows, then
+// all scales. gemvn and moe_gemv read it in place of quantizing x per block.
+extern "C" __global__ void quant_xq(const float* x, int xs, int n, signed char* out) {
+    int t = blockIdx.x;
+    quant_x(x + (size_t)t * xs, n, out + (size_t)t * n, (float*)(out + (size_t)gridDim.x * n) + t * (n / 32));
+}
+
 template <int T, int SBB>
 __device__ __forceinline__ void gemv_row_q(const u8* __restrict__ w, const signed char* qs, const float* xd, float* y, int row, int nsb) {
     int lane = threadIdx.x & 31;
@@ -438,12 +445,19 @@ FTYPES(DEF_FGEMV)
     }                                                                                                           \
     extern "C" __global__ void moe_gemv_##NAME(const u8* w, const int* ids, long long stride, const float* x,  \
                                                int x_stride, int xg, float* y, int rows, int nsb, int rpw,      \
-                                               long long w2, long long y2) {                                   \
-        extern __shared__ __align__(16) signed char xs[];                                                       \
+                                               long long w2, long long y2, const signed char* xq) {            \
+        extern __shared__ __align__(16) signed char sx[];                                                       \
         int k = blockIdx.y, e = ids[k];                                                                         \
         if (e < 0) return;                                                                                      \
-        float* xd = (float*)(xs + 256 * nsb);                                                                   \
-        quant_x(x + (size_t)(k / xg) * x_stride, 256 * nsb, xs, xd);                                            \
+        const signed char* xs; const float* xd;                                                                 \
+        if (xq) {                                                                                               \
+            int t = k / xg;                                                                                     \
+            xs = xq + (size_t)t * 256 * nsb;                                                                    \
+            xd = (const float*)(xq + (size_t)gridDim.y / xg * 256 * nsb) + t * 8 * nsb;                         \
+        } else {                                                                                                \
+            quant_x(x + (size_t)(k / xg) * x_stride, 256 * nsb, sx, (float*)(sx + 256 * nsb));                  \
+            xs = sx; xd = (const float*)(sx + 256 * nsb);                                                       \
+        }                                                                                                       \
         const u8* we = w + e * stride + blockIdx.z * w2;                                                        \
         y = (float*)((char*)y + blockIdx.z * y2);                                                               \
         int r0 = blockIdx.x * 8 * rpw + (threadIdx.x >> 5), r1 = min(rows, r0 - (threadIdx.x >> 5) + 8 * rpw);  \
@@ -455,10 +469,12 @@ ITYPES(DEF_IGEMV)
 // gemvn: y[t] = W x[t] for t < nt <= 4 (x t at x + t * xs, y t at y + t * ys); each weight block is read once.
 #define DEF_IGEMVN(T, NAME, SBB)                                                                                  \
     extern "C" __global__ void gemvn_##NAME(const u8* w, const float* x, int xs_, float* y, int ys, int rows, int nsb, \
-                                            int rpw, int nt) {                                                    \
-        extern __shared__ __align__(16) signed char xs[];                                                       \
-        float* xd = (float*)(xs + nt * 256 * nsb);                                                              \
-        for (int t = 0; t < nt; t++) quant_x(x + (size_t)t * xs_, 256 * nsb, xs + t * 256 * nsb, xd + t * 8 * nsb); \
+                                            int rpw, int nt, const signed char* xq) {                             \
+        extern __shared__ __align__(16) signed char sx[];                                                       \
+        const signed char* xs = xq ? xq : sx;                                                                   \
+        const float* xd = (const float*)(xs + nt * 256 * nsb);                                                  \
+        if (!xq) for (int t = 0; t < nt; t++)                                                                   \
+            quant_x(x + (size_t)t * xs_, 256 * nsb, sx + t * 256 * nsb, (float*)(sx + nt * 256 * nsb) + t * 8 * nsb); \
         int r0 = blockIdx.x * 8 * rpw + (threadIdx.x >> 5), r1 = min(rows, r0 - (threadIdx.x >> 5) + 8 * rpw);  \
         for (int row = r0; row < r1; row += 8) {                                                               \
             const u8* wr = w + (size_t)row * nsb * SBB;                                                         \
