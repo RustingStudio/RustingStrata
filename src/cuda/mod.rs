@@ -21,7 +21,7 @@ const KERNELS: [&str; 26] = [
 ];
 
 /// Blocks per head in decode attention (positions split across them).
-pub const ATT_SPLITS: usize = 64;
+pub const ATT_SPLITS: usize = 32;
 /// Splits of the one-head-per-block decode attention used below ATT_GQA_MIN positions.
 const ATT_SPLITS_1: usize = 16;
 /// Positions from which decode attention shares K/V loads across a GQA group (break-even measured near 2K).
