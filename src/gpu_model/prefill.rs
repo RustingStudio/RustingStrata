@@ -65,7 +65,7 @@ impl GpuModel<'_> {
     pub fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
         let Some(chunk) = self.pf.as_ref().map(|p| p.chunk) else { return self.step_all(tokens) };
         if tokens.len() < self.short { return self.step_all(tokens); }
-        anyhow::ensure!(self.pos + tokens.len() <= self.ctx, "context full ({} tokens)", self.ctx);
+        anyhow::ensure!(self.pos + tokens.len() <= self.ctx, "context full ({} tokens; raise --ctx)", self.ctx);
         for ch in tokens.chunks(chunk) { self.prefill_chunk(ch)?; }
         let (g, ne) = (&self.gpu, self.m.cfg.n_embd);
         let last = g.ptr(&self.pf.as_ref().unwrap().slab) + (4 * ne * ((tokens.len() - 1) % chunk)) as u64;
