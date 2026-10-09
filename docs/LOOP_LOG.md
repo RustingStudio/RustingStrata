@@ -1147,6 +1147,30 @@ those CPU experts used the f32 dequant fallback. Added scalar and AVX2 ports of 
   three successive runs of the old binary (CPU share 65%, 14%, 1%).
 - Next on this model: layer 39 down is Q6_K and has no integer kernel (1390 us per expert matvec).
 
+### 2026-10-09 #68 — IQ2_XXS, IQ2_S, IQ1_S, IQ1_M: Qwen3.8-27B-UD-IQ3_XXS runs (bd1f895, dd68d3e, 654a270)
+
+The dense 27B (arch qwen35) stopped at `unsupported quant type id 19`. That error now names the type
+(`unsupported quant type IQ1_S (ggml type id 19); supported: ...`, bd1f895).
+
+- dd68d3e: IQ2_XXS (16) and IQ2_S (22) grids, CPU dequant, GPU `deq8`/`QI`. IQ2_S keeps the f16 prefill GEMM by
+  default, like IQ2_XS (scale per 16, #31).
+- 654a270: IQ1_S (19) and IQ1_M (29). The integer path folds the ±1/8 offset into the weight,
+  dl * (g ± 1/8) = (dl / 8) * (8g ± 1), an exact int8 in {-9, -7, -1, 1, 7, 9}, so no min term is needed.
+- Found on the way: `gemvn` with 3 or 4 inputs over the 27B's 17408-column `ffn_down` needs 59-77 KB of shared
+  memory, above the default 48 KB, and the launch failed with `CUDA_ERROR_INVALID_VALUE`. `gemvn_*` now opts in to
+  96 KB like `attn_prefill_*`.
+- Proof on the 27B (`STRATA_MODEL`): CPU dequant equals gguf-py's `dequantize` exactly (row 3, first 1024 values) for
+  all four types; GPU dequant max diff 0; gemv rel err 1.2-1.3e-6; gemm 1.2e-6 (int8), 3.1e-6 / 4.1e-6 (f16). All
+  `cuda` tests pass on the 27B; the per-type tests now skip types the build does not support, and the MoE test skips
+  dense models.
+- Greedy, "The capital of France is", 24 tokens: llama.cpp, Strata `--gpu` and Strata CPU give identical text.
+  `--gpu`: 19.3 tok/s decode, plan 10784 MB with KV for 4096 tokens.
+- Main model, `benchpend.sh` k = 1, 3 rounds interleaved with the pre-change binary (load 4.9-8.0): 4K decode
+  100.1 / 100.5 / 98.9 (HEAD) vs 100.0 / 99.7 / 96.2 tok/s; 4K prefill 2048.7 / 2049.7 / 1978.7 vs 2038.9 / 2037.1 /
+  1816.9 (round 3 of the new binary had one 178 tok/s outlier rep). No change.
+- Every GGUF type in the local Qwen3.5/3.6/3.8 files now loads. Not yet supported: F16, Q4_0/Q4_1/Q5_0/Q5_1,
+  IQ4_NL, TQ*, MXFP4.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
