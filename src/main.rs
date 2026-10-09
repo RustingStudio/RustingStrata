@@ -50,6 +50,10 @@ struct Engine {
     /// accumulator) for parity runs; attention gets much slower.
     #[arg(long)]
     llama_numerics: bool,
+    /// Place experts in layer order and never move them, ignoring and keeping the routing profile, so parity runs
+    /// repeat exactly.
+    #[arg(long)]
+    fixed_experts: bool,
     /// Prompts shorter than this skip the batched prefill (from `strata calibrate`, else 32).
     #[arg(skip)]
     short: usize,
@@ -111,6 +115,7 @@ impl Engine {
         if let Some(n) = self.threads.or(get("threads")) { rayon::ThreadPoolBuilder::new().num_threads(n).build_global()?; }
         if !self.gpu { return Ok(Runner::Cpu(m, State::new(&m.cfg))); }
         if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
+        if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
         let mut g = GpuModel::load(m, Gpu::new()?, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp())?;
         g.short = self.short;
         Ok(Runner::Gpu(Box::new(g)))
