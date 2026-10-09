@@ -7,21 +7,21 @@ use half::{bf16, f16};
 use tables::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GgmlType { F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ2XS, IQ3XXS, IQ3S, IQ4XS }
+pub enum GgmlType { F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS }
 use GgmlType::*;
 
 impl GgmlType {
     pub fn from_u32(id: u32) -> anyhow::Result<Self> {
         Ok(match id {
             0 => F32, 30 => BF16, 8 => Q8_0, 10 => Q2K, 11 => Q3K, 12 => Q4K, 13 => Q5K, 14 => Q6K,
-            17 => IQ2XS, 18 => IQ3XXS, 21 => IQ3S, 23 => IQ4XS,
+            16 => IQ2XXS, 17 => IQ2XS, 18 => IQ3XXS, 21 => IQ3S, 22 => IQ2S, 23 => IQ4XS,
             _ => {
                 const NAMES: [&str; 40] = ["F32", "F16", "Q4_0", "Q4_1", "", "", "Q5_0", "Q5_1", "Q8_0", "Q8_1", "Q2_K",
                     "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_K", "IQ2_XXS", "IQ2_XS", "IQ3_XXS", "IQ1_S", "IQ4_NL", "IQ3_S",
                     "IQ2_S", "IQ4_XS", "I8", "I16", "I32", "I64", "F64", "IQ1_M", "BF16", "", "", "", "TQ1_0", "TQ2_0",
                     "", "", "", "MXFP4"];
                 let name = NAMES.get(id as usize).filter(|n| !n.is_empty()).unwrap_or(&"unknown");
-                anyhow::bail!("unsupported quant type {name} (ggml type id {id}); supported: F32 BF16 Q8_0 Q2_K-Q6_K IQ2_XS IQ3_XXS IQ3_S IQ4_XS")
+                anyhow::bail!("unsupported quant type {name} (ggml type id {id}); supported: F32 BF16 Q8_0 Q2_K-Q6_K IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_XS")
             }
         })
     }
@@ -29,14 +29,14 @@ impl GgmlType {
     pub fn block_bytes(self) -> usize {
         match self {
             F32 => 4, BF16 => 2, Q8_0 => 34, Q2K => 84, Q3K => 110, Q4K => 144, Q5K => 176, Q6K => 210,
-            IQ2XS => 74, IQ3XXS => 98, IQ3S => 110, IQ4XS => 136,
+            IQ2XXS => 66, IQ2XS => 74, IQ2S => 82, IQ3XXS => 98, IQ3S => 110, IQ4XS => 136,
         }
     }
     pub fn row_bytes(self, n: u64) -> usize { n as usize / self.block_elems() * self.block_bytes() }
     pub fn name(self) -> &'static str {
         match self {
             F32 => "F32", BF16 => "BF16", Q8_0 => "Q8_0", Q2K => "Q2_K", Q3K => "Q3_K", Q4K => "Q4_K",
-            Q5K => "Q5_K", Q6K => "Q6_K", IQ2XS => "IQ2_XS", IQ3XXS => "IQ3_XXS", IQ3S => "IQ3_S", IQ4XS => "IQ4_XS",
+            Q5K => "Q5_K", Q6K => "Q6_K", IQ2XXS => "IQ2_XXS", IQ2XS => "IQ2_XS", IQ2S => "IQ2_S", IQ3XXS => "IQ3_XXS", IQ3S => "IQ3_S", IQ4XS => "IQ4_XS",
         }
     }
 }
@@ -59,7 +59,7 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) {
             BF16 => y[0] = bf16::from_le_bytes([blk[0], blk[1]]).to_f32(),
             Q8_0 => { let d = h(blk, 0); for j in 0..32 { y[j] = blk[2 + j] as i8 as f32 * d; } }
             Q2K => q2k(blk, y), Q3K => q3k(blk, y), Q4K => q4k(blk, y), Q5K => q5k(blk, y), Q6K => q6k(blk, y),
-            IQ2XS => iq2xs(blk, y), IQ3XXS => iq3xxs(blk, y), IQ3S => iq3s(blk, y), IQ4XS => iq4xs(blk, y),
+            IQ2XXS => iq2xxs(blk, y), IQ2XS => iq2xs(blk, y), IQ2S => iq2s(blk, y), IQ3XXS => iq3xxs(blk, y), IQ3S => iq3s(blk, y), IQ4XS => iq4xs(blk, y),
         }
     }
 }
@@ -162,6 +162,30 @@ fn q6k(b: &[u8], y: &mut [f32]) {
 }
 
 fn sign(signs: u8, j: usize) -> f32 { if signs & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 } }
+
+fn iq2xxs(b: &[u8], y: &mut [f32]) {
+    let d = h(b, 0);
+    for ib in 0..8 {
+        let (qs, aux) = (&b[2 + 8 * ib..6 + 8 * ib], u32::from_le_bytes(b[6 + 8 * ib..10 + 8 * ib].try_into().unwrap()));
+        let db = d * (0.5 + (aux >> 28) as f32) * 0.25;
+        for l in 0..4 {
+            let (grid, signs) = (IQ2XXS_GRID[qs[l] as usize].to_le_bytes(), KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize]);
+            for j in 0..8 { y[32 * ib + 8 * l + j] = db * grid[j] as f32 * sign(signs, j); }
+        }
+    }
+}
+
+fn iq2s(b: &[u8], y: &mut [f32]) {
+    let d = h(b, 0);
+    let (qs, signs, qh, scales) = (&b[2..34], &b[34..66], &b[66..74], &b[74..82]);
+    for ib in 0..8 {
+        let db = [d * (0.5 + (scales[ib] & 0xF) as f32) * 0.25, d * (0.5 + (scales[ib] >> 4) as f32) * 0.25];
+        for l in 0..4 {
+            let grid = IQ2S_GRID[qs[4 * ib + l] as usize | ((qh[ib] as usize) << (8 - 2 * l) & 0x300)].to_le_bytes();
+            for j in 0..8 { y[32 * ib + 8 * l + j] = db[l / 2] * grid[j] as f32 * sign(signs[4 * ib + l], j); }
+        }
+    }
+}
 
 fn iq2xs(b: &[u8], y: &mut [f32]) {
     let d = h(b, 0);
