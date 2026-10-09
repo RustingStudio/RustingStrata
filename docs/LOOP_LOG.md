@@ -942,6 +942,23 @@ tokens and every head_dim).
   attention and dense weight reads plus one sync. k = 2 still loses to k = 1 (49% accepted). 4K with MTP: 95.2;
   the 100 tok/s target is not met.
 
+### 2026-10-09 #54 — float GEMVs batch verify tokens (0272e25)
+
+- Profile of 4K MTP decode at 1b4dba2 (nsys, `--pp 4096 --tg 128 --mtp 1`): `gemv_f32` ran 276 times per
+  verify cycle (~1.0 ms of ~13.5 ms). For F32/BF16, `gemvn` looped `gemv` per token. So the router (2 MB),
+  ssm beta/alpha and the shared-expert gate were read twice per 2-token verify, with twice the launches.
+- Change: `gemv_row` takes NT inputs and keeps the same per-token arithmetic. New `gemvn_f32`/`gemvn_bf16`
+  kernels. `gemvn_matches_gemv` now also covers the float types and is bit-exact. cuda 9/9, gpu_model 7/7.
+  Plain decode (nt = 1) and verify outputs are unchanged, so parity was not re-run.
+- Bench `--mtp 1 --pp 512,4096 --tg 128 --reps 3`, 3 interleaved rounds against 1b4dba2, load 3.8-6.6:
+
+| | 1b4dba2 | this |
+|---|---|---|
+| 512 | 106.6 / 107.2 / 107.1 | 109.8 / 109.9 / 109.6 |
+| 4096 | 95.3 / 95.3 / 95.1 | 97.5 / 97.3 / 96.2 |
+
+  +2.6% at 512 and +1.8% at 4K. Acceptance is the same (297/471).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
