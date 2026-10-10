@@ -1,5 +1,5 @@
 # Extract IQ lookup tables from llama.cpp ggml-common.h into Rust.
-# Usage: python -I tools/gen_tables.py ~/llama.cpp/ggml/src/ggml-common.h > src/quant/tables.rs
+# Usage: python -I tools/gen_tables.py ~/Clones/llama.cpp/ggml/src/ggml-common.h > src/quant/tables.rs
 import re, sys
 src = open(sys.argv[1]).read()
 

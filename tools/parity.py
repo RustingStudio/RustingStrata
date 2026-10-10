@@ -1,7 +1,7 @@
 # M1 parity gate: llama.cpp greedy continuations, teacher-forced through `strata score`.
 # Usage: python -I tools/parity.py <model.gguf> [--n 32] [--limit 20] [--port 8199] [--bin target/release/strata] [--ref target/parity-ref.json]
 #        [--extra "--gpu"] [--tag gpu]  (result goes to target/parity-result[-tag].json)
-# Phase 1 needs llama-server running on --port (e.g. ~/llama.cpp/build/bin/llama-server -m M --port 8199);
+# Phase 1 needs llama-server running on --port (e.g. ~/Clones/llama.cpp/build/bin/llama-server -m M --port 8199);
 # its outputs are cached in target/parity-ref.json so phase 2 can run without it.
 import argparse, json, pathlib, subprocess, sys, urllib.request
 
