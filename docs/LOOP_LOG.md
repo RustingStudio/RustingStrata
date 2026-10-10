@@ -1,6 +1,6 @@
 # Improvement loop log
 
-Each iteration: one verified item. Newest entry last. Loop instructions: `/home/vasylt/Rusting/loop-prompts/strata.md`.
+Each iteration: one verified item. Newest entry last. Loop instructions: `/home/vasylt/Code/rusting/loop-prompts/strata.md`.
 
 ## State
 
@@ -468,7 +468,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 
 ### 2026-10-08 #31 — GPU held by YOLO training; parity reference lost (no commit)
 - `target/` was deleted at 18:17 (disk 90% full), with `target/parity-ref.json` and all cached parity results.
-- GPU held from 18:47 to ~19:55 by `flock .gpu.lock yolo detect train` (~/cs2), then by RustingCS2 `train-bc` runs.
+- GPU held from 18:47 to ~19:55 by `flock .gpu.lock yolo detect train` (~/Code/games/cs2), then by RustingCS2 `train-bc` runs.
 
 ### 2026-10-08 #32 — int8 MMQ prefill GEMM (3754e65)
 - Reference rebuilt 20:04-20:11: `llama-server -ngl 99 --n-cpu-moe 20 -fa on`, 20 prompts x 32 tokens.
@@ -510,7 +510,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   88.9 (85.7-90.8); 32K prefill 1413.0, decode 67.8 (MTP 64.9). llama.cpp n-cpu-moe 10: pp512 1046.4, pp4096
   1048.1, tg128 69.8; n-cpu-moe 14 at d32768: pp512 775.7, tg128 57.9. Speed gate passed (1.64x prefill, 1.17x
   decode). MTP helps only at short context (+7.2 / +0.4 / -2.9 tok/s at 512 / 4K / 32K).
-- Found: `~/llama.cpp/build` is a CPU-only build ("no usable GPU found, --gpu-layers option will be ignored").
+- Found: `~/Clones/llama.cpp/build` is a CPU-only build ("no usable GPU found, --gpu-layers option will be ignored").
   The first gate script used its llama-bench (pp512 55 tok/s, killed and rerun on `build-cuda`). Every parity
   reference so far (`target/parity-ref.json`, #33 self-parity) came from that build's llama-server, so the 99%
   gate has been measured against llama.cpp's CPU numerics.

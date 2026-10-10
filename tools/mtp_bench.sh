@@ -4,7 +4,7 @@
 # DRAFT=0 runs without speculative decoding.
 set -u
 M=${STRATA_MODEL:?set STRATA_MODEL}
-BIN=${LLAMA_BIN:-$HOME/llama.cpp/build-cuda/bin}
+BIN=${LLAMA_BIN:-$HOME/Clones/llama.cpp/build-cuda/bin}
 NCMOE=${NCMOE:-10}
 PORT=${PORT:-8198}
 PROMPT=${PROMPT:-"Write a detailed explanation of how a hash map works, including collision handling."}

@@ -12,7 +12,7 @@ scalar math; `model` runs the hybrid DeltaNet/attention/MoE stack one token at a
 feeds token ids and prints argmax per position, which `tools/parity.py` compares to `llama-server`.
 
 **Tech Stack:** Rust 1.95 (edition 2024), `memmap2`, `rayon`, `half`, `tokenizers`, `serde_json`, `clap`, `anyhow`.
-Python 3 + numpy + `~/llama.cpp/gguf-py` for fixture/oracle scripts only.
+Python 3 + numpy + `~/Clones/llama.cpp/gguf-py` for fixture/oracle scripts only.
 
 **Spec:** `docs/superpowers/specs/2026-10-06-rusting-strata-v1-design.md`
 
@@ -93,15 +93,15 @@ RustingStrata/
 - Create: `tools/baseline.sh`, `docs/baseline.md`
 
 **Interfaces:** Produces `docs/baseline.md` with the numbers every later speed gate compares against, and a CUDA
-`llama-server` at `~/llama.cpp/build-cuda/bin/` that `tools/parity.py` uses.
+`llama-server` at `~/Clones/llama.cpp/build-cuda/bin/` that `tools/parity.py` uses.
 
 - [ ] **Step 1: Build llama.cpp with CUDA in a separate build dir** (existing `build/` is CPU-only; leave it alone)
 
 ```bash
-cd ~/llama.cpp && cmake -B build-cuda -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release \
+cd ~/Clones/llama.cpp && cmake -B build-cuda -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release \
   && cmake --build build-cuda -j 12 --target llama-bench llama-server llama-tokenize llama-cli
 ```
-Expected: binaries in `~/llama.cpp/build-cuda/bin/`, `ldd .../libggml-cuda.so` shows libcudart.
+Expected: binaries in `~/Clones/llama.cpp/build-cuda/bin/`, `ldd .../libggml-cuda.so` shows libcudart.
 
 - [ ] **Step 2: Write `tools/baseline.sh`**
 
@@ -110,7 +110,7 @@ Expected: binaries in `~/llama.cpp/build-cuda/bin/`, `ldd .../libggml-cuda.so` s
 # Sweep llama.cpp's --n-cpu-moe on the target file; print llama-bench tables.
 set -euo pipefail
 M=${STRATA_MODEL:-/mnt/ollama/hub/models--unsloth--Qwen3.6-35B-A3B-MTP-GGUF/snapshots/5bc3e238d916f48a861bac2f8a1990a0e9b7e98d/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf}
-B=~/llama.cpp/build-cuda/bin
+B=~/Clones/llama.cpp/build-cuda/bin
 for n in 0 4 8 12 16 20 24; do
   echo "== n-cpu-moe $n"
   $B/llama-bench -m "$M" -ngl 99 --n-cpu-moe $n -fa 1 -p 4096 -n 128 -r 2 -o md 2>/dev/null | tail -n +3 || echo "OOM"
@@ -126,7 +126,7 @@ Then for the best `n`: `llama-bench ... -d 32768 -p 4096 -n 128` (decode/prefill
 for the exact flag) measuring decode tok/s from the `timings` field of a 256-token `/completion` at temperature 0.
 
 - [ ] **Step 4: Write `docs/baseline.md`** — table: setting, prefill 4K, prefill at 32K depth, decode short, decode at
-  32K depth, decode with MTP; hardware line; llama.cpp commit (`git -C ~/llama.cpp log -1 --format=%h`).
+  32K depth, decode with MTP; hardware line; llama.cpp commit (`git -C ~/Clones/llama.cpp log -1 --format=%h`).
 
 - [ ] **Step 5: Commit**
 
@@ -524,7 +524,7 @@ kernels later).
 - [ ] **Step 1: `tools/gen_tables.py`**
 
 ```python
-# Usage: python -I tools/gen_tables.py ~/llama.cpp/ggml/src/ggml-common.h > src/quant/tables.rs
+# Usage: python -I tools/gen_tables.py ~/Clones/llama.cpp/ggml/src/ggml-common.h > src/quant/tables.rs
 import re, sys
 src = open(sys.argv[1]).read()
 def arr(name):
@@ -731,7 +731,7 @@ use rusting_strata::ops::*;
 - [ ] **Step 1: Fixture from llama.cpp** — strings: `"Hello world"`, `"fn main() {\n    println!(\"hi\");\n}"`,
   `"Привіт, як справи?"`, `"<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n"`, `"   spaces\t\ttabs\n\n\n"`,
   `"数字 12345 and émojis 🚀"`. For each run
-  `~/llama.cpp/build-cuda/bin/llama-tokenize -m "$STRATA_MODEL" -p "<s>" --ids --log-disable --no-bos`
+  `~/Clones/llama.cpp/build-cuda/bin/llama-tokenize -m "$STRATA_MODEL" -p "<s>" --ids --log-disable --no-bos`
   and store `[{"text": ..., "ids": [...]}]` in `tests/fixtures/tokens.json` (a short python wrapper with
   `subprocess.run([...], capture_output=True)` and `ast.literal_eval` on the printed list; commit the JSON).
 - [ ] **Step 2: Failing test** — for each fixture: `encode(text) == ids` and `decode(ids) == text`.
@@ -811,7 +811,7 @@ attention loop reads `st` KV for positions `0..=pos` after appending the current
 (`output.weight` missing in a tied model) → use `token_embd.weight` as the head.
 
 - [ ] **Step 4: Run** `cargo test --test model -- --nocapture` — Expected: PASS ("Paris"). If it fails, debug with
-  `~/llama.cpp/build-cuda/bin/llama-eval-callback -m $STRATA_MODEL -p "The capital of France is" -n 1 --no-warmup`,
+  `~/Clones/llama.cpp/build-cuda/bin/llama-eval-callback -m $STRATA_MODEL -p "The capital of France is" -n 1 --no-warmup`,
   which prints sums of every named tensor (`attn_norm-0`, `linear_attn_out-0`, `ffn_moe_out-0`, `l_out-N`, ...);
   print the same sums from Rust for token 0 and find the first divergence.
 - [ ] **Step 5: Commit** `feat: CPU reference forward for qwen35/qwen35moe`
@@ -840,7 +840,7 @@ attention loop reads `st` KV for positions `0..=pos` after appending the current
 
 ```python
 # Usage: python -I tools/parity.py <model.gguf> [--n 32] [--limit 20]
-# Needs llama-server already running: ~/llama.cpp/build-cuda/bin/llama-server -m M -ngl 99 --n-cpu-moe 20 --port 8199
+# Needs llama-server already running: ~/Clones/llama.cpp/build-cuda/bin/llama-server -m M -ngl 99 --n-cpu-moe 20 --port 8199
 import json, subprocess, sys, urllib.request, argparse, pathlib
 ap = argparse.ArgumentParser(); ap.add_argument("model"); ap.add_argument("--n", type=int, default=32)
 ap.add_argument("--limit", type=int, default=20); a = ap.parse_args()
@@ -868,7 +868,7 @@ sys.exit(0 if agree >= 0.99 * total else 1)
 
 ```bash
 cargo build --release
-~/llama.cpp/build-cuda/bin/llama-server -m "$STRATA_MODEL" -ngl 99 --n-cpu-moe 20 -fa on --port 8199 &
+~/Clones/llama.cpp/build-cuda/bin/llama-server -m "$STRATA_MODEL" -ngl 99 --n-cpu-moe 20 -fa on --port 8199 &
 python -I tools/parity.py "$STRATA_MODEL"
 ```
 Expected: `TOP1 AGREEMENT ... ≥ 99.00%`, exit 0. Disagreements at near-ties (top-2 logprob within 0.05 in our top5)
