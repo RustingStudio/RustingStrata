@@ -78,7 +78,7 @@ On the reference machine, same GGUF file:
 
 ## Architecture
 
-One crate, `rusting_strata`, at `~/Rusting/RustingStrata`. Standalone: no dependency on RustingBrain (pieces may be
+One crate, `rusting_strata`, at `~/Code/rusting/RustingStrata`. Standalone: no dependency on RustingBrain (pieces may be
 ported). Dependencies kept to: `cudarc` (nvrtc, runtime, cublas only if a kernel loses to it), `memmap2`, `rayon`
 (or a hand-rolled pinned worker pool if rayon's latency is the bottleneck), `half`, `tokenizers`, `minijinja`,
 `serde`/`serde_json`, `clap`, an HTTP server crate (`axum` or `tiny_http`, chosen in the plan), `anyhow`.
@@ -182,7 +182,7 @@ CLI flags: `--model`, `--ctx`, `--kv q8|f16`, `--chunk`, `--mtp-k`, `--threads`,
 
 ## Testing
 
-- **Quant oracle:** a one-time script using `~/llama.cpp/gguf-py` dumps dequantized fixture blocks for every v1 type
+- **Quant oracle:** a one-time script using `~/Clones/llama.cpp/gguf-py` dumps dequantized fixture blocks for every v1 type
   from the target file; Rust scalar dequant must match exactly.
 - **Kernel parity:** each CPU and CUDA kernel vs the Rust scalar reference, with stated tolerances (GEMV per type,
   DeltaNet recurrent vs chunked, flash decode/prefill, router top-k, MRoPE, sampling).
