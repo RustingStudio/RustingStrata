@@ -35,7 +35,7 @@ fn rel_l2(a: &[f32], b: &[f32]) -> f32 {
 fn dequant_and_gemv_match_reference_for_every_type() {
     let (Some(p), Some(gpu)) = (common::model_path(), gpu()) else { return };
     let g = Gguf::open(&p).unwrap();
-    let w = Weights { g: &g };
+    let w = Weights::new(&g).unwrap();
     let mut seen = std::collections::BTreeSet::new();
     for (name, info) in &g.tensors {
         let Ok(ty) = GgmlType::from_u32(info.ty) else { continue };
@@ -79,7 +79,7 @@ fn rms_norm_q_matches_quant_xq() {
 fn moe_gemv_selects_experts() {
     let (Some(p), Some(gpu)) = (common::model_path(), gpu()) else { return };
     let g = Gguf::open(&p).unwrap();
-    let w = Weights { g: &g };
+    let w = Weights::new(&g).unwrap();
     let Some(info) = g.tensors.get("blk.0.ffn_gate_exps.weight") else { return };  // dense model
     let t = w.get("blk.0.ffn_gate_exps.weight").unwrap();
     let n_expert = info.dims[2] as usize;
@@ -120,7 +120,7 @@ fn moe_gemv_selects_experts() {
 fn gemvn_matches_gemv() {
     let (Some(p), Some(gpu)) = (common::model_path(), gpu()) else { return };
     let g = Gguf::open(&p).unwrap();
-    let w = Weights { g: &g };
+    let w = Weights::new(&g).unwrap();
     let mut seen = std::collections::BTreeSet::new();
     for (name, info) in &g.tensors {
         let Ok(ty) = GgmlType::from_u32(info.ty) else { continue };
@@ -154,7 +154,7 @@ fn gemvn_matches_gemv() {
 fn gemv_bandwidth() {
     let (Some(p), Some(gpu)) = (common::model_path(), gpu()) else { return };
     let g = Gguf::open(&p).unwrap();
-    let w = Weights { g: &g };
+    let w = Weights::new(&g).unwrap();
     let time = |f: &dyn Fn()| {
         // Warm up long enough for the clocks to ramp.
         let t0 = std::time::Instant::now();
@@ -201,7 +201,7 @@ fn f16r(v: f32) -> f32 { half::f16::from_f32(v).to_f32() }
 fn gemm_matches_reference_for_every_type() {
     let (Some(p), Some(gpu)) = (common::model_path(), gpu()) else { return };
     let g = Gguf::open(&p).unwrap();
-    let w = Weights { g: &g };
+    let w = Weights::new(&g).unwrap();
     let mut seen = std::collections::BTreeSet::new();
     for (name, info) in &g.tensors {
         let Ok(ty) = GgmlType::from_u32(info.ty) else { continue };
@@ -242,7 +242,7 @@ fn gemm_matches_reference_for_every_type() {
 fn gemm_throughput() {
     let (Some(p), Some(gpu)) = (common::model_path(), gpu()) else { return };
     let g = Gguf::open(&p).unwrap();
-    let w = Weights { g: &g };
+    let w = Weights::new(&g).unwrap();
     let m = 4096usize;
     for name in ["blk.0.attn_qkv.weight", "blk.0.attn_gate.weight", "blk.0.ssm_out.weight", "blk.0.ffn_gate_exps.weight", "blk.0.ffn_down_exps.weight"] {
         let t = w.get(name).unwrap();
