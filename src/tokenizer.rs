@@ -13,6 +13,9 @@ use tokenizers::{AddedToken, PreTokenizerWrapper, SplitDelimiterBehavior};
 /// llama.cpp `LLAMA_VOCAB_PRE_TYPE_QWEN35` pre-tokenizer regex.
 const QWEN35_RE: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// llama.cpp `LLAMA_VOCAB_PRE_TYPE_QWEN2` pre-tokenizer regex (qwen3, qwen3moe, qwen3next).
+const QWEN2_RE: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
     eos: Vec<u32>,
@@ -23,7 +26,7 @@ impl Tokenizer {
         let model = g.get("tokenizer.ggml.model")?.as_str().unwrap_or("");
         if model != "gpt2" { bail!("unsupported tokenizer model '{model}'"); }
         let pre = g.get("tokenizer.ggml.pre")?.as_str().unwrap_or("");
-        if pre != "qwen35" { bail!("unsupported pre-tokenizer '{pre}'"); }
+        let re = match pre { "qwen35" => QWEN35_RE, "qwen2" => QWEN2_RE, _ => bail!("unsupported pre-tokenizer '{pre}'") };
         let strs = |k: &str| -> anyhow::Result<Vec<String>> {
             g.get(k)?.as_arr().with_context(|| format!("{k}: not an array"))?
                 .iter().map(|v| v.as_str().map(str::to_string).with_context(|| format!("{k}: not a string"))).collect()
@@ -37,7 +40,7 @@ impl Tokenizer {
         let bpe = BPE::builder().vocab_and_merges(vocab, merges).build().map_err(|e| anyhow!("{e}"))?;
 
         let mut inner = tokenizers::Tokenizer::new(bpe);
-        let split = Split::new(SplitPattern::Regex(QWEN35_RE.into()), SplitDelimiterBehavior::Isolated, false)
+        let split = Split::new(SplitPattern::Regex(re.into()), SplitDelimiterBehavior::Isolated, false)
             .map_err(|e| anyhow!("{e}"))?;
         inner.with_pre_tokenizer(Some(Sequence::new(vec![
             PreTokenizerWrapper::Split(split),

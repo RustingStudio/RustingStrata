@@ -1,5 +1,6 @@
 //! Named tensor views over the mmapped GGUF and a reference parallel matvec.
 
+use crate::config::ModelConfig;
 use crate::gguf::Gguf;
 use crate::quant::{GgmlType, dequant_row};
 use anyhow::Context;
@@ -50,11 +51,20 @@ impl<'a> Tensor<'a> {
 
 pub struct Weights<'a> {
     pub g: &'a Gguf,
+    aliases: &'static [(&'static str, &'static str)],
 }
 
 impl<'a> Weights<'a> {
+    pub fn new(g: &'a Gguf) -> anyhow::Result<Weights<'a>> {
+        let c = ModelConfig::from_gguf(g)?;
+        Ok(Weights { g, aliases: c.aliases })
+    }
+
+    /// `name` with the architecture's alias for a canonical suffix tried second.
     pub fn get(&self, name: &str) -> anyhow::Result<Tensor<'a>> {
-        let t = self.g.tensors.get(name).with_context(|| format!("missing tensor {name}"))?;
+        let t = self.g.tensors.get(name)
+            .or_else(|| self.aliases.iter().find_map(|&(c, a)| self.g.tensors.get(&format!("{}{a}", name.strip_suffix(c)?))))
+            .with_context(|| format!("missing tensor {name}"))?;
         let ty = GgmlType::from_u32(t.ty).with_context(|| format!("tensor {name}"))?;
         Ok(Tensor {
             ty,

@@ -1,7 +1,7 @@
-//! Scalar CPU reference forward for `qwen35` / `qwen35moe`, one token at a time.
+//! Scalar CPU reference forward for the architectures in `config::arch`, one token at a time.
 //! Mirrors llama.cpp `src/models/qwen35moe.cpp`; this is the correctness oracle, not the fast path.
 
-use crate::config::ModelConfig;
+use crate::config::{LayerKind, ModelConfig};
 use crate::gguf::Gguf;
 use crate::ops;
 use crate::weights::{Tensor, Weights};
@@ -26,15 +26,13 @@ pub struct State {
 impl State {
     pub fn new(c: &ModelConfig) -> State {
         let channels = c.ssm_d_inner + 2 * c.ssm_n_group * c.ssm_d_state;
-        let head_v = c.ssm_d_inner / c.ssm_dt_rank;
-        let layers = (0..c.n_layer)
-            .map(|il| if c.is_recurrent(il) {
-                LayerState::Recurrent {
+        let layers = c.layers.iter()
+            .map(|k| match k {
+                LayerKind::Delta => LayerState::Recurrent {
                     conv: vec![0.0; (c.ssm_conv - 1) * channels],
-                    s: vec![0.0; c.ssm_dt_rank * head_v * c.ssm_d_state],
-                }
-            } else {
-                LayerState::Attn { k: Vec::new(), v: Vec::new() }
+                    s: vec![0.0; c.ssm_dt_rank * c.ssm_dv() * c.ssm_d_state],
+                },
+                LayerKind::Attn => LayerState::Attn { k: Vec::new(), v: Vec::new() },
             })
             .collect();
         State { layers, pos: 0 }
@@ -56,9 +54,9 @@ fn mv(t: &Tensor, x: &[f32]) -> Vec<f32> {
 
 impl<'a> Model<'a> {
     pub fn load(g: &'a Gguf) -> anyhow::Result<Model<'a>> {
-        let w = Weights { g };
-        w.validate()?;
         let cfg = ModelConfig::from_gguf(g)?;
+        let w = Weights::new(g)?;
+        w.validate()?;
         w.get("token_embd.weight")?;
         w.get("output_norm.weight")?;
         Ok(Model { cfg, w })
@@ -126,7 +124,7 @@ impl<'a> Model<'a> {
     fn deltanet(&self, il: usize, h: &[f32], conv: &mut [f32], s: &mut [f32]) -> Vec<f32> {
         let c = &self.cfg;
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
-        let dv = c.ssm_d_inner / nv;
+        let dv = c.ssm_dv();
         let channels = c.ssm_d_inner + 2 * nk * dk;
         let kw = c.ssm_conv;
 

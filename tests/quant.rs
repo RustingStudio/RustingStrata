@@ -31,7 +31,7 @@ fn check(name: &str, ty: GgmlType) {
 fn matvec_matches_rowwise_dequant() {
     let Some(p) = common::model_path() else { return };
     let g = rusting_strata::gguf::Gguf::open(&p).unwrap();
-    let w = rusting_strata::weights::Weights { g: &g };
+    let w = rusting_strata::weights::Weights::new(&g).unwrap();
     w.validate().unwrap();
     let t = w.layer(0, "ffn_down_exps.weight").unwrap().expert(7, 256); // IQ3_XXS, 2048 rows x 512
     assert_eq!((t.rows, t.cols), (2048, 512));
