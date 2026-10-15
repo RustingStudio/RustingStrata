@@ -1444,6 +1444,23 @@ Gate run at 9f4af2a, all under the GPU lock (`docs/m6-results.md`):
   broken since IQ2_XXS support landed. Now checks IQ4_NL (20). All 47 tests pass.
 - Release: version 1.0.0 in Cargo.toml, `strata --version`, README status and agreement row, local tag v1.0.0.
 
+### 2026-10-15 #85 — backend seam (Part 1 of the Vulkan and architecture-table spec)
+
+`src/backend.rs` puts a `Backend` trait between the model and CUDA: `Buf` (device address plus owner) replaces
+`CudaSlice` in `gpu_model.rs`, `gpu_model/prefill.rs`, `expert_cache.rs` and `cpu_worker.rs`; the forward and MTP
+graphs go through `Backend::graph`; the CPU mailbox comes from `Backend::host_mailbox`. cudarc is used only under
+`src/cuda/`.
+- Greedy output (64 tokens, MTP 0) byte-identical to v1.0.0. With `--mtp 1`, v1.0.0 itself is not reproducible run to
+  run: across 3 runs (one with `STRATA_NO_GRAPH`) it gives two different texts after 185 bytes, and the new binary
+  gives the same two texts. So MTP is compared as that set, not one run.
+- Interleaved A/B against v1.0.0, 3 rounds, load 1.0-1.2: 4K prefill 2032.6 vs 2042.0 (v1 range 2017.8-2057.1),
+  decode after 512 115.9 vs 115.4, after 4K 105.2 vs 106.1 tok/s (within 1%). `bench` now runs MTP by default, so
+  decode is above the README ranges for both binaries.
+- Parity `--gpu`: the reference caches were gone, so `target/parity-ref.json` was rebuilt with llama-server CUDA
+  5d8ccdf9d (`--n-cpu-moe 20`). The batch-mode cache (`selfparity.py`, about 1 h) was not rebuilt, so only strict counts.
+  On that reference, interleaved: v1.0.0 626 / 622, new 626 / 627 of 640.
+- `cargo test --release`: 55 pass, 4 ignored, no warnings.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
