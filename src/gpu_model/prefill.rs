@@ -191,7 +191,7 @@ impl GpuModel<'_> {
                     g.stream.memcpy_htod(&xrow, &mut pf.ints.slice_mut(n * k..n * k + t * k))?;
                     g.stream.memcpy_htod(&inv, &mut pf.ints.slice_mut(2 * n * k..2 * n * k + t * k))?;
                     let lx = cache.layer(il).unwrap();
-                    let (pool, stride) = cache.base(g, lx);
+                    let (pool, stride) = cache.base(lx);
                     let used = |e: &usize| off[e + 1] > off[*e];
                     let missed: Vec<usize> = (0..c.n_expert).filter(used).filter(|&e| cache.slot(il, e) < 0).collect();
                     // Group 0: resident experts; then staged groups of at most STAGE missed experts.
