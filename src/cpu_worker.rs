@@ -4,7 +4,7 @@
 //! their weighted sum back and raises the done flag, which the GPU combine kernel waits on only if the layer missed.
 
 use crate::model::Model;
-use cudarc::driver::{PinnedHostSlice, sys};
+use crate::backend::{Backend, Buf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
@@ -32,7 +32,7 @@ impl Mailbox {
 }
 
 pub struct CpuWorker {
-    _mem: PinnedHostSlice<u32>,
+    _mem: Buf,
     host: usize,
     /// Device address of the mailboxes (layer `il` at `dev + 4 * il * layout.stride`).
     pub dev: u64,
@@ -46,17 +46,12 @@ pub struct CpuWorker {
 
 impl CpuWorker {
     /// Mailboxes cover layers up to the largest of `moe_layers`. Safety: `m` must outlive the worker (it is joined on drop).
-    pub fn new(m: &Model, ctx: &Arc<cudarc::driver::CudaContext>, moe_layers: Vec<usize>) -> anyhow::Result<CpuWorker> {
+    pub fn new(m: &Model, gpu: &dyn Backend, moe_layers: Vec<usize>) -> anyhow::Result<CpuWorker> {
         let c = &m.cfg;
         let layout = Mailbox::new(c.n_expert_used, c.n_embd);
         let len = layout.stride * moe_layers.iter().max().map_or(0, |&il| il + 1);
-        let flags = sys::CU_MEMHOSTALLOC_DEVICEMAP | sys::CU_MEMHOSTALLOC_PORTABLE;
-        let mut mem = unsafe { ctx.alloc_pinned_with_flags::<u32>(len, flags)? };
-        let host = mem.as_mut_ptr()? as usize;
-        unsafe { std::ptr::write_bytes(host as *mut u32, 0, len) };
-        let mut dev = 0;
-        let r = unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev, host as *mut _, 0) };
-        anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "cuMemHostGetDevicePointer: {r:?}");
+        let (mem, host) = gpu.host_mailbox(len)?;
+        let (host, dev) = (host as usize, mem.addr);
 
         let (tx, rx) = mpsc::channel::<u32>();
         let (stop, busy_ns) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)));
