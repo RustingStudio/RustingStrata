@@ -228,6 +228,7 @@ impl GpuModel<'_> {
                                 for (name, mat) in MATS.iter().zip(&lx.mats) {
                                     let src = self.m.w.layer(il, name)?.expert(e, c.n_expert);
                                     let o = i * stride + mat.off;
+                                    debug_assert_eq!(src.data.len(), mat.bytes);
                                     g.htod(src.data, &pf.staging, o)?;
                                 }
                             }

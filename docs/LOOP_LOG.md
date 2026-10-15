@@ -1460,6 +1460,10 @@ graphs go through `Backend::graph`; the CPU mailbox comes from `Backend::host_ma
   5d8ccdf9d (`--n-cpu-moe 20`). The batch-mode cache (`selfparity.py`, about 1 h) was not rebuilt, so only strict counts.
   On that reference, interleaved: v1.0.0 626 / 622, new 626 / 627 of 640.
 - `cargo test --release`: 55 pass, 4 ignored, no warnings.
+- `Backend::htod` syncs the stream after the copy. cudarc's `memcpy_htod` from a slice did not, and the final review
+  suggested dropping the sync to match. Without it, greedy output degenerates into "The capital of France is Paris."
+  repeated, and all tests still pass. So some caller relies on the upload having landed. The sync stays and its
+  comment says why. The cause was not traced.
 
 ## Next candidates
 
