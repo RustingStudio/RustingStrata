@@ -121,7 +121,7 @@ impl Engine {
         if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
         if self.kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new
-        let mut g = GpuModel::load(m, Gpu::new()?, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp())?;
+        let mut g = GpuModel::load(m, Box::new(Gpu::new()?), self.ctx, self.chunk(), self.vram_margin << 20, self.mtp())?;
         g.short = self.short;
         Ok(Runner::Gpu(Box::new(g)))
     }
@@ -393,7 +393,7 @@ fn calibrate(model: &Path, ctx: usize, margin: usize) -> anyhow::Result<()> {
     anyhow::ensure!(n_pf >= 512, "--ctx too small to calibrate");
     let pf = prose(&tok, n_pf)?;
     let load = |chunk: usize| -> anyhow::Result<GpuModel> {
-        let mut gm = GpuModel::load(&m, Gpu::new()?, ctx, chunk, margin, 3)?;
+        let mut gm = GpuModel::load(&m, Box::new(Gpu::new()?), ctx, chunk, margin, 3)?;
         gm.adapt_every = 0; // fixed placement: steadier timings
         Ok(gm)
     };

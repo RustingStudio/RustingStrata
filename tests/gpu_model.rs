@@ -19,7 +19,7 @@ fn gpu_forward_matches_cpu_reference() {
             Err(e) if format!("{e}") == "CUDA init" => { eprintln!("SKIP: no GPU: {e:#}"); return }
             Err(e) => panic!("{e:#}"),
         };
-        let mut gm = GpuModel::load(&m, gpu, 256, 0, margin, 0).unwrap();
+        let mut gm = GpuModel::load(&m, Box::new(gpu), 256, 0, margin, 0).unwrap();
         let t0 = std::time::Instant::now();
         for (i, (&t, w)) in ids.iter().zip(&want).enumerate() {
             let got = gm.step(t).unwrap();
@@ -63,7 +63,7 @@ fn prefill_matches_reference() {
     let next = ops::argmax(&cpu) as u32;
     let cpu2 = m.step(&mut st, next);
     let chunk = std::env::var("CHUNK").map_or(48, |v| v.parse().unwrap());
-    let mut gm = GpuModel::load(&m, gpu, 512, chunk, 512 << 20, 0).unwrap();
+    let mut gm = GpuModel::load(&m, Box::new(gpu), 512, chunk, 512 << 20, 0).unwrap();
     // Fixed expert placement: adaptive moves change the decode yardstick from run to run (it differed inside the
     // full suite and failed once).
     gm.adapt_every = 0;
@@ -102,7 +102,7 @@ fn mtp_draft_matches_reference() {
         Ok(g) => g,
         Err(e) => { eprintln!("SKIP: no GPU: {e:#}"); return }
     };
-    let mut gm = GpuModel::load(&m, gpu, 256, 0, 512 << 20, 1).unwrap();
+    let mut gm = GpuModel::load(&m, Box::new(gpu), 256, 0, 512 << 20, 1).unwrap();
     let mut ids = tok.encode("The capital of France is").unwrap();
     let (mut st, mut mtp) = (State::new(&m.cfg), Mtp::default());
     let mut bad = 0;
@@ -133,7 +133,7 @@ fn verify_matches_steps() {
         Ok(g) => g,
         Err(e) => { eprintln!("SKIP: no GPU: {e:#}"); return }
     };
-    let mut gm = GpuModel::load(&m, gpu, 256, 0, 512 << 20, 0).unwrap();
+    let mut gm = GpuModel::load(&m, Box::new(gpu), 256, 0, 512 << 20, 0).unwrap();
     let ids = tok.encode("The capital of France is Paris, and the capital of Spain is").unwrap();
     let (pre, rest) = ids.split_at(ids.len() - 4);
     for &t in pre { gm.step(t).unwrap(); }
@@ -177,7 +177,7 @@ fn mtp_spec_matches_greedy() {
         Ok(g) => g,
         Err(e) => { eprintln!("SKIP: no GPU: {e:#}"); return }
     };
-    let mut gm = GpuModel::load(&m, gpu, 512, 0, 512 << 20, 3).unwrap();
+    let mut gm = GpuModel::load(&m, Box::new(gpu), 512, 0, 512 << 20, 3).unwrap();
     assert_eq!(gm.k, 3);
     gm.adapt_every = 0;
     let ids = tok.encode("Write a short story about a dragon.").unwrap();
@@ -222,7 +222,7 @@ fn rollback_matches_step() {
         Ok(g) => g,
         Err(e) => { eprintln!("SKIP: no GPU: {e:#}"); return }
     };
-    let mut gm = GpuModel::load(&m, gpu, 256, 0, 512 << 20, 1).unwrap();
+    let mut gm = GpuModel::load(&m, Box::new(gpu), 256, 0, 512 << 20, 1).unwrap();
     gm.adapt_every = 0;
     let ids = tok.encode("The capital of France is Paris, and the capital of Spain is").unwrap();
     let (pre, rest) = ids.split_at(ids.len() - 3);
@@ -251,7 +251,7 @@ fn prefill_cached_reuses_history() {
         Ok(g) => g,
         Err(e) => { eprintln!("SKIP: no GPU: {e:#}"); return }
     };
-    let mut gm = GpuModel::load(&m, gpu, 512, 128, 512 << 20, 0).unwrap();
+    let mut gm = GpuModel::load(&m, Box::new(gpu), 512, 128, 512 << 20, 0).unwrap();
     gm.adapt_every = 0;
     let enc = |s: &str| tok.encode(s).unwrap();
     let h1 = enc("<|im_start|>user\nTell me about rivers, the ways they carve valleys over thousands of years, and why towns grow on their banks.<|im_end|>\n");
