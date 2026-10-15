@@ -3,6 +3,7 @@
 //! copied into a small staging area, a group of them at a time.
 
 use super::{Ffn, GpuModel, Mixer};
+use crate::backend::Backend;
 use crate::cuda::{GEMM_BM, Gpu};
 use crate::expert_cache::MATS;
 use crate::model::Model;

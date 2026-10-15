@@ -1,4 +1,5 @@
 mod common;
+use rusting_strata::backend::Backend;
 use rusting_strata::{cuda::Gpu, gguf::Gguf, quant::GgmlType, weights::Weights};
 
 /// Skip only when there is no usable CUDA device; kernel compile errors fail the test.

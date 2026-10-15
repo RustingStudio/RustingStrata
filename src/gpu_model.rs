@@ -2,6 +2,7 @@
 //! rest run on the CPU (`cpu_moe`) while the GPU computes hits and the shared expert. Mirrors `model.rs`.
 
 use crate::cpu_worker::{CpuWorker, TMAX};
+use crate::backend::Backend;
 use crate::cuda::{Gpu, GpuTensor};
 use crate::expert_cache::ExpertCache;
 use crate::model::Model;
