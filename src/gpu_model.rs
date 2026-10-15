@@ -161,7 +161,7 @@ impl<'a> GpuModel<'a> {
             let budget = free1.saturating_sub(vram_margin);
             Some(ExpertCache::new(m, &gpu, budget, c.n_layer + mtp as usize)?)
         } else { None };
-        let worker = if c.is_moe() { Some(CpuWorker::new(m, &gpu.ctx, (0..c.n_layer).collect())?) } else { None };
+        let worker = if c.is_moe() { Some(CpuWorker::new(m, &gpu, (0..c.n_layer).collect())?) } else { None };
         let mb = |b: usize| b as f64 / 1048576.0;
         eprintln!(
             "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {ctx} tokens, prefill {:.0} MB), expert slots {:.0} MB, resident experts {}/{}",
@@ -171,7 +171,7 @@ impl<'a> GpuModel<'a> {
         );
         let mtp = match mtp_parts {
             Some((layer, eh_proj, enorm, hnorm, head_norm, step_buf, emb, eh, x)) => Some(MtpHead {
-                layer, eh_proj, enorm, hnorm, head_norm, worker: CpuWorker::new(m, &gpu.ctx, vec![c.n_layer])?,
+                layer, eh_proj, enorm, hnorm, head_norm, worker: CpuWorker::new(m, &gpu, vec![c.n_layer])?,
                 step_buf, emb, eh, x, pos: 0, pend: vec![],
             }),
             None => None,
