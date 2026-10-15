@@ -1,4 +1,5 @@
 //! `--kv q8`: the KV cache stores q8_0 blocks. Its own process, since the kernel module is compiled per KV format.
+use rusting_strata::backend::Backend;
 use rusting_strata::cuda::{ATT_GQA_MIN, ATT_SPLITS, Gpu};
 
 fn xs(n: usize) -> Vec<f32> {

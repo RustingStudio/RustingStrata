@@ -1,5 +1,6 @@
 //! `--llama-numerics` kernels. A separate test binary: the mode is read from the environment when a `Gpu` compiles its
 //! kernels, so setting it here cannot leak into the other GPU tests.
+use rusting_strata::backend::Backend;
 use rusting_strata::cuda::{ATT_GQA_MIN, ATT_SPLITS, Gpu};
 
 fn xs(n: usize) -> Vec<f32> {
