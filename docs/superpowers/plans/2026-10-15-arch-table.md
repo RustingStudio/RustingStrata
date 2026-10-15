@@ -53,7 +53,7 @@ LD_LIBRARY_PATH=~/Clones/llama.cpp/build-cuda/bin ~/Clones/llama.cpp/build-cuda/
 Greedy-24 gate (tool added in Task 2):
 
 ```bash
-cargo build --release --features cuda
+cargo build --release
 python -I tools/greedy24.py $M                 # CPU oracle
 python -I tools/greedy24.py $M --extra=--gpu   # CUDA
 ```
@@ -359,7 +359,7 @@ and use `re` instead of `QWEN35_RE` in the `Split::new` call.
 - [ ] **Step 10: Run the tests**
 
 ```bash
-cargo build --release --features cuda 2>&1 | grep -E '^(warning|error)' ; cargo test --release --features cuda 2>&1 | grep -E 'test result|FAILED|panicked'
+cargo build --release 2>&1 | grep -E '^(warning|error)' ; cargo test --release 2>&1 | grep -E 'test result|FAILED|panicked'
 STRATA_MODEL=$Q3 cargo test --release --test gguf arch_table_fields
 STRATA_MODEL=$Q3 cargo test --release --test tokenizer
 ./target/release/strata info --model $Q3 | head -40
@@ -424,7 +424,7 @@ Inside the `for gq_min` loop, after `let want = gpu.stream.clone_dtoh(&ddec).unw
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `cargo test --release --features cuda --test cuda attn_prefill_matches_decode`
+Run: `cargo test --release --test cuda attn_prefill_matches_decode`
 Expected: FAIL. The kernels read the gate through a null pointer (illegal address), or the error check fails.
 
 - [ ] **Step 3: Kernels: gate pointer 0 means no gate**
@@ -464,7 +464,7 @@ Update the comment above `attn_merge` to say "* sigmoid(gate), gate skipped when
 
 - [ ] **Step 4: Run the kernel test**
 
-Run: `cargo test --release --features cuda --test cuda attn_prefill_matches_decode`
+Run: `cargo test --release --test cuda attn_prefill_matches_decode`
 Expected: PASS.
 
 - [ ] **Step 5: CPU oracle without the gate (`src/model.rs` `attention`)**
@@ -531,9 +531,9 @@ sys.exit(0 if want and want in got else 1)
 - [ ] **Step 8: Unit gates on the qwen3 model**
 
 ```bash
-cargo build --release --features cuda 2>&1 | grep -E '^(warning|error)'
+cargo build --release 2>&1 | grep -E '^(warning|error)'
 STRATA_MODEL=$Q3 cargo test --release --test model greedy_continuation_is_sane
-STRATA_MODEL=$Q3 cargo test --release --features cuda --test gpu_model 2>&1 | grep -E 'test |test result'
+STRATA_MODEL=$Q3 cargo test --release --test gpu_model 2>&1 | grep -E 'test |test result'
 ```
 
 Expected: the CPU test passes ("Paris"). In the GPU tests, each test that compares against the CPU oracle passes. A test that needs MTP or MoE may fail on a dense model with no MTP head. List those failures with their first panic line in the report. Do not change them.
@@ -552,7 +552,7 @@ Expected: both greedy runs exit 0, and `TOP1 AGREEMENT` is at least 98.5%. Stop 
 
 - [ ] **Step 10: Regression on the default model, then commit**
 
-Run: `cargo test --release --features cuda 2>&1 | grep -E 'test result|FAILED|panicked'`. Expected: all green.
+Run: `cargo test --release 2>&1 | grep -E 'test result|FAILED|panicked'`. Expected: all green.
 
 ```bash
 git add tools/greedy24.py
@@ -584,7 +584,7 @@ Below, `QM=~/models/Qwen3-30B-A3B-Instruct-2507-UD-Q2_K_XL.gguf`.
 ```bash
 ./target/release/strata info --model $QM | head -40
 STRATA_MODEL=$QM cargo test --release --test gguf arch_table_fields
-STRATA_MODEL=$QM cargo test --release --features cuda --test cuda dequant_and_gemv_match_reference_for_every_type
+STRATA_MODEL=$QM cargo test --release --test cuda dequant_and_gemv_match_reference_for_every_type
 STRATA_MODEL=$QM cargo test --release --test model greedy_continuation_is_sane
 ```
 
@@ -716,9 +716,9 @@ template <> struct QI<20> {  // IQ4_NL, 8 blocks of 18 (2-byte aligned: ld16 onl
 No model on disk has IQ4_NL until Task 5 downloads one. Do Task 5 Step 1 (the download) now if it has not happened, then run:
 
 ```bash
-cargo build --release --features cuda 2>&1 | grep -E '^(warning|error)'
-STRATA_MODEL=~/models/Qwen3-Next-80B-A3B-Instruct-UD-IQ1_S.gguf cargo test --release --features cuda --test cuda dequant_and_gemv_match_reference_for_every_type -- --nocapture 2>&1 | grep -iE 'iq4_nl|test result'
-cargo test --release --features cuda 2>&1 | grep -E 'test result|FAILED|panicked'
+cargo build --release 2>&1 | grep -E '^(warning|error)'
+STRATA_MODEL=~/models/Qwen3-Next-80B-A3B-Instruct-UD-IQ1_S.gguf cargo test --release --test cuda dequant_and_gemv_match_reference_for_every_type -- --nocapture 2>&1 | grep -iE 'iq4_nl|test result'
+cargo test --release 2>&1 | grep -E 'test result|FAILED|panicked'
 ```
 
 Expected: the every-type test passes and its output lists IQ4_NL. The default suite is green.
@@ -789,7 +789,7 @@ Add `ilv` to the assertion message. (With `nk = 2, nv = 4`, the two mappings dif
 - [ ] **Step 3: Run them to verify they fail**
 
 ```bash
-cargo test --release --features cuda --test cuda deltanet_chunk_matches_steps
+cargo test --release --test cuda deltanet_chunk_matches_steps
 STRATA_MODEL=$QN cargo test --release --test gguf qwen3next_ssm_ba_split
 ```
 
@@ -859,12 +859,12 @@ Run: `STRATA_MODEL=$QN cargo test --release --test gguf qwen3next_ssm_ba_split a
 
 Call sites: `src/gpu_model.rs:429` and `src/gpu_model/prefill.rs:135`. Pass `c.k_interleave` after `nv`.
 
-Run: `cargo test --release --features cuda --test cuda deltanet_chunk_matches_steps`. Expected: PASS for both `ilv` values.
+Run: `cargo test --release --test cuda deltanet_chunk_matches_steps`. Expected: PASS for both `ilv` values.
 
 - [ ] **Step 7: Config and CPU oracle on the 80B**
 
 ```bash
-cargo build --release --features cuda 2>&1 | grep -E '^(warning|error)'
+cargo build --release 2>&1 | grep -E '^(warning|error)'
 ./target/release/strata info --model $QN | head -45
 STRATA_MODEL=$QN cargo test --release --test gguf arch_table_fields
 STRATA_MODEL=$QN cargo test --release --test model greedy_continuation_is_sane
@@ -886,7 +886,7 @@ Expected: both greedy runs exit 0, and `TOP1 AGREEMENT` is at least 98.5%. IQ1_S
 
 - [ ] **Step 9: Regression on the default model, then commit**
 
-Run: `cargo test --release --features cuda 2>&1 | grep -E 'test result|FAILED|panicked'`. Expected: all green.
+Run: `cargo test --release 2>&1 | grep -E 'test result|FAILED|panicked'`. Expected: all green.
 
 ```bash
 git commit -m "feat: qwen3next: ssm_ba split and interleaved key heads" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" -- src/weights.rs src/model.rs src/backend.rs src/cuda/mod.rs src/cuda/kernels.cu src/gpu_model.rs src/gpu_model/prefill.rs tests/cuda.rs tests/gguf.rs
