@@ -117,7 +117,7 @@ impl GpuModel<'_> {
         let l = &pf.lay;
         let (x, h) = (at(0), at(l.h));
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
-        let (dv, channels) = (c.ssm_d_inner / nv, c.ssm_d_inner + 2 * nk * dk);
+        let (dv, channels) = (c.ssm_dv(), c.ssm_d_inner + 2 * nk * dk);
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
         let kv = nkv * hd;
         for (il, ly) in self.layers.iter().enumerate() {

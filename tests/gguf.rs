@@ -1,5 +1,5 @@
 mod common;
-use rusting_strata::{config::ModelConfig, gguf::Gguf};
+use rusting_strata::{config::{LayerKind, ModelConfig}, gguf::Gguf, weights::Weights};
 
 fn w_str(b: &mut Vec<u8>, s: &str) {
     b.extend((s.len() as u64).to_le_bytes());
@@ -49,8 +49,27 @@ fn real_file_config() {
     assert_eq!((c.n_layer, c.n_nextn, c.n_embd, c.n_head, c.n_head_kv, c.head_dim), (40, 1, 2048, 16, 2, 256));
     assert_eq!((c.n_expert, c.n_expert_used, c.n_ff_exp, c.n_ff_shexp), (256, 8, 512, 512));
     assert_eq!((c.ssm_d_inner, c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank, c.ssm_conv), (4096, 128, 16, 32, 4));
-    assert_eq!((c.n_rot, c.full_attention_interval, c.n_vocab), (64, 4, 248320));
-    assert!(c.is_recurrent(0) && c.is_recurrent(2) && !c.is_recurrent(3));
+    assert_eq!((c.n_rot, c.n_vocab), (64, 248320));
+    assert_eq!(&c.layers[..4], &[LayerKind::Delta, LayerKind::Delta, LayerKind::Delta, LayerKind::Attn]);
+    assert!(c.q_gate && !c.k_interleave);
     // IQ3_XXS: 98 bytes per 256 elements; [512, 2048, 256].
     assert_eq!(g.bytes(&g.tensors["blk.0.ffn_down_exps.weight"]).len(), 2048 * 256 * 2 * 98);
+}
+
+/// Arch-table fields of whichever model STRATA_MODEL names; canonical tensor names resolve through the aliases.
+#[test]
+fn arch_table_fields() {
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let c = ModelConfig::from_gguf(&g).unwrap();
+    let attn = c.layers.iter().filter(|&&k| k == LayerKind::Attn).count();
+    assert_eq!(c.layers.len(), c.n_layer);
+    match c.arch.as_str() {
+        "qwen3" | "qwen3moe" => assert!(attn == c.n_layer && !c.q_gate && !c.k_interleave && c.ssm_dv() == 0),
+        "qwen3next" => assert!(attn == c.n_layer / 4 && c.q_gate && c.k_interleave),
+        _ => assert!(attn == c.n_layer / 4 && c.q_gate && !c.k_interleave),
+    }
+    let w = Weights::new(&g).unwrap();
+    w.layer(0, "post_attention_norm.weight").unwrap();
+    w.layer(c.n_layer - 1, "post_attention_norm.weight").unwrap();
 }

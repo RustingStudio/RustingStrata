@@ -1,6 +1,7 @@
-//! GPU decode forward for `qwen35` / `qwen35moe`. Routed experts resident in the expert cache run on the GPU; the
+//! GPU decode forward for the architectures in `config::arch`. Routed experts resident in the expert cache run on the GPU; the
 //! rest run on the CPU (`cpu_moe`) while the GPU computes hits and the shared expert. Mirrors `model.rs`.
 
+use crate::config::LayerKind;
 use crate::cpu_worker::{CpuWorker, TMAX};
 use crate::backend::{ATT_SPLITS, Backend, Buf, GpuTensor};
 use crate::expert_cache::ExpertCache;
@@ -96,13 +97,13 @@ impl<'a> GpuModel<'a> {
 
         let k = if c.n_nextn > 0 { k.min(TMAX - 1) } else { 0 };
         let mtp = k > 0;
-        let load_layer = |il: usize, recurrent: bool| -> anyhow::Result<Layer> {
-            let mixer = if recurrent {
+        let load_layer = |il: usize, kind: LayerKind| -> anyhow::Result<Layer> {
+            let mixer = if kind == LayerKind::Delta {
                 Mixer::Delta {
                     qkv: lt(il, "attn_qkv.weight")?, gate: lt(il, "attn_gate.weight")?, beta: lt(il, "ssm_beta.weight")?,
                     alpha: lt(il, "ssm_alpha.weight")?, dt_bias: lt(il, "ssm_dt.bias")?, a: lt(il, "ssm_a")?,
                     conv_w: lt(il, "ssm_conv1d.weight")?, norm: lt(il, "ssm_norm.weight")?, out: lt(il, "ssm_out.weight")?,
-                    conv: gpu.zeros::<f32>((c.ssm_conv - 1) * channels)?, s: gpu.zeros::<f32>(nv * (c.ssm_d_inner / nv) * dk)?,
+                    conv: gpu.zeros::<f32>((c.ssm_conv - 1) * channels)?, s: gpu.zeros::<f32>(nv * c.ssm_dv() * dk)?,
                     snap: if mtp { Some((gpu.zeros::<f32>(k * (c.ssm_conv - 1) * channels)?, gpu.zeros::<f32>(k * c.ssm_d_inner * dk)?)) } else { None },
                 }
             } else {
@@ -125,10 +126,10 @@ impl<'a> GpuModel<'a> {
             };
             Ok(Layer { attn_norm: lt(il, "attn_norm.weight")?, post_norm: lt(il, "post_attention_norm.weight")?, mixer, ffn })
         };
-        let layers = (0..c.n_layer).map(|il| load_layer(il, c.is_recurrent(il))).collect::<anyhow::Result<Vec<_>>>()?;
+        let layers = c.layers.iter().enumerate().map(|(il, &kind)| load_layer(il, kind)).collect::<anyhow::Result<Vec<_>>>()?;
         let mtp_parts = if mtp {
             let il = c.n_layer;
-            Some((load_layer(il, false)?, lt(il, "nextn.eh_proj.weight")?, lt(il, "nextn.enorm.weight")?,
+            Some((load_layer(il, LayerKind::Attn)?, lt(il, "nextn.eh_proj.weight")?, lt(il, "nextn.enorm.weight")?,
                   lt(il, "nextn.hnorm.weight")?, lt(il, "nextn.shared_head_norm.weight")?,
                   gpu.zeros::<i32>(2 * TMAX)?, gpu.zeros::<f32>(TMAX * c.n_embd)?, gpu.zeros::<f32>(TMAX * 2 * c.n_embd)?, gpu.zeros::<f32>(TMAX * c.n_embd)?))
         } else { None };
@@ -159,7 +160,7 @@ impl<'a> GpuModel<'a> {
         let mb = |b: usize| b as f64 / 1048576.0;
         eprintln!(
             "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {ctx} tokens, prefill {:.0} MB), expert slots {:.0} MB, resident experts {}/{}",
-            mb(free0 - free1), mb(2 * 2 * gpu.kv_words(ctx * kv) * (c.n_layer / c.full_attention_interval)), mb(pf.as_ref().map_or(0, |p| p.bytes())),
+            mb(free0 - free1), mb(2 * 2 * gpu.kv_words(ctx * kv) * c.layers.iter().filter(|&&k| k == LayerKind::Attn).count()), mb(pf.as_ref().map_or(0, |p| p.bytes())),
             mb(cache.as_ref().map_or(0, |x| x.slot_bytes_total())),
             cache.as_ref().map_or(0, |x| x.resident_count()), cache.as_ref().map_or(0, |x| x.total_experts()),
         );
@@ -407,7 +408,7 @@ impl<'a> GpuModel<'a> {
         let mv = |w: &GpuTensor, x: &str, xs: usize, y: &str, ys: usize|
             if x == "h" { g.gemvq(w, p(x), xs, p("hq"), p(y), ys, nt) } else { self.mv(w, p(x), xs, p(y), ys, nt) };
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
-        let (dv, channels) = (c.ssm_d_inner / nv, c.ssm_d_inner + 2 * nk * dk);
+        let (dv, channels) = (c.ssm_dv(), c.ssm_d_inner + 2 * nk * dk);
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
         let kv = nkv * hd;
         {
