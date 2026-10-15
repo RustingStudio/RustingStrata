@@ -3,11 +3,9 @@
 //! copied into a small staging area, a group of them at a time.
 
 use super::{Ffn, GpuModel, Mixer};
-use crate::backend::Backend;
-use crate::cuda::{GEMM_BM, Gpu};
+use crate::backend::{Backend, Buf, GEMM_BM};
 use crate::expert_cache::MATS;
 use crate::model::Model;
-use cudarc::driver::CudaSlice;
 
 /// Experts staged per group when a layer routes to experts outside the cache.
 const STAGE: usize = 16;
@@ -18,15 +16,15 @@ struct Lay { h: usize, a: usize, b: usize, c: usize, d: usize, e: usize, rl: usi
 pub(super) struct Scratch {
     pub chunk: usize,
     lay: Lay,
-    slab: CudaSlice<f32>,
+    slab: Buf,
     /// ids | xrow | inv, `chunk * k` each.
-    ints: CudaSlice<i32>,
-    tiles: CudaSlice<u64>,
-    staging: CudaSlice<u8>,
+    ints: Buf,
+    tiles: Buf,
+    staging: Buf,
 }
 
 impl Scratch {
-    pub fn new(m: &Model, gpu: &Gpu, chunk: usize) -> anyhow::Result<Scratch> {
+    pub fn new(m: &Model, gpu: &dyn Backend, chunk: usize) -> anyhow::Result<Scratch> {
         let c = &m.cfg;
         let mut stage_bytes = 0;
         for il in 0..c.n_layer {
@@ -51,13 +49,13 @@ impl Scratch {
         let n_tiles = 3 * (chunk * k / GEMM_BM + 2 * c.n_expert);
         Ok(Scratch {
             chunk, lay: Lay { h, a, b, c: c2, d, e, rl, wts, ge, ye, shg, shy, sg },
-            slab: gpu.zeros(total)?, ints: gpu.zeros(3 * chunk * k)?, tiles: gpu.zeros(2 * n_tiles)?,
-            staging: gpu.zeros(if c.is_moe() { STAGE * stage_bytes } else { 0 })?,
+            slab: gpu.zeros::<f32>(total)?, ints: gpu.zeros::<i32>(3 * chunk * k)?, tiles: gpu.zeros::<u64>(2 * n_tiles)?,
+            staging: gpu.zeros::<u8>(if c.is_moe() { STAGE * stage_bytes } else { 0 })?,
         })
     }
 
     /// Bytes of VRAM this scratch takes.
-    pub fn bytes(&self) -> usize { 4 * (self.slab.len() + self.ints.len()) + 8 * self.tiles.len() + self.staging.len() }
+    pub fn bytes(&self) -> usize { self.slab.len + self.ints.len + self.tiles.len + self.staging.len }
 }
 
 impl GpuModel<'_> {
@@ -69,13 +67,13 @@ impl GpuModel<'_> {
         anyhow::ensure!(self.pos + tokens.len() <= self.ctx, "context full ({} tokens; raise --ctx)", self.ctx);
         for ch in tokens.chunks(chunk) { self.prefill_chunk(ch)?; }
         let (g, ne) = (&self.gpu, self.m.cfg.n_embd);
-        let last = g.ptr(&self.pf.as_ref().unwrap().slab) + (4 * ne * ((tokens.len() - 1) % chunk)) as u64;
-        let h = g.ptr(&self.bufs["h"]);
+        let (pf, r) = (self.pf.as_ref().unwrap(), (tokens.len() - 1) % chunk);
+        let h = self.bufs["h"].addr;
         // Row 0 of `x` holds the last hidden state, as after `step` (the MTP draft reads it).
-        g.stream.memcpy_dtod(&self.pf.as_ref().unwrap().slab.slice(ne * ((tokens.len() - 1) % chunk)..ne * ((tokens.len() - 1) % chunk + 1)), &mut self.x.slice_mut(0..ne))?;
-        g.rms_norm(last, 0, self.output_norm.ptr, h, 0, ne, 1, self.m.cfg.eps)?;
-        g.gemv(&self.output, h, g.ptr(&self.logits))?;
-        Ok(g.stream.clone_dtoh(&self.logits.slice(0..self.m.cfg.n_vocab))?)
+        g.dtod(&pf.slab, 4 * ne * r, &self.x, 0, 4 * ne)?;
+        g.rms_norm(pf.slab.addr + (4 * ne * r) as u64, 0, self.output_norm.ptr, h, 0, ne, 1, self.m.cfg.eps)?;
+        g.gemv(&self.output, h, self.logits.addr)?;
+        g.get::<f32>(&self.logits, 0, self.m.cfg.n_vocab)
     }
 
     /// A fresh sequence: `prefill(tokens)` from position 0, reusing earlier work. The state after `tokens[..keep]` is
@@ -108,13 +106,13 @@ impl GpuModel<'_> {
 
     fn prefill_chunk(&mut self, toks: &[u32]) -> anyhow::Result<()> {
         let c = &self.m.cfg;
-        let pf = self.pf.as_mut().unwrap();
+        let pf = self.pf.as_ref().unwrap();
         let (g, t, n, eps, ne) = (&self.gpu, toks.len(), pf.chunk, c.eps, c.n_embd);
         let emb: Vec<f32> = toks.iter().flat_map(|&tk| self.m.embed(tk)).collect();
-        g.stream.memcpy_htod(&emb, &mut pf.slab.slice_mut(0..t * ne))?;
-        g.stream.memcpy_htod(&[self.pos as i32, 0], &mut self.step_buf)?;
-        let step = g.ptr(&self.step_buf);
-        let base = g.ptr(&pf.slab);
+        g.put(&emb, &pf.slab, 0)?;
+        g.put(&[self.pos as i32, 0], &self.step_buf, 0)?;
+        let step = self.step_buf.addr;
+        let base = pf.slab.addr;
         let at = |o: usize| base + 4 * o as u64;
         let l = &pf.lay;
         let (x, h) = (at(0), at(l.h));
@@ -132,9 +130,9 @@ impl GpuModel<'_> {
                     g.gemm_dense(beta, t, h, ne, eb, nv, 0)?;
                     g.gemm_dense(alpha, t, h, ne, eg, nv, 0)?;
                     g.ssm_gates(eb, eg, dt_bias.ptr, a.ptr, t * nv, nv)?;
-                    g.conv_seq(at(l.a), g.ptr(conv), conv_w.ptr, at(l.c), channels, c.ssm_conv, t, 0, 0)?;
+                    g.conv_seq(at(l.a), conv.addr, conv_w.ptr, at(l.c), channels, c.ssm_conv, t, 0, 0)?;
                     g.l2_norm(at(l.c), dk, 2 * nk, channels, t * 2 * nk, eps)?;
-                    g.deltanet(at(l.c), g.ptr(s), eb, eg, at(l.d), nk, nv, dk, dv, 1.0 / (dk as f32).sqrt(), t, channels, 0, 0)?;
+                    g.deltanet(at(l.c), s.addr, eb, eg, at(l.d), nk, nv, dk, dv, 1.0 / (dk as f32).sqrt(), t, channels, 0, 0)?;
                     g.norm_gate(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps)?;
                     g.gemm_dense(out, t, at(l.d), c.ssm_d_inner, x, ne, 2)?;
                 }
@@ -147,8 +145,8 @@ impl GpuModel<'_> {
                     g.gemm_dense(v, t, h, ne, vv, kv, 0)?;
                     g.rms_norm(kraw, hd, kn.ptr, kk, hd, hd, t * nkv, eps)?;
                     g.rope_neox(kk, hd, t * nkv, nkv, c.n_rot, step, c.rope_base)?;
-                    g.kv_store(kk, vv, g.ptr(kc), g.ptr(vc), kv, t, step, hd)?;
-                    g.attn_prefill(at(l.b), g.ptr(kc), g.ptr(vc), at(l.a), at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt())?;
+                    g.kv_store(kk, vv, kc.addr, vc.addr, kv, t, step, hd)?;
+                    g.attn_prefill(at(l.b), kc.addr, vc.addr, at(l.a), at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt())?;
                     g.gemm_dense(o, t, at(l.d), nh * hd, x, ne, 2)?;
                 }
             }
@@ -161,7 +159,7 @@ impl GpuModel<'_> {
                 }
                 Ffn::Moe { router, shared } => {
                     let k = c.n_expert_used;
-                    let ids_d = g.ptr(&pf.ints);
+                    let ids_d = pf.ints.addr;
                     g.gemm_dense(router, t, h, ne, at(l.rl), c.n_expert, 0)?;
                     g.router_topk(at(l.rl), c.n_expert, k, c.expert_weights_scale, ids_d, at(l.wts), t)?;
                     let (sh, sg) = match shared {
@@ -174,7 +172,7 @@ impl GpuModel<'_> {
                         }
                         None => (0, 0),
                     };
-                    let ids = g.stream.clone_dtoh(&pf.ints.slice(0..t * k))?;
+                    let ids = g.get::<i32>(&pf.ints, 0, t * k)?;
                     let cache = self.cache.as_mut().unwrap();
                     cache.record(il, &ids);
                     // Sort (token, j) pairs by expert: slot s holds token xrow[s]; inv maps t * k + j to its slot.
@@ -188,8 +186,8 @@ impl GpuModel<'_> {
                         inv[i] = *s as i32;
                         *s += 1;
                     }
-                    g.stream.memcpy_htod(&xrow, &mut pf.ints.slice_mut(n * k..n * k + t * k))?;
-                    g.stream.memcpy_htod(&inv, &mut pf.ints.slice_mut(2 * n * k..2 * n * k + t * k))?;
+                    g.put(&xrow, &pf.ints, n * k)?;
+                    g.put(&inv, &pf.ints, 2 * n * k)?;
                     let lx = cache.layer(il).unwrap();
                     let (pool, stride) = cache.base(lx);
                     let used = |e: &usize| off[e + 1] > off[*e];
@@ -197,7 +195,7 @@ impl GpuModel<'_> {
                     // Group 0: resident experts; then staged groups of at most STAGE missed experts.
                     let mut groups: Vec<Vec<(usize, u64)>> = vec![(0..c.n_expert).filter(used)
                         .filter_map(|e| { let s = cache.slot(il, e); (s >= 0).then(|| (e, pool + (s as usize * stride) as u64)) }).collect()];
-                    let sp = g.ptr(&pf.staging);
+                    let sp = pf.staging.addr;
                     for grp in missed.chunks(STAGE) {
                         groups.push(grp.iter().enumerate().map(|(i, &e)| (e, sp + (i * stride) as u64)).collect());
                     }
@@ -217,10 +215,10 @@ impl GpuModel<'_> {
                         }
                         spans.push(sp);
                     }
-                    anyhow::ensure!(tiles.len() <= pf.tiles.len(), "prefill tile list overflow");
-                    g.stream.memcpy_htod(&tiles, &mut pf.tiles.slice_mut(0..tiles.len()))?;
-                    let tp = |s: usize| g.ptr(&pf.tiles) + 16 * s as u64;
-                    let xrow_d = g.ptr(&pf.ints) + 4 * (n * k) as u64;
+                    anyhow::ensure!(8 * tiles.len() <= pf.tiles.len, "prefill tile list overflow");
+                    g.put(&tiles, &pf.tiles, 0)?;
+                    let tp = |s: usize| pf.tiles.addr + 16 * s as u64;
+                    let xrow_d = pf.ints.addr + 4 * (n * k) as u64;
                     let [mg, mu, md] = lx.mats;
                     for (gi, grp) in groups.iter().enumerate() {
                         if gi > 0 {
@@ -230,7 +228,7 @@ impl GpuModel<'_> {
                                 for (name, mat) in MATS.iter().zip(&lx.mats) {
                                     let src = self.m.w.layer(il, name)?.expert(e, c.n_expert);
                                     let o = i * stride + mat.off;
-                                    g.stream.memcpy_htod(src.data, &mut pf.staging.slice_mut(o..o + mat.bytes))?;
+                                    g.htod(src.data, &pf.staging, o)?;
                                 }
                             }
                         }
@@ -239,7 +237,7 @@ impl GpuModel<'_> {
                         g.gemm(mu.ty, mu.rows, mu.cols, tp(sp[1].0), sp[1].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1)?;
                         g.gemm(md.ty, md.rows, md.cols, tp(sp[2].0), sp[2].1, at(l.ge), c.n_ff_exp, t * k, 0, at(l.ye), ne, 0)?;
                     }
-                    g.moe_combine_seq(x, at(l.ye), at(l.wts), g.ptr(&pf.ints) + 4 * (2 * n * k) as u64, k, sh, sg, ne, t)?;
+                    g.moe_combine_seq(x, at(l.ye), at(l.wts), pf.ints.addr + 4 * (2 * n * k) as u64, k, sh, sg, ne, t)?;
                 }
             }
         }
