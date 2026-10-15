@@ -492,12 +492,12 @@ impl<'a> GpuModel<'a> {
                     g.router_topk(p("rl"), c.n_expert, k, c.expert_weights_scale, ids, p("wts"), nt)?;
                     let cache = self.cache.as_ref().unwrap();
                     let lx = cache.layer(il).unwrap();
-                    let (base, stride) = cache.base(g, lx);
+                    let (base, stride) = cache.base(lx);
                     let [mg, mu, md] = lx.mats;
                     let slots = g.ptr(&self.slots);
                     let w = worker.unwrap();
                     let mb = w.dev + (4 * il * w.layout.stride) as u64;
-                    g.map_hits(ids, g.ptr(&lx.table_dev), slots, p("wts"), p("wh"), kt)?;
+                    g.map_hits(ids, lx.table_dev.addr, slots, p("wts"), p("wh"), kt)?;
                     g.moe_publish(ids, p("wts"), slots, p("h"), mb, k, ne, w.layout.h, step, nt)?;
                     if mg.ty == mu.ty && (mg.rows, mg.cols) == (mu.rows, mu.cols) {
                         let pair = (mu.off as i64 - mg.off as i64, p("ue") as i64 - p("ge") as i64);

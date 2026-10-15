@@ -2,10 +2,9 @@
 //! expert's gate, up and down matrices back to back. A per-layer table maps expert id to slot (-1 = on the CPU).
 //! Routing counts decay over time; `adapt` swaps the coldest resident experts for the hottest missed ones.
 
-use crate::cuda::Gpu;
+use crate::backend::{Backend, Buf};
 use crate::model::Model;
 use crate::quant::GgmlType;
-use cudarc::driver::CudaSlice;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -18,10 +17,10 @@ pub struct LayerExperts {
     pub pool: usize,
     pub mats: [Mat; 3],
     table: Vec<i32>,
-    pub table_dev: CudaSlice<i32>,
+    pub table_dev: Buf,
 }
 
-struct Pool { buf: CudaSlice<u8>, slot_bytes: usize, owner: Vec<(usize, usize)> }
+struct Pool { buf: Buf, slot_bytes: usize, owner: Vec<(usize, usize)> }
 
 pub struct ExpertCache {
     pools: Vec<Pool>,
@@ -49,7 +48,7 @@ fn profile_path(m: &Model) -> PathBuf {
 impl ExpertCache {
     /// Allocate slots worth at most `budget` bytes for layers `0..n_layers` (n_layer, plus one with the MTP layer) and
     /// fill them from the saved routing profile, or in layer order.
-    pub fn new(m: &Model, gpu: &Gpu, budget: usize, n_layers: usize) -> anyhow::Result<ExpertCache> {
+    pub fn new(m: &Model, gpu: &dyn Backend, budget: usize, n_layers: usize) -> anyhow::Result<ExpertCache> {
         let c = &m.cfg;
         let n = c.n_expert;
         let mut layers: Vec<Option<(usize, [Mat; 3])>> = Vec::new();
@@ -80,14 +79,14 @@ impl ExpertCache {
         let mut out: Vec<Option<LayerExperts>> = Vec::new();
         for (&slot_bytes, &k) in &classes {
             let slots = (frac * k as f64) as usize;
-            pools.push(Pool { buf: gpu.zeros::<u8>((slots * slot_bytes).max(1))?, slot_bytes, owner: Vec::with_capacity(slots) });
+            pools.push(Pool { buf: gpu.zeros::<u8>(slots * slot_bytes)?, slot_bytes, owner: Vec::with_capacity(slots) });
         }
         for l in &layers {
             out.push(match l {
                 None => None,
                 Some((sb, mats)) => Some(LayerExperts {
                     pool: classes.keys().position(|k| k == sb).unwrap(), mats: *mats, table: vec![-1; n],
-                    table_dev: gpu.stream.clone_htod(&vec![-1i32; n])?,
+                    table_dev: { let b = gpu.zeros::<i32>(n)?; gpu.put(&vec![-1i32; n], &b, 0)?; b },
                 }),
             });
         }
@@ -98,7 +97,7 @@ impl ExpertCache {
         for i in order {
             let p = cache.layers[i / n].as_ref().unwrap().pool;
             let pool = &cache.pools[p];
-            if pool.owner.len() * pool.slot_bytes + pool.slot_bytes > pool.buf.len() { continue; }
+            if pool.owner.len() * pool.slot_bytes + pool.slot_bytes > pool.buf.len { continue; }
             let slot = pool.owner.len();
             cache.pools[p].owner.push((i / n, i % n));
             cache.place(m, gpu, i / n, i % n, slot, false)?;
@@ -108,34 +107,34 @@ impl ExpertCache {
     }
 
     /// Copy expert `e` of layer `il` into `slot` of its pool and point the table at it.
-    fn place(&mut self, m: &Model, gpu: &Gpu, il: usize, e: usize, slot: usize, sync: bool) -> anyhow::Result<()> {
+    fn place(&mut self, m: &Model, gpu: &dyn Backend, il: usize, e: usize, slot: usize, sync: bool) -> anyhow::Result<()> {
         let lx = self.layers[il].as_mut().unwrap();
         let pool = &mut self.pools[lx.pool];
         for (name, mat) in MATS.iter().zip(&lx.mats) {
             let t = m.w.layer(il, name)?.expert(e, self.n_expert);
             let o = slot * pool.slot_bytes + mat.off;
-            gpu.stream.memcpy_htod(t.data, &mut pool.buf.slice_mut(o..o + mat.bytes))?;
+            gpu.htod(t.data, &pool.buf, o)?;
         }
         lx.table[e] = slot as i32;
         if sync { self.sync_table(gpu, il)?; }
         Ok(())
     }
 
-    fn sync_table(&mut self, gpu: &Gpu, il: usize) -> anyhow::Result<()> {
-        if let Some(lx) = self.layers[il].as_mut() { gpu.stream.memcpy_htod(&lx.table, &mut lx.table_dev)?; }
+    fn sync_table(&mut self, gpu: &dyn Backend, il: usize) -> anyhow::Result<()> {
+        if let Some(lx) = self.layers[il].as_ref() { gpu.put(&lx.table, &lx.table_dev, 0)?; }
         Ok(())
     }
 
     pub fn layer(&self, il: usize) -> Option<&LayerExperts> { self.layers[il].as_ref() }
-    pub fn base(&self, gpu: &Gpu, lx: &LayerExperts) -> (u64, usize) {
+    pub fn base(&self, lx: &LayerExperts) -> (u64, usize) {
         let p = &self.pools[lx.pool];
-        (gpu.ptr(&p.buf), p.slot_bytes)
+        (p.buf.addr, p.slot_bytes)
     }
     /// Cache slot of expert `e` in layer `il`, or -1.
     pub fn slot(&self, il: usize, e: usize) -> i32 { self.layers[il].as_ref().map_or(-1, |l| l.table[e]) }
     pub fn resident(&self, il: usize, e: usize) -> bool { self.layers[il].as_ref().is_some_and(|l| l.table[e] >= 0) }
     pub fn resident_count(&self) -> usize { self.pools.iter().map(|p| p.owner.len()).sum() }
-    pub fn slot_bytes_total(&self) -> usize { self.pools.iter().map(|p| p.buf.len()).sum() }
+    pub fn slot_bytes_total(&self) -> usize { self.pools.iter().map(|p| p.buf.len).sum() }
     pub fn total_experts(&self) -> usize { self.layers.iter().flatten().count() * self.n_expert }
 
     pub fn record(&mut self, il: usize, ids: &[i32]) {
@@ -143,7 +142,7 @@ impl ExpertCache {
     }
 
     /// Decay counts, then per pool swap up to `max_swaps` cold residents for clearly hotter missed experts.
-    pub fn adapt(&mut self, m: &Model, gpu: &Gpu, max_swaps: usize) -> anyhow::Result<()> {
+    pub fn adapt(&mut self, m: &Model, gpu: &dyn Backend, max_swaps: usize) -> anyhow::Result<()> {
         if self.profile.is_none() { return Ok(()); }
         for c in &mut self.counts { *c *= 0.95; }
         let n = self.n_expert;
