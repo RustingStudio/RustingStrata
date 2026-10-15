@@ -239,13 +239,15 @@ impl Backend for Gpu {
         Ok(Buf::new(self.ptr(&s), s.len(), s))
     }
 
-    // Pageable copies, then a stream sync, as cudarc's memcpy_htod / clone_dtoh do.
+    // Synced on purpose, unlike cudarc's memcpy_htod: without it greedy output breaks (LOOP_LOG #85).
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
         anyhow::ensure!(off + src.len() <= dst.len, "htod: {} bytes at {off} into {}", src.len(), dst.len);
         self.ctx.bind_to_thread()?;
         unsafe { result::memcpy_htod_async(dst.addr + off as u64, src, self.stream.cu_stream()) }?;
         Ok(self.stream.synchronize()?)
     }
+
+    // As cudarc's clone_dtoh: copy, then a stream sync.
 
     fn dtoh(&self, src: &Buf, off: usize, dst: &mut [u8]) -> anyhow::Result<()> {
         anyhow::ensure!(off + dst.len() <= src.len, "dtoh: {} bytes at {off} from {}", dst.len(), src.len);

@@ -113,6 +113,7 @@ impl ExpertCache {
         for (name, mat) in MATS.iter().zip(&lx.mats) {
             let t = m.w.layer(il, name)?.expert(e, self.n_expert);
             let o = slot * pool.slot_bytes + mat.off;
+            debug_assert_eq!(t.data.len(), mat.bytes);
             gpu.htod(t.data, &pool.buf, o)?;
         }
         lx.table[e] = slot as i32;
