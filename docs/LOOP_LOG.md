@@ -1570,6 +1570,11 @@ they act like `auto`. `parallel_tool_calls` is ignored. A literal `<tool_call>` 
 the reply plain text. `chat` (the CLI) does not use tools. No speed or parity numbers changed (the prompt for
 messages without tools is unchanged, `old_chat_prompt_unchanged`).
 
+Follow-up (6874637): a security review found that the order-preserving JSON parser checked repeated keys with a
+linear scan, so a body with many distinct keys parsed in quadratic time (a cheap denial of service under the body
+size cap). A key index map makes it linear; `json_keeps_key_order_and_scales` parses 200k keys in 0.04 s. The old
+code was not timed on that test. Full suite green, load 2.55.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
