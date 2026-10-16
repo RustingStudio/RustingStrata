@@ -1336,12 +1336,13 @@ extern "C" __global__ void attn_decode_gqa(const float* q, const u16* kc, const 
     ATT_PER(ATT_G)
 }
 
-// grid = query heads: out = (sum of split partials) / (sum of split sums) * sigmoid(gate). Split 0 is never empty.
+// grid = query heads: out = (sum of split partials) / (sum of split sums) * sigmoid(gate), gate skipped when qg is null. Split 0 is never empty.
 extern "C" __global__ void attn_merge(const float* part, const float* qg, float* out, int hd, int ns, const int* step,
                                        int ns1, int gq_min) {
     int h = blockIdx.x;
     part += (size_t)blockIdx.z * gridDim.x * ns * (hd + 2); step += 2 * blockIdx.z;
-    qg += (size_t)blockIdx.z * gridDim.x * 2 * hd; out += (size_t)blockIdx.z * gridDim.x * hd;
+    if (qg) qg += (size_t)blockIdx.z * gridDim.x * 2 * hd;
+    out += (size_t)blockIdx.z * gridDim.x * hd;
     if (step[0] + 1 < gq_min) ns = ns1;  // attn_decode ran, not attn_decode_gqa
     const float* pp = part + (size_t)h * ns * (hd + 2);
     __shared__ float ws[256];  // split max, then split weight (ns <= blockDim.x <= 256)
@@ -1356,7 +1357,7 @@ extern "C" __global__ void attn_merge(const float* part, const float* qg, float*
     for (int d = threadIdx.x; d < hd; d += blockDim.x) {
         float o = 0.0f;
         for (int s = 0; s < ns; s++) o += pp[s * (hd + 2) + d] * ws[s];
-        out[h * hd + d] = o / L * sigmoid(qg[h * 2 * hd + hd + d]);
+        out[h * hd + d] = o / L * (qg ? sigmoid(qg[h * 2 * hd + hd + d]) : 1.0f);
     }
 }
 
@@ -1564,12 +1565,12 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
         int t = q0 + warp * 16 + g + 8 * r;
         if (t >= T) continue;
         float* orow = out + (size_t)t * nh * HD + h * HD;
-        const float* gate = qg + (size_t)t * nh * 2 * HD + h * 2 * HD + HD;
+        const float* gate = qg ? qg + (size_t)t * nh * 2 * HD + h * 2 * HD + HD : nullptr;
 #pragma unroll
         for (int d = 0; d < HD / 8; d++)
             for (int e = 0; e < 2; e++) {
                 int col = d * 8 + 2 * t4 + e;
-                orow[col] = o[d][2 * r + e] / l[r] * sigmoid(gate[col]);
+                orow[col] = o[d][2 * r + e] / l[r] * (gate ? sigmoid(gate[col]) : 1.0f);
             }
     }
 }
@@ -1611,10 +1612,10 @@ __device__ void attn_prefill_llama(const float* q, const u16* kc, const u16* vc,
             }
             m = mn;
         }
-        const float* gate = qg + (size_t)t * nh * 2 * HD + h * 2 * HD + HD;
+        const float* gate = qg ? qg + (size_t)t * nh * 2 * HD + h * 2 * HD + HD : nullptr;
         for (int r = 0; r < R; r++) {
             int d = tid + 128 * r;
-            if (d < HD) out[(size_t)t * nh * HD + h * HD + d] = acc[r] / l * sigmoid(gate[d]);
+            if (d < HD) out[(size_t)t * nh * HD + h * HD + d] = acc[r] / l * (gate ? sigmoid(gate[d]) : 1.0f);
         }
     }
 }

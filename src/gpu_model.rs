@@ -432,15 +432,16 @@ impl<'a> GpuModel<'a> {
                     mv(out, "o", c.ssm_d_inner, "mix", ne)?;
                 }
                 Mixer::Attn { q, k, v, qn, kn, o, kc, vc } => {
-                    mv(q, "h", ne, "qg", 2 * nh * hd)?;
-                    g.rms_norm(p("qg"), 2 * hd, qn.ptr, p("q"), hd, hd, nt * nh, eps)?;
+                    let qs = if c.q_gate { 2 * hd } else { hd };
+                    mv(q, "h", ne, "qg", nh * qs)?;
+                    g.rms_norm(p("qg"), qs, qn.ptr, p("q"), hd, hd, nt * nh, eps)?;
                     g.rope_neox(p("q"), hd, nt * nh, nh, c.n_rot, step, c.rope_base)?;
                     mv(k, "h", ne, "kraw", kv)?;
                     mv(v, "h", ne, "v", kv)?;
                     g.rms_norm(p("kraw"), hd, kn.ptr, p("k"), hd, hd, nt * nkv, eps)?;
                     g.rope_neox(p("k"), hd, nt * nkv, nkv, c.n_rot, step, c.rope_base)?;
                     g.kv_store(p("k"), p("v"), kc.addr, vc.addr, kv, nt, step, hd)?;
-                    g.attn_decode(p("q"), kc.addr, vc.addr, p("qg"), p("att"), p("attp"), step, nh, nkv, hd,
+                    g.attn_decode(p("q"), kc.addr, vc.addr, if c.q_gate { p("qg") } else { 0 }, p("att"), p("attp"), step, nh, nkv, hd,
                                   1.0 / (hd as f32).sqrt(), nt)?;
                     mv(o, "att", nh * hd, "mix", ne)?;
                 }
