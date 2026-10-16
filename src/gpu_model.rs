@@ -427,7 +427,7 @@ impl<'a> GpuModel<'a> {
                         g.conv_seq(p("qkv"), conv.addr, conv_w.ptr, p("y"), channels, c.ssm_conv, nt, sc, ns)?;
                     }
                     g.l2_norm(p("y"), dk, 2 * nk, channels, nt * 2 * nk, eps)?;
-                    g.deltanet(p("y"), s.addr, p("beta"), p("g"), p("o"), nk, nv, dk, dv, 1.0 / (dk as f32).sqrt(), nt, channels, ss, ns)?;
+                    g.deltanet(p("y"), s.addr, p("beta"), p("g"), p("o"), nk, nv, c.k_interleave, dk, dv, 1.0 / (dk as f32).sqrt(), nt, channels, ss, ns)?;
                     g.norm_gate(p("o"), norm.ptr, p("z"), dv, nt * nv, eps)?;
                     mv(out, "o", c.ssm_d_inner, "mix", ne)?;
                 }
