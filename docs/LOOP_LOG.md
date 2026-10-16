@@ -1534,6 +1534,42 @@ Test: `rejects_bad_ssm_dims` (tests/gguf.rs) builds small qwen3next files in mem
 synthetic and split tests also pass on the qwen3moe and qwen3next files. `real_file_config` fails on those two
 files, as documented in #86, because it pins the default model's values.
 
+### 2026-10-16 #88 — tool calling in `serve` (f4d0ed5)
+
+`/v1/chat/completions` now takes `tools` and `tool_choice` (`auto`, `required`, `none`, or a named function),
+assistant messages with `tool_calls`, and `role: "tool"` messages. A reply that ends in tool calls comes back as
+`message.tool_calls` (non-streamed) or as one `delta.tool_calls` chunk (streamed), with
+`finish_reason: "tool_calls"`. New module `src/chat.rs` holds the templates; `src/serve.rs` only parses the request.
+
+- Format: from the GGUF's `tokenizer.chat_template`. Qwen3.6 uses XML calls (`<function=f>` with
+  `<parameter=k>` items). Qwen3-2507 4B/30B and Qwen3-Next use `<tool_call>{json}</tool_call>`; the 2507 templates
+  also strip and re-wrap `<think>` in assistant history, the Next template does not. No Jinja engine (no new
+  crates): each family is written out by hand and checked against llama.cpp.
+- Byte identity: `tests/fixtures/chat/` holds the four local templates and llama.cpp's renderings
+  (`llama-server --jinja --chat-template-file`, `POST /apply-template`, CPU build, made by
+  `tools/gen_chat_fixtures.py`) of 21 requests. The requests cover tools with and without a system message, the
+  full two-tool flow, a call with content, thinking on and in history, `reasoning_content`, argument value types,
+  arguments given as an object, unicode and control characters, content parts, whitespace, two system messages,
+  and a tool message first. `prompts_match_llama_cpp` renders all 84 and they match byte for byte. The one request
+  llama.cpp rejects (arguments that are not JSON) is rejected too. Quirks matched: tools are rewritten to
+  `{type, function: {name, description, parameters}}`, `tojson` uses Python separators and keeps key order,
+  floats print like C `%g` (`1e-05`, `1.23457e+08`), XML parameter values print `True`/`False`/`None`.
+- Parsing: calls must close the reply. If any block is malformed, the whole reply goes out as plain content with
+  `finish_reason` `stop` or `length` (unit tests for both formats; never a 500). XML values are strings when
+  the tool schema says `string`, else JSON if they parse, else strings. A stream sends text up to the
+  `<tool_call>` tag as it comes and holds back a partial tag (`Hold`, tested at every split of a reply).
+- E2E on the default model (`--gpu`, load 6.41): "weather and local time in Paris" with `get_weather` and
+  `get_time` gives both calls (`{"city": "Paris"}` each, 51 tokens), streamed and not. With the two tool results
+  added, the final answer is "The current weather in Paris is clear with a temperature of 21°C. The local time is
+  14:05." (prompt 433 tokens, 333 cached: the history from the call turn is reused). With `tool_choice: "none"`
+  the tools still go into the prompt (as llama.cpp renders them), and the model's call text comes back as content.
+- Full suite green on the default model, load 2.20.
+
+Not done: `tool_choice: "required"` and a named function do not force a call (no grammar-constrained decoding);
+they act like `auto`. `parallel_tool_calls` is ignored. A literal `<tool_call>` inside the thinking part makes
+the reply plain text. `chat` (the CLI) does not use tools. No speed or parity numbers changed (the prompt for
+messages without tools is unchanged, `old_chat_prompt_unchanged`).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
@@ -1554,6 +1590,12 @@ files, as documented in #86, because it pins the default model's values.
    following GEMV and the router GEMV with router_topk are the next levers.
 
 ## Questions for owner
+
+- (#88) README: `serve` now does tool calling. Proposed addition after the sentence about `cached_tokens`:
+  "`tools` and `tool_choice` work as in the OpenAI API (calls come back as `tool_calls` with
+  `finish_reason: "tool_calls"`). The prompt follows the model's own chat template, rendered like llama.cpp's
+  `--jinja`. `tool_choice: "required"` does not force a call." Also `src/serve.rs (HTTP and chat template)`
+  should read `src/serve.rs (HTTP), src/chat.rs (chat templates and tool calls)`.
 
 - (#81) GPU runs only check for Dota 2. CS2 (and any game) also takes VRAM and GPU time, which moved parity by one
   token and made benches unreadable. Should the loop also stop GPU work while `cs2` (or any process holding over
