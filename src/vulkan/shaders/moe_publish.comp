@@ -17,6 +17,7 @@ void main() {
     if (t < kt) { p.mb.v[32 + t] = uint(p.ids.v[t]); p.mb.v[32 + kt + t] = floatBitsToUint(p.wts.v[t]); p.mb.v[32 + 2 * kt + t] = uint(p.slots.v[t]); }
     if (miss) for (uint i = t; i < p.n * p.T; i += 256) p.mb.v[p.h_off + i] = floatBitsToUint(p.h.v[i]);
     if (t == 0) p.mb.v[1] = p.T;
-    barrier();
+    // barrier() orders only shared memory: every invocation's mailbox writes must happen before the release below.
+    controlBarrier(gl_ScopeWorkgroup, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
     if (t == 0) atomicStore(p.mb.v[0], uint(p.step.v[1]), gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease | gl_SemanticsMakeAvailable);
 }

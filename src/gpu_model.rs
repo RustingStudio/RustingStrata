@@ -153,7 +153,10 @@ impl<'a> GpuModel<'a> {
         let (free1, _) = gpu.mem_info()?;
 
         let cache = if c.is_moe() {
-            let budget = free1.saturating_sub(vram_margin);
+            // STRATA_EXPERT_MB caps the expert slots, so that runs place the same experts whatever VRAM is free (a
+            // backend comparison, or other programs holding VRAM).
+            let cap = std::env::var("STRATA_EXPERT_MB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(usize::MAX, |v| v << 20);
+            let budget = free1.saturating_sub(vram_margin).min(cap);
             Some(ExpertCache::new(m, &*gpu, budget, c.n_layer + mtp as usize)?)
         } else { None };
         let worker = if c.is_moe() { Some(CpuWorker::new(m, &*gpu, (0..c.n_layer).collect())?) } else { None };
