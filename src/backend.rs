@@ -86,6 +86,9 @@ pub trait Backend: Send {
     /// Run the ops `f` queues as the graph recorded under `key`, recording it on first use. `f` runs only when
     /// recording, so its ops must read per-call values from device memory.
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()>;
+    /// Queue the ops of `f`, none of which reads what another writes, with no ordering among them (Vulkan: no
+    /// barriers between them); ops after the batch see all their results.
+    fn batch(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> { f() }
     /// Zeroed host memory of `words` u32 that kernels read and write at the `Buf` address. The host pointer is
     /// valid while the `Buf` lives.
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)>;

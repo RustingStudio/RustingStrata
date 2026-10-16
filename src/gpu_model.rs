@@ -419,10 +419,12 @@ impl<'a> GpuModel<'a> {
             match &l.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, snap } => {
                     let (sc, ss, ns) = snap.as_ref().map_or((0, 0, 0), |(a, b)| (a.addr(), b.addr(), self.k));
-                    mv(qkv, "h", ne, "qkv", channels)?;
-                    mv(gate, "h", ne, "z", c.ssm_d_inner)?;
-                    mv(beta, "h", ne, "beta", nv)?;
-                    mv(alpha, "h", ne, "g", nv)?;
+                    g.batch(&mut || {
+                        mv(qkv, "h", ne, "qkv", channels)?;
+                        mv(gate, "h", ne, "z", c.ssm_d_inner)?;
+                        mv(beta, "h", ne, "beta", nv)?;
+                        mv(alpha, "h", ne, "g", nv)
+                    })?;
                     g.ssm_gates(p("beta"), p("g"), dt_bias.ptr, a.ptr, nt * nv, nv)?;
                     if nt == 1 {
                         g.conv_silu(p("qkv"), conv.addr(), conv_w.ptr, p("y"), channels, c.ssm_conv)?;
@@ -436,13 +438,15 @@ impl<'a> GpuModel<'a> {
                 }
                 Mixer::Attn { q, k, v, qn, kn, o, kc, vc } => {
                     let qs = if c.q_gate { 2 * hd } else { hd };
-                    mv(q, "h", ne, "qg", nh * qs)?;
-                    g.rms_norm(p("qg"), qs, qn.ptr, p("q"), hd, hd, nt * nh, eps)?;
-                    g.rope_neox(p("q"), hd, nt * nh, nh, c.n_rot, step, c.rope_base)?;
-                    mv(k, "h", ne, "kraw", kv)?;
-                    mv(v, "h", ne, "v", kv)?;
-                    g.rms_norm(p("kraw"), hd, kn.ptr, p("k"), hd, hd, nt * nkv, eps)?;
-                    g.rope_neox(p("k"), hd, nt * nkv, nkv, c.n_rot, step, c.rope_base)?;
+                    g.batch(&mut || { mv(q, "h", ne, "qg", nh * qs)?; mv(k, "h", ne, "kraw", kv)?; mv(v, "h", ne, "v", kv) })?;
+                    g.batch(&mut || {
+                        g.rms_norm(p("qg"), qs, qn.ptr, p("q"), hd, hd, nt * nh, eps)?;
+                        g.rms_norm(p("kraw"), hd, kn.ptr, p("k"), hd, hd, nt * nkv, eps)
+                    })?;
+                    g.batch(&mut || {
+                        g.rope_neox(p("q"), hd, nt * nh, nh, c.n_rot, step, c.rope_base)?;
+                        g.rope_neox(p("k"), hd, nt * nkv, nkv, c.n_rot, step, c.rope_base)
+                    })?;
                     g.kv_store(p("k"), p("v"), kc.addr(), vc.addr(), kv, nt, step, hd)?;
                     g.attn_decode(p("q"), kc.addr(), vc.addr(), if c.q_gate { p("qg") } else { 0 }, p("att"), p("attp"), step, nh, nkv, hd,
                                   1.0 / (hd as f32).sqrt(), nt)?;
@@ -453,8 +457,7 @@ impl<'a> GpuModel<'a> {
             g.rms_norm_q(x, ne, l.post_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"))?;
             match &l.ffn {
                 Ffn::Dense { gate, up, down } => {
-                    mv(gate, "h", ne, "ge", c.n_ff)?;
-                    mv(up, "h", ne, "ue", c.n_ff)?;
+                    g.batch(&mut || { mv(gate, "h", ne, "ge", c.n_ff)?; mv(up, "h", ne, "ue", c.n_ff) })?;
                     g.swiglu(p("ge"), p("ue"), nt * c.n_ff)?;
                     mv(down, "ge", c.n_ff, "ye", ne)?;
                     g.add(x, p("ye"), nt * ne)?;
@@ -463,7 +466,16 @@ impl<'a> GpuModel<'a> {
                     let k = c.n_expert_used;
                     let kt = nt * k;
                     let ids = self.ids.addr();
-                    mv(router, "h", ne, "rl", c.n_expert)?;
+                    // The shared expert's GEMVs and swiglu share batches with the routed ones.
+                    g.batch(&mut || {
+                        mv(router, "h", ne, "rl", c.n_expert)?;
+                        if let Some(s) = shared {
+                            mv(&s.gate_inp, "h", ne, "sg", 1)?;
+                            mv(&s.gate, "h", ne, "shg", c.n_ff_shexp)?;
+                            mv(&s.up, "h", ne, "shu", c.n_ff_shexp)?;
+                        }
+                        Ok(())
+                    })?;
                     g.router_topk(p("rl"), c.n_expert, k, c.expert_weights_scale, ids, p("wts"), nt)?;
                     let cache = self.cache.as_ref().unwrap();
                     let lx = cache.layer(il).unwrap();
@@ -474,26 +486,24 @@ impl<'a> GpuModel<'a> {
                     let mb = w.dev + (4 * il * w.layout.stride) as u64;
                     g.map_hits(ids, lx.table_dev.addr(), slots, p("wts"), p("wh"), kt)?;
                     g.moe_publish(ids, p("wts"), slots, p("h"), mb, k, ne, w.layout.h, step, nt)?;
-                    if mg.ty == mu.ty && (mg.rows, mg.cols) == (mu.rows, mu.cols) {
-                        let pair = (mu.off as i64 - mg.off as i64, p("ue") as i64 - p("ge") as i64);
-                        g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, p("h"), ne, k, p("ge"), Some(pair), p("hq"))?;
-                    } else {
-                        g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, p("h"), ne, k, p("ge"), None, p("hq"))?;
-                        g.moe_gemv(mu.ty, mu.rows, mu.cols, base + mu.off as u64, stride, slots, kt, p("h"), ne, k, p("ue"), None, p("hq"))?;
-                    }
-                    g.swiglu(p("ge"), p("ue"), kt * c.n_ff_exp)?;
-                    g.moe_gemv(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, kt, p("ge"), c.n_ff_exp, 1, p("ye"), None, 0)?;
-                    let (sh, sg) = match shared {
-                        Some(s) => {
-                            mv(&s.gate_inp, "h", ne, "sg", 1)?;
-                            mv(&s.gate, "h", ne, "shg", c.n_ff_shexp)?;
-                            mv(&s.up, "h", ne, "shu", c.n_ff_shexp)?;
-                            g.swiglu(p("shg"), p("shu"), nt * c.n_ff_shexp)?;
-                            mv(&s.down, "shg", c.n_ff_shexp, "shy", ne)?;
-                            (p("shy"), p("sg"))
+                    g.batch(&mut || {
+                        if mg.ty == mu.ty && (mg.rows, mg.cols) == (mu.rows, mu.cols) {
+                            let pair = (mu.off as i64 - mg.off as i64, p("ue") as i64 - p("ge") as i64);
+                            g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, p("h"), ne, k, p("ge"), Some(pair), p("hq"))?;
+                        } else {
+                            g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, p("h"), ne, k, p("ge"), None, p("hq"))?;
+                            g.moe_gemv(mu.ty, mu.rows, mu.cols, base + mu.off as u64, stride, slots, kt, p("h"), ne, k, p("ue"), None, p("hq"))?;
                         }
-                        None => (0, 0),
-                    };
+                        if shared.is_some() { g.swiglu(p("shg"), p("shu"), nt * c.n_ff_shexp)?; }
+                        Ok(())
+                    })?;
+                    g.batch(&mut || {
+                        g.swiglu(p("ge"), p("ue"), kt * c.n_ff_exp)?;
+                        if let Some(s) = shared { mv(&s.down, "shg", c.n_ff_shexp, "shy", ne)?; }
+                        Ok(())
+                    })?;
+                    g.moe_gemv(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, kt, p("ge"), c.n_ff_exp, 1, p("ye"), None, 0)?;
+                    let (sh, sg) = if shared.is_some() { (p("shy"), p("sg")) } else { (0, 0) };
                     g.moe_combine(x, p("ye"), p("wh"), k, sh, sg, mb, w.layout.y, step, slots, ne, nt)?;
                 }
             }
