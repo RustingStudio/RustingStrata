@@ -1,0 +1,38 @@
+#version 460
+// Expert GEMV (CUDA moe_gemv for integer types): workgroup y = slot k, z = matrix (z = 1: weights + w2, output + y2
+// bytes). Slot k multiplies expert ids[k] (skipped when negative; its weights at w + ids[k] * stride) by token k / xg
+// of x pre-quantized by quant_xq at xq (ntok rows), into y + k * rows. One subgroup per row, 8 rows per workgroup.
+layout(local_size_x = 256) in;
+#include "common.glsl"
+#include "deq.glsl"
+
+layout(push_constant) uniform P { U8 w; I32 ids; U32 xq; F32 y; uint64_t stride; uint64_t w2; uint64_t y2; uint rows; uint nsb; uint xg; uint ntok; } p;
+
+int sbyte(uint v, uint i) { return int(v << (24 - 8 * i)) >> 24; }
+
+void main() {
+    uint k = gl_WorkGroupID.y, row = gl_WorkGroupID.x * 8 + gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    int e = p.ids.v[k];
+    if (e < 0 || row >= p.rows) return;
+    U8 w = U8(uint64_t(p.w) + uint64_t(e) * p.stride + gl_WorkGroupID.z * p.w2);
+    F32 y = F32(uint64_t(p.y) + gl_WorkGroupID.z * p.y2);
+    F32 xd = F32(uint64_t(p.xq) + p.ntok * p.nsb * 256);
+    uint t = k / p.xg;
+    precise float acc = 0.0;
+    for (uint s = 0; s < p.nsb; s++) {
+        int q[8]; float d, m;
+        qi8(w, (row * p.nsb + s) * SBB, lane, q, d, m);
+        uint o = (t * p.nsb + s) * 64 + lane * 2, a = p.xq.v[o], c = p.xq.v[o + 1];
+        int dot = 0, sx = 0;
+        for (uint i = 0; i < 4; i++) {
+            int xa = sbyte(a, i), xc = sbyte(c, i);
+            dot += q[i] * xa + q[i + 4] * xc;
+            sx += xa + xc;
+        }
+        float dx = xd.v[(t * p.nsb + s) * 8 + (lane >> 2)];
+        acc = fma(d * dx, float(dot), acc);
+        if (T == 10 || T == 12 || T == 13) acc = fma(-(m * dx), float(sx), acc);  // types with a min
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) y.v[k * p.rows + row] = acc;
+}
