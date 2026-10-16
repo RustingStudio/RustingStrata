@@ -132,7 +132,7 @@ impl GpuModel<'_> {
                     g.ssm_gates(eb, eg, dt_bias.ptr, a.ptr, t * nv, nv)?;
                     g.conv_seq(at(l.a), conv.addr, conv_w.ptr, at(l.c), channels, c.ssm_conv, t, 0, 0)?;
                     g.l2_norm(at(l.c), dk, 2 * nk, channels, t * 2 * nk, eps)?;
-                    g.deltanet(at(l.c), s.addr, eb, eg, at(l.d), nk, nv, dk, dv, 1.0 / (dk as f32).sqrt(), t, channels, 0, 0)?;
+                    g.deltanet(at(l.c), s.addr, eb, eg, at(l.d), nk, nv, c.k_interleave, dk, dv, 1.0 / (dk as f32).sqrt(), t, channels, 0, 0)?;
                     g.norm_gate(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps)?;
                     g.gemm_dense(out, t, at(l.d), c.ssm_d_inner, x, ne, 2)?;
                 }

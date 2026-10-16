@@ -1026,8 +1026,8 @@ extern "C" __global__ void conv_state(const float* qkv, float* state, int ch, in
 // The state after each of the first min(nsnap, T - 1) tokens also goes to snap (S's layout, one state each).
 // ponytail: sequential scan (latency-bound per token); a chunked WY form would use tensor cores for long prompts.
 extern "C" __global__ void deltanet_seq(const float* y, float* S, const float* beta, const float* g, float* o,
-                                        int nk, int nv, int dk, int dv, float scale, int T, int ych, float* snap, int nsnap) {
-    int L = dk >> 4, R = 32 / L, lane = threadIdx.x & 31, s = lane % L, vh = blockIdx.x, kh = vh % nk;
+                                        int nk, int nv, int ilv, int dk, int dv, float scale, int T, int ych, float* snap, int nsnap) {
+    int L = dk >> 4, R = 32 / L, lane = threadIdx.x & 31, s = lane % L, vh = blockIdx.x, kh = ilv ? vh / (nv / nk) : vh % nk;
     int j0 = (blockIdx.y * 8 + (threadIdx.x >> 5)) * R, j = j0 + lane / L;
     if (j0 >= dv) return;  // whole warp past the end (R divides dv)
     float4* row = (float4*)(S + ((size_t)vh * dv + j) * dk);

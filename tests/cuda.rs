@@ -335,46 +335,48 @@ fn deltanet_chunk_matches_steps() {
     let g: Vec<f32> = xs(t * nv + 1)[1..].iter().map(|v| -0.2 * v.abs()).collect();
     let s0: Vec<f32> = xs(nv * dv * dk + 2)[2..].iter().map(|v| 0.1 * v).collect();
     let (dy, db, dg) = (gpu.stream.clone_htod(&y).unwrap(), gpu.stream.clone_htod(&beta).unwrap(), gpu.stream.clone_htod(&g).unwrap());
-    let (ns, len) = (3, nv * dv * dk);
-    let run = |chunk: bool| {
-        let ds = gpu.stream.clone_htod(&s0).unwrap();
-        let o = gpu.zeros::<f32>(t * nv * dv).unwrap();
-        let snap = gpu.zeros::<f32>(ns * len).unwrap();
-        let p = |d: u64, per: usize, i: usize| d + (i * per * 4) as u64;
-        let steps: Vec<(usize, usize)> = if chunk { vec![(0, t)] } else { (0..t).map(|i| (i, 1)).collect() };
-        let mut snaps = vec![];
-        for (i, n) in steps {
-            gpu.deltanet(p(gpu.ptr(&dy), ych, i), gpu.ptr(&ds), p(gpu.ptr(&db), nv, i), p(gpu.ptr(&dg), nv, i),
-                         p(gpu.ptr(&o), nv * dv, i), nk, nv, dk, dv, 0.5, n, ych, gpu.ptr(&snap), ns).unwrap();
-            if !chunk && i < ns { snaps.extend(gpu.stream.clone_dtoh(&ds).unwrap()); }
-        }
-        if chunk { snaps = gpu.stream.clone_dtoh(&snap).unwrap(); }
-        (gpu.stream.clone_dtoh(&o).unwrap(), gpu.stream.clone_dtoh(&ds).unwrap(), snaps)
-    };
-    let ((o1, s1, n1), (o2, s2, n2)) = (run(true), run(false));
-    let (eo, es, en) = (rel_l2(&o1, &o2), rel_l2(&s1, &s2), rel_l2(&n1, &n2));
-    eprintln!("deltanet chunk vs steps: out {eo:.2e}, state {es:.2e}, snapshots {en:.2e}");
-    assert!(eo <= 1e-5 && es <= 1e-5 && en <= 1e-5, "out {eo}, state {es}, snapshots {en}");
-    // CPU: S_j = decay * S_j; d = beta (v_j - S_j . k); S_j += d k; o_j = scale * S_j . q
-    let (mut sc, mut oc) = (s0.clone(), vec![0.0f32; t * nv * dv]);
-    for tok in 0..t {
-        let yt = &y[tok * ych..];
-        for vh in 0..nv {
-            let kh = vh % nk;
-            let (q, k) = (&yt[kh * dk..][..dk], &yt[nk * dk + kh * dk..][..dk]);
-            let (decay, b) = (g[tok * nv + vh].exp(), beta[tok * nv + vh]);
-            for j in 0..dv {
-                let row = &mut sc[(vh * dv + j) * dk..][..dk];
-                row.iter_mut().for_each(|x| *x *= decay);
-                let d = b * (yt[2 * nk * dk + vh * dv + j] - row.iter().zip(k).map(|(a, b)| a * b).sum::<f32>());
-                row.iter_mut().zip(k).for_each(|(x, k)| *x += d * k);
-                oc[tok * nv * dv + vh * dv + j] = 0.5 * row.iter().zip(q).map(|(a, b)| a * b).sum::<f32>();
+    for ilv in [false, true] {
+        let (ns, len) = (3, nv * dv * dk);
+        let run = |chunk: bool| {
+            let ds = gpu.stream.clone_htod(&s0).unwrap();
+            let o = gpu.zeros::<f32>(t * nv * dv).unwrap();
+            let snap = gpu.zeros::<f32>(ns * len).unwrap();
+            let p = |d: u64, per: usize, i: usize| d + (i * per * 4) as u64;
+            let steps: Vec<(usize, usize)> = if chunk { vec![(0, t)] } else { (0..t).map(|i| (i, 1)).collect() };
+            let mut snaps = vec![];
+            for (i, n) in steps {
+                gpu.deltanet(p(gpu.ptr(&dy), ych, i), gpu.ptr(&ds), p(gpu.ptr(&db), nv, i), p(gpu.ptr(&dg), nv, i),
+                             p(gpu.ptr(&o), nv * dv, i), nk, nv, ilv, dk, dv, 0.5, n, ych, gpu.ptr(&snap), ns).unwrap();
+                if !chunk && i < ns { snaps.extend(gpu.stream.clone_dtoh(&ds).unwrap()); }
+            }
+            if chunk { snaps = gpu.stream.clone_dtoh(&snap).unwrap(); }
+            (gpu.stream.clone_dtoh(&o).unwrap(), gpu.stream.clone_dtoh(&ds).unwrap(), snaps)
+        };
+        let ((o1, s1, n1), (o2, s2, n2)) = (run(true), run(false));
+        let (eo, es, en) = (rel_l2(&o1, &o2), rel_l2(&s1, &s2), rel_l2(&n1, &n2));
+        eprintln!("deltanet ilv {ilv} chunk vs steps: out {eo:.2e}, state {es:.2e}, snapshots {en:.2e}");
+        assert!(eo <= 1e-5 && es <= 1e-5 && en <= 1e-5, "ilv {ilv}: out {eo}, state {es}, snapshots {en}");
+        // CPU: S_j = decay * S_j; d = beta (v_j - S_j . k); S_j += d k; o_j = scale * S_j . q
+        let (mut sc, mut oc) = (s0.clone(), vec![0.0f32; t * nv * dv]);
+        for tok in 0..t {
+            let yt = &y[tok * ych..];
+            for vh in 0..nv {
+                let kh = if ilv { vh / (nv / nk) } else { vh % nk };
+                let (q, k) = (&yt[kh * dk..][..dk], &yt[nk * dk + kh * dk..][..dk]);
+                let (decay, b) = (g[tok * nv + vh].exp(), beta[tok * nv + vh]);
+                for j in 0..dv {
+                    let row = &mut sc[(vh * dv + j) * dk..][..dk];
+                    row.iter_mut().for_each(|x| *x *= decay);
+                    let d = b * (yt[2 * nk * dk + vh * dv + j] - row.iter().zip(k).map(|(a, b)| a * b).sum::<f32>());
+                    row.iter_mut().zip(k).for_each(|(x, k)| *x += d * k);
+                    oc[tok * nv * dv + vh * dv + j] = 0.5 * row.iter().zip(q).map(|(a, b)| a * b).sum::<f32>();
+                }
             }
         }
+        let (eo, es) = (rel_l2(&o1, &oc), rel_l2(&s1, &sc));
+        eprintln!("deltanet ilv {ilv} vs CPU: out {eo:.2e}, state {es:.2e}");
+        assert!(eo <= 1e-5 && es <= 1e-5, "ilv {ilv} vs CPU: out {eo}, state {es}");
     }
-    let (eo, es) = (rel_l2(&o1, &oc), rel_l2(&s1, &sc));
-    eprintln!("deltanet vs CPU: out {eo:.2e}, state {es:.2e}");
-    assert!(eo <= 1e-5 && es <= 1e-5, "vs CPU: out {eo}, state {es}");
 }
 
 /// Chunked causal conv (conv_seq + conv_state) equals T single-token conv_silu steps, also for T < kernel width - 1.
