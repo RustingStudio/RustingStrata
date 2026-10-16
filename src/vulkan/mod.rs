@@ -27,6 +27,8 @@ const SPV: &[(&str, &[u8])] = &[
     ("conv_state", include_bytes!("spv/conv_state.spv")),
     ("deltanet", include_bytes!("spv/deltanet.spv")),
     ("dequant", include_bytes!("spv/dequant.spv")),
+    ("gemm_f", include_bytes!("spv/gemm_f.spv")),
+    ("gemmi", include_bytes!("spv/gemmi.spv")),
     ("gemv_f", include_bytes!("spv/gemv_f.spv")),
     ("gemv_q", include_bytes!("spv/gemv_q.spv")),
     ("kv_store", include_bytes!("spv/kv_store.spv")),
@@ -38,6 +40,7 @@ const SPV: &[(&str, &[u8])] = &[
     ("moe_gemv_q", include_bytes!("spv/moe_gemv_q.spv")),
     ("moe_publish", include_bytes!("spv/moe_publish.spv")),
     ("norm_gate", include_bytes!("spv/norm_gate.spv")),
+    ("quant_q8", include_bytes!("spv/quant_q8.spv")),
     ("quant_xq", include_bytes!("spv/quant_xq.spv")),
     ("rms_norm", include_bytes!("spv/rms_norm.spv")),
     ("rope_neox", include_bytes!("spv/rope_neox.spv")),
@@ -46,9 +49,9 @@ const SPV: &[(&str, &[u8])] = &[
     ("swiglu", include_bytes!("spv/swiglu.spv")),
 ];
 
-/// The device, a scratch buffer of XQ bytes for x quantized by `quant_xq` when an op does that itself, and the IQ
-/// lookup tables (`iq_tables`).
-pub struct Vk(Arc<Inner>, Buf, Buf);
+/// The device, a scratch buffer of XQ bytes for x quantized by `quant_xq` when an op does that itself, the IQ lookup
+/// tables (`iq_tables`), and the q8 rows of x for `gemmi` (grown as needed).
+pub struct Vk(Arc<Inner>, Buf, Buf, Mutex<Buf>);
 
 /// The IQ lookup tables in one buffer, and the `tables.glsl` that names each at its offset from the buffer's address
 /// (spec constants 3 and 4). As GLSL const arrays the tables went to per-thread local memory on NVIDIA, which made
@@ -100,7 +103,7 @@ struct Inner {
     queue: vk::Queue,
     mem: vk::PhysicalDeviceMemoryProperties,
     budget: bool,
-    /// VK_KHR_cooperative_matrix with the 16 x 16 x 16 f16 / f32 shape is enabled.
+    /// VK_KHR_cooperative_matrix with the 16 x 16 x 16 f16 / f32 and 16 x 16 x 32 int8 / int32 shapes is enabled.
     coop: bool,
     /// Specialization constant 0 of kernels that quantize x: llama.cpp q8_K numerics (`--llama-numerics`).
     llama: u32,
@@ -229,12 +232,16 @@ impl Vk {
         let has = |n: &std::ffi::CStr| dexts.iter().any(|e| e.extension_name_as_c_str() == Ok(n));
         let budget = has(ash::ext::memory_budget::NAME);
         let mut exts = if budget { vec![ash::ext::memory_budget::NAME.as_ptr()] } else { vec![] };
-        // 16 x 16 x 16 f16 products summed in f32 per subgroup: the mma.sync shape of the CUDA kernels.
+        // 16 x 16 x 16 f16 products summed in f32 and 16 x 16 x 32 int8 ones summed in int32, per subgroup: the
+        // mma.sync shapes of the CUDA kernels.
+        // ponytail: both or neither; split the flag when a device has only one (RDNA3 int8 is 16 x 16 x 16).
         let cm = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
-        let coop = has(ash::khr::cooperative_matrix::NAME) && unsafe { cm.get_physical_device_cooperative_matrix_properties(pd) }
-            .unwrap_or_default().iter().any(|c| (c.m_size, c.n_size, c.k_size) == (16, 16, 16) && c.scope == vk::ScopeKHR::SUBGROUP
-            && c.a_type == vk::ComponentTypeKHR::FLOAT16 && c.b_type == vk::ComponentTypeKHR::FLOAT16
-            && c.c_type == vk::ComponentTypeKHR::FLOAT32 && c.result_type == vk::ComponentTypeKHR::FLOAT32);
+        let props = if has(ash::khr::cooperative_matrix::NAME) { unsafe { cm.get_physical_device_cooperative_matrix_properties(pd) }
+            .unwrap_or_default() } else { vec![] };
+        let shape = |k, ab, cr| props.iter().any(|c| (c.m_size, c.n_size, c.k_size) == (16, 16, k) && c.scope == vk::ScopeKHR::SUBGROUP
+            && c.a_type == ab && c.b_type == ab && c.c_type == cr && c.result_type == cr);
+        let coop = shape(16, vk::ComponentTypeKHR::FLOAT16, vk::ComponentTypeKHR::FLOAT32)
+            && shape(32, vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32);
         if coop { exts.push(ash::khr::cooperative_matrix::NAME.as_ptr()) }
         let mut fcoop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
         let mut f11 = vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(true);
@@ -271,7 +278,7 @@ impl Vk {
         unsafe { (p as *mut u32).write_volatile(0) };
         st.err = (b, m, p as usize, unsafe { inner.dev.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(b)) });
         drop(st);
-        let mut v = Vk(Arc::new(inner), Buf::new(0, 0, ()), Buf::new(0, 0, ()));
+        let mut v = Vk(Arc::new(inner), Buf::new(0, 0, ()), Buf::new(0, 0, ()), Mutex::new(Buf::new(0, 0, ())));
         v.1 = v.buf(XQ, DEVICE)?.0;
         let t = iq_tables().0;
         v.2 = v.alloc(t.len())?;
@@ -460,6 +467,28 @@ impl Vk {
     }
 }
 
+impl Vk {
+    /// `gemm` over a tile list, or (tiles = 0) the dense matrix `wd` over positions 0 .. nd; as `gemm_raw` in
+    /// src/cuda/mod.rs, with the same choice of f16 or int8 products (`Gpu::mmq`).
+    fn gemm_raw(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, wd: u64, nd: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
+        ensure!(cols % 256 == 0, "{} matrix with {cols} columns: GEMM needs a multiple of 256", ty.name());
+        if n_tiles == 0 { return Ok(()); }
+        if !self.0.coop { return todo("gemm without VK_KHR_cooperative_matrix"); }
+        let (spec, grid, nsb) = (self.wspec(ty), [rows.div_ceil(64), n_tiles, 1], (cols / 256) as u32);
+        let tail = [&(rows as u32) as &dyn Arg, &nsb, &act];
+        if !crate::cuda::Gpu::mmq(ty) {
+            return self.run("gemm_f", &spec, grid, &[&tiles, &wd, &x, &xrow, &y, &(nd as u32), &(x_stride as u32), &(y_stride as u32), tail[0], tail[1], tail[2]]);
+        }
+        // ponytail: x is quantized on every call, also when several GEMMs read the same x (as on CUDA).
+        let mut q8 = self.3.lock().unwrap();
+        let need = n_x * (cols + cols / 8 + cols / 4);
+        if q8.len() < need { *q8 = self.alloc(need)?; }  // dropping the old buffer waits for work that uses it
+        let xq = q8.addr();
+        self.run("quant_q8", &[self.0.llama], [n_x, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
+        self.run("gemmi", &spec, grid, &[&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2]])
+    }
+}
+
 /// Super-blocks per row of `w`.
 fn nsb(w: &GpuTensor) -> anyhow::Result<u32> {
     ensure!(w.cols % 256 == 0, "{} tensor with {} columns: GEMV needs a multiple of 256", w.ty.name(), w.cols);
@@ -566,8 +595,12 @@ impl Backend for Vk {
     }
     fn kv_words(&self, n: usize) -> usize { n }
 
-    fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> { todo("gemm") }
-    fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> { todo("gemm_dense") }
+    fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
+        self.gemm_raw(ty, rows, cols, tiles, n_tiles, 0, 0, x, x_stride, n_x, xrow, y, y_stride, act)
+    }
+    fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
+        self.gemm_raw(w.ty, w.rows, w.cols, 0, n.div_ceil(128), w.ptr, n, x, x_stride, n, 0, y, y_stride, act)
+    }
     fn gemv(&self, w: &GpuTensor, x: u64, y: u64) -> anyhow::Result<()> { self.gemvq(w, x, 0, 0, y, 0, 1) }
     fn gemvn(&self, w: &GpuTensor, x: u64, x_stride: usize, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
         self.gemvq(w, x, x_stride, 0, y, y_stride, nt)

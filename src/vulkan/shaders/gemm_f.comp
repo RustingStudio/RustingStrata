@@ -1,0 +1,71 @@
+#version 460
+// Prefill GEMM on f16 cooperative matrices, as gemm_q in kernels.cu (the same 16 x 16 x 16 f16 products summed in f32,
+// in the same order, so results match bit for bit). Workgroup (x, y): output rows 64x .. 64x + 63 of tile y, whose
+// positions m0 .. m0 + cnt read x row xrow[m] (m when xrow is null) and write y row m. tiles holds [w, m0 | cnt << 32]
+// per tile; tiles = null is one dense matrix wd over positions 0 .. nd. act: 0 stores, 1 y = silu(y) * result, 2 adds.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+layout(local_size_x = 256) in;
+#include "common.glsl"
+#include "deq.glsl"
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64 { uint64_t v[]; };
+layout(push_constant) uniform P { U64 tiles; uint64_t wd; F32 x; I32 xrow; F32 y; uint nd; uint xs; uint ys; uint rows; uint nsb; uint act; } p;
+const uint BM = 128, BK = 64, PH = BK + 8;
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+shared float16_t xs[BM * PH], ws[64 * PH];
+shared float ix[512];  // the row and column index matrices
+
+void main() {
+    uint tid = gl_LocalInvocationID.x, w = gl_SubgroupID, n0 = gl_WorkGroupID.x * 64;
+    uint wm = (w >> 1) * 32, wn = (w & 1) * 32, m0, cnt;
+    U8 wt;
+    if (uint64_t(p.tiles) != 0) {
+        uint64_t t = p.tiles.v[2 * gl_WorkGroupID.y + 1];
+        wt = U8(p.tiles.v[2 * gl_WorkGroupID.y]); m0 = uint(t); cnt = uint(t >> 32);
+    } else {
+        wt = U8(p.wd); m0 = gl_WorkGroupID.y * BM; cnt = min(BM, p.nd - m0);
+    }
+    for (uint i = tid; i < 256; i += 256) { ix[i] = float(i / 16); ix[256 + i] = float(i % 16); }
+    ACC acc[2][2];
+    for (uint a = 0; a < 2; a++) for (uint b = 0; b < 2; b++) acc[a][b] = ACC(0.0);
+    for (uint kb = 0; kb < p.nsb * 4; kb++) {
+        uint sb = kb / 4, part = kb % 4;
+        for (uint i = tid; i < 64 * 8; i += 256) {
+            uint r = i / 8, j = i % 8;
+            float v[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+            if (n0 + r < p.rows) deq8(wt, ((n0 + r) * p.nsb + sb) * SBB, part * 8 + j, v);
+            for (uint e = 0; e < 8; e++) ws[r * PH + j * 8 + e] = uint16BitsToHalf(uint16_t(f2h(v[e])));
+        }
+        for (uint i = tid; i < BM * BK; i += 256) {
+            uint r = i / BK, c = i % BK;
+            float v = 0.0;
+            if (r < cnt) v = p.x.v[(uint64_t(p.xrow) != 0 ? uint(p.xrow.v[m0 + r]) : m0 + r) * p.xs + kb * BK + c];
+            xs[r * PH + c] = uint16BitsToHalf(uint16_t(f2h(v)));
+        }
+        barrier();
+        for (uint kk = 0; kk < BK; kk += 16) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a[2];
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b[2];
+            for (uint i = 0; i < 2; i++) {
+                coopMatLoad(a[i], xs, (wm + 16 * i) * PH + kk, PH, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(b[i], ws, (wn + 16 * i) * PH + kk, PH, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            for (uint mt = 0; mt < 2; mt++)
+                for (uint nt = 0; nt < 2; nt++) acc[mt][nt] = coopMatMulAdd(a[mt], b[nt], acc[mt][nt]);
+        }
+        barrier();
+    }
+    // Accumulator element i of this invocation is at row ri[i], column ci[i] (the layout is the implementation's).
+    ACC ri, ci;
+    coopMatLoad(ri, ix, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(ci, ix, 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+    for (uint mt = 0; mt < 2; mt++)
+        for (uint nt = 0; nt < 2; nt++)
+            for (uint i = 0; i < ri.length(); i++) {
+                uint r = wm + 16 * mt + uint(ri[i]), n = n0 + wn + 16 * nt + uint(ci[i]);
+                if (r >= cnt || n >= p.rows) continue;
+                uint o = (m0 + r) * p.ys + n;
+                float v = acc[mt][nt][i];
+                p.y.v[o] = p.act == 0 ? v : p.act == 1 ? silu(p.y.v[o]) * v : p.y.v[o] + v;
+            }
+}
