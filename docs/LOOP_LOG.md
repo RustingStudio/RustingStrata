@@ -1746,6 +1746,29 @@ code was not timed on that test. Full suite green, load 2.55.
 - Not verified: `act` 1 and 2 and the dense path (`tiles == 0`) are not covered by a kernel test (Task 3.5 runs
   them end to end); fallbacks without matrix cores (Tasks 3.2/3.3 as written) wait for RADV.
 
+### 2026-10-16 #97 — Vulkan V3 Task 3.5: prefill and MTP end to end (5469f79)
+- No code change was needed: with the GEMMs of #96 the batched prefill, MTP verify and rollback run on Vulkan.
+  `tests/gpu_model.rs` (7 tests: forward vs CPU, prefill vs reference, MTP draft, verify, rollback,
+  `mtp_spec_matches_greedy` k = 1-3, cached prefill) now runs on every backend; all pass on Vulkan.
+- Parity, default model, `--gpu --backend X`, 3 interleaved runs (load 1.1-2.8): Vulkan 628/629/630 (98.28%),
+  CUDA 630/628/628 (98.23%). Both under the plan's 98.5%; the CUDA drop predates Vulkan (#94).
+- Bit-for-bit check: with `--fixed-experts` the first comparison showed 2 prompts off. Cause: CUDA reads its
+  calibration file (`short: 16`), Vulkan has none (default 32), so prompts of 27 and 31 tokens were batched on CUDA
+  and stepped on Vulkan. With the same threshold (a temporary copy of the calibration for Vulkan, removed after)
+  and `STRATA_EXPERT_MB=6000` for the same placement, argmax is equal on all 20 prompts, and `score` output is
+  byte-identical on the two longest prompts (995 and 1367 tokens). Qwen3-4B (dense) and Qwen3-30B (MoE): `score`
+  byte-identical with `--chunk 0` and `4096`.
+- MTP: `generate -n 256 --fixed-experts STRATA_EXPERT_MB=6000`, 43-token prompt: Vulkan text equals CUDA (md5) for
+  `--mtp 0`, `1`, `2`, with equal accepted counts (106/151, 134/248). `--mtp 0` vs `--mtp 1` text differs on both
+  backends alike: loading the MTP layer changes the expert placement (also with `--fixed-experts`), so this plan
+  gate is not a valid check; `mtp_spec_matches_greedy` (same instance) is.
+- Speed, `bench --pp 512,4096 --tg 64 --reps 3 --mtp 0` (load 5.3-6.4): CUDA prefill 842 (751-890) / 1971
+  (1952-1984), decode 96.0 / 92.3; Vulkan prefill 450 (433-461) / 704 (488-822), decode 58.6 / 55.2. V4 work.
+- Full suite green (72 passed, 4 ignored, load 5.7-6.7).
+- Not verified: Vulkan calibration (`strata calibrate --backend vulkan`) not run, so Vulkan defaults to
+  `short: 32`, `mtp: 0`; RADV deferred. Another loop's process (RustingEngine-performance test binary, 281 MiB)
+  held GPU memory outside the lock during these runs.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
