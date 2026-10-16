@@ -619,7 +619,8 @@ fn argmax_rows_matches_ops_argmax() {
 
 #[test]
 fn router_topk_matches_ops_top_k() {
-    for (bk, gpu) in common::backends_except(&["vulkan"]) {
+    let mut first: Option<(Vec<i32>, Vec<u32>)> = None;
+    for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let (n, k, t) = (256, 8, 3);
@@ -640,6 +641,88 @@ fn router_topk_matches_ops_top_k() {
             for (j, &i) in want.iter().enumerate() { assert!((w[r * k + j] - p[i] / s * 2.5).abs() < 1e-5, "token {r} {j}"); }
         }
         assert_eq!(ids[k..k + 2], [7, 200]);
+        let bits = (ids, w.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        match &first { None => first = Some(bits), Some(f) => assert!(*f == bits, "{bk} differs from the first backend") }
+    }
+}
+
+/// The CPU expert round trip: map_hits, moe_publish, a host thread answering through the mailbox, moe_combine. On
+/// Vulkan an unanswered request then ends in an error, not a hang (CUDA traps, which kills the context).
+#[test]
+fn moe_mailbox_round_trip() {
+    use rusting_strata::cpu_worker::{DONE, IDS, Mailbox, NTOK, REQ};
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        eprintln!("backend {bk}");
+        let (k, n, t) = (4, 300, 2);
+        let lay = Mailbox::new(k, n);
+        let ids = [0, 1, 2, 3, 3, 2, 1, 0];
+        let table = [5, -1, 2, -1];
+        let (wts, h, ye, sh, sg, x0) = (xs(k * t), xs(n * t), xs(k * t * n), xs(n * t), [0.3f32, -0.7], xs(n * t));
+        let (dids, dtable, dwts, dh, dye, dsh, dsg, dx) = (up(gpu, &ids), up(gpu, &table), up(gpu, &wts), up(gpu, &h), up(gpu, &ye), up(gpu, &sh), up(gpu, &sg), up(gpu, &x0));
+        let (slots, wh) = (gpu.zeros::<i32>(k * t).unwrap(), gpu.zeros::<f32>(k * t).unwrap());
+        let (mb, host) = gpu.host_mailbox(lay.stride).unwrap();
+        let step = gpu.zeros::<i32>(2).unwrap();
+        let hp = host as usize;
+        let at = move |o: usize| (hp + 4 * o) as *mut u32;
+        // The CPU side: each missed expert's output is its weight times h.
+        let answer = |seq: u32| {
+            let t0 = std::time::Instant::now();
+            while unsafe { at(REQ).read_volatile() } != seq { assert!(t0.elapsed().as_secs() < 10, "no request"); std::hint::spin_loop(); }
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            let rd = |o: usize| unsafe { at(o).read_volatile() };
+            assert_eq!(rd(NTOK) as usize, t);
+            for tk in 0..t {
+                let mut y = vec![0f32; n];
+                for j in tk * k..(tk + 1) * k {
+                    assert_eq!(rd(IDS + j) as i32, ids[j]);
+                    assert_eq!(rd(IDS + 2 * k * t + j) as i32, table[ids[j] as usize]);
+                    if (rd(IDS + 2 * k * t + j) as i32) < 0 {
+                        let wj = f32::from_bits(rd(IDS + k * t + j));
+                        for i in 0..n { y[i] += wj * f32::from_bits(rd(lay.h + tk * n + i)); }
+                    }
+                }
+                for i in 0..n { unsafe { at(lay.y + tk * n + i).write_volatile(y[i].to_bits()) } }
+            }
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            unsafe { at(DONE).write_volatile(seq) };
+        };
+        let ops = |step: &rusting_strata::backend::Buf| {
+            gpu.map_hits(dids.addr(), dtable.addr(), slots.addr(), dwts.addr(), wh.addr(), k * t)?;
+            gpu.moe_publish(dids.addr(), dwts.addr(), slots.addr(), dh.addr(), mb.addr(), k, n, lay.h, step.addr(), t)?;
+            gpu.moe_combine(dx.addr(), dye.addr(), wh.addr(), k, dsh.addr(), dsg.addr(), mb.addr(), lay.y, step.addr(), slots.addr(), n, t)?;
+            gpu.sync()
+        };
+        // Rounds with new activations: stale mailbox reads would show.
+        let mut want = x0.clone();
+        for seq in 1..4 {
+            let hs: Vec<f32> = h.iter().map(|v| v * seq as f32).collect();
+            gpu.put(&hs, &dh, 0).unwrap();
+            gpu.put(&[0i32, seq], &step, 0).unwrap();
+            std::thread::scope(|s| {
+                s.spawn(|| answer(seq as u32));
+                ops(&step).unwrap();
+            });
+            let got = down::<f32>(gpu, &dx);
+            for tk in 0..t {
+                for i in 0..n {
+                    want[tk * n + i] += sh[tk * n + i] / (1.0 + (-sg[tk]).exp());
+                    for j in tk * k..(tk + 1) * k {
+                        want[tk * n + i] += wts[j] * if table[ids[j] as usize] >= 0 { ye[j * n + i] } else { hs[tk * n + i] };
+                    }
+                    assert!((got[tk * n + i] - want[tk * n + i]).abs() < 1e-4, "round {seq} token {tk} {i}: {} vs {}", got[tk * n + i], want[tk * n + i]);
+                }
+            }
+        }
+        if bk == "vulkan" {
+            gpu.put(&[0i32, 4], &step, 0).unwrap();
+            let t0 = std::time::Instant::now();
+            let e = ops(&step).unwrap_err();
+            eprintln!("unanswered: {e} after {:.2} s", t0.elapsed().as_secs_f64());
+            assert!(format!("{e}").contains("did not answer"), "{e}");
+            gpu.add(dx.addr(), dx.addr(), n).unwrap();
+            gpu.sync().unwrap();
+        }
     }
 }
 
@@ -675,3 +758,4 @@ fn attn_decode_bandwidth() {
         }
     }
 }
+
