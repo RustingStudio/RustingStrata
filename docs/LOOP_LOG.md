@@ -1625,6 +1625,27 @@ code was not timed on that test. Full suite green, load 2.55.
   measured). GLSL `exp`/`log` are not refined (Vulkan allows 3 + 2|x| ulp); revisit if the Task 1.9 greedy check
   differs from CUDA. RADV gates deferred: no AMD GPU on this machine.
 
+### 2026-10-16 #92 — Vulkan dequant, GEMV and decode attention (2da2110, 12eedd2, a3b3d28)
+- 2da2110 (Task 1.4): `deq.glsl` ports `QI<T>`/`deq8<T>` for all 17 weight types; the IQ grids and `kvalues_iq4nl`
+  are generated into `tables.glsl` from `quant::tables` (`glsl_tables_are_fresh` checks it). `dequant` and the
+  float GEMV (`gemv_f`, F32/BF16). Dequant is exact (max diff 0) for every type on the default and 80B models.
+  SPIR-V with 16-bit loads needs `shaderInt16`, now required (validation reported it).
+- 12eedd2 (Tasks 1.5, 1.6): integer GEMV (`gemv_q`) for every quantized type, x quantized by `quant_xq` into a
+  4 MiB scratch buffer owned by `Vk` when the caller gives none; explicit `precise` fma order as CUDA. Vulkan GEMV
+  output equals CUDA bit for bit ("0 of N differ") for all 17 types on the default and 80B models;
+  `gemvn_matches_gemv` passes on Vulkan.
+- a3b3d28 (Task 1.7): `kv_store` (f16, exact round-to-nearest-even conversion in integer code), `attn_decode`
+  (one shader specialized per head_dim, group size and entry point; same splits, chunks and `warp_sum_scatter`
+  order as CUDA) and `attn_merge`. `expf_` ports the PTX CUDA emits for `expf`; `silu`/`sigmoid` use it with IEEE
+  division (changes conv_silu, norm_gate, ssm_gates and swiglu on Vulkan only). Decode attention is bit-identical
+  to CUDA on all 5 test shapes through both kernels. `attn_prefill_matches_decode` runs on every backend: decode
+  vs a CPU f64 softmax (rel err ~1e-7), `kv_store` vs `half` rounding, prefill skipped where missing. ATT_SPLITS_1
+  moved to `backend.rs` (no CUDA behavior change, so no greedy/parity re-run).
+- Gates: full suite green after each commit (load 3.4-11.5). Validation layers with sync validation: no messages.
+- Not verified: `--llama-numerics` decode attention on Vulkan (returns not implemented); hd 512 shapes (no model
+  uses them); the 4B and 30B models fail the GEMV tests' type-coverage asserts by design (also on CUDA, Goal 3
+  item). RADV deferred: no AMD GPU.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
