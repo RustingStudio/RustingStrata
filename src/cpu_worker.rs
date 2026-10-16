@@ -87,8 +87,11 @@ impl CpuWorker {
                         let y = crate::cpu_moe::experts(m, il, &h, &sel);
                         unsafe { std::ptr::copy_nonoverlapping(y.as_ptr(), at(lay.y + t * n) as *mut f32, n) };
                     }
-                    fence(Ordering::Release);
+                    // SeqCst fences (mfence on x86) also order and flush write-combining stores (Vulkan maps the
+                    // mailbox through the BAR): y before DONE, and DONE out now.
+                    fence(Ordering::SeqCst);
                     unsafe { at(DONE).write_volatile(seq) };
+                    fence(Ordering::SeqCst);
                     bn.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 }
             }
