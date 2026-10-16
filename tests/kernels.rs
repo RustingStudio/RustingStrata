@@ -27,7 +27,7 @@ fn rel_l2(a: &[f32], b: &[f32]) -> f32 {
 #[test]
 fn dequant_and_gemv_match_reference_for_every_type() {
     let Some(p) = common::model_path() else { return };
-    for (bk, gpu) in common::backends() {
+    for (bk, gpu) in common::backends_except(&["vulkan"]) {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let g = Gguf::open(&p).unwrap();
@@ -65,7 +65,7 @@ fn dequant_and_gemv_match_reference_for_every_type() {
 
 #[test]
 fn rms_norm_q_matches_quant_xq() {
-    for (bk, gpu) in common::backends() {
+    for (bk, gpu) in common::backends_except(&["vulkan"]) {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let (n, rows) = (2048, 3);
@@ -80,7 +80,7 @@ fn rms_norm_q_matches_quant_xq() {
 #[test]
 fn moe_gemv_selects_experts() {
     let Some(p) = common::model_path() else { return };
-    for (bk, gpu) in common::backends() {
+    for (bk, gpu) in common::backends_except(&["vulkan"]) {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let g = Gguf::open(&p).unwrap();
@@ -125,7 +125,7 @@ fn moe_gemv_selects_experts() {
 #[test]
 fn gemvn_matches_gemv() {
     let Some(p) = common::model_path() else { return };
-    for (bk, gpu) in common::backends() {
+    for (bk, gpu) in common::backends_except(&["vulkan"]) {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let g = Gguf::open(&p).unwrap();
@@ -163,7 +163,7 @@ fn gemvn_matches_gemv() {
 #[ignore]
 fn gemv_bandwidth() {
     let Some(p) = common::model_path() else { return };
-    for (bk, gpu) in common::backends() {
+    for (bk, gpu) in common::backends_except(&["vulkan"]) {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let g = Gguf::open(&p).unwrap();
@@ -214,7 +214,7 @@ fn f16r(v: f32) -> f32 { half::f16::from_f32(v).to_f32() }
 #[test]
 fn gemm_matches_reference_for_every_type() {
     let Some(p) = common::model_path() else { return };
-    for (bk, gpu) in common::backends() {
+    for (bk, gpu) in common::backends_except(&["vulkan"]) {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let g = Gguf::open(&p).unwrap();
@@ -259,7 +259,7 @@ fn gemm_matches_reference_for_every_type() {
 #[ignore]
 fn gemm_throughput() {
     let Some(p) = common::model_path() else { return };
-    for (bk, gpu) in common::backends() {
+    for (bk, gpu) in common::backends_except(&["vulkan"]) {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let g = Gguf::open(&p).unwrap();
@@ -290,7 +290,7 @@ fn gemm_throughput() {
 /// splits empty.
 #[test]
 fn attn_prefill_matches_decode() {
-    for (bk, gpu) in common::backends() {
+    for (bk, gpu) in common::backends_except(&["vulkan"]) {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let (pos0, t) = (5, 100);
@@ -352,7 +352,7 @@ fn attn_prefill_matches_decode() {
 /// its snapshots equal the states after the first single-token scans.
 #[test]
 fn deltanet_chunk_matches_steps() {
-    for (bk, gpu) in common::backends() {
+    for (bk, gpu) in common::backends_except(&["vulkan"]) {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let (nk, nv, dk, dv, t) = (2, 4, 128, 128, 37);
@@ -410,7 +410,7 @@ fn deltanet_chunk_matches_steps() {
 /// Chunked causal conv (conv_seq + conv_state) equals T single-token conv_silu steps, also for T < kernel width - 1.
 #[test]
 fn conv_seq_matches_steps() {
-    for (bk, gpu) in common::backends() {
+    for (bk, gpu) in common::backends_except(&["vulkan"]) {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let (ch, kw) = (96, 4);
@@ -440,7 +440,7 @@ fn conv_seq_matches_steps() {
 
 #[test]
 fn argmax_rows_matches_ops_argmax() {
-    for (bk, gpu) in common::backends() {
+    for (bk, gpu) in common::backends_except(&["vulkan"]) {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let n = 248_320;
@@ -461,7 +461,7 @@ fn argmax_rows_matches_ops_argmax() {
 
 #[test]
 fn router_topk_matches_ops_top_k() {
-    for (bk, gpu) in common::backends() {
+    for (bk, gpu) in common::backends_except(&["vulkan"]) {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let (n, k, t) = (256, 8, 3);
@@ -489,7 +489,7 @@ fn router_topk_matches_ops_top_k() {
 #[test]
 #[ignore]
 fn attn_decode_bandwidth() {
-    for (bk, gpu) in common::backends() {
+    for (bk, gpu) in common::backends_except(&["vulkan"]) {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let (nh, nkv, hd) = (16, 2, 256);

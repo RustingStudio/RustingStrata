@@ -1,5 +1,5 @@
 //! Backend seam: device memory as `Buf` (an address plus whatever keeps the memory alive) and the kernel ops the
-//! model runs. Every op takes device addresses, so model code never sees backend types. CUDA implements it in `cuda`.
+//! model runs. Every op takes device addresses, so model code never sees backend types. `cuda` and `vulkan` implement it.
 
 use crate::quant::GgmlType;
 use crate::weights::Tensor;
@@ -52,11 +52,18 @@ unsafe impl Plain for u64 {}
 
 /// Device memory, recorded graphs and kernel ops. Host copies are synchronous; device work runs in queue order.
 /// Pointer arguments are device addresses; strides are in floats unless named otherwise.
-/// The backend `kind` ("cuda") on GPU `device`; with no kind, CUDA.
+/// The backend `kind` ("cuda" or "vulkan") on GPU `device`; with no kind, CUDA if it loads, else Vulkan.
 pub fn open(kind: Option<&str>, device: usize) -> anyhow::Result<Box<dyn Backend>> {
     match kind {
-        None | Some("cuda") => Ok(Box::new(crate::cuda::Gpu::new(device)?)),
-        Some(k) => anyhow::bail!("unknown backend {k:?}"),
+        Some("cuda") => Ok(Box::new(crate::cuda::Gpu::new(device)?)),
+        Some("vulkan") => Ok(Box::new(crate::vulkan::Vk::new(device)?)),
+        Some(k) => anyhow::bail!("unknown backend {k:?} (cuda or vulkan)"),
+        None => match crate::cuda::Gpu::new(device) {
+            Ok(g) => Ok(Box::new(g)),
+            Err(c) if format!("{c}") == "CUDA init" => Ok(Box::new(crate::vulkan::Vk::new(device)
+                .map_err(|v| anyhow::anyhow!("no GPU backend loads: CUDA: {c:#}; Vulkan: {v:#}"))?)),
+            Err(c) => Err(c),
+        },
     }
 }
 

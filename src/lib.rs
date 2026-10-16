@@ -7,6 +7,7 @@ pub mod tokenizer;
 pub mod model;
 pub mod backend;
 pub mod cuda;
+pub mod vulkan;
 pub mod gpu_model;
 pub mod cpu_moe;
 pub mod expert_cache;
