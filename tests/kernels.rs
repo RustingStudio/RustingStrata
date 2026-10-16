@@ -293,36 +293,61 @@ fn gemm_throughput() {
     }
 }
 
-/// Prefill attention (tensor cores, f16 Q and P, 64-query tiles) matches decode attention at every position, with
-/// keys cached before the chunk, a chunk that does not fill its last tile, and early positions that leave decode
+/// Decode attention (both kernels) matches a CPU softmax over the f16 cache that kv_store writes; prefill attention
+/// (tensor cores, f16 Q and P, 64-query tiles), where the backend has it, matches decode attention at every position,
+/// with keys cached before the chunk, a chunk that does not fill its last tile, and early positions that leave decode
 /// splits empty.
 #[test]
 fn attn_prefill_matches_decode() {
-    for (bk, gpu) in common::backends_except(&["vulkan"]) {
+    let mut first = std::collections::HashMap::new();
+    for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let (pos0, t) = (5, 100);
-        let h16 = |v: Vec<f32>| -> Vec<u16> { v.iter().map(|x| half::f16::from_f32(*x).to_bits()).collect() };
         for (nh, nkv, hd) in [(4, 2, 64), (4, 2, 128), (4, 2, 256), (16, 2, 256), (8, 8, 128)] {
             let n = (pos0 + t) * nkv * hd;
-            let (kc, vc) = (h16(xs(n)), h16(xs(n + 5)[5..].to_vec()));
+            let (kf, vf) = (xs(n), xs(n + 5)[5..].to_vec());
+            let (dk, dv) = (gpu.zeros::<u16>(n).unwrap(), gpu.zeros::<u16>(n).unwrap());
+            gpu.kv_store(up(gpu, &kf).addr(), up(gpu, &vf).addr(), dk.addr(), dv.addr(), nkv * hd, pos0 + t,
+                         up(gpu, &[0i32]).addr(), hd).unwrap();
+            let h16 = |v: &[f32]| -> Vec<u16> { v.iter().map(|x| half::f16::from_f32(*x).to_bits()).collect() };
+            assert_eq!(down::<u16>(gpu, &dk), h16(&kf), "kv_store keys");
+            assert_eq!(down::<u16>(gpu, &dv), h16(&vf), "kv_store values");
             let q: Vec<f32> = xs(t * nh * hd + 3)[3..].iter().map(|v| 4.0 * v).collect();
             let qg = xs(t * nh * 2 * hd);
-            let (dk, dv, dq, dg) = (up(gpu, &kc), up(gpu, &vc),
-                                    up(gpu, &q), up(gpu, &qg));
+            let (dq, dg) = (up(gpu, &q), up(gpu, &qg));
             let scale = 1.0 / (hd as f32).sqrt();
             let step = up(gpu, &[pos0 as i32]);
             let dout = gpu.zeros::<f32>(t * nh * hd).unwrap();
-            gpu.attn_prefill(dq.addr(), dk.addr(), dv.addr(), dg.addr(), dout.addr(), step.addr(), t, nh, nkv, hd, scale).unwrap();
-            let got = down::<f32>(gpu, &dout);
             // qg = 0: no output gate. The gated output is the ungated output times sigmoid(gate).
             let sig = |x: f32| 1.0 / (1.0 + (-x).exp());
             let gated = |plain: &[f32]| -> Vec<f32> {
                 plain.iter().enumerate().map(|(i, o)| o * sig(qg[(i / hd) * 2 * hd + hd + i % hd])).collect()
             };
-            gpu.attn_prefill(dq.addr(), dk.addr(), dv.addr(), 0, dout.addr(), step.addr(), t, nh, nkv, hd, scale).unwrap();
-            let e = rel_l2(&gated(&down::<f32>(gpu, &dout)), &got);
-            assert!(e <= 1e-6, "attn_prefill without gate nh {nh} hd {hd}: {e}");
+            let got = match gpu.attn_prefill(dq.addr(), dk.addr(), dv.addr(), dg.addr(), dout.addr(), step.addr(), t, nh, nkv, hd, scale) {
+                Err(e) if format!("{e}").contains("not implemented") => { eprintln!("attn_prefill: {e}"); None }
+                r => {
+                    r.unwrap();
+                    let got = down::<f32>(gpu, &dout);
+                    gpu.attn_prefill(dq.addr(), dk.addr(), dv.addr(), 0, dout.addr(), step.addr(), t, nh, nkv, hd, scale).unwrap();
+                    let e = rel_l2(&gated(&down::<f32>(gpu, &dout)), &got);
+                    assert!(e <= 1e-6, "attn_prefill without gate nh {nh} hd {hd}: {e}");
+                    Some(got)
+                }
+            };
+            // Token i attends positions 0 ..= pos0 + i, in f64 over the f16-rounded cache.
+            let cpu: Vec<f32> = (0..t * nh).flat_map(|r| {
+                let (i, h) = (r / nh, r % nh);
+                let (g, qh) = (h / (nh / nkv), &q[r * hd..][..hd]);
+                let s: Vec<f64> = (0..=pos0 + i).map(|p| {
+                    (0..hd).map(|d| qh[d] as f64 * f16r(kf[(p * nkv + g) * hd + d]) as f64).sum::<f64>() * scale as f64
+                }).collect();
+                let mx = s.iter().cloned().fold(f64::MIN, f64::max);
+                let e: Vec<f64> = s.iter().map(|v| (v - mx).exp()).collect();
+                let l: f64 = e.iter().sum();
+                (0..hd).map(|d| (e.iter().enumerate().map(|(p, w)| w * f16r(vf[(p * nkv + g) * hd + d]) as f64).sum::<f64>() / l) as f32)
+                    .collect::<Vec<f32>>()
+            }).collect();
             let ddec = gpu.zeros::<f32>(t * nh * hd).unwrap();
             let part = gpu.zeros::<f32>(nh * ATT_SPLITS * (hd + 2)).unwrap();
             for gq_min in [ATT_GQA_MIN, 0] {
@@ -333,6 +358,11 @@ fn attn_prefill_matches_decode() {
                                        off(ddec.addr(), nh * hd), part.addr(), s.addr(), nh, nkv, hd, scale, gq_min, 1).unwrap();
                 }
                 let want = down::<f32>(gpu, &ddec);
+                let e = rel_l2(&want, &gated(&cpu));
+                assert!(e <= 1e-5, "attn_decode nh {nh} nkv {nkv} hd {hd} gq_min {gq_min}: rel err vs CPU {e}");
+                let f = first.entry((nh, nkv, hd, gq_min)).or_insert_with(|| want.clone());
+                eprintln!("attn_decode nh {nh} nkv {nkv} hd {hd} gq_min {gq_min}: rel err vs CPU {e:.2e}, {} of {} differ from the first backend",
+                          want.iter().zip(f.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count(), want.len());
                 for i in 0..t {
                     let s = up(gpu, &[(pos0 + i) as i32]);
                     let off = |p: u64, per: usize| p + (i * per * 4) as u64;
@@ -348,7 +378,8 @@ fn attn_prefill_matches_decode() {
                 gpu.attn_decode_gq(dq.addr(), dk.addr(), dv.addr(), dg.addr(), dbat.addr(), pbat.addr(), ds.addr(),
                                    nh, nkv, hd, scale, gq_min, t).unwrap();
                 assert_eq!(down::<f32>(gpu, &dbat), want, "attn_decode batched nh {nh} nkv {nkv} hd {hd} gq_min {gq_min}");
-                let e = rel_l2(&got, &want);
+                let Some(got) = &got else { continue };
+                let e = rel_l2(got, &want);
                 eprintln!("attn_prefill_{hd} nh {nh} nkv {nkv} gq_min {gq_min}: rel err vs decode {e:.2e}");
                 assert!(e <= 5e-4, "attn_prefill_{hd} nh {nh} nkv {nkv} gq_min {gq_min}: rel err {e}");
             }
@@ -460,6 +491,15 @@ fn elementwise_ops_match_cpu() {
         gpu.add(dg.addr(), du.addr(), n).unwrap();
         let want: Vec<f32> = want.iter().zip(&u).map(|(a, b)| a + b).collect();
         assert!(rel_l2(&down::<f32>(gpu, &dg), &want) < 1e-6);
+        // kv_store rounds to f16 to nearest even, through subnormals, ties, overflow and infinities.
+        let k = [0.0, -0.0, 1e-8, -3e-8, 5.96e-8, 6.1e-5, 6.0e-5, 1.0 + 1.0 / 2048.0, 1.0 + 3.0 / 2048.0, 65504.0, 65519.0,
+                 65520.0, 1e9, f32::INFINITY, f32::NEG_INFINITY, -2.5e-3, 3.14159, -1234.5678, 0.1, 7e-6, 1e-40, -1.0, 2.0, 0.5,
+                 1.0 / 3.0, 100.0, 1000.0, 4096.5, 8191.0, 1e-4, -6.5e-5, 12.375];
+        let (dk, dv) = (gpu.zeros::<u16>(64).unwrap(), gpu.zeros::<u16>(64).unwrap());
+        gpu.kv_store(up(gpu, &k).addr(), up(gpu, &k).addr(), dk.addr(), dv.addr(), 32, 1, up(gpu, &[1i32]).addr(), 32).unwrap();
+        let want: Vec<u16> = [0.0f32; 32].iter().chain(&k).map(|x| half::f16::from_f32(*x).to_bits()).collect();
+        assert_eq!(down::<u16>(gpu, &dk), want);
+        assert_eq!(down::<u16>(gpu, &dv), want);
     }
 }
 

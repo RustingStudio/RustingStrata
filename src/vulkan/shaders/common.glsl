@@ -15,11 +15,18 @@ layout(buffer_reference, std430, buffer_reference_align = 1) buffer U8 { uint8_t
 float fdiv(float a, float b) { float y = 1.0 / b, q = a * y; precise float r = fma(fma(-q, b, a), y, q); return r; }
 float sqrt_(float x) { float s = sqrt(x); precise float r = fma(fma(-s, s, x), fdiv(0.5, s), s); return x > 0.0 ? r : s; }
 
-float silu(float x) { return x / (1.0 + exp(-x)); }
-float sigmoid(float x) { return 1.0 / (1.0 + exp(-x)); }
+// expf as CUDA compiles it (its PTX): x = j ln2 + r with j from a rounded-down fma, then ex2.approx(r) * 2^j.
+float expf_(float x) {
+    precise float t = clamp(fma(x, uintBitsToFloat(0x3bbb989du), 0.5), 0.0, 1.0), y = floor(t * 252.0);
+    if (fma(t, 252.0, -y) < 0.0) y -= 1.0;  // t * 252 rounded up to an integer: fma.rm takes the floor
+    precise float r = fma(x, uintBitsToFloat(0x32a57060u), fma(x, uintBitsToFloat(0x3fb8aa3bu), 126.0 - y));
+    return exp2(r) * uintBitsToFloat(uint(y + 1.0) << 23);
+}
+float silu(float x) { return fdiv(x, 1.0 + expf_(-x)); }
+float sigmoid(float x) { return fdiv(1.0, 1.0 + expf_(-x)); }
 // log1p without the loss of log(1 + x) for small x (GLSL has no log1p).
 float log1p_(float x) { float u = 1.0 + x; return u == 1.0 ? x : log(u) * x / (u - 1.0); }
-float softplus(float x) { return x > 20.0 ? x : log1p_(exp(x)); }
+float softplus(float x) { return x > 20.0 ? x : log1p_(expf_(x)); }
 
 // Sums and maxima over a subgroup of 32 in the butterfly order of the CUDA warp_sum / warp_max.
 float warp_sum(float v) { for (uint o = 16; o > 0; o >>= 1) v += subgroupShuffleXor(v, o); return v; }
@@ -33,6 +40,16 @@ float block_sum(float v) {
     if (gl_SubgroupInvocationID == 0) block_sum_s[gl_SubgroupID] = v;
     barrier();
     return warp_sum(gl_SubgroupInvocationID < gl_NumSubgroups ? block_sum_s[gl_SubgroupInvocationID] : 0.0);
+}
+
+// f32 to f16 bits, rounded to nearest even (cvt.rn.f16.f32).
+uint f2h(float x) {
+    uint b = floatBitsToUint(x), s = b >> 16 & 0x8000u, a = b & 0x7fffffffu;
+    if (a > 0x7f800000u) return s | 0x7e00u;
+    if (a >= 0x477ff000u) return s | 0x7c00u;  // 65520 and up round to infinity
+    if (a < 0x38800000u) return s | uint(roundEven(uintBitsToFloat(a) * 16777216.0));  // subnormal: units of 2^-24
+    uint r = a - 0x38000000u;
+    return s | (r + 0xfffu + (r >> 13 & 1u)) >> 13;
 }
 
 uint pack4(int a, int b, int c, int d) { return uint(a & 255) | uint(b & 255) << 8 | uint(c & 255) << 16 | uint(d & 255) << 24; }
