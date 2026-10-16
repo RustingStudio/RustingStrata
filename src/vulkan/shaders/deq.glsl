@@ -13,11 +13,6 @@ float h2f(uint h) { return float(uint16BitsToFloat16(uint16_t(h))); }
 float ldh(U8 w, uint o) { return h2f(ld16(w, o)); }
 int sb(uint x) { return int(x << 24) >> 24; }  // the low byte, signed
 
-void scale_min_k4(uint j, U8 w, uint q, out uint s, out uint m) {
-    if (j < 4) { s = u8_(w, q + j) & 63; m = u8_(w, q + j + 4) & 63; }
-    else { s = (u8_(w, q + j + 4) & 15) | (u8_(w, q + j - 4) >> 6) << 4; m = (u8_(w, q + j + 4) >> 4) | (u8_(w, q + j) >> 6) << 4; }
-}
-
 // IQ1_M (T 29) or IQ1_S (19) sub-block l of block ib: grid index, scale and the sign of the 1/8 offset.
 void iq1_sub(U8 w, uint b, uint ib, uint l, out uint idx, out float dl, out bool neg) {
     if (T == 29) {  // d is split over the top nibbles of the four scale words
@@ -74,16 +69,12 @@ void qw_k(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out flo
         hi = vsub4(((v.y >> (2 * j)) & 0x03030303u) | ((h.y >> hb) & 0x01010101u) << 2, 0x04040404u);
     } else if (T == 12 || T == 13) {  // Q4_K, Q5_K
         uint e = sub * 8, j = e >> 6, h = (e >> 5) & 1, r = e & 31, s, mi, bit = 2 * j + h, dm;
-        if (T == 12) {  // k4_dm<true>: d, dmin and the 12 scale bytes from word loads
-            U32 u = U32(uint64_t(w) + b);
-            uint sh = 8 * (bit & 3), sa = (u.v[1] >> sh) & 255, sc = (u.v[2] >> sh) & 255, se = (u.v[3] >> sh) & 255;
-            dm = u.v[0];
-            if (bit < 4) { s = sa & 63; mi = sc & 63; }
-            else { s = (se & 15) | (sa >> 6) << 4; mi = (se >> 4) | (sc >> 6) << 4; }
-        } else {
-            scale_min_k4(bit, w, b + 4, s, mi);
-            dm = ld32(w, b);
-        }
+        // k4_dm<true>: d, dmin and the 12 scale bytes from word loads (both blocks are 4-aligned, 144 and 176 bytes)
+        U32 u = U32(uint64_t(w) + b);
+        uint sh = 8 * (bit & 3), sa = (u.v[1] >> sh) & 255, sc = (u.v[2] >> sh) & 255, se = (u.v[3] >> sh) & 255;
+        dm = u.v[0];
+        if (bit < 4) { s = sa & 63; mi = sc & 63; }
+        else { s = (se & 15) | (sa >> 6) << 4; mi = (se >> 4) | (sc >> 6) << 4; }
         d = h2f(dm & 0xFFFF) * float(s); m = h2f(dm >> 16) * float(mi);
         v = ld8(w, b + (T == 12 ? 16 : 48) + 32 * j + r);
         lo = (v.x >> (4 * h)) & 0x0F0F0F0Fu; hi = (v.y >> (4 * h)) & 0x0F0F0F0Fu;
