@@ -1790,6 +1790,25 @@ code was not timed on that test. Full suite green, load 2.55.
 - Not verified: llama.cpp tg is after an empty context while Strata's is after the prefill, so the decode columns
   are not the same test; one round only, at high load (another job ran during the 4B rows).
 
+### 2026-10-16 #99 — Vulkan V4: weight decode with word loads (fc868d8)
+- `qi8` (deq.glsl) read its 8 weight bytes with 8 byte loads. For Q8_0 and Q2_K-Q6_K it now loads two words
+  (four 2-byte loads when the address is not 4-aligned) and unpacks bitwise as `QI<T>` in kernels.cu (a `vsub4`
+  for Q3_K / Q6_K). Used by gemv_q, moe_gemv_q, gemmi and dequant. IQ types keep byte loads.
+- Correctness: `dequant_and_gemv_match_reference_for_every_type` shows 0 bits differing from CUDA on all 11 types
+  of the default model; `gemm_matches_reference_for_every_type` (bitwise assert) passes; full suite green (72
+  passed, 4 ignored, load 2.3-4.6).
+- A/B against f739a59, `bench --gpu --backend vulkan --pp 512 --tg 128 --reps 3 --mtp 0`, 3 interleaved rounds,
+  load 2.1-8.7. Round 1 was disturbed (base decode min 14.9, and the new binary's default-model run printed no
+  result: stderr was filtered out; 8 reruns all passed), so rounds 2-3 decide:
+
+  | | base decode | new decode | base pp512 | new pp512 |
+  |---|---|---|---|---|
+  | Qwen3-4B | 46.3, 49.8 | 53.9, 54.3 (+12%) | 878, 904 | 945, 964 (+7%) |
+  | default | 56.4, 59.0 | 61.8, 63.7 (+9%) | 453, 483 | 426, 498 |
+
+- Not verified: the cause of the empty round-1 run (guess: another process took VRAM at load); parity not rerun
+  (outputs bit-identical by the kernel tests). llama.cpp Vulkan 4B decode is still 85.8 (#98).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
