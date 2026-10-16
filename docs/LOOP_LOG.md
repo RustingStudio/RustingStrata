@@ -1465,6 +1465,58 @@ graphs go through `Backend::graph`; the CPU mailbox comes from `Backend::host_ma
   repeated, and all tests still pass. So some caller relies on the upload having landed. The sync stays and its
   comment says why. The cause was not traced.
 
+### 2026-10-16 #86 — architecture table (Part 2 of the Vulkan and architecture-table spec)
+
+`src/config.rs` has one `match` on the architecture name. It sets `hybrid`, `q_gate`, `k_interleave` and tensor
+`aliases`, and `ModelConfig::layers` lists a `LayerKind` (`Delta` or `Attn`) per block. Strata now loads `qwen3`,
+`qwen3moe` and `qwen3next` next to `qwen35` / `qwen35moe`. Commits fe52577, 0a283d3, f3338f8, 9440fd1, d2a03d8.
+- Attention without the output gate: `qg == 0` in `attn_decode`, `attn_decode_gq` and `attn_prefill` means no gate.
+  The CPU oracle, decode and prefill size the Q projection from `q_gate`.
+- qwen3next: `Weights::new` splits the fused `ssm_ba` into `ssm_beta` / `ssm_alpha` rows at load time, and
+  `deltanet` takes `interleave` (value head h reads key head h / (nv / nk), else h % nk).
+- New quant type IQ4_NL (ggml id 20), CPU and CUDA. New pre-tokenizer `qwen2`.
+- `tools/greedy24.py` (greedy 24 tokens against llama-server) and `parity.py --no-think` (see below).
+
+Deviations from the spec, decided while planning:
+1. `ssm_ba` is split at load time; no reorder kernel.
+2. Legacy `ssm_in` files are not supported (unsloth ships `attn_qkv` + `attn_gate`).
+3. No `qwen3next` alias for `post_attention_norm`; llama.cpp uses that name for both `qwen35` and `qwen3next`.
+4. `router_topk` already handles 512 experts; only a config check was added.
+5. New flag `k_interleave`.
+6. New quant type IQ4_NL (the qwen3next shared-expert gate and up tensors use it).
+7. New pre-tokenizer `qwen2`.
+
+Gates. Reference: llama-server CUDA with `--n-cpu-moe 99 -c 4096 -np 1`. The auto-sized 52K context took 10 GB of
+VRAM and strata ran out of memory next to it. Parity is strict (no batch-mode file). "Near-tie" counts prompts
+whose first miss has a top-2 gap under 0.1 nats.
+
+| Arch | File | Greedy 24 CPU / GPU | Parity `--gpu` (3 runs where listed) | Near-tie first misses |
+|---|---|---|---|---|
+| qwen3 | Qwen3-4B-Instruct-2507-Q4_K_M | pass / pass | 602/609 = 98.85% | 5 of 5 |
+| qwen3moe | Qwen3-30B-A3B-Instruct-2507-UD-Q2_K_XL | fail (tie) / pass | `--no-think` 631, 631, 633 of 640 (98.59-98.91%) | 2, 1, 1 of 7 |
+| qwen3next | Qwen3-Next-80B-A3B-Instruct-UD-IQ1_S | pass / pass | `--no-think` 636, 634, 635 of 640 (99.06-99.38%) | 1, 1, 3 of 4-6 |
+
+- qwen3moe with the original prompts: 519/533 = 97.37% (11 prompts miss, 7 near-tie). `tools/prompts.json` uses the
+  Qwen3.6 template with an empty `<think></think>` block. The Instruct-2507 models never saw it, so the first token
+  after it is close to uniform. There, llama.cpp, the CPU oracle and the GPU differ by up to 2.5 nats, while in the
+  middle of text the top-1 matches and alternatives agree within about 0.2 nats. `--no-think` drops the block.
+  `--llama-numerics` made it worse (96.06%).
+- qwen3moe CPU greedy: the oracle flips at token 5 on a 0.006 logprob tie (" Germany" against " the"). The oracle is
+  f32; llama.cpp quantizes activations. No fix.
+- qwen3moe `dequant_and_gemv_match_reference_for_every_type`: all 6 types in the file pass; only the final
+  `seen.len() >= 10` coverage check fails (it is written for the default model). `real_file_config` likewise pins
+  default-model values.
+- The 80B parity run 2 first hit CUDA out of memory next to llama-server; it was rerun from the cached reference
+  with the server stopped.
+
+Default model: `cargo test --release` green after every task. Base (fe52577) against Task 2, strict parity on a
+fresh reference, 4 runs each: 628/629/627/627 against 628/627/626/627 of 640. Runs are not reproducible even with
+`--fixed-experts`, so bit identity could not be checked.
+
+Open items: README's supported-architecture list is not updated (the owner has uncommitted README edits). Legacy
+`ssm_in` files are unsupported. The model tests that pin default-model values could skip on other architectures.
+The GPU lock is now at `/home/vasylt/Code/rusting/.gpu.lock` (the old `/home/vasylt/Rusting` path is gone).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
