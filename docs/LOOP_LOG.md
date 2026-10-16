@@ -1873,6 +1873,8 @@ code was not timed on that test. Full suite green, load 2.55.
   token and made benches unreadable. Should the loop also stop GPU work while `cs2` (or any process holding over
   1 GB of VRAM outside the lock) is running?
   Update #101: Minecraft (Java, 3 GB VRAM) made the default model OOM in `gpu_model` and in an A/B bench.
+  Update 2026-10-16 23:54: Geometry Dash (Steam, gamescope) started during a Vulkan A/B and took about 38% of
+  the GPU, so that A/B is void. The loop now waits for gamescope/java to exit and the GPU to idle before benching.
 
 - 2026-10-08 10:20: the GPU lock deadlocked. Another loop ran `flock .gpu.lock rusting test --release --json`
   (PID 3491381), which started `flock .gpu.lock cargo test --release --features cuda --lib prompt` (PID 3495422).
