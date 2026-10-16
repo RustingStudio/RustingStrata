@@ -1824,6 +1824,15 @@ code was not timed on that test. Full suite green, load 2.55.
 - Since #98 (Qwen3-4B, llama.cpp Vulkan tg 85.8): Strata Vulkan decode 49.9 -> 59.1. Not verified: parity
   (bit-identical kernels).
 
+### 2026-10-16 #101 — tests skip default-model checks on other models (8882267)
+- `real_file_config` (exact shapes of the default model) and the type-coverage asserts in
+  `dequant_and_gemv_match_reference_for_every_type` / `gemvn_matches_gemv` now skip, with a SKIP note, unless
+  STRATA_MODEL is the default model (`common::is_default_model`). The other checks in those tests still run.
+- Verified: with Qwen3-4B, the three tests pass (load 3.9). Default-model suite: all targets green (load 6.4-8.7)
+  except `gpu_model`, whose 7 tests failed with "allocate 2641920 bytes": Minecraft (java, 3 GB VRAM) was running
+  outside the lock. That target is unaffected by this diff; rerun pending once the game exits.
+- GPU A/B for the Q4_K scale word loads (k4_dm, saved as a patch) is paused for the same reason.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
@@ -1854,6 +1863,7 @@ code was not timed on that test. Full suite green, load 2.55.
 - (#81) GPU runs only check for Dota 2. CS2 (and any game) also takes VRAM and GPU time, which moved parity by one
   token and made benches unreadable. Should the loop also stop GPU work while `cs2` (or any process holding over
   1 GB of VRAM outside the lock) is running?
+  Update #101: Minecraft (Java, 3 GB VRAM) made the default model OOM in `gpu_model` and in an A/B bench.
 
 - 2026-10-08 10:20: the GPU lock deadlocked. Another loop ran `flock .gpu.lock rusting test --release --json`
   (PID 3491381), which started `flock .gpu.lock cargo test --release --features cuda --lib prompt` (PID 3495422).
