@@ -1809,6 +1809,21 @@ code was not timed on that test. Full suite green, load 2.55.
 - Not verified: the cause of the empty round-1 run (guess: another process took VRAM at load); parity not rerun
   (outputs bit-identical by the kernel tests). llama.cpp Vulkan 4B decode is still 85.8 (#98).
 
+### 2026-10-16 #100 — Vulkan V4: integer GEMV on packed dot products (8e66d07)
+- gemv_q and moe_gemv_q take the 8 weight values packed in two words (`qw` in deq.glsl) and sum the products with
+  `dotPacked4x8EXT` (GL_EXT_integer_dot_product), as the CUDA kernels use `__dp4a`. `shaderIntegerDotProduct`
+  (Vulkan 1.3 core) is enabled and required.
+- `qw` is `qi8` + `pack4`: calling the word decoder `qw_k` directly makes glslc's optimizer fail ("does not
+  dominate its use" / "SelectionMerge must appear in a block"; -O0 compiles). The driver folds the unpack/repack
+  well enough for the gain below; a direct path is a later try.
+- Correctness: every gemv and attention line of `tests/kernels.rs` shows 0 bits differing from CUDA; full suite
+  green (72 passed, 4 ignored, load 1.2-2.9).
+- A/B against 6c89560, `bench --gpu --backend vulkan --pp 512 --tg 128 --reps 3 --mtp 0`, 3 interleaved rounds,
+  load 1.4-3.9: Qwen3-4B decode 53.7/54.2/53.5 -> 59.3/59.1/58.9 (+10%); default model 63.8/63.7/63.0 ->
+  66.5/66.7/66.8 (+5%). pp512 unchanged (4B 949/964/950 vs 954/963/952; default 458/496/491 vs 498/492/492).
+- Since #98 (Qwen3-4B, llama.cpp Vulkan tg 85.8): Strata Vulkan decode 49.9 -> 59.1. Not verified: parity
+  (bit-identical kernels).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
