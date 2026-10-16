@@ -5,10 +5,9 @@
 layout(local_size_x = 256) in;
 #include "common.glsl"
 #include "deq.glsl"
+#extension GL_EXT_integer_dot_product : require
 
 layout(push_constant) uniform P { U8 w; I32 ids; U32 xq; F32 y; uint64_t stride; uint64_t w2; uint64_t y2; uint rows; uint nsb; uint xg; uint ntok; } p;
-
-int sbyte(uint v, uint i) { return int(v << (24 - 8 * i)) >> 24; }
 
 void main() {
     uint k = gl_WorkGroupID.y, row = gl_WorkGroupID.x * 8 + gl_SubgroupID, lane = gl_SubgroupInvocationID;
@@ -20,15 +19,11 @@ void main() {
     uint t = k / p.xg;
     precise float acc = 0.0;
     for (uint s = 0; s < p.nsb; s++) {
-        int q[8]; float d, m;
-        qi8(w, (row * p.nsb + s) * SBB, lane, q, d, m);
+        uint lo, hi; float d, m;
+        qw(w, (row * p.nsb + s) * SBB, lane, lo, hi, d, m);
         uint o = (t * p.nsb + s) * 64 + lane * 2, a = p.xq.v[o], c = p.xq.v[o + 1];
-        int dot = 0, sx = 0;
-        for (uint i = 0; i < 4; i++) {
-            int xa = sbyte(a, i), xc = sbyte(c, i);
-            dot += q[i] * xa + q[i + 4] * xc;
-            sx += xa + xc;
-        }
+        int dot = dotPacked4x8EXT(int(lo), int(a)) + dotPacked4x8EXT(int(hi), int(c));
+        int sx = dotPacked4x8EXT(0x01010101, int(a)) + dotPacked4x8EXT(0x01010101, int(c));
         float dx = xd.v[(t * p.nsb + s) * 8 + (lane >> 2)];
         acc = fma(d * dx, float(dot), acc);
         if (T == 10 || T == 12 || T == 13) acc = fma(-(m * dx), float(sx), acc);  // types with a min

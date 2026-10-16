@@ -197,6 +197,7 @@ fn unusable(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<String> 
         ("shaderInt8", f12.shader_int8), ("shaderFloat16", f12.shader_float16), ("vulkanMemoryModel", f12.vulkan_memory_model),
         ("vulkanMemoryModelDeviceScope", f12.vulkan_memory_model_device_scope),
         ("subgroupSizeControl", f13.subgroup_size_control), ("computeFullSubgroups", f13.compute_full_subgroups),
+        ("shaderIntegerDotProduct", f13.shader_integer_dot_product),
     ].into_iter().filter(|f| f.1 == vk::FALSE).map(|f| f.0).collect();
     (!missing.is_empty()).then(|| format!("missing {}", missing.join(", ")))
 }
@@ -247,7 +248,8 @@ impl Vk {
         let mut f11 = vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(true);
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true)
             .storage_buffer8_bit_access(true).shader_int8(true).shader_float16(true).vulkan_memory_model(true).vulkan_memory_model_device_scope(true);
-        let mut f13 = vk::PhysicalDeviceVulkan13Features::default().subgroup_size_control(true).compute_full_subgroups(true);
+        let mut f13 = vk::PhysicalDeviceVulkan13Features::default().subgroup_size_control(true).compute_full_subgroups(true)
+            .shader_integer_dot_product(true);
         let mut f = features(&mut f11, &mut f12, &mut f13);
         f.features.shader_int16 = vk::TRUE;
         f.features.shader_int64 = vk::TRUE;
