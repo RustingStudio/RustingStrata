@@ -1588,6 +1588,20 @@ code was not timed on that test. Full suite green, load 2.55.
   repeated). Same as the strict numbers of #84 (628 / 630 / 625). The 98.85% headline is "either llama.cpp mode",
   which needs the batch-argmax file (`tools/selfparity.py`, about 1 h); rebuild it before the V3 parity gate.
 
+### 2026-10-16 #90 — Kernel tests on every backend; `--backend` / `--device` (e4db774, 4ba30c2)
+- e4db774 (Task 0.2): `tests/cuda.rs` is now `tests/kernels.rs` and runs each kernel test for every backend in
+  `common::backends()` through `dyn Backend`. `dequant`, `quant_xq` and `attn_decode_gq` moved onto the trait
+  (`attn_decode` is a provided method). `tests/kv_q8.rs`, `tests/llama_numerics.rs` and `tests/gpu_model.rs` stay
+  CUDA-only.
+- 4ba30c2 (Task 0.3): `backend::open(kind, device)` and `Backend::name`; `Gpu::new(device)`. `--backend` and
+  `--device` on the engine commands and `calibrate`. Calibration files are `strata-<model>-<backend>.json` for
+  backends other than CUDA; CUDA keeps `strata-<model>.json`. `--backend vulkan` errors with "unknown backend" until
+  V1.
+- Gates: full suite green both times (load 4.7, 5.0). `generate --gpu`, 24 tokens on the default model: same output
+  (md5) from the 7634b41 binary, the new binary, and the new binary with `--backend cuda --device 0` (load 5-15).
+- Not verified: the ignored bandwidth kernel tests after the conversion; parity not re-run (no kernel or numerics
+  change since the #89 control).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
