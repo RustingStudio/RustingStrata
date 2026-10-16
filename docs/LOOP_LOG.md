@@ -1833,6 +1833,15 @@ code was not timed on that test. Full suite green, load 2.55.
   outside the lock. That target is unaffected by this diff; rerun pending once the game exits.
 - GPU A/B for the Q4_K scale word loads (k4_dm, saved as a patch) is paused for the same reason.
 
+### 2026-10-16 #102 — serve: 400 for malformed requests (a58109b)
+- `handle` answered a request that `read_request` rejects by closing the connection without a reply. It now sends
+  400 with the reason (best effort) and still logs it. A bad Content-Length reads "bad Content-Length".
+- Tests: every `read_request` error (empty, no path, cut-off headers, body too large, bad Content-Length, short
+  body) in `rejects_bad_hosts_and_huge_headers`. Smoke test on the CPU path (Qwen3-4B, port 8197): a 9 MB
+  Content-Length and `Content-Length: x` both got `400 Bad Request` JSON; `/v1/models` unchanged.
+- Suite green except `gpu_model` (not run: Minecraft holds 3 GB VRAM, the default model OOMs; see #101). The
+  change does not touch the GPU path.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
