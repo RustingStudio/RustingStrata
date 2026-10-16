@@ -18,6 +18,8 @@ const SPV: &[(&str, &[u8])] = &[
     ("add", include_bytes!("spv/add.spv")),
     ("argmax_rows", include_bytes!("spv/argmax_rows.spv")),
     ("conv_silu", include_bytes!("spv/conv_silu.spv")),
+    ("dequant", include_bytes!("spv/dequant.spv")),
+    ("gemv_f", include_bytes!("spv/gemv_f.spv")),
     ("l2_norm", include_bytes!("spv/l2_norm.spv")),
     ("norm_gate", include_bytes!("spv/norm_gate.spv")),
     ("quant_xq", include_bytes!("spv/quant_xq.spv")),
@@ -117,9 +119,9 @@ fn unusable(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<String> 
     let (mut f11, mut f12, mut f13) = Default::default();
     let mut f = features(&mut f11, &mut f12, &mut f13);
     unsafe { instance.get_physical_device_features2(pd, &mut f) };
-    let (int64, f64) = (f.features.shader_int64, f.features.shader_float64);
+    let (int16, int64, f64) = (f.features.shader_int16, f.features.shader_int64, f.features.shader_float64);
     let missing: Vec<_> = [
-        ("shaderInt64", int64), ("shaderFloat64", f64), ("storageBuffer16BitAccess", f11.storage_buffer16_bit_access),
+        ("shaderInt16", int16), ("shaderInt64", int64), ("shaderFloat64", f64), ("storageBuffer16BitAccess", f11.storage_buffer16_bit_access),
         ("bufferDeviceAddress", f12.buffer_device_address), ("storageBuffer8BitAccess", f12.storage_buffer8_bit_access),
         ("shaderInt8", f12.shader_int8), ("shaderFloat16", f12.shader_float16),
         ("subgroupSizeControl", f13.subgroup_size_control), ("computeFullSubgroups", f13.compute_full_subgroups),
@@ -162,6 +164,7 @@ impl Vk {
             .storage_buffer8_bit_access(true).shader_int8(true).shader_float16(true);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default().subgroup_size_control(true).compute_full_subgroups(true);
         let mut f = features(&mut f11, &mut f12, &mut f13);
+        f.features.shader_int16 = vk::TRUE;
         f.features.shader_int64 = vk::TRUE;
         f.features.shader_float64 = vk::TRUE;
         let prio = [1.0];
@@ -354,6 +357,19 @@ impl State {
 /// An op the Vulkan backend does not have yet.
 fn todo(op: &str) -> anyhow::Result<()> { anyhow::bail!("{op} is not implemented on Vulkan yet") }
 
+/// Specialization constants of the weight kernels (deq.glsl): llama numerics, the ggml type id and the bytes per
+/// 256-element super-block.
+fn wspec(llama: u32, ty: GgmlType) -> [u32; 3] {
+    let id = (0..64).find(|&i| GgmlType::from_u32(i).is_ok_and(|t| t == ty)).unwrap();
+    [llama, id, (ty.block_bytes() * 256 / ty.block_elems()) as u32]
+}
+
+/// Super-blocks per row of `w`.
+fn nsb(w: &GpuTensor) -> anyhow::Result<u32> {
+    ensure!(w.cols % 256 == 0, "{} tensor with {} columns: GEMV needs a multiple of 256", w.ty.name(), w.cols);
+    Ok((w.cols / 256) as u32)
+}
+
 #[allow(unused_variables)]
 impl Backend for Vk {
     fn name(&self) -> &'static str { "vulkan" }
@@ -456,11 +472,20 @@ impl Backend for Vk {
 
     fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> { todo("gemm") }
     fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> { todo("gemm_dense") }
-    fn gemv(&self, w: &GpuTensor, x: u64, y: u64) -> anyhow::Result<()> { todo("gemv") }
-    fn gemvn(&self, w: &GpuTensor, x: u64, x_stride: usize, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> { todo("gemvn") }
-    fn gemvq(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> { todo("gemvq") }
+    fn gemv(&self, w: &GpuTensor, x: u64, y: u64) -> anyhow::Result<()> { self.gemvq(w, x, 0, 0, y, 0, 1) }
+    fn gemvn(&self, w: &GpuTensor, x: u64, x_stride: usize, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
+        self.gemvq(w, x, x_stride, 0, y, y_stride, nt)
+    }
+    fn gemvq(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
+        ensure!((1..=4).contains(&nt), "gemvn: {nt} inputs (1 to 4)");
+        let nsb = nsb(w)?;
+        if !matches!(w.ty, GgmlType::F32 | GgmlType::BF16) { return todo(&format!("gemv for {}", w.ty.name())); }
+        self.run("gemv_f", &wspec(self.0.llama, w.ty), [w.rows, 1, 1], &[&w.ptr, &x, &y, &(x_stride as u32), &(y_stride as u32), &nsb, &(nt as u32)])
+    }
     fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()> { todo("moe_gemv") }
-    fn dequant(&self, w: &GpuTensor, rows: usize, out: u64) -> anyhow::Result<()> { todo("dequant") }
+    fn dequant(&self, w: &GpuTensor, rows: usize, out: u64) -> anyhow::Result<()> {
+        self.run("dequant", &wspec(self.0.llama, w.ty), [rows, 1, 1], &[&w.ptr, &out, &nsb(w)?])
+    }
     fn quant_xq(&self, x: u64, x_stride: usize, n: usize, nt: usize, out: u64) -> anyhow::Result<()> {
         self.run("quant_xq", &[self.0.llama], [nt, 1, 1], &[&x, &out, &(x_stride as u32), &(n as u32)])
     }
