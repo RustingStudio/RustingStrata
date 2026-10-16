@@ -19,7 +19,12 @@ const SPV: &[(&str, &[u8])] = &[
     ("argmax_rows", include_bytes!("spv/argmax_rows.spv")),
     ("attn_decode", include_bytes!("spv/attn_decode.spv")),
     ("attn_merge", include_bytes!("spv/attn_merge.spv")),
+    ("attn_prefill_64", include_bytes!("spv/attn_prefill_64.spv")),
+    ("attn_prefill_128", include_bytes!("spv/attn_prefill_128.spv")),
+    ("attn_prefill_256", include_bytes!("spv/attn_prefill_256.spv")),
     ("conv_silu", include_bytes!("spv/conv_silu.spv")),
+    ("conv_seq", include_bytes!("spv/conv_seq.spv")),
+    ("conv_state", include_bytes!("spv/conv_state.spv")),
     ("deltanet", include_bytes!("spv/deltanet.spv")),
     ("dequant", include_bytes!("spv/dequant.spv")),
     ("gemv_f", include_bytes!("spv/gemv_f.spv")),
@@ -28,6 +33,7 @@ const SPV: &[(&str, &[u8])] = &[
     ("l2_norm", include_bytes!("spv/l2_norm.spv")),
     ("map_hits", include_bytes!("spv/map_hits.spv")),
     ("moe_combine", include_bytes!("spv/moe_combine.spv")),
+    ("moe_combine_seq", include_bytes!("spv/moe_combine_seq.spv")),
     ("moe_gemv_f", include_bytes!("spv/moe_gemv_f.spv")),
     ("moe_gemv_q", include_bytes!("spv/moe_gemv_q.spv")),
     ("moe_publish", include_bytes!("spv/moe_publish.spv")),
@@ -94,6 +100,8 @@ struct Inner {
     queue: vk::Queue,
     mem: vk::PhysicalDeviceMemoryProperties,
     budget: bool,
+    /// VK_KHR_cooperative_matrix with the 16 x 16 x 16 f16 / f32 shape is enabled.
+    coop: bool,
     /// Specialization constant 0 of kernels that quantize x: llama.cpp q8_K numerics (`--llama-numerics`).
     llama: u32,
     /// The one pipeline layout: a 128-byte push constant range (the Vulkan minimum), no descriptor sets.
@@ -217,9 +225,18 @@ impl Vk {
         // ponytail: the instance leaks if device setup below fails; it is a one-time startup error.
         let qf = unsafe { instance.get_physical_device_queue_family_properties(pd) }.iter()
             .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE)).context("no compute queue")? as u32;
-        let budget = unsafe { instance.enumerate_device_extension_properties(pd) }?.iter()
-            .any(|e| e.extension_name_as_c_str() == Ok(ash::ext::memory_budget::NAME));
-        let exts = if budget { vec![ash::ext::memory_budget::NAME.as_ptr()] } else { vec![] };
+        let dexts = unsafe { instance.enumerate_device_extension_properties(pd) }?;
+        let has = |n: &std::ffi::CStr| dexts.iter().any(|e| e.extension_name_as_c_str() == Ok(n));
+        let budget = has(ash::ext::memory_budget::NAME);
+        let mut exts = if budget { vec![ash::ext::memory_budget::NAME.as_ptr()] } else { vec![] };
+        // 16 x 16 x 16 f16 products summed in f32 per subgroup: the mma.sync shape of the CUDA kernels.
+        let cm = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
+        let coop = has(ash::khr::cooperative_matrix::NAME) && unsafe { cm.get_physical_device_cooperative_matrix_properties(pd) }
+            .unwrap_or_default().iter().any(|c| (c.m_size, c.n_size, c.k_size) == (16, 16, 16) && c.scope == vk::ScopeKHR::SUBGROUP
+            && c.a_type == vk::ComponentTypeKHR::FLOAT16 && c.b_type == vk::ComponentTypeKHR::FLOAT16
+            && c.c_type == vk::ComponentTypeKHR::FLOAT32 && c.result_type == vk::ComponentTypeKHR::FLOAT32);
+        if coop { exts.push(ash::khr::cooperative_matrix::NAME.as_ptr()) }
+        let mut fcoop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
         let mut f11 = vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(true);
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true)
             .storage_buffer8_bit_access(true).shader_int8(true).shader_float16(true).vulkan_memory_model(true).vulkan_memory_model_device_scope(true);
@@ -228,6 +245,7 @@ impl Vk {
         f.features.shader_int16 = vk::TRUE;
         f.features.shader_int64 = vk::TRUE;
         f.features.shader_float64 = vk::TRUE;
+        if coop { f = f.push_next(&mut fcoop) }
         let prio = [1.0];
         let qi = [vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio)];
         let dev = unsafe { instance.create_device(pd, &vk::DeviceCreateInfo::default().queue_create_infos(&qi)
@@ -242,7 +260,7 @@ impl Vk {
         let layout = unsafe { dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc), None) }?;
         let st = State { pool, spare: vec![], used: vec![], cur: None, busy: false, gpool, graphs: HashMap::new(), rec: None,
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, bufs: BTreeMap::new(), err: Default::default() };
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, llama: crate::cuda::llama_numerics() as u32, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, coop, llama: crate::cuda::llama_numerics() as u32, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -623,9 +641,20 @@ impl Backend for Vk {
         self.run("deltanet", &[], [nv, dv.div_ceil(8 * rows), 1], &[&y, &s, &beta, &g, &o, &snap, &(nk as u32), &(nv as u32),
             &(interleave as u32), &(dk as u32), &(dv as u32), &scale, &(t as u32), &(ych as u32), &(nsnap as u32)])
     }
-    fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> { todo("conv_seq") }
-    fn attn_prefill(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> { todo("attn_prefill") }
-    fn moe_combine_seq(&self, x: u64, ye: u64, wts: u64, inv: u64, k: usize, sh: u64, sg: u64, n: usize, t: usize) -> anyhow::Result<()> { todo("moe_combine_seq") }
+    fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> {
+        self.run("conv_seq", &[], [(t * ch).div_ceil(256), 1, 1], &[&qkv, &state, &w, &y, &(ch as u32), &(kw as u32), &(t as u32)])?;
+        self.run("conv_state", &[], [ch.div_ceil(256), 1, 1], &[&qkv, &state, &snap, &(ch as u32), &(kw as u32), &(t as u32), &(nsnap as u32)])
+    }
+    fn attn_prefill(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
+        let name = match hd { 64 => "attn_prefill_64", 128 => "attn_prefill_128", 256 => "attn_prefill_256",
+            _ => anyhow::bail!("attention prefill: head_dim {hd} unsupported (64, 128 or 256)") };
+        if self.0.llama != 0 { return todo("attn_prefill with --llama-numerics"); }
+        if !self.0.coop { return todo("attn_prefill without VK_KHR_cooperative_matrix"); }
+        self.run(name, &[], [t.div_ceil(64), nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale])
+    }
+    fn moe_combine_seq(&self, x: u64, ye: u64, wts: u64, inv: u64, k: usize, sh: u64, sg: u64, n: usize, t: usize) -> anyhow::Result<()> {
+        self.run("moe_combine_seq", &[], [(t * n).div_ceil(256), 1, 1], &[&x, &ye, &wts, &inv, &sh, &sg, &(k as u32), &(n as u32), &(t as u32)])
+    }
     fn norm_gate(&self, o: u64, w: u64, z: u64, n: usize, heads: usize, eps: f32) -> anyhow::Result<()> {
         self.run("norm_gate", &[], [heads, 1, 1], &[&o, &w, &z, &(n as u32), &eps])
     }
