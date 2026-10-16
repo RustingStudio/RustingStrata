@@ -15,6 +15,7 @@ ap.add_argument("--alt", default="target/llama-batch-argmax.json",
                 help="llama.cpp argmax with the context run as one batch (tools/selfparity.py); the v1 gate counts a "
                      "token if it matches either llama.cpp mode")
 ap.add_argument("--start", type=int, default=0, help="score only prompts from this index (resume)")
+ap.add_argument("--no-think", action="store_true", help="drop the empty think block (models without thinking, e.g. *-Instruct-2507)")
 a = ap.parse_args()
 root = pathlib.Path(__file__).resolve().parent.parent
 cache = root / a.ref
@@ -25,6 +26,7 @@ def post(path, body):
     return json.load(urllib.request.urlopen(r))
 
 prompts = json.load(open(root / "tools/prompts.json"))[: a.limit]
+if a.no_think: prompts = [p.replace("<think>\n\n</think>\n\n", "") for p in prompts]
 ref = json.load(open(cache)) if cache.exists() else {}
 for p in prompts:
     if p in ref and len(ref[p]["cont"]) >= a.n:
