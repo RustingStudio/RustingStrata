@@ -23,6 +23,18 @@ fn prompts_match_llama_cpp() {
 }
 
 #[test]
+fn json_keeps_key_order_and_scales() {
+    let j: Json = serde_json::from_str(r#"{"b": 1, "a": 2, "b": 3}"#).unwrap();
+    assert_eq!(j.dump(), r#"{"b": 3, "a": 2}"#);
+    // 200k distinct keys: quadratic duplicate checks would take minutes.
+    let big = format!("{{{}}}", (0..200_000).map(|i| format!("\"k{i}\":0")).collect::<Vec<_>>().join(","));
+    let t = std::time::Instant::now();
+    let Json::Obj(o) = serde_json::from_str(&big).unwrap() else { panic!() };
+    assert_eq!(o.len(), 200_000);
+    assert!(t.elapsed().as_secs() < 5);
+}
+
+#[test]
 fn detects_template_family() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/chat/");
     let t = |f: &str| Template::detect(Some(&std::fs::read_to_string(format!("{dir}{f}.jinja")).unwrap()));
