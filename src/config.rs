@@ -89,7 +89,7 @@ impl ModelConfig {
         let n_expert = opt("expert_count");
         anyhow::ensure!(n_expert <= 512, "{n_expert} experts (at most 512 supported)");
         let emb = g.tensors.get("token_embd.weight").context("missing tensor token_embd.weight")?;
-        Ok(ModelConfig {
+        let c = ModelConfig {
             n_layer,
             n_nextn,
             n_embd,
@@ -116,7 +116,12 @@ impl ModelConfig {
             k_interleave: a.k_interleave,
             aliases: a.aliases,
             arch,
-        })
+        };
+        // Kernels divide by these and index value heads by nv / nk key heads.
+        let (nk, nv) = (c.ssm_n_group, c.ssm_dt_rank);
+        anyhow::ensure!(!has_delta || (nk > 0 && nv > 0 && nv % nk == 0 && c.ssm_d_inner % nv == 0),
+            "bad ssm dims: group_count {nk}, time_step_rank {nv}, inner_size {}", c.ssm_d_inner);
+        Ok(c)
     }
 
     pub fn is_moe(&self) -> bool { self.n_expert > 0 }
