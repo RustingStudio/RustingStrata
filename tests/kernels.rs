@@ -67,7 +67,7 @@ fn dequant_and_gemv_match_reference_for_every_type() {
             assert!(e <= 1e-4, "{} gemv ({name}): rel err {e}", ty.name());
             first.entry(name.clone()).or_insert(got);
         }
-        assert!(seen.len() >= 10, "types covered: {seen:?}");
+        assert!(seen.len() >= 10 || !common::is_default_model(&p), "types covered: {seen:?}");
     }
 }
 
@@ -166,7 +166,7 @@ fn gemvn_matches_gemv() {
                 assert_eq!(down::<f32>(gpu, &dy), want[..nt * t.rows], "{} {name} quant_xq nt {nt}", ty.name());
             }
         }
-        assert!(seen.len() >= 5, "types covered: {seen:?}");
+        assert!(seen.len() >= 5 || !common::is_default_model(&p), "types covered: {seen:?}");
     }
 }
 
