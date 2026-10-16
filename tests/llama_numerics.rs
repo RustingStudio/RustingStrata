@@ -52,13 +52,13 @@ fn llama_attn(q: &[f32], kc: &[u16], vc: &[u16], qg: &[f32], n_pos: usize, nh: u
 /// One test owns both Gpus: the environment variable set here would leak into a parallel test's default Gpu.
 #[test]
 fn llama_mode_attention() {
-    let base = match Gpu::new() {
+    let base = match Gpu::new(0) {
         Ok(g) => g,
         Err(e) if format!("{e}") == "CUDA init" => { eprintln!("SKIP: no GPU: {e:#}"); return }
         Err(e) => panic!("{e:#}"),
     };
     unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") }
-    let llama = Gpu::new().unwrap();
+    let llama = Gpu::new(0).unwrap();
     attn_decode_matches_llama_cpu(&base, &llama);
     attn_prefill_is_f32(&base, &llama);
 }

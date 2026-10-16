@@ -121,10 +121,10 @@ macro_rules! launch {
 fn kname(prefix: &str, ty: GgmlType) -> String { format!("{prefix}_{}", ty.name().to_lowercase()) }
 
 impl Gpu {
-    pub fn new() -> anyhow::Result<Gpu> {
+    pub fn new(device: usize) -> anyhow::Result<Gpu> {
         let kv_q8 = kv_q8();
         anyhow::ensure!(!(kv_q8 && llama_numerics()), "--kv q8 does not combine with --llama-numerics (its attention reads f16 KV)");
-        let ctx = CudaContext::new(0).context("CUDA init")?;
+        let ctx = CudaContext::new(device).context("CUDA init")?;
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream()?;
         let (maj, min) = ctx.compute_capability()?;
@@ -214,6 +214,7 @@ impl Gpu {
 }
 
 impl Backend for Gpu {
+    fn name(&self) -> &'static str { "cuda" }
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf> {
         let s = self.stream.alloc_zeros::<u8>(bytes.max(1))?;
         Ok(Buf::new(self.ptr(&s), s.len(), s))
