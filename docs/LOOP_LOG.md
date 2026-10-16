@@ -1884,6 +1884,23 @@ code was not timed on that test. Full suite green, load 2.55.
   4B (no F32 GEMV) 79.1/79.2/79.0 vs 79.7/79.1/79.0. A first A/B was hit by another loop's process (CPU 900%):
   one 35B round at 40.7.
 
+### 2026-10-17 #107 — Vulkan V4: no barriers between independent decode ops (850746e)
+- Every Vulkan dispatch was followed by a full barrier. A timing-only hack with no barriers at all (wrong output)
+  put the 4B decode ceiling at 78.6 -> 99.2 tok/s: barriers cost ~2.6 of 12.7 ms per token (~21 dispatches per
+  layer). `Backend::batch(f)` now queues ops that do not read each other's output; Vulkan records them with no
+  barrier between them and one after the batch (quant_xq keeps its barrier: the GEMV after it reads it). CUDA runs
+  them as before. Decode batches q/k/v, q/k norm, q/k rope, dense gate/up, the four DeltaNet input GEMVs, and in
+  MoE layers {router, shared gate_inp/gate/up}, {routed gate/up, shared swiglu}, {routed swiglu, shared down}.
+- A/B against 1e27f0e, same bench, 3 interleaved rounds, load 2.5-10: Qwen3-4B decode 79.4/79.1/78.8 ->
+  83.1/82.5/82.7 (+4.6%, llama.cpp Vulkan 85.8); default model 76.5/77.0/76.5 -> 83.9/83.6/83.2 (+9.2%). pp512
+  unchanged. An attention/dense-only first version gave 4B +4% but the default model only +0.9%.
+- `generate --gpu --mtp 0 -n 64` greedy text: CUDA and Vulkan byte-identical on both models (load 3.0). Suite
+  green (72 passed). CUDA A/B on the default model (load 4.4-6.1): decode 101.8/101.7/101.9 vs 102.2/102.1/102.3,
+  pp ~1005 both: no regression.
+- Tried and dropped: quant_xq split into 2048-value workgroups (neutral, 4B 79.3 -> 79.6, default 76.8 -> 77.0);
+  gemv_q super-block loop unrolled by 2 (slower, 4B 78.9 -> 73.7, default 76.2 -> 73.6).
+- Not verified: parity (kernels are bit-identical, only the barrier placement changed).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
