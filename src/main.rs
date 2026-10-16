@@ -3,6 +3,7 @@ use anyhow::Context;
 use rusting_strata::model::{Model, State};
 use rusting_strata::{cuda::Gpu, gpu_model::GpuModel};
 use rusting_strata::{config::ModelConfig, gguf::Gguf, ops, ops::Sampler, quant::GgmlType, serve, tokenizer::Tokenizer};
+use rusting_strata::chat::{Hold, Msg, Template};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::{collections::BTreeMap, net::{TcpListener, TcpStream}, path::{Path, PathBuf}, time::{Duration, Instant, SystemTime}};
@@ -77,10 +78,10 @@ impl Runner<'_> {
         }
     }
     /// Feed a chat prompt as a fresh sequence, reusing the earlier request's state for the shared message history
-    /// (GPU). Returns the logits and the number of tokens reused.
-    fn chat(&mut self, tok: &Tokenizer, msgs: &[(String, String)], think: bool) -> anyhow::Result<(Vec<u32>, Vec<f32>, usize)> {
-        let ids = tok.encode(&serve::chat_prompt(msgs, think))?;
-        let h = tok.encode(&serve::chat_history(msgs))?;
+    /// (GPU; `history` is the prompt without the assistant header). Returns the logits and the number of tokens reused.
+    fn chat(&mut self, tok: &Tokenizer, prompt: &str, history: &str) -> anyhow::Result<(Vec<u32>, Vec<f32>, usize)> {
+        let ids = tok.encode(prompt)?;
+        let h = tok.encode(history)?;
         let keep = if ids.starts_with(&h) { h.len() } else { 0 };
         let (logits, reused) = match self {
             Runner::Gpu(g) => g.prefill_cached(&ids, keep)?,
@@ -329,7 +330,8 @@ fn main() -> anyhow::Result<()> {
             let tok = Tokenizer::from_gguf(&g)?;
             let mut r = engine.runner(&m, &model)?;
             let mut smp = engine.sampler();
-            let mut msgs: Vec<(String, String)> = system.into_iter().map(|s| ("system".into(), s)).collect();
+            let tpl = template(&g);
+            let mut msgs: Vec<Msg> = system.iter().map(|s| Msg::new("system", s)).collect();
             let stdin = std::io::stdin();
             loop {
                 print!("> ");
@@ -337,11 +339,11 @@ fn main() -> anyhow::Result<()> {
                 let mut line = String::new();
                 if stdin.lock().read_line(&mut line)? == 0 { break; }
                 if line.trim().is_empty() { continue; }
-                msgs.push(("user".into(), line.trim_end().into()));
-                let (ids, logits, _) = r.chat(&tok, &msgs, think)?;
+                msgs.push(Msg::new("user", line.trim_end()));
+                let (ids, logits, _) = r.chat(&tok, &tpl.render(&msgs, &[], think, true), &tpl.render(&msgs, &[], think, false))?;
                 let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut smp, logits, room(&engine, ids.len(), n), &mut |t| { print!("{t}"); Ok(std::io::stdout().flush()?) })?;
                 println!();
-                msgs.push(("assistant".into(), answer(&tok.decode(&out)?)));
+                msgs.push(Msg::new("assistant", &answer(&tok.decode(&out)?)));
             }
             r.finish()?;
         }
@@ -351,12 +353,13 @@ fn main() -> anyhow::Result<()> {
             let g = Gguf::open(&model)?;
             let m = Model::load(&g)?;
             let tok = Tokenizer::from_gguf(&g)?;
+            let tpl = template(&g);
             let mut r = engine.runner(&m, &model)?;
             let name = model.file_stem().and_then(|s| s.to_str()).unwrap_or("strata").to_string();
             let listener = TcpListener::bind(&addr)?;
             eprintln!("listening on http://{addr}");
             for (i, conn) in listener.incoming().enumerate() {
-                let res = conn.map_err(Into::into).and_then(|c| handle(c, &mut r, &tok, &engine, &name, &addr, api_key.as_deref(), i));
+                let res = conn.map_err(Into::into).and_then(|c| handle(c, &mut r, &tok, tpl, &engine, &name, &addr, api_key.as_deref(), i));
                 if let Err(e) = res { eprintln!("request {i}: {e:#}"); }
             }
         }
@@ -484,10 +487,18 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
 /// Tokens left for a reply: `n`, capped by the context after a `used`-token prompt.
 fn room(e: &Engine, used: usize, n: usize) -> usize { n.min(e.ctx.saturating_sub(used)) }
 
+/// The chat format from the GGUF's `tokenizer.chat_template`.
+fn template(g: &Gguf) -> Template {
+    let t = Template::detect(g.meta.get("tokenizer.chat_template").and_then(|v| v.as_str()));
+    eprintln!("chat template: {t:?}");
+    t
+}
+
 /// Reply text without the thinking part (the template drops it from history too).
 fn answer(s: &str) -> String { s.rsplit_once("</think>").map_or(s, |x| x.1).trim().to_string() }
 
-fn handle(c: TcpStream, r: &mut Runner, tok: &Tokenizer, e: &Engine, name: &str, addr: &str, key: Option<&str>, i: usize) -> anyhow::Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn handle(c: TcpStream, r: &mut Runner, tok: &Tokenizer, tpl: Template, e: &Engine, name: &str, addr: &str, key: Option<&str>, i: usize) -> anyhow::Result<()> {
     // A stalled client must not hold the single request slot.
     c.set_read_timeout(Some(Duration::from_secs(30)))?;
     c.set_write_timeout(Some(Duration::from_secs(30)))?;
@@ -511,7 +522,8 @@ fn handle(c: TcpStream, r: &mut Runner, tok: &Tokenizer, e: &Engine, name: &str,
                 Err(err) => return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
             };
             // Room is checked on the full prompt before any state changes.
-            let ids = tok.encode(&serve::chat_prompt(&req.messages, req.think))?;
+            let prompt = tpl.render(&req.messages, &req.tools, req.think, true);
+            let ids = tok.encode(&prompt)?;
             let mut smp = e.sampler();
             smp.temp = req.temperature.unwrap_or(smp.temp);
             smp.top_k = req.top_k.unwrap_or(smp.top_k);
@@ -522,37 +534,56 @@ fn handle(c: TcpStream, r: &mut Runner, tok: &Tokenizer, e: &Engine, name: &str,
             let id = format!("chatcmpl-{i}");
             let chunk = |delta: serde_json::Value, finish: Option<&str>| json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": name,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
+            // With tools, a stream holds back the text from a `<tool_call>` tag on until the reply is parsed.
+            let tools = req.tool_calls && !req.tools.is_empty();
             let mut cached = 0;
-            let res = (|| -> anyhow::Result<(Vec<u32>, bool, String)> {
+            let mut hold = Hold::default();
+            let res = (|| -> anyhow::Result<(Vec<u32>, bool)> {
                 let logits;
-                (_, logits, cached) = r.chat(tok, &req.messages, req.think)?;
+                (_, logits, cached) = r.chat(tok, &prompt, &tpl.render(&req.messages, &req.tools, req.think, false))?;
                 if req.stream {
                     write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
                     write!(w, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), None))?;
-                    let (out, stop) = decode(r, tok, e.mtp() > 0, &mut smp, logits, n, &mut |t| Ok(write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?))?;
-                    Ok((out, stop, String::new()))
-                } else {
-                    let mut text = String::new();
-                    let (out, stop) = decode(r, tok, e.mtp() > 0, &mut smp, logits, n, &mut |t| { text += t; Ok(()) })?;
-                    Ok((out, stop, text))
                 }
+                decode(r, tok, e.mtp() > 0, &mut smp, logits, n, &mut |t| {
+                    let t = if tools { hold.push(t) } else { hold.text += t; t };
+                    if req.stream && !t.is_empty() { write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?; }
+                    Ok(())
+                })
             })();
             // The next request starts from the saved history state or from scratch. A stream that already started is just cut off.
-            let (out, stop, text) = match res {
+            let (out, stop) = match res {
                 Ok(x) => x,
                 Err(err) if !req.stream => return send(&mut w, "500 Internal Server Error", json!({"error": {"message": format!("{err:#}"), "type": "server_error"}})),
                 Err(err) => return Err(err),
             };
-            let finish = if stop { "stop" } else { "length" };
+            // A malformed call goes out as plain text.
+            let calls = if tools { tpl.parse_calls(&hold.text, &req.tools) } else { None };
+            let calls_json = |(content, calls): &(String, Vec<(String, String)>), stream: bool| {
+                let c: Vec<_> = calls.iter().enumerate().map(|(k, (f, a))| {
+                    let mut c = json!({"id": format!("call_{i}_{k}"), "type": "function", "function": {"name": f, "arguments": a}});
+                    if stream { c["index"] = k.into(); }
+                    c
+                }).collect();
+                if stream { json!({"tool_calls": c}) }
+                else { json!({"role": "assistant", "content": if content.is_empty() { None } else { Some(content) }, "tool_calls": c}) }
+            };
+            let finish = if calls.is_some() { "tool_calls" } else if stop { "stop" } else { "length" };
             let usage = json!({"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len(),
                 "prompt_tokens_details": {"cached_tokens": cached}});
             if req.stream {
+                match &calls {
+                    Some(c) => write!(w, "data: {}\n\n", chunk(calls_json(c, true), None))?,
+                    None if !hold.rest().is_empty() => write!(w, "data: {}\n\n", chunk(json!({"content": hold.rest()}), None))?,
+                    None => {}
+                }
                 let mut last = chunk(json!({}), Some(finish));
                 last["usage"] = usage;
                 Ok(write!(w, "data: {last}\n\ndata: [DONE]\n\n")?)
             } else {
+                let message = match &calls { Some(c) => calls_json(c, false), None => json!({"role": "assistant", "content": hold.text}) };
                 send(&mut w, "200 OK", json!({"id": id, "object": "chat.completion", "created": created, "model": name,
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": finish}], "usage": usage}))
+                    "choices": [{"index": 0, "message": message, "finish_reason": finish}], "usage": usage}))
             }
         }
         _ => send(&mut w, "404 Not Found", json!({"error": {"message": format!("no route {method} {path}"), "type": "not_found"}})),

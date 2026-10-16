@@ -1,21 +1,9 @@
-//! Chat prompt format and the small HTTP/1.1 subset `strata serve` speaks (std::net, one request per connection).
+//! The small HTTP/1.1 subset `strata serve` speaks (std::net, one request per connection) and its chat request.
 
+use crate::chat::{Json, Msg, tool_def};
 use anyhow::{Context, bail};
 use serde_json::Value;
 use std::io::{BufRead, Read};
-
-/// ChatML prompt in the model's template: (role, content) turns, then the assistant header. `think` false
-/// appends the empty think block the template uses for `enable_thinking = false`.
-pub fn chat_prompt(msgs: &[(String, String)], think: bool) -> String {
-    let mut s = chat_history(msgs);
-    s += if think { "<|im_start|>assistant\n<think>\n" } else { "<|im_start|>assistant\n<think>\n\n</think>\n\n" };
-    s
-}
-
-/// The messages part of `chat_prompt`, without the assistant header. The next turn's prompt starts with it.
-pub fn chat_history(msgs: &[(String, String)]) -> String {
-    msgs.iter().map(|(r, c)| format!("<|im_start|>{r}\n{c}<|im_end|>\n")).collect()
-}
 
 pub struct Request {
     pub method: String,
@@ -73,7 +61,12 @@ pub fn key_ok(auth: &str, key: &str) -> bool {
 /// The parts of an OpenAI chat completion request that strata uses. Sampling fields left out fall back to the
 /// server's flags (greedy by default).
 pub struct ChatRequest {
-    pub messages: Vec<(String, String)>,
+    pub messages: Vec<Msg>,
+    /// Tool definitions as the template prints them (`chat::tool_def`).
+    pub tools: Vec<Json>,
+    /// Whether to look for tool calls in the reply (`tool_choice` other than "none"). "required" and a named
+    /// function are not enforced: the model may still answer in text.
+    pub tool_calls: bool,
     pub max_tokens: Option<usize>,
     pub stream: bool,
     pub think: bool,
@@ -85,21 +78,22 @@ pub struct ChatRequest {
 
 pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
     let v: Value = serde_json::from_slice(body)?;
-    let messages = v["messages"].as_array().context("missing messages")?.iter().map(|m| {
-        let role = m["role"].as_str().context("message without role")?;
-        // The role goes into the template verbatim, so only the template's roles pass.
-        if !["system", "user", "assistant", "tool"].contains(&role) { bail!("unknown role {role:?}"); }
-        // content is a string or a list of {"type": "text", "text": ..} parts; only assistant turns may leave it out
-        let content = match &m["content"] {
-            Value::String(s) => s.clone(),
-            Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect(),
-            Value::Null if role == "assistant" => String::new(),
-            Value::Null => bail!("{role} message without content"),
-            _ => bail!("bad content"),
-        };
-        Ok((role.to_string(), content))
-    }).collect::<anyhow::Result<Vec<_>>>()?;
+    // Messages and tools are read again in key order: the template prints tools and call arguments as given.
+    let j: Json = serde_json::from_slice(body)?;
+    let Json::Arr(msgs) = j.get("messages") else { bail!("missing messages") };
+    let messages = msgs.iter().map(Msg::from_json).collect::<anyhow::Result<Vec<_>>>()?;
     if messages.is_empty() { bail!("no messages"); }
+    let tools = match j.get("tools") {
+        Json::Null => vec![],
+        Json::Arr(a) => a.iter().map(tool_def).collect::<anyhow::Result<_>>()?,
+        _ => bail!("tools must be an array"),
+    };
+    let tool_calls = match &v["tool_choice"] {
+        Value::Null => true,
+        Value::String(s) if ["auto", "required", "none"].contains(&s.as_str()) => s != "none",
+        Value::Object(o) if o.get("type").and_then(Value::as_str) == Some("function") => true,
+        _ => bail!("tool_choice must be \"auto\", \"required\", \"none\" or a function"),
+    };
     // Optional fields: absent or null means the default, anything else must be valid.
     let int = |k: &str, min: u64| match &v[k] {
         Value::Null => Ok(None),
@@ -111,7 +105,7 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
     };
     let max_tokens = int("max_completion_tokens", 1)?.or(int("max_tokens", 1)?).map(|n| n as usize);
     let think = v["chat_template_kwargs"]["enable_thinking"].as_bool().unwrap_or(false);
-    Ok(ChatRequest { messages, max_tokens, stream: v["stream"].as_bool().unwrap_or(false), think,
+    Ok(ChatRequest { messages, tools, tool_calls, max_tokens, stream: v["stream"].as_bool().unwrap_or(false), think,
         temperature: num("temperature", |f| f >= 0.0, "a number >= 0")?, top_k: int("top_k", 0)?.map(|n| n as usize),
         top_p: num("top_p", |f| f > 0.0 && f <= 1.0, "a number in (0, 1]")?, seed: int("seed", 0)? })
 }
