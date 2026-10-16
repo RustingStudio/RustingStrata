@@ -439,6 +439,23 @@ fn conv_seq_matches_steps() {
 }
 
 #[test]
+fn elementwise_ops_match_cpu() {
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        eprintln!("backend {bk}");
+        let n = 1000; // not a multiple of the block size
+        let (g, u) = (xs(n).iter().map(|v| v * 8.0).collect::<Vec<f32>>(), xs(n + 1)[1..].to_vec());
+        let (dg, du) = (up(gpu, &g), up(gpu, &u));
+        gpu.swiglu(dg.addr(), du.addr(), n).unwrap();
+        let want: Vec<f32> = g.iter().zip(&u).map(|(g, u)| g / (1.0 + (-g).exp()) * u).collect();
+        assert!(rel_l2(&down::<f32>(gpu, &dg), &want) < 1e-6);
+        gpu.add(dg.addr(), du.addr(), n).unwrap();
+        let want: Vec<f32> = want.iter().zip(&u).map(|(a, b)| a + b).collect();
+        assert!(rel_l2(&down::<f32>(gpu, &dg), &want) < 1e-6);
+    }
+}
+
+#[test]
 fn argmax_rows_matches_ops_argmax() {
     for (bk, gpu) in common::backends_except(&["vulkan"]) {
         let gpu = &*gpu;

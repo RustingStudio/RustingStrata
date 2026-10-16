@@ -1,16 +1,23 @@
 //! Vulkan backend on a dynamically loaded libvulkan (`ash`). Every buffer has its own allocation and a device
-//! address, so `Buf` addresses are real pointers that kernels take as push constants. Ops are recorded into one
-//! command buffer, which a host copy or `sync` submits and waits for.
+//! address, so `Buf` addresses are real pointers that kernels take as push constants. Ops are recorded into an open
+//! command buffer, which a host copy or `sync` submits and waits for. Every op ends with a full compute and transfer
+//! barrier, which also orders it before the work of later submissions.
 
 use crate::backend::{Backend, Buf, GpuTensor};
 use crate::quant::GgmlType;
 use anyhow::{Context, anyhow, ensure};
 use ash::vk;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Host-visible buffer that host copies go through, in chunks of this size.
 const STAGING: usize = 64 << 20;
+
+/// SPIR-V of every kernel, from `tools/gen_spirv.sh`.
+const SPV: &[(&str, &[u8])] = &[
+    ("add", include_bytes!("spv/add.spv")),
+    ("swiglu", include_bytes!("spv/swiglu.spv")),
+];
 
 pub struct Vk(Arc<Inner>);
 
@@ -22,14 +29,27 @@ struct Inner {
     queue: vk::Queue,
     mem: vk::PhysicalDeviceMemoryProperties,
     budget: bool,
+    /// The one pipeline layout: a 128-byte push constant range (the Vulkan minimum), no descriptor sets.
+    layout: vk::PipelineLayout,
     st: Mutex<State>,
 }
 
 struct State {
+    /// Command buffers for ops outside graphs, recycled after each wait.
     pool: vk::CommandPool,
-    cb: vk::CommandBuffer,
-    /// `cb` is recording.
-    open: bool,
+    spare: Vec<vk::CommandBuffer>,
+    /// Submitted since the last wait.
+    used: Vec<vk::CommandBuffer>,
+    /// The open command buffer.
+    cur: Option<vk::CommandBuffer>,
+    /// Work was submitted since the last wait.
+    busy: bool,
+    /// Graph command buffers, kept for the backend's life.
+    gpool: vk::CommandPool,
+    graphs: HashMap<u64, vk::CommandBuffer>,
+    /// The graph being recorded; ops go there instead of `cur`.
+    rec: Option<vk::CommandBuffer>,
+    pipes: HashMap<(&'static str, Vec<u32>), vk::Pipeline>,
     fence: vk::Fence,
     staging: (vk::Buffer, vk::DeviceMemory),
     /// Mapped `staging` (a pointer kept as an integer so the state is `Send`).
@@ -59,6 +79,9 @@ impl Drop for Inner {
             self.dev.free_memory(st.staging.1, None);
             self.dev.destroy_fence(st.fence, None);
             self.dev.destroy_command_pool(st.pool, None);
+            self.dev.destroy_command_pool(st.gpool, None);
+            for &p in st.pipes.values() { self.dev.destroy_pipeline(p, None) }
+            self.dev.destroy_pipeline_layout(self.layout, None);
             self.dev.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -131,13 +154,15 @@ impl Vk {
             .enabled_extension_names(&exts).push_next(&mut f), None) }.with_context(|| format!("create device {name}"))?;
         let queue = unsafe { dev.get_device_queue(qf, 0) };
         let mem = unsafe { instance.get_physical_device_memory_properties(pd) };
-        let pool = unsafe { dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(qf)
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None) }?;
-        let cb = unsafe { dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool)
-            .command_buffer_count(1)) }?[0];
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(qf);
+        let pool = unsafe { dev.create_command_pool(&pool_info, None) }?;
+        let gpool = unsafe { dev.create_command_pool(&pool_info, None) }?;
         let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None) }?;
-        let st = State { pool, cb, open: false, fence, staging: Default::default(), map: 0, bufs: BTreeMap::new() };
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, st: Mutex::new(st) };
+        let pc = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(128)];
+        let layout = unsafe { dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc), None) }?;
+        let st = State { pool, spare: vec![], used: vec![], cur: None, busy: false, gpool, graphs: HashMap::new(), rec: None,
+            pipes: HashMap::new(), fence, staging: Default::default(), map: 0, bufs: BTreeMap::new() };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, true)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -171,14 +196,20 @@ impl Inner {
         Ok((buf, mem))
     }
 
-    /// The open command buffer, begun if needed.
+    /// Where ops record: the graph being recorded, else the open command buffer.
     fn cb(&self, st: &mut State) -> anyhow::Result<vk::CommandBuffer> {
-        if !st.open {
-            unsafe { self.dev.begin_command_buffer(st.cb, &vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)) }?;
-            st.open = true;
-        }
-        Ok(st.cb)
+        match st.rec { Some(c) => Ok(c), None => self.open_cb(st) }
+    }
+
+    /// The open command buffer, begun if needed.
+    fn open_cb(&self, st: &mut State) -> anyhow::Result<vk::CommandBuffer> {
+        if let Some(c) = st.cur { return Ok(c); }
+        let c = match st.spare.pop() { Some(c) => c, None => unsafe { self.dev.allocate_command_buffers(
+            &vk::CommandBufferAllocateInfo::default().command_pool(st.pool).command_buffer_count(1)) }?[0] };
+        unsafe { self.dev.begin_command_buffer(c, &vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)) }?;
+        st.cur = Some(c);
+        Ok(c)
     }
 
     /// Orders everything recorded so far before what follows (`HOST`: also before host reads).
@@ -192,19 +223,105 @@ impl Inner {
         unsafe { self.dev.cmd_pipeline_barrier(cb, all, dst, vk::DependencyFlags::empty(), &[m], &[], &[]) }
     }
 
-    /// Submit the open command buffer and wait for it.
-    fn flush(&self, st: &mut State) -> anyhow::Result<()> {
-        if !st.open { return Ok(()); }
-        st.open = false;
-        let cbs = [st.cb];
-        unsafe {
-            self.dev.end_command_buffer(st.cb)?;
-            self.dev.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&cbs)], st.fence)?;
-            self.dev.wait_for_fences(&[st.fence], true, u64::MAX)?;
-            self.dev.reset_fences(&[st.fence])?;
-            self.dev.reset_command_buffer(st.cb, vk::CommandBufferResetFlags::empty())?;
+    /// Submit the open command buffer, then `graph`; with `wait`, wait for all submitted work.
+    fn submit(&self, st: &mut State, graph: Option<vk::CommandBuffer>, wait: bool) -> anyhow::Result<()> {
+        let mut cbs = vec![];
+        if let Some(c) = st.cur.take() {
+            unsafe { self.dev.end_command_buffer(c) }?;
+            st.used.push(c);
+            cbs.push(c);
+        }
+        cbs.extend(graph);
+        if cbs.is_empty() && !(wait && st.busy) { return Ok(()); }
+        let fence = if wait { st.fence } else { vk::Fence::null() };
+        unsafe { self.dev.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&cbs)], fence) }?;
+        st.busy = true;
+        if wait {
+            // A fence also covers every earlier submission on the queue.
+            unsafe {
+                self.dev.wait_for_fences(&[st.fence], true, u64::MAX)?;
+                self.dev.reset_fences(&[st.fence])?;
+                self.dev.reset_command_pool(st.pool, vk::CommandPoolResetFlags::empty())?;
+            }
+            let used = std::mem::take(&mut st.used);
+            st.spare.extend(used);
+            st.busy = false;
         }
         Ok(())
+    }
+
+    /// Submit and wait for everything queued.
+    fn flush(&self, st: &mut State) -> anyhow::Result<()> {
+        ensure!(st.rec.is_none(), "a host copy or sync while recording a graph");
+        self.submit(st, None, true)
+    }
+
+    /// The pipeline of kernel `name` with specialization constants `spec` (ids 0, 1, ...), created on first use.
+    fn pipeline(&self, st: &mut State, name: &'static str, spec: &[u32]) -> anyhow::Result<vk::Pipeline> {
+        if let Some(&p) = st.pipes.get(&(name, spec.to_vec())) { return Ok(p); }
+        let code = SPV.iter().find(|s| s.0 == name).with_context(|| format!("no Vulkan kernel {name}"))?.1;
+        let words = ash::util::read_spv(&mut std::io::Cursor::new(code))?;
+        let m = unsafe { self.dev.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None) }?;
+        let entries: Vec<_> = (0..spec.len() as u32).map(|i| vk::SpecializationMapEntry::default().constant_id(i).offset(4 * i).size(4)).collect();
+        let data: Vec<u8> = spec.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let si = vk::SpecializationInfo::default().map_entries(&entries).data(&data);
+        let mut sub = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32);
+        let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(m).name(c"main")
+            .specialization_info(&si).flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS).push_next(&mut sub);
+        let r = unsafe { self.dev.create_compute_pipelines(vk::PipelineCache::null(),
+            &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(self.layout)], None) };
+        unsafe { self.dev.destroy_shader_module(m, None) };
+        let p = r.map_err(|e| e.1).with_context(|| format!("create pipeline {name}"))?[0];
+        st.pipes.insert((name, spec.to_vec()), p);
+        Ok(p)
+    }
+}
+
+/// A push constant argument: pointers are u64, the rest 32-bit, each at its natural alignment (std430).
+trait Arg { fn put(&self, v: &mut Vec<u8>); }
+impl Arg for u64 { fn put(&self, v: &mut Vec<u8>) { v.resize(v.len().next_multiple_of(8), 0); v.extend(self.to_le_bytes()) } }
+impl Arg for u32 { fn put(&self, v: &mut Vec<u8>) { v.extend(self.to_le_bytes()) } }
+impl Arg for i32 { fn put(&self, v: &mut Vec<u8>) { v.extend(self.to_le_bytes()) } }
+impl Arg for f32 { fn put(&self, v: &mut Vec<u8>) { v.extend(self.to_le_bytes()) } }
+
+impl Vk {
+    /// Record kernel `name` over `groups` workgroups with push constants `args`.
+    fn run(&self, name: &'static str, spec: &[u32], groups: [usize; 3], args: &[&dyn Arg]) -> anyhow::Result<()> {
+        let mut pc = Vec::with_capacity(128);
+        for a in args { a.put(&mut pc) }
+        assert!(pc.len() <= 128, "{name}: {} bytes of push constants", pc.len());
+        let mut st = self.0.st();
+        let p = self.0.pipeline(&mut st, name, spec)?;
+        let cb = self.0.cb(&mut st)?;
+        let d = &self.0.dev;
+        unsafe {
+            d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, p);
+            d.cmd_push_constants(cb, self.0.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
+            d.cmd_dispatch(cb, groups[0] as u32, groups[1] as u32, groups[2] as u32);
+        }
+        self.0.barrier(cb, false);
+        Ok(())
+    }
+
+    /// A zeroed buffer of `bytes`; with `host`, in mapped host memory, with its host pointer.
+    fn buf(&self, bytes: usize, host: bool) -> anyhow::Result<(Buf, *mut u8)> {
+        let (buf, mem) = self.0.buffer(bytes, host)?;
+        let addr = unsafe { self.0.dev.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buf)) };
+        let owner = Mem { vk: self.0.clone(), buf, mem, addr };
+        let mut st = self.0.st();
+        st.bufs.insert(addr, (buf, bytes));
+        let mut ptr = std::ptr::null_mut();
+        if host {
+            ptr = unsafe { self.0.dev.map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }?.cast::<u8>();
+            unsafe { ptr.write_bytes(0, bytes) };
+        } else {
+            // Outside any graph being recorded: zeroing is done once, now.
+            let cb = self.0.open_cb(&mut st)?;
+            unsafe { self.0.dev.cmd_fill_buffer(cb, buf, 0, vk::WHOLE_SIZE, 0) };
+            self.0.barrier(cb, false);
+        }
+        drop(st);
+        Ok((Buf::new(addr, bytes, owner), ptr))
     }
 }
 
@@ -224,17 +341,7 @@ fn todo(op: &str) -> anyhow::Result<()> { anyhow::bail!("{op} is not implemented
 impl Backend for Vk {
     fn name(&self) -> &'static str { "vulkan" }
 
-    fn alloc(&self, bytes: usize) -> anyhow::Result<Buf> {
-        let (buf, mem) = self.0.buffer(bytes, false)?;
-        let addr = unsafe { self.0.dev.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buf)) };
-        let owner = Mem { vk: self.0.clone(), buf, mem, addr };
-        let mut st = self.0.st();
-        st.bufs.insert(addr, (buf, bytes));
-        let cb = self.0.cb(&mut st)?;
-        unsafe { self.0.dev.cmd_fill_buffer(cb, buf, 0, vk::WHOLE_SIZE, 0) };
-        self.0.barrier(cb, false);
-        Ok(Buf::new(addr, bytes, owner))
-    }
+    fn alloc(&self, bytes: usize) -> anyhow::Result<Buf> { Ok(self.buf(bytes, false)?.0) }
 
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
         ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
@@ -303,8 +410,31 @@ impl Backend for Vk {
 
     fn sync(&self) -> anyhow::Result<()> { self.0.flush(&mut self.0.st()) }
 
-    fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> { todo("graph") }
-    fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)> { todo("host_mailbox").map(|_| unreachable!()) }
+    /// A reusable command buffer per key, submitted without waiting. `STRATA_NO_GRAPH` runs `f` every time instead.
+    fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
+        let mut st = self.0.st();
+        if let Some(&g) = st.graphs.get(&key) { return self.0.submit(&mut st, Some(g), false); }
+        if std::env::var_os("STRATA_NO_GRAPH").is_some() { drop(st); return f(); }
+        let c = unsafe { self.0.dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(st.gpool)
+            .command_buffer_count(1)) }?[0];
+        unsafe { self.0.dev.begin_command_buffer(c, &vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE)) }?;
+        st.rec = Some(c);
+        drop(st);
+        let r = f();
+        let mut st = self.0.st();
+        st.rec = None;
+        unsafe { self.0.dev.end_command_buffer(c) }?;
+        if let Err(e) = r { unsafe { self.0.dev.free_command_buffers(st.gpool, &[c]) }; return Err(e); }
+        st.graphs.insert(key, c);
+        self.0.submit(&mut st, Some(c), false)
+    }
+
+    /// Host-visible coherent memory mapped for the host.
+    fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)> {
+        let (b, p) = self.buf(4 * words.max(1), true)?;
+        Ok((b, p.cast()))
+    }
     fn kv_words(&self, n: usize) -> usize { n }
 
     fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> { todo("gemm") }
@@ -321,8 +451,8 @@ impl Backend for Vk {
     fn argmax_rows(&self, x: u64, n: usize, rows: usize, out: u64) -> anyhow::Result<()> { todo("argmax_rows") }
     fn l2_norm(&self, x: u64, n: usize, per: usize, stride: usize, rows: usize, eps: f32) -> anyhow::Result<()> { todo("l2_norm") }
     fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> { todo("rope_neox") }
-    fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()> { todo("add") }
-    fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()> { todo("swiglu") }
+    fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()> { self.run("add", &[], [n.div_ceil(256), 1, 1], &[&x, &y, &(n as u32)]) }
+    fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()> { self.run("swiglu", &[], [n.div_ceil(256), 1, 1], &[&g, &u, &(n as u32)]) }
     fn ssm_gates(&self, beta: u64, g: u64, dt_bias: u64, a: u64, n: usize, nv: usize) -> anyhow::Result<()> { todo("ssm_gates") }
     fn conv_silu(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize) -> anyhow::Result<()> { todo("conv_silu") }
     fn deltanet(&self, y: u64, s: u64, beta: u64, g: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> { todo("deltanet") }
