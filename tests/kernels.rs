@@ -225,7 +225,8 @@ fn f16r(v: f32) -> f32 { half::f16::from_f32(v).to_f32() }
 #[test]
 fn gemm_matches_reference_for_every_type() {
     let Some(p) = common::model_path() else { return };
-    for (bk, gpu) in common::backends_except(&["vulkan"]) {
+    let mut first = std::collections::HashMap::new();  // results of the first backend, which the others match bit for bit
+    for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let g = Gguf::open(&p).unwrap();
@@ -261,6 +262,9 @@ fn gemm_matches_reference_for_every_type() {
             let e = rel_l2(&got, &want);
             eprintln!("{:8} {name}: gemm rel err {e:.2e}", ty.name());
             assert!(e <= 1e-4, "{} gemm ({name}): rel err {e}", ty.name());
+            let f = first.entry(name.clone()).or_insert_with(|| got.clone());
+            let bits = got.iter().zip(f.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            assert_eq!(bits, 0, "{} gemm ({name}) on {bk}: {bits} values differ from the first backend", ty.name());
         }
     }
 }
@@ -270,7 +274,7 @@ fn gemm_matches_reference_for_every_type() {
 #[ignore]
 fn gemm_throughput() {
     let Some(p) = common::model_path() else { return };
-    for (bk, gpu) in common::backends_except(&["vulkan"]) {
+    for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let g = Gguf::open(&p).unwrap();
