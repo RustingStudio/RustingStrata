@@ -20,6 +20,7 @@ const SPV: &[(&str, &[u8])] = &[
     ("attn_decode", include_bytes!("spv/attn_decode.spv")),
     ("attn_merge", include_bytes!("spv/attn_merge.spv")),
     ("conv_silu", include_bytes!("spv/conv_silu.spv")),
+    ("deltanet", include_bytes!("spv/deltanet.spv")),
     ("dequant", include_bytes!("spv/dequant.spv")),
     ("gemv_f", include_bytes!("spv/gemv_f.spv")),
     ("gemv_q", include_bytes!("spv/gemv_q.spv")),
@@ -529,7 +530,12 @@ impl Backend for Vk {
     fn conv_silu(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize) -> anyhow::Result<()> {
         self.run("conv_silu", &[], [ch.div_ceil(256), 1, 1], &[&qkv, &state, &w, &y, &(ch as u32), &(kw as u32)])
     }
-    fn deltanet(&self, y: u64, s: u64, beta: u64, g: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> { todo("deltanet") }
+    fn deltanet(&self, y: u64, s: u64, beta: u64, g: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> {
+        let rows = 512 / dk.max(1);  // state rows per subgroup
+        ensure!(matches!(dk, 32 | 64 | 128 | 256) && dv % rows == 0, "deltanet: head dims {dk}/{dv} unsupported");
+        self.run("deltanet", &[], [nv, dv.div_ceil(8 * rows), 1], &[&y, &s, &beta, &g, &o, &snap, &(nk as u32), &(nv as u32),
+            &(interleave as u32), &(dk as u32), &(dv as u32), &scale, &(t as u32), &(ych as u32), &(nsnap as u32)])
+    }
     fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> { todo("conv_seq") }
     fn attn_prefill(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> { todo("attn_prefill") }
     fn moe_combine_seq(&self, x: u64, ye: u64, wts: u64, inv: u64, k: usize, sh: u64, sg: u64, n: usize, t: usize) -> anyhow::Result<()> { todo("moe_combine_seq") }

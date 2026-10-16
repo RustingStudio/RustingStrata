@@ -1,0 +1,37 @@
+#version 460
+layout(local_size_x = 256) in;
+#include "common.glsl"
+// Gated DeltaNet scan over T tokens, as deltanet_seq in kernels.cu (see there). Workgroup (value head, row block):
+// state row j (dk floats) is held by L = dk / 16 lanes, 16 floats each (4-float chunks s, s + L, ...), so a
+// subgroup holds R = 32 / L rows. The state after each of the first min(nsnap, T - 1) tokens goes to snap.
+layout(push_constant) uniform P { F32 y; F32 S; F32 beta; F32 g; F32 o; F32 snap; uint nk; uint nv; uint ilv; uint dk;
+                                  uint dv; float scale; uint T; uint ych; uint nsnap; } p;
+void main() {
+    uint dk = p.dk, L = dk >> 4, R = 32 / L, lane = gl_SubgroupInvocationID, s = lane % L, vh = gl_WorkGroupID.x;
+    uint kh = p.ilv != 0 ? vh / (p.nv / p.nk) : vh % p.nk;
+    uint j0 = (gl_WorkGroupID.y * 8 + gl_SubgroupID) * R, j = j0 + lane / L;
+    if (j0 >= p.dv) return;  // whole subgroup past the end (R divides dv)
+    uint row = (vh * p.dv + j) * dk, ns = min(p.nsnap, p.T - 1);
+    precise float r[16];
+    for (uint e = 0; e < 16; e++) r[e] = p.S.v[row + 4 * (s + L * (e / 4)) + e % 4];
+    for (uint tok = 0; tok < p.T; tok++) {
+        uint yt = tok * p.ych;
+        float kk[16], qv[16], decay = expf_(p.g.v[tok * p.nv + vh]), bt = p.beta.v[tok * p.nv + vh];
+        float vt = p.y.v[yt + 2 * p.nk * dk + vh * p.dv + j];
+        for (uint e = 0; e < 16; e++) {
+            uint c = 4 * (s + L * (e / 4)) + e % 4;
+            kk[e] = p.y.v[yt + p.nk * dk + kh * dk + c];
+            qv[e] = p.y.v[yt + kh * dk + c];
+        }
+        precise float sk = 0.0, oq = 0.0;
+        for (uint e = 0; e < 16; e++) { r[e] *= decay; sk = fma(r[e], kk[e], sk); }
+        for (uint off = L >> 1; off > 0; off >>= 1) sk += subgroupShuffleXor(sk, off);
+        float d = bt * (vt - sk);
+        for (uint e = 0; e < 16; e++) { r[e] = fma(d, kk[e], r[e]); oq = fma(r[e], qv[e], oq); }
+        for (uint off = L >> 1; off > 0; off >>= 1) oq += subgroupShuffleXor(oq, off);
+        if (s == 0) p.o.v[tok * p.nv * p.dv + vh * p.dv + j] = oq * p.scale;
+        if (tok < ns)
+            for (uint e = 0; e < 16; e++) p.snap.v[tok * p.nv * p.dv * dk + row + 4 * (s + L * (e / 4)) + e % 4] = r[e];
+    }
+    for (uint e = 0; e < 16; e++) p.S.v[row + 4 * (s + L * (e / 4)) + e % 4] = r[e];
+}
