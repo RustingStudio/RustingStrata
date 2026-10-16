@@ -26,8 +26,28 @@ float expf_(float x) {
 }
 float silu(float x) { return fdiv(x, 1.0 + expf_(-x)); }
 float sigmoid(float x) { return fdiv(1.0, 1.0 + expf_(-x)); }
-// log1p without the loss of log(1 + x) for small x (GLSL has no log1p).
-float log1p_(float x) { float u = 1.0 + x; return u == 1.0 ? x : log(u) * x / (u - 1.0); }
+// log1pf as CUDA compiles it (its PTX): 1 + a rounded toward zero picks the scale 2^e, then a polynomial in the
+// scaled argument.
+float log1p_(float a) {
+    precise float m = a + 1.0, bb = m - a, err = (a - (m - bb)) + (1.0 - bb);
+    if (err != 0.0 && (err < 0.0) != (m < 0.0)) m = uintBitsToFloat(floatBitsToUint(m) - 1u);  // round toward zero
+    int e = (floatBitsToInt(m) - 0x3f400000) & int(0xff800000u);
+    precise float s = fma(0.25, intBitsToFloat(0x40800000 - e), -1.0) + intBitsToFloat(floatBitsToInt(a) - e);
+    precise float q = fma(uintBitsToFloat(0xbd39bf78u), s, uintBitsToFloat(0x3dd80012u));
+    q = fma(q, s, uintBitsToFloat(0xbe0778e0u));
+    q = fma(q, s, uintBitsToFloat(0x3e146475u));
+    q = fma(q, s, uintBitsToFloat(0xbe2a68ddu));
+    q = fma(q, s, uintBitsToFloat(0x3e4caf9eu));
+    q = fma(q, s, uintBitsToFloat(0xbe800042u));
+    q = fma(q, s, uintBitsToFloat(0x3eaaaae6u));
+    q = fma(q, s, -0.5);
+    precise float r = fma(float(e) * uintBitsToFloat(0x34000000u), uintBitsToFloat(0x3f317218u), fma(s * q, s, s));
+    if (floatBitsToUint(a) >= 0x7f800000u) {  // negative, inf or NaN
+        if (floatBitsToInt(a) >= int(0xbf800001u)) r = fma(a, uintBitsToFloat(0x7f800000u), uintBitsToFloat(0x7f800000u));
+        if (a == 0.0) r = -0.0;
+    }
+    return r;
+}
 float softplus(float x) { return x > 20.0 ? x : log1p_(expf_(x)); }
 
 // Sums and maxima over a subgroup of 32 in the butterfly order of the CUDA warp_sum / warp_max.

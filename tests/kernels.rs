@@ -445,10 +445,10 @@ fn deltanet_chunk_matches_steps() {
                 }
             }
             let (eo, es) = (rel_l2(&o1, &oc), rel_l2(&s1, &sc));
-            let f = first.entry(ilv).or_insert_with(|| (o1.clone(), s1.clone()));
+            let f = first.entry(ilv).or_insert_with(|| (o1.clone(), s1.clone(), o2.clone(), s2.clone()));
             let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-            eprintln!("deltanet ilv {ilv} vs CPU: out {eo:.2e}, state {es:.2e}; differ from the first backend: out {} of {}, state {} of {}",
-                      diff(&o1, &f.0), o1.len(), diff(&s1, &f.1), s1.len());
+            eprintln!("deltanet ilv {ilv} vs CPU: out {eo:.2e}, state {es:.2e}; differ from the first backend: out {} of {}, state {} of {}; steps: out {}, state {}",
+                      diff(&o1, &f.0), o1.len(), diff(&s1, &f.1), s1.len(), diff(&o2, &f.2), diff(&s2, &f.3));
             assert!(eo <= 1e-5 && es <= 1e-5, "ilv {ilv} vs CPU: out {eo}, state {es}");
         }
     }
@@ -508,6 +508,28 @@ fn elementwise_ops_match_cpu() {
         let want: Vec<u16> = [0.0f32; 32].iter().chain(&k).map(|x| half::f16::from_f32(*x).to_bits()).collect();
         assert_eq!(down::<u16>(gpu, &dk), want);
         assert_eq!(down::<u16>(gpu, &dv), want);
+    }
+}
+
+/// ssm_gates: sigmoid(beta) and softplus(g + dt_bias) * a, bit-identical across backends (Vulkan ports CUDA's expf
+/// and log1pf); a log1p differing in the last bit flips greedy tokens a few steps into a DeltaNet decode.
+#[test]
+fn ssm_gates_match_across_backends() {
+    let (n, nv) = (4000, 32);
+    let beta: Vec<f32> = xs(n).iter().map(|v| 12.0 * v).collect();
+    let g: Vec<f32> = xs(n + 1)[1..].iter().map(|v| 30.0 * v).collect();
+    let (dt, a): (Vec<f32>, Vec<f32>) = (xs(nv + 2)[2..].to_vec(), xs(nv + 3)[3..].iter().map(|v| -v.abs()).collect());
+    let mut first: Option<(Vec<u32>, Vec<u32>)> = None;
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        let (db, dg) = (up(gpu, &beta), up(gpu, &g));
+        gpu.ssm_gates(db.addr(), dg.addr(), up(gpu, &dt).addr(), up(gpu, &a).addr(), n, nv).unwrap();
+        let (gb, gg) = (down::<f32>(gpu, &db), down::<f32>(gpu, &dg));
+        let wb: Vec<f32> = beta.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect();
+        let wg: Vec<f32> = g.iter().enumerate().map(|(i, x)| { let x = x + dt[i % nv]; (if x > 20.0 { x } else { x.exp().ln_1p() }) * a[i % nv] }).collect();
+        assert!(rel_l2(&gb, &wb) < 1e-6 && rel_l2(&gg, &wg) < 1e-6, "{bk}: rel err beta {}, g {}", rel_l2(&gb, &wb), rel_l2(&gg, &wg));
+        let bits = (gb.iter().map(|x| x.to_bits()).collect(), gg.iter().map(|x| x.to_bits()).collect());
+        match &first { None => first = Some(bits), Some(f) => assert!(*f == bits, "{bk} differs from the first backend") }
     }
 }
 
