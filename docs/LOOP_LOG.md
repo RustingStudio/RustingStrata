@@ -1575,6 +1575,19 @@ linear scan, so a body with many distinct keys parsed in quadratic time (a cheap
 size cap). A key index map makes it linear; `json_keeps_key_order_and_scales` parses 200k keys in 0.04 s. The old
 code was not timed on that test. Full suite green, load 2.55.
 
+### 2026-10-16 #89 — Vulkan plan; backend seam fixes for a second backend (7634b41, c865829)
+- Branch `vulkan`, cut from `main` at 4b25af1. Plan: `docs/superpowers/plans/2026-10-16-vulkan.md` (V0 seam fixes,
+  V1-V4 as in the spec, with the 48 KB shared-memory limit of the 3060 under Vulkan and CUDA-matched int8 numerics).
+- c865829 (Task 0.1): `Backend: Send` (CudaGraph wrapped in a `Send` newtype), `Buf` fields private with `addr()` /
+  `len()`, `GpuTensor::new`, op docs moved onto the trait, inherent `Gpu::zeros` renamed `zeros_slice`. Covers the
+  four parked minors except the kernel tests through `dyn Backend` (Task 0.2).
+- Gates: full suite green (load 7.7). `greedy24.py --extra=--gpu` identical to llama-server (load 7.9).
+- Parity: `target/parity-ref.json` and `target/llama-batch-argmax.json` were gone, so the reference was rebuilt
+  from llama-server CUDA (same flags as #84) and only the strict count is available. Interleaved control, load
+  2.5-9.7: base 4b25af1 626 / 627 / 627, new 626 / 628 / 626 of 640 (one base run printed no result and was
+  repeated). Same as the strict numbers of #84 (628 / 630 / 625). The 98.85% headline is "either llama.cpp mode",
+  which needs the batch-argmax file (`tools/selfparity.py`, about 1 h); rebuild it before the V3 parity gate.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
