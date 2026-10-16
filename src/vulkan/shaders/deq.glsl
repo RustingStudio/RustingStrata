@@ -158,6 +158,13 @@ void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
     }
 }
 
+// qi8 with the values packed in lo, hi (calling qw_k directly for the WORDS types trips glslc's optimizer).
+void qw(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out float m) {
+    int q[8];
+    qi8(w, b, sub, q, d, m);
+    lo = pack4(q[0], q[1], q[2], q[3]); hi = pack4(q[4], q[5], q[6], q[7]);
+}
+
 // Values [8 sub, 8 sub + 8) of the super-block at byte b (deq8<T> in kernels.cu; d * q - m is the same float).
 void deq8(U8 w, uint b, uint sub, out float o[8]) {
     if (T == 0) {  // F32
