@@ -1,0 +1,15 @@
+#version 460
+layout(local_size_x = 256) in;
+#include "common.glsl"
+// Causal depthwise conv over [state..., current] then SiLU; state keeps the last kw-1 inputs, oldest first.
+layout(push_constant) uniform P { F32 qkv; F32 state; F32 w; F32 y; uint ch; uint kw; } p;
+void main() {
+    uint c = gl_GlobalInvocationID.x, kw = p.kw, ch = p.ch;
+    if (c >= ch) return;
+    float acc = 0.0;
+    for (uint k = 0; k < kw - 1; k++) acc += p.state.v[k * ch + c] * p.w.v[c * kw + k];
+    acc += p.qkv.v[c] * p.w.v[c * kw + kw - 1];
+    p.y.v[c] = silu(acc);
+    for (uint k = 0; k + 2 < kw; k++) p.state.v[k * ch + c] = p.state.v[(k + 1) * ch + c];
+    p.state.v[(kw - 2) * ch + c] = p.qkv.v[c];
+}
