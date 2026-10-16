@@ -1842,6 +1842,29 @@ code was not timed on that test. Full suite green, load 2.55.
 - Suite green except `gpu_model` (not run: Minecraft holds 3 GB VRAM, the default model OOMs; see #101). The
   change does not touch the GPU path.
 
+### 2026-10-17 #103 — Vulkan V4: Q4_K scale word loads; fused x quant rejected (388e9a8)
+- Tried first: gemv_q quantizing x itself in shared memory (no `quant_xq` dispatch or barrier) plus CUDA's rows
+  per workgroup rule (rpw 2/8). Bits equal, but slower in every config of a 6-way sweep (load 1.3-3.2, rounds 2-3):
+  base 4B 59.5 / default 67.3-67.6 tok/s decode; fused+rpw 54.0-56.3 / 65.6-65.8; fused only 57.3 / 66.2; rpw only
+  ~57 / 62.4-65.6; rpw 4 49.5 / 56.6. Even both knobs off ran ~1-2% below base (larger shader). Reverted.
+- Kept: `qw_k` reads the Q4_K d, dmin and 12 scale bytes as four words (k4_dm<true> in kernels.cu) instead of
+  byte loads. 0 bits differ from CUDA in tests/kernels.rs; suite green (load 2.0).
+- A/B against 0905725, `bench --gpu --backend vulkan --pp 512 --tg 128 --reps 3 --mtp 0`, 3 interleaved rounds,
+  load 1.9-6.5: Qwen3-4B decode 59.0/58.9/58.8 -> 65.3/56.9*/65.2 (+11%; *one rep at 40.7, spread 40.7-65.2);
+  default model 66.9/66.6/66.8 -> 67.7/67.3/67.7 (+1%). pp512 4B 949/954/950 -> 973/967/971 (+2%).
+- `gemv_bandwidth` now runs on Vulkan too. On the default model Vulkan reaches about half of CUDA's GB/s on the
+  dense K-quants (Q5_K attn_gate 143 vs 258, attn_qkv 167 vs 282) and ~70% on the MoE IQ types.
+- Not verified: parity (bit-identical kernels).
+
+### 2026-10-17 #104 — Vulkan V4: Q5_K scale word loads (dc524f2)
+- Q5_K keeps d, dmin and the scales where Q4_K does and its 176-byte blocks are 4-aligned, so it takes the same
+  word loads; `scale_min_k4` is gone. 0 bits differ; suite green (gpu_model OOMed once while another loop's
+  process held 553 MiB; rerun 7/7, load 6.9).
+- A/B against 388e9a8, same bench, load 3.3-8.2: default model decode 68.2/68.5/68.3 -> 69.7*/71.8/71.5 (+5%;
+  *round 1 noisy, 67.8-70.9). Qwen3-4B (no Q5_K) 65.8/65.4/66.2 -> 43.9*/66.4/66.2, *round 1 hit by load (one
+  rep 23.6). pp512 default 465/456/500 -> 444*/492/499.
+- Not verified: parity (bit-identical kernels).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
