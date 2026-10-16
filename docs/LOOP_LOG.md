@@ -1865,6 +1865,25 @@ code was not timed on that test. Full suite green, load 2.55.
   rep 23.6). pp512 default 465/456/500 -> 444*/492/499.
 - Not verified: parity (bit-identical kernels).
 
+### 2026-10-17 #105 — Vulkan V4: gemv_q input count as a specialization constant (a766baf)
+- gemv_q took nt (1-4 inputs) as a push constant, so `acc[4]` was indexed at run time. nt is now specialization
+  constant 5 (a pipeline per count), as CUDA's `gemv_row_qn<T, SBB, NT>`. 0 bits differ; suite green (72 passed,
+  load 1.5).
+- A/B against dc524f2, same bench, 3 interleaved rounds, load 1.5-6.2: Qwen3-4B decode 66.4/65.8/65.7 ->
+  78.6/78.6/78.7 (+19%); default model 71.3/71.3/71.3 -> 75.4/76.3/76.2 (+7%). pp512 unchanged.
+- Tried first and dropped: `qw` calling `qw_k` directly for the word types (no unpack/repack): neutral (4B 66.2 vs
+  66.2, default 71.5 vs 71.5). The glslc "does not dominate its use" failure behind #100's note is a glslang bug:
+  `const bool WORDS = T == 8 || (T >= 10 && T <= 14)` on a spec constant becomes an OpPhi inside the first function
+  using it, which a second function cannot use; a bit-mask form compiles.
+- Qwen3-4B decode is now 78.7 against llama.cpp Vulkan 85.8 (#98). Not verified: parity (bit-identical kernels).
+
+### 2026-10-17 #106 — Vulkan V4: gemv_f input count specialized too (1e27f0e)
+- Same change for the F32/BF16 GEMV (router, ssm_alpha/beta on the default model). 0 bits differ; suite green
+  (72 passed, load 2.8).
+- A/B against a766baf, load 3.0-7.8: default model decode 76.3/76.5/76.4 -> 76.9/76.6/76.7 (+0.4%, every round);
+  4B (no F32 GEMV) 79.1/79.2/79.0 vs 79.7/79.1/79.0. A first A/B was hit by another loop's process (CPU 900%):
+  one 35B round at 40.7.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
