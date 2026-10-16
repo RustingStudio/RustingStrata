@@ -1536,6 +1536,23 @@ The GPU lock is now at `/home/vasylt/Code/rusting/.gpu.lock` (the old `/home/vas
    router_topk 219, gemv_q5_k 205; about 1.5 ms of small launch-bound kernels in all. Fusing rms_norm into the
    following GEMV and the router GEMV with router_topk are the next levers.
 
+### 2026-10-16 #87 — validate DeltaNet metadata from the GGUF (65b43e7)
+
+A security review of #86 found two places where a malformed file could crash the engine or the GPU:
+
+- `ModelConfig::from_gguf` accepted `ssm.group_count = 0`. That gives a division by zero on the CPU, and the
+  interleaved key head index `vh / (nv / nk)` divides by zero in the kernel when `nv < nk`. It now requires
+  `group_count > 0`, `time_step_rank > 0`, `time_step_rank % group_count == 0` and
+  `inner_size % time_step_rank == 0` whenever the model has DeltaNet layers.
+- The `ssm_ba` split trusted the tensor shape. If it has a row count other than `2 * time_step_rank`, the beta and
+  alpha tensors come out the wrong size, and the GPU kernels would read past them. `Weights::new` now checks the
+  shape (and the group dims, because the split also runs for models without DeltaNet layers) before it splits.
+
+Test: `rejects_bad_ssm_dims` (tests/gguf.rs) builds small qwen3next files in memory. It fails on the old code
+(group_count 0 is accepted) and passes now. The full suite on the default model is green, at load 6.11. The
+synthetic and split tests also pass on the qwen3moe and qwen3next files. `real_file_config` fails on those two
+files, as documented in #86, because it pins the default model's values.
+
 ## Questions for owner
 
 - (#81) GPU runs only check for Dota 2. CS2 (and any game) also takes VRAM and GPU time, which moved parity by one
