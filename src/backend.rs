@@ -15,13 +15,15 @@ pub const GEMM_BM: usize = 128;
 
 /// `len` bytes of device memory at device address `addr`, freed when the owner drops.
 pub struct Buf {
-    pub addr: u64,
-    pub len: usize,
+    addr: u64,
+    len: usize,
     _owner: Box<dyn Any + Send + Sync>,
 }
 
 impl Buf {
     pub fn new(addr: u64, len: usize, owner: impl Any + Send + Sync) -> Buf { Buf { addr, len, _owner: Box::new(owner) } }
+    pub fn addr(&self) -> u64 { self.addr }
+    pub fn len(&self) -> usize { self.len }
 }
 
 pub struct GpuTensor {
@@ -33,6 +35,8 @@ pub struct GpuTensor {
 }
 
 impl GpuTensor {
+    /// `rows` x `cols` of `ty` stored in `buf` from its start.
+    pub fn new(ty: GgmlType, rows: usize, cols: usize, buf: Buf) -> GpuTensor { GpuTensor { ty, rows, cols, ptr: buf.addr, _buf: buf } }
     pub fn bytes(&self) -> usize { self.ty.row_bytes(self.cols as u64) * self.rows }
 }
 
@@ -47,8 +51,8 @@ unsafe impl Plain for u8 {}
 unsafe impl Plain for u64 {}
 
 /// Device memory, recorded graphs and kernel ops. Host copies are synchronous; device work runs in queue order.
-/// The ops are documented in `cuda/mod.rs`.
-pub trait Backend {
+/// Pointer arguments are device addresses; strides are in floats unless named otherwise.
+pub trait Backend: Send {
     /// Zeroed buffer of `bytes` (at least 1).
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf>;
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()>;
@@ -70,38 +74,66 @@ pub trait Backend {
     fn upload(&self, t: &Tensor) -> anyhow::Result<GpuTensor> {
         let b = self.alloc(t.data.len())?;
         self.htod(t.data, &b, 0)?;
-        Ok(GpuTensor { ty: t.ty, rows: t.rows, cols: t.cols, ptr: b.addr, _buf: b })
+        Ok(GpuTensor::new(t.ty, t.rows, t.cols, b))
     }
 
+    /// u16 words of a KV cache for `n` values: f16, or q8 with one f16 scale per 32 values.
     fn kv_words(&self, n: usize) -> usize;
+    /// GEMM over a tile list: for each tile, positions m0 .. m0 + cnt get y[m, 0..rows] = W_tile x[xrow[m]] (x row m
+    /// when `xrow` is 0). `tiles` is a device array of [w, m0 | cnt << 32]. `act`: 0 stores, 1 computes
+    /// y = silu(y) * result (SwiGLU with the gate already in y), 2 adds to y. `n_x`: rows of x the tiles read.
     fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()>;
+    /// y[m] (op) W x[m] for positions m < n, x and y rows `x_stride` / `y_stride` floats apart.
     fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()>;
+    /// y = W x (all rows of `w`).
     fn gemv(&self, w: &GpuTensor, x: u64, y: u64) -> anyhow::Result<()>;
+    /// y[t] = W x[t] for t < nt (1 to 4; x[t] at x + 4 * t * x_stride bytes, y[t] at y + 4 * t * y_stride); each
+    /// weight block is read once for all nt.
     fn gemvn(&self, w: &GpuTensor, x: u64, x_stride: usize, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()>;
+    /// `gemvn` that reads x pre-quantized by `quant_xq` at `xq` (0 = quantize x itself; float weights read x).
     fn gemvq(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()>;
+    /// For j < k with ids[j] >= 0: y[j] = W_j x[j / xg], where W_j is the `rows` x `cols` matrix at w + ids[j] * stride
+    /// bytes. `pair` = (w2, y2) also computes the same product for the matrices at byte offset w2 into the output at
+    /// byte offset y2. `xq` (not 0): x pre-quantized by `quant_xq` (k / xg rows), read in place of x.
     fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()>;
+    /// Expert cache lookup for k routed experts: slots[j] = table[ids[j]] (-1 = not resident); wh[j] = wts[j] on a hit, else 0.
     fn map_hits(&self, ids: u64, table: u64, slots: u64, wts: u64, wh: u64, k: usize) -> anyhow::Result<()>;
+    /// `rows` rows: out[r] = rmsnorm(x[r]) * w.
     fn rms_norm(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32) -> anyhow::Result<()>;
+    /// `rms_norm` that also writes its output quantized as `quant_xq` does to `xq` (when not 0).
     fn rms_norm_q(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32, xq: u64) -> anyhow::Result<()>;
+    /// out[r] = argmax of row r of x (`rows` rows of n floats), first index on ties.
     fn argmax_rows(&self, x: u64, n: usize, rows: usize, out: u64) -> anyhow::Result<()>;
+    /// Row r: vector r % per (n floats) of token r / per, tokens `stride` floats apart.
     fn l2_norm(&self, x: u64, n: usize, per: usize, stride: usize, rows: usize, eps: f32) -> anyhow::Result<()>;
+    /// `heads` rows of `stride` floats, `per` per token; token t is at position step[0] + t.
     fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()>;
+    /// x += y.
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()>;
+    /// g = silu(g) * u.
     fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()>;
     fn ssm_gates(&self, beta: u64, g: u64, dt_bias: u64, a: u64, n: usize, nv: usize) -> anyhow::Result<()>;
     fn conv_silu(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize) -> anyhow::Result<()>;
+    /// Scan `t` tokens (rows of y `ych` floats apart) through the DeltaNet state `s`.
+    /// `snap`: room for `nsnap` states; the state after each of the first min(nsnap, t - 1) tokens is kept there.
     /// `interleave`: value head h reads key head h / (nv / nk), else h % nk.
     fn deltanet(&self, y: u64, s: u64, beta: u64, g: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize) -> anyhow::Result<()>;
+    /// Causal conv + SiLU over `t` tokens of `ch` channels, then roll the conv state forward (snapshots as in `deltanet`).
     fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize, snap: u64, nsnap: usize) -> anyhow::Result<()>;
     /// `qg` 0: no output gate.
     fn attn_prefill(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()>;
     fn moe_combine_seq(&self, x: u64, ye: u64, wts: u64, inv: u64, k: usize, sh: u64, sg: u64, n: usize, t: usize) -> anyhow::Result<()>;
     fn norm_gate(&self, o: u64, w: u64, z: u64, n: usize, heads: usize, eps: f32) -> anyhow::Result<()>;
+    /// Store `t` tokens of `n` values at positions step[0] ...
     fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()>;
-    /// `qg` 0: no output gate.
+    /// Decode attention for `nt` query tokens, token t over positions 0 ..= step[2 t] (rows of q, qg, out and step per
+    /// token, `part` holds `nh * ATT_SPLITS * (hd + 2)` floats per token). `qg` 0: no output gate.
     fn attn_decode(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize) -> anyhow::Result<()>;
+    /// Route `t` tokens (logit rows of n, ids / wts rows of k).
     fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()>;
+    /// Write routing and (on a miss) `h` to the layer mailbox at `mb` and raise its request flag.
     fn moe_publish(&self, ids: u64, wts: u64, slots: u64, h: u64, mb: u64, k: usize, n: usize, h_off: usize, step: u64, t: usize) -> anyhow::Result<()>;
+    /// `mb` = 0: no CPU part. Otherwise adds the CPU result at word `y_off` of the mailbox once its done flag is `seq`.
     fn moe_combine(&self, x: u64, ye: u64, w: u64, k: usize, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, slots: u64, n: usize, t: usize) -> anyhow::Result<()>;
 }
 

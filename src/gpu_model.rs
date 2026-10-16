@@ -216,7 +216,7 @@ impl<'a> GpuModel<'a> {
         let (nt, nvoc) = (tokens.len(), self.m.cfg.n_vocab);
         self.verify_run(tokens)?;
         let g = &self.gpu;
-        g.argmax_rows(self.logits.addr, nvoc, nt, self.amax.addr)?;
+        g.argmax_rows(self.logits.addr(), nvoc, nt, self.amax.addr())?;
         let am: Vec<u32> = g.get::<i32>(&self.amax, 0, nt)?.into_iter().map(|x| x as u32).collect();
         let n = keep(&am);
         self.after_forward(nt)?;
@@ -242,15 +242,15 @@ impl<'a> GpuModel<'a> {
         let g = &self.gpu;
         if self.saved.is_empty() {
             for l in &self.layers {
-                if let Mixer::Delta { conv, s, .. } = &l.mixer { self.saved.push((g.alloc(conv.len)?, g.alloc(s.len)?)); }
+                if let Mixer::Delta { conv, s, .. } = &l.mixer { self.saved.push((g.alloc(conv.len())?, g.alloc(s.len())?)); }
             }
         }
         let mut it = self.saved.iter();
         for l in &self.layers {
             if let Mixer::Delta { conv, s, .. } = &l.mixer {
                 let (bc, bs) = it.next().unwrap();
-                g.dtod(conv, 0, bc, 0, conv.len)?;
-                g.dtod(s, 0, bs, 0, s.len)?;
+                g.dtod(conv, 0, bc, 0, conv.len())?;
+                g.dtod(s, 0, bs, 0, s.len())?;
             }
         }
         self.saved_pos = self.pos;
@@ -266,7 +266,7 @@ impl<'a> GpuModel<'a> {
         for l in &self.layers {
             if let Mixer::Delta { conv, s, snap: Some((sc, ss)), .. } = &l.mixer {
                 // Snapshot `keep - 1` of each state; sizes in bytes.
-                let (nc, ns) = (conv.len, s.len);
+                let (nc, ns) = (conv.len(), s.len());
                 g.dtod(sc, (keep - 1) * nc, conv, 0, nc)?;
                 g.dtod(ss, (keep - 1) * ns, s, 0, ns)?;
             }
@@ -282,8 +282,8 @@ impl<'a> GpuModel<'a> {
         for l in &self.layers {
             if let Mixer::Delta { conv, s, .. } = &l.mixer {
                 let (bc, bs) = it.next().ok_or_else(|| anyhow::anyhow!("restore_state without save_state"))?;
-                g.dtod(bc, 0, conv, 0, conv.len)?;
-                g.dtod(bs, 0, s, 0, s.len)?;
+                g.dtod(bc, 0, conv, 0, conv.len())?;
+                g.dtod(bs, 0, s, 0, s.len())?;
             }
         }
         self.pos = self.saved_pos;
@@ -296,12 +296,12 @@ impl<'a> GpuModel<'a> {
     /// Enqueue (or record into a graph) the forward of `nt` tokens; per-token values come from `step_buf`.
     fn forward(&self, nt: usize) -> anyhow::Result<()> {
         let c = &self.m.cfg;
-        let (g, eps, ne, step) = (&self.gpu, c.eps, c.n_embd, self.step_buf.addr);
-        let p = |n: &str| self.bufs[n].addr;
-        let x = self.x.addr;
+        let (g, eps, ne, step) = (&self.gpu, c.eps, c.n_embd, self.step_buf.addr());
+        let p = |n: &str| self.bufs[n].addr();
+        let x = self.x.addr();
         for (il, l) in self.layers.iter().enumerate() { self.layer(il, l, x, step, self.worker.as_ref(), nt)?; }
         g.rms_norm_q(x, ne, self.output_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"))?;
-        g.gemvq(&self.output, p("h"), ne, p("hq"), self.logits.addr, c.n_vocab, nt)
+        g.gemvq(&self.output, p("h"), ne, p("hq"), self.logits.addr(), c.n_vocab, nt)
     }
 
     /// y[t] = W x[t] for t < nt (strides in floats).
@@ -338,7 +338,7 @@ impl<'a> GpuModel<'a> {
         let mut hid = self.row_ptr(row + 1 - nf);
         for i in 0..k {
             let d = if i == 0 { self.mtp_run(&first, hid, true)? } else { self.mtp_run(&toks[i..=i], hid, true)? };
-            hid = self.mtp.as_ref().unwrap().x.addr + 4 * ((if i == 0 { nf } else { 1 } - 1) * self.m.cfg.n_embd) as u64;
+            hid = self.mtp.as_ref().unwrap().x.addr() + 4 * ((if i == 0 { nf } else { 1 } - 1) * self.m.cfg.n_embd) as u64;
             toks.push(d);
         }
         let start = self.pos;
@@ -355,7 +355,7 @@ impl<'a> GpuModel<'a> {
     }
 
     /// Address of hidden row `row` of the last `step` or `verify`.
-    fn row_ptr(&self, row: usize) -> u64 { self.x.addr + 4 * (row * self.m.cfg.n_embd) as u64 }
+    fn row_ptr(&self, row: usize) -> u64 { self.x.addr() + 4 * (row * self.m.cfg.n_embd) as u64 }
 
     /// Draft head on `tokens` with hidden states at `hid` (rows of n_embd), as one batch at the next draft positions;
     /// returns the argmax of the last token's logits (left in `logits` row 0), or 0 when `head` = false skips the head.
@@ -385,16 +385,16 @@ impl<'a> GpuModel<'a> {
     /// Enqueue the draft head (see `mtp_run`).
     fn mtp_forward(&self, hid: u64, nt: usize, head: bool) -> anyhow::Result<()> {
         let (c, g, h) = (&self.m.cfg, &self.gpu, self.mtp.as_ref().unwrap());
-        let (eps, ne, hp) = (c.eps, c.n_embd, self.bufs["h"].addr);
-        let (eh, x) = (h.eh.addr, h.x.addr);
-        g.rms_norm(h.emb.addr, ne, h.enorm.ptr, eh, 2 * ne, ne, nt, eps)?;
+        let (eps, ne, hp) = (c.eps, c.n_embd, self.bufs["h"].addr());
+        let (eh, x) = (h.eh.addr(), h.x.addr());
+        g.rms_norm(h.emb.addr(), ne, h.enorm.ptr, eh, 2 * ne, ne, nt, eps)?;
         g.rms_norm(hid, ne, h.hnorm.ptr, eh + 4 * ne as u64, 2 * ne, ne, nt, eps)?;
         self.mv(&h.eh_proj, eh, 2 * ne, x, ne, nt)?;
-        self.layer(c.n_layer, &h.layer, x, h.step_buf.addr, Some(&h.worker), nt)?;
+        self.layer(c.n_layer, &h.layer, x, h.step_buf.addr(), Some(&h.worker), nt)?;
         if head {
             g.rms_norm(x + 4 * ((nt - 1) * ne) as u64, 0, h.head_norm.ptr, hp, 0, ne, 1, eps)?;
-            g.gemv(&self.output, hp, self.logits.addr)?;
-            g.argmax_rows(self.logits.addr, c.n_vocab, 1, self.amax.addr)?;
+            g.gemv(&self.output, hp, self.logits.addr())?;
+            g.argmax_rows(self.logits.addr(), c.n_vocab, 1, self.amax.addr())?;
         }
         Ok(())
     }
@@ -403,7 +403,7 @@ impl<'a> GpuModel<'a> {
     fn layer(&self, il: usize, l: &Layer, x: u64, step: u64, worker: Option<&CpuWorker>, nt: usize) -> anyhow::Result<()> {
         let c = &self.m.cfg;
         let (g, eps, ne) = (&self.gpu, c.eps, c.n_embd);
-        let p = |n: &str| self.bufs[n].addr;
+        let p = |n: &str| self.bufs[n].addr();
         // Inputs from "h" are quantized once ("hq", after each norm) instead of once per GEMV block.
         let mv = |w: &GpuTensor, x: &str, xs: usize, y: &str, ys: usize|
             if x == "h" { g.gemvq(w, p(x), xs, p("hq"), p(y), ys, nt) } else { self.mv(w, p(x), xs, p(y), ys, nt) };
@@ -415,19 +415,19 @@ impl<'a> GpuModel<'a> {
             g.rms_norm_q(x, ne, l.attn_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"))?;
             match &l.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, snap } => {
-                    let (sc, ss, ns) = snap.as_ref().map_or((0, 0, 0), |(a, b)| (a.addr, b.addr, self.k));
+                    let (sc, ss, ns) = snap.as_ref().map_or((0, 0, 0), |(a, b)| (a.addr(), b.addr(), self.k));
                     mv(qkv, "h", ne, "qkv", channels)?;
                     mv(gate, "h", ne, "z", c.ssm_d_inner)?;
                     mv(beta, "h", ne, "beta", nv)?;
                     mv(alpha, "h", ne, "g", nv)?;
                     g.ssm_gates(p("beta"), p("g"), dt_bias.ptr, a.ptr, nt * nv, nv)?;
                     if nt == 1 {
-                        g.conv_silu(p("qkv"), conv.addr, conv_w.ptr, p("y"), channels, c.ssm_conv)?;
+                        g.conv_silu(p("qkv"), conv.addr(), conv_w.ptr, p("y"), channels, c.ssm_conv)?;
                     } else {
-                        g.conv_seq(p("qkv"), conv.addr, conv_w.ptr, p("y"), channels, c.ssm_conv, nt, sc, ns)?;
+                        g.conv_seq(p("qkv"), conv.addr(), conv_w.ptr, p("y"), channels, c.ssm_conv, nt, sc, ns)?;
                     }
                     g.l2_norm(p("y"), dk, 2 * nk, channels, nt * 2 * nk, eps)?;
-                    g.deltanet(p("y"), s.addr, p("beta"), p("g"), p("o"), nk, nv, c.k_interleave, dk, dv, 1.0 / (dk as f32).sqrt(), nt, channels, ss, ns)?;
+                    g.deltanet(p("y"), s.addr(), p("beta"), p("g"), p("o"), nk, nv, c.k_interleave, dk, dv, 1.0 / (dk as f32).sqrt(), nt, channels, ss, ns)?;
                     g.norm_gate(p("o"), norm.ptr, p("z"), dv, nt * nv, eps)?;
                     mv(out, "o", c.ssm_d_inner, "mix", ne)?;
                 }
@@ -440,8 +440,8 @@ impl<'a> GpuModel<'a> {
                     mv(v, "h", ne, "v", kv)?;
                     g.rms_norm(p("kraw"), hd, kn.ptr, p("k"), hd, hd, nt * nkv, eps)?;
                     g.rope_neox(p("k"), hd, nt * nkv, nkv, c.n_rot, step, c.rope_base)?;
-                    g.kv_store(p("k"), p("v"), kc.addr, vc.addr, kv, nt, step, hd)?;
-                    g.attn_decode(p("q"), kc.addr, vc.addr, if c.q_gate { p("qg") } else { 0 }, p("att"), p("attp"), step, nh, nkv, hd,
+                    g.kv_store(p("k"), p("v"), kc.addr(), vc.addr(), kv, nt, step, hd)?;
+                    g.attn_decode(p("q"), kc.addr(), vc.addr(), if c.q_gate { p("qg") } else { 0 }, p("att"), p("attp"), step, nh, nkv, hd,
                                   1.0 / (hd as f32).sqrt(), nt)?;
                     mv(o, "att", nh * hd, "mix", ne)?;
                 }
@@ -459,17 +459,17 @@ impl<'a> GpuModel<'a> {
                 Ffn::Moe { router, shared } => {
                     let k = c.n_expert_used;
                     let kt = nt * k;
-                    let ids = self.ids.addr;
+                    let ids = self.ids.addr();
                     mv(router, "h", ne, "rl", c.n_expert)?;
                     g.router_topk(p("rl"), c.n_expert, k, c.expert_weights_scale, ids, p("wts"), nt)?;
                     let cache = self.cache.as_ref().unwrap();
                     let lx = cache.layer(il).unwrap();
                     let (base, stride) = cache.base(lx);
                     let [mg, mu, md] = lx.mats;
-                    let slots = self.slots.addr;
+                    let slots = self.slots.addr();
                     let w = worker.unwrap();
                     let mb = w.dev + (4 * il * w.layout.stride) as u64;
-                    g.map_hits(ids, lx.table_dev.addr, slots, p("wts"), p("wh"), kt)?;
+                    g.map_hits(ids, lx.table_dev.addr(), slots, p("wts"), p("wh"), kt)?;
                     g.moe_publish(ids, p("wts"), slots, p("h"), mb, k, ne, w.layout.h, step, nt)?;
                     if mg.ty == mu.ty && (mg.rows, mg.cols) == (mu.rows, mu.cols) {
                         let pair = (mu.off as i64 - mg.off as i64, p("ue") as i64 - p("ge") as i64);

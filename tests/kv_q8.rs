@@ -37,18 +37,18 @@ fn q8_kv_attention_matches_f16() {
         // (prefill, decode) outputs of all t query tokens.
         let run = |g: &Gpu, cache: usize| {
             let (dk, dv) = (g.stream.clone_htod(&k).unwrap(), g.stream.clone_htod(&v).unwrap());
-            let (kc, vc) = (g.zeros::<u16>(cache).unwrap(), g.zeros::<u16>(cache).unwrap());
+            let (kc, vc) = (g.zeros_slice::<u16>(cache).unwrap(), g.zeros_slice::<u16>(cache).unwrap());
             let zero = g.stream.clone_htod(&[0i32]).unwrap();
             g.kv_store(g.ptr(&dk), g.ptr(&dv), g.ptr(&kc), g.ptr(&vc), nkv * hd, pos0 + t, g.ptr(&zero), hd).unwrap();
             let (dq, dg) = (g.stream.clone_htod(&q).unwrap(), g.stream.clone_htod(&qg).unwrap());
             let step = g.stream.clone_htod(&[pos0 as i32]).unwrap();
-            let dout = g.zeros::<f32>(t * nh * hd).unwrap();
+            let dout = g.zeros_slice::<f32>(t * nh * hd).unwrap();
             g.attn_prefill(g.ptr(&dq), g.ptr(&kc), g.ptr(&vc), g.ptr(&dg), g.ptr(&dout), g.ptr(&step), t, nh, nkv, hd, scale).unwrap();
             let mut dec = vec![];
             for gq_min in [ATT_GQA_MIN, 0] {
                 let steps: Vec<i32> = (0..t).flat_map(|i| [(pos0 + i) as i32, 0]).collect();
                 let ds = g.stream.clone_htod(&steps).unwrap();
-                let (dd, part) = (g.zeros::<f32>(t * nh * hd).unwrap(), g.zeros::<f32>(t * nh * ATT_SPLITS * (hd + 2)).unwrap());
+                let (dd, part) = (g.zeros_slice::<f32>(t * nh * hd).unwrap(), g.zeros_slice::<f32>(t * nh * ATT_SPLITS * (hd + 2)).unwrap());
                 g.attn_decode_gq(g.ptr(&dq), g.ptr(&kc), g.ptr(&vc), g.ptr(&dg), g.ptr(&dd), g.ptr(&part), g.ptr(&ds),
                                  nh, nkv, hd, scale, gq_min, t).unwrap();
                 let batched = g.stream.clone_dtoh(&dd).unwrap();

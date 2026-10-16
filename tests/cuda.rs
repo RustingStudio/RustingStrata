@@ -52,7 +52,7 @@ fn dequant_and_gemv_match_reference_for_every_type() {
 
         let x = xs(t.cols);
         let dx = gpu.stream.clone_htod(&x).unwrap();
-        let dy = gpu.zeros::<f32>(t.rows).unwrap();
+        let dy = gpu.zeros_slice::<f32>(t.rows).unwrap();
         gpu.gemv(&dt, gpu.ptr(&dx), gpu.ptr(&dy)).unwrap();
         let got = gpu.stream.clone_dtoh(&dy).unwrap();
         let mut want = vec![0f32; t.rows];
@@ -69,7 +69,7 @@ fn rms_norm_q_matches_quant_xq() {
     let Some(gpu) = gpu() else { return };
     let (n, rows) = (2048, 3);
     let (x, w) = (gpu.stream.clone_htod(&xs(rows * n)).unwrap(), gpu.stream.clone_htod(&xs(n + 7)[7..]).unwrap());
-    let (out, q1, q2) = (gpu.zeros::<f32>(rows * n).unwrap(), gpu.zeros::<u8>(rows * n * 9 / 8).unwrap(), gpu.zeros::<u8>(rows * n * 9 / 8).unwrap());
+    let (out, q1, q2) = (gpu.zeros_slice::<f32>(rows * n).unwrap(), gpu.zeros_slice::<u8>(rows * n * 9 / 8).unwrap(), gpu.zeros_slice::<u8>(rows * n * 9 / 8).unwrap());
     gpu.rms_norm_q(gpu.ptr(&x), n, gpu.ptr(&w), gpu.ptr(&out), n, n, rows, 1e-6, gpu.ptr(&q1)).unwrap();
     gpu.quant_xq(gpu.ptr(&out), n, n, rows, gpu.ptr(&q2)).unwrap();
     assert_eq!(gpu.stream.clone_dtoh(&q1).unwrap(), gpu.stream.clone_dtoh(&q2).unwrap());
@@ -88,7 +88,7 @@ fn moe_gemv_selects_experts() {
     let x = xs(t.cols);
     let (di, dx) = (gpu.stream.clone_htod(&ids).unwrap(), gpu.stream.clone_htod(&x).unwrap());
     let rows = t.rows / n_expert;
-    let dy = gpu.zeros::<f32>(3 * rows).unwrap();
+    let dy = gpu.zeros_slice::<f32>(3 * rows).unwrap();
     gpu.moe_gemv(t.ty, rows, t.cols, dt.ptr, dt.bytes() / n_expert, gpu.ptr(&di), 3, gpu.ptr(&dx), 0, 1, gpu.ptr(&dy), None, 0).unwrap();
     let got = gpu.stream.clone_dtoh(&dy).unwrap();
     for (k, &e) in ids.iter().enumerate() {
@@ -100,14 +100,14 @@ fn moe_gemv_selects_experts() {
     }
     // The paired launch (gate and up in one) matches a separate launch of the up matrices bit for bit.
     let u = gpu.upload(&w.get("blk.0.ffn_up_exps.weight").unwrap()).unwrap();
-    let (dg, du) = (gpu.zeros::<f32>(3 * rows).unwrap(), gpu.zeros::<f32>(3 * rows).unwrap());
+    let (dg, du) = (gpu.zeros_slice::<f32>(3 * rows).unwrap(), gpu.zeros_slice::<f32>(3 * rows).unwrap());
     let pair = (u.ptr as i64 - dt.ptr as i64, gpu.ptr(&du) as i64 - gpu.ptr(&dg) as i64);
     gpu.moe_gemv(t.ty, rows, t.cols, dt.ptr, dt.bytes() / n_expert, gpu.ptr(&di), 3, gpu.ptr(&dx), 0, 1, gpu.ptr(&dg), Some(pair), 0).unwrap();
     gpu.moe_gemv(u.ty, rows, u.cols, u.ptr, u.bytes() / n_expert, gpu.ptr(&di), 3, gpu.ptr(&dx), 0, 1, gpu.ptr(&dy), None, 0).unwrap();
     assert_eq!(gpu.stream.clone_dtoh(&dg).unwrap(), got, "paired gate");
     assert_eq!(gpu.stream.clone_dtoh(&du).unwrap(), gpu.stream.clone_dtoh(&dy).unwrap(), "paired up");
     // x quantized once by quant_xq (one token for the 3 experts) gives the same result as per-block quantization.
-    let xq = gpu.zeros::<u8>(t.cols * 9 / 8).unwrap();
+    let xq = gpu.zeros_slice::<u8>(t.cols * 9 / 8).unwrap();
     gpu.quant_xq(gpu.ptr(&dx), 0, t.cols, 1, gpu.ptr(&xq)).unwrap();
     gpu.moe_gemv(t.ty, rows, t.cols, dt.ptr, dt.bytes() / n_expert, gpu.ptr(&di), 3, 0, 0, 3, gpu.ptr(&dg), Some(pair), gpu.ptr(&xq)).unwrap();
     assert_eq!(gpu.stream.clone_dtoh(&dg).unwrap(), got, "quant_xq gate");
@@ -131,17 +131,17 @@ fn gemvn_matches_gemv() {
         let dx = gpu.stream.clone_htod(&x).unwrap();
         let mut want = vec![];
         for i in 0..4u64 {
-            let dy = gpu.zeros::<f32>(t.rows).unwrap();
+            let dy = gpu.zeros_slice::<f32>(t.rows).unwrap();
             gpu.gemv(&dt, gpu.ptr(&dx) + 4 * i * t.cols as u64, gpu.ptr(&dy)).unwrap();
             want.extend(gpu.stream.clone_dtoh(&dy).unwrap());
         }
         for nt in 1..=4 {
-            let dy = gpu.zeros::<f32>(nt * t.rows).unwrap();
+            let dy = gpu.zeros_slice::<f32>(nt * t.rows).unwrap();
             gpu.gemvn(&dt, gpu.ptr(&dx), t.cols, gpu.ptr(&dy), t.rows, nt).unwrap();
             assert_eq!(gpu.stream.clone_dtoh(&dy).unwrap(), want[..nt * t.rows], "{} {name} nt {nt}", ty.name());
-            let xq = gpu.zeros::<u8>(nt * t.cols * 9 / 8).unwrap();
+            let xq = gpu.zeros_slice::<u8>(nt * t.cols * 9 / 8).unwrap();
             gpu.quant_xq(gpu.ptr(&dx), t.cols, t.cols, nt, gpu.ptr(&xq)).unwrap();
-            let dy = gpu.zeros::<f32>(nt * t.rows).unwrap();
+            let dy = gpu.zeros_slice::<f32>(nt * t.rows).unwrap();
             gpu.gemvq(&dt, gpu.ptr(&dx), t.cols, gpu.ptr(&xq), gpu.ptr(&dy), t.rows, nt).unwrap();
             assert_eq!(gpu.stream.clone_dtoh(&dy).unwrap(), want[..nt * t.rows], "{} {name} quant_xq nt {nt}", ty.name());
         }
@@ -172,7 +172,7 @@ fn gemv_bandwidth() {
         let t = w.get(name).unwrap();
         let dt = gpu.upload(&t).unwrap();
         let x = gpu.stream.clone_htod(&xs(t.cols)).unwrap();
-        let y = gpu.zeros::<f32>(t.rows).unwrap();
+        let y = gpu.zeros_slice::<f32>(t.rows).unwrap();
         let run = || if moe {
             let n = info.dims[2] as usize;
             let ids = gpu.stream.clone_htod(&[3i32, 17, 40, 77, 101, 150, 200, 255]).unwrap();
@@ -183,7 +183,7 @@ fn gemv_bandwidth() {
             (time(&|| gpu.gemv(&dt, gpu.ptr(&x), gpu.ptr(&y)).unwrap()), dt.bytes())
         };
         if !moe {
-            let (x4, y4) = (gpu.stream.clone_htod(&xs(4 * t.cols)).unwrap(), gpu.zeros::<f32>(4 * t.rows).unwrap());
+            let (x4, y4) = (gpu.stream.clone_htod(&xs(4 * t.cols)).unwrap(), gpu.zeros_slice::<f32>(4 * t.rows).unwrap());
             let tn: Vec<String> = (2..=4).map(|nt| format!("{:.1}", 1e6 * time(&|| gpu.gemvn(&dt, gpu.ptr(&x4), t.cols, gpu.ptr(&y4), t.rows, nt).unwrap()))).collect();
             eprintln!("  gemvn 2/3/4 inputs: {} us", tn.join(" / "));
         }
@@ -214,7 +214,7 @@ fn gemm_matches_reference_for_every_type() {
         // Tiles: positions 0..128, 128..144 and 144..170 (all with the same matrix).
         let tiles: Vec<u64> = [(0u64, 128u64), (128, 16), (144, 26)].iter().flat_map(|&(m0, c)| [dt.ptr, m0 | c << 32]).collect();
         let (dtl, dx, dr) = (gpu.stream.clone_htod(&tiles).unwrap(), gpu.stream.clone_htod(&x).unwrap(), gpu.stream.clone_htod(&xrow).unwrap());
-        let dy = gpu.zeros::<f32>(m * rows).unwrap();
+        let dy = gpu.zeros_slice::<f32>(m * rows).unwrap();
         gpu.gemm(t.ty, rows, t.cols, gpu.ptr(&dtl), 3, gpu.ptr(&dx), t.cols, n_x, gpu.ptr(&dr), gpu.ptr(&dy), rows, 0).unwrap();
         let got = gpu.stream.clone_dtoh(&dy).unwrap();
         let mut wr = vec![0f32; t.cols];
@@ -251,7 +251,7 @@ fn gemm_throughput() {
         let bm = rusting_strata::cuda::GEMM_BM;
         let tiles: Vec<u64> = (0..m / bm).flat_map(|i| [dt.ptr, (bm * i) as u64 | (bm as u64) << 32]).collect();
         let (dtl, dx) = (gpu.stream.clone_htod(&tiles).unwrap(), gpu.stream.clone_htod(&xs(m * t.cols)).unwrap());
-        let dy = gpu.zeros::<f32>(m * rows).unwrap();
+        let dy = gpu.zeros_slice::<f32>(m * rows).unwrap();
         let run = || gpu.gemm(t.ty, rows, t.cols, gpu.ptr(&dtl), m / bm, gpu.ptr(&dx), t.cols, m, 0, gpu.ptr(&dy), rows, 0).unwrap();
         for _ in 0..3 { run(); }
         gpu.stream.synchronize().unwrap();
@@ -280,7 +280,7 @@ fn attn_prefill_matches_decode() {
                                 gpu.stream.clone_htod(&q).unwrap(), gpu.stream.clone_htod(&qg).unwrap());
         let scale = 1.0 / (hd as f32).sqrt();
         let step = gpu.stream.clone_htod(&[pos0 as i32]).unwrap();
-        let dout = gpu.zeros::<f32>(t * nh * hd).unwrap();
+        let dout = gpu.zeros_slice::<f32>(t * nh * hd).unwrap();
         gpu.attn_prefill(gpu.ptr(&dq), gpu.ptr(&dk), gpu.ptr(&dv), gpu.ptr(&dg), gpu.ptr(&dout), gpu.ptr(&step), t, nh, nkv, hd, scale).unwrap();
         let got = gpu.stream.clone_dtoh(&dout).unwrap();
         // qg = 0: no output gate. The gated output is the ungated output times sigmoid(gate).
@@ -291,8 +291,8 @@ fn attn_prefill_matches_decode() {
         gpu.attn_prefill(gpu.ptr(&dq), gpu.ptr(&dk), gpu.ptr(&dv), 0, gpu.ptr(&dout), gpu.ptr(&step), t, nh, nkv, hd, scale).unwrap();
         let e = rel_l2(&gated(&gpu.stream.clone_dtoh(&dout).unwrap()), &got);
         assert!(e <= 1e-6, "attn_prefill without gate nh {nh} hd {hd}: {e}");
-        let ddec = gpu.zeros::<f32>(t * nh * hd).unwrap();
-        let part = gpu.zeros::<f32>(nh * rusting_strata::cuda::ATT_SPLITS * (hd + 2)).unwrap();
+        let ddec = gpu.zeros_slice::<f32>(t * nh * hd).unwrap();
+        let part = gpu.zeros_slice::<f32>(nh * rusting_strata::cuda::ATT_SPLITS * (hd + 2)).unwrap();
         for gq_min in [rusting_strata::cuda::ATT_GQA_MIN, 0] {
             for i in 0..t {
                 let s = gpu.stream.clone_htod(&[(pos0 + i) as i32]).unwrap();
@@ -312,7 +312,7 @@ fn attn_prefill_matches_decode() {
             // One launch for all t tokens (the MTP verify path) gives the same bits as t launches.
             let steps: Vec<i32> = (0..t).flat_map(|i| [(pos0 + i) as i32, 0]).collect();
             let ds = gpu.stream.clone_htod(&steps).unwrap();
-            let (dbat, pbat) = (gpu.zeros::<f32>(t * nh * hd).unwrap(), gpu.zeros::<f32>(t * nh * rusting_strata::cuda::ATT_SPLITS * (hd + 2)).unwrap());
+            let (dbat, pbat) = (gpu.zeros_slice::<f32>(t * nh * hd).unwrap(), gpu.zeros_slice::<f32>(t * nh * rusting_strata::cuda::ATT_SPLITS * (hd + 2)).unwrap());
             gpu.attn_decode_gq(gpu.ptr(&dq), gpu.ptr(&dk), gpu.ptr(&dv), gpu.ptr(&dg), gpu.ptr(&dbat), gpu.ptr(&pbat), gpu.ptr(&ds),
                                nh, nkv, hd, scale, gq_min, t).unwrap();
             assert_eq!(gpu.stream.clone_dtoh(&dbat).unwrap(), want, "attn_decode batched nh {nh} nkv {nkv} hd {hd} gq_min {gq_min}");
@@ -339,8 +339,8 @@ fn deltanet_chunk_matches_steps() {
         let (ns, len) = (3, nv * dv * dk);
         let run = |chunk: bool| {
             let ds = gpu.stream.clone_htod(&s0).unwrap();
-            let o = gpu.zeros::<f32>(t * nv * dv).unwrap();
-            let snap = gpu.zeros::<f32>(ns * len).unwrap();
+            let o = gpu.zeros_slice::<f32>(t * nv * dv).unwrap();
+            let snap = gpu.zeros_slice::<f32>(ns * len).unwrap();
             let p = |d: u64, per: usize, i: usize| d + (i * per * 4) as u64;
             let steps: Vec<(usize, usize)> = if chunk { vec![(0, t)] } else { (0..t).map(|i| (i, 1)).collect() };
             let mut snaps = vec![];
@@ -390,9 +390,9 @@ fn conv_seq_matches_steps() {
         let x = xs(t * ch + 4)[4..].to_vec();
         let (dw, dx) = (gpu.stream.clone_htod(&w).unwrap(), gpu.stream.clone_htod(&x).unwrap());
         let (s1, s2) = (gpu.stream.clone_htod(&st0).unwrap(), gpu.stream.clone_htod(&st0).unwrap());
-        let (y1, y2) = (gpu.zeros::<f32>(t * ch).unwrap(), gpu.zeros::<f32>(t * ch).unwrap());
+        let (y1, y2) = (gpu.zeros_slice::<f32>(t * ch).unwrap(), gpu.zeros_slice::<f32>(t * ch).unwrap());
         let ns = 3;
-        let snap = gpu.zeros::<f32>(ns * (kw - 1) * ch).unwrap();
+        let snap = gpu.zeros_slice::<f32>(ns * (kw - 1) * ch).unwrap();
         gpu.conv_seq(gpu.ptr(&dx), gpu.ptr(&s1), gpu.ptr(&dw), gpu.ptr(&y1), ch, kw, t, gpu.ptr(&snap), ns).unwrap();
         let d = |a: &cudarc::driver::CudaSlice<f32>| gpu.stream.clone_dtoh(a).unwrap();
         let mut snaps = vec![];
@@ -417,7 +417,7 @@ fn argmax_rows_matches_ops_argmax() {
     x[3 * n - 1] = 5.0;
     x[3 * n..].fill(f32::NEG_INFINITY); x[3 * n + 77] = -1.0;
     let dx = gpu.stream.clone_htod(&x).unwrap();
-    let dout = gpu.zeros::<i32>(4).unwrap();
+    let dout = gpu.zeros_slice::<i32>(4).unwrap();
     gpu.argmax_rows(gpu.ptr(&dx), n, 4, gpu.ptr(&dout)).unwrap();
     let got = gpu.stream.clone_dtoh(&dout).unwrap();
     let want: Vec<i32> = x.chunks(n).map(|r| rusting_strata::ops::argmax(r) as i32).collect();
@@ -434,7 +434,7 @@ fn router_topk_matches_ops_top_k() {
     x[n + 7] = 9.0; x[n + 200] = 9.0;
     x[2 * n + 30] = 5.0; x[2 * n + 31] = 5.0; x[2 * n + 255] = 5.0;
     let dx = gpu.stream.clone_htod(&x).unwrap();
-    let (dids, dw) = (gpu.zeros::<i32>(k * t).unwrap(), gpu.zeros::<f32>(k * t).unwrap());
+    let (dids, dw) = (gpu.zeros_slice::<i32>(k * t).unwrap(), gpu.zeros_slice::<f32>(k * t).unwrap());
     gpu.router_topk(gpu.ptr(&dx), n, k, 2.5, gpu.ptr(&dids), gpu.ptr(&dw), t).unwrap();
     let (ids, w) = (gpu.stream.clone_dtoh(&dids).unwrap(), gpu.stream.clone_dtoh(&dw).unwrap());
     for r in 0..t {
@@ -462,7 +462,7 @@ fn attn_decode_bandwidth() {
             let (dq, dg) = (gpu.stream.clone_htod(&xs(nt * nh * hd)).unwrap(), gpu.stream.clone_htod(&xs(nt * nh * 2 * hd)).unwrap());
             let steps: Vec<i32> = (0..nt).flat_map(|i| [(n_pos - nt + i) as i32, 0]).collect();
             let ds = gpu.stream.clone_htod(&steps).unwrap();
-            let (dout, part) = (gpu.zeros::<f32>(nt * nh * hd).unwrap(), gpu.zeros::<f32>(nt * nh * rusting_strata::cuda::ATT_SPLITS * (hd + 2)).unwrap());
+            let (dout, part) = (gpu.zeros_slice::<f32>(nt * nh * hd).unwrap(), gpu.zeros_slice::<f32>(nt * nh * rusting_strata::cuda::ATT_SPLITS * (hd + 2)).unwrap());
             for gq_min in [i32::MAX, 0] {
                 let run = || gpu.attn_decode_gq(gpu.ptr(&dq), gpu.ptr(&dk), gpu.ptr(&dv), gpu.ptr(&dg), gpu.ptr(&dout), gpu.ptr(&part), gpu.ptr(&ds),
                                                 nh, nkv, hd, 0.0625, gq_min, nt).unwrap();

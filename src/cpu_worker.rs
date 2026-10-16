@@ -51,7 +51,7 @@ impl CpuWorker {
         let layout = Mailbox::new(c.n_expert_used, c.n_embd);
         let len = layout.stride * moe_layers.iter().max().map_or(0, |&il| il + 1);
         let (mem, host) = gpu.host_mailbox(len)?;
-        let (host, dev) = (host as usize, mem.addr);
+        let (host, dev) = (host as usize, mem.addr());
 
         let (tx, rx) = mpsc::channel::<u32>();
         let (stop, busy_ns) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)));
