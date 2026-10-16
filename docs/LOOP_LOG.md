@@ -1602,6 +1602,29 @@ code was not timed on that test. Full suite green, load 2.55.
 - Not verified: the ignored bandwidth kernel tests after the conversion; parity not re-run (no kernel or numerics
   change since the #89 control).
 
+### 2026-10-16 #91 — Vulkan backend: device, memory, command flow, first kernels (2d5bed4, 36de601, 7bd9eeb)
+- 2d5bed4 (Task 1.1): `src/vulkan` on `ash` 0.38 (Vulkan 1.3). One VkBuffer and allocation per `Buf` with a device
+  address; host copies go through a 64 MB staging buffer in chunks; `mem_info` uses `VK_EXT_memory_budget` when the
+  driver has it. `backend::open` falls back to Vulkan when CUDA does not load. Backend tests run on both backends,
+  plus an 80 MB round trip through the staging chunks.
+- 36de601 (Task 1.2): kernels are GLSL with `GL_EXT_buffer_reference` (pointers as push constants, one pipeline
+  layout, no descriptor sets), compiled offline by `tools/gen_spirv.sh` and committed; `spirv_is_fresh` rebuilds
+  them and compares. Pipelines need subgroup size 32 with full subgroups. Ops record into an open command buffer
+  with a full barrier after each; `graph` records a reusable command buffer per key. `add` and `swiglu`.
+- 7bd9eeb (Task 1.3): `rms_norm` (with the int8 copy), `quant_xq`, `argmax_rows`, `l2_norm`, `rope_neox`,
+  `norm_gate`, `ssm_gates`, `conv_silu`. Reductions use the CUDA butterfly order. GLSL division and sqrt are a few
+  ulp off on NVIDIA (the quant scales differed by 1 ulp from the CPU), so `fdiv`/`sqrt_` refine them with a
+  `precise` fma (GLSL may split an fma that is not `precise`). Rope computes theta and sin/cos in f64 (Taylor after
+  a pi/2 reduction; GLSL has no f64 pow/sin/cos), so the device needs `shaderFloat64`. New test
+  `norm_rope_and_gate_ops_match_cpu` checks each op against `ops.rs` on both backends (quant bytes exactly).
+- Gates: full suite green after each commit (load 4.2-21; another session was busy). CUDA greedy md5 unchanged
+  after 2d5bed4 (the only commit touching shared code). Vulkan tests clean under `VK_LAYER_KHRONOS_validation`
+  with `VK_LAYER_VALIDATE_SYNC=1` (no messages).
+- Kernel tests not yet ported stay CUDA-only through `common::backends_except(&["vulkan"])`.
+- Not verified: no on-disk VkPipelineCache (the NVIDIA driver caches shaders itself; first-run pipeline cost not
+  measured). GLSL `exp`/`log` are not refined (Vulkan allows 3 + 2|x| ulp); revisit if the Task 1.9 greedy check
+  differs from CUDA. RADV gates deferred: no AMD GPU on this machine.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
