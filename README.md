@@ -91,3 +91,10 @@ python -I tools/parity.py $M --extra "--gpu" --tag gpu   # agreement with llama.
 `src/gpu_model/prefill.rs` (chunked prefill), `src/expert_cache.rs` (expert placement), `src/cpu_moe.rs` and `src/cpu_worker.rs`
 (CPU expert compute), `src/serve.rs` (HTTP and chat template), `src/main.rs` (CLI).
 Design: `docs/superpowers/specs/2026-10-06-rusting-strata-v1-design.md`.
+
+## License
+
+RustingStrata is released under the [RustingStrata License 1.0](LICENSE.md).
+You may use, modify and distribute it, including for commercial services, as
+long as you keep the license and credit Vasyl Trefilov as the original author.
+You may not sell RustingStrata itself.
