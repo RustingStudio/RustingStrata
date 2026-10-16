@@ -28,6 +28,8 @@ const SPV: &[(&str, &[u8])] = &[
     ("l2_norm", include_bytes!("spv/l2_norm.spv")),
     ("map_hits", include_bytes!("spv/map_hits.spv")),
     ("moe_combine", include_bytes!("spv/moe_combine.spv")),
+    ("moe_gemv_f", include_bytes!("spv/moe_gemv_f.spv")),
+    ("moe_gemv_q", include_bytes!("spv/moe_gemv_q.spv")),
     ("moe_publish", include_bytes!("spv/moe_publish.spv")),
     ("norm_gate", include_bytes!("spv/norm_gate.spv")),
     ("quant_xq", include_bytes!("spv/quant_xq.spv")),
@@ -521,7 +523,24 @@ impl Backend for Vk {
         };
         self.run("gemv_q", &spec, [w.rows.div_ceil(8), 1, 1], &[&w.ptr, &xq, &y, &(y_stride as u32), &(w.rows as u32), &nsb, &(nt as u32)])
     }
-    fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()> { todo("moe_gemv") }
+    fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()> {
+        ensure!(cols % 256 == 0, "{} expert with {cols} columns: GEMV needs a multiple of 256", ty.name());
+        ensure!(xg > 0 && k % xg == 0, "moe_gemv: {k} slots in groups of {xg}");
+        let (nsb, spec, ntok) = ((cols / 256) as u32, wspec(self.0.llama, ty), k / xg);
+        let (w2, y2) = pair.unwrap_or((0, 0));
+        let z = if pair.is_some() { 2 } else { 1 };
+        if matches!(ty, GgmlType::F32 | GgmlType::BF16) {
+            return self.run("moe_gemv_f", &spec, [rows, k, z], &[&w, &ids, &x, &y, &(stride as u64), &(w2 as u64), &(y2 as u64),
+                &(x_stride as u32), &(rows as u32), &nsb, &(xg as u32)]);
+        }
+        let xq = if xq != 0 { xq } else {
+            ensure!(ntok * cols * 9 / 8 <= XQ, "moe_gemv: {ntok} x {cols} inputs do not fit the quantized-x buffer");
+            self.quant_xq(x, x_stride, cols, ntok, self.1.addr())?;
+            self.1.addr()
+        };
+        self.run("moe_gemv_q", &spec, [rows.div_ceil(8), k, z], &[&w, &ids, &xq, &y, &(stride as u64), &(w2 as u64), &(y2 as u64),
+            &(rows as u32), &nsb, &(xg as u32), &(ntok as u32)])
+    }
     fn dequant(&self, w: &GpuTensor, rows: usize, out: u64) -> anyhow::Result<()> {
         self.run("dequant", &wspec(self.0.llama, w.ty), [rows, 1, 1], &[&w.ptr, &out, &nsb(w)?])
     }

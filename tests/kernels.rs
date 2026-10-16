@@ -88,7 +88,8 @@ fn rms_norm_q_matches_quant_xq() {
 #[test]
 fn moe_gemv_selects_experts() {
     let Some(p) = common::model_path() else { return };
-    for (bk, gpu) in common::backends_except(&["vulkan"]) {
+    let mut first = None;
+    for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let g = Gguf::open(&p).unwrap();
@@ -97,7 +98,7 @@ fn moe_gemv_selects_experts() {
         let t = w.get("blk.0.ffn_gate_exps.weight").unwrap();
         let n_expert = info.dims[2] as usize;
         let dt = gpu.upload(&t).unwrap();
-        let ids = [3i32, -1, 200];
+        let ids = [3i32, -1, n_expert as i32 - 1];  // the last expert: 255 on the default model, 127 on Qwen3-30B
         let x = xs(t.cols);
         let (di, dx) = (up(gpu, &ids), up(gpu, &x));
         let rows = t.rows / n_expert;
@@ -125,6 +126,8 @@ fn moe_gemv_selects_experts() {
         gpu.moe_gemv(t.ty, rows, t.cols, dt.ptr, dt.bytes() / n_expert, di.addr(), 3, 0, 0, 3, dg.addr(), Some(pair), xq.addr()).unwrap();
         assert_eq!(down::<f32>(gpu, &dg), got, "quant_xq gate");
         assert_eq!(down::<f32>(gpu, &du), down::<f32>(gpu, &dy), "quant_xq up");
+        let bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+        match &first { None => first = Some(bits), Some(f) => assert!(*f == bits, "{bk} differs from the first backend") }
     }
 }
 
