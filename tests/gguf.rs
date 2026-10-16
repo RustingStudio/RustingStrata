@@ -1,5 +1,5 @@
 mod common;
-use rusting_strata::{config::{LayerKind, ModelConfig}, gguf::Gguf, weights::Weights};
+use rusting_strata::{config::{LayerKind, ModelConfig}, gguf::Gguf, weights::{Tensor, Weights}};
 
 fn w_str(b: &mut Vec<u8>, s: &str) {
     b.extend((s.len() as u64).to_le_bytes());
@@ -72,4 +72,24 @@ fn arch_table_fields() {
     let w = Weights::new(&g).unwrap();
     w.layer(0, "post_attention_norm.weight").unwrap();
     w.layer(c.n_layer - 1, "post_attention_norm.weight").unwrap();
+}
+
+/// qwen3next fuses beta and alpha in `ssm_ba`: per key head group, r = nv / nk beta rows, then r alpha rows.
+#[test]
+fn qwen3next_ssm_ba_split() {
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let c = ModelConfig::from_gguf(&g).unwrap();
+    if c.arch != "qwen3next" { return; }
+    let w = Weights::new(&g).unwrap();
+    let (ba, b, a) = (w.layer(0, "ssm_ba.weight").unwrap(), w.layer(0, "ssm_beta.weight").unwrap(), w.layer(0, "ssm_alpha.weight").unwrap());
+    assert_eq!((b.rows, a.rows, b.cols, a.cols), (c.ssm_dt_rank, c.ssm_dt_rank, ba.cols, ba.cols));
+    let row = |t: &Tensor, i: usize| { let mut v = vec![0f32; t.cols]; t.row(i, &mut v); v };
+    let r = c.ssm_dt_rank / c.ssm_n_group;
+    for grp in 0..c.ssm_n_group {
+        for j in 0..r {
+            assert_eq!(row(&b, grp * r + j), row(&ba, grp * 2 * r + j), "beta group {grp} row {j}");
+            assert_eq!(row(&a, grp * r + j), row(&ba, grp * 2 * r + r + j), "alpha group {grp} row {j}");
+        }
+    }
 }

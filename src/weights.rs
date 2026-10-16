@@ -5,6 +5,7 @@ use crate::gguf::Gguf;
 use crate::quant::{GgmlType, dequant_row};
 use anyhow::Context;
 use rayon::prelude::*;
+use std::collections::HashMap;
 
 #[derive(Clone, Copy)]
 pub struct Tensor<'a> {
@@ -52,16 +53,35 @@ impl<'a> Tensor<'a> {
 pub struct Weights<'a> {
     pub g: &'a Gguf,
     aliases: &'static [(&'static str, &'static str)],
+    /// Tensors built at load time: qwen3next `ssm_ba` split into `ssm_beta` and `ssm_alpha`.
+    built: HashMap<String, Tensor<'a>>,
 }
 
 impl<'a> Weights<'a> {
     pub fn new(g: &'a Gguf) -> anyhow::Result<Weights<'a>> {
         let c = ModelConfig::from_gguf(g)?;
-        Ok(Weights { g, aliases: c.aliases })
+        let mut w = Weights { g, aliases: c.aliases, built: HashMap::new() };
+        // llama.cpp src/models/qwen3next.cpp: per key head group, r = nv / nk beta rows, then r alpha rows.
+        for il in 0..c.n_layer {
+            let Ok(ba) = w.layer(il, "ssm_ba.weight") else { continue };
+            let (r, rb) = (c.ssm_dt_rank / c.ssm_n_group, ba.row_bytes());
+            let (mut b, mut a) = (Vec::with_capacity(ba.data.len() / 2), Vec::with_capacity(ba.data.len() / 2));
+            for grp in ba.data.chunks_exact(2 * r * rb) {
+                b.extend_from_slice(&grp[..r * rb]);
+                a.extend_from_slice(&grp[r * rb..]);
+            }
+            // ponytail: leaked, a few KB per layer per load; own the bytes in Weights if one process loads many models.
+            let leak = |v: Vec<u8>| -> &'a [u8] { Box::leak(v.into_boxed_slice()) };
+            let half = Tensor { rows: ba.rows / 2, ..ba };
+            w.built.insert(format!("blk.{il}.ssm_beta.weight"), Tensor { data: leak(b), ..half });
+            w.built.insert(format!("blk.{il}.ssm_alpha.weight"), Tensor { data: leak(a), ..half });
+        }
+        Ok(w)
     }
 
     /// `name` with the architecture's alias for a canonical suffix tried second.
     pub fn get(&self, name: &str) -> anyhow::Result<Tensor<'a>> {
+        if let Some(t) = self.built.get(name) { return Ok(*t); }
         let t = self.g.tensors.get(name)
             .or_else(|| self.aliases.iter().find_map(|&(c, a)| self.g.tensors.get(&format!("{}{a}", name.strip_suffix(c)?))))
             .with_context(|| format!("missing tensor {name}"))?;

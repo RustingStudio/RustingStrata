@@ -156,7 +156,7 @@ impl<'a> Model<'a> {
         let mut out = vec![0f32; nv * dv];
         let mut o = vec![0f32; dv];
         for vh in 0..nv {
-            let kh = vh % nk;
+            let kh = if c.k_interleave { vh / (nv / nk) } else { vh % nk };
             let (qh, khv, vv) = (&q[kh * dk..(kh + 1) * dk], &k[kh * dk..(kh + 1) * dk], &v[vh * dv..(vh + 1) * dv]);
             let sm = &mut s[vh * dv * dk..(vh + 1) * dv * dk]; // row j (value dim) x col i (key dim)
             let decay = g[vh].exp();
