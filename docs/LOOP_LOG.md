@@ -1769,6 +1769,27 @@ code was not timed on that test. Full suite green, load 2.55.
   `short: 32`, `mtp: 0`; RADV deferred. Another loop's process (RustingEngine-performance test binary, 281 MiB)
   held GPU memory outside the lock during these runs.
 
+### 2026-10-16 #98 — Vulkan V4 Task 4.1: baseline against llama.cpp Vulkan (docs only)
+- llama.cpp 5d8ccdf9d built with `-DGGML_VULKAN=ON` in `~/Clones/llama.cpp/build-vulkan`, no source edits. The
+  machine has no Vulkan SDK: Vulkan-Headers v1.4.321 and SPIRV-Headers vulkan-sdk-1.4.321.0 were cloned into the
+  session scratchpad and passed as `-DVulkan_INCLUDE_DIR`, `-DSPIRV-Headers_DIR` and `-DCMAKE_CXX_FLAGS=-I...`.
+- `llama-bench -ngl 99 -fa 1 -r 3 -p 512,4096 -n 128` (`--n-cpu-moe 10` on the default model) vs
+  `strata bench --gpu --backend vulkan --pp 512,4096 --tg 128 --reps 3 --mtp 0` at e3b0aea, one round each, load
+  6.9-12.8:
+
+  | model | | pp512 | pp4096 | tg128 (after 512 / 4096 for Strata) |
+  |---|---|---|---|---|
+  | Qwen3-4B Q4_K_M | llama.cpp Vulkan | 3149 ± 27 | 2825 ± 25 | 85.8 ± 2.8 |
+  | | Strata Vulkan | 916 (897-927) | 774 (773-775) | 49.9 / 39.3 |
+  | default (35B-A3B Q2_K_XL) | llama.cpp Vulkan | 357 ± 178 | 817 ± 45 | 48.5 ± 0.8 |
+  | | Strata Vulkan | 454 (413-475) | 778 (673-831) | 59.7 / 56.3 |
+
+- On the MoE default model Strata is ahead on decode and short prefill and even at 4K (its expert cache vs
+  llama.cpp's 10 CPU layers). The dense 4B shows the kernel gap: 3.4x on prefill, 1.7x on decode. The 4B decode
+  reads 2.3 GB per token, so 49.9 tok/s is ~115 GB/s of the 3060's 360: the GEMV is far from bandwidth.
+- Not verified: llama.cpp tg is after an empty context while Strata's is after the prefill, so the decode columns
+  are not the same test; one round only, at high load (another job ran during the 4B rows).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
