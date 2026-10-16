@@ -283,6 +283,14 @@ fn attn_prefill_matches_decode() {
         let dout = gpu.zeros::<f32>(t * nh * hd).unwrap();
         gpu.attn_prefill(gpu.ptr(&dq), gpu.ptr(&dk), gpu.ptr(&dv), gpu.ptr(&dg), gpu.ptr(&dout), gpu.ptr(&step), t, nh, nkv, hd, scale).unwrap();
         let got = gpu.stream.clone_dtoh(&dout).unwrap();
+        // qg = 0: no output gate. The gated output is the ungated output times sigmoid(gate).
+        let sig = |x: f32| 1.0 / (1.0 + (-x).exp());
+        let gated = |plain: &[f32]| -> Vec<f32> {
+            plain.iter().enumerate().map(|(i, o)| o * sig(qg[(i / hd) * 2 * hd + hd + i % hd])).collect()
+        };
+        gpu.attn_prefill(gpu.ptr(&dq), gpu.ptr(&dk), gpu.ptr(&dv), 0, gpu.ptr(&dout), gpu.ptr(&step), t, nh, nkv, hd, scale).unwrap();
+        let e = rel_l2(&gated(&gpu.stream.clone_dtoh(&dout).unwrap()), &got);
+        assert!(e <= 1e-6, "attn_prefill without gate nh {nh} hd {hd}: {e}");
         let ddec = gpu.zeros::<f32>(t * nh * hd).unwrap();
         let part = gpu.zeros::<f32>(nh * rusting_strata::cuda::ATT_SPLITS * (hd + 2)).unwrap();
         for gq_min in [rusting_strata::cuda::ATT_GQA_MIN, 0] {
@@ -293,6 +301,14 @@ fn attn_prefill_matches_decode() {
                                    off(gpu.ptr(&ddec), nh * hd), gpu.ptr(&part), gpu.ptr(&s), nh, nkv, hd, scale, gq_min, 1).unwrap();
             }
             let want = gpu.stream.clone_dtoh(&ddec).unwrap();
+            for i in 0..t {
+                let s = gpu.stream.clone_htod(&[(pos0 + i) as i32]).unwrap();
+                let off = |p: u64, per: usize| p + (i * per * 4) as u64;
+                gpu.attn_decode_gq(off(gpu.ptr(&dq), nh * hd), gpu.ptr(&dk), gpu.ptr(&dv), 0,
+                                   off(gpu.ptr(&ddec), nh * hd), gpu.ptr(&part), gpu.ptr(&s), nh, nkv, hd, scale, gq_min, 1).unwrap();
+            }
+            let e = rel_l2(&gated(&gpu.stream.clone_dtoh(&ddec).unwrap()), &want);
+            assert!(e <= 1e-6, "attn_decode without gate nh {nh} hd {hd} gq_min {gq_min}: {e}");
             // One launch for all t tokens (the MTP verify path) gives the same bits as t launches.
             let steps: Vec<i32> = (0..t).flat_map(|i| [(pos0 + i) as i32, 0]).collect();
             let ds = gpu.stream.clone_htod(&steps).unwrap();
