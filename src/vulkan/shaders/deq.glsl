@@ -38,40 +38,68 @@ void iq1_sub(U8 w, uint b, uint ib, uint l, out uint idx, out float dl, out bool
 // Sign j of the 8 sign bits sg applied to grid byte j of g.
 int sgn(uint g, uint sg, uint j) { int v = int((g >> (8 * (j & 3))) & 255); return ((sg >> j) & 1) != 0 ? -v : v; }
 
+// 8 bytes at 2-aligned w + o: two word loads when 4-aligned, else four 2-byte loads.
+uvec2 ld8(U8 w, uint o) {
+    uint64_t a = uint64_t(w) + o;
+    if ((a & 3) == 0) { U32 u = U32(a); return uvec2(u.v[0], u.v[1]); }
+    return uvec2(ld32(w, o), ld32(w, o + 4));
+}
+// Bytewise a - c (each byte of a below 128; CUDA __vsub4).
+uint vsub4(uint a, uint c) { return ((a | 0x80808080u) - c) ^ 0x80808080u; }
+// The types QI<T> in kernels.cu reads with word loads: Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K.
+const bool WORDS = T == 8 || (T >= 10 && T <= 14);
+
+// qi8 for the WORDS types, the 8 int8 values packed in lo, hi (QI<T>::get).
+void qw_k(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out float m) {
+    m = 0.0;
+    uvec2 v;
+    if (T == 8) {  // Q8_0, 8 blocks of 34
+        uint p = b + 34 * (sub >> 2);
+        d = ldh(w, p);
+        v = ld8(w, p + 2 + (sub & 3) * 8); lo = v.x; hi = v.y;
+    } else if (T == 10) {  // Q2_K
+        uint e = sub * 8, n = e >> 7, r = e & 127, j = r >> 5, r2 = r & 31;
+        uint s = u8_(w, b + n * 8 + j * 2 + (r2 >> 4));
+        d = ldh(w, b + 80) * float(s & 15); m = ldh(w, b + 82) * float(s >> 4);
+        v = ld8(w, b + 16 + 32 * n + r2);
+        lo = (v.x >> (2 * j)) & 0x03030303u; hi = (v.y >> (2 * j)) & 0x03030303u;
+    } else if (T == 11) {  // Q3_K: value = 2 low bits + 4 * high bit - 4
+        uint e = sub * 8, n = e >> 7, r = e & 127, j = r >> 5, i0 = r & 31, is = n * 8 + j * 2 + (i0 >> 4), sc = b + 96;
+        uint low = is < 8 ? u8_(w, sc + is) & 15 : u8_(w, sc + is - 8) >> 4;
+        uint hs = (u8_(w, sc + 8 + (is & 3)) >> (2 * (is >> 2))) & 3, hb = 4 * n + j;
+        d = ldh(w, b + 108) * float(int(low | hs << 4) - 32);
+        uvec2 h = ld8(w, b + i0);
+        v = ld8(w, b + 32 + 32 * n + i0);
+        lo = vsub4(((v.x >> (2 * j)) & 0x03030303u) | ((h.x >> hb) & 0x01010101u) << 2, 0x04040404u);
+        hi = vsub4(((v.y >> (2 * j)) & 0x03030303u) | ((h.y >> hb) & 0x01010101u) << 2, 0x04040404u);
+    } else if (T == 12 || T == 13) {  // Q4_K, Q5_K
+        uint e = sub * 8, j = e >> 6, h = (e >> 5) & 1, r = e & 31, s, mi, bit = 2 * j + h;
+        scale_min_k4(bit, w, b + 4, s, mi);
+        d = ldh(w, b) * float(s); m = ldh(w, b + 2) * float(mi);
+        v = ld8(w, b + (T == 12 ? 16 : 48) + 32 * j + r);
+        lo = (v.x >> (4 * h)) & 0x0F0F0F0Fu; hi = (v.y >> (4 * h)) & 0x0F0F0F0Fu;
+        if (T == 13) {
+            uvec2 qh = ld8(w, b + 16 + r);
+            lo |= ((qh.x >> bit) & 0x01010101u) << 4; hi |= ((qh.y >> bit) & 0x01010101u) << 4;
+        }
+    } else {  // Q6_K
+        uint e = sub * 8, n = e >> 7, r = e & 127, qt = r >> 5, k = r & 31, ns = 4 * (qt >> 1), hs = 2 * qt;
+        d = ldh(w, b + 208) * float(sb(u8_(w, b + 192 + 8 * n + (k >> 4) + 2 * qt)));
+        uvec2 l = ld8(w, b + 64 * n + (qt & 1) * 32 + k), h = ld8(w, b + 128 + 32 * n + k);
+        lo = vsub4(((l.x >> ns) & 0x0F0F0F0Fu) | ((h.x >> hs) & 0x03030303u) << 4, 0x20202020u);
+        hi = vsub4(((l.y >> ns) & 0x0F0F0F0Fu) | ((h.y >> hs) & 0x03030303u) << 4, 0x20202020u);
+    }
+}
+
 // Values [8 sub, 8 sub + 8) of the quantized super-block at byte b as value i = d * q[i] - m with q[i] an int8
 // (QI<T> in kernels.cu).
 void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
     m = 0.0;
     uint ib = sub >> 2, l = sub & 3;
-    if (T == 8) {  // Q8_0, 8 blocks of 34
-        uint p = b + 34 * ib, o = p + 2 + l * 8;
-        d = ldh(w, p);
-        for (uint i = 0; i < 8; i++) q[i] = sb(u8_(w, o + i));
-    } else if (T == 10) {  // Q2_K
-        uint e = sub * 8, n = e >> 7, r = e & 127, j = r >> 5, r2 = r & 31;
-        uint s = u8_(w, b + n * 8 + j * 2 + (r2 >> 4)), o = b + 16 + 32 * n + r2;
-        d = ldh(w, b + 80) * float(s & 15); m = ldh(w, b + 82) * float(s >> 4);
-        for (uint i = 0; i < 8; i++) q[i] = int((u8_(w, o + i) >> (2 * j)) & 3);
-    } else if (T == 11) {  // Q3_K
-        uint e = sub * 8, n = e >> 7, r = e & 127, j = r >> 5, i0 = r & 31, is = n * 8 + j * 2 + (i0 >> 4), sc = b + 96;
-        uint low = is < 8 ? u8_(w, sc + is) & 15 : u8_(w, sc + is - 8) >> 4;
-        uint hi = (u8_(w, sc + 8 + (is & 3)) >> (2 * (is >> 2))) & 3, bit = 1u << (n * 4 + j);
-        d = ldh(w, b + 108) * float(int(low | hi << 4) - 32);
-        for (uint i = 0; i < 8; i++)
-            q[i] = int((u8_(w, b + 32 + 32 * n + i0 + i) >> (2 * j)) & 3) - ((u8_(w, b + i0 + i) & bit) != 0 ? 0 : 4);
-    } else if (T == 12 || T == 13) {  // Q4_K, Q5_K
-        uint e = sub * 8, j = e >> 6, hi = (e >> 5) & 1, r = e & 31, s, mi;
-        scale_min_k4(2 * j + hi, w, b + 4, s, mi);
-        d = ldh(w, b) * float(s); m = ldh(w, b + 2) * float(mi);
-        uint o = b + (T == 12 ? 16 : 48) + 32 * j + r, bit = 1u << (2 * j + hi);
-        for (uint i = 0; i < 8; i++)
-            q[i] = int((u8_(w, o + i) >> (4 * hi)) & 15) + (T == 13 && (u8_(w, b + 16 + r + i) & bit) != 0 ? 16 : 0);
-    } else if (T == 14) {  // Q6_K
-        uint e = sub * 8, n = e >> 7, r = e & 127, qt = r >> 5, k = r & 31;
-        uint ql = b + 64 * n + (qt & 1) * 32 + k, qh = b + 128 + 32 * n + k;
-        d = ldh(w, b + 208) * float(sb(u8_(w, b + 192 + 8 * n + (k >> 4) + 2 * qt)));
-        for (uint i = 0; i < 8; i++)
-            q[i] = int(((u8_(w, ql + i) >> (4 * (qt >> 1))) & 15) | ((u8_(w, qh + i) >> (2 * qt)) & 3) << 4) - 32;
+    if (WORDS) {
+        uint lo, hi;
+        qw_k(w, b, sub, lo, hi, d, m);
+        for (uint i = 0; i < 4; i++) { q[i] = sb(lo >> (8 * i)); q[i + 4] = sb(hi >> (8 * i)); }
     } else if (T == 19 || T == 29) {  // IQ1_S, IQ1_M: dl * (g +- 1/8) = (dl / 8) * (8 g +- 1)
         uint idx; float dl; bool neg;
         iq1_sub(w, b, ib, l, idx, dl, neg);
