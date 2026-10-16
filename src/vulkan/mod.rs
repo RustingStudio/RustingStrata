@@ -618,7 +618,8 @@ impl Backend for Vk {
             self.quant_xq(x, x_stride, w.cols, nt, self.1.addr())?;
             self.1.addr()
         };
-        self.run("gemv_q", &spec, [w.rows.div_ceil(8), 1, 1], &[&w.ptr, &xq, &y, &(y_stride as u32), &(w.rows as u32), &nsb, &(nt as u32)])
+        let spec = [&spec[..], &[nt as u32]].concat();
+        self.run("gemv_q", &spec, [w.rows.div_ceil(8), 1, 1], &[&w.ptr, &xq, &y, &(y_stride as u32), &(w.rows as u32), &nsb])
     }
     fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()> {
         ensure!(cols % 256 == 0, "{} expert with {cols} columns: GEMV needs a multiple of 256", ty.name());
