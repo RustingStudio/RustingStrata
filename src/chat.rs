@@ -99,9 +99,11 @@ impl<'de> Deserialize<'de> for Json {
             }
             fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Json, A::Error> {
                 let mut v: Vec<(String, Json)> = Vec::new();
+                // Key positions, so a body with many keys parses in linear time.
+                let mut at = std::collections::HashMap::<String, usize>::new();
                 while let Some((k, x)) = a.next_entry::<String, Json>()? {
                     // A repeated key keeps its first place and its last value, as in nlohmann's ordered_json.
-                    match v.iter_mut().find(|e| e.0 == k) { Some(e) => e.1 = x, None => v.push((k, x)) }
+                    match at.get(&k) { Some(&i) => v[i].1 = x, None => { at.insert(k.clone(), v.len()); v.push((k, x)) } }
                 }
                 Ok(Json::Obj(v))
             }
