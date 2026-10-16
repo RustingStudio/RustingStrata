@@ -517,10 +517,17 @@ fn handle(c: TcpStream, r: &mut Runner, tok: &Tokenizer, tpl: Template, e: &Engi
     c.set_read_timeout(Some(Duration::from_secs(30)))?;
     c.set_write_timeout(Some(Duration::from_secs(30)))?;
     let mut w = c.try_clone()?;
-    let serve::Request { method, path, host, auth, json, body } = serve::read_request(&mut BufReader::new(c))?;
     let send = |w: &mut TcpStream, status: &str, v: serde_json::Value| -> anyhow::Result<()> {
         let b = v.to_string();
         Ok(write!(w, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len())?)
+    };
+    // A malformed request gets a 400 (best effort: the client may be gone) and is still logged.
+    let serve::Request { method, path, host, auth, json, body } = match serve::read_request(&mut BufReader::new(c)) {
+        Ok(q) => q,
+        Err(err) => {
+            let _ = send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}}));
+            return Err(err);
+        }
     };
     let created = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
     // Browsers can reach a loopback server: the Host check stops DNS rebinding, and requiring a JSON content type

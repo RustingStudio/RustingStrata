@@ -31,7 +31,7 @@ pub fn read_request(r: &mut impl BufRead) -> anyhow::Result<Request> {
         let Some((k, v)) = l.split_once(':') else { continue };
         let (k, v) = (k.to_ascii_lowercase(), v.trim());
         match k.as_str() {
-            "content-length" => len = v.parse()?,
+            "content-length" => len = v.parse().context("bad Content-Length")?,
             "host" => host = v.to_string(),
             "authorization" => auth = v.to_string(),
             "content-type" => json = v.starts_with("application/json"),
