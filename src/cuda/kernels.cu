@@ -185,6 +185,13 @@ template <> __device__ __forceinline__ void deq8<23>(const u8* b, int sub, float
     const u8* q = b + 8 + 16 * ib + (r & 15);
     for (int i = 0; i < 8; i++) o[i] = dl * (float)kvalues_iq4nl[r < 16 ? q[i] & 0xF : q[i] >> 4];
 }
+template <> __device__ __forceinline__ void deq8<20>(const u8* b, int sub, float* o) {  // IQ4_NL, 8 blocks of 18
+    const u8* p = b + 18 * (sub >> 2);
+    int r = (sub & 3) * 8;
+    float d = ldh(p);
+    const u8* q = p + 2 + (r & 15);
+    for (int i = 0; i < 8; i++) o[i] = d * (float)kvalues_iq4nl[r < 16 ? q[i] & 0xF : q[i] >> 4];
+}
 
 // One warp per output row; lane `l` covers elements [8l, 8l+8) of every super-block. NT inputs (x + t * xst) share
 // each weight load; output t goes to y + t * yst.
@@ -391,6 +398,19 @@ template <> struct QI<23> {  // IQ4_XS (136 bytes)
         lo = pack4(v[0], v[1], v[2], v[3]); hi = pack4(v[4], v[5], v[6], v[7]);
     }
 };
+template <> struct QI<20> {  // IQ4_NL, 8 blocks of 18 (2-byte aligned: ld16 only)
+    static constexpr bool MIN = false;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        const u8* p = b + 18 * (sub >> 2);
+        int r = (sub & 3) * 8;
+        d = ldh(p);
+        const u8* q = p + 2 + (r & 15);
+        u32 w0 = ld16(q) | (ld16(q + 2) << 16), w1 = ld16(q + 4) | (ld16(q + 6) << 16), sft = r < 16 ? 0 : 4;
+        int v[8];
+        for (int i = 0; i < 4; i++) { v[i] = kvalues_iq4nl[(w0 >> (8 * i + sft)) & 0xF]; v[i + 4] = kvalues_iq4nl[(w1 >> (8 * i + sft)) & 0xF]; }
+        lo = pack4(v[0], v[1], v[2], v[3]); hi = pack4(v[4], v[5], v[6], v[7]);
+    }
+};
 
 #ifndef LLAMA_Q8
 #define LLAMA_Q8 0
@@ -489,7 +509,7 @@ __device__ __forceinline__ void gemv_row_qn(const u8* __restrict__ w, const sign
 
 #define FTYPES(X) X(0, f32, 1024) X(30, bf16, 512)
 #define ITYPES(X) X(8, q8_0, 272) X(10, q2_k, 84) X(11, q3_k, 110) X(12, q4_k, 144) X(13, q5_k, 176) X(14, q6_k, 210) \
-    X(19, iq1_s, 50) X(29, iq1_m, 56) X(16, iq2_xxs, 66) X(17, iq2_xs, 74) X(22, iq2_s, 82) X(18, iq3_xxs, 98) X(21, iq3_s, 110) X(23, iq4_xs, 136)
+    X(19, iq1_s, 50) X(29, iq1_m, 56) X(16, iq2_xxs, 66) X(17, iq2_xs, 74) X(22, iq2_s, 82) X(18, iq3_xxs, 98) X(21, iq3_s, 110) X(23, iq4_xs, 136) X(20, iq4_nl, 144)
 #define QTYPES(X) FTYPES(X) ITYPES(X)
 
 #define DEF_DEQUANT(T, NAME, SBB)                                                                                 \
