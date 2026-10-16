@@ -178,12 +178,13 @@ impl<'a> Model<'a> {
     fn attention(&self, il: usize, h: &[f32], kc: &mut Vec<f32>, vc: &mut Vec<f32>, pos: usize) -> Vec<f32> {
         let c = &self.cfg;
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
+        let qs = if c.q_gate { 2 * hd } else { hd };  // per-head row of attn_q: query, then the gate if any
         let qg = mv(&self.t(il, "attn_q.weight"), h);
         let (qn, kn) = (self.f(il, "attn_q_norm.weight"), self.f(il, "attn_k_norm.weight"));
         let mut q = vec![0f32; nh * hd];
         for i in 0..nh {
             let qh = &mut q[i * hd..(i + 1) * hd];
-            ops::rms_norm(&qg[i * 2 * hd..i * 2 * hd + hd], &qn, c.eps, qh);
+            ops::rms_norm(&qg[i * qs..i * qs + hd], &qn, c.eps, qh);
             ops::rope_neox(qh, c.n_rot, pos, c.rope_base);
         }
         let kraw = mv(&self.t(il, "attn_k.weight"), h);
@@ -213,8 +214,10 @@ impl<'a> Model<'a> {
                 let vt = &vc[(t * nkv + g) * hd..(t * nkv + g + 1) * hd];
                 for (o, vv) in oh.iter_mut().zip(vt) { *o += p * vv; }
             }
-            let gate = &qg[i * 2 * hd + hd..(i + 1) * 2 * hd];
-            for (o, gg) in oh.iter_mut().zip(gate) { *o *= ops::sigmoid(*gg); }
+            if c.q_gate {
+                let gate = &qg[i * qs + hd..(i + 1) * qs];
+                for (o, gg) in oh.iter_mut().zip(gate) { *o *= ops::sigmoid(*gg); }
+            }
         }
         mv(&self.t(il, "attn_output.weight"), &out)
     }

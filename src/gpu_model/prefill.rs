@@ -138,15 +138,16 @@ impl GpuModel<'_> {
                 }
                 Mixer::Attn { q, k, v, qn, kn, o, kc, vc } => {
                     let (kraw, kk, vv) = (at(l.c), at(l.c + n * kv), at(l.c + 2 * n * kv));
-                    g.gemm_dense(q, t, h, ne, at(l.a), 2 * nh * hd, 0)?;
-                    g.rms_norm(at(l.a), 2 * hd, qn.ptr, at(l.b), hd, hd, t * nh, eps)?;
+                    let qs = if c.q_gate { 2 * hd } else { hd };
+                    g.gemm_dense(q, t, h, ne, at(l.a), nh * qs, 0)?;
+                    g.rms_norm(at(l.a), qs, qn.ptr, at(l.b), hd, hd, t * nh, eps)?;
                     g.rope_neox(at(l.b), hd, t * nh, nh, c.n_rot, step, c.rope_base)?;
                     g.gemm_dense(k, t, h, ne, kraw, kv, 0)?;
                     g.gemm_dense(v, t, h, ne, vv, kv, 0)?;
                     g.rms_norm(kraw, hd, kn.ptr, kk, hd, hd, t * nkv, eps)?;
                     g.rope_neox(kk, hd, t * nkv, nkv, c.n_rot, step, c.rope_base)?;
                     g.kv_store(kk, vv, kc.addr, vc.addr, kv, t, step, hd)?;
-                    g.attn_prefill(at(l.b), kc.addr, vc.addr, at(l.a), at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt())?;
+                    g.attn_prefill(at(l.b), kc.addr, vc.addr, if c.q_gate { at(l.a) } else { 0 }, at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt())?;
                     g.gemm_dense(o, t, at(l.d), nh * hd, x, ne, 2)?;
                 }
             }
