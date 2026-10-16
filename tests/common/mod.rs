@@ -13,3 +13,27 @@ pub fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+use rusting_strata::backend::{Backend, Buf, Plain};
+
+/// Every GPU backend that opens on this machine, by name. One that fails to open for lack of a device is skipped
+/// with a note; any other error (such as a kernel compile error) fails the test.
+pub fn backends() -> Vec<(&'static str, Box<dyn Backend>)> {
+    let mut v: Vec<(&'static str, Box<dyn Backend>)> = vec![];
+    match rusting_strata::cuda::Gpu::new() {
+        Ok(g) => v.push(("cuda", Box::new(g))),
+        Err(e) if format!("{e}") == "CUDA init" => eprintln!("SKIP: cuda: {e:#}"),
+        Err(e) => panic!("{e:#}"),
+    }
+    v
+}
+
+/// A device copy of `v`.
+pub fn up<T: Plain>(g: &dyn Backend, v: &[T]) -> Buf {
+    let b = g.zeros::<T>(v.len()).unwrap();
+    g.put(v, &b, 0).unwrap();
+    b
+}
+
+/// All of `b` as values of `T`.
+pub fn down<T: Plain>(g: &dyn Backend, b: &Buf) -> Vec<T> { g.get(b, 0, b.len() / size_of::<T>()).unwrap() }

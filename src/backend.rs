@@ -96,6 +96,11 @@ pub trait Backend: Send {
     /// bytes. `pair` = (w2, y2) also computes the same product for the matrices at byte offset w2 into the output at
     /// byte offset y2. `xq` (not 0): x pre-quantized by `quant_xq` (k / xg rows), read in place of x.
     fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()>;
+    /// out = the first `rows` rows of `w` as floats (a test helper).
+    fn dequant(&self, w: &GpuTensor, rows: usize, out: u64) -> anyhow::Result<()>;
+    /// Quantize `nt` rows of n floats (row t at x + 4 * t * x_stride bytes) for `gemvq` / `moe_gemv` into `out`:
+    /// the nt rows of n int8 values, then their f32 scales (one per 32 values), nt * (n + n / 8) bytes in all.
+    fn quant_xq(&self, x: u64, x_stride: usize, n: usize, nt: usize, out: u64) -> anyhow::Result<()>;
     /// Expert cache lookup for k routed experts: slots[j] = table[ids[j]] (-1 = not resident); wh[j] = wts[j] on a hit, else 0.
     fn map_hits(&self, ids: u64, table: u64, slots: u64, wts: u64, wh: u64, k: usize) -> anyhow::Result<()>;
     /// `rows` rows: out[r] = rmsnorm(x[r]) * w.
@@ -128,7 +133,11 @@ pub trait Backend: Send {
     fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()>;
     /// Decode attention for `nt` query tokens, token t over positions 0 ..= step[2 t] (rows of q, qg, out and step per
     /// token, `part` holds `nh * ATT_SPLITS * (hd + 2)` floats per token). `qg` 0: no output gate.
-    fn attn_decode(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize) -> anyhow::Result<()>;
+    fn attn_decode(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize) -> anyhow::Result<()> {
+        self.attn_decode_gq(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, ATT_GQA_MIN, nt)
+    }
+    /// `attn_decode` that shares K/V loads across a GQA group from `gq_min` positions on (tests use 0 to force it).
+    fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize) -> anyhow::Result<()>;
     /// Route `t` tokens (logit rows of n, ids / wts rows of k).
     fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()>;
     /// Write routing and (on a miss) `h` to the layer mailbox at `mb` and raise its request flag.
