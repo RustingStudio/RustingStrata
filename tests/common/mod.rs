@@ -8,6 +8,13 @@ pub fn model_path() -> Option<std::path::PathBuf> {
     if p.exists() { Some(p) } else { eprintln!("SKIP: model file missing"); None }
 }
 
+/// True for the default model; tests of its exact shapes and type mix skip those checks on any other.
+pub fn is_default_model(p: &std::path::Path) -> bool {
+    let d = p == std::path::Path::new(DEFAULT_MODEL);
+    if !d { eprintln!("SKIP: default-model checks on {}", p.display()); }
+    d
+}
+
 /// Held by tests that load the whole model on the GPU: two at once do not fit in 12 GB.
 pub fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

@@ -42,7 +42,7 @@ fn parses_synthetic_file() {
 
 #[test]
 fn real_file_config() {
-    let Some(p) = common::model_path() else { return };
+    let Some(p) = common::model_path().filter(|p| common::is_default_model(p)) else { return };
     let g = Gguf::open(&p).unwrap();
     let c = ModelConfig::from_gguf(&g).unwrap();
     assert_eq!(c.arch, "qwen35moe");
