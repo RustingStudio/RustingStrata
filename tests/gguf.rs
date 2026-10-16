@@ -93,3 +93,55 @@ fn qwen3next_ssm_ba_split() {
         }
     }
 }
+
+/// Minimal qwen3next file: u32 metadata (plus the rms epsilon) and F32 tensors.
+fn qwen3next_syn(tag: &str, kv: &[(&str, u32)], tensors: &[(&str, [u64; 2])]) -> Gguf {
+    let mut b = Vec::new();
+    b.extend(b"GGUF");
+    b.extend(3u32.to_le_bytes());
+    b.extend((tensors.len() as u64).to_le_bytes());
+    b.extend((kv.len() as u64 + 2).to_le_bytes());
+    w_str(&mut b, "general.architecture");
+    b.extend(8u32.to_le_bytes());
+    w_str(&mut b, "qwen3next");
+    w_str(&mut b, "qwen3next.attention.layer_norm_rms_epsilon");
+    b.extend(6u32.to_le_bytes());
+    b.extend(1e-6f32.to_le_bytes());
+    for (k, v) in kv {
+        w_str(&mut b, &format!("qwen3next.{k}"));
+        b.extend(4u32.to_le_bytes());
+        b.extend(v.to_le_bytes());
+    }
+    let mut off = 0u64;
+    for (name, dims) in tensors {
+        w_str(&mut b, name);
+        b.extend(2u32.to_le_bytes());
+        for d in dims { b.extend(d.to_le_bytes()); }
+        b.extend(0u32.to_le_bytes()); // F32
+        b.extend(off.to_le_bytes());
+        off += (dims[0] * dims[1] * 4).next_multiple_of(32);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    b.resize(b.len() + off as usize, 0);
+    let p = std::env::temp_dir().join(format!("strata-{}-{tag}.gguf", std::process::id()));
+    std::fs::write(&p, &b).unwrap();
+    let g = Gguf::open(&p).unwrap();
+    std::fs::remove_file(&p).ok();
+    g
+}
+
+/// Malformed DeltaNet metadata or a mis-sized `ssm_ba` is an error, not a divide by zero or an out of bounds kernel read.
+#[test]
+fn rejects_bad_ssm_dims() {
+    let kv = |groups: u32| [("block_count", 4), ("embedding_length", 8), ("attention.head_count", 2), ("attention.head_count_kv", 1),
+        ("ssm.inner_size", 8), ("ssm.state_size", 4), ("ssm.group_count", groups), ("ssm.time_step_rank", 4), ("ssm.conv_kernel", 4)];
+    let emb = ("token_embd.weight", [8, 16]);
+    for groups in [0, 3, 8] {
+        let g = qwen3next_syn("ssm", &kv(groups), &[emb]);
+        assert!(ModelConfig::from_gguf(&g).is_err(), "group_count {groups}");
+    }
+    let ok = qwen3next_syn("ssm-ok", &kv(2), &[emb, ("blk.0.ssm_ba.weight", [8, 8])]);
+    Weights::new(&ok).unwrap();
+    let bad = qwen3next_syn("ssm-ba", &kv(2), &[emb, ("blk.0.ssm_ba.weight", [8, 6])]);
+    assert!(Weights::new(&bad).is_err());
+}

@@ -64,7 +64,10 @@ impl<'a> Weights<'a> {
         // llama.cpp src/models/qwen3next.cpp: per key head group, r = nv / nk beta rows, then r alpha rows.
         for il in 0..c.n_layer {
             let Ok(ba) = w.layer(il, "ssm_ba.weight") else { continue };
-            let (r, rb) = (c.ssm_dt_rank / c.ssm_n_group, ba.row_bytes());
+            let (nk, nv, rb) = (c.ssm_n_group, c.ssm_dt_rank, ba.row_bytes());
+            anyhow::ensure!(nk > 0 && nv > 0 && nv % nk == 0 && ba.rows == 2 * nv && ba.data.len() == ba.rows * rb,
+                "blk.{il}.ssm_ba: {} rows, {} bytes for group_count {nk}, time_step_rank {nv}", ba.rows, ba.data.len());
+            let r = nv / nk;
             let (mut b, mut a) = (Vec::with_capacity(ba.data.len() / 2), Vec::with_capacity(ba.data.len() / 2));
             for grp in ba.data.chunks_exact(2 * r * rb) {
                 b.extend_from_slice(&grp[..r * rb]);
