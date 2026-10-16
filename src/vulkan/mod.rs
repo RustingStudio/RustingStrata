@@ -20,6 +20,7 @@ const SPV: &[(&str, &[u8])] = &[
     ("conv_silu", include_bytes!("spv/conv_silu.spv")),
     ("dequant", include_bytes!("spv/dequant.spv")),
     ("gemv_f", include_bytes!("spv/gemv_f.spv")),
+    ("gemv_q", include_bytes!("spv/gemv_q.spv")),
     ("l2_norm", include_bytes!("spv/l2_norm.spv")),
     ("norm_gate", include_bytes!("spv/norm_gate.spv")),
     ("quant_xq", include_bytes!("spv/quant_xq.spv")),
@@ -29,7 +30,11 @@ const SPV: &[(&str, &[u8])] = &[
     ("swiglu", include_bytes!("spv/swiglu.spv")),
 ];
 
-pub struct Vk(Arc<Inner>);
+/// The device, and a scratch buffer of XQ bytes for x quantized by `quant_xq` when an op does that itself.
+pub struct Vk(Arc<Inner>, Buf);
+
+/// Bytes of the quantized-x scratch buffer.
+const XQ: usize = 4 << 20;
 
 struct Inner {
     _entry: ash::Entry,
@@ -188,7 +193,9 @@ impl Vk {
         st.staging = staging;
         st.map = map? as usize;
         drop(st);
-        Ok(Vk(Arc::new(inner)))
+        let mut v = Vk(Arc::new(inner), Buf::new(0, 0, ()));
+        v.1 = v.buf(XQ, false)?.0;
+        Ok(v)
     }
 }
 
@@ -478,9 +485,16 @@ impl Backend for Vk {
     }
     fn gemvq(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
         ensure!((1..=4).contains(&nt), "gemvn: {nt} inputs (1 to 4)");
-        let nsb = nsb(w)?;
-        if !matches!(w.ty, GgmlType::F32 | GgmlType::BF16) { return todo(&format!("gemv for {}", w.ty.name())); }
-        self.run("gemv_f", &wspec(self.0.llama, w.ty), [w.rows, 1, 1], &[&w.ptr, &x, &y, &(x_stride as u32), &(y_stride as u32), &nsb, &(nt as u32)])
+        let (nsb, spec) = (nsb(w)?, wspec(self.0.llama, w.ty));
+        if matches!(w.ty, GgmlType::F32 | GgmlType::BF16) {
+            return self.run("gemv_f", &spec, [w.rows, 1, 1], &[&w.ptr, &x, &y, &(x_stride as u32), &(y_stride as u32), &nsb, &(nt as u32)]);
+        }
+        let xq = if xq != 0 { xq } else {
+            ensure!(nt * w.cols * 9 / 8 <= XQ, "gemv: {nt} x {} inputs do not fit the quantized-x buffer", w.cols);
+            self.quant_xq(x, x_stride, w.cols, nt, self.1.addr())?;
+            self.1.addr()
+        };
+        self.run("gemv_q", &spec, [w.rows.div_ceil(8), 1, 1], &[&w.ptr, &xq, &y, &(y_stride as u32), &(w.rows as u32), &nsb, &(nt as u32)])
     }
     fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()> { todo("moe_gemv") }
     fn dequant(&self, w: &GpuTensor, rows: usize, out: u64) -> anyhow::Result<()> {

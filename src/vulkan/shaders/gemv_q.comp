@@ -1,0 +1,37 @@
+#version 460
+// y[t * ys + row] = W[row] . x[t] for t < nt (at most 4), with x pre-quantized by quant_xq at xq (nt rows of 256 nsb
+// int8 values, then their scales, one per 32): one subgroup per row, 8 rows per workgroup (CUDA gemv_row_qn).
+layout(local_size_x = 256) in;
+#include "common.glsl"
+#include "deq.glsl"
+
+layout(push_constant) uniform P { U8 w; U32 xq; F32 y; uint ys; uint rows; uint nsb; uint nt; } p;
+
+int sbyte(uint v, uint i) { return int(v << (24 - 8 * i)) >> 24; }
+
+void main() {
+    uint row = gl_WorkGroupID.x * 8 + gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    if (row >= p.rows) return;
+    F32 xd = F32(uint64_t(p.xq) + p.nt * p.nsb * 256);
+    precise float acc[4] = float[4](0.0, 0.0, 0.0, 0.0);
+    for (uint s = 0; s < p.nsb; s++) {
+        int q[8]; float d, m;
+        qi8(p.w, (row * p.nsb + s) * SBB, lane, q, d, m);
+        for (uint t = 0; t < p.nt; t++) {
+            uint o = (t * p.nsb + s) * 64 + lane * 2, a = p.xq.v[o], c = p.xq.v[o + 1];
+            int dot = 0, sx = 0;
+            for (uint i = 0; i < 4; i++) {
+                int xa = sbyte(a, i), xc = sbyte(c, i);
+                dot += q[i] * xa + q[i + 4] * xc;
+                sx += xa + xc;
+            }
+            float dx = xd.v[(t * p.nsb + s) * 8 + (lane >> 2)];
+            acc[t] = fma(d * dx, float(dot), acc[t]);
+            if (T == 10 || T == 12 || T == 13) acc[t] = fma(-(m * dx), float(sx), acc[t]);  // types with a min
+        }
+    }
+    for (uint t = 0; t < p.nt; t++) {
+        float a = warp_sum(acc[t]);
+        if (lane == 0) p.y.v[t * p.ys + row] = a;
+    }
+}
