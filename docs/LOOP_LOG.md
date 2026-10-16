@@ -1646,6 +1646,25 @@ code was not timed on that test. Full suite green, load 2.55.
   uses them); the 4B and 30B models fail the GEMV tests' type-coverage asserts by design (also on CUDA, Goal 3
   item). RADV deferred: no AMD GPU.
 
+### 2026-10-16 #93 — Vulkan V1: DeltaNet and dense decode end to end (197338b, eba809a)
+- 197338b (Task 1.8): `deltanet` ports `deltanet_seq` (same lane layout, fma order, reductions; snapshots; both key
+  head mappings). `deltanet_chunk_matches_steps` runs on every backend: output and state bit-identical to CUDA.
+- eba809a: the first greedy check on a 2337-token prompt diverged from CUDA after 9 tokens. Cause: CUDA (LLVM fma
+  contraction) fuses the per-chunk rescale into the first accumulate, `acc = fma(acc, cs, e * v)`; Vulkan did the
+  multiply and the fma apart. Only splits with more than one 32-position chunk (contexts above 512) differed, and
+  the test had none. The attention test gains nh 32 / nkv 8 (Qwen3-4B, group 4) and contexts of 1000 and 2100;
+  all shapes now bit-identical to CUDA through both kernels.
+- Task 1.9 gate, Qwen3-4B Q4_K_M, `generate --gpu --chunk 0 --mtp 0 -n 64`: identical output (md5) on CUDA and
+  Vulkan for 5 prompts ("The capital of France is", a poem, `def fibonacci(n):`, a chat-template question, and a
+  2337-token prompt that runs the GQA kernel). `GpuModel` needed no change.
+- Decode speed, same model, 256 tokens, 3 interleaved runs (load 1.8-1.9): CUDA 86.4 tok/s (86.3-86.6), Vulkan
+  47.6 tok/s (47.5-47.7). Speed is V4.
+- Gates: full suite green (load 1.9-7.1). One earlier run had `prefill_cached_reuses_history` (CUDA only) fail
+  with an error at `prefill_cached`; it passed alone and in two full reruns. Error text not captured; the commit
+  under test touched only Vulkan code.
+- Not verified: the default model and qwen3next on Vulkan (need MoE, V2); `--llama-numerics` attention on Vulkan;
+  RADV deferred (no AMD GPU).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
