@@ -26,10 +26,14 @@ const SPV: &[(&str, &[u8])] = &[
     ("gemv_q", include_bytes!("spv/gemv_q.spv")),
     ("kv_store", include_bytes!("spv/kv_store.spv")),
     ("l2_norm", include_bytes!("spv/l2_norm.spv")),
+    ("map_hits", include_bytes!("spv/map_hits.spv")),
+    ("moe_combine", include_bytes!("spv/moe_combine.spv")),
+    ("moe_publish", include_bytes!("spv/moe_publish.spv")),
     ("norm_gate", include_bytes!("spv/norm_gate.spv")),
     ("quant_xq", include_bytes!("spv/quant_xq.spv")),
     ("rms_norm", include_bytes!("spv/rms_norm.spv")),
     ("rope_neox", include_bytes!("spv/rope_neox.spv")),
+    ("router_topk", include_bytes!("spv/router_topk.spv")),
     ("ssm_gates", include_bytes!("spv/ssm_gates.spv")),
     ("swiglu", include_bytes!("spv/swiglu.spv")),
 ];
@@ -77,6 +81,9 @@ struct State {
     map: usize,
     /// Live buffers by start address: (buffer, bytes).
     bufs: BTreeMap<u64, (vk::Buffer, usize)>,
+    /// Host-mapped error word that `moe_combine` sets when the CPU worker does not answer: buffer, memory, host
+    /// pointer, device address.
+    err: (vk::Buffer, vk::DeviceMemory, usize, u64),
 }
 
 /// Owner of one `Buf`: the buffer and its memory, freed on drop.
@@ -98,6 +105,8 @@ impl Drop for Inner {
             let _ = self.dev.device_wait_idle();
             self.dev.destroy_buffer(st.staging.0, None);
             self.dev.free_memory(st.staging.1, None);
+            self.dev.destroy_buffer(st.err.0, None);
+            self.dev.free_memory(st.err.1, None);
             self.dev.destroy_fence(st.fence, None);
             self.dev.destroy_command_pool(st.pool, None);
             self.dev.destroy_command_pool(st.gpool, None);
@@ -132,7 +141,8 @@ fn unusable(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<String> 
     let missing: Vec<_> = [
         ("shaderInt16", int16), ("shaderInt64", int64), ("shaderFloat64", f64), ("storageBuffer16BitAccess", f11.storage_buffer16_bit_access),
         ("bufferDeviceAddress", f12.buffer_device_address), ("storageBuffer8BitAccess", f12.storage_buffer8_bit_access),
-        ("shaderInt8", f12.shader_int8), ("shaderFloat16", f12.shader_float16),
+        ("shaderInt8", f12.shader_int8), ("shaderFloat16", f12.shader_float16), ("vulkanMemoryModel", f12.vulkan_memory_model),
+        ("vulkanMemoryModelDeviceScope", f12.vulkan_memory_model_device_scope),
         ("subgroupSizeControl", f13.subgroup_size_control), ("computeFullSubgroups", f13.compute_full_subgroups),
     ].into_iter().filter(|f| f.1 == vk::FALSE).map(|f| f.0).collect();
     (!missing.is_empty()).then(|| format!("missing {}", missing.join(", ")))
@@ -170,7 +180,7 @@ impl Vk {
         let exts = if budget { vec![ash::ext::memory_budget::NAME.as_ptr()] } else { vec![] };
         let mut f11 = vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(true);
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true)
-            .storage_buffer8_bit_access(true).shader_int8(true).shader_float16(true);
+            .storage_buffer8_bit_access(true).shader_int8(true).shader_float16(true).vulkan_memory_model(true).vulkan_memory_model_device_scope(true);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default().subgroup_size_control(true).compute_full_subgroups(true);
         let mut f = features(&mut f11, &mut f12, &mut f13);
         f.features.shader_int16 = vk::TRUE;
@@ -189,13 +199,17 @@ impl Vk {
         let pc = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(128)];
         let layout = unsafe { dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc), None) }?;
         let st = State { pool, spare: vec![], used: vec![], cur: None, busy: false, gpool, graphs: HashMap::new(), rec: None,
-            pipes: HashMap::new(), fence, staging: Default::default(), map: 0, bufs: BTreeMap::new() };
+            pipes: HashMap::new(), fence, staging: Default::default(), map: 0, bufs: BTreeMap::new(), err: Default::default() };
         let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, llama: crate::cuda::llama_numerics() as u32, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, true)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
         st.staging = staging;
         st.map = map? as usize;
+        let (b, m) = inner.buffer(4, true)?;
+        let p = unsafe { inner.dev.map_memory(m, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }?;
+        unsafe { (p as *mut u32).write_volatile(0) };
+        st.err = (b, m, p as usize, unsafe { inner.dev.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(b)) });
         drop(st);
         let mut v = Vk(Arc::new(inner), Buf::new(0, 0, ()));
         v.1 = v.buf(XQ, false)?.0;
@@ -214,9 +228,11 @@ impl Inner {
         let size = bytes.max(1).next_multiple_of(4) as u64;
         let buf = unsafe { self.dev.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(usage), None) }?;
         let req = unsafe { self.dev.get_buffer_memory_requirements(buf) };
-        let want = if host { vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT } else { vk::MemoryPropertyFlags::DEVICE_LOCAL };
-        let ty = (0..self.mem.memory_type_count).find(|&i| req.memory_type_bits & (1 << i) != 0
-            && self.mem.memory_types[i as usize].property_flags.contains(want));
+        // Host memory: cached if possible, as CUDA's pinned memory (host reads of uncached memory are slow).
+        let hv = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let wants: &[_] = if host { &[hv | vk::MemoryPropertyFlags::HOST_CACHED, hv] } else { &[vk::MemoryPropertyFlags::DEVICE_LOCAL] };
+        let ty = wants.iter().find_map(|&want| (0..self.mem.memory_type_count).find(|&i| req.memory_type_bits & (1 << i) != 0
+            && self.mem.memory_types[i as usize].property_flags.contains(want)));
         let mut flags = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
         let r = ty.context("no memory type").and_then(|ty| Ok(unsafe { self.dev.allocate_memory(&vk::MemoryAllocateInfo::default()
             .allocation_size(req.size).memory_type_index(ty).push_next(&mut flags), None) }
@@ -276,6 +292,11 @@ impl Inner {
             let used = std::mem::take(&mut st.used);
             st.spare.extend(used);
             st.busy = false;
+            let e = st.err.2 as *mut u32;
+            if !e.is_null() && unsafe { e.read_volatile() } != 0 {
+                unsafe { e.write_volatile(0) };
+                anyhow::bail!("moe_combine: the CPU expert worker did not answer within about 2 s");
+            }
         }
         Ok(())
     }
@@ -507,7 +528,10 @@ impl Backend for Vk {
     fn quant_xq(&self, x: u64, x_stride: usize, n: usize, nt: usize, out: u64) -> anyhow::Result<()> {
         self.run("quant_xq", &[self.0.llama], [nt, 1, 1], &[&x, &out, &(x_stride as u32), &(n as u32)])
     }
-    fn map_hits(&self, ids: u64, table: u64, slots: u64, wts: u64, wh: u64, k: usize) -> anyhow::Result<()> { todo("map_hits") }
+    fn map_hits(&self, ids: u64, table: u64, slots: u64, wts: u64, wh: u64, k: usize) -> anyhow::Result<()> {
+        ensure!(k <= 32, "map_hits: top {k}");
+        self.run("map_hits", &[], [1, 1, 1], &[&ids, &table, &slots, &wts, &wh, &(k as u32)])
+    }
     fn rms_norm(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32) -> anyhow::Result<()> {
         self.rms_norm_q(x, x_stride, w, out, out_stride, n, rows, eps, 0)
     }
@@ -556,7 +580,16 @@ impl Backend for Vk {
         self.run("attn_decode", &[0, per, g as u32, 1], [nh / g * nt, ATT_SPLITS, 1], &args)?;
         self.run("attn_merge", &[], [nh, 1, nt], &[&part, &qg, &out, &step, &(hd as u32), &(ATT_SPLITS as u32), &(ATT_SPLITS_1 as u32), &gq_min])
     }
-    fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()> { todo("router_topk") }
-    fn moe_publish(&self, ids: u64, wts: u64, slots: u64, h: u64, mb: u64, k: usize, n: usize, h_off: usize, step: u64, t: usize) -> anyhow::Result<()> { todo("moe_publish") }
-    fn moe_combine(&self, x: u64, ye: u64, w: u64, k: usize, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, slots: u64, n: usize, t: usize) -> anyhow::Result<()> { todo("moe_combine") }
+    fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()> {
+        ensure!(n <= 512 && k <= 32, "router_topk: {n} experts, top {k}");
+        self.run("router_topk", &[], [t, 1, 1], &[&p, &ids, &wts, &(n as u32), &(k as u32), &extra_scale])
+    }
+    fn moe_publish(&self, ids: u64, wts: u64, slots: u64, h: u64, mb: u64, k: usize, n: usize, h_off: usize, step: u64, t: usize) -> anyhow::Result<()> {
+        ensure!(k * t <= 256, "moe_publish: {t} tokens of top {k}");
+        self.run("moe_publish", &[], [1, 1, 1], &[&ids, &wts, &slots, &h, &mb, &step, &(k as u32), &(n as u32), &(h_off as u32), &(t as u32)])
+    }
+    fn moe_combine(&self, x: u64, ye: u64, w: u64, k: usize, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, slots: u64, n: usize, t: usize) -> anyhow::Result<()> {
+        let err = self.0.st().err.3;
+        self.run("moe_combine", &[], [n.div_ceil(256), t, 1], &[&x, &ye, &w, &sh, &sg, &mb, &step, &slots, &err, &(k as u32), &(y_off as u32), &(n as u32)])
+    }
 }

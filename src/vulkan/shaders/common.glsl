@@ -10,6 +10,8 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer I32 { int v[
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32 { uint v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer U16 { uint16_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 1) buffer U8 { uint8_t v[]; };
+// Host-mapped memory that the host reads or writes while kernels run (the CPU expert mailbox).
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent volatile buffer MB { uint v[]; };
 
 // a / b and sqrt(x) refined to the IEEE (CUDA) result: GLSL's are a few ulp off. `precise` keeps fma fused.
 float fdiv(float a, float b) { float y = 1.0 / b, q = a * y; precise float r = fma(fma(-q, b, a), y, q); return r; }
