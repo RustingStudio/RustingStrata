@@ -27,7 +27,7 @@ fn rel_l2(a: &[f32], b: &[f32]) -> f32 {
 #[test]
 fn dequant_and_gemv_match_reference_for_every_type() {
     let Some(p) = common::model_path() else { return };
-    for (bk, gpu) in common::backends_except(&["vulkan"]) {
+    for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let g = Gguf::open(&p).unwrap();
@@ -51,7 +51,10 @@ fn dequant_and_gemv_match_reference_for_every_type() {
             let x = xs(t.cols);
             let dx = up(gpu, &x);
             let dy = gpu.zeros::<f32>(t.rows).unwrap();
-            gpu.gemv(&dt, dx.addr(), dy.addr()).unwrap();
+            match gpu.gemv(&dt, dx.addr(), dy.addr()) {
+                Err(e) if e.to_string().contains("not implemented") => { eprintln!("{:8} {name}: dequant max diff {diff:.2e}, {e}", ty.name()); continue }
+                r => r.unwrap(),
+            }
             let got = down::<f32>(gpu, &dy);
             let mut want = vec![0f32; t.rows];
             t.matvec(&as_seen(ty, &x), &mut want);
