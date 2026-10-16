@@ -97,7 +97,7 @@ impl ExpertCache {
         for i in order {
             let p = cache.layers[i / n].as_ref().unwrap().pool;
             let pool = &cache.pools[p];
-            if pool.owner.len() * pool.slot_bytes + pool.slot_bytes > pool.buf.len { continue; }
+            if pool.owner.len() * pool.slot_bytes + pool.slot_bytes > pool.buf.len() { continue; }
             let slot = pool.owner.len();
             cache.pools[p].owner.push((i / n, i % n));
             cache.place(m, gpu, i / n, i % n, slot, false)?;
@@ -129,13 +129,13 @@ impl ExpertCache {
     pub fn layer(&self, il: usize) -> Option<&LayerExperts> { self.layers[il].as_ref() }
     pub fn base(&self, lx: &LayerExperts) -> (u64, usize) {
         let p = &self.pools[lx.pool];
-        (p.buf.addr, p.slot_bytes)
+        (p.buf.addr(), p.slot_bytes)
     }
     /// Cache slot of expert `e` in layer `il`, or -1.
     pub fn slot(&self, il: usize, e: usize) -> i32 { self.layers[il].as_ref().map_or(-1, |l| l.table[e]) }
     pub fn resident(&self, il: usize, e: usize) -> bool { self.layers[il].as_ref().is_some_and(|l| l.table[e] >= 0) }
     pub fn resident_count(&self) -> usize { self.pools.iter().map(|p| p.owner.len()).sum() }
-    pub fn slot_bytes_total(&self) -> usize { self.pools.iter().map(|p| p.buf.len).sum() }
+    pub fn slot_bytes_total(&self) -> usize { self.pools.iter().map(|p| p.buf.len()).sum() }
     pub fn total_experts(&self) -> usize { self.layers.iter().flatten().count() * self.n_expert }
 
     pub fn record(&mut self, il: usize, ids: &[i32]) {

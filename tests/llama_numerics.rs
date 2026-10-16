@@ -76,7 +76,7 @@ fn attn_decode_matches_llama_cpu(base: &Gpu, llama: &Gpu) {
         let (dk, dv, dq, dg) = (gpu.stream.clone_htod(&kc).unwrap(), gpu.stream.clone_htod(&vc).unwrap(),
                                 gpu.stream.clone_htod(&q).unwrap(), gpu.stream.clone_htod(&qg).unwrap());
         let step = gpu.stream.clone_htod(&[n_pos as i32 - 1, 0]).unwrap();
-        let (dout, part) = (gpu.zeros::<f32>(nh * hd).unwrap(), gpu.zeros::<f32>(nh * ATT_SPLITS * (hd + 2)).unwrap());
+        let (dout, part) = (gpu.zeros_slice::<f32>(nh * hd).unwrap(), gpu.zeros_slice::<f32>(nh * ATT_SPLITS * (hd + 2)).unwrap());
         gpu.attn_decode_gq(gpu.ptr(&dq), gpu.ptr(&dk), gpu.ptr(&dv), gpu.ptr(&dg), gpu.ptr(&dout), gpu.ptr(&part), gpu.ptr(&step),
                            nh, nkv, hd, scale, gq_min, 1).unwrap();
         gpu.stream.clone_dtoh(&dout).unwrap()
@@ -122,7 +122,7 @@ fn attn_prefill_is_f32(base: &Gpu, llama: &Gpu) {
             let (dk, dv, dq, dg) = (gpu.stream.clone_htod(&kc).unwrap(), gpu.stream.clone_htod(&vc).unwrap(),
                                     gpu.stream.clone_htod(&q).unwrap(), gpu.stream.clone_htod(&qg).unwrap());
             let step = gpu.stream.clone_htod(&[pos0 as i32]).unwrap();
-            let dout = gpu.zeros::<f32>(t * nh * hd).unwrap();
+            let dout = gpu.zeros_slice::<f32>(t * nh * hd).unwrap();
             gpu.attn_prefill(gpu.ptr(&dq), gpu.ptr(&dk), gpu.ptr(&dv), gpu.ptr(&dg), gpu.ptr(&dout), gpu.ptr(&step), t, nh, nkv, hd, scale).unwrap();
             gpu.stream.clone_dtoh(&dout).unwrap()
         };

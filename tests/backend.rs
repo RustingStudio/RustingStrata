@@ -13,7 +13,7 @@ fn backend() -> Option<Box<dyn Backend>> {
 fn memory_ops_round_trip() {
     let Some(g) = backend() else { return };
     let a = g.zeros::<f32>(8).unwrap();
-    assert_eq!(a.len, 32);
+    assert_eq!(a.len(), 32);
     assert_eq!(g.get::<f32>(&a, 0, 8).unwrap(), [0.0; 8]);
     g.put(&[1.0f32, 2.0, 3.0], &a, 2).unwrap();
     assert_eq!(g.get::<f32>(&a, 0, 6).unwrap(), [0.0, 0.0, 1.0, 2.0, 3.0, 0.0]);
@@ -34,7 +34,7 @@ fn graph_records_once_and_replays() {
     let (x, y) = (g.zeros::<f32>(4).unwrap(), g.zeros::<f32>(4).unwrap());
     g.put(&[1.0f32, 2.0, 3.0, 4.0], &y, 0).unwrap();
     let mut calls = 0;
-    for _ in 0..3 { g.graph(5, &mut || { calls += 1; g.add(x.addr, y.addr, 4) }).unwrap(); }
+    for _ in 0..3 { g.graph(5, &mut || { calls += 1; g.add(x.addr(), y.addr(), 4) }).unwrap(); }
     assert_eq!(calls, 1, "f runs only when recording");
     assert_eq!(g.get::<f32>(&x, 0, 4).unwrap(), [3.0, 6.0, 9.0, 12.0]);
 }
@@ -46,7 +46,7 @@ fn host_mailbox_is_shared_with_kernels() {
     let ones = g.zeros::<f32>(4).unwrap();
     g.put(&[1.0f32; 4], &ones, 0).unwrap();
     unsafe { host.cast::<f32>().write_volatile(2.0) };
-    g.add(mb.addr, ones.addr, 4).unwrap(); // the kernel reads and writes host memory
+    g.add(mb.addr(), ones.addr(), 4).unwrap(); // the kernel reads and writes host memory
     g.sync().unwrap();
     let got: Vec<f32> = (0..4).map(|i| unsafe { host.cast::<f32>().add(i).read_volatile() }).collect();
     assert_eq!(got, [3.0, 1.0, 1.0, 1.0]);

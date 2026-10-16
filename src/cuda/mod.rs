@@ -34,8 +34,13 @@ pub struct Gpu {
     /// The kernels were compiled for a q8 KV cache (`--kv q8`).
     pub kv_q8: bool,
     /// Recorded graphs by `Backend::graph` key.
-    graphs: std::sync::Mutex<HashMap<u64, CudaGraph>>,
+    graphs: std::sync::Mutex<HashMap<u64, Graph>>,
 }
+
+/// A recorded graph. Its handles are plain CUDA driver handles, which any thread may launch once the context is
+/// bound (cudarc leaves `CudaGraph` without `Send` only because it holds raw pointers).
+struct Graph(CudaGraph);
+unsafe impl Send for Graph {}
 
 /// `--llama-numerics`: quantize activations like llama.cpp's CPU q8_K (one scale per 256) for every integer matmul,
 /// and run attention as its CPU flash attention does (LLAMA_Q8 in kernels.cu).
@@ -145,13 +150,13 @@ impl Gpu {
 
     pub fn ptr<T>(&self, s: &CudaSlice<T>) -> u64 { s.device_ptr(&self.stream).0 }
 
-    pub fn zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(&self, n: usize) -> anyhow::Result<CudaSlice<T>> {
+    pub fn zeros_slice<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(&self, n: usize) -> anyhow::Result<CudaSlice<T>> {
         Ok(self.stream.alloc_zeros::<T>(n.max(1))?)
     }
 
     /// First `rows` rows of `w`, dequantized on the GPU (test helper).
     pub fn dequant(&self, w: &GpuTensor, rows: usize) -> anyhow::Result<Vec<f32>> {
-        let out = self.zeros::<f32>(rows * w.cols)?;
+        let out = self.zeros_slice::<f32>(rows * w.cols)?;
         launch!(self, &kname("dequant", w.ty), cfg((rows as u32, 1), 256, 0), w.ptr, self.ptr(&out), (w.cols / 256) as i32);
         Ok(self.stream.clone_dtoh(&out)?)
     }
@@ -241,30 +246,30 @@ impl Backend for Gpu {
 
     // Synced on purpose, unlike cudarc's memcpy_htod: without it greedy output breaks (LOOP_LOG #85).
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
-        anyhow::ensure!(off + src.len() <= dst.len, "htod: {} bytes at {off} into {}", src.len(), dst.len);
+        anyhow::ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
         self.ctx.bind_to_thread()?;
-        unsafe { result::memcpy_htod_async(dst.addr + off as u64, src, self.stream.cu_stream()) }?;
+        unsafe { result::memcpy_htod_async(dst.addr() + off as u64, src, self.stream.cu_stream()) }?;
         Ok(self.stream.synchronize()?)
     }
 
     // As cudarc's clone_dtoh: copy, then a stream sync.
 
     fn dtoh(&self, src: &Buf, off: usize, dst: &mut [u8]) -> anyhow::Result<()> {
-        anyhow::ensure!(off + dst.len() <= src.len, "dtoh: {} bytes at {off} from {}", dst.len(), src.len);
+        anyhow::ensure!(off + dst.len() <= src.len(), "dtoh: {} bytes at {off} from {}", dst.len(), src.len());
         self.ctx.bind_to_thread()?;
-        unsafe { result::memcpy_dtoh_async(dst, src.addr + off as u64, self.stream.cu_stream()) }?;
+        unsafe { result::memcpy_dtoh_async(dst, src.addr() + off as u64, self.stream.cu_stream()) }?;
         Ok(self.stream.synchronize()?)
     }
 
     fn dtod(&self, src: &Buf, src_off: usize, dst: &Buf, dst_off: usize, bytes: usize) -> anyhow::Result<()> {
-        anyhow::ensure!(src_off + bytes <= src.len && dst_off + bytes <= dst.len, "dtod: {bytes} bytes out of range");
+        anyhow::ensure!(src_off + bytes <= src.len() && dst_off + bytes <= dst.len(), "dtod: {bytes} bytes out of range");
         self.ctx.bind_to_thread()?;
-        Ok(unsafe { result::memcpy_dtod_async(dst.addr + dst_off as u64, src.addr + src_off as u64, bytes, self.stream.cu_stream()) }?)
+        Ok(unsafe { result::memcpy_dtod_async(dst.addr() + dst_off as u64, src.addr() + src_off as u64, bytes, self.stream.cu_stream()) }?)
     }
 
     fn memset(&self, dst: &Buf) -> anyhow::Result<()> {
         self.ctx.bind_to_thread()?;
-        Ok(unsafe { result::memset_d8_async(dst.addr, 0, dst.len, self.stream.cu_stream()) }?)
+        Ok(unsafe { result::memset_d8_async(dst.addr(), 0, dst.len(), self.stream.cu_stream()) }?)
     }
 
     fn mem_info(&self) -> anyhow::Result<(usize, usize)> { Ok(self.ctx.mem_get_info()?) }
@@ -273,7 +278,7 @@ impl Backend for Gpu {
 
     /// CUDA graph captured from the stream. `STRATA_NO_GRAPH` runs `f` every time instead.
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
-        if let Some(g) = self.graphs.lock().unwrap().get(&key) { return Ok(g.launch()?); }
+        if let Some(g) = self.graphs.lock().unwrap().get(&key) { return Ok(g.0.launch()?); }
         if std::env::var_os("STRATA_NO_GRAPH").is_some() { return f(); }
         self.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
         let r = f();
@@ -281,7 +286,7 @@ impl Backend for Gpu {
         r?;
         let g = g.ok_or_else(|| anyhow::anyhow!("empty CUDA graph"))?;
         g.launch()?;
-        self.graphs.lock().unwrap().insert(key, g);
+        self.graphs.lock().unwrap().insert(key, Graph(g));
         Ok(())
     }
 
@@ -298,20 +303,15 @@ impl Backend for Gpu {
         Ok((Buf::new(dev, 4 * n, mem), host))
     }
 
-    /// Tensor-core GEMM over a tile list (see `GemmTile` in kernels.cu): for each tile, positions m0 .. m0 + cnt get
-    /// y[m, 0..rows] = W_tile x[xrow[m]] (x row m when `xrow` is 0). `tiles` is a device array of [w, m0 | cnt << 32].
-    /// `act`: 0 stores, 1 computes y = silu(y) * result (SwiGLU with the gate already in y), 2 adds to y.
-    /// `n_x`: rows of x the tiles read (integer weight types quantize them to int8 first).
+    /// Tensor-core GEMM (see `GemmTile` in kernels.cu); integer weight types quantize x to int8 first.
     fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
         self.gemm_raw(ty, rows, cols, tiles, n_tiles, 0, 0, x, x_stride, n_x, xrow, y, y_stride, act)
     }
 
-    /// y[m] (op) W x[m] for positions m < n, x and y rows `x_stride` / `y_stride` floats apart.
     fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
         self.gemm_raw(w.ty, w.rows, w.cols, 0, n.div_ceil(GEMM_BM), w.ptr, n, x, x_stride, n, 0, y, y_stride, act)
     }
 
-    /// y = W x (all rows of `w`).
     fn gemv(&self, w: &GpuTensor, x: u64, y: u64) -> anyhow::Result<()> {
         let nsb = Self::nsb(w)?;
         let (c, rpw) = Self::gemv_cfg(w.ty, w.rows, w.cols, 1);
@@ -319,13 +319,10 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    /// y[t] = W x[t] for t < nt (x[t] at x + 4 * t * x_stride bytes, y[t] at y + 4 * t * y_stride); each weight
-    /// block is read once for all nt.
     fn gemvn(&self, w: &GpuTensor, x: u64, x_stride: usize, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
         self.gemvq(w, x, x_stride, 0, y, y_stride, nt)
     }
 
-    /// `gemvn` that reads x pre-quantized by `quant_xq` at `xq` (0 = quantize x per block; float weights read x).
     fn gemvq(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
         if !(1..=4).contains(&nt) { bail!("gemvn: {nt} inputs (1 to 4)"); }
         let nsb = Self::nsb(w)?;
@@ -335,9 +332,6 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    /// For j < k with ids[j] >= 0: y[j] = W_j x[j / xg], where W_j is the `rows` x `cols` matrix at w + ids[j] * stride bytes.
-    /// `pair` = (w2, y2) also computes the same product for the matrices at byte offset w2 into the output at byte offset y2.
-    /// `xq` (not 0): x pre-quantized by `quant_xq` (k / xg rows), read in place of x.
     fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()> {
         if cols % 256 != 0 { bail!("{} expert with {cols} columns: GEMV needs a multiple of 256", ty.name()); }
         let (mut c, mut rpw) = Self::gemv_cfg(ty, rows, cols, k);
@@ -355,30 +349,25 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    /// `rows` rows: out[r] = rmsnorm(x[r]) * w.
     fn rms_norm(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32) -> anyhow::Result<()> {
         self.rms_norm_q(x, x_stride, w, out, out_stride, n, rows, eps, 0)
     }
 
-    /// `rms_norm` that also writes its output quantized as `quant_xq` does to `xq` (when not 0).
     fn rms_norm_q(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32, xq: u64) -> anyhow::Result<()> {
         launch!(self, "rms_norm", cfg((rows as u32, 1), 512, 0), x, x_stride as i32, w, out, out_stride as i32, n as i32, eps, xq);
         Ok(())
     }
 
-    /// out[r] = argmax of row r of x (`rows` rows of n floats), first index on ties.
     fn argmax_rows(&self, x: u64, n: usize, rows: usize, out: u64) -> anyhow::Result<()> {
         launch!(self, "argmax_rows", cfg((rows as u32, 1), 1024, 0), x, n as i32, out);
         Ok(())
     }
 
-    /// Row r: vector r % per (n floats) of token r / per, tokens `stride` floats apart.
     fn l2_norm(&self, x: u64, n: usize, per: usize, stride: usize, rows: usize, eps: f32) -> anyhow::Result<()> {
         launch!(self, "l2_norm", cfg((rows as u32, 1), 128, 0), x, n as i32, per as i32, stride as i32, eps);
         Ok(())
     }
 
-    /// `heads` rows of `stride` floats, `per` per token; token t is at position step[0] + t.
     fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
         launch!(self, "rope_neox", cfg(((heads / per) as u32, 1), (n_rot / 2) as u32, 0), x, stride as i32, per as i32, n_rot as i32, step, base);
         Ok(())
@@ -404,8 +393,6 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    /// Scan `t` tokens (rows of y `ych` floats apart) through the DeltaNet state `s`.
-    /// `snap`: room for `nsnap` states; the state after each of the first min(nsnap, t - 1) tokens is kept there.
     fn deltanet(&self, y: u64, s: u64, beta: u64, g: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> {
         let rows = 512 / dk.max(1);  // state rows per warp
         anyhow::ensure!(matches!(dk, 32 | 64 | 128 | 256) && dv % rows == 0, "deltanet: head dims {dk}/{dv} unsupported");
@@ -414,7 +401,6 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    /// Causal conv + SiLU over `t` tokens of `ch` channels, then roll the conv state forward (snapshots as in `deltanet`).
     fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> {
         launch!(self, "conv_seq", Self::grid(t * ch), qkv, state, w, y, ch as i32, kw as i32, t as i32);
         launch!(self, "conv_state", Self::grid(ch), qkv, state, ch as i32, kw as i32, t as i32, snap, nsnap as i32);
@@ -439,8 +425,6 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    /// Store `t` tokens of `n` values at positions step[0] ...
-    /// u16 words of a KV cache for `n` values: f16, or q8 with one f16 scale per 32 values.
     fn kv_words(&self, n: usize) -> usize { if self.kv_q8 { n * 17 / 32 } else { n } }
 
     fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()> {
@@ -450,29 +434,24 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    /// Decode attention for `nt` query tokens, token t over positions 0 ..= step[2 t] (rows of q, qg, out and step
-    /// per token, `part` holds `nh * ATT_SPLITS * (hd + 2)` floats per token). One launch serves all tokens, their
-    /// blocks side by side, so they read the same K/V rows from L2. Below ATT_GQA_MIN positions one block serves one head
+    /// One launch serves all tokens, their blocks side by side, so they read the same K/V rows from L2. Below ATT_GQA_MIN positions one block serves one head
     /// (ATT_SPLITS_1 splits), from it on one block serves all query heads of a KV head (ATT_SPLITS splits). Both
     /// kernels are launched; the step decides which one works.
     fn attn_decode(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize) -> anyhow::Result<()> {
         self.attn_decode_gq(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, ATT_GQA_MIN, nt)
     }
 
-    /// Route `t` tokens (logit rows of n, ids / wts rows of k).
     fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()> {
         anyhow::ensure!(n <= 512 && k <= 32, "router_topk: {n} experts, top {k}");
         launch!(self, "router_topk", cfg((t as u32, 1), 32, 0), p, n as i32, k as i32, extra_scale, ids, wts);
         Ok(())
     }
 
-    /// Write routing and (on a miss) `h` to the layer mailbox at `mb` and raise its request flag.
     fn moe_publish(&self, ids: u64, wts: u64, slots: u64, h: u64, mb: u64, k: usize, n: usize, h_off: usize, step: u64, t: usize) -> anyhow::Result<()> {
         launch!(self, "moe_publish", cfg((1, 1), 256, 0), ids, wts, slots, h, mb, k as i32, n as i32, h_off as i32, step, t as i32);
         Ok(())
     }
 
-    /// `mb` = 0: no CPU part. Otherwise adds the CPU result at word `y_off` of the mailbox once its done flag is `seq`.
     fn moe_combine(&self, x: u64, ye: u64, w: u64, k: usize, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, slots: u64, n: usize, t: usize) -> anyhow::Result<()> {
         let mut c = Self::grid(n);
         c.grid_dim.1 = t as u32;
