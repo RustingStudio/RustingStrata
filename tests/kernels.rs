@@ -303,8 +303,9 @@ fn attn_prefill_matches_decode() {
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
-        let (pos0, t) = (5, 100);
-        for (nh, nkv, hd) in [(4, 2, 64), (4, 2, 128), (4, 2, 256), (16, 2, 256), (8, 8, 128)] {
+        // Long contexts give each split several 32-position chunks.
+        for (pos0, t, nh, nkv, hd) in [(5, 100, 4, 2, 64), (5, 100, 4, 2, 128), (5, 100, 4, 2, 256), (5, 100, 16, 2, 256),
+                                       (5, 100, 8, 8, 128), (5, 100, 32, 8, 128), (2100, 3, 32, 8, 128), (1000, 3, 16, 2, 256)] {
             let n = (pos0 + t) * nkv * hd;
             let (kf, vf) = (xs(n), xs(n + 5)[5..].to_vec());
             let (dk, dv) = (gpu.zeros::<u16>(n).unwrap(), gpu.zeros::<u16>(n).unwrap());
@@ -360,8 +361,8 @@ fn attn_prefill_matches_decode() {
                 let want = down::<f32>(gpu, &ddec);
                 let e = rel_l2(&want, &gated(&cpu));
                 assert!(e <= 1e-5, "attn_decode nh {nh} nkv {nkv} hd {hd} gq_min {gq_min}: rel err vs CPU {e}");
-                let f = first.entry((nh, nkv, hd, gq_min)).or_insert_with(|| want.clone());
-                eprintln!("attn_decode nh {nh} nkv {nkv} hd {hd} gq_min {gq_min}: rel err vs CPU {e:.2e}, {} of {} differ from the first backend",
+                let f = first.entry((pos0, nh, nkv, hd, gq_min)).or_insert_with(|| want.clone());
+                eprintln!("attn_decode pos {pos0} nh {nh} nkv {nkv} hd {hd} gq_min {gq_min}: rel err vs CPU {e:.2e}, {} of {} differ from the first backend",
                           want.iter().zip(f.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count(), want.len());
                 for i in 0..t {
                     let s = up(gpu, &[(pos0 + i) as i32]);

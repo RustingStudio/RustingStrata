@@ -78,14 +78,13 @@ void main() {
             if (lane == 0) sc[w] = cs;
         }
         barrier();
-        for (uint i = 0; i < G; i++) {
-            float cs = sc[i];
-            for (uint d = 0; d < PER; d++) acc[i * PER + d] *= cs;
-        }
         for (uint j = 0; j < J; j++)
             for (uint i = 0; i < G; i++) {
                 float e = ss[i * C + w * J + j];
-                for (uint d = 0; d < PER; d++) acc[i * PER + d] = fma(e, hraw(vr[j * PER / 2 + d / 2], d), acc[i * PER + d]);
+                for (uint d = 0; d < PER; d++) {
+                    float v = hraw(vr[j * PER / 2 + d / 2], d);
+                    acc[i * PER + d] = j == 0 ? fma(acc[i * PER + d], sc[i], e * v) : fma(e, v, acc[i * PER + d]);
+                }
             }
         barrier();
     }
