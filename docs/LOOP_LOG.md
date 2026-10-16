@@ -1665,6 +1665,48 @@ code was not timed on that test. Full suite green, load 2.55.
 - Not verified: the default model and qwen3next on Vulkan (need MoE, V2); `--llama-numerics` attention on Vulkan;
   RADV deferred (no AMD GPU).
 
+### 2026-10-16 #94 — Vulkan V2: MoE decode (44ce104, 46c8024, ab6908a, d5aa421)
+- 44ce104 (Task 2.1): `router_topk`, `map_hits`, `moe_publish`, `moe_combine` and the CPU expert mailbox.
+  `router_topk` is bit-identical to CUDA. The kernel side of the mailbox uses Vulkan memory model atomics (release
+  store of the request flag, acquire loads of the done flag); a kernel spinning without them was never released,
+  and after about 5 s the driver reports device lost, so `moe_combine` gives up after about 2.3 s and sets an
+  error word that the host turns into an error.
+- 46c8024 (Task 2.2): `moe_gemv_q`/`moe_gemv_f` (paired gate/up), bit-identical to CUDA. `moe_gemv_selects_experts`
+  used expert id 200, past the 128 experts of Qwen3-30B (CUDA illegal address there); it now uses the last expert.
+- d5aa421 (Task 2.3), three fixes found running the default model:
+  - IQ tables as GLSL const arrays went to per-thread local memory on NVIDIA: IQ2_XS expert GEMVs took about 35 ms
+    a call (about 200x CUDA), 0.7 tok/s. They now live in one device buffer read through buffer references, its
+    address in spec constants 3 and 4; `tables.glsl` comes from `vulkan::iq_tables`. Then about 41 tok/s.
+  - With many misses `moe_combine` timed out: the kernel saw the worker's done flag in host memory hundreds of ms
+    late (stale L2 copy), even with an acquire load and with uncached host memory. The earlier mailbox test passed
+    by timing. The mailbox is now device memory mapped through the BAR (ReBAR is on: memory type 5, 12 GB); the
+    worker puts SeqCst fences around the done store (they also flush write-combining stores). Host reads of BAR
+    memory are uncached, a V4 item.
+  - `moe_publish` used `barrier()`, which orders only shared memory under the Vulkan memory model; a control
+    barrier over buffer memory now precedes the request flag. No observed failure; formal fix.
+  - `STRATA_EXPERT_MB` caps the expert slots. Placement depends on free VRAM, so without it two runs (or two
+    backends) can place different experts and give different, equally valid, greedy text.
+- ab6908a: with experts on the CPU, Vulkan greedy diverged from CUDA a few tokens in. Per-op checksums of layers
+  0-3 found `ssm_gates`: Vulkan's softplus used `log(1 + x) * x / ((1 + x) - 1)`, a last-bit difference from CUDA's
+  `log1pf`, which changes the DeltaNet decay from the second token on. `log1p_` now ports the PTX of `log1pf`. New
+  test `ssm_gates_match_across_backends` (fails on the old shader). With all experts resident the difference had
+  hidden behind matching text for 32 tokens.
+- V2 gates (`--chunk 0 --mtp 0 --fixed-experts`, a frozen copy of the routing profile via `XDG_CACHE_HOME`, same
+  `STRATA_EXPERT_MB`): greedy 64 tokens identical (md5) on CUDA and Vulkan for the default model (1 MB and 8000
+  MB caps: 0 and 8189 resident experts), Qwen3-30B (1 and 5000 MB) and Qwen3-Next (1 and 5000 MB). Parity, default
+  model, `--chunk 0`, cap 8000: Vulkan 632/640 = 98.75%, CUDA 632/640, identical per prompt (load 2.5-7.0).
+- Decode, default model, 256 tokens, cap 8000 (79% hit), `--chunk 0 --mtp 0` (load 2.8-4.0): Vulkan 46.5 tok/s
+  (45.9-46.6, 7 runs), CUDA 74.6 tok/s (73.5-75.0, 6 runs). In the first batch 3 of 6 runs printed no speed line;
+  the exit status was not captured and 12 reruns were all clean. Not explained.
+- CUDA unchanged (shared code: worker fences, the env cap): greedy md5 equal to the previous binary on 2 prompts
+  x `--chunk 0`/`4096` with `--fixed-experts`. Parity `--gpu --backend cuda --fixed-experts`, 3 interleaved runs:
+  previous 626/626/627, new 626/628/627 (load 2.1-4.6). That is below the 633 of #62 in both binaries, so the drop
+  predates this work (routing profile and placement have moved since). `greedy24.py --extra="--gpu --mtp 0"`
+  fails on CUDA in both binaries (3/3 each): " Paris." then a near-tie that placement decides.
+- Full suite green after each commit (71 passed, load 7.7-8.8).
+- Not verified: Vulkan prefill (`gemm`, `gemm_dense`, `conv_seq`, `attn_prefill`, `moe_combine_seq` are V3), so
+  Vulkan parity runs only with `--chunk 0`; MTP on Vulkan; RADV deferred (no AMD GPU).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
