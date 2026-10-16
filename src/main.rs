@@ -59,7 +59,7 @@ struct Engine {
     /// default f16 cache).
     #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
     kv: String,
-    /// GPU backend: cuda [default: cuda].
+    /// GPU backend: cuda or vulkan [default: cuda if it loads, else vulkan].
     #[arg(long)]
     backend: Option<String>,
     /// GPU index.

@@ -21,8 +21,21 @@ fn memory_ops_round_trip() {
 }
 
 #[test]
-fn graph_records_once_and_replays() {
+fn large_copies_round_trip() {
     for (bk, g) in common::backends() {
+        eprintln!("backend {bk}");
+        let v: Vec<u32> = (0..20u32 << 20).map(|i| i.wrapping_mul(2654435761)).collect(); // 80 MB, past one staging chunk
+        let a = g.zeros::<u32>(v.len() + 1).unwrap();
+        g.put(&v, &a, 1).unwrap();
+        let b = g.zeros::<u32>(v.len() + 1).unwrap();
+        g.dtod(&a, 0, &b, 0, a.len()).unwrap();
+        assert!(g.get::<u32>(&b, 1, v.len()).unwrap() == v);
+    }
+}
+
+#[test]
+fn graph_records_once_and_replays() {
+    for (bk, g) in common::backends_except(&["vulkan"]) {
         eprintln!("backend {bk}");
         if std::env::var_os("STRATA_NO_GRAPH").is_some() { return; }
         let (x, y) = (g.zeros::<f32>(4).unwrap(), g.zeros::<f32>(4).unwrap());
@@ -36,7 +49,7 @@ fn graph_records_once_and_replays() {
 
 #[test]
 fn host_mailbox_is_shared_with_kernels() {
-    for (bk, g) in common::backends() {
+    for (bk, g) in common::backends_except(&["vulkan"]) {
         eprintln!("backend {bk}");
         let (mb, host) = g.host_mailbox(4).unwrap();
         let ones = g.zeros::<f32>(4).unwrap();

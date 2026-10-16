@@ -25,7 +25,17 @@ pub fn backends() -> Vec<(&'static str, Box<dyn Backend>)> {
         Err(e) if format!("{e}") == "CUDA init" => eprintln!("SKIP: cuda: {e:#}"),
         Err(e) => panic!("{e:#}"),
     }
+    match rusting_strata::vulkan::Vk::new(0) {
+        Ok(g) => v.push(("vulkan", Box::new(g))),
+        Err(e) if format!("{e}") == "Vulkan init" => eprintln!("SKIP: vulkan: {e:#}"),
+        Err(e) => panic!("{e:#}"),
+    }
     v
+}
+
+/// `backends()` less the named ones, for tests of ops a backend does not have yet.
+pub fn backends_except(skip: &[&str]) -> Vec<(&'static str, Box<dyn Backend>)> {
+    backends().into_iter().filter(|b| !skip.contains(&b.0)).collect()
 }
 
 /// A device copy of `v`.
