@@ -65,7 +65,7 @@ fn dequant_and_gemv_match_reference_for_every_type() {
 
 #[test]
 fn rms_norm_q_matches_quant_xq() {
-    for (bk, gpu) in common::backends_except(&["vulkan"]) {
+    for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let (n, rows) = (2048, 3);
@@ -456,8 +456,96 @@ fn elementwise_ops_match_cpu() {
 }
 
 #[test]
+fn norm_rope_and_gate_ops_match_cpu() {
+    use rusting_strata::ops;
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        eprintln!("backend {bk}");
+        let close = |got: &[f32], want: &[f32], what: &str| assert!(rel_l2(got, want) < 1e-6, "{what}: rel err {}", rel_l2(got, want));
+        let (n, rows) = (2048, 3);
+        let (x, w) = (xs(rows * n).iter().map(|v| v * 3.0).collect::<Vec<f32>>(), xs(n + 7)[7..].to_vec());
+        let (dx, dw, dout) = (up(gpu, &x), up(gpu, &w), gpu.zeros::<f32>(rows * n).unwrap());
+        gpu.rms_norm(dx.addr(), n, dw.addr(), dout.addr(), n, n, rows, 1e-6).unwrap();
+        let mut want = vec![0f32; rows * n];
+        for (o, r) in want.chunks_mut(n).zip(x.chunks(n)) { ops::rms_norm(r, &w, 1e-6, o) }
+        close(&down::<f32>(gpu, &dout), &want, "rms_norm");
+
+        // quant_xq: int8 rows, then scales, as the CPU rounds them.
+        let dq = gpu.zeros::<u8>(rows * n * 9 / 8).unwrap();
+        gpu.quant_xq(dx.addr(), n, n, rows, dq.addr()).unwrap();
+        let q = down::<u8>(gpu, &dq);
+        let (mut wq, mut wd) = (vec![], vec![]);
+        for b in x.chunks(32) {
+            let mx = b.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let id = if mx > 0.0 { 127.0 / mx } else { 0.0 };
+            wq.extend(b.iter().map(|v| (v * id).round_ties_even() as i8 as u8));
+            wd.extend((mx / 127.0).to_le_bytes());
+        }
+        assert_eq!(q[..rows * n], wq[..], "quant_xq values");
+        assert_eq!(q[rows * n..], wd[..], "quant_xq scales");
+
+        // l2_norm on vectors of 128, 2 per token, tokens 300 floats apart.
+        let (hn, per, stride) = (128, 2, 300);
+        let dx = up(gpu, &x[..3 * stride]);
+        gpu.l2_norm(dx.addr(), hn, per, stride, 3 * per, 1e-6).unwrap();
+        let mut want = x[..3 * stride].to_vec();
+        for t in 0..3 { for h in 0..per { ops::l2_norm(&mut want[t * stride + h * hn..][..hn], 1e-6) } }
+        close(&down::<f32>(gpu, &dx), &want, "l2_norm");
+
+        // rope_neox: 3 tokens from position 30000, 2 heads each, 64 of 128 dims rotated.
+        let (hd, n_rot, pos) = (128, 64, 30_000);
+        let dx = up(gpu, &x[..6 * hd]);
+        let step = up(gpu, &[pos as i32, 0]);
+        gpu.rope_neox(dx.addr(), hd, 6, 2, n_rot, step.addr(), 1e7).unwrap();
+        let mut want = x[..6 * hd].to_vec();
+        for (h, v) in want.chunks_mut(hd).enumerate() { ops::rope_neox(v, n_rot, pos + h / 2, 1e7) }
+        close(&down::<f32>(gpu, &dx), &want, "rope_neox");
+
+        // norm_gate over 4 heads of 128.
+        let z = xs(4 * hn + 3)[3..].to_vec();
+        let (dx, dz) = (up(gpu, &x[..4 * hn]), up(gpu, &z));
+        gpu.norm_gate(dx.addr(), dw.addr(), dz.addr(), hn, 4, 1e-6).unwrap();
+        let mut want = vec![0f32; 4 * hn];
+        for h in 0..4 {
+            ops::rms_norm(&x[h * hn..][..hn], &w[..hn], 1e-6, &mut want[h * hn..][..hn]);
+            for i in h * hn..(h + 1) * hn { want[i] *= ops::silu(z[i]) }
+        }
+        close(&down::<f32>(gpu, &dx), &want, "norm_gate");
+
+        // ssm_gates on 3 tokens of 5 heads, with g reaching the softplus cutoff.
+        let (nv, nt) = (5, 3);
+        let (beta, g): (Vec<f32>, Vec<f32>) = (x[..nv * nt].to_vec(), x[100..100 + nv * nt].iter().map(|v| v * 30.0).collect());
+        let (dt, a) = (xs(nv + 1)[1..].to_vec(), xs(nv + 2)[2..].to_vec());
+        let (db, dg, ddt, da) = (up(gpu, &beta), up(gpu, &g), up(gpu, &dt), up(gpu, &a));
+        gpu.ssm_gates(db.addr(), dg.addr(), ddt.addr(), da.addr(), nv * nt, nv).unwrap();
+        close(&down::<f32>(gpu, &db), &beta.iter().map(|&b| ops::sigmoid(b)).collect::<Vec<_>>(), "ssm_gates beta");
+        let want: Vec<f32> = g.iter().enumerate().map(|(i, &g)| ops::softplus(g + dt[i % nv]) * a[i % nv]).collect();
+        close(&down::<f32>(gpu, &dg), &want, "ssm_gates g");
+
+        // conv_silu: 300 channels, kernel 4, two steps so the state shifts.
+        let (ch, kw) = (300, 4);
+        let (cw, st0) = (xs(ch * kw + 5)[5..].to_vec(), xs((kw - 1) * ch + 9)[9..].to_vec());
+        let (dcw, dst, dy) = (up(gpu, &cw), up(gpu, &st0), gpu.zeros::<f32>(ch).unwrap());
+        let mut st = st0.clone();
+        for s in 0..2 {
+            let qkv = x[s * ch..][..ch].to_vec();
+            let dq = up(gpu, &qkv);
+            gpu.conv_silu(dq.addr(), dst.addr(), dcw.addr(), dy.addr(), ch, kw).unwrap();
+            let want: Vec<f32> = (0..ch).map(|c| {
+                let acc = (0..kw - 1).map(|k| st[k * ch + c] * cw[c * kw + k]).sum::<f32>() + qkv[c] * cw[c * kw + kw - 1];
+                ops::silu(acc)
+            }).collect();
+            st.drain(..ch);
+            st.extend(&qkv);
+            close(&down::<f32>(gpu, &dy), &want, "conv_silu y");
+            close(&down::<f32>(gpu, &dst), &st, "conv_silu state");
+        }
+    }
+}
+
+#[test]
 fn argmax_rows_matches_ops_argmax() {
-    for (bk, gpu) in common::backends_except(&["vulkan"]) {
+    for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let n = 248_320;

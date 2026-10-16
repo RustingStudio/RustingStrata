@@ -1,0 +1,30 @@
+#version 460
+layout(local_size_x = 1024) in;
+#include "common.glsl"
+// Workgroup = row. o[r] = index of the largest x in row r (the first one on ties, like ops::argmax).
+layout(push_constant) uniform P { F32 x; I32 o; uint n; } p;
+shared float sv[32];
+shared int si[32];
+void reduce(inout float b, inout int bi) {
+    for (uint o = 16; o > 0; o >>= 1) {
+        float v = subgroupShuffleXor(b, o); int vi = subgroupShuffleXor(bi, o);
+        if (v > b || (v == b && vi < bi)) { b = v; bi = vi; }
+    }
+}
+void main() {
+    uint xo = gl_WorkGroupID.x * p.n, lane = gl_SubgroupInvocationID, w = gl_SubgroupID;
+    float ninf = uintBitsToFloat(0xff800000u), b = ninf;
+    int n = int(p.n), bi = n;
+    for (uint i = gl_LocalInvocationID.x; i < p.n; i += 1024) {
+        float v = p.x.v[xo + i];
+        if (v > b || bi == n) { b = v; bi = int(i); }
+    }
+    reduce(b, bi);
+    if (lane == 0) { sv[w] = b; si[w] = bi; }
+    barrier();
+    if (w == 0) {
+        b = lane < gl_NumSubgroups ? sv[lane] : ninf; bi = lane < gl_NumSubgroups ? si[lane] : n;
+        reduce(b, bi);
+        if (lane == 0) p.o.v[gl_WorkGroupID.x] = bi;
+    }
+}

@@ -1,0 +1,12 @@
+#version 460
+layout(local_size_x = 128) in;
+#include "common.glsl"
+// Workgroup = head: o = rmsnorm(o_h) * w * silu(z_h), in place.
+layout(push_constant) uniform P { F32 o; F32 w; F32 z; uint n; float eps; } p;
+void main() {
+    uint ho = gl_WorkGroupID.x * p.n;
+    float s = 0.0;
+    for (uint i = gl_LocalInvocationID.x; i < p.n; i += 128) s += p.o.v[ho + i] * p.o.v[ho + i];
+    float sc = fdiv(1.0, sqrt_(fdiv(block_sum(s), float(p.n)) + p.eps));
+    for (uint i = gl_LocalInvocationID.x; i < p.n; i += 128) p.o.v[ho + i] = p.o.v[ho + i] * sc * p.w.v[i] * silu(p.z.v[ho + i]);
+}

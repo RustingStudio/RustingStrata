@@ -16,6 +16,14 @@ const STAGING: usize = 64 << 20;
 /// SPIR-V of every kernel, from `tools/gen_spirv.sh`.
 const SPV: &[(&str, &[u8])] = &[
     ("add", include_bytes!("spv/add.spv")),
+    ("argmax_rows", include_bytes!("spv/argmax_rows.spv")),
+    ("conv_silu", include_bytes!("spv/conv_silu.spv")),
+    ("l2_norm", include_bytes!("spv/l2_norm.spv")),
+    ("norm_gate", include_bytes!("spv/norm_gate.spv")),
+    ("quant_xq", include_bytes!("spv/quant_xq.spv")),
+    ("rms_norm", include_bytes!("spv/rms_norm.spv")),
+    ("rope_neox", include_bytes!("spv/rope_neox.spv")),
+    ("ssm_gates", include_bytes!("spv/ssm_gates.spv")),
     ("swiglu", include_bytes!("spv/swiglu.spv")),
 ];
 
@@ -29,6 +37,8 @@ struct Inner {
     queue: vk::Queue,
     mem: vk::PhysicalDeviceMemoryProperties,
     budget: bool,
+    /// Specialization constant 0 of kernels that quantize x: llama.cpp q8_K numerics (`--llama-numerics`).
+    llama: u32,
     /// The one pipeline layout: a 128-byte push constant range (the Vulkan minimum), no descriptor sets.
     layout: vk::PipelineLayout,
     st: Mutex<State>,
@@ -91,7 +101,8 @@ impl Drop for Inner {
 /// Why `pd` cannot run the kernels, if it cannot.
 fn unusable(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<String> {
     let mut sg = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
-    let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sg);
+    let mut p11 = vk::PhysicalDeviceVulkan11Properties::default();
+    let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sg).push_next(&mut p11);
     unsafe { instance.get_physical_device_properties2(pd, &mut p2) };
     let p = p2.properties;
     if p.device_type == vk::PhysicalDeviceType::CPU { return Some("a CPU device".into()); }
@@ -99,12 +110,16 @@ fn unusable(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<String> 
     if !(sg.min_subgroup_size..=sg.max_subgroup_size).contains(&32) || !sg.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE) {
         return Some(format!("subgroup size 32 is needed (it has {}-{})", sg.min_subgroup_size, sg.max_subgroup_size));
     }
+    let ops = vk::SubgroupFeatureFlags::ARITHMETIC | vk::SubgroupFeatureFlags::SHUFFLE;
+    if !p11.subgroup_supported_operations.contains(ops) || !p11.subgroup_supported_stages.contains(vk::ShaderStageFlags::COMPUTE) {
+        return Some("subgroup arithmetic and shuffle in compute shaders are needed".into());
+    }
     let (mut f11, mut f12, mut f13) = Default::default();
     let mut f = features(&mut f11, &mut f12, &mut f13);
     unsafe { instance.get_physical_device_features2(pd, &mut f) };
-    let int64 = f.features.shader_int64;
+    let (int64, f64) = (f.features.shader_int64, f.features.shader_float64);
     let missing: Vec<_> = [
-        ("shaderInt64", int64), ("storageBuffer16BitAccess", f11.storage_buffer16_bit_access),
+        ("shaderInt64", int64), ("shaderFloat64", f64), ("storageBuffer16BitAccess", f11.storage_buffer16_bit_access),
         ("bufferDeviceAddress", f12.buffer_device_address), ("storageBuffer8BitAccess", f12.storage_buffer8_bit_access),
         ("shaderInt8", f12.shader_int8), ("shaderFloat16", f12.shader_float16),
         ("subgroupSizeControl", f13.subgroup_size_control), ("computeFullSubgroups", f13.compute_full_subgroups),
@@ -148,6 +163,7 @@ impl Vk {
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default().subgroup_size_control(true).compute_full_subgroups(true);
         let mut f = features(&mut f11, &mut f12, &mut f13);
         f.features.shader_int64 = vk::TRUE;
+        f.features.shader_float64 = vk::TRUE;
         let prio = [1.0];
         let qi = [vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio)];
         let dev = unsafe { instance.create_device(pd, &vk::DeviceCreateInfo::default().queue_create_infos(&qi)
@@ -162,7 +178,7 @@ impl Vk {
         let layout = unsafe { dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc), None) }?;
         let st = State { pool, spare: vec![], used: vec![], cur: None, busy: false, gpool, graphs: HashMap::new(), rec: None,
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, bufs: BTreeMap::new() };
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, llama: crate::cuda::llama_numerics() as u32, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, true)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -280,6 +296,7 @@ impl Inner {
 /// A push constant argument: pointers are u64, the rest 32-bit, each at its natural alignment (std430).
 trait Arg { fn put(&self, v: &mut Vec<u8>); }
 impl Arg for u64 { fn put(&self, v: &mut Vec<u8>) { v.resize(v.len().next_multiple_of(8), 0); v.extend(self.to_le_bytes()) } }
+impl Arg for f64 { fn put(&self, v: &mut Vec<u8>) { v.resize(v.len().next_multiple_of(8), 0); v.extend(self.to_le_bytes()) } }
 impl Arg for u32 { fn put(&self, v: &mut Vec<u8>) { v.extend(self.to_le_bytes()) } }
 impl Arg for i32 { fn put(&self, v: &mut Vec<u8>) { v.extend(self.to_le_bytes()) } }
 impl Arg for f32 { fn put(&self, v: &mut Vec<u8>) { v.extend(self.to_le_bytes()) } }
@@ -444,22 +461,39 @@ impl Backend for Vk {
     fn gemvq(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> { todo("gemvq") }
     fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()> { todo("moe_gemv") }
     fn dequant(&self, w: &GpuTensor, rows: usize, out: u64) -> anyhow::Result<()> { todo("dequant") }
-    fn quant_xq(&self, x: u64, x_stride: usize, n: usize, nt: usize, out: u64) -> anyhow::Result<()> { todo("quant_xq") }
+    fn quant_xq(&self, x: u64, x_stride: usize, n: usize, nt: usize, out: u64) -> anyhow::Result<()> {
+        self.run("quant_xq", &[self.0.llama], [nt, 1, 1], &[&x, &out, &(x_stride as u32), &(n as u32)])
+    }
     fn map_hits(&self, ids: u64, table: u64, slots: u64, wts: u64, wh: u64, k: usize) -> anyhow::Result<()> { todo("map_hits") }
-    fn rms_norm(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32) -> anyhow::Result<()> { todo("rms_norm") }
-    fn rms_norm_q(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32, xq: u64) -> anyhow::Result<()> { todo("rms_norm_q") }
-    fn argmax_rows(&self, x: u64, n: usize, rows: usize, out: u64) -> anyhow::Result<()> { todo("argmax_rows") }
-    fn l2_norm(&self, x: u64, n: usize, per: usize, stride: usize, rows: usize, eps: f32) -> anyhow::Result<()> { todo("l2_norm") }
-    fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> { todo("rope_neox") }
+    fn rms_norm(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32) -> anyhow::Result<()> {
+        self.rms_norm_q(x, x_stride, w, out, out_stride, n, rows, eps, 0)
+    }
+    fn rms_norm_q(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32, xq: u64) -> anyhow::Result<()> {
+        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &xq, &(x_stride as u32), &(out_stride as u32), &(n as u32), &eps])
+    }
+    fn argmax_rows(&self, x: u64, n: usize, rows: usize, out: u64) -> anyhow::Result<()> { self.run("argmax_rows", &[], [rows, 1, 1], &[&x, &out, &(n as u32)]) }
+    fn l2_norm(&self, x: u64, n: usize, per: usize, stride: usize, rows: usize, eps: f32) -> anyhow::Result<()> {
+        self.run("l2_norm", &[], [rows, 1, 1], &[&x, &(n as u32), &(per as u32), &(stride as u32), &eps])
+    }
+    fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
+        let ts = (base as f64).powf(-2.0 / n_rot as f64);
+        self.run("rope_neox", &[], [heads / per, 1, 1], &[&x, &step, &ts, &(stride as u32), &(per as u32), &(n_rot as u32)])
+    }
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()> { self.run("add", &[], [n.div_ceil(256), 1, 1], &[&x, &y, &(n as u32)]) }
     fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()> { self.run("swiglu", &[], [n.div_ceil(256), 1, 1], &[&g, &u, &(n as u32)]) }
-    fn ssm_gates(&self, beta: u64, g: u64, dt_bias: u64, a: u64, n: usize, nv: usize) -> anyhow::Result<()> { todo("ssm_gates") }
-    fn conv_silu(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize) -> anyhow::Result<()> { todo("conv_silu") }
+    fn ssm_gates(&self, beta: u64, g: u64, dt_bias: u64, a: u64, n: usize, nv: usize) -> anyhow::Result<()> {
+        self.run("ssm_gates", &[], [n.div_ceil(256), 1, 1], &[&beta, &g, &dt_bias, &a, &(n as u32), &(nv as u32)])
+    }
+    fn conv_silu(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize) -> anyhow::Result<()> {
+        self.run("conv_silu", &[], [ch.div_ceil(256), 1, 1], &[&qkv, &state, &w, &y, &(ch as u32), &(kw as u32)])
+    }
     fn deltanet(&self, y: u64, s: u64, beta: u64, g: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> { todo("deltanet") }
     fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> { todo("conv_seq") }
     fn attn_prefill(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> { todo("attn_prefill") }
     fn moe_combine_seq(&self, x: u64, ye: u64, wts: u64, inv: u64, k: usize, sh: u64, sg: u64, n: usize, t: usize) -> anyhow::Result<()> { todo("moe_combine_seq") }
-    fn norm_gate(&self, o: u64, w: u64, z: u64, n: usize, heads: usize, eps: f32) -> anyhow::Result<()> { todo("norm_gate") }
+    fn norm_gate(&self, o: u64, w: u64, z: u64, n: usize, heads: usize, eps: f32) -> anyhow::Result<()> {
+        self.run("norm_gate", &[], [heads, 1, 1], &[&o, &w, &z, &(n as u32), &eps])
+    }
     fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()> { todo("kv_store") }
     fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize) -> anyhow::Result<()> { todo("attn_decode") }
     fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()> { todo("router_topk") }

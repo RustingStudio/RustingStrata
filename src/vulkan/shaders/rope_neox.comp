@@ -1,0 +1,30 @@
+#version 460
+layout(local_size_x = 64) in;
+#include "common.glsl"
+// Workgroup = token (each rotates its per heads). NEOX pairs (i, i + n_rot/2). Token t sits at position step[0] + t.
+// theta = pos * ts^i with ts = base^(-2 / n_rot) from the host, and sin / cos in f64 as the CPU and CUDA take them
+// (GLSL has no f64 pow, sin or cos).
+layout(push_constant) uniform P { F32 x; I32 step; double ts; uint stride; uint per; uint n_rot; } p;
+void main() {
+    uint t = gl_WorkGroupID.x, half_ = p.n_rot / 2;
+    double pos = double(p.step.v[0] + int(t));
+    for (uint i = gl_LocalInvocationID.x; i < half_; i += 64) {
+        double f = 1.0LF, b = p.ts;
+        for (uint e = i; e > 0; e >>= 1, b *= b) if ((e & 1) != 0) f *= b;
+        double theta = pos * f, k = roundEven(theta * 0.63661977236758134LF);  // 2 / pi
+        double y = fma(-k, 1.5707963267948966LF, theta);
+        y = fma(-k, 6.123233995736766e-17LF, y);
+        double y2 = y * y;
+        double s = 1.0LF, c = 1.0LF;  // Taylor to y^17 and y^16 on |y| <= pi / 4
+        for (int j = 8; j >= 1; j--) { s = 1.0LF - y2 / double(2 * j * (2 * j + 1)) * s; c = 1.0LF - y2 / double((2 * j - 1) * 2 * j) * c; }
+        s *= y;
+        int q = int(k) & 3;
+        float sn = float(q == 0 ? s : q == 1 ? c : q == 2 ? -s : -c), cs = float(q == 0 ? c : q == 1 ? -s : q == 2 ? -c : s);
+        for (uint hd = 0; hd < p.per; hd++) {
+            uint h = (t * p.per + hd) * p.stride;
+            float a = p.x.v[h + i], bb = p.x.v[h + i + half_];
+            p.x.v[h + i] = a * cs - bb * sn;
+            p.x.v[h + i + half_] = a * sn + bb * cs;
+        }
+    }
+}
