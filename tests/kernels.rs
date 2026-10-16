@@ -27,6 +27,7 @@ fn rel_l2(a: &[f32], b: &[f32]) -> f32 {
 #[test]
 fn dequant_and_gemv_match_reference_for_every_type() {
     let Some(p) = common::model_path() else { return };
+    let mut first = std::collections::HashMap::new();  // gemv outputs of the first backend, to count bit differences
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
@@ -59,8 +60,12 @@ fn dequant_and_gemv_match_reference_for_every_type() {
             let mut want = vec![0f32; t.rows];
             t.matvec(&as_seen(ty, &x), &mut want);
             let e = rel_l2(&got, &want);
-            eprintln!("{:8} {name}: dequant max diff {diff:.2e}, gemv rel err {e:.2e}", ty.name());
+            let bits = first.get(name).map_or(String::new(), |f: &Vec<f32>| {
+                format!(", {} of {} differ from the first backend", got.iter().zip(f).filter(|(a, b)| a.to_bits() != b.to_bits()).count(), f.len())
+            });
+            eprintln!("{:8} {name}: dequant max diff {diff:.2e}, gemv rel err {e:.2e}{bits}", ty.name());
             assert!(e <= 1e-4, "{} gemv ({name}): rel err {e}", ty.name());
+            first.entry(name.clone()).or_insert(got);
         }
         assert!(seen.len() >= 10, "types covered: {seen:?}");
     }
@@ -128,7 +133,7 @@ fn moe_gemv_selects_experts() {
 #[test]
 fn gemvn_matches_gemv() {
     let Some(p) = common::model_path() else { return };
-    for (bk, gpu) in common::backends_except(&["vulkan"]) {
+    for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let g = Gguf::open(&p).unwrap();
