@@ -18,7 +18,7 @@ fn rel_l2(a: &[f32], b: &[f32]) -> f32 {
 fn q8_kv_attention_matches_f16() {
     let mk = |q8: bool| {
         if q8 { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } } else { unsafe { std::env::remove_var("STRATA_KV_Q8") } }
-        match Gpu::new() {
+        match Gpu::new(0) {
             Ok(g) => Some(g),
             Err(e) if format!("{e}") == "CUDA init" => { eprintln!("SKIP: no GPU: {e:#}"); None }
             Err(e) => panic!("{e:#}"),

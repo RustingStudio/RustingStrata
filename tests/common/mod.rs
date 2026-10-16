@@ -20,7 +20,7 @@ use rusting_strata::backend::{Backend, Buf, Plain};
 /// with a note; any other error (such as a kernel compile error) fails the test.
 pub fn backends() -> Vec<(&'static str, Box<dyn Backend>)> {
     let mut v: Vec<(&'static str, Box<dyn Backend>)> = vec![];
-    match rusting_strata::cuda::Gpu::new() {
+    match rusting_strata::cuda::Gpu::new(0) {
         Ok(g) => v.push(("cuda", Box::new(g))),
         Err(e) if format!("{e}") == "CUDA init" => eprintln!("SKIP: cuda: {e:#}"),
         Err(e) => panic!("{e:#}"),

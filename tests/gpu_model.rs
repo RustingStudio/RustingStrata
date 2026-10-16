@@ -14,7 +14,7 @@ fn gpu_forward_matches_cpu_reference() {
     let want: Vec<Vec<f32>> = ids.iter().map(|&t| m.step(&mut st, t)).collect();
 
     for margin in [usize::MAX / 2, 512 << 20] {
-        let gpu = match Gpu::new() {
+        let gpu = match Gpu::new(0) {
             Ok(g) => g,
             Err(e) if format!("{e}") == "CUDA init" => { eprintln!("SKIP: no GPU: {e:#}"); return }
             Err(e) => panic!("{e:#}"),
@@ -53,7 +53,7 @@ fn prefill_matches_reference() {
                 tracks the object lifetime of all references in a program during compilation. Rust was influenced by";
     let ids = tok.encode(text).unwrap();
     assert!(ids.len() > 64, "{} tokens", ids.len());
-    let gpu = match Gpu::new() {
+    let gpu = match Gpu::new(0) {
         Ok(g) => g,
         Err(e) => { eprintln!("SKIP: no GPU: {e:#}"); return }
     };
@@ -98,7 +98,7 @@ fn mtp_draft_matches_reference() {
     let m = Model::load(&g).unwrap();
     if m.cfg.n_nextn == 0 { eprintln!("SKIP: no nextn layer"); return }
     let tok = Tokenizer::from_gguf(&g).unwrap();
-    let gpu = match Gpu::new() {
+    let gpu = match Gpu::new(0) {
         Ok(g) => g,
         Err(e) => { eprintln!("SKIP: no GPU: {e:#}"); return }
     };
@@ -129,7 +129,7 @@ fn verify_matches_steps() {
     let g = Gguf::open(&p).unwrap();
     let m = Model::load(&g).unwrap();
     let tok = Tokenizer::from_gguf(&g).unwrap();
-    let gpu = match Gpu::new() {
+    let gpu = match Gpu::new(0) {
         Ok(g) => g,
         Err(e) => { eprintln!("SKIP: no GPU: {e:#}"); return }
     };
@@ -173,7 +173,7 @@ fn mtp_spec_matches_greedy() {
     let m = Model::load(&g).unwrap();
     if m.cfg.n_nextn == 0 { eprintln!("SKIP: no nextn layer"); return }
     let tok = Tokenizer::from_gguf(&g).unwrap();
-    let gpu = match Gpu::new() {
+    let gpu = match Gpu::new(0) {
         Ok(g) => g,
         Err(e) => { eprintln!("SKIP: no GPU: {e:#}"); return }
     };
@@ -218,7 +218,7 @@ fn rollback_matches_step() {
     let m = Model::load(&g).unwrap();
     if m.cfg.n_nextn == 0 { eprintln!("SKIP: no nextn layer"); return }
     let tok = Tokenizer::from_gguf(&g).unwrap();
-    let gpu = match Gpu::new() {
+    let gpu = match Gpu::new(0) {
         Ok(g) => g,
         Err(e) => { eprintln!("SKIP: no GPU: {e:#}"); return }
     };
@@ -247,7 +247,7 @@ fn prefill_cached_reuses_history() {
     let g = Gguf::open(&p).unwrap();
     let m = Model::load(&g).unwrap();
     let tok = Tokenizer::from_gguf(&g).unwrap();
-    let gpu = match Gpu::new() {
+    let gpu = match Gpu::new(0) {
         Ok(g) => g,
         Err(e) => { eprintln!("SKIP: no GPU: {e:#}"); return }
     };

@@ -52,7 +52,17 @@ unsafe impl Plain for u64 {}
 
 /// Device memory, recorded graphs and kernel ops. Host copies are synchronous; device work runs in queue order.
 /// Pointer arguments are device addresses; strides are in floats unless named otherwise.
+/// The backend `kind` ("cuda") on GPU `device`; with no kind, CUDA.
+pub fn open(kind: Option<&str>, device: usize) -> anyhow::Result<Box<dyn Backend>> {
+    match kind {
+        None | Some("cuda") => Ok(Box::new(crate::cuda::Gpu::new(device)?)),
+        Some(k) => anyhow::bail!("unknown backend {k:?}"),
+    }
+}
+
 pub trait Backend: Send {
+    /// "cuda" or "vulkan".
+    fn name(&self) -> &'static str;
     /// Zeroed buffer of `bytes` (at least 1).
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf>;
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()>;

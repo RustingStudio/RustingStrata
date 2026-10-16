@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use anyhow::Context;
 use rusting_strata::model::{Model, State};
-use rusting_strata::{cuda::Gpu, gpu_model::GpuModel};
+use rusting_strata::{backend, gpu_model::GpuModel};
 use rusting_strata::{config::ModelConfig, gguf::Gguf, ops, ops::Sampler, quant::GgmlType, serve, tokenizer::Tokenizer};
 use rusting_strata::chat::{Hold, Msg, Template};
 use serde_json::json;
@@ -59,6 +59,12 @@ struct Engine {
     /// default f16 cache).
     #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
     kv: String,
+    /// GPU backend: cuda [default: cuda].
+    #[arg(long)]
+    backend: Option<String>,
+    /// GPU index.
+    #[arg(long, default_value_t = 0)]
+    device: usize,
     /// Prompts shorter than this skip the batched prefill (from `strata calibrate`, else 32).
     #[arg(skip)]
     short: usize,
@@ -110,7 +116,10 @@ impl Runner<'_> {
 impl Engine {
     /// Fills settings not given on the command line from the model's calibration file, else built-in defaults.
     fn runner<'a>(&mut self, m: &'a Model<'a>, model: &Path) -> anyhow::Result<Runner<'a>> {
-        let path = calibration_path(model);
+        if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
+        if self.kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new
+        let bk = if self.gpu { Some(backend::open(self.backend.as_deref(), self.device)?) } else { None };
+        let path = calibration_path(model, bk.as_ref().map_or("cuda", |b| b.name()));
         let v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         if !v.is_null() { eprintln!("calibration: {}", path.display()); }
         let get = |k: &str| v[k].as_u64().map(|x| x as usize);
@@ -118,11 +127,9 @@ impl Engine {
         self.mtp.get_or_insert(get("mtp").unwrap_or(0));
         self.short = get("short").unwrap_or(32);
         if let Some(n) = self.threads.or(get("threads")) { rayon::ThreadPoolBuilder::new().num_threads(n).build_global()?; }
-        if !self.gpu { return Ok(Runner::Cpu(m, State::new(&m.cfg))); }
-        if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
+        let Some(bk) = bk else { return Ok(Runner::Cpu(m, State::new(&m.cfg))) };
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
-        if self.kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new
-        let mut g = GpuModel::load(m, Box::new(Gpu::new()?), self.ctx, self.chunk(), self.vram_margin << 20, self.mtp())?;
+        let mut g = GpuModel::load(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp())?;
         g.short = self.short;
         Ok(Runner::Gpu(Box::new(g)))
     }
@@ -139,9 +146,11 @@ fn seed(s: Option<u64>) -> u64 {
         .wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1
 }
 
-fn calibration_path(model: &Path) -> PathBuf {
+/// Calibration file for `model` on `backend`; CUDA keeps the original name.
+fn calibration_path(model: &Path, backend: &str) -> PathBuf {
     let stem = model.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
-    rusting_strata::expert_cache::cache_dir().join(format!("strata-{stem}.json"))
+    let sfx = if backend == "cuda" { String::new() } else { format!("-{backend}") };
+    rusting_strata::expert_cache::cache_dir().join(format!("strata-{stem}{sfx}.json"))
 }
 
 #[derive(Subcommand)]
@@ -201,6 +210,10 @@ enum Cmd {
         ctx: usize,
         #[arg(long, default_value_t = 512)]
         vram_margin: usize,
+        #[arg(long)]
+        backend: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        device: usize,
     },
     /// Speed test: for each prompt length, prefill that many tokens of prose, then greedily decode `tg` more at that
     /// depth. Prints prefill and decode tok/s as mean (min-max) over `reps` runs. `--ctx` grows to fit.
@@ -323,7 +336,7 @@ fn main() -> anyhow::Result<()> {
             }
             r.finish()?;
         }
-        Cmd::Calibrate { model, ctx, vram_margin } => calibrate(&model, ctx, vram_margin << 20)?,
+        Cmd::Calibrate { model, ctx, vram_margin, backend, device } => calibrate(&model, ctx, vram_margin << 20, backend.as_deref(), device)?,
         Cmd::Chat { model, system, n, think, mut engine } => {
             let g = Gguf::open(&model)?;
             let m = Model::load(&g)?;
@@ -388,7 +401,7 @@ fn best(f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<f64> {
     Ok(b)
 }
 
-fn calibrate(model: &Path, ctx: usize, margin: usize) -> anyhow::Result<()> {
+fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device: usize) -> anyhow::Result<()> {
     let g = Gguf::open(model)?;
     let m = Model::load(&g)?;
     let tok = Tokenizer::from_gguf(&g)?;
@@ -396,7 +409,7 @@ fn calibrate(model: &Path, ctx: usize, margin: usize) -> anyhow::Result<()> {
     anyhow::ensure!(n_pf >= 512, "--ctx too small to calibrate");
     let pf = prose(&tok, n_pf)?;
     let load = |chunk: usize| -> anyhow::Result<GpuModel> {
-        let mut gm = GpuModel::load(&m, Box::new(Gpu::new()?), ctx, chunk, margin, 3)?;
+        let mut gm = GpuModel::load(&m, backend::open(kind, device)?, ctx, chunk, margin, 3)?;
         gm.adapt_every = 0; // fixed placement: steadier timings
         Ok(gm)
     };
@@ -442,7 +455,8 @@ fn calibrate(model: &Path, ctx: usize, margin: usize) -> anyhow::Result<()> {
         if tps > mtp.1 { mtp = (k, tps); }
     }
 
-    let path = calibration_path(model);
+    let Runner::Gpu(g) = &r else { unreachable!() };
+    let path = calibration_path(model, g.gpu.name());
     std::fs::create_dir_all(path.parent().unwrap())?;
     let v = json!({"chunk": chunk.0, "mtp": mtp.0, "short": short, "ctx": ctx,
         "measured": {"prefill_tok_s": chunk.1.round(), "decode_tok_s": (mtp.1 * 10.0).round() / 10.0}});
