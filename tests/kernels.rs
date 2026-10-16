@@ -302,7 +302,7 @@ fn gemm_throughput() {
 /// splits empty.
 #[test]
 fn attn_prefill_matches_decode() {
-    let mut first = std::collections::HashMap::new();
+    let (mut first, mut first_pf) = (std::collections::HashMap::new(), std::collections::HashMap::new());
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
@@ -333,6 +333,10 @@ fn attn_prefill_matches_decode() {
                 r => {
                     r.unwrap();
                     let got = down::<f32>(gpu, &dout);
+                    // Vulkan's cooperative matrices are the same f16 products summed in f32 as CUDA's mma.sync.
+                    let f = first_pf.entry((pos0, nh, nkv, hd)).or_insert_with(|| got.clone());
+                    let nd = got.iter().zip(f.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                    assert!(nd == 0, "{bk} attn_prefill pos {pos0} nh {nh} nkv {nkv} hd {hd}: {nd} of {} differ from the first backend", got.len());
                     gpu.attn_prefill(dq.addr(), dk.addr(), dv.addr(), 0, dout.addr(), step.addr(), t, nh, nkv, hd, scale).unwrap();
                     let e = rel_l2(&gated(&down::<f32>(gpu, &dout)), &got);
                     assert!(e <= 1e-6, "attn_prefill without gate nh {nh} hd {hd}: {e}");
@@ -457,7 +461,8 @@ fn deltanet_chunk_matches_steps() {
 /// Chunked causal conv (conv_seq + conv_state) equals T single-token conv_silu steps, also for T < kernel width - 1.
 #[test]
 fn conv_seq_matches_steps() {
-    for (bk, gpu) in common::backends_except(&["vulkan"]) {
+    let mut first: Option<Vec<u32>> = None;
+    for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let (ch, kw) = (96, 4);
@@ -481,7 +486,43 @@ fn conv_seq_matches_steps() {
             let (ey, es) = (rel_l2(&d(&y1), &d(&y2)), rel_l2(&d(&s1), &d(&s2)));
             assert!(ey <= 1e-6 && es == 0.0, "T {t}: y {ey}, state {es}");
             assert_eq!(d(&snap)[..snaps.len()], snaps[..], "T {t}: snapshots");
+            if t == 10 {
+                let bits: Vec<u32> = d(&y1).iter().map(|x| x.to_bits()).collect();
+                match &first { None => first = Some(bits), Some(f) => assert!(*f == bits, "{bk}: conv_seq differs from the first backend") }
+            }
         }
+    }
+}
+
+/// moe_combine_seq against the CPU, with and without the gated shared expert, bit-identical across backends.
+#[test]
+fn moe_combine_seq_matches_cpu() {
+    let (n, k, t, ne) = (300, 3, 5, 20);
+    let x0 = xs(t * n);
+    let ye = xs(ne * n + 1)[1..].to_vec();
+    let wts = xs(t * k + 2)[2..].to_vec();
+    let inv: Vec<i32> = (0..t * k).map(|i| ((i * 7) % ne) as i32).collect();
+    let (sh, sg) = (xs(t * n + 3)[3..].to_vec(), xs(t + 4)[4..].to_vec());
+    let mut first: Option<Vec<u32>> = None;
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        let mut bits = vec![];
+        for shared in [false, true] {
+            let dx = up(gpu, &x0);
+            let (dsh, dsg) = (up(gpu, &sh), up(gpu, &sg));
+            gpu.moe_combine_seq(dx.addr(), up(gpu, &ye).addr(), up(gpu, &wts).addr(), up(gpu, &inv).addr(), k,
+                                if shared { dsh.addr() } else { 0 }, dsg.addr(), n, t).unwrap();
+            let got = down::<f32>(gpu, &dx);
+            let want: Vec<f32> = (0..t * n).map(|i| {
+                let (tk, d) = (i / n, i % n);
+                let mut y: f32 = (0..k).map(|j| wts[tk * k + j] * ye[inv[tk * k + j] as usize * n + d]).sum();
+                if shared { y += sh[i] / (1.0 + (-sg[tk]).exp()) }
+                x0[i] + y
+            }).collect();
+            assert!(rel_l2(&got, &want) < 1e-6, "{bk} shared {shared}: rel err {}", rel_l2(&got, &want));
+            bits.extend(got.iter().map(|x| x.to_bits()));
+        }
+        match &first { None => first = Some(bits), Some(f) => assert!(*f == bits, "{bk}: moe_combine_seq differs from the first backend") }
     }
 }
 
