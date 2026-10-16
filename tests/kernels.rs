@@ -391,7 +391,8 @@ fn attn_prefill_matches_decode() {
 /// its snapshots equal the states after the first single-token scans.
 #[test]
 fn deltanet_chunk_matches_steps() {
-    for (bk, gpu) in common::backends_except(&["vulkan"]) {
+    let mut first = std::collections::HashMap::new();
+    for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let (nk, nv, dk, dv, t) = (2, 4, 128, 128, 37);
@@ -440,7 +441,10 @@ fn deltanet_chunk_matches_steps() {
                 }
             }
             let (eo, es) = (rel_l2(&o1, &oc), rel_l2(&s1, &sc));
-            eprintln!("deltanet ilv {ilv} vs CPU: out {eo:.2e}, state {es:.2e}");
+            let f = first.entry(ilv).or_insert_with(|| (o1.clone(), s1.clone()));
+            let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+            eprintln!("deltanet ilv {ilv} vs CPU: out {eo:.2e}, state {es:.2e}; differ from the first backend: out {} of {}, state {} of {}",
+                      diff(&o1, &f.0), o1.len(), diff(&s1, &f.1), s1.len());
             assert!(eo <= 1e-5 && es <= 1e-5, "ilv {ilv} vs CPU: out {eo}, state {es}");
         }
     }
