@@ -35,7 +35,7 @@ fn large_copies_round_trip() {
 
 #[test]
 fn graph_records_once_and_replays() {
-    for (bk, g) in common::backends_except(&["vulkan"]) {
+    for (bk, g) in common::backends() {
         eprintln!("backend {bk}");
         if std::env::var_os("STRATA_NO_GRAPH").is_some() { return; }
         let (x, y) = (g.zeros::<f32>(4).unwrap(), g.zeros::<f32>(4).unwrap());
@@ -49,7 +49,7 @@ fn graph_records_once_and_replays() {
 
 #[test]
 fn host_mailbox_is_shared_with_kernels() {
-    for (bk, g) in common::backends_except(&["vulkan"]) {
+    for (bk, g) in common::backends() {
         eprintln!("backend {bk}");
         let (mb, host) = g.host_mailbox(4).unwrap();
         let ones = g.zeros::<f32>(4).unwrap();
@@ -60,4 +60,20 @@ fn host_mailbox_is_shared_with_kernels() {
         let got: Vec<f32> = (0..4).map(|i| unsafe { host.cast::<f32>().add(i).read_volatile() }).collect();
         assert_eq!(got, [3.0, 1.0, 1.0, 1.0]);
     }
+}
+
+/// The committed SPIR-V is what `tools/gen_spirv.sh` makes from the shaders now.
+#[test]
+fn spirv_is_fresh() {
+    if std::process::Command::new("glslc").arg("--version").output().is_err() { return eprintln!("SKIP: no glslc"); }
+    let tmp = std::env::temp_dir().join(format!("strata-spv-{}", std::process::id()));
+    let st = std::process::Command::new("tools/gen_spirv.sh").arg(&tmp).status().unwrap();
+    assert!(st.success());
+    let names = |d: &std::path::Path| { let mut v: Vec<_> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name()).collect(); v.sort(); v };
+    let committed = std::path::Path::new("src/vulkan/spv");
+    assert_eq!(names(&tmp), names(committed), "run tools/gen_spirv.sh");
+    for n in names(&tmp) {
+        assert!(std::fs::read(tmp.join(&n)).unwrap() == std::fs::read(committed.join(&n)).unwrap(), "{n:?} is stale: run tools/gen_spirv.sh");
+    }
+    std::fs::remove_dir_all(&tmp).unwrap();
 }
