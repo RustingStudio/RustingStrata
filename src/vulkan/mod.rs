@@ -609,16 +609,15 @@ impl Backend for Vk {
     }
     fn gemvq(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
         ensure!((1..=4).contains(&nt), "gemvn: {nt} inputs (1 to 4)");
-        let (nsb, spec) = (nsb(w)?, self.wspec(w.ty));
+        let (nsb, spec) = (nsb(w)?, [&self.wspec(w.ty)[..], &[nt as u32]].concat());
         if matches!(w.ty, GgmlType::F32 | GgmlType::BF16) {
-            return self.run("gemv_f", &spec, [w.rows, 1, 1], &[&w.ptr, &x, &y, &(x_stride as u32), &(y_stride as u32), &nsb, &(nt as u32)]);
+            return self.run("gemv_f", &spec, [w.rows, 1, 1], &[&w.ptr, &x, &y, &(x_stride as u32), &(y_stride as u32), &nsb]);
         }
         let xq = if xq != 0 { xq } else {
             ensure!(nt * w.cols * 9 / 8 <= XQ, "gemv: {nt} x {} inputs do not fit the quantized-x buffer", w.cols);
             self.quant_xq(x, x_stride, w.cols, nt, self.1.addr())?;
             self.1.addr()
         };
-        let spec = [&spec[..], &[nt as u32]].concat();
         self.run("gemv_q", &spec, [w.rows.div_ceil(8), 1, 1], &[&w.ptr, &xq, &y, &(y_stride as u32), &(w.rows as u32), &nsb])
     }
     fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()> {
