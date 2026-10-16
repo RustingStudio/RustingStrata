@@ -21,9 +21,7 @@ const KERNELS: [&str; 26] = [
 ];
 
 pub use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
-
-/// Splits of the one-head-per-block decode attention used below ATT_GQA_MIN positions.
-const ATT_SPLITS_1: usize = 16;
+use crate::backend::ATT_SPLITS_1;
 
 pub struct Gpu {
     pub ctx: Arc<CudaContext>,

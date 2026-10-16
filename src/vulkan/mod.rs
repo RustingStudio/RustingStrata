@@ -3,7 +3,7 @@
 //! command buffer, which a host copy or `sync` submits and waits for. Every op ends with a full compute and transfer
 //! barrier, which also orders it before the work of later submissions.
 
-use crate::backend::{Backend, Buf, GpuTensor};
+use crate::backend::{ATT_SPLITS, ATT_SPLITS_1, Backend, Buf, GpuTensor};
 use crate::quant::GgmlType;
 use anyhow::{Context, anyhow, ensure};
 use ash::vk;
@@ -17,10 +17,13 @@ const STAGING: usize = 64 << 20;
 const SPV: &[(&str, &[u8])] = &[
     ("add", include_bytes!("spv/add.spv")),
     ("argmax_rows", include_bytes!("spv/argmax_rows.spv")),
+    ("attn_decode", include_bytes!("spv/attn_decode.spv")),
+    ("attn_merge", include_bytes!("spv/attn_merge.spv")),
     ("conv_silu", include_bytes!("spv/conv_silu.spv")),
     ("dequant", include_bytes!("spv/dequant.spv")),
     ("gemv_f", include_bytes!("spv/gemv_f.spv")),
     ("gemv_q", include_bytes!("spv/gemv_q.spv")),
+    ("kv_store", include_bytes!("spv/kv_store.spv")),
     ("l2_norm", include_bytes!("spv/l2_norm.spv")),
     ("norm_gate", include_bytes!("spv/norm_gate.spv")),
     ("quant_xq", include_bytes!("spv/quant_xq.spv")),
@@ -533,8 +536,20 @@ impl Backend for Vk {
     fn norm_gate(&self, o: u64, w: u64, z: u64, n: usize, heads: usize, eps: f32) -> anyhow::Result<()> {
         self.run("norm_gate", &[], [heads, 1, 1], &[&o, &w, &z, &(n as u32), &eps])
     }
-    fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()> { todo("kv_store") }
-    fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize) -> anyhow::Result<()> { todo("attn_decode") }
+    fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()> {
+        self.run("kv_store", &[], [(n * t).div_ceil(256), 1, 1], &[&k, &v, &kc, &vc, &step, &(n as u32), &((n * t) as u32)])
+    }
+    /// As the CUDA one: both kernels run, the step decides which one works, then attn_merge combines the splits.
+    fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize) -> anyhow::Result<()> {
+        ensure!([64, 128, 256, 512].contains(&hd), "attention head_dim {hd} unsupported (64, 128, 256 or 512)");
+        if self.0.llama != 0 { return todo("attn_decode with --llama-numerics"); }
+        let g = [8, 4, 2, 1].into_iter().find(|&g| (nh / nkv) % g == 0 && g * hd <= 2048).unwrap();
+        let (per, pz) = ((hd / 32) as u32, (nh * ATT_SPLITS * (hd + 2)) as u32);
+        let args: [&dyn Arg; 11] = [&q, &kc, &vc, &part, &step, &(nh as u32), &(nkv as u32), &scale, &gq_min, &pz, &(nt as u32)];
+        self.run("attn_decode", &[0, per, 1, 0], [nh * nt, ATT_SPLITS_1, 1], &args)?;
+        self.run("attn_decode", &[0, per, g as u32, 1], [nh / g * nt, ATT_SPLITS, 1], &args)?;
+        self.run("attn_merge", &[], [nh, 1, nt], &[&part, &qg, &out, &step, &(hd as u32), &(ATT_SPLITS as u32), &(ATT_SPLITS_1 as u32), &gq_min])
+    }
     fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()> { todo("router_topk") }
     fn moe_publish(&self, ids: u64, wts: u64, slots: u64, h: u64, mb: u64, k: usize, n: usize, h_off: usize, step: u64, t: usize) -> anyhow::Result<()> { todo("moe_publish") }
     fn moe_combine(&self, x: u64, ye: u64, w: u64, k: usize, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, slots: u64, n: usize, t: usize) -> anyhow::Result<()> { todo("moe_combine") }
