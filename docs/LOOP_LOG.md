@@ -1726,6 +1726,26 @@ code was not timed on that test. Full suite green, load 2.55.
 - Not verified: performance of `attn_prefill` (correctness only; head_dim 256 likely spills registers); end-to-end
   prefill still needs `gemm`/`gemm_dense` (Tasks 3.2-3.4).
 
+### 2026-10-16 #96 — Vulkan V3 Tasks 3.2-3.4: prefill GEMM on cooperative matrices (9cb6597)
+- `gemm` and `gemm_dense` on Vulkan. Types CUDA runs in f16 (`Gpu::mmq`: F32, BF16, IQ2_XS, IQ2_S) go through
+  `gemm_f` (16x16x16 f16 cooperative matrices, port of `gemm_q`); the rest through `quant_q8` + `gemmi` (16x16x32
+  int8 cooperative matrices, port of `gemmi_q`, exact int32 sums scaled per weight scale in f32).
+- `gemm_matches_reference_for_every_type` now requires the same bits on every backend: Vulkan is bit-identical to
+  CUDA for Q2_K..Q8_0, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, F32, BF16 (default
+  model, Qwen3-Next 80B, Qwen3-30B, Qwen3-4B), also with `STRATA_LLAMA_NUMERICS` (there the reference rel-err assert
+  fails on CUDA too, 4.8e-3, because the CPU reference does not model llama numerics; not a regression).
+- Lesson: check float op order in the SASS, not the PTX. For the min types (q2_k, q4_k, q5_k) the PTX has
+  `c*s` then `- sa*m` then `+ acc`, but ptxas contracts the first two into one FFMA
+  (`ptxas -arch=sm_86` + `cuobjdump -sass`). Matching the PTX left 11k of 17k values off by an ulp.
+- Throughput (`gemm_throughput`, 4096 positions, 3 runs, load 4.9-7.5), CUDA vs Vulkan ms:
+  Q5_K 8192x2048 7.39-7.93 vs 21.01-21.17; Q5_K 4096x2048 3.76-3.92 vs 10.53-10.76; Q6_K 2048x4096 4.23-4.35 vs
+  12.13-12.28; IQ2_XS 512x2048 (f16) 0.62-0.63 vs 2.00-2.01; IQ3_XXS 2048x512 0.46-0.59 vs 0.92-1.04. Vulkan ~2.7x
+  slower: no double buffering, scalar epilogue from shared memory, byte-wide shared stores. For V4.
+- The cooperative-matrix flag now needs both the f16 and the int8 shape.
+- Full suite green (72 passed, 4 ignored, load 5.6; #95's "73" was a miscount).
+- Not verified: `act` 1 and 2 and the dense path (`tiles == 0`) are not covered by a kernel test (Task 3.5 runs
+  them end to end); fallbacks without matrix cores (Tasks 3.2/3.3 as written) wait for RADV.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
