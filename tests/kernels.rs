@@ -174,7 +174,7 @@ fn gemvn_matches_gemv() {
 #[ignore]
 fn gemv_bandwidth() {
     let Some(p) = common::model_path() else { return };
-    for (bk, gpu) in common::backends_except(&["vulkan"]) {
+    for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let g = Gguf::open(&p).unwrap();
