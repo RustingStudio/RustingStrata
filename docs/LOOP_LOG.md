@@ -1469,7 +1469,7 @@ graphs go through `Backend::graph`; the CPU mailbox comes from `Backend::host_ma
 
 `src/config.rs` has one `match` on the architecture name. It sets `hybrid`, `q_gate`, `k_interleave` and tensor
 `aliases`, and `ModelConfig::layers` lists a `LayerKind` (`Delta` or `Attn`) per block. Strata now loads `qwen3`,
-`qwen3moe` and `qwen3next` next to `qwen35` / `qwen35moe`. Commits fe52577, 0a283d3, f3338f8, 9440fd1, d2a03d8.
+`qwen3moe` and `qwen3next` next to `qwen35` / `qwen35moe`. Commits 38949be, 048f164, 414244d, b5fe15f, 4de35ba.
 - Attention without the output gate: `qg == 0` in `attn_decode`, `attn_decode_gq` and `attn_prefill` means no gate.
   The CPU oracle, decode and prefill size the Q projection from `q_gate`.
 - qwen3next: `Weights::new` splits the fused `ssm_ba` into `ssm_beta` / `ssm_alpha` rows at load time, and
@@ -1509,7 +1509,7 @@ whose first miss has a top-2 gap under 0.1 nats.
 - The 80B parity run 2 first hit CUDA out of memory next to llama-server; it was rerun from the cached reference
   with the server stopped.
 
-Default model: `cargo test --release` green after every task. Base (fe52577) against Task 2, strict parity on a
+Default model: `cargo test --release` green after every task. Base (38949be) against Task 2, strict parity on a
 fresh reference, 4 runs each: 628/629/627/627 against 628/627/626/627 of 640. Runs are not reproducible even with
 `--fixed-experts`, so bit identity could not be checked.
 
