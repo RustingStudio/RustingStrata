@@ -127,6 +127,9 @@ struct State {
     graphs: HashMap<u64, vk::CommandBuffer>,
     /// The graph being recorded; ops go there instead of `cur`.
     rec: Option<vk::CommandBuffer>,
+    /// Inside `batch`: dispatches get no barrier after them (except quant_xq, read by the GEMV after it). quant_xq
+    /// output has one scratch buffer, so at most one GEMV in a batch may quantize its own input.
+    batch: bool,
     pipes: HashMap<(&'static str, Vec<u32>), vk::Pipeline>,
     fence: vk::Fence,
     staging: (vk::Buffer, vk::DeviceMemory),
@@ -267,7 +270,7 @@ impl Vk {
         let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None) }?;
         let pc = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(128)];
         let layout = unsafe { dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc), None) }?;
-        let st = State { pool, spare: vec![], used: vec![], cur: None, busy: false, gpool, graphs: HashMap::new(), rec: None,
+        let st = State { pool, spare: vec![], used: vec![], cur: None, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false,
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, bufs: BTreeMap::new(), err: Default::default() };
         let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, coop, llama: crate::cuda::llama_numerics() as u32, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
@@ -420,7 +423,7 @@ impl Vk {
             d.cmd_push_constants(cb, self.0.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
             d.cmd_dispatch(cb, groups[0] as u32, groups[1] as u32, groups[2] as u32);
         }
-        self.0.barrier(cb, false);
+        if !st.batch || name == "quant_xq" { self.0.barrier(cb, false); }
         Ok(())
     }
 
@@ -571,6 +574,15 @@ impl Backend for Vk {
     fn sync(&self) -> anyhow::Result<()> { self.0.flush(&mut self.0.st()) }
 
     /// A reusable command buffer per key, submitted without waiting. `STRATA_NO_GRAPH` runs `f` every time instead.
+    fn batch(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
+        self.0.st().batch = true;
+        let r = f();
+        let mut st = self.0.st();
+        st.batch = false;
+        let cb = self.0.cb(&mut st)?;
+        self.0.barrier(cb, false);
+        r
+    }
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
         let mut st = self.0.st();
         if let Some(&g) = st.graphs.get(&key) { return self.0.submit(&mut st, Some(g), false); }
