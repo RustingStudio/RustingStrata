@@ -1707,6 +1707,25 @@ code was not timed on that test. Full suite green, load 2.55.
 - Not verified: Vulkan prefill (`gemm`, `gemm_dense`, `conv_seq`, `attn_prefill`, `moe_combine_seq` are V3), so
   Vulkan parity runs only with `--chunk 0`; MTP on Vulkan; RADV deferred (no AMD GPU).
 
+### 2026-10-16 #95 — Vulkan V3 Task 3.1: prefill sequence kernels (5b8d2a1)
+- `conv_seq` + `conv_state`, `moe_combine_seq` and `attn_prefill` (head_dim 64, 128, 256) on Vulkan, all
+  bit-identical to CUDA (the tests now require the same bits on every backend).
+- `attn_prefill` uses `VK_KHR_cooperative_matrix` (16x16x16 f16 products, f32 sums, per subgroup). On the 3060 the
+  driver's cooperative-matrix multiply gives the same bits as CUDA's `mma.sync.m16n8k16` when the k order is the
+  same, so the prefill GEMMs (Tasks 3.2-3.4) can be bit-identical too. Two details needed for that: the softmax runs
+  per lane in CUDA's fragment layout (the per-lane sums of l are reduced only at the end), and nvcc fuses `l *= c`
+  into the first `l += p` of each block (checked in the PTX), so the shader writes that as an fma. The O
+  accumulators are rescaled per row through two index matrices (row and column of each accumulator element),
+  because the element layout of a cooperative matrix is the implementation's. Shared memory: 47.5 KB at head_dim
+  256 (the Q tile is staged once in the K/V area and then kept in registers), under the 48 KB Vulkan limit.
+- Without cooperative matrices (and with `--llama-numerics`) `attn_prefill` reports "not implemented"; the fallback
+  waits for the RADV work.
+- Load time (Task 2.3 asked for it; measured after #94): default model, cap 8000, warm page cache, load 3.6-4.6:
+  Vulkan 2.49 s (2.45-2.55), CUDA 1.87 s (1.86-1.89).
+- Full suite green (73 passed, load 2.3).
+- Not verified: performance of `attn_prefill` (correctness only; head_dim 256 likely spills registers); end-to-end
+  prefill still needs `gemm`/`gemm_dense` (Tasks 3.2-3.4).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
