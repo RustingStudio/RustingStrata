@@ -2358,6 +2358,16 @@ code was not timed on that test. Full suite green, load 2.55.
   ahead or equal.
 - Not verified: parity (same bits by test and greedy output); 4B decode speed (no DeltaNet layers there).
 
+### 2026-10-17 #131 — Routed SwiGLU inside the down `moe_gemv`: slower, reverted (no code commit)
+
+- Tried `moe_swiglu_gemv`: CUDA's per-block `quant_x` of the down `moe_gemv` read g and u and quantized
+  silu(g) * u; Vulkan ran its `quant_xq` with u (as the dense `swiglu_gemv`). Saves the routed `swiglu` launch (40
+  per token). Same bits as `swiglu` then `moe_gemv` (test) and same greedy output.
+- Decode, default model, interleaved 5 runs against c31cd6f (load 3.1-4.5): CUDA 107.16 (106.4-107.5) to 106.48
+  (106.2-106.6), -0.6%, every pair; Vulkan 102.30 (100.3-103.0) to 102.20 (101.7-102.4), 4 of 5 pairs behind.
+  On CUDA every block of every slot recomputes the SiLU of its expert's whole input (`n_ff_exp` `expf`s), which
+  costs more than the launch. Reverted, as #125 did for the dense down GEMV; patch kept out of the tree.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
