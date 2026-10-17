@@ -18,9 +18,11 @@ const SPV: &[(&str, &[u8])] = &[
     ("add", include_bytes!("spv/add.spv")),
     ("argmax_rows", include_bytes!("spv/argmax_rows.spv")),
     ("attn_decode", include_bytes!("spv/attn_decode.spv")),
+    ("attn_decode_llama", include_bytes!("spv/attn_decode_llama.spv")),
     ("attn_merge", include_bytes!("spv/attn_merge.spv")),
     ("attn_prefill_64", include_bytes!("spv/attn_prefill_64.spv")),
     ("attn_prefill_dp", include_bytes!("spv/attn_prefill_dp.spv")),
+    ("attn_prefill_llama", include_bytes!("spv/attn_prefill_llama.spv")),
     ("attn_prefill_128", include_bytes!("spv/attn_prefill_128.spv")),
     ("attn_prefill_256", include_bytes!("spv/attn_prefill_256.spv")),
     ("conv_silu", include_bytes!("spv/conv_silu.spv")),
@@ -498,7 +500,6 @@ impl State {
 }
 
 /// An op the Vulkan backend does not have yet.
-fn todo(op: &str) -> anyhow::Result<()> { anyhow::bail!("{op} is not implemented on Vulkan yet") }
 
 impl Vk {
     /// Specialization constants of the weight kernels (deq.glsl): llama numerics, the ggml type id, the bytes per
@@ -749,7 +750,9 @@ impl Backend for Vk {
     fn attn_prefill(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
         let name = match hd { 64 => "attn_prefill_64", 128 => "attn_prefill_128", 256 => "attn_prefill_256",
             _ => anyhow::bail!("attention prefill: head_dim {hd} unsupported (64, 128 or 256)") };
-        if self.0.llama != 0 { return todo("attn_prefill with --llama-numerics"); }
+        if self.0.llama != 0 {
+            return self.run("attn_prefill_llama", &[0, hd as u32], [t, nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale]);
+        }
         if !self.0.coop {
             return self.run("attn_prefill_dp", &[0, (hd / 32) as u32], [t.div_ceil(4), nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale]);
         }
@@ -767,9 +770,12 @@ impl Backend for Vk {
     /// As the CUDA one: both kernels run, the step decides which one works, then attn_merge combines the splits.
     fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize) -> anyhow::Result<()> {
         ensure!([64, 128, 256, 512].contains(&hd), "attention head_dim {hd} unsupported (64, 128, 256 or 512)");
-        if self.0.llama != 0 { return todo("attn_decode with --llama-numerics"); }
-        let g = [8, 4, 2, 1].into_iter().find(|&g| (nh / nkv) % g == 0 && g * hd <= 2048).unwrap();
         let (per, pz) = ((hd / 32) as u32, (nh * ATT_SPLITS * (hd + 2)) as u32);
+        if self.0.llama != 0 {  // one head per workgroup, merged as the attn_decode splits (empty ones weigh 0)
+            self.run("attn_decode_llama", &[0, hd as u32], [nh * nt, ATT_SPLITS_1, 1], &[&q, &kc, &vc, &part, &step, &(nh as u32), &(nkv as u32), &scale, &pz, &(nt as u32)])?;
+            return self.run("attn_merge", &[], [nh, 1, nt], &[&part, &qg, &out, &step, &(hd as u32), &(ATT_SPLITS as u32), &(ATT_SPLITS_1 as u32), &i32::MAX]);
+        }
+        let g = [8, 4, 2, 1].into_iter().find(|&g| (nh / nkv) % g == 0 && g * hd <= 2048).unwrap();
         let args: [&dyn Arg; 11] = [&q, &kc, &vc, &part, &step, &(nh as u32), &(nkv as u32), &scale, &gq_min, &pz, &(nt as u32)];
         self.run("attn_decode", &[0, per, 1, 0], [nh * nt, ATT_SPLITS_1, 1], &args)?;
         self.run("attn_decode", &[0, per, g as u32, 1], [nh / g * nt, ATT_SPLITS, 1], &args)?;
