@@ -29,6 +29,8 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
 - Vulkan (branch `vulkan`, #121, 36f529c; `bench --mtp 0`, tg128 after pp512): default model decode ~99-100, pp512
   ~1000, pp4096 ~1650; 4B decode 99.3, pp512 2080, pp4096 ~1950. llama.cpp Vulkan (#110, #116): 4B 95.4 / 3120 /
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
+  Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
+  632-633/640.
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2212,6 +2214,33 @@ code was not timed on that test. Full suite green, load 2.55.
 - Full suite green (72 passed, load 1.6).
 - Not verified: a real device without cooperative matrices (no AMD GPU here). The spec's dp4a tiled GEMM fallback
   is still not written; token-by-token prefill is slow (it is decode speed) but correct.
+
+### 2026-10-17 #123 — prefill kernels without cooperative matrices (dbfcc55)
+- Replaces #122's token-by-token fallback: `Backend::batched_prefill` is gone again. Without
+  `VK_KHR_cooperative_matrix` (or with `STRATA_VK_NO_COOP=1`) Vulkan runs three new kernels:
+  - `gemmi_dp`: gemmi with the int8 tile products done by `dotPacked4x8EXT` (GL_EXT_integer_dot_product). Int8
+    sums are exact in int32 and the epilogue keeps its order, so output is bit-identical to coop gemmi and CUDA
+    (kernel test, all MMQ types).
+  - `gemm_f_dp`: gemm_f with `fma` over k in order. Rel err 0 against the CPU reference (IQ2_XS, F32, BF16); not
+    bit-identical to mma.sync, whose f16 sum order is the hardware's.
+  - `attn_prefill_dp`: one subgroup per query, keys one at a time with an online softmax, same f16 inputs and
+    softmax weights as attn_prefill. Rel err against decode 2.2e-7 to 1.4e-6.
+  - gemmi and gemm_f bodies moved to `.glsl`, with `.comp` wrappers setting `COOP` 1 or 0 (the build compiles only
+    `*.comp`). The coop SPIR-V keeps its size and the coop kernel tests still match CUDA bit for bit.
+- Kernel tests skip only the bit-identity checks for gemm_f and attn_prefill when `STRATA_VK_NO_COOP` is set;
+  the error bounds still apply.
+- Greedy (`generate -n 64`, `STRATA_EXPERT_MB=6000 --fixed-experts`, no-coop vs CUDA): 4B identical; default model
+  differs at byte 69 (f16 sum order), so the gate there is parity.
+- Parity (`tools/parity.py`, 640 tokens, interleaved, load 2.9-11.0): CUDA 628 / 629 / 629 / 627, Vulkan no-coop
+  632 / 632 / 633 (98.75-98.91%). Two no-coop and one CUDA run died on a VRAM allocation while another project's
+  test process held the GPU; those were rerun, not counted.
+- No-coop speed on the 3060 (bench, 3 reps): 4B pp512 883.3 (873.9-888.0), pp4096 456.7 (456.0-457.6), tg 99.0 /
+  84.3, load 4.7; default model pp512 311.1 (199.1-397.5, noisy), pp4096 785.7 (732.4-821.7), tg 88.3 / 79.4,
+  load 2.8. Much slower than coop prefill (4B pp4096 ~1950); token by token would run at decode speed.
+- Suite green (72 passed, load 5.1). One earlier run failed `rollback_matches_step` on an unwrap; it passed alone
+  and in the rerun (not traced). Kernel tests with `STRATA_VK_NO_COOP=1`: 15 passed.
+- Not verified: a real device without cooperative matrices (no AMD GPU here; RADV deferred). No tuning of the dp
+  kernels (tile shape, attention keys per step).
 
 ## Next candidates
 
