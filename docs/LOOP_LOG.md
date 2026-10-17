@@ -2198,6 +2198,21 @@ code was not timed on that test. Full suite green, load 2.55.
 - Each commit: suite 72 passed; greedy `generate -n 64` CUDA == Vulkan on the 4B (mtp 0) and the default model
   (mtp 0 and 2). Not verified: parity (results bit-identical to before).
 
+### 2026-10-17 #122 — prefill without cooperative matrices runs token by token (b1d81a3)
+- 4B prefill profile first (pp4096, Vulkan, load 3.8): gemmi 76.6%, attn_prefill 14.9%, rms_norm 3.1%, quant_q8
+  3.1% (256 us per call, ~325 GB/s, already at bandwidth; sharing one quantized x among q/k/v and gate/up would save
+  under 1%). No cheap lever there; the gap is gemmi (Questions for owner, #119).
+- Spec gap: without `VK_KHR_cooperative_matrix` (RDNA2) `gemm`, `gemm_dense` and `attn_prefill` report "not
+  implemented", so any prompt of 32+ tokens failed. New `Backend::batched_prefill` (Vulkan: the coop flag);
+  without it `GpuModel::load` keeps no prefill chunk (as `--chunk 0`) and prints a note. `STRATA_VK_NO_COOP=1`
+  forces it, for tests and for drivers with broken cooperative matrices.
+- Check (`generate -n 64`, 80-line prompt, load 1.3-7.1): `STRATA_VK_NO_COOP=1` output equals Vulkan `--chunk 0`
+  on 4B mtp 0 and default model mtp 0 and 1; Vulkan `--chunk 0` equals CUDA `--chunk 0` except one default-model
+  mtp 0 run, and with `STRATA_EXPERT_MB=6000 --fixed-experts` CUDA x2, Vulkan x2 and no-coop give one md5.
+- Full suite green (72 passed, load 1.6).
+- Not verified: a real device without cooperative matrices (no AMD GPU here). The spec's dp4a tiled GEMM fallback
+  is still not written; token-by-token prefill is slow (it is decode speed) but correct.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
