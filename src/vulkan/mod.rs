@@ -256,7 +256,8 @@ impl Vk {
         let shape = |k, ab, cr| props.iter().any(|c| (c.m_size, c.n_size, c.k_size) == (16, 16, k) && c.scope == vk::ScopeKHR::SUBGROUP
             && c.a_type == ab && c.b_type == ab && c.c_type == cr && c.result_type == cr);
         let coop = shape(16, vk::ComponentTypeKHR::FLOAT16, vk::ComponentTypeKHR::FLOAT32)
-            && shape(32, vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32);
+            && shape(32, vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32)
+            && std::env::var_os("STRATA_VK_NO_COOP").is_none();  // runs as a device without them would
         if coop { exts.push(ash::khr::cooperative_matrix::NAME.as_ptr()) }
         let stats = std::env::var_os("STRATA_VK_STATS").is_some() && has(ash::khr::pipeline_executable_properties::NAME);
         if stats { exts.push(ash::khr::pipeline_executable_properties::NAME.as_ptr()) }
@@ -537,6 +538,7 @@ fn nsb(w: &GpuTensor) -> anyhow::Result<u32> {
 #[allow(unused_variables)]
 impl Backend for Vk {
     fn name(&self) -> &'static str { "vulkan" }
+    fn batched_prefill(&self) -> bool { self.0.coop }
 
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf> { Ok(self.buf(bytes, DEVICE)?.0) }
 

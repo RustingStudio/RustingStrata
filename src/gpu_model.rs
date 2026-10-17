@@ -149,7 +149,10 @@ impl<'a> GpuModel<'a> {
         let (x, logits, ids) = (gpu.zeros::<f32>(TMAX * c.n_embd)?, gpu.zeros::<f32>(TMAX * c.n_vocab)?, gpu.zeros::<i32>(TMAX * ke)?);
         let amax = gpu.zeros::<i32>(TMAX)?;
         let (slots, step_buf) = (gpu.zeros::<i32>(TMAX * ke)?, gpu.zeros::<i32>(2 * TMAX)?);
-        let pf = if chunk > 0 { Some(prefill::Scratch::new(m, &*gpu, chunk.min(ctx))?) } else { None };
+        if chunk > 0 && !gpu.batched_prefill() {
+            eprintln!("note: no batched prefill on this {} device (cooperative matrices missing); prompts run token by token", gpu.name());
+        }
+        let pf = if chunk > 0 && gpu.batched_prefill() { Some(prefill::Scratch::new(m, &*gpu, chunk.min(ctx))?) } else { None };
         let (free1, _) = gpu.mem_info()?;
 
         let cache = if c.is_moe() {
