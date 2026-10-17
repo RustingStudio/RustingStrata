@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 0c8aa99 (#129, `bench --mtp 0`, tg128 after pp512): CUDA decode 107.0, Vulkan 102.8.
+- At c31cd6f (#130, `bench --mtp 0`, tg128 after pp512): CUDA decode 107.5, Vulkan 102.8.
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2345,6 +2345,18 @@ code was not timed on that test. Full suite green, load 2.55.
   an hour under its own lock file (`/tmp/rusting-gpu.lock`), and both binaries ran at half speed (CUDA ~50.3,
   Vulkan ~39.6). The loop now waits for no other GPU compute process before an A/B.
 - Not verified: parity (same bits as before by the new tests and greedy output); 4B decode speed.
+
+### 2026-10-17 #130 — Decode: `ssm_gates` in `deltanet` (c31cd6f)
+
+- `deltanet` takes `dt_bias` and `a`; when set, it applies the `ssm_gates` sigmoid and softplus to beta and g as it
+  loads them. Decode drops the `ssm_gates` launch (30 per token on the default model); prefill keeps it. CUDA and
+  Vulkan; new test `deltanet_gates_match_ssm_gates` checks the same bits as `ssm_gates` then `deltanet` on both.
+- Greedy output identical to 9489929 (4B and default model, CUDA and Vulkan, `--mtp 0` and `--mtp 1`). Suite 74
+  passed.
+- Decode, default model, interleaved 5 runs against 9489929 (load 2.5-3.0): CUDA 107.12 (107.0-107.2) to 107.50
+  (107.4-107.6), +0.35%, every pair; Vulkan 102.68 (102.4-102.9) to 102.84 (102.7-103.0), +0.15%, 4 of 5 pairs
+  ahead or equal.
+- Not verified: parity (same bits by test and greedy output); 4B decode speed (no DeltaNet layers there).
 
 ## Next candidates
 
