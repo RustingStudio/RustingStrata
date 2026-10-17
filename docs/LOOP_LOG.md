@@ -2295,6 +2295,20 @@ code was not timed on that test. Full suite green, load 2.55.
   (101.5-101.7), +0.8%, every pair. A first 3-run A/B at load 6-10 was too noisy to read.
 - Not verified: parity (routing arithmetic unchanged, greedy output identical).
 
+### 2026-10-17 #127 — `moe_route`: decode routing and mailbox publish in one launch (3d75f5b)
+
+- Decode now routes with `moe_route`: one block, warp i routes tokens i, i + 8, ... (top-k, then the cache lookup
+  from #126), and the same block writes the CPU mailbox (`moe_publish`'s job, now removed). Prefill keeps
+  `router_topk` (one warp per token, no lookup). Top-k body shared: CUDA `topk_warp`, GLSL `topk.glsl`. Another 40
+  launches fewer per decoded token on the default model.
+- `moe_mailbox_round_trip` now drives `moe_route` from router logits and checks ids, slots and hit weights. Kernel
+  tests and suite 72 passed. Greedy output identical to a6ead70 (4B and default model, CUDA and Vulkan, `--mtp 0`),
+  and with `--mtp 1` (default model, both backends; the two-token verify path).
+- Decode, default model, interleaved 5 runs against a6ead70 (load 2.4-6.0): CUDA 104.34 (103.9-104.5) to 104.96
+  (104.9-105.0), +0.6%, every pair; Vulkan 100.48 (98.8-101.5) to 101.88 (100.2-102.6), +1.4%, 4 of 5 pairs.
+- Not verified: parity (routing arithmetic unchanged, greedy output identical); more than 8 tokens per decode step
+  (the warp loop's second pass; decode steps have at most 4).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
