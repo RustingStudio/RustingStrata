@@ -33,40 +33,40 @@ void main() {
     for (uint i = tid; i < G * HD; i += 256) sq[i] = p.q.v[qo + h0 * HD + i];
     precise float acc[G * PER], l = 0.0;  // l, m: running sum and max of head w (subgroups w < G)
     float m = ninf;
-    for (uint i = 0; i < G * PER; i++) acc[i] = 0.0;
+    [[unroll]] for (uint i = 0; i < G * PER; i++) acc[i] = 0.0;
     barrier();
     for (uint c0 = p0; c0 < p1; c0 += C) {
         uint kr[J * PER / 2], vr[J * PER / 2];
-        for (uint j = 0; j < J; j++) {
+        [[unroll]] for (uint j = 0; j < J; j++) {
             uint tt = c0 + w * J + j, r = ((tt * p.nkv + g) * HD + lane * PER) / 2;
-            for (uint d = 0; d < PER / 2; d++) {
+            [[unroll]] for (uint d = 0; d < PER / 2; d++) {
                 kr[j * PER / 2 + d] = tt < p1 ? p.kc.v[r + d] : 0;
                 vr[j * PER / 2 + d] = tt < p1 ? p.vc.v[r + d] : 0;
             }
         }
         float kf[J * PER], sp[J * G];
-        for (uint j = 0; j < J; j++)
-            for (uint d = 0; d < PER; d++) kf[j * PER + d] = hraw(kr[j * PER / 2 + d / 2], d);
-        for (uint i = 0; i < G; i++) {
+        [[unroll]] for (uint j = 0; j < J; j++)
+            [[unroll]] for (uint d = 0; d < PER; d++) kf[j * PER + d] = hraw(kr[j * PER / 2 + d / 2], d);
+        [[unroll]] for (uint i = 0; i < G; i++) {
             float qv[PER];
-            for (uint d = 0; d < PER; d++) qv[d] = sq[i * HD + lane * PER + d];
-            for (uint j = 0; j < J; j++) {
+            [[unroll]] for (uint d = 0; d < PER; d++) qv[d] = sq[i * HD + lane * PER + d];
+            [[unroll]] for (uint j = 0; j < J; j++) {
                 precise float s = 0.0;
-                for (uint d = 0; d < PER; d++) s = fma(qv[d], kf[j * PER + d], s);
+                [[unroll]] for (uint d = 0; d < PER; d++) s = fma(qv[d], kf[j * PER + d], s);
                 sp[j * G + i] = s;
             }
         }
         {   // warp_sum_scatter<J * G>: lane l ends with the sum of sp[l / (32 / (J * G))]
             const uint N = J * G, L = 32 / N;
-            for (uint S = N / 2; S >= 1; S /= 2) {
+            [[unroll]] for (uint S = N / 2; S >= 1; S /= 2) {
                 bool hi = (lane & (S * 32 / N)) != 0;
-                for (uint i = 0; i < S; i++) {
+                [[unroll]] for (uint i = 0; i < S; i++) {
                     float keep = hi ? sp[i + S] : sp[i], send = hi ? sp[i] : sp[i + S];
                     sp[i] = keep + subgroupShuffleXor(send, S * 32 / N);
                 }
             }
             float s = sp[0];
-            for (uint o = 16 / N; o >= 1; o /= 2) s += subgroupShuffleXor(s, o);
+            [[unroll]] for (uint o = 16 / N; o >= 1; o /= 2) s += subgroupShuffleXor(s, o);
             uint k = lane / L, j = k / G;
             if (lane % L == 0) ss[(k % G) * C + w * J + j] = c0 + w * J + j < p1 ? s * p.scale : ninf;
         }
@@ -78,10 +78,10 @@ void main() {
             if (lane == 0) sc[w] = cs;
         }
         barrier();
-        for (uint j = 0; j < J; j++)
-            for (uint i = 0; i < G; i++) {
+        [[unroll]] for (uint j = 0; j < J; j++)
+            [[unroll]] for (uint i = 0; i < G; i++) {
                 float e = ss[i * C + w * J + j];
-                for (uint d = 0; d < PER; d++) {
+                [[unroll]] for (uint d = 0; d < PER; d++) {
                     float v = hraw(vr[j * PER / 2 + d / 2], d);
                     acc[i * PER + d] = j == 0 ? fma(acc[i * PER + d], sc[i], e * v) : fma(e, v, acc[i * PER + d]);
                 }
@@ -89,13 +89,13 @@ void main() {
         barrier();
     }
     if (w < G && lane == 0) { sm[w] = m; sl[w] = l; }
-    for (uint i = 0; i < G; i++) {  // the queries are no longer needed (the loop ends on a barrier)
-        for (uint d = 0; d < PER; d++) sq[w * HD + lane * PER + d] = acc[i * PER + d];
+    [[unroll]] for (uint i = 0; i < G; i++) {  // the queries are no longer needed (the loop ends on a barrier)
+        [[unroll]] for (uint d = 0; d < PER; d++) sq[w * HD + lane * PER + d] = acc[i * PER + d];
         barrier();
         uint pp = po + ((h0 + i) * ns + sy) * (HD + 2);
         for (uint d = tid; d < HD; d += 256) {
             float o = 0.0;
-            for (uint k = 0; k < NW; k++) o += sq[k * HD + d];
+            [[unroll]] for (uint k = 0; k < NW; k++) o += sq[k * HD + d];
             p.part.v[pp + d] = o;
         }
         if (tid == 0) { p.part.v[pp + HD] = sm[i]; p.part.v[pp + HD + 1] = sl[i]; }

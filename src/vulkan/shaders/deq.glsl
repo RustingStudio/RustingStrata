@@ -152,17 +152,17 @@ void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
     if (WORDS) {
         uint lo, hi;
         qw_k(w, b, sub, lo, hi, d, m);
-        for (uint i = 0; i < 4; i++) { q[i] = sb(lo >> (8 * i)); q[i + 4] = sb(hi >> (8 * i)); }
+        [[unroll]] for (uint i = 0; i < 4; i++) { q[i] = sb(lo >> (8 * i)); q[i + 4] = sb(hi >> (8 * i)); }
     } else if (T == 19 || T == 29) {  // IQ1_S, IQ1_M: dl * (g +- 1/8) = (dl / 8) * (8 g +- 1)
         uint idx; float dl; bool neg;
         iq1_sub(w, b, ib, l, idx, dl, neg);
         uint64_t g = iq1s_grid[idx];
         d = dl * 0.125;
-        for (uint j = 0; j < 8; j++) q[j] = 8 * sb(uint(g >> (8 * j))) + (neg ? -1 : 1);
+        [[unroll]] for (uint j = 0; j < 8; j++) q[j] = 8 * sb(uint(g >> (8 * j))) + (neg ? -1 : 1);
     } else if (IQG) {
         uint g0, g1, sg;
         iq_grid(w, b, ib, l, g0, g1, sg, d);
-        for (uint j = 0; j < 8; j++) q[j] = sgn(j < 4 ? g0 : g1, sg, j);
+        [[unroll]] for (uint j = 0; j < 8; j++) q[j] = sgn(j < 4 ? g0 : g1, sg, j);
     } else {  // IQ4_XS (23), IQ4_NL (20, 8 blocks of 18)
         uint r = l * 8, o;
         if (T == 23) {
@@ -176,7 +176,7 @@ void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
             o = p + 2 + (r & 15);
         }
         uvec2 v = ld8(w, o);
-        for (uint i = 0; i < 8; i++) q[i] = kvalues_iq4nl[((i < 4 ? v.x : v.y) >> (8 * (i & 3) + (r < 16 ? 0 : 4))) & 15];
+        [[unroll]] for (uint i = 0; i < 8; i++) q[i] = kvalues_iq4nl[((i < 4 ? v.x : v.y) >> (8 * (i & 3) + (r < 16 ? 0 : 4))) & 15];
     }
 }
 
@@ -197,12 +197,12 @@ void qw(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out float
 // Values [8 sub, 8 sub + 8) of the super-block at byte b (deq8<T> in kernels.cu; d * q - m is the same float).
 void deq8(U8 w, uint b, uint sub, out float o[8]) {
     if (T == 0) {  // F32
-        for (uint i = 0; i < 8; i++) o[i] = F32(uint64_t(w)).v[b / 4 + 8 * sub + i];
+        [[unroll]] for (uint i = 0; i < 8; i++) o[i] = F32(uint64_t(w)).v[b / 4 + 8 * sub + i];
     } else if (T == 30) {  // BF16
-        for (uint i = 0; i < 8; i++) o[i] = uintBitsToFloat(ld16(w, b + 16 * sub + 2 * i) << 16);
+        [[unroll]] for (uint i = 0; i < 8; i++) o[i] = uintBitsToFloat(ld16(w, b + 16 * sub + 2 * i) << 16);
     } else {
         int q[8]; float d, m;
         qi8(w, b, sub, q, d, m);
-        for (uint i = 0; i < 8; i++) o[i] = d * float(q[i]) - m;
+        [[unroll]] for (uint i = 0; i < 8; i++) o[i] = d * float(q[i]) - m;
     }
 }

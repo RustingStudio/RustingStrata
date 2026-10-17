@@ -4,6 +4,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32 { float v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer I32 { int v[]; };
@@ -101,7 +102,7 @@ void rope_cs(double pos, double ts, uint i, out float sn, out float cs) {
 void quant_x(F32 x, uint xo, uint n, F32 w, float sc, F32 u, U32 q, uint qo, F32 d, uint do_) {
     for (uint i = gl_LocalInvocationID.x * 8; i < n; i += gl_WorkGroupSize.x * 8) {
         float v[8], mx = 0.0;
-        for (uint j = 0; j < 8; j++) {
+        [[unroll]] for (uint j = 0; j < 8; j++) {
             v[j] = uint64_t(w) != 0 ? x.v[xo + i + j] * sc * w.v[i + j] : x.v[xo + i + j];
             if (uint64_t(u) != 0) v[j] = silu(v[j]) * u.v[xo + i + j];
             mx = max(mx, abs(v[j]));
@@ -109,8 +110,8 @@ void quant_x(F32 x, uint xo, uint n, F32 w, float sc, F32 u, U32 q, uint qo, F32
         float dd, id;
         if (LLAMA_Q8) {  // one scale per 256 (the subgroup): -127 / the signed value of largest magnitude, lowest index
             float sv = 0.0; uint si = 1u << 30;
-            for (uint j = 0; j < 8; j++) if (abs(v[j]) == mx && si > i + j) { sv = v[j]; si = i + j; }
-            for (uint o = 1; o < 32; o <<= 1) {
+            [[unroll]] for (uint j = 0; j < 8; j++) if (abs(v[j]) == mx && si > i + j) { sv = v[j]; si = i + j; }
+            [[unroll]] for (uint o = 1; o < 32; o <<= 1) {
                 float ov = subgroupShuffleXor(sv, o); uint oi = subgroupShuffleXor(si, o);
                 if (abs(ov) > abs(sv) || (abs(ov) == abs(sv) && oi < si)) { sv = ov; si = oi; }
             }
@@ -122,7 +123,7 @@ void quant_x(F32 x, uint xo, uint n, F32 w, float sc, F32 u, U32 q, uint qo, F32
             dd = fdiv(mx, 127.0); id = mx > 0.0 ? fdiv(127.0, mx) : 0.0;
         }
         int r[8];
-        for (uint j = 0; j < 8; j++) r[j] = int(roundEven(v[j] * id));
+        [[unroll]] for (uint j = 0; j < 8; j++) r[j] = int(roundEven(v[j] * id));
         q.v[qo + i / 4] = pack4(r[0], r[1], r[2], r[3]);
         q.v[qo + i / 4 + 1] = pack4(r[4], r[5], r[6], r[7]);
         if ((gl_LocalInvocationID.x & 3) == 0) d.v[do_ + i / 32] = dd;

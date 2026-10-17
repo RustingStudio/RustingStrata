@@ -13,25 +13,25 @@ void main() {
     if (j0 >= p.dv) return;  // whole subgroup past the end (R divides dv)
     uint row = (vh * p.dv + j) * dk, ns = min(p.nsnap, p.T - 1);
     precise float r[16];
-    for (uint e = 0; e < 16; e++) r[e] = p.S.v[row + 4 * (s + L * (e / 4)) + e % 4];
+    [[unroll]] for (uint e = 0; e < 16; e++) r[e] = p.S.v[row + 4 * (s + L * (e / 4)) + e % 4];
     for (uint tok = 0; tok < p.T; tok++) {
         uint yt = tok * p.ych;
         float kk[16], qv[16], decay = expf_(p.g.v[tok * p.nv + vh]), bt = p.beta.v[tok * p.nv + vh];
         float vt = p.y.v[yt + 2 * p.nk * dk + vh * p.dv + j];
-        for (uint e = 0; e < 16; e++) {
+        [[unroll]] for (uint e = 0; e < 16; e++) {
             uint c = 4 * (s + L * (e / 4)) + e % 4;
             kk[e] = p.y.v[yt + p.nk * dk + kh * dk + c];
             qv[e] = p.y.v[yt + kh * dk + c];
         }
         precise float sk = 0.0, oq = 0.0;
-        for (uint e = 0; e < 16; e++) { r[e] *= decay; sk = fma(r[e], kk[e], sk); }
-        for (uint off = L >> 1; off > 0; off >>= 1) sk += subgroupShuffleXor(sk, off);
+        [[unroll]] for (uint e = 0; e < 16; e++) { r[e] *= decay; sk = fma(r[e], kk[e], sk); }
+        [[unroll]] for (uint off = L >> 1; off > 0; off >>= 1) sk += subgroupShuffleXor(sk, off);
         float d = bt * (vt - sk);
-        for (uint e = 0; e < 16; e++) { r[e] = fma(d, kk[e], r[e]); oq = fma(r[e], qv[e], oq); }
-        for (uint off = L >> 1; off > 0; off >>= 1) oq += subgroupShuffleXor(oq, off);
+        [[unroll]] for (uint e = 0; e < 16; e++) { r[e] = fma(d, kk[e], r[e]); oq = fma(r[e], qv[e], oq); }
+        [[unroll]] for (uint off = L >> 1; off > 0; off >>= 1) oq += subgroupShuffleXor(oq, off);
         if (s == 0) p.o.v[tok * p.nv * p.dv + vh * p.dv + j] = oq * p.scale;
         if (tok < ns)
-            for (uint e = 0; e < 16; e++) p.snap.v[tok * p.nv * p.dv * dk + row + 4 * (s + L * (e / 4)) + e % 4] = r[e];
+            [[unroll]] for (uint e = 0; e < 16; e++) p.snap.v[tok * p.nv * p.dv * dk + row + 4 * (s + L * (e / 4)) + e % 4] = r[e];
     }
-    for (uint e = 0; e < 16; e++) p.S.v[row + 4 * (s + L * (e / 4)) + e % 4] = r[e];
+    [[unroll]] for (uint e = 0; e < 16; e++) p.S.v[row + 4 * (s + L * (e / 4)) + e % 4] = r[e];
 }
