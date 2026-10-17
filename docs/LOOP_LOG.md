@@ -2101,6 +2101,35 @@ code was not timed on that test. Full suite green, load 2.55.
   (mtp 0 and 2); `attn_prefill_matches_decode` bit-identical across backends.
 - Not verified: parity (results bit-identical to before).
 
+### 2026-10-17 #117 — gemmi double-buffered X, Q6_K back under 128 registers (7be9129)
+
+- New `STRATA_VK_STATS=1`: prints each pipeline's driver statistics. At 20273b4: gemmi Q4_K 128 registers, Q6_K 120,
+  30.7 KB shared; attn_prefill_128 201 registers. CUDA (ptxas -v on the cached PTX): gemmi_q4_k 119, gemmi_q6_k 124,
+  attn_prefill_128 128. So the dropped register X prefetch of #116 pushed gemmi past 128 registers, one workgroup per
+  SM.
+- 7be9129: X double-buffered in shared memory (the next step stored before the current products, like kernels.cu's
+  cp.async). For KS = 16 types the zeros after each 16 values moved from the X rows to the W rows (written once), so
+  X rows stay 20 words. Without that move Q6_K had 52 KB shared memory and the driver gave it 138 registers
+  (ffn_down 14.8 -> 21 ms). After: Q4_K 128 registers / 35.9 KB, Q6_K 126 / 40 KB.
+- `gemm_throughput` 4B, Vulkan (load 1.0-1.3): Q4_K attn_q 4.73-4.85 -> 4.67-4.68 ms, ffn_gate 11.32 -> 11.08,
+  Q6_K ffn_down 14.8 -> 14.16-14.18, attn_v 1.72 -> 1.57. CUDA: 4.17-4.48, 9.85-10.09, 12.5-12.6, 1.44-1.46.
+- A/B against 20273b4, 3 interleaved rounds (load 1.5-3.1), prefill tok/s:
+
+  | | pp512 base | pp512 new | pp4096 base | pp4096 new |
+  |---|---|---|---|---|
+  | 4B | 1906/1956/1959 | 2035/2012/2017 | 1793/1798/1793 | 1857/1844/1841 (+3%) |
+  | Default model | 746/1019/1023 | 875/1040/1044 | 1627/1641/1618 | 1863/1697/1695 |
+
+  Decode unchanged (4B 97.2-98.2, default model 94.5-97.5 at 512).
+- Tried and dropped:
+  - gemm_f: subgroups whose 32 rows are all past `cnt` skip the products. Default model pp512 gemm_f 756 -> 748 ms in
+    the profile, so the cost of small expert tiles is the weight decode, not the products.
+  - gemmi: the row/column index matrices reloaded from shared memory where used instead of held through the loop:
+    Q4_K stays at 128 registers, `gemm_throughput` a little slower.
+- Suite 72 passed; greedy `generate -n 64` CUDA == Vulkan on the 4B (mtp 0) and the default model (mtp 0 and 2);
+  `gemm_matches_reference_for_every_type` bit-identical across backends.
+- Not verified: parity (results bit-identical to before).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
