@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At c31cd6f (#130, `bench --mtp 0`, tg128 after pp512): CUDA decode 107.5, Vulkan 102.8.
+- At 5a78b2c (#132, `bench --mtp 0`, tg128 after pp512): CUDA decode 107.7 (4B 84.1), Vulkan 102.8 (4B 98.4).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2367,6 +2367,25 @@ code was not timed on that test. Full suite green, load 2.55.
   (106.2-106.6), -0.6%, every pair; Vulkan 102.30 (100.3-103.0) to 102.20 (101.7-102.4), 4 of 5 pairs behind.
   On CUDA every block of every slot recomputes the SiLU of its expert's whole input (`n_ff_exp` `expf`s), which
   costs more than the launch. Reverted, as #125 did for the dense down GEMV; patch kept out of the tree.
+
+### 2026-10-17 #132 — One-token GEMVs on the `gemv` kernel; same-shape GEMV pairs in one launch (5a78b2c)
+
+- `gemvq` with one token (every decode GEMV on the normed "h") now launches the `gemv` kernel, which takes the
+  pre-quantized x, instead of `gemvn`. Same math (`gemv_row_q` vs `gemv_row_qn<1>`), but `gemvn` carries the
+  nt = 2..4 branches and their registers. New `gemvq2`: two same-shape GEMVs on one x; CUDA runs both in one
+  launch (grid.z = 2, weight and output byte offsets), so decode pairs DeltaNet beta/alpha, the shared expert
+  gate/up and the dense gate/up. Same bits as two `gemvq` (test); greedy md5 unchanged on both models and both
+  backends, MTP 1 too.
+- First try paired through `moe_gemv` (one slot of a zero id at stride 0): CUDA 107.14 to 107.52 (+0.35%, every
+  pair, load 3.4-4.0), 4B 82.8 to 85.1; Vulkan slower (default model 102.44 to 102.18, 4B 98.43 to 97.3, load
+  2.2-3.2), so Vulkan keeps two launches (`gemvq2`'s default). Then paired as `gemvn` grid.z = 2: CUDA 107.48 to
+  106.36 (every pair behind, load 4.8-5.8), 4B 82.97 to 83.8; that pointed at `gemvn` itself, hence the switch.
+- Final, interleaved against c31cd6f, CUDA only (Vulkan runs the same launches as before): default model 106.83
+  (106.1-107.5) to 107.73 (107.0-108.1), +0.8%, 5 of 6 pairs ahead, one tie; 4B 82.9 (82.5-83.1) to 84.07
+  (84.0-84.1), +1.4%. Load 1.1 at the start, then 8-12 from another process (both binaries alike).
+- Not verified: Vulkan bench after the final change (no Vulkan code path changed); MTP verify (nt = 2) speed, where
+  pairs go through `gemvn` grid.z = 2; why the `moe_gemv` pairing gave more on the 4B (85.1 vs 84.1, different
+  load).
 
 ## Next candidates
 
