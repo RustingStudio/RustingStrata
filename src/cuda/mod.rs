@@ -14,9 +14,9 @@ const QTYPES: [GgmlType; 17] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL]
 };
-const KERNELS: [&str; 26] = [
+const KERNELS: [&str; 25] = [
     "rms_norm", "quant_xq", "argmax_rows", "l2_norm", "rope_neox", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
-    "kv_store", "attn_decode", "attn_decode_gqa", "attn_merge", "router_topk", "moe_combine", "map_hits", "moe_publish", "conv_seq", "conv_state",
+    "kv_store", "attn_decode", "attn_decode_gqa", "attn_merge", "router_topk", "moe_combine", "moe_publish", "conv_seq", "conv_state",
     "moe_combine_seq", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
 ];
 
@@ -328,11 +328,6 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    fn map_hits(&self, ids: u64, table: u64, slots: u64, wts: u64, wh: u64, k: usize) -> anyhow::Result<()> {
-        launch!(self, "map_hits", cfg((1, 1), 32, 0), ids, table, slots, wts, wh, k as i32);
-        Ok(())
-    }
-
     fn rms_norm(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32) -> anyhow::Result<()> {
         self.rms_norm_q(x, x_stride, w, out, out_stride, n, rows, eps, 0)
     }
@@ -432,9 +427,9 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()> {
+    fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize, table: u64, slots: u64, wh: u64) -> anyhow::Result<()> {
         anyhow::ensure!(n <= 512 && k <= 32, "router_topk: {n} experts, top {k}");
-        launch!(self, "router_topk", cfg((t as u32, 1), 32, 0), p, n as i32, k as i32, extra_scale, ids, wts);
+        launch!(self, "router_topk", cfg((t as u32, 1), 32, 0), p, n as i32, k as i32, extra_scale, ids, wts, table, slots, wh);
         Ok(())
     }
 

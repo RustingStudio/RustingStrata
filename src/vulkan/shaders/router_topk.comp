@@ -1,10 +1,11 @@
 #version 460
 layout(local_size_x = 32) in;
 #include "common.glsl"
-layout(push_constant) uniform P { F32 p; I32 ids; F32 wts; uint n; uint k; float extra_scale; } p;
+layout(push_constant) uniform P { F32 p; I32 ids; F32 wts; I32 table; I32 slots; F32 wh; uint n; uint k; float extra_scale; } p;
 
 // One subgroup per token (workgroup x): softmax over n <= 32 * R logits (in place), top-k (ties to the lower index),
-// renormalized weights. Lane holds i = lane + 32 r.
+// renormalized weights. Lane holds i = lane + 32 r. With table set, also the expert cache lookup: slots[j] =
+// table[ids[j]] (-1 = not resident), wh[j] = weight of hits, else 0.
 const uint R = 16;
 void main() {
     uint lane = gl_LocalInvocationID.x, b = gl_WorkGroupID.x * p.n, o = gl_WorkGroupID.x * p.k;
@@ -18,6 +19,7 @@ void main() {
     for (uint r = 0; r < R; r++) v[r] = fdiv(v[r], s);
     uint taken = 0;
     float sum = 0.0, mine = 0.0;
+    int id = 0;
     for (uint j = 0; j < p.k; j++) {
         float bv = -1.0; int bi = 0x7fffffff;
         for (uint r = 0; r < R; r++) {
@@ -30,10 +32,16 @@ void main() {
             if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
         if (uint(bi & 31) == lane) taken |= 1u << (bi >> 5);
-        if (lane == j) { p.ids.v[o + j] = bi; mine = bv; }
+        if (lane == j) { p.ids.v[o + j] = bi; mine = bv; id = bi; }
         sum += bv;
     }
     float scale = fdiv(1.0, max(sum, 6.103515625e-5));
     if (p.extra_scale != 0.0) scale *= p.extra_scale;
-    if (lane < p.k) p.wts.v[o + lane] = mine * scale;
+    if (lane >= p.k) return;
+    p.wts.v[o + lane] = mine * scale;
+    if (uint64_t(p.table) != 0) {
+        int s = p.table.v[id];
+        p.slots.v[o + lane] = s;
+        p.wh.v[o + lane] = s >= 0 ? mine * scale : 0.0;
+    }
 }

@@ -1400,7 +1400,10 @@ extern "C" __global__ void attn_merge(const float* part, const float* qg, float*
 // weights.
 // One warp per token; the n <= 32 * TOPK_R logits stay in registers (lane holds i = lane + 32 r).
 #define TOPK_R 16
-extern "C" __global__ void router_topk(float* p, int n, int k, float extra_scale, int* ids, float* wts) {
+// With table set, also the expert cache lookup: slots[j] = table[ids[j]] (-1 = not resident), wh[j] = weight of
+// hits, else 0.
+extern "C" __global__ void router_topk(float* p, int n, int k, float extra_scale, int* ids, float* wts,
+                                       const int* table, int* slots, float* wh) {
     int lane = threadIdx.x;
     p += (size_t)blockIdx.x * n; ids += blockIdx.x * k; wts += blockIdx.x * k;
     float v[TOPK_R];
@@ -1416,6 +1419,7 @@ extern "C" __global__ void router_topk(float* p, int n, int k, float extra_scale
     for (int r = 0; r < TOPK_R; r++) v[r] /= s;
     unsigned taken = 0;
     float sum = 0.0f, mine = 0.0f;
+    int id = 0;
     for (int j = 0; j < k; j++) {
         float bv = -1.0f; int bi = 0x7fffffff;
 #pragma unroll
@@ -1429,24 +1433,21 @@ extern "C" __global__ void router_topk(float* p, int n, int k, float extra_scale
             if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
         if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
-        if (lane == j) { ids[j] = bi; mine = bv; }
+        if (lane == j) { ids[j] = bi; mine = bv; id = bi; }
         sum += bv;
     }
     float scale = 1.0f / fmaxf(sum, 6.103515625e-5f);
     if (extra_scale != 0.0f) scale *= extra_scale;
-    if (lane < k) wts[lane] = mine * scale;
+    if (lane >= k) return;
+    wts[lane] = mine * scale;
+    if (table) {
+        int s = table[id], o = blockIdx.x * k + lane;
+        slots[o] = s;
+        wh[o] = s >= 0 ? mine * scale : 0.0f;
+    }
 }
 
 // x += sum_k w[k] * ye[k] + sigmoid(sg[0]) * sh + cpu (sh and cpu may be null).
-// Expert cache lookup: slots[j] = table[ids[j]] (-1 = not resident); wh[j] = routing weight of hits, else 0.
-extern "C" __global__ void map_hits(const int* ids, const int* table, int* slots, const float* wts, float* wh, int k) {
-    int j = threadIdx.x;
-    if (j >= k) return;
-    int s = table[ids[j]];
-    slots[j] = s;
-    wh[j] = s >= 0 ? wts[j] : 0.0f;
-}
-
 // Copy one layer's routing for T tokens (k entries each) to the host-mapped mailbox `mb` (activations only if an
 // expert missed), store T in word 1, then raise the request flag. One block.
 extern "C" __global__ void moe_publish(const int* ids, const float* wts, const int* slots, const float* h,

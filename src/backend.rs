@@ -123,8 +123,6 @@ pub trait Backend: Send {
     /// Quantize `nt` rows of n floats (row t at x + 4 * t * x_stride bytes) for `gemvq` / `moe_gemv` into `out`:
     /// the nt rows of n int8 values, then their f32 scales (one per 32 values), nt * (n + n / 8) bytes in all.
     fn quant_xq(&self, x: u64, x_stride: usize, n: usize, nt: usize, out: u64) -> anyhow::Result<()>;
-    /// Expert cache lookup for k routed experts: slots[j] = table[ids[j]] (-1 = not resident); wh[j] = wts[j] on a hit, else 0.
-    fn map_hits(&self, ids: u64, table: u64, slots: u64, wts: u64, wh: u64, k: usize) -> anyhow::Result<()>;
     /// `rows` rows: out[r] = rmsnorm(x[r]) * w.
     fn rms_norm(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32) -> anyhow::Result<()>;
     /// `rms_norm` that also writes its output quantized as `quant_xq` does to `xq` (when not 0).
@@ -170,8 +168,9 @@ pub trait Backend: Send {
     }
     /// `attn_decode` that shares K/V loads across a GQA group from `gq_min` positions on (tests use 0 to force it).
     fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize) -> anyhow::Result<()>;
-    /// Route `t` tokens (logit rows of n, ids / wts rows of k).
-    fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()>;
+    /// Route `t` tokens (logit rows of n, ids / wts rows of k). With `table` != 0, also the expert cache lookup:
+    /// slots[j] = table[ids[j]] (-1 = not resident); wh[j] = wts[j] on a hit, else 0.
+    fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize, table: u64, slots: u64, wh: u64) -> anyhow::Result<()>;
     /// Write routing and (on a miss) `h` to the layer mailbox at `mb` and raise its request flag.
     fn moe_publish(&self, ids: u64, wts: u64, slots: u64, h: u64, mb: u64, k: usize, n: usize, h_off: usize, step: u64, t: usize) -> anyhow::Result<()>;
     /// `mb` = 0: no CPU part. Otherwise adds the CPU result at word `y_off` of the mailbox once its done flag is `seq`.

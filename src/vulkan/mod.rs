@@ -38,7 +38,6 @@ const SPV: &[(&str, &[u8])] = &[
     ("gemv_q", include_bytes!("spv/gemv_q.spv")),
     ("kv_store", include_bytes!("spv/kv_store.spv")),
     ("l2_norm", include_bytes!("spv/l2_norm.spv")),
-    ("map_hits", include_bytes!("spv/map_hits.spv")),
     ("moe_combine", include_bytes!("spv/moe_combine.spv")),
     ("moe_combine_seq", include_bytes!("spv/moe_combine_seq.spv")),
     ("moe_gemv_f", include_bytes!("spv/moe_gemv_f.spv")),
@@ -707,10 +706,6 @@ impl Backend for Vk {
         self.run("quant_xq", &[self.0.llama], [w.cols.div_ceil(256), nt, 1], &[&g, &self.1.addr(), &u, &(w.cols as u32), &(w.cols as u32)])?;
         self.gemvq(w, g, w.cols, self.1.addr(), y, y_stride, nt)
     }
-    fn map_hits(&self, ids: u64, table: u64, slots: u64, wts: u64, wh: u64, k: usize) -> anyhow::Result<()> {
-        ensure!(k <= 32, "map_hits: top {k}");
-        self.run("map_hits", &[], [1, 1, 1], &[&ids, &table, &slots, &wts, &wh, &(k as u32)])
-    }
     fn rms_norm(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32) -> anyhow::Result<()> {
         self.rms_norm_q(x, x_stride, w, out, out_stride, n, rows, eps, 0)
     }
@@ -781,9 +776,9 @@ impl Backend for Vk {
         self.run("attn_decode", &[0, per, g as u32, 1], [nh / g * nt, ATT_SPLITS, 1], &args)?;
         self.run("attn_merge", &[], [nh, 1, nt], &[&part, &qg, &out, &step, &(hd as u32), &(ATT_SPLITS as u32), &(ATT_SPLITS_1 as u32), &gq_min])
     }
-    fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()> {
+    fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize, table: u64, slots: u64, wh: u64) -> anyhow::Result<()> {
         ensure!(n <= 512 && k <= 32, "router_topk: {n} experts, top {k}");
-        self.run("router_topk", &[], [t, 1, 1], &[&p, &ids, &wts, &(n as u32), &(k as u32), &extra_scale])
+        self.run("router_topk", &[], [t, 1, 1], &[&p, &ids, &wts, &table, &slots, &wh, &(n as u32), &(k as u32), &extra_scale])
     }
     fn moe_publish(&self, ids: u64, wts: u64, slots: u64, h: u64, mb: u64, k: usize, n: usize, h_off: usize, step: u64, t: usize) -> anyhow::Result<()> {
         ensure!(k * t <= 256, "moe_publish: {t} tokens of top {k}");
