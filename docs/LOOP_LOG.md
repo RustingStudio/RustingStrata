@@ -1984,6 +1984,35 @@ code was not timed on that test. Full suite green, load 2.55.
   51-56, the rest and the 4B neutral (2 rounds, load 2.6-4.8).
 - Not verified: parity (kernels bit-identical to before).
 
+### 2026-10-17 #112 — Vulkan V4: weight loads without the alignment branch (e06cd8f, e6a4ecf)
+- `ld8` (8 weight bytes per lane) tested the address for 4-alignment at run time and fell back to four 2-byte
+  loads. e06cd8f: Q4_K, Q5_K and IQ4_XS (blocks of 144, 176, 136 bytes, every field 8-aligned) read the 8 bytes
+  with one load. e6a4ecf: Q2_K (84, 4-aligned) with two word loads; the 2-aligned Q3_K, Q6_K, Q8_0 read the three
+  words around the 8 bytes and shift them (ld8a2 in kernels.cu) without a branch (in Q8_0 the lanes of a subgroup
+  differ in alignment). Results bit-identical (kernel tests on the default model, 30B, 80B, 4B).
+- gemv_bandwidth, Vulkan, 3 interleaved rounds against the previous commit each (us; e06cd8f load 1.0-6.0,
+  e6a4ecf load 1.2-9.4, one void row with another session's process on the GPU left out):
+  | tensor | before | e06cd8f | e6a4ecf | CUDA (#110) |
+  | Q5_K attn_qkv 8192x2048 | 55.5-56.5 | 42.0-42.4 | 42.3-42.5 | 42.5 |
+  | Q5_K attn_output 2048x4096 | 33.7-34.8 | 25.5-26.5 | 25.5-25.9 | |
+  | Q4_K output 248320x2048 | 1109-1139 | 879-895 | 875-885 | 934 |
+  | IQ4_XS moe8 down | 39.2-40.2 | 36.6-37.0 | 36.9-37.2 | 31 |
+  | Q6_K attn_q 8192x2048 | 51 | 51 | 47.9-48.3 | |
+  | Q3_K moe8 down | 35.5 | 35.5 | 30.9-32.1 | |
+  | Q2_K moe8 gate | 23.5 | 23.5 | 19.9 | |
+  | 4B Q6_K output 151936x2560 | | 1069-1084 | 935-946 | |
+  | 4B Q6_K ffn_down | | 78.2-78.5 | 72.6-72.8 | |
+  Q8_0 unchanged (eh_proj 33.3).
+- Decode A/B, `bench --pp 512 --tg 128 --reps 3 --mtp 0`, 3 interleaved rounds, load 0.8-1.7:
+  e06cd8f: 4B 82.9/82.6/82.1 -> 90.3/89.9/89.5 (+9%), default 83.0/86.6/86.6 -> 93.4/93.9/94.6 (+10%).
+  e6a4ecf: 4B 90.8/90.3/90.2 -> 92.9/92.0/91.7 (+2%), default 94.2/94.9/95.4 -> 95.2/95.7/95.2 (+0.6%).
+  4B decode now 92 vs llama.cpp Vulkan 95.4 (#110), default model 95 vs 47.1; CUDA default model 102.
+  Greedy `generate -n 64` CUDA == Vulkan on the 4B (mtp 0) and the default model (mtp 0 and 2) after each commit.
+  Suite green (72 passed) after each.
+- Dropped: `qw` taking `qw_k`'s packed words directly for the K types (skipping qi8's unpack and repack):
+  spirv-opt fails ("does not dominate its use") on gemv_q and moe_gemv_q with any form tried.
+- Not verified: parity (kernels bit-identical to before).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
