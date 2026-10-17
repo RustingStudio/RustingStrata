@@ -125,8 +125,9 @@ pub trait Backend: Send {
     fn quant_xq(&self, x: u64, x_stride: usize, n: usize, nt: usize, out: u64) -> anyhow::Result<()>;
     /// `rows` rows: out[r] = rmsnorm(x[r]) * w.
     fn rms_norm(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32) -> anyhow::Result<()>;
-    /// `rms_norm` that also writes its output quantized as `quant_xq` does to `xq` (when not 0).
-    fn rms_norm_q(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32, xq: u64) -> anyhow::Result<()>;
+    /// `rms_norm` that also writes its output quantized as `quant_xq` does to `xq` (when not 0), and first adds `res`
+    /// (rows `x_stride` apart, when not 0) into x in place.
+    fn rms_norm_q(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32, xq: u64, res: u64) -> anyhow::Result<()>;
     /// out[r] = argmax of row r of x (`rows` rows of n floats), first index on ties.
     fn argmax_rows(&self, x: u64, n: usize, rows: usize, out: u64) -> anyhow::Result<()>;
     /// Row r: vector r % per (n floats) of token r / per, tokens `stride` floats apart.
@@ -148,7 +149,8 @@ pub trait Backend: Send {
         if nt == 1 { self.gemv(w, g, y) } else { self.gemvn(w, g, w.cols, y, y_stride, nt) }
     }
     fn ssm_gates(&self, beta: u64, g: u64, dt_bias: u64, a: u64, n: usize, nv: usize) -> anyhow::Result<()>;
-    fn conv_silu(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize) -> anyhow::Result<()>;
+    /// One token's causal conv and SiLU; then the first `nn` groups of 128 channels are l2-normalized as `l2_norm` does.
+    fn conv_silu(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, nn: usize, eps: f32) -> anyhow::Result<()>;
     /// Scan `t` tokens (rows of y `ych` floats apart) through the DeltaNet state `s`.
     /// `snap`: room for `nsnap` states; the state after each of the first min(nsnap, t - 1) tokens is kept there.
     /// `interleave`: value head h reads key head h / (nv / nk), else h % nk.

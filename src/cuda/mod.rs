@@ -329,11 +329,11 @@ impl Backend for Gpu {
     }
 
     fn rms_norm(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32) -> anyhow::Result<()> {
-        self.rms_norm_q(x, x_stride, w, out, out_stride, n, rows, eps, 0)
+        self.rms_norm_q(x, x_stride, w, out, out_stride, n, rows, eps, 0, 0)
     }
 
-    fn rms_norm_q(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32, xq: u64) -> anyhow::Result<()> {
-        launch!(self, "rms_norm", cfg((rows as u32, 1), 512, 0), x, x_stride as i32, w, out, out_stride as i32, n as i32, eps, xq);
+    fn rms_norm_q(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32, xq: u64, res: u64) -> anyhow::Result<()> {
+        launch!(self, "rms_norm", cfg((rows as u32, 1), 512, 0), x, x_stride as i32, w, out, out_stride as i32, n as i32, eps, xq, res);
         Ok(())
     }
 
@@ -367,8 +367,8 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    fn conv_silu(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize) -> anyhow::Result<()> {
-        launch!(self, "conv_silu", Self::grid(ch), qkv, state, w, y, ch as i32, kw as i32);
+    fn conv_silu(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, nn: usize, eps: f32) -> anyhow::Result<()> {
+        launch!(self, "conv_silu", cfg((ch.div_ceil(128) as u32, 1), 128, 0), qkv, state, w, y, ch as i32, kw as i32, nn as i32, eps);
         Ok(())
     }
 
