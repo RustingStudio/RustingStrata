@@ -2051,6 +2051,25 @@ code was not timed on that test. Full suite green, load 2.55.
   Suite green (72 passed) after each.
 - Not verified: parity (results bit-identical to before).
 
+### 2026-10-17 #115 — Vulkan V4: gemmi weight decode overlapped (1034c40)
+
+- llama.cpp Vulkan vs Strata Vulkan, 4B Q4_K_M, interleaved, 3 rounds of `-r 3` (load 3.2–4.0, before this
+  change): tg128 llama.cpp 95.7/95.0/94.9, Strata 95.3/95.4/95.3, so decode is at parity. pp512 llama.cpp
+  3059/3144/3128, Strata 1747/1746/1753: prefill is about 1.8x behind. Strata CUDA on the same file: pp512
+  2109/2173, decode 81.1/81.5 (CUDA decode is now slower than Vulkan on 4B; not in V4 scope).
+- 4B `gemm_throughput` before (ms, CUDA / Vulkan): Q4_K attn_q 4.2–4.5 / 5.15–5.24, Q4_K ffn_gate 10.1–10.4 /
+  12.0, Q6_K ffn_down 12.7 / 14.9–15.0, Q6_K attn_v 1.45 / 1.71. The Vulkan gemmi decoded W after the X stores
+  and then waited on it; CUDA decodes step kb + 1's weights in registers during step kb's MMA.
+- Change: gemmi does the same. `ldw` decodes the 16 weights of the next step into a `uvec4` plus scale and min
+  while the coopmat products run; they are stored after the products. After (Vulkan, load about 6): Q4_K attn_q
+  4.82–5.06, Q4_K ffn_gate 11.6, Q6_K unchanged.
+- Model A/B against 0ed0067, interleaved, 3 rounds of pp512 tg128 reps 3 (load 0.8–1.7): 4B prefill
+  1792/1790/1790 -> 1802/1794/1778 (flat), 35B 909/956/996 -> 945/998/991 (+2%, base still warming). An
+  earlier run (load 0.6–1.9) gave 4B 1761/1787/1789 -> 1823/1834/1836. Decode unchanged.
+- Suite 72 passed; greedy CUDA vs Vulkan same on 4B mtp0, 35B mtp0 and mtp2 (a first greedy run reported DIFF on
+  35B; manual reruns and a second full run were all same, so the first run was disturbed).
+- Not verified: parity (the change is bit-identical by construction: same values, same order).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
