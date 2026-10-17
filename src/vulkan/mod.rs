@@ -140,6 +140,9 @@ struct State {
     /// Host-mapped error word that `moe_combine` sets when the CPU worker does not answer: buffer, memory, host
     /// pointer, device address.
     err: (vk::Buffer, vk::DeviceMemory, usize, u64),
+    /// STRATA_VK_PROF: timestamps after each dispatch outside graphs, names in order, and per-name totals (ns, calls)
+    /// printed on drop.
+    prof: Option<(vk::QueryPool, Vec<&'static str>, HashMap<&'static str, (u64, usize)>)>,
 }
 
 /// Owner of one `Buf`: the buffer and its memory, freed on drop.
@@ -157,12 +160,18 @@ impl Drop for Mem {
 impl Drop for Inner {
     fn drop(&mut self) {
         let st = self.st.get_mut().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, _, tot)) = &st.prof {
+            let mut v: Vec<_> = tot.iter().collect(); v.sort_by_key(|x| std::cmp::Reverse(x.1.0));
+            let all: u64 = v.iter().map(|x| x.1.0).sum();
+            for (n, (ns, c)) in v { eprintln!("prof {n:16} {:9.1} ms {:5.1}% {c:7} calls {:8.2} us", *ns as f64 / 1e6, *ns as f64 * 100.0 / all as f64, *ns as f64 / 1e3 / *c as f64); }
+        }
         unsafe {
             let _ = self.dev.device_wait_idle();
             self.dev.destroy_buffer(st.staging.0, None);
             self.dev.free_memory(st.staging.1, None);
             self.dev.destroy_buffer(st.err.0, None);
             self.dev.free_memory(st.err.1, None);
+            if let Some((qp, ..)) = &st.prof { self.dev.destroy_query_pool(*qp, None) }
             self.dev.destroy_fence(st.fence, None);
             self.dev.destroy_command_pool(st.pool, None);
             self.dev.destroy_command_pool(st.gpool, None);
@@ -271,7 +280,8 @@ impl Vk {
         let pc = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(128)];
         let layout = unsafe { dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc), None) }?;
         let st = State { pool, spare: vec![], used: vec![], cur: None, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false,
-            pipes: HashMap::new(), fence, staging: Default::default(), map: 0, bufs: BTreeMap::new(), err: Default::default() };
+            pipes: HashMap::new(), fence, staging: Default::default(), map: 0, bufs: BTreeMap::new(), err: Default::default(),
+            prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
         let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, coop, llama: crate::cuda::llama_numerics() as u32, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
@@ -361,6 +371,11 @@ impl Inner {
                 self.dev.reset_fences(&[st.fence])?;
                 self.dev.reset_command_pool(st.pool, vk::CommandPoolResetFlags::empty())?;
             }
+            if let Some((qp, names, tot)) = &mut st.prof { if !names.is_empty() {
+                let mut t = vec![0u64; names.len() + 1];
+                unsafe { self.dev.get_query_pool_results(*qp, 0, &mut t, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT) }?;
+                for (i, n) in names.drain(..).enumerate() { let e = tot.entry(n).or_default(); e.0 += t[i + 1] - t[i]; e.1 += 1; }
+            } }
             let used = std::mem::take(&mut st.used);
             st.spare.extend(used);
             st.busy = false;
@@ -421,9 +436,13 @@ impl Vk {
         unsafe {
             d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, p);
             d.cmd_push_constants(cb, self.0.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
+            if st.rec.is_none() { if let Some((qp, names, _)) = &mut st.prof { if names.is_empty() {
+                d.cmd_reset_query_pool(cb, *qp, 0, 65536); d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, *qp, 0); } } }
             d.cmd_dispatch(cb, groups[0] as u32, groups[1] as u32, groups[2] as u32);
         }
         if !st.batch || name == "quant_xq" { self.0.barrier(cb, false); }
+        if st.rec.is_none() { if let Some((qp, names, _)) = &mut st.prof { if names.len() < 65535 {
+            names.push(name); unsafe { d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, *qp, names.len() as u32) } } } }
         Ok(())
     }
 
