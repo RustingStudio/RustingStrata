@@ -2146,6 +2146,26 @@ code was not timed on that test. Full suite green, load 2.55.
   (mtp 0 and 2); `attn_prefill_matches_decode` and `deltanet_chunk_matches_steps` bit-identical across backends.
 - Not verified: parity (results bit-identical to before).
 
+### 2026-10-17 #119 — gemmi W double buffer, attn_prefill hardware f16 (4a8ddf3, 21d44cb)
+
+- 4a8ddf3: gemmi double-buffers W as well as X, so each step has one barrier instead of two (kernels.cu has two).
+  The layout check's index matrices sit in X buffer 1 before its first use, so Q6_K stays at 48 KB of shared memory
+  and two workgroups per SM. `gemm_throughput`: 4B Q4_K attn_q 4.76 -> 4.46 ms (CUDA 4.3-4.6), ffn_gate 11.0 ->
+  10.77 (CUDA 10.0-10.3); default model Q5_K attn_qkv 8.09 -> 7.88; Q6_K unchanged (its KS = 16 products run 32 deep
+  with 16 zeros, the only int8 shapes the driver offers). A/B against dca523d (load 1.2-1.7): 4B pp4096
+  1850/1888/1882 -> 1896/1916/1900 (+1.5%); default model within noise.
+- 21d44cb: attn_prefill converts Q and the register-fed softmax weights to f16 in hardware (bit for bit, also with q
+  scaled by 24 in `attn_prefill_matches_decode`); the shared memory fallback keeps the software f2h, since the
+  hardware conversion there raised the shader from 168 to 239 registers. 4B pp4096 profile: 9.32 -> 8.56 ms per
+  call (CUDA attn_prefill_128 7.43, nsys). A/B against 4a8ddf3 (load 1.9-3.3): 4B pp4096 1956/1936/1929 ->
+  1961/1939/1959; default model within noise (wide spreads, one base round disturbed).
+- 4B pp4096 profile now: gemmi 1617 ms (CUDA gemmi_q4_k + gemmi_q6_k 1560), attn_prefill 308 ms (CUDA 267).
+- Tried and dropped: gemm_f loading step kb + 1 into registers during step kb's products: 80 -> 123 registers
+  (three workgroups per SM down to two), IQ2_XS ffn_gate_exps 0.54 -> 0.71 ms.
+- ncu cannot read the performance counters here (ERR_NVGPUCTRPERM), so stall reasons are not measured.
+- Each commit: suite 72 passed; greedy `generate -n 64` CUDA == Vulkan on the 4B (mtp 0) and the default model
+  (mtp 0 and 2). Not verified: parity (results bit-identical to before).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
@@ -2166,6 +2186,14 @@ code was not timed on that test. Full suite green, load 2.55.
    following GEMV and the router GEMV with router_topk are the next levers.
 
 ## Questions for owner
+
+- (#119) V4 on the 4B prefill: llama.cpp Vulkan pp4096 2849, Strata Vulkan ~1950, Strata CUDA ~2040. Three
+  quarters of the 4B prefill is gemmi, whose int8 epilogue (each exact int32 sum scaled into f32 with the roundings
+  of kernels.cu) is what makes Vulkan greedy output identical to CUDA; llama.cpp dequantizes to f16 and uses NVIDIA's
+  cooperative_matrix2. Under "greedy output identical to CUDA" the 4B prefill target looks out of reach (gemmi would
+  need ~45% less time while doing the same rounded operations). Options: (a) accept the 4B prefill gap (decode and
+  the default model meet V4); (b) allow a Vulkan-only f16 prefill path whose greedy output may differ from CUDA,
+  gated by parity only; (c) change the prefill numerics of both backends (changes CUDA greedy output). Which?
 
 - (#88) README: `serve` now does tool calling. Proposed addition after the sentence about `cached_tokens`:
   "`tools` and `tool_choice` work as in the OpenAI API (calls come back as `tool_calls` with
