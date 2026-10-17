@@ -2031,6 +2031,26 @@ code was not timed on that test. Full suite green, load 2.55.
   add 1.87 us/call.
 - Not verified: parity (kernels bit-identical to before).
 
+### 2026-10-17 #114 — Vulkan V4: quant_xq split, SwiGLU and RoPE fused (b191ca3, 0ed0067)
+- b191ca3: quant_xq ran one 256-thread workgroup per token (one for 9728 values of the 4B's FFN); it now runs one
+  subgroup per 256 values (the same lanes, scales and rounding; bit-identical). New `Backend::swiglu_gemv` (default
+  swiglu then gemv, so CUDA is unchanged): Vulkan computes the dense FFN's SwiGLU inside that quant_xq.
+- 0ed0067: new `Backend::rms_norm_rope` (default rms_norm then rope_neox): Vulkan's rms_norm kernel rotates the
+  normed q and k heads itself, one stage fewer per attention layer. rope_neox's f64 sin / cos moved to `rope_cs` in
+  common.glsl; a kernel test checks rms_norm_rope == rms_norm + rope_neox bit for bit.
+- Decode A/B, `bench --pp 512 --tg 128 --reps 3 --mtp 0`, 3 interleaved rounds against the previous commit:
+  SwiGLU fusion alone (on top of 9119ed2, quant_xq still one workgroup per token, load 1.0-6.5): 4B 94.0/93.6/93.6 ->
+  93.0/92.8/93.8, no gain. With the quant_xq split, b191ca3 vs 9119ed2 (load 0.8-2.4): 4B 94.3/93.5/94.7 ->
+  94.4/94.8/95.5 (+0.8%), default model 93.7/95.4/96.3 -> 95.1/96.0/97.0 (+0.9%). Fusion on vs off on top of the
+  split (load 1.2-1.8): 4B 94.8/94.6 -> 95.1/94.7/94.9 (a third base round void: 83.5, spread 80.6-86.1), about +0.2%.
+  0ed0067 vs b191ca3 (load 2.3-6.0): 4B 94.8/94.8/95.0 -> 96.0/96.1/96.6 (+1.4%), default model 94.7/95.6/95.7 ->
+  95.8/96.1/96.3 (+0.7%).
+- 4B decode now 96.2 vs llama.cpp Vulkan 95.4 (#110): the V4 target is met on both models (default model 96 vs 47.1).
+  CUDA default model 102.
+- Greedy `generate -n 64` CUDA == Vulkan on the 4B (mtp 0) and the default model (mtp 0 and 2) after each commit.
+  Suite green (72 passed) after each.
+- Not verified: parity (results bit-identical to before).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
