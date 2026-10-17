@@ -897,14 +897,17 @@ ITYPES(DEF_GEMMI)
 // ---- elementwise / norm ----
 
 // grid = rows. out[r] = rmsnorm(x[r]) * w (same w for every row). xq (optional): out also quantized as quant_xq does.
-extern "C" __global__ void rms_norm(const float* x, int x_stride, const float* w, float* out, int out_stride, int n, float eps,
-                                    signed char* xq) {
-    const float* xr = x + (size_t)blockIdx.x * x_stride;
+extern "C" __global__ void rms_norm(float* x, int x_stride, const float* w, float* out, int out_stride, int n, float eps,
+                                    signed char* xq, const float* res) {
+    float* xr = x + (size_t)blockIdx.x * x_stride;
     float* o = out + (size_t)blockIdx.x * out_stride;
     float s = 0.0f;
     // The sum keeps the order of a 256-thread block (bit-identical results); all threads scale. Four loads in flight
-    // per step; the output values are all loaded before any store, as out may alias x.
-    if (threadIdx.x < 256) {
+    // per step; the output values are all loaded before any store, as out may alias x. With res, x += res first.
+    if (threadIdx.x < 256 && res) {
+        const float* rr = res + (size_t)blockIdx.x * x_stride;
+        for (int i = threadIdx.x; i < n; i += 256) { float a = xr[i] + rr[i]; xr[i] = a; s += a * a; }
+    } else if (threadIdx.x < 256) {
         int i = threadIdx.x;
         for (; i + 768 < n; i += 1024) {
             float a = xr[i], b = xr[i + 256], c = xr[i + 512], d = xr[i + 768];
@@ -992,15 +995,21 @@ extern "C" __global__ void ssm_gates(float* beta, float* g, const float* dt_bias
 }
 
 // Causal depthwise conv over [state..., current] then SiLU; state keeps the last kw-1 inputs, oldest first.
-extern "C" __global__ void conv_silu(const float* qkv, float* state, const float* w, float* y, int ch, int kw) {
+// Block = 128 channels; the first nn blocks are then l2-normalized as l2_norm does (the decode q and k heads).
+extern "C" __global__ void conv_silu(const float* qkv, float* state, const float* w, float* y, int ch, int kw, int nn,
+                                     float eps) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= ch) return;
-    float acc = 0.0f;
-    for (int k = 0; k < kw - 1; k++) acc += state[k * ch + c] * w[c * kw + k];
-    acc += qkv[c] * w[c * kw + kw - 1];
-    y[c] = silu(acc);
-    for (int k = 0; k < kw - 2; k++) state[k * ch + c] = state[(k + 1) * ch + c];
-    state[(kw - 2) * ch + c] = qkv[c];
+    float v = 0.0f;
+    if (c < ch) {
+        float acc = 0.0f;
+        for (int k = 0; k < kw - 1; k++) acc += state[k * ch + c] * w[c * kw + k];
+        acc += qkv[c] * w[c * kw + kw - 1];
+        v = silu(acc);
+        for (int k = 0; k < kw - 2; k++) state[k * ch + c] = state[(k + 1) * ch + c];
+        state[(kw - 2) * ch + c] = qkv[c];
+    }
+    if ((int)blockIdx.x < nn) v *= 1.0f / fmaxf(sqrtf(block_sum(v * v)), eps);
+    if (c < ch) y[c] = v;
 }
 
 // Parallel over tokens for a chunk: y[t] = silu(conv over inputs t-kw+1 .. t), inputs before the chunk from state.

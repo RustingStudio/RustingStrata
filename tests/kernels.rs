@@ -79,8 +79,17 @@ fn rms_norm_q_matches_quant_xq() {
         let (n, rows) = (2048, 3);
         let (x, w) = (up(gpu, &xs(rows * n)), up(gpu, &xs(n + 7)[7..]));
         let (out, q1, q2) = (gpu.zeros::<f32>(rows * n).unwrap(), gpu.zeros::<u8>(rows * n * 9 / 8).unwrap(), gpu.zeros::<u8>(rows * n * 9 / 8).unwrap());
-        gpu.rms_norm_q(x.addr(), n, w.addr(), out.addr(), n, n, rows, 1e-6, q1.addr()).unwrap();
+        gpu.rms_norm_q(x.addr(), n, w.addr(), out.addr(), n, n, rows, 1e-6, q1.addr(), 0).unwrap();
         gpu.quant_xq(out.addr(), n, n, rows, q2.addr()).unwrap();
+        assert_eq!(down::<u8>(gpu, &q1), down::<u8>(gpu, &q2));
+        // With res: the same bits as add, then rms_norm_q.
+        let (x2, r, out2) = (up(gpu, &xs(rows * n)), up(gpu, &xs(rows * n + 3)[3..]), gpu.zeros::<f32>(rows * n).unwrap());
+        gpu.add(x.addr(), r.addr(), rows * n).unwrap();
+        gpu.rms_norm_q(x.addr(), n, w.addr(), out.addr(), n, n, rows, 1e-6, q1.addr(), 0).unwrap();
+        gpu.rms_norm_q(x2.addr(), n, w.addr(), out2.addr(), n, n, rows, 1e-6, q2.addr(), r.addr()).unwrap();
+        let bits = |b| down::<f32>(gpu, b).iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&x), bits(&x2));
+        assert_eq!(bits(&out), bits(&out2));
         assert_eq!(down::<u8>(gpu, &q1), down::<u8>(gpu, &q2));
     }
 }
@@ -489,7 +498,7 @@ fn conv_seq_matches_steps() {
             let mut snaps = vec![];
             for i in 0..t {
                 let off = (i * ch * 4) as u64;
-                gpu.conv_silu(dx.addr() + off, s2.addr(), dw.addr(), y2.addr() + off, ch, kw).unwrap();
+                gpu.conv_silu(dx.addr() + off, s2.addr(), dw.addr(), y2.addr() + off, ch, kw, 0, 0.0).unwrap();
                 if i + 1 < t && i < ns { snaps.extend(d(&s2)); }
             }
             let (ey, es) = (rel_l2(&d(&y1), &d(&y2)), rel_l2(&d(&s1), &d(&s2)));
@@ -500,6 +509,26 @@ fn conv_seq_matches_steps() {
                 match &first { None => first = Some(bits), Some(f) => assert!(*f == bits, "{bk}: conv_seq differs from the first backend") }
             }
         }
+    }
+}
+
+/// conv_silu with its l2 norms of the first heads gives the same bits as conv_silu, then l2_norm.
+#[test]
+fn conv_silu_l2_matches_l2_norm() {
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        eprintln!("backend {bk}");
+        let (ch, kw, nn, eps) = (3 * 128 + 40, 4, 2, 1e-6);
+        let (dw, dx) = (up(gpu, &xs(ch * kw)), up(gpu, &xs(ch + 5)[5..]));
+        let st0 = xs((kw - 1) * ch + 9)[9..].to_vec();
+        let (s1, s2) = (up(gpu, &st0), up(gpu, &st0));
+        let (y1, y2) = (gpu.zeros::<f32>(ch).unwrap(), gpu.zeros::<f32>(ch).unwrap());
+        gpu.conv_silu(dx.addr(), s1.addr(), dw.addr(), y1.addr(), ch, kw, 0, eps).unwrap();
+        gpu.l2_norm(y1.addr(), 128, nn, ch, nn, eps).unwrap();
+        gpu.conv_silu(dx.addr(), s2.addr(), dw.addr(), y2.addr(), ch, kw, nn, eps).unwrap();
+        let bits = |b| down::<f32>(gpu, b).iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&y1), bits(&y2));
+        assert_eq!(bits(&s1), bits(&s2));
     }
 }
 
@@ -665,7 +694,7 @@ fn norm_rope_and_gate_ops_match_cpu() {
         for s in 0..2 {
             let qkv = x[s * ch..][..ch].to_vec();
             let dq = up(gpu, &qkv);
-            gpu.conv_silu(dq.addr(), dst.addr(), dcw.addr(), dy.addr(), ch, kw).unwrap();
+            gpu.conv_silu(dq.addr(), dst.addr(), dcw.addr(), dy.addr(), ch, kw, 0, 0.0).unwrap();
             let want: Vec<f32> = (0..ch).map(|c| {
                 let acc = (0..kw - 1).map(|k| st[k * ch + c] * cw[c * kw + k]).sum::<f32>() + qkv[c] * cw[c * kw + kw - 1];
                 ops::silu(acc)

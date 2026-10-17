@@ -2,13 +2,18 @@
 layout(local_size_x = 256) in;
 #include "common.glsl"
 // Workgroup = row. out[r] = rmsnorm(x[r]) * w; with q not null, out is also quantized as quant_xq does. With step not
-// null, out is then rotated as rope_neox does (row r = a head of token r / per).
-layout(push_constant) uniform P { F32 x; F32 w; F32 o; U32 q; uint xs; uint os; uint n; float eps; I32 step; double ts; uint per; uint n_rot; } p;
+// null, out is then rotated as rope_neox does (row r = a head of token r / per). With res not null, x += res first.
+layout(push_constant) uniform P { F32 x; F32 w; F32 o; U32 q; uint xs; uint os; uint n; float eps; I32 step; double ts; uint per; uint n_rot; F32 res; } p;
 void main() {
     uint r = gl_WorkGroupID.x, xo = r * p.xs, oo = r * p.os, h = 0;
     float s = 0.0;
     // Four loads in flight per step (the sum keeps its order).
     uint i = gl_LocalInvocationID.x;
+    if (uint64_t(p.res) != 0) {
+        // Each invocation reads back only its own x below; quant_x reads others', hence the buffer barrier.
+        for (; i < p.n; i += 256) { float a = p.x.v[xo + i] + p.res.v[xo + i]; p.x.v[xo + i] = a; s += a * a; }
+        memoryBarrierBuffer();
+    }
     for (; i + 768 < p.n; i += 1024) {
         float a = p.x.v[xo + i], b = p.x.v[xo + i + 256], c = p.x.v[xo + i + 512], e = p.x.v[xo + i + 768];
         s += a * a; s += b * b; s += c * c; s += e * e;

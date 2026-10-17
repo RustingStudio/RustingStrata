@@ -303,7 +303,7 @@ impl<'a> GpuModel<'a> {
         let p = |n: &str| self.bufs[n].addr();
         let x = self.x.addr();
         for (il, l) in self.layers.iter().enumerate() { self.layer(il, l, x, step, self.worker.as_ref(), nt)?; }
-        g.rms_norm_q(x, ne, self.output_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"))?;
+        g.rms_norm_q(x, ne, self.output_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"), 0)?;
         g.gemvq(&self.output, p("h"), ne, p("hq"), self.logits.addr(), c.n_vocab, nt)
     }
 
@@ -415,7 +415,7 @@ impl<'a> GpuModel<'a> {
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
         let kv = nkv * hd;
         {
-            g.rms_norm_q(x, ne, l.attn_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"))?;
+            g.rms_norm_q(x, ne, l.attn_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"), 0)?;
             match &l.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, snap } => {
                     let (sc, ss, ns) = snap.as_ref().map_or((0, 0, 0), |(a, b)| (a.addr(), b.addr(), self.k));
@@ -426,12 +426,14 @@ impl<'a> GpuModel<'a> {
                         mv(alpha, "h", ne, "g", nv)
                     })?;
                     g.ssm_gates(p("beta"), p("g"), dt_bias.ptr, a.ptr, nt * nv, nv)?;
+                    // One token with 128-wide heads: conv_silu also does the q and k l2 norms.
+                    let nn = if nt == 1 && dk == 128 { 2 * nk } else { 0 };
                     if nt == 1 {
-                        g.conv_silu(p("qkv"), conv.addr(), conv_w.ptr, p("y"), channels, c.ssm_conv)?;
+                        g.conv_silu(p("qkv"), conv.addr(), conv_w.ptr, p("y"), channels, c.ssm_conv, nn, eps)?;
                     } else {
                         g.conv_seq(p("qkv"), conv.addr(), conv_w.ptr, p("y"), channels, c.ssm_conv, nt, sc, ns)?;
                     }
-                    g.l2_norm(p("y"), dk, 2 * nk, channels, nt * 2 * nk, eps)?;
+                    if nn == 0 { g.l2_norm(p("y"), dk, 2 * nk, channels, nt * 2 * nk, eps)?; }
                     g.deltanet(p("y"), s.addr(), p("beta"), p("g"), p("o"), nk, nv, c.k_interleave, dk, dv, 1.0 / (dk as f32).sqrt(), nt, channels, ss, ns)?;
                     g.norm_gate(p("o"), norm.ptr, p("z"), dv, nt * nv, eps)?;
                     mv(out, "o", c.ssm_d_inner, "mix", ne)?;
@@ -449,8 +451,7 @@ impl<'a> GpuModel<'a> {
                     mv(o, "att", nh * hd, "mix", ne)?;
                 }
             }
-            g.add(x, p("mix"), nt * ne)?;
-            g.rms_norm_q(x, ne, l.post_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"))?;
+            g.rms_norm_q(x, ne, l.post_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"), p("mix"))?;
             match &l.ffn {
                 Ffn::Dense { gate, up, down } => {
                     g.batch(&mut || { mv(gate, "h", ne, "ge", c.n_ff)?; mv(up, "h", ne, "ue", c.n_ff) })?;
