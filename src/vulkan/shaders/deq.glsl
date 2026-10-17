@@ -33,9 +33,13 @@ void iq1_sub(U8 w, uint b, uint ib, uint l, out uint idx, out float dl, out bool
 // Sign j of the 8 sign bits sg applied to grid byte j of g.
 int sgn(uint g, uint sg, uint j) { int v = int((g >> (8 * (j & 3))) & 255); return ((sg >> j) & 1) != 0 ? -v : v; }
 
-// 8 bytes at 2-aligned w + o: two word loads when 4-aligned, else four 2-byte loads.
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer U32x2 { uvec2 v[]; };
+// Q4_K, Q5_K and IQ4_XS blocks (144, 176, 136 bytes) and every field ld8 reads in them are 8-aligned.
+const bool A8 = T == 12 || T == 13 || T == 23;
+// 8 bytes at 2-aligned w + o: one load for the A8 types, two word loads when 4-aligned, else four 2-byte loads.
 uvec2 ld8(U8 w, uint o) {
     uint64_t a = uint64_t(w) + o;
+    if (A8) return U32x2(a).v[0];
     if ((a & 3) == 0) { U32 u = U32(a); return uvec2(u.v[0], u.v[1]); }
     return uvec2(ld32(w, o), ld32(w, o + 4));
 }
