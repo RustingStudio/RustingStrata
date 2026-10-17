@@ -2283,6 +2283,18 @@ code was not timed on that test. Full suite green, load 2.55.
   eb3e696 runs 629, 627. No change from rms_norm. Plain default mode scored 629/640 at #69; 633/640 is the
   `--llama-numerics --fixed-experts` baseline, not run here.
 
+### 2026-10-17 #126 — `router_topk` does the expert cache lookup (1a7efa3)
+
+- `map_hits` (one tiny launch per MoE layer: slots = table[ids], hit weights) folded into the end of `router_topk`,
+  CUDA and Vulkan; prefill passes no table. 40 launches fewer per decoded token on the default model.
+- Kernel tests extended (`router_topk_matches_ops_top_k` checks slots and hit weights; the mailbox test uploads
+  them), suite 72 passed. Greedy output identical to 1d89d02 (4B and default model, CUDA and Vulkan,
+  `--fixed-experts --mtp 0`).
+- Decode, default model, `bench --pp 512 --tg 128 --mtp 0`, interleaved 5 runs against 1d89d02 (load 4.4-7.5):
+  CUDA 103.78 (102.7-104.1) to 104.08 (103.7-104.4), +0.3%; Vulkan 100.82 (100.7-100.9) to 101.60
+  (101.5-101.7), +0.8%, every pair. A first 3-run A/B at load 6-10 was too noisy to read.
+- Not verified: parity (routing arithmetic unchanged, greedy output identical).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
