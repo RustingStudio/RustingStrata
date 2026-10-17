@@ -26,6 +26,9 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   3-run control against the previous binary, since single 3-run means move by +-0.3%.
 - v1.0.0 (#84): gate passed. 4K prefill 2016, decode 100.7 / 96.0 after 512 / 4K, MTP 109.9; parity 99.32%
   either llama.cpp mode in parity mode, 98.85% default.
+- Vulkan (branch `vulkan`, #121, 36f529c; `bench --mtp 0`, tg128 after pp512): default model decode ~99-100, pp512
+  ~1000, pp4096 ~1650; 4B decode 99.3, pp512 2080, pp4096 ~1950. llama.cpp Vulkan (#110, #116): 4B 95.4 / 3120 /
+  2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2178,6 +2181,22 @@ code was not timed on that test. Full suite green, load 2.55.
 - Suite 72 passed. Greedy: the first run under load gave a default-model mtp 0 DIFF; repeated twice each for CUDA,
   Vulkan and the base binary, all six outputs are identical. Expert placement moves with load (State: decode is not
   deterministic run to run), which matches the one-off. Not verified: parity (per-row results bit-identical).
+
+### 2026-10-17 #121 — rms_norm and gemv_f keep four loads in flight (e0bd201, 36f529c)
+
+- Default model decode profile (`STRATA_VK_PROF=1 STRATA_NO_GRAPH=1`, tg256): rms_norm 101 calls per token at 4.9 us,
+  gemv_f 140 calls at 4.1 us. Both looped one load per iteration (rms_norm: 8 iterations of 256 for 2048 values).
+- e0bd201: rms_norm's sum of squares and output loop take four elements per step (each lane's sum in the same order;
+  the output values are loaded before any store, which may alias x). 4.9 -> 3.6 us per call, two interleaved runs.
+- 36f529c: gemv_f runs four super-blocks per step, as gemv_q. 4.1 -> 3.1 us per call, two interleaved runs.
+- Decode A/B against 3d145d9 (`bench --pp 512 --tg 128 --reps 3 --mtp 0`, load 3.3-6.3): 4B 97.7/97.9/98.3 ->
+  99.5/99.3/99.0 (+1.3%); default model 80.0 (disturbed: 74.8-83.7)/97.7/98.7 -> 97.5/100.4/98.8.
+- Tried and dropped (moe_gemv_q): weights read through `readonly` buffer references (gate IQ2_XS 21.0 -> 20.8 us,
+  within noise); eight super-blocks per step (gate -1 to -2.5%, but IQ4_XS down +3.7%).
+- moe_gemv_q in the decode profile is now 2.24 ms per token (was 2.42; CUDA ~2.1). `gemv_bandwidth` with x not
+  pre-quantized adds a separate quant_xq dispatch on Vulkan only, so its moe numbers overstate the gap to CUDA.
+- Each commit: suite 72 passed; greedy `generate -n 64` CUDA == Vulkan on the 4B (mtp 0) and the default model
+  (mtp 0 and 2). Not verified: parity (results bit-identical to before).
 
 ## Next candidates
 
