@@ -168,7 +168,8 @@ void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
             d = ldh(w, p);
             o = p + 2 + (r & 15);
         }
-        for (uint i = 0; i < 8; i++) q[i] = kvalues_iq4nl[(u8_(w, o + i) >> (r < 16 ? 0 : 4)) & 15];
+        uvec2 v = ld8(w, o);
+        for (uint i = 0; i < 8; i++) q[i] = kvalues_iq4nl[((i < 4 ? v.x : v.y) >> (8 * (i & 3) + (r < 16 ? 0 : 4))) & 15];
     }
 }
 
