@@ -84,6 +84,8 @@ fn prefill_matches_reference() {
 /// GPU MTP draft head matches `Model::mtp_step` per position (prompt plus a few greedy tokens). Both get the GPU's
 /// hidden state, so the check covers the head alone, not the main model's drift. One position may miss: a near-tie in
 /// the head's expert routing sometimes picks a different expert on the two sides (|dlogit| ~1.1, seen on 0991789 too).
+/// No experts resident: with a VRAM margin, which experts run on the GPU depends on free VRAM (the second backend sees
+/// less while the first one's context lives), so the hidden states and the near-ties moved between backends and runs.
 #[test]
 fn mtp_draft_matches_reference() {
     use rusting_strata::model::Mtp;
@@ -95,7 +97,7 @@ fn mtp_draft_matches_reference() {
     let tok = Tokenizer::from_gguf(&g).unwrap();
     for (bk, gpu) in common::backends() {
         eprintln!("backend {bk}");
-        let mut gm = GpuModel::load(&m, gpu, 256, 0, 512 << 20, 1).unwrap();
+        let mut gm = GpuModel::load(&m, gpu, 256, 0, usize::MAX / 2, 1).unwrap();
         let mut ids = tok.encode("The capital of France is").unwrap();
         let (mut st, mut mtp) = (State::new(&m.cfg), Mtp::default());
         let mut bad = 0;
