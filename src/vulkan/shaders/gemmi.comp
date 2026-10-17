@@ -21,10 +21,9 @@ const uint KS = T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 ||
 // Rows in words. The int8 products are 32 deep: for KS = 16, w row holds each 16 values followed by 16 zeros (so
 // the 16 x values after each 16 add nothing).
 const uint PX = 20, PW = KS == 32 ? 20 : 36;
-// X is double buffered, as kernels.cu: step kb + 1 is stored while step kb's products run.
-shared uint xq[2 * BM * PX], wq[64 * PW];
-shared float xd[2][BM][2], xsum[2][BM][4], wsc[64][4], wmn[64][4];
-shared int ix[512];  // the row and column index matrices
+// X and W are double buffered: step kb + 1 is stored while step kb's products run, so one barrier per step.
+shared uint xq[2 * BM * PX], wq[2 * 64 * PW];
+shared float xd[2][BM][2], xsum[2][BM][4], wsc[2][64][4], wmn[2][64][4];
 // int to float for |c| < 2^22 without the quarter-rate I2F, as i2f_small in kernels.cu.
 float i2f_small(int c) { return intBitsToFloat(0x4B400000 + c) - 12582912.0; }
 // acc += dx dw c - sx mw, rounded as in kernels.cu.
@@ -73,13 +72,15 @@ void main() {
     } else {
         wt = U8(p.wd); m0 = gl_WorkGroupID.y * BM; cnt = min(BM, p.nd - m0);
     }
-    for (uint i = tid; i < 256; i += 256) { ix[i] = int(i / 16); ix[256 + i] = int(i % 16); }
-    if (KS == 16) for (uint i = tid; i < 64 * PW; i += 256) wq[i] = 0;
+    // The row and column index matrices, in X buffer 1 (first stored after the loop's first barrier).
+    const uint IX = BM * PX;
+    for (uint i = tid; i < 256; i += 256) { xq[IX + i] = i / 16; xq[IX + 256 + i] = i % 16; }
+    if (KS == 16) for (uint i = tid; i < 2 * 64 * PW; i += 256) wq[i] = 0;
     barrier();
     // Accumulator element i of this invocation is at row ri[i], column ci[i] (the layout is the implementation's).
     IACC ri, ci;
-    coopMatLoad(ri, ix, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
-    coopMatLoad(ci, ix, 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(ri, xq, IX, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(ci, xq, IX + 256, 16, gl_CooperativeMatrixLayoutRowMajor);
     // nv: the layout of mma.sync (element i at row g + 8 (i >> 2), column 2 t + (i & 1) + 8 ((i >> 1) & 1)), as on NVIDIA.
     uint g = gl_SubgroupInvocationID >> 2, t = gl_SubgroupInvocationID & 3;
     bool nv = ri.length() == 8;
@@ -99,7 +100,7 @@ void main() {
     ldw(wt, wr, wi, wok, n0, 0, wv, d, m);
     ldx(xr, xh, xok, xo, cols, 0, 0);
     [[unroll]] for (uint j = 0; j < 4; j++) wq[wr * PW + wi * 128 / KS + j] = wv[j];
-    wsc[wr][wi] = d; wmn[wr][wi] = m;
+    wsc[0][wr][wi] = d; wmn[0][wr][wi] = m;
     for (uint kb = 0; kb < p.nsb * 4; kb++) {
         uint xb = kb & 1;
         barrier();
@@ -110,7 +111,7 @@ void main() {
             coopmat<int8_t, gl_ScopeSubgroup, 32, 16, gl_MatrixUseB> b[2];
             [[unroll]] for (uint i = 0; i < 2; i++) {
                 coopMatLoad(a[i], xq, (xb * BM + wm + 16 * i) * PX + h * KS / 4, PX, gl_CooperativeMatrixLayoutRowMajor);
-                coopMatLoad(b[i], wq, (wn + 16 * i) * PW + h * 8, PW, gl_CooperativeMatrixLayoutColumnMajor);
+                coopMatLoad(b[i], wq, (xb * 64 + wn + 16 * i) * PW + h * 8, PW, gl_CooperativeMatrixLayoutColumnMajor);
             }
             // NVIDIA layout: a lane's scales are those of 2 rows per mt and 4 columns per nt, loaded once per h.
             float da[2][2], sa[2][2], db[2][4], mb[2][4];
@@ -124,8 +125,8 @@ void main() {
                 [[unroll]] for (uint nt = 0; nt < 2; nt++)
                     [[unroll]] for (uint e = 0; e < 4; e++) {
                         uint n = wn + 16 * nt + 2 * t + (e & 1) + 8 * (e >> 1);
-                        db[nt][e] = wsc[n][h * KS / 16];
-                        if (MIN) mb[nt][e] = wmn[n][h * KS / 16];
+                        db[nt][e] = wsc[xb][n][h * KS / 16];
+                        if (MIN) mb[nt][e] = wmn[xb][n][h * KS / 16];
                     }
             }
             [[unroll]] for (uint mt = 0; mt < 2; mt++)
@@ -138,14 +139,15 @@ void main() {
                         [[unroll]] for (uint i = 0; i < c.length(); i++) {
                             uint r = wm + 16 * mt + ri[i], n = wn + 16 * nt + ci[i];
                             float s = KS == 32 ? xsum[xb][r][2 * h] + xsum[xb][r][2 * h + 1] : xsum[xb][r][h];
-                            scale_add(acc[mt][nt][i], c[i], xd[xb][r][h * KS / 32], wsc[n][h * KS / 16], s, wmn[n][h * KS / 16]);
+                            scale_add(acc[mt][nt][i], c[i], xd[xb][r][h * KS / 32], wsc[xb][n][h * KS / 16], s, wmn[xb][n][h * KS / 16]);
                         }
                     }
                 }
         }
-        barrier();
-        [[unroll]] for (uint j = 0; j < 4; j++) wq[wr * PW + wi * 128 / KS + j] = wv[j];
-        wsc[wr][wi] = d; wmn[wr][wi] = m;
+        if (kb + 1 < p.nsb * 4) {
+            [[unroll]] for (uint j = 0; j < 4; j++) wq[((xb ^ 1) * 64 + wr) * PW + wi * 128 / KS + j] = wv[j];
+            wsc[xb ^ 1][wr][wi] = d; wmn[xb ^ 1][wr][wi] = m;
+        }
     }
     [[unroll]] for (uint mt = 0; mt < 2; mt++)
         [[unroll]] for (uint nt = 0; nt < 2; nt++)
