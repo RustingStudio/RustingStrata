@@ -6,8 +6,20 @@ layout(local_size_x = 256) in;
 #include "common.glsl"
 #include "deq.glsl"
 #extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : require
 
 layout(push_constant) uniform P { U8 w; I32 ids; U32 xq; F32 y; uint64_t stride; uint64_t w2; uint64_t y2; uint rows; uint nsb; uint xg; uint ntok; } p;
+
+void sb_step(U8 w, F32 xd, uint row, uint lane, uint t, uint s, inout precise float acc) {
+    uint lo, hi; float d, m;
+    qw(w, (row * p.nsb + s) * SBB, lane, lo, hi, d, m);
+    uint o = (t * p.nsb + s) * 64 + lane * 2, a = p.xq.v[o], c = p.xq.v[o + 1];
+    int dot = dotPacked4x8EXT(int(lo), int(a)) + dotPacked4x8EXT(int(hi), int(c));
+    int sx = dotPacked4x8EXT(0x01010101, int(a)) + dotPacked4x8EXT(0x01010101, int(c));
+    float dx = xd.v[(t * p.nsb + s) * 8 + (lane >> 2)];
+    acc = fma(d * dx, float(dot), acc);
+    if (T == 10 || T == 12 || T == 13) acc = fma(-(m * dx), float(sx), acc);  // types with a min
+}
 
 void main() {
     uint k = gl_WorkGroupID.y, row = gl_WorkGroupID.x * 8 + gl_SubgroupID, lane = gl_SubgroupInvocationID;
@@ -18,16 +30,10 @@ void main() {
     F32 xd = F32(uint64_t(p.xq) + p.ntok * p.nsb * 256);
     uint t = k / p.xg;
     precise float acc = 0.0;
-    for (uint s = 0; s < p.nsb; s++) {
-        uint lo, hi; float d, m;
-        qw(w, (row * p.nsb + s) * SBB, lane, lo, hi, d, m);
-        uint o = (t * p.nsb + s) * 64 + lane * 2, a = p.xq.v[o], c = p.xq.v[o + 1];
-        int dot = dotPacked4x8EXT(int(lo), int(a)) + dotPacked4x8EXT(int(hi), int(c));
-        int sx = dotPacked4x8EXT(0x01010101, int(a)) + dotPacked4x8EXT(0x01010101, int(c));
-        float dx = xd.v[(t * p.nsb + s) * 8 + (lane >> 2)];
-        acc = fma(d * dx, float(dot), acc);
-        if (T == 10 || T == 12 || T == 13) acc = fma(-(m * dx), float(sx), acc);  // types with a min
-    }
+    // Four super-blocks per iteration so their loads overlap (kernels.cu: unroll 4); the sums keep their order.
+    uint s = 0;
+    for (; s + 4 <= p.nsb; s += 4) [[unroll]] for (uint j = 0; j < 4; j++) sb_step(w, xd, row, lane, t, s + j, acc);
+    for (; s < p.nsb; s++) sb_step(w, xd, row, lane, t, s, acc);
     acc = warp_sum(acc);
     if (lane == 0) y.v[k * p.rows + row] = acc;
 }
