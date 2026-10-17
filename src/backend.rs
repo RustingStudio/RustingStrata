@@ -89,8 +89,6 @@ pub trait Backend: Send {
     /// Queue the ops of `f`, none of which reads what another writes, with no ordering among them (Vulkan: no
     /// barriers between them); ops after the batch see all their results.
     fn batch(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> { f() }
-    /// Whether `gemm`, `gemm_dense` and `attn_prefill` run here; if not, prompts go through the decode step.
-    fn batched_prefill(&self) -> bool { true }
     /// Zeroed host memory of `words` u32 that kernels read and write at the `Buf` address. The host pointer is
     /// valid while the `Buf` lives.
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)>;

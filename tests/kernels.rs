@@ -262,6 +262,8 @@ fn gemm_matches_reference_for_every_type() {
             let e = rel_l2(&got, &want);
             eprintln!("{:8} {name}: gemm rel err {e:.2e}", ty.name());
             assert!(e <= 1e-4, "{} gemm ({name}): rel err {e}", ty.name());
+            // Vulkan without cooperative matrices sums the f16 products in another order than mma.sync.
+            if bk == "vulkan" && !Gpu::mmq(t.ty) && std::env::var_os("STRATA_VK_NO_COOP").is_some() { continue; }
             let f = first.entry(name.clone()).or_insert_with(|| got.clone());
             let bits = got.iter().zip(f.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
             assert_eq!(bits, 0, "{} gemm ({name}) on {bk}: {bits} values differ from the first backend", ty.name());
@@ -341,6 +343,8 @@ fn attn_prefill_matches_decode() {
                     // Vulkan's cooperative matrices are the same f16 products summed in f32 as CUDA's mma.sync.
                     let f = first_pf.entry((pos0, nh, nkv, hd)).or_insert_with(|| got.clone());
                     let nd = got.iter().zip(f.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                    // Without cooperative matrices Vulkan sums in another order.
+                    let nd = if bk == "vulkan" && std::env::var_os("STRATA_VK_NO_COOP").is_some() { 0 } else { nd };
                     assert!(nd == 0, "{bk} attn_prefill pos {pos0} nh {nh} nkv {nkv} hd {hd}: {nd} of {} differ from the first backend", got.len());
                     gpu.attn_prefill(dq.addr(), dk.addr(), dv.addr(), 0, dout.addr(), step.addr(), t, nh, nkv, hd, scale).unwrap();
                     let e = rel_l2(&gated(&down::<f32>(gpu, &dout)), &got);
