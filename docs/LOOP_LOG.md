@@ -31,6 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
+- At 49c2aba (#128, `bench --mtp 0`, tg128 after pp512): CUDA decode 106.9, Vulkan 102.5.
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2308,6 +2309,25 @@ code was not timed on that test. Full suite green, load 2.55.
   (104.9-105.0), +0.6%, every pair; Vulkan 100.48 (98.8-101.5) to 101.88 (100.2-102.6), +1.4%, 4 of 5 pairs.
 - Not verified: parity (routing arithmetic unchanged, greedy output identical); more than 8 tokens per decode step
   (the warp loop's second pass; decode steps have at most 4).
+
+### 2026-10-17 #128 — `moe_route`: no system fence on layers with no miss, CUDA (49c2aba)
+
+- nsys (fixed experts): `moe_route` 10.2-10.7 us per call, 6.3 us without `__threadfence_system`. The fence is
+  ~4 us x 40 layers per token. Fencing from thread 0 only: no gain (10.9 us).
+- When no routed expert missed, the CUDA kernel now writes NTOK (still read by `routing()`), raises a new skip flag
+  (mailbox word 2) and returns: no h copy, no fence, no request flag. The CPU worker leaves a layer on its skip flag
+  or on a newer seq. The default bench has 100% expert hits, so every layer takes this path.
+- First version returned before writing NTOK; `routing()` then sized the read by a stale count and
+  `mtp_spec_matches_greedy` panicked in `ExpertCache::record` (index out of range). Fixed before commit.
+- Vulkan, same protocol in the shader: 101.83 vs 101.85 (8 pairs, load 2.4-3.0), so Vulkan keeps the request flag.
+  One Vulkan bench of that build exited without a decode line (load 3.6); 14 more runs passed and it did not repeat.
+  Cause unknown; the committed Vulkan path only adds the skip-flag poll in the worker.
+- Decode, default model, interleaved against f57e215: CUDA 104.97 (104.9-105.0) to 106.87 (106.8-106.9), +1.8%,
+  every pair, load 2.4-2.7 (5 pairs before the NTOK fix: 105.0 to 107.0). Vulkan 102.6 to 102.5 (3 pairs, noise).
+- Greedy output identical to f57e215 (4B and default model, CUDA and Vulkan, `--mtp 0` with `STRATA_EXPERT_MB=6000`,
+  so miss and no-miss layers mix) and with `--mtp 1` (both backends). Suite 72 passed. `moe_mailbox_round_trip`
+  checks a no-miss round raises only the skip flag on CUDA.
+- Not verified: parity (routing arithmetic unchanged, greedy identical).
 
 ## Next candidates
 
