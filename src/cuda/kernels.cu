@@ -902,10 +902,23 @@ extern "C" __global__ void rms_norm(const float* x, int x_stride, const float* w
     const float* xr = x + (size_t)blockIdx.x * x_stride;
     float* o = out + (size_t)blockIdx.x * out_stride;
     float s = 0.0f;
-    // The sum keeps the order of a 256-thread block (bit-identical results); all threads scale.
-    if (threadIdx.x < 256) for (int i = threadIdx.x; i < n; i += 256) s += xr[i] * xr[i];
+    // The sum keeps the order of a 256-thread block (bit-identical results); all threads scale. Four loads in flight
+    // per step; the output values are all loaded before any store, as out may alias x.
+    if (threadIdx.x < 256) {
+        int i = threadIdx.x;
+        for (; i + 768 < n; i += 1024) {
+            float a = xr[i], b = xr[i + 256], c = xr[i + 512], d = xr[i + 768];
+            s += a * a; s += b * b; s += c * c; s += d * d;
+        }
+        for (; i < n; i += 256) s += xr[i] * xr[i];
+    }
     float sc = 1.0f / sqrtf(block_sum(s) / (float)n + eps);
-    for (int i = threadIdx.x; i < n; i += blockDim.x) o[i] = xr[i] * sc * w[i];
+    int i = threadIdx.x, bd = blockDim.x;
+    for (; i + 3 * bd < n; i += 4 * bd) {
+        float a = xr[i] * sc * w[i], b = xr[i + bd] * sc * w[i + bd], c = xr[i + 2 * bd] * sc * w[i + 2 * bd], d = xr[i + 3 * bd] * sc * w[i + 3 * bd];
+        o[i] = a; o[i + bd] = b; o[i + 2 * bd] = c; o[i + 3 * bd] = d;
+    }
+    for (; i < n; i += bd) o[i] = xr[i] * sc * w[i];
     if (xq) {
         __syncthreads();
         quant_x(o, n, xq + (size_t)blockIdx.x * n, (float*)(xq + (size_t)gridDim.x * n) + blockIdx.x * (n / 32));
