@@ -1938,6 +1938,38 @@ code was not timed on that test. Full suite green, load 2.55.
 - Tried and dropped: X for step kb + 1 loaded into registers during step kb's products in gemmi (neutral: 4B same,
   Q5_K 9.3 -> 9.8). Without the W decode gemmi takes 4.33 ms on Q4_K attn_q (vs 5.15) and 6.8 on Q5_K (vs 9.3).
 
+### 2026-10-17 #110 — Vulkan V4: IQ grid signs per word, IQ4 word loads, llama.cpp comparison (05a310f, 774d565, 38db3ff)
+- V4 comparison with llama.cpp Vulkan (build 5d8ccdf9d), RTX 3060, load 1.4-2.4, Strata at d60620e; llama-bench
+  3 reps, Strata `bench --reps 3`:
+  | model | llama.cpp pp512 / pp4096 / tg128 | Strata pp512 / pp4096 / tg128 |
+  | Qwen3-4B Q4_K_M | 3120 +-57 / 2854 +-3 / 95.4 +-2.4 | 1722 (1687-1743) / 1218 / 82.7 |
+  | default model (llama `--n-cpu-moe 10`) | 124 +-15 / 582 +-409 / 47.1 +-0.1 | 894 (869-907) / 923 (847-1028) / 78.5 |
+  The goal (not slower than llama.cpp Vulkan on the same file) holds on the default model. On the 4B Strata is behind:
+  prefill by ~1.8-2.3x (the int8 MMQ epilogue that keeps results bit-identical to CUDA, see #108), decode by ~13%,
+  the same as Strata's CUDA decode on that file (82.0). iGPU numbers and the RADV gates: deferred, no AMD GPU here.
+- 05a310f: `qw` for IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S negates the 4 grid bytes of a word with one bytewise subtract
+  (`apply_signs`, as kernels.cu) instead of 8 sign selects and a pack; `iq_grid` is shared with `qi8`. gemv_bandwidth
+  on the default model: IQ2_XS moe8 35.2 -> 23.9 us (CUDA 16.8), IQ3_XXS moe8 gate 27.6 -> 25.3 (19.4), down 31.2 ->
+  29.2 (28.2). Decode A/B against d60620e, `bench --pp 512 --tg 128 --reps 3 --mtp 0`, 3 interleaved rounds, load
+  1.0-2.7: default model 83.7/83.4/83.7 -> 85.4/86.2 (+2.5%; the first round had another session's GPU process
+  running and is void), 4B unchanged (81.5/82.6/82.4 vs 83.2/82.5/80.7). Greedy `generate -n 64` CUDA == Vulkan on
+  the 4B (mtp 0) and the default model (mtp 0 and 2). Kernel tests bit-identical on the default model, 30B, 80B, 4B.
+- 774d565: IQ4_XS/IQ4_NL indices read with `ld8` instead of 8 byte loads: IQ4_XS moe8 40.5 -> 38.6 us interleaved
+  (CUDA 31). Tried and dropped: `kvalues_iq4nl` picked from four constant words by selects instead of the table
+  (47 us, slower).
+- 38db3ff: `mtp_draft_matches_reference` failed (2 positions, 1 allowed) on every commit back to 7a65dfd. Its
+  argument `512 << 20` is a VRAM margin, so the resident experts depend on free VRAM, and the Vulkan backend sees
+  less while the CUDA context lives: the hidden states differed between backends. With no resident experts both
+  backends match bit for bit, 9/9. Suite green (72 passed) after each commit.
+- Rejected, not committed: residual add fused into `rms_norm_q` (`add_rms_norm_q`, bit-identical). Decode A/B 3
+  rounds, load 2.2-4.3: 4B 77.3/81.6/82.2 vs 81.3/81.1/81.8, default 81.8/82.3/83.3 vs 82.6/81.2/83.1 (neutral);
+  `STRATA_VK_PROF` 4B add+rms_norm 192.7 -> 206.3 ms over 256 tokens (the norm's loop stores and reloads x).
+- Default model decode, CUDA 102.2 vs Vulkan ~84 (tg128 after pp512, all experts resident). Per call, Vulkan
+  `STRATA_VK_PROF` vs CUDA nsys: gemv_q 21.7 us vs gemvn_q5_k 17.2, moe_gemv_q 34.5 vs moe_gemv_iq2_xs 28.7 /
+  iq3_xxs 24.7, moe_combine 3.5 vs 10.1. gemv_bandwidth (us, CUDA / Vulkan): Q5_K attn_qkv 42.5 / 55.5, Q4_K output
+  934 / 1115; Vulkan's small GEMVs carry ~4-5 us of quant_xq and dispatch overhead.
+- Not verified: parity (kernels bit-identical to before).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
