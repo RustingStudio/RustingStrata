@@ -478,8 +478,7 @@ impl<'a> GpuModel<'a> {
                     let slots = self.slots.addr();
                     let w = worker.unwrap();
                     let mb = w.dev + (4 * il * w.layout.stride) as u64;
-                    g.router_topk(p("rl"), c.n_expert, k, c.expert_weights_scale, ids, p("wts"), nt, lx.table_dev.addr(), slots, p("wh"))?;
-                    g.moe_publish(ids, p("wts"), slots, p("h"), mb, k, ne, w.layout.h, step, nt)?;
+                    g.moe_route(p("rl"), c.n_expert, k, c.expert_weights_scale, lx.table_dev.addr(), ids, p("wts"), slots, p("wh"), p("h"), mb, ne, w.layout.h, step, nt)?;
                     g.batch(&mut || {
                         if mg.ty == mu.ty && (mg.rows, mg.cols) == (mu.rows, mu.cols) {
                             let pair = (mu.off as i64 - mg.off as i64, p("ue") as i64 - p("ge") as i64);

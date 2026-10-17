@@ -16,7 +16,7 @@ const QTYPES: [GgmlType; 17] = {
 };
 const KERNELS: [&str; 25] = [
     "rms_norm", "quant_xq", "argmax_rows", "l2_norm", "rope_neox", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
-    "kv_store", "attn_decode", "attn_decode_gqa", "attn_merge", "router_topk", "moe_combine", "moe_publish", "conv_seq", "conv_state",
+    "kv_store", "attn_decode", "attn_decode_gqa", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
 ];
 
@@ -427,14 +427,15 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize, table: u64, slots: u64, wh: u64) -> anyhow::Result<()> {
+    fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()> {
         anyhow::ensure!(n <= 512 && k <= 32, "router_topk: {n} experts, top {k}");
-        launch!(self, "router_topk", cfg((t as u32, 1), 32, 0), p, n as i32, k as i32, extra_scale, ids, wts, table, slots, wh);
+        launch!(self, "router_topk", cfg((t as u32, 1), 32, 0), p, n as i32, k as i32, extra_scale, ids, wts);
         Ok(())
     }
 
-    fn moe_publish(&self, ids: u64, wts: u64, slots: u64, h: u64, mb: u64, k: usize, n: usize, h_off: usize, step: u64, t: usize) -> anyhow::Result<()> {
-        launch!(self, "moe_publish", cfg((1, 1), 256, 0), ids, wts, slots, h, mb, k as i32, n as i32, h_off as i32, step, t as i32);
+    fn moe_route(&self, p: u64, n: usize, k: usize, extra_scale: f32, table: u64, ids: u64, wts: u64, slots: u64, wh: u64, h: u64, mb: u64, nh: usize, h_off: usize, step: u64, t: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(n <= 512 && k <= 32, "moe_route: {n} experts, top {k}");
+        launch!(self, "moe_route", cfg((1, 1), 256, 0), p, n as i32, k as i32, extra_scale, table, ids, wts, slots, wh, h, mb, nh as i32, h_off as i32, step, t as i32);
         Ok(())
     }
 
