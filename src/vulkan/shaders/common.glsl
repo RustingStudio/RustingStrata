@@ -79,14 +79,15 @@ uint pack4(int a, int b, int c, int d) { return uint(a & 255) | uint(b & 255) <<
 // llama.cpp q8_K numerics (--llama-numerics) for kernels that quantize x.
 layout(constant_id = 0) const bool LLAMA_Q8 = false;
 
-// Quantize x[0, n) (times sc * w[i] when w is not null) to int8 at q (as words, from word qo) with per-32 scales at
+// Quantize x[0, n) (times sc * w[i] when w is not null, or silu(x) * u when u is not null) to int8 at q (as words, from word qo) with per-32 scales at
 // d[do_]; the whole workgroup takes part. As quant_x in kernels.cu; reading x, not an output just written, needs no
 // barrier.
-void quant_x(F32 x, uint xo, uint n, F32 w, float sc, U32 q, uint qo, F32 d, uint do_) {
+void quant_x(F32 x, uint xo, uint n, F32 w, float sc, F32 u, U32 q, uint qo, F32 d, uint do_) {
     for (uint i = gl_LocalInvocationID.x * 8; i < n; i += gl_WorkGroupSize.x * 8) {
         float v[8], mx = 0.0;
         for (uint j = 0; j < 8; j++) {
             v[j] = uint64_t(w) != 0 ? x.v[xo + i + j] * sc * w.v[i + j] : x.v[xo + i + j];
+            if (uint64_t(u) != 0) v[j] = silu(v[j]) * u.v[xo + i + j];
             mx = max(mx, abs(v[j]));
         }
         float dd, id;

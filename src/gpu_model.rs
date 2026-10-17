@@ -458,8 +458,7 @@ impl<'a> GpuModel<'a> {
             match &l.ffn {
                 Ffn::Dense { gate, up, down } => {
                     g.batch(&mut || { mv(gate, "h", ne, "ge", c.n_ff)?; mv(up, "h", ne, "ue", c.n_ff) })?;
-                    g.swiglu(p("ge"), p("ue"), nt * c.n_ff)?;
-                    mv(down, "ge", c.n_ff, "ye", ne)?;
+                    g.swiglu_gemv(p("ge"), p("ue"), down, p("ye"), ne, nt)?;
                     g.add(x, p("ye"), nt * ne)?;
                 }
                 Ffn::Moe { router, shared } => {

@@ -139,6 +139,11 @@ pub trait Backend: Send {
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()>;
     /// g = silu(g) * u.
     fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()>;
+    /// y[t] = W (silu(g[t]) * u[t]) for t < nt (rows of `w.cols` floats; y rows `y_stride` apart); g may be overwritten.
+    fn swiglu_gemv(&self, g: u64, u: u64, w: &GpuTensor, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
+        self.swiglu(g, u, nt * w.cols)?;
+        if nt == 1 { self.gemv(w, g, y) } else { self.gemvn(w, g, w.cols, y, y_stride, nt) }
+    }
     fn ssm_gates(&self, beta: u64, g: u64, dt_bias: u64, a: u64, n: usize, nv: usize) -> anyhow::Result<()>;
     fn conv_silu(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize) -> anyhow::Result<()>;
     /// Scan `t` tokens (rows of y `ych` floats apart) through the DeltaNet state `s`.
