@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 49c2aba (#128, `bench --mtp 0`, tg128 after pp512): CUDA decode 106.9, Vulkan 102.5.
+- At 0c8aa99 (#129, `bench --mtp 0`, tg128 after pp512): CUDA decode 107.0, Vulkan 102.8.
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2329,6 +2329,23 @@ code was not timed on that test. Full suite green, load 2.55.
   checks a no-miss round raises only the skip flag on CUDA.
 - Not verified: parity (routing arithmetic unchanged, greedy identical).
 
+### 2026-10-17 #129 — Decode: residual add in `rms_norm_q`, q/k l2 norms in `conv_silu` (0c8aa99)
+
+- `rms_norm_q` takes an optional residual and adds it into x before the norm, so the mixer output add before the
+  post-norm is gone (one launch per layer). `conv_silu` now runs 128-channel blocks and l2-normalizes the first
+  `nn` of them: the DeltaNet q and k heads of a one-token step (one launch per DeltaNet layer; only when the heads
+  are 128 wide; multi-token steps keep `conv_seq` + `l2_norm`). 70 fewer launches per token on the default model.
+  Both on CUDA and Vulkan; new tests check both give the same bits as the separate kernels.
+- Greedy output identical to c931cfa (4B and default model, CUDA and Vulkan, `--mtp 0` and `--mtp 1`). Suite 73
+  passed.
+- Decode, default model, interleaved 5 runs against c931cfa (load 0.7-1.6): CUDA 106.7 (106.7-106.7) to 107.0
+  (106.9-107.1), +0.3%, pairs 2-5 (pair 1 was a cold start: 98.3 vs 101.1); Vulkan 102.42 (102.4-102.5) to 102.76
+  (102.6-102.9), +0.3%, every pair. Smaller than the launch count suggested.
+- A first A/B of the add fusion alone was void: `physics_bench` from RustingEngine held the GPU at 100% for about
+  an hour under its own lock file (`/tmp/rusting-gpu.lock`), and both binaries ran at half speed (CUDA ~50.3,
+  Vulkan ~39.6). The loop now waits for no other GPU compute process before an A/B.
+- Not verified: parity (same bits as before by the new tests and greedy output); 4B decode speed.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
@@ -2370,6 +2387,9 @@ code was not timed on that test. Full suite green, load 2.55.
   Update #101: Minecraft (Java, 3 GB VRAM) made the default model OOM in `gpu_model` and in an A/B bench.
   Update 2026-10-16 23:54: Geometry Dash (Steam, gamescope) started during a Vulkan A/B and took about 38% of
   the GPU, so that A/B is void. The loop now waits for gamescope/java to exit and the GPU to idle before benching.
+  Update 2026-10-17 (#129): RustingEngine's `physics_bench` ran about an hour at 100% GPU under
+  `/tmp/rusting-gpu.lock`, a different lock file from `/home/vasylt/Code/rusting/.gpu.lock`, so the two loops do not
+  exclude each other. Should all projects share one lock file?
 
 - 2026-10-08 10:20: the GPU lock deadlocked. Another loop ran `flock .gpu.lock rusting test --release --json`
   (PID 3491381), which started `flock .gpu.lock cargo test --release --features cuda --lib prompt` (PID 3495422).
