@@ -12,6 +12,8 @@ layout(local_size_x = 256) in;
 #include "common.glsl"
 #include "deq.glsl"
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64 { uint64_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer UV4 { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer UV2 { uvec2 v[]; };
 layout(push_constant) uniform P { U64 tiles; uint64_t wd; U32 x; I32 xrow; F32 y; uint nd; uint ys; uint rows; uint nsb; uint act; } p;
 const uint BM = 128;
 const bool MIN = T == 10 || T == 12 || T == 13;
@@ -66,13 +68,16 @@ void main() {
     precise float acc[2][2][8];
     [[unroll]] for (uint a = 0; a < 2; a++) for (uint b = 0; b < 2; b++) for (uint i = 0; i < 8; i++) acc[a][b][i] = 0.0;
     for (uint kb = 0; kb < p.nsb * 4; kb++) {
+        // 16-byte loads: q8 rows are 11 cols / 32 words, a multiple of 4.
+        uvec4 xv[2];
+        [[unroll]] for (uint j = 0; j < 2; j++) xv[j] = xok ? UV4(uint64_t(p.x)).v[(xo + kb * 16 + xh * 8) / 4 + j] : uvec4(0);
         [[unroll]] for (uint j = 0; j < 8; j++) {
-            uint v = xok ? p.x.v[xo + kb * 16 + xh * 8 + j] : 0;
+            uint v = xv[j / 4][j % 4];
             if (KS == 32) xq[xr * PX + xh * 8 + j] = v;
             else { uint c = 2 * xh + j / 4; xq[xr * PX + c * 8 + j % 4] = v; xq[xr * PX + c * 8 + 4 + j % 4] = 0; }
         }
-        if (xh == 0) for (uint j = 0; j < 2; j++) xd[xr][j] = xok ? uintBitsToFloat(p.x.v[xo + cols / 4 + kb * 2 + j]) : 0.0;
-        else for (uint j = 0; j < 4; j++) xsum[xr][j] = xok ? uintBitsToFloat(p.x.v[xo + cols / 4 + cols / 32 + kb * 4 + j]) : 0.0;
+        if (xh == 0) { vec2 d = xok ? uintBitsToFloat(UV2(uint64_t(p.x)).v[(xo + cols / 4) / 2 + kb]) : vec2(0.0); xd[xr][0] = d.x; xd[xr][1] = d.y; }
+        else { vec4 sm = xok ? uintBitsToFloat(UV4(uint64_t(p.x)).v[(xo + cols / 4 + cols / 32) / 4 + kb]) : vec4(0.0); for (uint j = 0; j < 4; j++) xsum[xr][j] = sm[j]; }
         int q[16]; float d = 0.0, m = 0.0, d1, m1;
         [[unroll]] for (uint j = 0; j < 16; j++) q[j] = 0;
         if (wok) {
