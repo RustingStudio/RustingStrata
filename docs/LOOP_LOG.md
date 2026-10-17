@@ -2130,6 +2130,22 @@ code was not timed on that test. Full suite green, load 2.55.
   `gemm_matches_reference_for_every_type` bit-identical across backends.
 - Not verified: parity (results bit-identical to before).
 
+### 2026-10-17 #118 — attn_prefill weights from registers, deltanet next-token prefetch (518e31c, dca523d)
+
+- 518e31c: attn_prefill detects whether the f16 A matrix layout is mma.sync's (index matrices, as for the
+  accumulator) and then writes the softmax weights into the A matrix elements directly, skipping the shared memory
+  round trip, as kernels.cu. attn_prefill_128: 201 -> 168 registers (`STRATA_VK_STATS`), binary 202 -> 79 KB, so
+  three workgroups per SM; 11.16 -> 10.17 ms per call at pp4096 (4B, profile).
+  A/B against 7be9129, 3 interleaved rounds (load 1.1-5.4): 4B pp4096 1836/1851/1827 -> 1896/1918/1880 (+3%);
+  4B pp512 and the default model within noise (one 4B pp512 round hit a load spike to 5.4).
+- dca523d: deltanet loads k and q as vec4 and the next token's inputs during the current token, as deltanet_seq in
+  kernels.cu. Default model pp512 profile: 912 -> 630 us per call (-31%, 164 -> 113 ms over 3 runs).
+  A/B against 518e31c (load 2.2-4.4): default model pp4096 1657/1632/1616 -> 1675/1639/1666 (+1.5%); pp512
+  798/980/987 -> 1001/876/1009 (noisy); 4B unchanged (no DeltaNet layers).
+- Each commit: suite 72 passed; greedy `generate -n 64` CUDA == Vulkan on the 4B (mtp 0) and the default model
+  (mtp 0 and 2); `attn_prefill_matches_decode` and `deltanet_chunk_matches_steps` bit-identical across backends.
+- Not verified: parity (results bit-identical to before).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
