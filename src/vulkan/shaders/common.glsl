@@ -79,6 +79,22 @@ uint pack4(int a, int b, int c, int d) { return uint(a & 255) | uint(b & 255) <<
 // llama.cpp q8_K numerics (--llama-numerics) for kernels that quantize x.
 layout(constant_id = 0) const bool LLAMA_Q8 = false;
 
+// sin and cos of theta = pos * ts^i (ts = base^(-2 / n_rot) from the host) in f64, as the CPU and CUDA take them
+// (GLSL has no f64 pow, sin or cos).
+void rope_cs(double pos, double ts, uint i, out float sn, out float cs) {
+    double f = 1.0LF, b = ts;
+    for (uint e = i; e > 0; e >>= 1, b *= b) if ((e & 1) != 0) f *= b;
+    double theta = pos * f, k = roundEven(theta * 0.63661977236758134LF);  // 2 / pi
+    double y = fma(-k, 1.5707963267948966LF, theta);
+    y = fma(-k, 6.123233995736766e-17LF, y);
+    double y2 = y * y;
+    double s = 1.0LF, c = 1.0LF;  // Taylor to y^17 and y^16 on |y| <= pi / 4
+    for (int j = 8; j >= 1; j--) { s = 1.0LF - y2 / double(2 * j * (2 * j + 1)) * s; c = 1.0LF - y2 / double((2 * j - 1) * 2 * j) * c; }
+    s *= y;
+    int q = int(k) & 3;
+    sn = float(q == 0 ? s : q == 1 ? c : q == 2 ? -s : -c); cs = float(q == 0 ? c : q == 1 ? -s : q == 2 ? -c : s);
+}
+
 // Quantize x[0, n) (times sc * w[i] when w is not null, or silu(x) * u when u is not null) to int8 at q (as words, from word qo) with per-32 scales at
 // d[do_]; the whole workgroup takes part. As quant_x in kernels.cu; reading x, not an output just written, needs no
 // barrier.

@@ -693,7 +693,11 @@ impl Backend for Vk {
         self.rms_norm_q(x, x_stride, w, out, out_stride, n, rows, eps, 0)
     }
     fn rms_norm_q(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32, xq: u64) -> anyhow::Result<()> {
-        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &xq, &(x_stride as u32), &(out_stride as u32), &(n as u32), &eps])
+        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &xq, &(x_stride as u32), &(out_stride as u32), &(n as u32), &eps, &0u64, &0f64, &0u32, &0u32])
+    }
+    fn rms_norm_rope(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
+        let ts = (base as f64).powf(-2.0 / n_rot as f64);
+        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &0u64, &(x_stride as u32), &(n as u32), &(n as u32), &eps, &step, &ts, &(per as u32), &(n_rot as u32)])
     }
     fn argmax_rows(&self, x: u64, n: usize, rows: usize, out: u64) -> anyhow::Result<()> { self.run("argmax_rows", &[], [rows, 1, 1], &[&x, &out, &(n as u32)]) }
     fn l2_norm(&self, x: u64, n: usize, per: usize, stride: usize, rows: usize, eps: f32) -> anyhow::Result<()> {

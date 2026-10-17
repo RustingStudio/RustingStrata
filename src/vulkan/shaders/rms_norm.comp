@@ -1,14 +1,26 @@
 #version 460
 layout(local_size_x = 256) in;
 #include "common.glsl"
-// Workgroup = row. out[r] = rmsnorm(x[r]) * w; with q not null, out is also quantized as quant_xq does.
-layout(push_constant) uniform P { F32 x; F32 w; F32 o; U32 q; uint xs; uint os; uint n; float eps; } p;
+// Workgroup = row. out[r] = rmsnorm(x[r]) * w; with q not null, out is also quantized as quant_xq does. With step not
+// null, out is then rotated as rope_neox does (row r = a head of token r / per).
+layout(push_constant) uniform P { F32 x; F32 w; F32 o; U32 q; uint xs; uint os; uint n; float eps; I32 step; double ts; uint per; uint n_rot; } p;
 void main() {
-    uint r = gl_WorkGroupID.x, xo = r * p.xs, oo = r * p.os;
+    uint r = gl_WorkGroupID.x, xo = r * p.xs, oo = r * p.os, h = 0;
     float s = 0.0;
     for (uint i = gl_LocalInvocationID.x; i < p.n; i += 256) s += p.x.v[xo + i] * p.x.v[xo + i];
     float sc = fdiv(1.0, sqrt_(fdiv(block_sum(s), float(p.n)) + p.eps));
-    for (uint i = gl_LocalInvocationID.x; i < p.n; i += 256) p.o.v[oo + i] = p.x.v[xo + i] * sc * p.w.v[i];
+    if (uint64_t(p.step) != 0) {
+        h = p.n_rot / 2;
+        double pos = double(p.step.v[0] + int(r / p.per));
+        for (uint i = gl_LocalInvocationID.x; i < h; i += 256) {
+            float sn, cs, a = p.x.v[xo + i] * sc * p.w.v[i], b = p.x.v[xo + i + h] * sc * p.w.v[i + h];
+            rope_cs(pos, p.ts, i, sn, cs);
+            p.o.v[oo + i] = a * cs - b * sn;
+            p.o.v[oo + i + h] = a * sn + b * cs;
+        }
+        h *= 2;
+    }
+    for (uint i = h + gl_LocalInvocationID.x; i < p.n; i += 256) p.o.v[oo + i] = p.x.v[xo + i] * sc * p.w.v[i];
     if (uint64_t(p.q) != 0)
         quant_x(p.x, xo, p.n, p.w, sc, F32(0ul), p.q, r * p.n / 4, F32(uint64_t(p.q) + gl_NumWorkGroups.x * p.n), r * (p.n / 32));
 }

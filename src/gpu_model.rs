@@ -440,12 +440,8 @@ impl<'a> GpuModel<'a> {
                     let qs = if c.q_gate { 2 * hd } else { hd };
                     g.batch(&mut || { mv(q, "h", ne, "qg", nh * qs)?; mv(k, "h", ne, "kraw", kv)?; mv(v, "h", ne, "v", kv) })?;
                     g.batch(&mut || {
-                        g.rms_norm(p("qg"), qs, qn.ptr, p("q"), hd, hd, nt * nh, eps)?;
-                        g.rms_norm(p("kraw"), hd, kn.ptr, p("k"), hd, hd, nt * nkv, eps)
-                    })?;
-                    g.batch(&mut || {
-                        g.rope_neox(p("q"), hd, nt * nh, nh, c.n_rot, step, c.rope_base)?;
-                        g.rope_neox(p("k"), hd, nt * nkv, nkv, c.n_rot, step, c.rope_base)
+                        g.rms_norm_rope(p("qg"), qs, qn.ptr, p("q"), hd, nt * nh, eps, nh, c.n_rot, step, c.rope_base)?;
+                        g.rms_norm_rope(p("kraw"), hd, kn.ptr, p("k"), hd, nt * nkv, eps, nkv, c.n_rot, step, c.rope_base)
                     })?;
                     g.kv_store(p("k"), p("v"), kc.addr(), vc.addr(), kv, nt, step, hd)?;
                     g.attn_decode(p("q"), kc.addr(), vc.addr(), if c.q_gate { p("qg") } else { 0 }, p("att"), p("attp"), step, nh, nkv, hd,

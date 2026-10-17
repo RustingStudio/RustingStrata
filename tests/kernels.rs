@@ -624,6 +624,13 @@ fn norm_rope_and_gate_ops_match_cpu() {
         let mut want = x[..6 * hd].to_vec();
         for (h, v) in want.chunks_mut(hd).enumerate() { ops::rope_neox(v, n_rot, pos + h / 2, 1e7) }
         close(&down::<f32>(gpu, &dx), &want, "rope_neox");
+        // rms_norm_rope == rms_norm then rope_neox, from rows 160 floats apart.
+        let dx = up(gpu, &x[..6 * 160]);
+        let (d1, d2) = (gpu.zeros::<f32>(6 * hd).unwrap(), gpu.zeros::<f32>(6 * hd).unwrap());
+        gpu.rms_norm(dx.addr(), 160, dw.addr(), d1.addr(), hd, hd, 6, 1e-6).unwrap();
+        gpu.rope_neox(d1.addr(), hd, 6, 2, n_rot, step.addr(), 1e7).unwrap();
+        gpu.rms_norm_rope(dx.addr(), 160, dw.addr(), d2.addr(), hd, 6, 1e-6, 2, n_rot, step.addr(), 1e7).unwrap();
+        assert_eq!(down::<f32>(gpu, &d2), down::<f32>(gpu, &d1), "rms_norm_rope");
 
         // norm_gate over 4 heads of 128.
         let z = xs(4 * hn + 3)[3..].to_vec();
