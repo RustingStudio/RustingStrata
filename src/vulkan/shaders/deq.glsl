@@ -91,23 +91,11 @@ void qw_k(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out flo
     }
 }
 
-// Values [8 sub, 8 sub + 8) of the quantized super-block at byte b as value i = d * q[i] - m with q[i] an int8
-// (QI<T> in kernels.cu).
-void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
-    m = 0.0;
-    uint ib = sub >> 2, l = sub & 3;
-    if (WORDS) {
-        uint lo, hi;
-        qw_k(w, b, sub, lo, hi, d, m);
-        for (uint i = 0; i < 4; i++) { q[i] = sb(lo >> (8 * i)); q[i + 4] = sb(hi >> (8 * i)); }
-    } else if (T == 19 || T == 29) {  // IQ1_S, IQ1_M: dl * (g +- 1/8) = (dl / 8) * (8 g +- 1)
-        uint idx; float dl; bool neg;
-        iq1_sub(w, b, ib, l, idx, dl, neg);
-        uint64_t g = iq1s_grid[idx];
-        d = dl * 0.125;
-        for (uint j = 0; j < 8; j++) q[j] = 8 * sb(uint(g >> (8 * j))) + (neg ? -1 : 1);
-    } else if (T == 16 || T == 17 || T == 22) {  // IQ2_XXS, IQ2_XS, IQ2_S
-        uint sg;
+// IQ2_XXS (16), IQ2_XS (17), IQ2_S (22), IQ3_XXS (18), IQ3_S (21): grid bytes of sub-block l of block ib (4 in g0,
+// 4 in g1), their 8 sign bits and the scale.
+const bool IQG = T == 16 || T == 17 || T == 22 || T == 18 || T == 21;
+void iq_grid(U8 w, uint b, uint ib, uint l, out uint g0, out uint g1, out uint sg, out float d) {
+    if (T == 16 || T == 17 || T == 22) {
         uint64_t g;
         if (T == 16) {
             uint aux = ld32(w, b + 6 + 8 * ib);
@@ -126,22 +114,48 @@ void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
             }
             d = ldh(w, b) * (0.5 + float(l < 2 ? sc & 15 : sc >> 4)) * 0.25;
         }
-        for (uint j = 0; j < 8; j++) q[j] = sgn(uint(g >> (j < 4 ? 0 : 32)), sg, j);
-    } else if (T == 18 || T == 21) {  // IQ3_XXS, IQ3_S
-        uint sg, g1, g2;
+        g0 = uint(g); g1 = uint(g >> 32);
+    } else {
+        uint qq = ld16(w, b + 2 + 8 * ib + 2 * l);
         if (T == 18) {
             uint aux = ld32(w, b + 66 + 4 * ib);
             d = ldh(w, b) * (0.5 + float(aux >> 28)) * 0.5;
             sg = ksigns_iq2xs[(aux >> (7 * l)) & 127];
-            g1 = iq3xxs_grid[u8_(w, b + 2 + 8 * ib + 2 * l)]; g2 = iq3xxs_grid[u8_(w, b + 3 + 8 * ib + 2 * l)];
+            g0 = iq3xxs_grid[qq & 255]; g1 = iq3xxs_grid[qq >> 8];
         } else {
             uint hb = u8_(w, b + 66 + ib);
             sg = u8_(w, b + 74 + 4 * ib + l);
             d = ldh(w, b) * float(1 + 2 * ((u8_(w, b + 106 + ib / 2) >> (4 * (ib & 1))) & 15));
-            g1 = iq3s_grid[u8_(w, b + 2 + 8 * ib + 2 * l) | ((hb << (8 - 2 * l)) & 256)];
-            g2 = iq3s_grid[u8_(w, b + 3 + 8 * ib + 2 * l) | ((hb << (7 - 2 * l)) & 256)];
+            g0 = iq3s_grid[(qq & 255) | ((hb << (8 - 2 * l)) & 256)];
+            g1 = iq3s_grid[(qq >> 8) | ((hb << (7 - 2 * l)) & 256)];
         }
-        for (uint j = 0; j < 8; j++) q[j] = sgn(j < 4 ? g1 : g2, sg, j);
+    }
+}
+// The 4 bytes of g, negated where bit j of s is set (j < 4), as apply_signs in kernels.cu.
+uint apply_signs(uint g, uint s) {
+    uint m = ((s * 0x00204081u) & 0x01010101u) * 0xFFu, a = g ^ m;
+    return ((a | 0x80808080u) - (m & 0x7F7F7F7Fu)) ^ ((a ^ ~m) & 0x80808080u);  // bytewise a - m
+}
+
+// Values [8 sub, 8 sub + 8) of the quantized super-block at byte b as value i = d * q[i] - m with q[i] an int8
+// (QI<T> in kernels.cu).
+void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
+    m = 0.0;
+    uint ib = sub >> 2, l = sub & 3;
+    if (WORDS) {
+        uint lo, hi;
+        qw_k(w, b, sub, lo, hi, d, m);
+        for (uint i = 0; i < 4; i++) { q[i] = sb(lo >> (8 * i)); q[i + 4] = sb(hi >> (8 * i)); }
+    } else if (T == 19 || T == 29) {  // IQ1_S, IQ1_M: dl * (g +- 1/8) = (dl / 8) * (8 g +- 1)
+        uint idx; float dl; bool neg;
+        iq1_sub(w, b, ib, l, idx, dl, neg);
+        uint64_t g = iq1s_grid[idx];
+        d = dl * 0.125;
+        for (uint j = 0; j < 8; j++) q[j] = 8 * sb(uint(g >> (8 * j))) + (neg ? -1 : 1);
+    } else if (IQG) {
+        uint g0, g1, sg;
+        iq_grid(w, b, ib, l, g0, g1, sg, d);
+        for (uint j = 0; j < 8; j++) q[j] = sgn(j < 4 ? g0 : g1, sg, j);
     } else {  // IQ4_XS (23), IQ4_NL (20, 8 blocks of 18)
         uint r = l * 8, o;
         if (T == 23) {
@@ -160,6 +174,13 @@ void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
 
 // qi8 with the values packed in lo, hi (calling qw_k directly for the WORDS types trips glslc's optimizer).
 void qw(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out float m) {
+    if (IQG) {
+        uint g0, g1, sg;
+        m = 0.0;
+        iq_grid(w, b, sub >> 2, sub & 3, g0, g1, sg, d);
+        lo = apply_signs(g0, sg & 15); hi = apply_signs(g1, sg >> 4);
+        return;
+    }
     int q[8];
     qi8(w, b, sub, q, d, m);
     lo = pack4(q[0], q[1], q[2], q[3]); hi = pack4(q[4], q[5], q[6], q[7]);
