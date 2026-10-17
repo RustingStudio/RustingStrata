@@ -162,7 +162,7 @@ impl GpuModel<'_> {
                     let k = c.n_expert_used;
                     let ids_d = pf.ints.addr();
                     g.gemm_dense(router, t, h, ne, at(l.rl), c.n_expert, 0)?;
-                    g.router_topk(at(l.rl), c.n_expert, k, c.expert_weights_scale, ids_d, at(l.wts), t)?;
+                    g.router_topk(at(l.rl), c.n_expert, k, c.expert_weights_scale, ids_d, at(l.wts), t, 0, 0, 0)?;
                     let (sh, sg) = match shared {
                         Some(s) => {
                             g.gemm_dense(&s.gate_inp, t, h, ne, at(l.sg), 1, 0)?;

@@ -471,7 +471,6 @@ impl<'a> GpuModel<'a> {
                         }
                         Ok(())
                     })?;
-                    g.router_topk(p("rl"), c.n_expert, k, c.expert_weights_scale, ids, p("wts"), nt)?;
                     let cache = self.cache.as_ref().unwrap();
                     let lx = cache.layer(il).unwrap();
                     let (base, stride) = cache.base(lx);
@@ -479,7 +478,7 @@ impl<'a> GpuModel<'a> {
                     let slots = self.slots.addr();
                     let w = worker.unwrap();
                     let mb = w.dev + (4 * il * w.layout.stride) as u64;
-                    g.map_hits(ids, lx.table_dev.addr(), slots, p("wts"), p("wh"), kt)?;
+                    g.router_topk(p("rl"), c.n_expert, k, c.expert_weights_scale, ids, p("wts"), nt, lx.table_dev.addr(), slots, p("wh"))?;
                     g.moe_publish(ids, p("wts"), slots, p("h"), mb, k, ne, w.layout.h, step, nt)?;
                     g.batch(&mut || {
                         if mg.ty == mu.ty && (mg.rows, mg.cols) == (mu.rows, mu.cols) {
