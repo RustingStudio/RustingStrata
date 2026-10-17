@@ -1921,6 +1921,23 @@ code was not timed on that test. Full suite green, load 2.55.
   2.00 -> 1.98 ms, dropped).
 - Suite green (72 passed). Not verified: parity (kernels bit-identical to before).
 
+### 2026-10-17 #109 — Vulkan V4: wide loads and hardware f16 in the prefill GEMMs (0ac254c, fc52e3c)
+- gemm_f (0ac254c): software `f2h` replaced by the hardware conversion (round to nearest even, as CUDA's: still bit
+  for bit, checked on every type of the default model incl. IQ2_XS, F32, BF16), X read as vec4, smem stored as
+  words. `gemm_throughput` IQ2_XS ffn_gate_exps 1.98 -> 0.53 ms (16 TFLOP/s; CUDA 0.66 ms).
+- gemmi (fc52e3c): q8 X, scales and sums read as uvec4/uvec2 instead of single words (CUDA uses 16-byte cp.async).
+  Q5_K attn_qkv 12.1 -> 9.3 ms (CUDA 7.8), Q6_K ssm_out 6.5 -> 5.1 (4.4), IQ3_XXS 0.65 -> 0.54 (0.49); 4B Q4_K
+  attn_q 6.27 -> 5.15 (4.38), ffn_gate 14.7 -> 12.35 (9.96), Q6_K ffn_down ~17 -> 14.9 (12.6).
+- Model A/B, `bench --pp 512,4096 --tg 32 --reps 3`, 3 interleaved rounds each. gemm_f vs fb5ce43 (load 2-7, r1
+  disturbed by another GPU process): default model pp512 ~515 -> ~800, pp4096 ~1010 -> ~1220; 4B unchanged. gemmi
+  vs 0ac254c (load 1.8-4.1): 4B pp512 1474 -> 1745 (+18%), pp4096 1111 -> 1240 (+12%); default pp512 908 -> 983
+  (+8%), pp4096 ~1265 -> ~1375 (noisy). Decode unchanged. llama.cpp Vulkan: 4B pp512 3149, pp4096 2825; default
+  pp4096 817.
+- Default model greedy (`generate --mtp 0 -n 64`, 600-token prompt) CUDA and Vulkan byte-identical after gemm_f.
+  Suite green (72) after each. Not verified: parity (kernels bit-identical).
+- Tried and dropped: X for step kb + 1 loaded into registers during step kb's products in gemmi (neutral: 4B same,
+  Q5_K 9.3 -> 9.8). Without the W decode gemmi takes 4.33 ms on Q4_K attn_q (vs 5.15) and 6.8 on Q5_K (vs 9.3).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
