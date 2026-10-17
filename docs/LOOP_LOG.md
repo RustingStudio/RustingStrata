@@ -2265,6 +2265,24 @@ code was not timed on that test. Full suite green, load 2.55.
 - Suite green (72 passed, load 1.6). Kernel tests with `STRATA_VK_NO_COOP=1`: 15 passed.
 - Not verified: RADV / non-NVIDIA drivers (whether they also drop the f16 round trip; `rh` is correct either way).
 
+### 2026-10-17 #125 — CUDA `rms_norm` keeps four loads in flight (eb3e696)
+
+- Default-model decode profile at 729bfb2 (nsys with `--cuda-graph-trace node`): about 1062 kernels per token with
+  about 0.85 us of gap each, so small launch-bound kernels are still the lever, not the big GEMVs.
+- `rms_norm` unrolled four ways in both loops (sum of squares, scaled store): 2.96 to 2.42 us average per launch.
+  Greedy output identical (4B and default model, CUDA, `--fixed-experts --mtp 0`), suite 72 passed (load 3.06).
+  Decode change is within the bench spread; not measured on its own.
+- Tried and reverted: SwiGLU computed inside the x quantization of the down GEMVs (CUDA `quant_x` with a `u` input;
+  Vulkan `quant_xq` with `u` for the routed experts; MoE step unbatched so the fused ops stay ordered). Kernel tests
+  bit-identical, greedy identical on both backends and models. Interleaved 3-run A/B against 729bfb2 (the base also
+  lacks the rms_norm change; load 1.6-2.1): CUDA default 103.23 to 103.50, CUDA 4B 83.10 to 83.27 (fusion off above
+  2048 columns: 4B's 9728-wide down GEMV was 1% slower fused, every block recomputes the SwiGLU), Vulkan default
+  100.63 to 99.87 (-0.8%: the MoE step loses the overlap between the shared down GEMV and the routed SwiGLU),
+  Vulkan 4B 98.70 to 99.10 (dense path unchanged, noise). Net gain at most 0.2% on CUDA, a loss on Vulkan.
+- Parity (CUDA default, interleaved 3 runs, load 2.5-5.0): 729bfb2 626/627/626, eb3e696 627/627/627; two more
+  eb3e696 runs 629, 627. No change from rms_norm. Plain default mode scored 629/640 at #69; 633/640 is the
+  `--llama-numerics --fixed-experts` baseline, not run here.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
@@ -2282,7 +2300,7 @@ code was not timed on that test. Full suite green, load 2.55.
    moe_gemv_iq3_xxs 933, LM head gemvn_q4_k 877 (bandwidth bound), attn_decode_gqa 646, gemvn_f32 626 (140 calls,
    router and SSM projections kept f32 like llama.cpp), rms_norm 495 (100 calls, 4.9 us each), moe_publish 249,
    router_topk 219, gemv_q5_k 205; about 1.5 ms of small launch-bound kernels in all. Fusing rms_norm into the
-   following GEMV and the router GEMV with router_topk are the next levers.
+   following GEMV and the router GEMV with router_topk are the next levers (SwiGLU into the down GEMV: no gain, #125).
 
 ## Questions for owner
 
