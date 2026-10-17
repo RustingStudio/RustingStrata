@@ -1,7 +1,7 @@
 #version 460
-// Prefill attention without cooperative matrices: attn_prefill.glsl's inputs and output (f16 Q scaled, f16 K and V,
-// f16 softmax weights), but one subgroup per query, lane l holding dims l + 32 j, and keys taken one at a time with
-// an online softmax, so results differ from it in the last bits. Workgroup (x, h): queries 4x .. 4x + 3 of head h.
+// Prefill attention without cooperative matrices: attn_prefill.glsl's inputs and output, but Q and the softmax weights
+// stay f32 (rounded to f16 as in attn_prefill, parity measured lower, #124), one subgroup per query, lane l holding dims
+// l + 32 j, and keys taken one at a time with an online softmax. Workgroup (x, h): queries 4x .. 4x + 3 of head h.
 layout(local_size_x = 128) in;
 #include "common.glsl"
 layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 qg; F32 o; I32 step; uint t; uint nh; uint nkv; float scale; } p;
@@ -14,16 +14,16 @@ void main() {
     uint kvo = h / (p.nh / p.nkv) * HD + lane, kvd = p.nkv * HD, last = uint(p.step.v[0]) + t;
     float q[PER], acc[PER], m = 0.0, l = 0.0;
     [[unroll]] for (uint j = 0; j < PER; j++) {
-        q[j] = float(float16_t(p.q.v[(t * p.nh + h) * HD + lane + 32 * j] * p.scale));
+        q[j] = p.q.v[(t * p.nh + h) * HD + lane + 32 * j] * p.scale;
         acc[j] = 0.0;
     }
     for (uint k = 0; k <= last; k++) {
         float s = 0.0;
         [[unroll]] for (uint j = 0; j < PER; j++) s += q[j] * float(uint16BitsToHalf(p.kc.v[k * kvd + kvo + 32 * j]));
         s = subgroupAdd(s);
-        float mn = k == 0 ? s : max(m, s), c = expf_(m - mn), e = expf_(s - mn), pe = float(float16_t(e));
+        float mn = k == 0 ? s : max(m, s), c = expf_(m - mn), e = expf_(s - mn);
         l = k == 0 ? e : fma(l, c, e);
-        [[unroll]] for (uint j = 0; j < PER; j++) acc[j] = fma(pe, float(uint16BitsToHalf(p.vc.v[k * kvd + kvo + 32 * j])), acc[j] * c);
+        [[unroll]] for (uint j = 0; j < PER; j++) acc[j] = fma(e, float(uint16BitsToHalf(p.vc.v[k * kvd + kvo + 32 * j])), acc[j] * c);
         m = mn;
     }
     [[unroll]] for (uint j = 0; j < PER; j++) {

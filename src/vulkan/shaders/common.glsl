@@ -25,6 +25,13 @@ float expf_(float x) {
     precise float r = fma(x, uintBitsToFloat(0x32a57060u), fma(x, uintBitsToFloat(0x3fb8aa3bu), 126.0 - y));
     return exp2(r) * uintBitsToFloat(uint(y + 1.0) << 23);
 }
+// x rounded to f16 (nearest even) in integer ops: the NVIDIA driver drops a float -> half -> float round trip.
+// No overflow to inf (callers' values are far below 65504).
+float rh(float x) {
+    uint u = floatBitsToUint(x), a = u & 0x7fffffffu;
+    if (a < 0x38800000u) return roundEven(x * 16777216.0) * (1.0 / 16777216.0);  // f16 subnormal: steps of 2^-24
+    return uintBitsToFloat((u & 0x80000000u) | ((a + 0xfffu + ((a >> 13) & 1u)) & 0xffffe000u));
+}
 float silu(float x) { return fdiv(x, 1.0 + expf_(-x)); }
 float sigmoid(float x) { return fdiv(1.0, 1.0 + expf_(-x)); }
 // log1pf as CUDA compiles it (its PTX): 1 + a rounded toward zero picks the scale 2^e, then a polynomial in the
