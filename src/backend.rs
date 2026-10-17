@@ -114,6 +114,11 @@ pub trait Backend: Send {
     fn gemvn(&self, w: &GpuTensor, x: u64, x_stride: usize, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()>;
     /// `gemvn` that reads x pre-quantized by `quant_xq` at `xq` (0 = quantize x itself; float weights read x).
     fn gemvq(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()>;
+    /// `gemvq` of `a` into `ya` and of `b` into `yb` on the same x (output rows `a.rows` / `b.rows` apart).
+    fn gemvq2(&self, a: &GpuTensor, b: &GpuTensor, x: u64, x_stride: usize, xq: u64, ya: u64, yb: u64, nt: usize) -> anyhow::Result<()> {
+        self.gemvq(a, x, x_stride, xq, ya, a.rows, nt)?;
+        self.gemvq(b, x, x_stride, xq, yb, b.rows, nt)
+    }
     /// For j < k with ids[j] >= 0: y[j] = W_j x[j / xg], where W_j is the `rows` x `cols` matrix at w + ids[j] * stride
     /// bytes. `pair` = (w2, y2) also computes the same product for the matrices at byte offset w2 into the output at
     /// byte offset y2. `xq` (not 0): x pre-quantized by `quant_xq` (k / xg rows), read in place of x.

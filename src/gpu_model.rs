@@ -410,6 +410,7 @@ impl<'a> GpuModel<'a> {
         // Inputs from "h" are quantized once ("hq", after each norm) instead of once per GEMV block.
         let mv = |w: &GpuTensor, x: &str, xs: usize, y: &str, ys: usize|
             if x == "h" { g.gemvq(w, p(x), xs, p("hq"), p(y), ys, nt) } else { self.mv(w, p(x), xs, p(y), ys, nt) };
+        let mv2 = |a: &GpuTensor, b: &GpuTensor, ya: &str, yb: &str| g.gemvq2(a, b, p("h"), ne, p("hq"), p(ya), p(yb), nt);
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
         let (dv, channels) = (c.ssm_dv(), c.ssm_d_inner + 2 * nk * dk);
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
@@ -422,8 +423,7 @@ impl<'a> GpuModel<'a> {
                     g.batch(&mut || {
                         mv(qkv, "h", ne, "qkv", channels)?;
                         mv(gate, "h", ne, "z", c.ssm_d_inner)?;
-                        mv(beta, "h", ne, "beta", nv)?;
-                        mv(alpha, "h", ne, "g", nv)
+                        mv2(beta, alpha, "beta", "g")
                     })?;
                     // One token with 128-wide heads: conv_silu also does the q and k l2 norms.
                     let nn = if nt == 1 && dk == 128 { 2 * nk } else { 0 };
@@ -453,7 +453,7 @@ impl<'a> GpuModel<'a> {
             g.rms_norm_q(x, ne, l.post_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"), p("mix"))?;
             match &l.ffn {
                 Ffn::Dense { gate, up, down } => {
-                    g.batch(&mut || { mv(gate, "h", ne, "ge", c.n_ff)?; mv(up, "h", ne, "ue", c.n_ff) })?;
+                    g.batch(&mut || mv2(gate, up, "ge", "ue"))?;
                     g.swiglu_gemv(p("ge"), p("ue"), down, p("ye"), ne, nt)?;
                     g.add(x, p("ye"), nt * ne)?;
                 }
@@ -466,8 +466,7 @@ impl<'a> GpuModel<'a> {
                         mv(router, "h", ne, "rl", c.n_expert)?;
                         if let Some(s) = shared {
                             mv(&s.gate_inp, "h", ne, "sg", 1)?;
-                            mv(&s.gate, "h", ne, "shg", c.n_ff_shexp)?;
-                            mv(&s.up, "h", ne, "shu", c.n_ff_shexp)?;
+                            mv2(&s.gate, &s.up, "shg", "shu")?;
                         }
                         Ok(())
                     })?;

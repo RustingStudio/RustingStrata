@@ -173,7 +173,18 @@ fn gemvn_matches_gemv() {
                 let dy = gpu.zeros::<f32>(nt * t.rows).unwrap();
                 gpu.gemvq(&dt, dx.addr(), t.cols, xq.addr(), dy.addr(), t.rows, nt).unwrap();
                 assert_eq!(down::<f32>(gpu, &dy), want[..nt * t.rows], "{} {name} quant_xq nt {nt}", ty.name());
+                let dz = gpu.zeros::<f32>(nt * t.rows).unwrap();
+                gpu.gemvq2(&dt, &dt, dx.addr(), t.cols, xq.addr(), dy.addr(), dz.addr(), nt).unwrap();
+                assert_eq!(down::<f32>(gpu, &dy), want[..nt * t.rows], "{} {name} gemvq2 a nt {nt}", ty.name());
+                assert_eq!(down::<f32>(gpu, &dz), want[..nt * t.rows], "{} {name} gemvq2 b nt {nt}", ty.name());
             }
+            // As a paired moe_gemv of one slot (expert 0 at stride 0): float types apply the pair offsets too.
+            let (zid, dy) = (gpu.zeros::<i32>(1).unwrap(), gpu.zeros::<f32>(2 * t.rows).unwrap());
+            let xq = gpu.zeros::<u8>(t.cols * 9 / 8).unwrap();
+            gpu.quant_xq(dx.addr(), t.cols, t.cols, 1, xq.addr()).unwrap();
+            gpu.moe_gemv(t.ty, t.rows, t.cols, dt.ptr, 0, zid.addr(), 1, dx.addr(), t.cols, 1, dy.addr(), Some((0, 4 * t.rows as i64)), xq.addr()).unwrap();
+            let got = down::<f32>(gpu, &dy);
+            assert!(got[..t.rows] == want[..t.rows] && got[t.rows..] == want[..t.rows], "{} {name} paired moe_gemv", ty.name());
         }
         assert!(seen.len() >= 5 || !common::is_default_model(&p), "types covered: {seen:?}");
     }

@@ -522,21 +522,26 @@ QTYPES(DEF_DEQUANT)
 
 // Float types read x directly.
 #define DEF_FGEMV(T, NAME, SBB)                                                                                   \
-    extern "C" __global__ void gemv_##NAME(const u8* w, const float* x, float* y, int rows, int nsb, int) {   \
+    extern "C" __global__ void gemv_##NAME(const u8* w, const float* x, float* y, int rows, int nsb, int,     \
+                                           const signed char*, long long w2, long long y2) {                   \
         int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;                                                 \
+        w += blockIdx.z * w2; y = (float*)((char*)y + blockIdx.z * y2);                                         \
         if (row < rows) gemv_row<T, SBB>(w + (size_t)row * nsb * SBB, x, y, row, nsb);                         \
     }                                                                                                           \
     extern "C" __global__ void moe_gemv_##NAME(const u8* w, const int* ids, long long stride, const float* x,  \
-                                               int x_stride, int xg, float* y, int rows, int nsb, int) {      \
+                                               int x_stride, int xg, float* y, int rows, int nsb, int,         \
+                                               long long w2, long long y2) {                                   \
         int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, k = blockIdx.y;                                 \
+        w += blockIdx.z * w2; y = (float*)((char*)y + blockIdx.z * y2);                                         \
         if (row < rows && ids[k] >= 0)                                                                          \
             gemv_row<T, SBB>(w + ids[k] * stride + (size_t)row * nsb * SBB, x + (size_t)(k / xg) * x_stride,    \
                              y + (size_t)k * rows, row, nsb);                                                   \
     }                                                                                                           \
     extern "C" __global__ void gemvn_##NAME(const u8* w, const float* x, int xs, float* y, int ys, int rows, int nsb, \
-                                            int, int nt) {                                                      \
+                                            int, int nt, const signed char*, long long w2, long long y2) {      \
         int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;                                                 \
         if (row >= rows) return;                                                                                \
+        w += blockIdx.z * w2; y = (float*)((char*)y + blockIdx.z * y2);                                         \
         const u8* wr = w + (size_t)row * nsb * SBB;                                                             \
         if (nt == 2) gemv_row<T, SBB, 2>(wr, x, y, row, nsb, xs, ys);                                           \
         else if (nt == 3) gemv_row<T, SBB, 3>(wr, x, y, row, nsb, xs, ys);                                      \
@@ -550,10 +555,13 @@ FTYPES(DEF_FGEMV)
 // moe_gemv: grid.y = k; weights at w + ids[k] * stride (skipped when ids[k] < 0), input x + (k / xg) * x_stride,
 // output y + k * rows. grid.z = 2 also runs a second matrix at byte offset w2 into output at byte offset y2.
 #define DEF_IGEMV(T, NAME, SBB)                                                                                   \
-    extern "C" __global__ void gemv_##NAME(const u8* w, const float* x, float* y, int rows, int nsb, int rpw) { \
-        extern __shared__ __align__(16) signed char xs[];                                                       \
-        float* xd = (float*)(xs + 256 * nsb);                                                                   \
-        quant_x(x, 256 * nsb, xs, xd);                                                                          \
+    extern "C" __global__ void gemv_##NAME(const u8* w, const float* x, float* y, int rows, int nsb, int rpw,   \
+                                           const signed char* xq, long long w2, long long y2) {                \
+        extern __shared__ __align__(16) signed char sx[];                                                       \
+        const signed char* xs = xq ? xq : sx;                                                                   \
+        const float* xd = (const float*)(xs + 256 * nsb);                                                       \
+        if (!xq) quant_x(x, 256 * nsb, sx, (float*)(sx + 256 * nsb));                                           \
+        w += blockIdx.z * w2; y = (float*)((char*)y + blockIdx.z * y2);                                         \
         int r0 = blockIdx.x * 8 * rpw + (threadIdx.x >> 5), r1 = min(rows, r0 - (threadIdx.x >> 5) + 8 * rpw);  \
         for (int row = r0; row < r1; row += 8) gemv_row_q<T, SBB>(w + (size_t)row * nsb * SBB, xs, xd, y, row, nsb); \
     }                                                                                                           \
@@ -581,11 +589,13 @@ FTYPES(DEF_FGEMV)
 ITYPES(DEF_IGEMV)
 
 // gemvn: y[t] = W x[t] for t < nt <= 4 (x t at x + t * xs, y t at y + t * ys); each weight block is read once.
+// grid.z = 2 also runs a second matrix at byte offset w2 into output at byte offset y2 (gemv and float types too).
 #define DEF_IGEMVN(T, NAME, SBB)                                                                                  \
     extern "C" __global__ void gemvn_##NAME(const u8* w, const float* x, int xs_, float* y, int ys, int rows, int nsb, \
-                                            int rpw, int nt, const signed char* xq) {                             \
+                                            int rpw, int nt, const signed char* xq, long long w2, long long y2) { \
         extern __shared__ __align__(16) signed char sx[];                                                       \
         const signed char* xs = xq ? xq : sx;                                                                   \
+        w += blockIdx.z * w2; y = (float*)((char*)y + blockIdx.z * y2);                                         \
         const float* xd = (const float*)(xs + nt * 256 * nsb);                                                  \
         if (!xq) for (int t = 0; t < nt; t++)                                                                   \
             quant_x(x + (size_t)t * xs_, 256 * nsb, sx + t * 256 * nsb, (float*)(sx + nt * 256 * nsb) + t * 8 * nsb); \
