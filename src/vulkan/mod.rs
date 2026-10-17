@@ -107,6 +107,8 @@ struct Inner {
     coop: bool,
     /// Specialization constant 0 of kernels that quantize x: llama.cpp q8_K numerics (`--llama-numerics`).
     llama: u32,
+    /// STRATA_VK_STATS: print the driver's statistics (registers, ...) of each pipeline as it is created.
+    stats: bool,
     /// The one pipeline layout: a 128-byte push constant range (the Vulkan minimum), no descriptor sets.
     layout: vk::PipelineLayout,
     st: Mutex<State>,
@@ -256,6 +258,9 @@ impl Vk {
         let coop = shape(16, vk::ComponentTypeKHR::FLOAT16, vk::ComponentTypeKHR::FLOAT32)
             && shape(32, vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32);
         if coop { exts.push(ash::khr::cooperative_matrix::NAME.as_ptr()) }
+        let stats = std::env::var_os("STRATA_VK_STATS").is_some() && has(ash::khr::pipeline_executable_properties::NAME);
+        if stats { exts.push(ash::khr::pipeline_executable_properties::NAME.as_ptr()) }
+        let mut fstats = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default().pipeline_executable_info(true);
         let mut fcoop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
         let mut f11 = vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(true);
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true)
@@ -267,6 +272,7 @@ impl Vk {
         f.features.shader_int64 = vk::TRUE;
         f.features.shader_float64 = vk::TRUE;
         if coop { f = f.push_next(&mut fcoop) }
+        if stats { f = f.push_next(&mut fstats) }
         let prio = [1.0];
         let qi = [vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio)];
         let dev = unsafe { instance.create_device(pd, &vk::DeviceCreateInfo::default().queue_create_infos(&qi)
@@ -282,7 +288,7 @@ impl Vk {
         let st = State { pool, spare: vec![], used: vec![], cur: None, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false,
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, coop, llama: crate::cuda::llama_numerics() as u32, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, coop, llama: crate::cuda::llama_numerics() as u32, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -407,9 +413,18 @@ impl Inner {
         let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(m).name(c"main")
             .specialization_info(&si).flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS).push_next(&mut sub);
         let r = unsafe { self.dev.create_compute_pipelines(vk::PipelineCache::null(),
-            &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(self.layout)], None) };
+            &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(self.layout)
+                .flags(if self.stats { vk::PipelineCreateFlags::CAPTURE_STATISTICS_KHR } else { vk::PipelineCreateFlags::empty() })], None) };
         unsafe { self.dev.destroy_shader_module(m, None) };
         let p = r.map_err(|e| e.1).with_context(|| format!("create pipeline {name}"))?[0];
+        if self.stats {
+            let pe = ash::khr::pipeline_executable_properties::Device::new(&self.instance, &self.dev);
+            let s = unsafe { pe.get_pipeline_executable_statistics(&vk::PipelineExecutableInfoKHR::default().pipeline(p)) }?;
+            let v = s.iter().map(|s| format!("{} {}", s.name_as_c_str().map_or("?".into(), |n| n.to_string_lossy()), unsafe {
+                match s.format { vk::PipelineExecutableStatisticFormatKHR::INT64 => s.value.i64.to_string(),
+                    vk::PipelineExecutableStatisticFormatKHR::FLOAT64 => s.value.f64.to_string(), _ => s.value.u64.to_string() } }));
+            eprintln!("vk stats {name} {spec:?}: {}", v.collect::<Vec<_>>().join(", "));
+        }
         st.pipes.insert((name, spec.to_vec()), p);
         Ok(p)
     }
