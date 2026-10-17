@@ -1901,6 +1901,26 @@ code was not timed on that test. Full suite green, load 2.55.
   gemv_q super-block loop unrolled by 2 (slower, 4B 78.9 -> 73.7, default 76.2 -> 73.6).
 - Not verified: parity (kernels are bit-identical, only the barrier placement changed).
 
+### 2026-10-17 #108 — Vulkan V4: gemmi unrolled, scales loaded once per lane (3956997, 02a97b4)
+- `STRATA_VK_PROF=1` (02a97b4) prints GPU time per kernel name (timestamps outside graphs). Qwen3-4B pp512: gemmi
+  90%. Default model pp4096: gemmi 35.9%, gemm_f 35.8%, attn_prefill_256 13.5% (57.8 ms per call), deltanet 9.5%.
+- The NVIDIA Vulkan driver did not unroll gemmi's small loops: `[[unroll]]` on all of them. When the int32
+  accumulator has the mma.sync layout (checked in the shader with `subgroupAll`), each lane loads its 2 row and 4
+  column scales once per 16/32-deep step instead of per element. Output bit-identical (`gemm_matches`, 0 bits).
+- `gemm_throughput` (m=4096, 4B matrices; CUDA / Vulkan before / after): Q4_K attn_q 4.38 / 8.9 / 6.27 ms, Q4_K
+  ffn_gate 9.96 / 21 / 14.7, Q6_K ffn_down 12.58 / 30.6 / ~17, Q6_K attn_v 1.44 / 3.5 / 1.96. Default model after:
+  Q5_K attn_qkv 12.1 ms (11.3 TFLOP/s, CUDA 17.6), Q6_K ssm_out 6.4 (CUDA 4.4), IQ2_XS ffn_gate_exps on gemm_f
+  1.98 ms (4.3 TFLOP/s, CUDA f16 path 0.66 ms / 13.1), IQ3_XXS ffn_down_exps 0.65 (CUDA 0.49).
+- A/B against 850746e, 3 interleaved rounds, load 2.0-4.0: 4B pp512 903/977/978 -> 1251/1459/1458 (first round
+  noisy), pp4096 783/812/813 -> 1099/1094/1094 (+35%); default model pp4096 802/904/846 -> 1008/1062/1038 (+20%),
+  pp512 473/438/464 -> 507/504/516 (noisy). Decode unchanged (4B ~83, default ~83.5). llama.cpp Vulkan: 4B pp512
+  3149, pp4096 2825; default pp4096 817 (Strata is ahead there), pp512 357 +-178.
+- Breakdown on Q4_K attn_q: skipping the scale epilogue and all global loads leaves ~3.3 ms, so the epilogue still
+  costs ~3 ms. The driver exposes int8 cooperative matrices only as 16x16x32 (and 16x8x32): KS=16 types (Q6_K, ...)
+  multiply 16 zeros per 32. Neutral: i2f_small on its own (kept, as kernels.cu); `[[unroll]]` in gemm_f (IQ2_XS
+  2.00 -> 1.98 ms, dropped).
+- Suite green (72 passed). Not verified: parity (kernels bit-identical to before).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
