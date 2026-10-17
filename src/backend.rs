@@ -135,6 +135,11 @@ pub trait Backend: Send {
     fn l2_norm(&self, x: u64, n: usize, per: usize, stride: usize, rows: usize, eps: f32) -> anyhow::Result<()>;
     /// `heads` rows of `stride` floats, `per` per token; token t is at position step[0] + t.
     fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()>;
+    /// `rms_norm` of `rows` heads of n (output rows of n), then `rope_neox` on them.
+    fn rms_norm_rope(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
+        self.rms_norm(x, x_stride, w, out, n, n, rows, eps)?;
+        self.rope_neox(out, n, rows, per, n_rot, step, base)
+    }
     /// x += y.
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()>;
     /// g = silu(g) * u.
