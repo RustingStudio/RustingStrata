@@ -30,7 +30,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   ~1000, pp4096 ~1650; 4B decode 99.3, pp512 2080, pp4096 ~1950. llama.cpp Vulkan (#110, #116): 4B 95.4 / 3120 /
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
-  632-633/640.
+  632-634/640 (#124).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2241,6 +2241,29 @@ code was not timed on that test. Full suite green, load 2.55.
   and in the rerun (not traced). Kernel tests with `STRATA_VK_NO_COOP=1`: 15 passed.
 - Not verified: a real device without cooperative matrices (no AMD GPU here; RADV deferred). No tuning of the dp
   kernels (tile shape, attention keys per step).
+
+### 2026-10-17 #124 — Vulkan `--llama-numerics` attention (12b5c4f)
+- The last two `todo` paths on Vulkan are gone: `attn_decode_llama.comp` and `attn_prefill_llama.comp` port the
+  CUDA kernels (one head per workgroup over `ATT_SPLITS_1` chunks of 6 positions, merged by `attn_merge`; prefill
+  in f32 with chunks of 32 keys). `tests/llama_numerics.rs` now also runs them and asserts Vulkan == CUDA bit for
+  bit (decode n_pos 7, 300, 511, 512, 1400 with gq_min 2048 and 0; prefill hd 64, 128, 256).
+- The NVIDIA driver drops a float -> half -> float round trip: both `float(float16_t(x))` and
+  `unpackHalf2x16(packHalf2x16(x))` compile to nothing, so the first port matched the f32 path (rel 3.33e-4 against
+  CUDA). `common.glsl` gained `rh()`, rounding to f16 in integer ops; with it the kernels are bit-identical.
+  (Coop attn_prefill gets its rounding from the f16 matrix types, which the driver keeps.)
+- `attn_prefill_dp` (#123) had the same silent loss of its f16 rounding. Restoring it with `rh` lowered parity
+  (629 / 632 / 631), so it now keeps Q and the softmax weights in f32 on purpose: 634 / 632 / 633 (load 2.3-8.3).
+- Parity with `--llama-numerics`, `STRATA_EXPERT_MB=6000 --fixed-experts` (load 2.7-3.9): CUDA 628 / 628, Vulkan
+  631 / 631, each reproducible run to run.
+- Why CUDA and Vulkan scores differ on 6-7 of 20 prompts even with the same experts resident: the CUDA calibration
+  file (`~/.cache/rusting_strata/strata-<model>.json`) sets `short: 16` and `mtp: 1`; there is no Vulkan one, so
+  Vulkan uses 32 and 0. Prompts of 16-31 tokens therefore run batched on CUDA and token by token on Vulkan, and
+  the MTP layer's experts change CUDA's resident set. With `--mtp 0 --chunk 0` on both, a 27-token prompt gives
+  the same row-0 logprob (-0.8597) on CUDA, Vulkan batched and Vulkan token by token; CUDA batched gives -0.9346
+  (a different top token). Not a bug; a fair comparison needs `--mtp 0` and equal `short` (or a Vulkan
+  calibration file).
+- Suite green (72 passed, load 1.6). Kernel tests with `STRATA_VK_NO_COOP=1`: 15 passed.
+- Not verified: RADV / non-NVIDIA drivers (whether they also drop the f16 round trip; `rh` is correct either way).
 
 ## Next candidates
 
