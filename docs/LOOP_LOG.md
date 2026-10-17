@@ -1970,6 +1970,20 @@ code was not timed on that test. Full suite green, load 2.55.
   934 / 1115; Vulkan's small GEMVs carry ~4-5 us of quant_xq and dispatch overhead.
 - Not verified: parity (kernels bit-identical to before).
 
+### 2026-10-17 #111 — Vulkan V4: moe_gemv_q four super-blocks per step (4b32187)
+- 4b32187: `moe_gemv_q` runs four super-blocks per loop step (`[[unroll]]` over a `sb_step` helper, as the
+  `#pragma unroll 4` in kernels.cu), so their weight and x loads overlap; the sums keep their order (bit-identical).
+  gemv_bandwidth on the default model, 3 interleaved rounds against 774d565, load 1.0-3.0 (us): IQ2_XS moe8
+  24.4/24.0 -> 21.3/21.6/20.3, IQ3_XXS gate 25.3/25.5 -> 23.4/23.4/23.2, IQ3_XXS down 29.2/29.3 -> 30.5/30.5/30.0
+  (+1 us), IQ4_XS 40.8/40.8 -> 41.8/41.8/40.4, Q3_K and Q2_K unchanged (the base's second round had another
+  process on the GPU and is left out). Decode A/B, `bench --pp 512 --tg 128 --reps 3 --mtp 0`, default model, 3
+  interleaved rounds, load 0.9-1.0: 84.8/86.3/85.6 -> 86.4/87.8/86.8 (+1.4%). Greedy `generate -n 64` CUDA ==
+  Vulkan on the 4B (mtp 0) and the default model (mtp 0 and 2). Suite green (72 passed).
+- Tried and dropped: the tail also unrolled (`if (s + j < nsb)` inside the unrolled step): IQ4_XS 41.8 vs 39.6 us,
+  down still 30. The same unroll in the dense `gemv_q` (NT columns): Q8_0 eh_proj 33.3 -> 39.2 us, Q6_K attn_q 51 ->
+  51-56, the rest and the 4B neutral (2 rounds, load 2.6-4.8).
+- Not verified: parity (kernels bit-identical to before).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
