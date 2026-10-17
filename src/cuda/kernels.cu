@@ -1467,8 +1467,10 @@ extern "C" __global__ void moe_route(const float* p, int n, int k, float extra_s
         }
     }
     __syncthreads();
-    if (miss) for (int i = threadIdx.x; i < nh * T; i += blockDim.x) mb[h_off + i] = __float_as_uint(h[i]);
-    if (threadIdx.x == 0) mb[1] = T;
+    if (threadIdx.x == 0) mb[1] = T;  // also read by routing() after the token
+    // No miss: nobody waits on this layer. Raise only the skip flag, without the ~4 us system fence.
+    if (!miss) { if (threadIdx.x == 0) ((volatile unsigned int*)mb)[2] = seq; return; }
+    for (int i = threadIdx.x; i < nh * T; i += blockDim.x) mb[h_off + i] = __float_as_uint(h[i]);
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) *(volatile unsigned int*)mb = seq;

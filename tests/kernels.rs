@@ -732,7 +732,7 @@ fn router_topk_matches_ops_top_k() {
 /// Vulkan an unanswered request then ends in an error, not a hang (CUDA traps, which kills the context).
 #[test]
 fn moe_mailbox_round_trip() {
-    use rusting_strata::cpu_worker::{DONE, IDS, Mailbox, NTOK, REQ};
+    use rusting_strata::cpu_worker::{DONE, IDS, Mailbox, NTOK, REQ, SKIP};
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
@@ -808,8 +808,15 @@ fn moe_mailbox_round_trip() {
                 }
             }
         }
+        // A round with no miss raises only the skip flag on CUDA (Vulkan raises the request flag: no gain there, #128).
+        gpu.put(&[5i32, 1, 2, 3], &dtable, 0).unwrap();
+        gpu.put(&[0i32, 4], &step, 0).unwrap();
+        ops(&step).unwrap();
+        let want = if bk == "cuda" { (4, 3) } else { (0, 4) };
+        assert_eq!(unsafe { (at(SKIP).read_volatile(), at(REQ).read_volatile()) }, want);
+        gpu.put(&table, &dtable, 0).unwrap();
         if bk == "vulkan" {
-            gpu.put(&[0i32, 4], &step, 0).unwrap();
+            gpu.put(&[0i32, 5], &step, 0).unwrap();
             let t0 = std::time::Instant::now();
             let e = ops(&step).unwrap_err();
             eprintln!("unanswered: {e} after {:.2} s", t0.elapsed().as_secs_f64());

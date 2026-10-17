@@ -1,7 +1,8 @@
 //! CPU side of the expert split, without per-layer stream syncs. For each MoE layer the GPU writes routing ids,
 //! weights, cache slots and (when some expert missed) the normed activation into host-mapped pinned memory, then
-//! raises the layer's request flag. This worker spins on the flag, computes the missed experts with `cpu_moe`, writes
-//! their weighted sum back and raises the done flag, which the GPU combine kernel waits on only if the layer missed.
+//! raises the layer's request flag (on CUDA a layer with no miss raises only its skip flag). This worker spins on the
+//! flag, computes the missed experts with `cpu_moe`, writes their weighted sum back and raises the done flag, which the
+//! GPU combine kernel waits on only if the layer missed.
 
 use crate::model::Model;
 use crate::backend::{Backend, Buf};
@@ -14,6 +15,8 @@ use std::time::{Duration, Instant};
 pub const REQ: usize = 0;
 /// Tokens in the request (1 for decode, up to `TMAX` for a multi-token verify).
 pub const NTOK: usize = 1;
+/// Raised instead of REQ, with no data, when no expert of the layer missed (CUDA only; Vulkan raises REQ).
+pub const SKIP: usize = 2;
 pub const DONE: usize = 16;
 pub const IDS: usize = 32;
 
@@ -65,12 +68,13 @@ impl CpuWorker {
                 for &il in &moe_layers {
                     let b = il * lay.stride;
                     let at = |o: usize| (w(b + o)) as *mut u32;
-                    // A newer seq here means the GPU already moved on to the next token, so it did not wait for this
-                    // layer (no miss): skip it. Waiting for the old seq would hang, and the next miss would trap.
+                    // Skip the layer on its skip flag, or on a newer seq anywhere (the GPU already moved on to the
+                    // next token, so it did not wait for this one). Waiting for the old seq would hang.
+                    let ahead = |v: u32| v != 0 && (v.wrapping_sub(seq) as i32) >= 0;
                     let mut r;
                     while { r = unsafe { at(REQ).read_volatile() }; r != seq } {
                         if st.load(Ordering::Relaxed) { return; }
-                        if r != 0 && (r.wrapping_sub(seq) as i32) > 0 { break; }
+                        if ahead(r) || ahead(unsafe { at(SKIP).read_volatile() }) { break; }
                         std::hint::spin_loop();
                     }
                     if r != seq { continue; }
