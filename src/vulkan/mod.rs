@@ -20,6 +20,7 @@ const SPV: &[(&str, &[u8])] = &[
     ("attn_decode", include_bytes!("spv/attn_decode.spv")),
     ("attn_merge", include_bytes!("spv/attn_merge.spv")),
     ("attn_prefill_64", include_bytes!("spv/attn_prefill_64.spv")),
+    ("attn_prefill_dp", include_bytes!("spv/attn_prefill_dp.spv")),
     ("attn_prefill_128", include_bytes!("spv/attn_prefill_128.spv")),
     ("attn_prefill_256", include_bytes!("spv/attn_prefill_256.spv")),
     ("conv_silu", include_bytes!("spv/conv_silu.spv")),
@@ -28,7 +29,9 @@ const SPV: &[(&str, &[u8])] = &[
     ("deltanet", include_bytes!("spv/deltanet.spv")),
     ("dequant", include_bytes!("spv/dequant.spv")),
     ("gemm_f", include_bytes!("spv/gemm_f.spv")),
+    ("gemm_f_dp", include_bytes!("spv/gemm_f_dp.spv")),
     ("gemmi", include_bytes!("spv/gemmi.spv")),
+    ("gemmi_dp", include_bytes!("spv/gemmi_dp.spv")),
     ("gemv_f", include_bytes!("spv/gemv_f.spv")),
     ("gemv_q", include_bytes!("spv/gemv_q.spv")),
     ("kv_store", include_bytes!("spv/kv_store.spv")),
@@ -257,7 +260,7 @@ impl Vk {
             && c.a_type == ab && c.b_type == ab && c.c_type == cr && c.result_type == cr);
         let coop = shape(16, vk::ComponentTypeKHR::FLOAT16, vk::ComponentTypeKHR::FLOAT32)
             && shape(32, vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32)
-            && std::env::var_os("STRATA_VK_NO_COOP").is_none();  // runs as a device without them would
+            && std::env::var_os("STRATA_VK_NO_COOP").is_none();  // STRATA_VK_NO_COOP: run the kernels for devices without them
         if coop { exts.push(ash::khr::cooperative_matrix::NAME.as_ptr()) }
         let stats = std::env::var_os("STRATA_VK_STATS").is_some() && has(ash::khr::pipeline_executable_properties::NAME);
         if stats { exts.push(ash::khr::pipeline_executable_properties::NAME.as_ptr()) }
@@ -513,11 +516,10 @@ impl Vk {
     fn gemm_raw(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, wd: u64, nd: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
         ensure!(cols % 256 == 0, "{} matrix with {cols} columns: GEMM needs a multiple of 256", ty.name());
         if n_tiles == 0 { return Ok(()); }
-        if !self.0.coop { return todo("gemm without VK_KHR_cooperative_matrix"); }
         let (spec, grid, nsb) = (self.wspec(ty), [rows.div_ceil(64), n_tiles, 1], (cols / 256) as u32);
         let tail = [&(rows as u32) as &dyn Arg, &nsb, &act];
         if !crate::cuda::Gpu::mmq(ty) {
-            return self.run("gemm_f", &spec, grid, &[&tiles, &wd, &x, &xrow, &y, &(nd as u32), &(x_stride as u32), &(y_stride as u32), tail[0], tail[1], tail[2]]);
+            return self.run(if self.0.coop { "gemm_f" } else { "gemm_f_dp" }, &spec, grid, &[&tiles, &wd, &x, &xrow, &y, &(nd as u32), &(x_stride as u32), &(y_stride as u32), tail[0], tail[1], tail[2]]);
         }
         // ponytail: x is quantized on every call, also when several GEMMs read the same x (as on CUDA).
         let mut q8 = self.3.lock().unwrap();
@@ -525,7 +527,7 @@ impl Vk {
         if q8.len() < need { *q8 = self.alloc(need)?; }  // dropping the old buffer waits for work that uses it
         let xq = q8.addr();
         self.run("quant_q8", &[self.0.llama], [n_x, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
-        self.run("gemmi", &spec, grid, &[&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2]])
+        self.run(if self.0.coop { "gemmi" } else { "gemmi_dp" }, &spec, grid, &[&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2]])
     }
 }
 
@@ -538,7 +540,6 @@ fn nsb(w: &GpuTensor) -> anyhow::Result<u32> {
 #[allow(unused_variables)]
 impl Backend for Vk {
     fn name(&self) -> &'static str { "vulkan" }
-    fn batched_prefill(&self) -> bool { self.0.coop }
 
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf> { Ok(self.buf(bytes, DEVICE)?.0) }
 
@@ -749,7 +750,9 @@ impl Backend for Vk {
         let name = match hd { 64 => "attn_prefill_64", 128 => "attn_prefill_128", 256 => "attn_prefill_256",
             _ => anyhow::bail!("attention prefill: head_dim {hd} unsupported (64, 128 or 256)") };
         if self.0.llama != 0 { return todo("attn_prefill with --llama-numerics"); }
-        if !self.0.coop { return todo("attn_prefill without VK_KHR_cooperative_matrix"); }
+        if !self.0.coop {
+            return self.run("attn_prefill_dp", &[0, (hd / 32) as u32], [t.div_ceil(4), nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale]);
+        }
         self.run(name, &[], [t.div_ceil(64), nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale])
     }
     fn moe_combine_seq(&self, x: u64, ye: u64, wts: u64, inv: u64, k: usize, sh: u64, sg: u64, n: usize, t: usize) -> anyhow::Result<()> {
