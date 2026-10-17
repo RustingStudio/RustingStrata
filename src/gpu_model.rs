@@ -425,7 +425,6 @@ impl<'a> GpuModel<'a> {
                         mv(beta, "h", ne, "beta", nv)?;
                         mv(alpha, "h", ne, "g", nv)
                     })?;
-                    g.ssm_gates(p("beta"), p("g"), dt_bias.ptr, a.ptr, nt * nv, nv)?;
                     // One token with 128-wide heads: conv_silu also does the q and k l2 norms.
                     let nn = if nt == 1 && dk == 128 { 2 * nk } else { 0 };
                     if nt == 1 {
@@ -434,7 +433,7 @@ impl<'a> GpuModel<'a> {
                         g.conv_seq(p("qkv"), conv.addr(), conv_w.ptr, p("y"), channels, c.ssm_conv, nt, sc, ns)?;
                     }
                     if nn == 0 { g.l2_norm(p("y"), dk, 2 * nk, channels, nt * 2 * nk, eps)?; }
-                    g.deltanet(p("y"), s.addr(), p("beta"), p("g"), p("o"), nk, nv, c.k_interleave, dk, dv, 1.0 / (dk as f32).sqrt(), nt, channels, ss, ns)?;
+                    g.deltanet(p("y"), s.addr(), p("beta"), p("g"), dt_bias.ptr, a.ptr, p("o"), nk, nv, c.k_interleave, dk, dv, 1.0 / (dk as f32).sqrt(), nt, channels, ss, ns)?;
                     g.norm_gate(p("o"), norm.ptr, p("z"), dv, nt * nv, eps)?;
                     mv(out, "o", c.ssm_d_inner, "mix", ne)?;
                 }

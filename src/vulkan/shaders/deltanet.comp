@@ -5,7 +5,8 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer FV4 { vec4 
 // Gated DeltaNet scan over T tokens, as deltanet_seq in kernels.cu (see there). Workgroup (value head, row block):
 // state row j (dk floats) is held by L = dk / 16 lanes, 16 floats each (4-float chunks s, s + L, ...), so a
 // subgroup holds R = 32 / L rows. The state after each of the first min(nsnap, T - 1) tokens goes to snap.
-layout(push_constant) uniform P { F32 y; F32 S; F32 beta; F32 g; F32 o; F32 snap; uint nk; uint nv; uint ilv; uint dk;
+// With dtb set, beta and g are raw and get ssm_gates' gates here (dtb, ga as its dt_bias, a).
+layout(push_constant) uniform P { F32 y; F32 S; F32 beta; F32 g; F32 o; F32 snap; F32 dtb; F32 ga; uint nk; uint nv; uint ilv; uint dk;
                                   uint dv; float scale; uint T; uint ych; uint nsnap; } p;
 // Token tok's k and q (this lane's 4-float chunks), g, beta and v.
 void ld(uint tok, uint kh, uint vh, uint j, uint s, out vec4 k4[4], out vec4 q4[4], out float g, out float b, out float v) {
@@ -15,6 +16,7 @@ void ld(uint tok, uint kh, uint vh, uint j, uint s, out vec4 k4[4], out vec4 q4[
         q4[i] = FV4(uint64_t(p.y)).v[(yt + kh * dk) / 4 + s + L * i];
     }
     g = p.g.v[tok * p.nv + vh]; b = p.beta.v[tok * p.nv + vh]; v = p.y.v[yt + 2 * p.nk * dk + vh * p.dv + j];
+    if (uint64_t(p.dtb) != 0) { g = softplus(g + p.dtb.v[vh]) * p.ga.v[vh]; b = sigmoid(b); }
 }
 void main() {
     uint dk = p.dk, L = dk >> 4, R = 32 / L, lane = gl_SubgroupInvocationID, s = lane % L, vh = gl_WorkGroupID.x;

@@ -438,7 +438,7 @@ fn deltanet_chunk_matches_steps() {
                 let steps: Vec<(usize, usize)> = if chunk { vec![(0, t)] } else { (0..t).map(|i| (i, 1)).collect() };
                 let mut snaps = vec![];
                 for (i, n) in steps {
-                    gpu.deltanet(p(dy.addr(), ych, i), ds.addr(), p(db.addr(), nv, i), p(dg.addr(), nv, i),
+                    gpu.deltanet(p(dy.addr(), ych, i), ds.addr(), p(db.addr(), nv, i), p(dg.addr(), nv, i), 0, 0,
                                  p(o.addr(), nv * dv, i), nk, nv, ilv, dk, dv, 0.5, n, ych, snap.addr(), ns).unwrap();
                     if !chunk && i < ns { snaps.extend(down::<f32>(gpu, &ds)); }
                 }
@@ -473,6 +473,33 @@ fn deltanet_chunk_matches_steps() {
                       diff(&o1, &f.0), o1.len(), diff(&s1, &f.1), s1.len(), diff(&o2, &f.2), diff(&s2, &f.3));
             assert!(eo <= 1e-5 && es <= 1e-5, "ilv {ilv} vs CPU: out {eo}, state {es}");
         }
+    }
+}
+
+/// deltanet with dt_bias set gives the same bits as ssm_gates then deltanet.
+#[test]
+fn deltanet_gates_match_ssm_gates() {
+    let (nk, nv, dk, dv, t) = (2, 4, 128, 128, 3);
+    let ych = 2 * nk * dk + nv * dv;
+    let y: Vec<f32> = xs(t * ych).iter().map(|v| 0.1 * v).collect();
+    let beta: Vec<f32> = xs(t * nv).iter().map(|v| 4.0 * v).collect();
+    let g: Vec<f32> = xs(t * nv + 1)[1..].iter().map(|v| 30.0 * v).collect();
+    let (dt, a): (Vec<f32>, Vec<f32>) = (xs(nv + 2)[2..].to_vec(), xs(nv + 3)[3..].iter().map(|v| -0.1 * v.abs()).collect());
+    let s0: Vec<f32> = xs(nv * dv * dk + 2)[2..].iter().map(|v| 0.1 * v).collect();
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        let (dy, ddt, da) = (up(gpu, &y), up(gpu, &dt), up(gpu, &a));
+        let run = |fused: bool| {
+            let (db, dg, ds, o) = (up(gpu, &beta), up(gpu, &g), up(gpu, &s0), gpu.zeros::<f32>(t * nv * dv).unwrap());
+            let (pb, pa) = if fused { (ddt.addr(), da.addr()) } else {
+                gpu.ssm_gates(db.addr(), dg.addr(), ddt.addr(), da.addr(), t * nv, nv).unwrap();
+                (0, 0)
+            };
+            gpu.deltanet(dy.addr(), ds.addr(), db.addr(), dg.addr(), pb, pa, o.addr(), nk, nv, true, dk, dv, 0.5, t, ych, 0, 0).unwrap();
+            (bits(&down::<f32>(gpu, &o)), bits(&down::<f32>(gpu, &ds)))
+        };
+        assert!(run(true) == run(false), "{bk}: deltanet gates differ from ssm_gates");
     }
 }
 

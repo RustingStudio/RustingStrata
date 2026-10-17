@@ -1045,10 +1045,12 @@ extern "C" __global__ void conv_state(const float* qkv, float* state, int ch, in
 // registers of L = dk / 16 lanes, 16 floats each (float4 chunks s, s + L, ...), so a warp holds R = 32 / L rows and
 // row dot products reduce over L lanes. The warp scans the T tokens in order.
 // Token t: y + t * ych = [q | k | v] after conv and l2 norm; beta, g at t * nv; output at o + t * nv * dv.
+// With dtb set, beta and g are raw and get ssm_gates' gates here (dtb, ga as its dt_bias, a).
 // The state after each of the first min(nsnap, T - 1) tokens also goes to snap (S's layout, one state each).
 // ponytail: sequential scan (latency-bound per token); a chunked WY form would use tensor cores for long prompts.
 extern "C" __global__ void deltanet_seq(const float* y, float* S, const float* beta, const float* g, float* o,
-                                        int nk, int nv, int ilv, int dk, int dv, float scale, int T, int ych, float* snap, int nsnap) {
+                                        int nk, int nv, int ilv, int dk, int dv, float scale, int T, int ych, float* snap, int nsnap,
+                                        const float* dtb, const float* ga) {
     int L = dk >> 4, R = 32 / L, lane = threadIdx.x & 31, s = lane % L, vh = blockIdx.x, kh = ilv ? vh / (nv / nk) : vh % nk;
     int j0 = (blockIdx.y * 8 + (threadIdx.x >> 5)) * R, j = j0 + lane / L;
     if (j0 >= dv) return;  // whole warp past the end (R divides dv)
@@ -1068,6 +1070,7 @@ extern "C" __global__ void deltanet_seq(const float* y, float* S, const float* b
             v = q4[s + L * i]; nq[4 * i] = v.x; nq[4 * i + 1] = v.y; nq[4 * i + 2] = v.z; nq[4 * i + 3] = v.w;
         }
         ng = g[tok * nv + vh]; nb = beta[tok * nv + vh]; nvv = yt[2 * nk * dk + vh * dv + j];
+        if (dtb) { ng = softplus(ng + dtb[vh]) * ga[vh]; nb = sigmoid(nb); }
     };
     ld(0);
     for (int tok = 0; tok < T; tok++) {
