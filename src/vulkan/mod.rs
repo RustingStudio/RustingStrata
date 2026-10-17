@@ -42,7 +42,7 @@ const SPV: &[(&str, &[u8])] = &[
     ("moe_combine_seq", include_bytes!("spv/moe_combine_seq.spv")),
     ("moe_gemv_f", include_bytes!("spv/moe_gemv_f.spv")),
     ("moe_gemv_q", include_bytes!("spv/moe_gemv_q.spv")),
-    ("moe_publish", include_bytes!("spv/moe_publish.spv")),
+    ("moe_route", include_bytes!("spv/moe_route.spv")),
     ("norm_gate", include_bytes!("spv/norm_gate.spv")),
     ("quant_q8", include_bytes!("spv/quant_q8.spv")),
     ("quant_xq", include_bytes!("spv/quant_xq.spv")),
@@ -776,13 +776,13 @@ impl Backend for Vk {
         self.run("attn_decode", &[0, per, g as u32, 1], [nh / g * nt, ATT_SPLITS, 1], &args)?;
         self.run("attn_merge", &[], [nh, 1, nt], &[&part, &qg, &out, &step, &(hd as u32), &(ATT_SPLITS as u32), &(ATT_SPLITS_1 as u32), &gq_min])
     }
-    fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize, table: u64, slots: u64, wh: u64) -> anyhow::Result<()> {
+    fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()> {
         ensure!(n <= 512 && k <= 32, "router_topk: {n} experts, top {k}");
-        self.run("router_topk", &[], [t, 1, 1], &[&p, &ids, &wts, &table, &slots, &wh, &(n as u32), &(k as u32), &extra_scale])
+        self.run("router_topk", &[], [t, 1, 1], &[&p, &ids, &wts, &(n as u32), &(k as u32), &extra_scale])
     }
-    fn moe_publish(&self, ids: u64, wts: u64, slots: u64, h: u64, mb: u64, k: usize, n: usize, h_off: usize, step: u64, t: usize) -> anyhow::Result<()> {
-        ensure!(k * t <= 256, "moe_publish: {t} tokens of top {k}");
-        self.run("moe_publish", &[], [1, 1, 1], &[&ids, &wts, &slots, &h, &mb, &step, &(k as u32), &(n as u32), &(h_off as u32), &(t as u32)])
+    fn moe_route(&self, p: u64, n: usize, k: usize, extra_scale: f32, table: u64, ids: u64, wts: u64, slots: u64, wh: u64, h: u64, mb: u64, nh: usize, h_off: usize, step: u64, t: usize) -> anyhow::Result<()> {
+        ensure!(n <= 512 && k <= 32, "moe_route: {n} experts, top {k}");
+        self.run("moe_route", &[], [1, 1, 1], &[&p, &table, &ids, &wts, &slots, &wh, &h, &mb, &step, &(n as u32), &(k as u32), &extra_scale, &(nh as u32), &(h_off as u32), &(t as u32)])
     }
     fn moe_combine(&self, x: u64, ye: u64, w: u64, k: usize, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, slots: u64, n: usize, t: usize) -> anyhow::Result<()> {
         let err = self.0.st().err.3;

@@ -712,16 +712,8 @@ fn router_topk_matches_ops_top_k() {
         x[2 * n + 30] = 5.0; x[2 * n + 31] = 5.0; x[2 * n + 255] = 5.0;
         let dx = up(gpu, &x);
         let (dids, dw) = (gpu.zeros::<i32>(k * t).unwrap(), gpu.zeros::<f32>(k * t).unwrap());
-        // Expert cache table: even experts resident (slot i / 2), odd ones not.
-        let table: Vec<i32> = (0..n as i32).map(|i| if i % 2 == 0 { i / 2 } else { -1 }).collect();
-        let (dtable, dslots, dwh) = (up(gpu, &table), gpu.zeros::<i32>(k * t).unwrap(), gpu.zeros::<f32>(k * t).unwrap());
-        gpu.router_topk(dx.addr(), n, k, 2.5, dids.addr(), dw.addr(), t, dtable.addr(), dslots.addr(), dwh.addr()).unwrap();
+        gpu.router_topk(dx.addr(), n, k, 2.5, dids.addr(), dw.addr(), t).unwrap();
         let (ids, w) = (down::<i32>(gpu, &dids), down::<f32>(gpu, &dw));
-        let (slots, wh) = (down::<i32>(gpu, &dslots), down::<f32>(gpu, &dwh));
-        for j in 0..k * t {
-            assert_eq!(slots[j], table[ids[j] as usize], "slot {j}");
-            assert_eq!(wh[j], if slots[j] >= 0 { w[j] } else { 0.0 }, "hit weight {j}");
-        }
         for r in 0..t {
             let mut p = x[r * n..(r + 1) * n].to_vec();
             rusting_strata::ops::softmax(&mut p);
@@ -736,7 +728,7 @@ fn router_topk_matches_ops_top_k() {
     }
 }
 
-/// The CPU expert round trip: moe_publish, a host thread answering through the mailbox, moe_combine. On
+/// The CPU expert round trip: moe_route, a host thread answering through the mailbox, moe_combine. On
 /// Vulkan an unanswered request then ends in an error, not a hang (CUDA traps, which kills the context).
 #[test]
 fn moe_mailbox_round_trip() {
@@ -746,12 +738,19 @@ fn moe_mailbox_round_trip() {
         eprintln!("backend {bk}");
         let (k, n, t) = (4, 300, 2);
         let lay = Mailbox::new(k, n);
+        // Router logits of 4 experts that route token 0 to experts 0, 1, 2, 3 and token 1 to 3, 2, 1, 0.
+        let logits = [4f32, 3.0, 2.0, 1.0, 1.0, 2.0, 3.0, 4.0];
         let ids = [0, 1, 2, 3, 3, 2, 1, 0];
         let table = [5, -1, 2, -1];
-        let (wts, h, ye, sh, sg, x0) = (xs(k * t), xs(n * t), xs(k * t * n), xs(n * t), [0.3f32, -0.7], xs(n * t));
-        let (dids, dwts, dh, dye, dsh, dsg, dx) = (up(gpu, &ids), up(gpu, &wts), up(gpu, &h), up(gpu, &ye), up(gpu, &sh), up(gpu, &sg), up(gpu, &x0));
-        let hit: Vec<i32> = ids.iter().map(|&i| table[i as usize]).collect();
-        let (slots, wh) = (up(gpu, &hit), up(gpu, &hit.iter().zip(&wts).map(|(&s, &w)| if s >= 0 { w } else { 0.0 }).collect::<Vec<f32>>()));
+        let wts: Vec<f32> = logits.chunks(k).zip(ids.chunks(k)).flat_map(|(l, id)| {
+            let mut p = l.to_vec();
+            rusting_strata::ops::softmax(&mut p);
+            id.iter().map(move |&i| p[i as usize]).collect::<Vec<_>>()
+        }).collect();
+        let (h, ye, sh, sg, x0) = (xs(n * t), xs(k * t * n), xs(n * t), [0.3f32, -0.7], xs(n * t));
+        let (dlog, dtable, dh, dye, dsh, dsg, dx) = (up(gpu, &logits), up(gpu, &table), up(gpu, &h), up(gpu, &ye), up(gpu, &sh), up(gpu, &sg), up(gpu, &x0));
+        let (dids, slots) = (gpu.zeros::<i32>(k * t).unwrap(), gpu.zeros::<i32>(k * t).unwrap());
+        let (dwts, wh) = (gpu.zeros::<f32>(k * t).unwrap(), gpu.zeros::<f32>(k * t).unwrap());
         let (mb, host) = gpu.host_mailbox(lay.stride).unwrap();
         let step = gpu.zeros::<i32>(2).unwrap();
         let hp = host as usize;
@@ -779,7 +778,7 @@ fn moe_mailbox_round_trip() {
             unsafe { at(DONE).write_volatile(seq) };
         };
         let ops = |step: &rusting_strata::backend::Buf| {
-            gpu.moe_publish(dids.addr(), dwts.addr(), slots.addr(), dh.addr(), mb.addr(), k, n, lay.h, step.addr(), t)?;
+            gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), mb.addr(), n, lay.h, step.addr(), t)?;
             gpu.moe_combine(dx.addr(), dye.addr(), wh.addr(), k, dsh.addr(), dsg.addr(), mb.addr(), lay.y, step.addr(), slots.addr(), n, t)?;
             gpu.sync()
         };
@@ -794,6 +793,11 @@ fn moe_mailbox_round_trip() {
                 ops(&step).unwrap();
             });
             let got = down::<f32>(gpu, &dx);
+            let (gi, gs, gw) = (down::<i32>(gpu, &dids), down::<i32>(gpu, &slots), down::<f32>(gpu, &wh));
+            for j in 0..k * t {
+                assert_eq!((gi[j], gs[j]), (ids[j], table[ids[j] as usize]), "routing {j}");
+                assert!((gw[j] - if gs[j] >= 0 { wts[j] } else { 0.0 }).abs() < 1e-6, "hit weight {j}");
+            }
             for tk in 0..t {
                 for i in 0..n {
                     want[tk * n + i] += sh[tk * n + i] / (1.0 + (-sg[tk]).exp());

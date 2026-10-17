@@ -1396,16 +1396,11 @@ extern "C" __global__ void attn_merge(const float* part, const float* qg, float*
 
 // ---- MoE ----
 
-// One warp per token (grid = tokens): softmax over n logits (in place), top-k (ties to the lower index), renormalized
-// weights.
-// One warp per token; the n <= 32 * TOPK_R logits stay in registers (lane holds i = lane + 32 r).
+// One warp routes one token: softmax over n logits, top-k (ties to the lower index), renormalized weights. Lane
+// j < k gets the j-th expert's id and weight. The n <= 32 * TOPK_R logits stay in registers (lane holds
+// i = lane + 32 r).
 #define TOPK_R 16
-// With table set, also the expert cache lookup: slots[j] = table[ids[j]] (-1 = not resident), wh[j] = weight of
-// hits, else 0.
-extern "C" __global__ void router_topk(float* p, int n, int k, float extra_scale, int* ids, float* wts,
-                                       const int* table, int* slots, float* wh) {
-    int lane = threadIdx.x;
-    p += (size_t)blockIdx.x * n; ids += blockIdx.x * k; wts += blockIdx.x * k;
+__device__ void topk_warp(const float* p, int n, int k, float extra_scale, int lane, int& id, float& w) {
     float v[TOPK_R];
     float m = -INFINITY;
 #pragma unroll
@@ -1419,7 +1414,7 @@ extern "C" __global__ void router_topk(float* p, int n, int k, float extra_scale
     for (int r = 0; r < TOPK_R; r++) v[r] /= s;
     unsigned taken = 0;
     float sum = 0.0f, mine = 0.0f;
-    int id = 0;
+    id = 0;
     for (int j = 0; j < k; j++) {
         float bv = -1.0f; int bi = 0x7fffffff;
 #pragma unroll
@@ -1433,34 +1428,50 @@ extern "C" __global__ void router_topk(float* p, int n, int k, float extra_scale
             if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
         if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
-        if (lane == j) { ids[j] = bi; mine = bv; id = bi; }
+        if (lane == j) { id = bi; mine = bv; }
         sum += bv;
     }
     float scale = 1.0f / fmaxf(sum, 6.103515625e-5f);
     if (extra_scale != 0.0f) scale *= extra_scale;
-    if (lane >= k) return;
-    wts[lane] = mine * scale;
-    if (table) {
-        int s = table[id], o = blockIdx.x * k + lane;
-        slots[o] = s;
-        wh[o] = s >= 0 ? mine * scale : 0.0f;
-    }
+    w = mine * scale;
 }
 
-// x += sum_k w[k] * ye[k] + sigmoid(sg[0]) * sh + cpu (sh and cpu may be null).
-// Copy one layer's routing for T tokens (k entries each) to the host-mapped mailbox `mb` (activations only if an
-// expert missed), store T in word 1, then raise the request flag. One block.
-extern "C" __global__ void moe_publish(const int* ids, const float* wts, const int* slots, const float* h,
-                                       unsigned int* mb, int k, int n, int h_off, const int* step, int T) {
-    int t = threadIdx.x, kt = k * T;
+// One warp per token (grid = tokens).
+extern "C" __global__ void router_topk(const float* p, int n, int k, float extra_scale, int* ids, float* wts) {
+    int id, o = blockIdx.x * k + threadIdx.x;
+    float w;
+    topk_warp(p + (size_t)blockIdx.x * n, n, k, extra_scale, threadIdx.x, id, w);
+    if (threadIdx.x < k) { ids[o] = id; wts[o] = w; }
+}
+
+// Decode routing of T tokens in one block (warp i routes tokens i, i + 8, ...): router_topk, the expert cache lookup
+// (slots = table[ids], -1 = not resident; wh = weight of hits, else 0), then the routing (and h, if an expert missed)
+// copied to the host-mapped mailbox `mb`, T stored in word 1 and the request flag raised.
+extern "C" __global__ void moe_route(const float* p, int n, int k, float extra_scale, const int* table, int* ids,
+                                     float* wts, int* slots, float* wh, const float* h, unsigned int* mb, int nh,
+                                     int h_off, const int* step, int T) {
+    __shared__ int miss;
+    int lane = threadIdx.x & 31, kt = k * T;
     unsigned int seq = step[1];
-    int miss = __syncthreads_or(t < kt && slots[t] < 0);
-    if (t < kt) { mb[32 + t] = ids[t]; mb[32 + kt + t] = __float_as_uint(wts[t]); mb[32 + 2 * kt + t] = slots[t]; }
-    if (miss) for (int i = t; i < n * T; i += blockDim.x) mb[h_off + i] = __float_as_uint(h[i]);
-    if (t == 0) mb[1] = T;
+    if (threadIdx.x == 0) miss = 0;
+    __syncthreads();
+    for (int t = threadIdx.x >> 5; t < T; t += blockDim.x >> 5) {
+        int id;
+        float w;
+        topk_warp(p + (size_t)t * n, n, k, extra_scale, lane, id, w);
+        if (lane < k) {
+            int o = t * k + lane, s = table[id];
+            ids[o] = id; wts[o] = w; slots[o] = s; wh[o] = s >= 0 ? w : 0.0f;
+            mb[32 + o] = id; mb[32 + kt + o] = __float_as_uint(w); mb[32 + 2 * kt + o] = s;
+            if (s < 0) miss = 1;
+        }
+    }
+    __syncthreads();
+    if (miss) for (int i = threadIdx.x; i < nh * T; i += blockDim.x) mb[h_off + i] = __float_as_uint(h[i]);
+    if (threadIdx.x == 0) mb[1] = T;
     __threadfence_system();
     __syncthreads();
-    if (t == 0) *(volatile unsigned int*)mb = seq;
+    if (threadIdx.x == 0) *(volatile unsigned int*)mb = seq;
 }
 
 // x += sum_j w[j] ye[j] + sigmoid(sg) sh + cpu. If a slot missed, wait for the CPU worker's done flag first.
