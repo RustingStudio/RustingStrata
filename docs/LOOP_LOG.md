@@ -2166,6 +2166,19 @@ code was not timed on that test. Full suite green, load 2.55.
 - Each commit: suite 72 passed; greedy `generate -n 64` CUDA == Vulkan on the 4B (mtp 0) and the default model
   (mtp 0 and 2). Not verified: parity (results bit-identical to before).
 
+### 2026-10-17 #120 — moe_gemv_q several rows per subgroup (3d145d9)
+
+- Each subgroup of moe_gemv_q runs 2048 / cols rows, as CUDA's rows per warp, so the 512-column down experts get 4.
+  CUDA's forced minimum of 2 is left out: 2 rows of 2048 columns measured 2.5% slower (IQ2_XS gate 21.2 -> 21.7 us).
+- `gemv_bandwidth` A/B against 21d44cb, default model, clean rounds (load 0.4-1.9; two of six rounds ran 2.3x slower
+  on both binaries, GPU busy, dropped): down IQ3_XXS 30.0 -> 27.4 us, IQ4_XS 37.1 -> 35.0, Q3_K 31.1 -> 29.9; gate
+  experts unchanged.
+- Decode A/B (`bench --pp 512 --tg 128 --mtp 0`, load 3.3-7.1): default model 96.3/97.0/97.2 -> 97.7/98.1/98.4
+  (+1.3%); 4B 97.4/97.3/97.2 -> 97.1/97.3/96.9 (no MoE, noise).
+- Suite 72 passed. Greedy: the first run under load gave a default-model mtp 0 DIFF; repeated twice each for CUDA,
+  Vulkan and the base binary, all six outputs are identical. Expert placement moves with load (State: decode is not
+  deterministic run to run), which matches the one-off. Not verified: parity (per-row results bit-identical).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
