@@ -2013,6 +2013,24 @@ code was not timed on that test. Full suite green, load 2.55.
   spirv-opt fails ("does not dominate its use") on gemv_q and moe_gemv_q with any form tried.
 - Not verified: parity (kernels bit-identical to before).
 
+### 2026-10-17 #113 — Vulkan V4: gemv_q four super-blocks per step (9119ed2)
+- gemv_q (decode GEMV, one subgroup per row) now runs four super-blocks per loop step through an `sb_step` helper,
+  as `#pragma unroll 4` in CUDA's gemv_q and as moe_gemv_q in #111. Results bit-identical (kernel tests).
+- gemv_bandwidth, Vulkan, 3 interleaved rounds against 02bf8f6 (us, load 1.0-8.0): 4B Q4_K attn_output 25.9 -> 24.6,
+  attn_q 27.4 -> 25.4, ffn_gate 51.1 -> 48.7, Q4_K ffn_down 52.9 -> 51.5; default model Q4_K output 883 -> 848,
+  Q5_K about -0.5; Q6_K and Q8_0 unchanged (an unroll before the #112 loads made Q8_0 33 -> 39).
+- Decode A/B, `bench --pp 512 --tg 128 --reps 3 --mtp 0`, 3 interleaved rounds, load 1.7-2.6:
+  4B 92.7/92.3/92.4 -> 94.6/94.6/94.4 (+2%), default model 93.8/95.7/96.1 -> 95.5/96.6/96.7 (+0.8%).
+  4B decode 94.5 vs llama.cpp Vulkan 95.4 (#110).
+- Greedy: the first greedy.sh run gave DIFF on the default model at mtp 2 (a near-tie, "mtp_head" vs "mtp"); six
+  reruns of both binaries on both backends gave the same output, and a rerun of greedy.sh gave same on all three.
+  Another session's process was on the GPU during the first run (expert residency depends on free VRAM, as #109's
+  MTP test); greedy.sh now waits for an idle GPU before each generate. Suite green (72 passed).
+- 4B Vulkan profile (pp16 tg256, `STRATA_VK_PROF=1 STRATA_NO_GRAPH=1`, load 4.6): gemv_q 81.5% (32.5 us/call),
+  rms_norm 3.95, attn_decode 5.38, rope_neox 3.45, quant_xq 3.09, attn_merge 3.63, kv_store 2.44, swiglu 2.32,
+  add 1.87 us/call.
+- Not verified: parity (kernels bit-identical to before).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
