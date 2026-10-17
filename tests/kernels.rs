@@ -280,7 +280,8 @@ fn gemm_throughput() {
         let g = Gguf::open(&p).unwrap();
         let w = Weights::new(&g).unwrap();
         let m = 4096usize;
-        for name in ["blk.0.attn_qkv.weight", "blk.0.attn_gate.weight", "blk.0.ssm_out.weight", "blk.0.ffn_gate_exps.weight", "blk.0.ffn_down_exps.weight"] {
+        for name in ["blk.0.attn_qkv.weight", "blk.0.attn_gate.weight", "blk.0.ssm_out.weight", "blk.0.ffn_gate_exps.weight", "blk.0.ffn_down_exps.weight", "blk.0.attn_q.weight", "blk.0.ffn_gate.weight", "blk.0.ffn_down.weight", "blk.0.attn_v.weight"] {
+            if !g.tensors.contains_key(name) { continue; }
             let t = w.get(name).unwrap();
             let rows = if g.tensors[name].dims.len() == 3 { t.rows / g.tensors[name].dims[2] as usize } else { t.rows };
             let dt = gpu.upload(&t).unwrap();
