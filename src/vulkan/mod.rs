@@ -681,8 +681,11 @@ impl Backend for Vk {
             self.quant_xq(x, x_stride, cols, ntok, self.1.addr())?;
             self.1.addr()
         };
-        self.run("moe_gemv_q", &spec, [rows.div_ceil(8), k, z], &[&w, &ids, &xq, &y, &(stride as u64), &(w2 as u64), &(y2 as u64),
-            &(rows as u32), &nsb, &(xg as u32), &(ntok as u32)])
+        // Rows per subgroup as CUDA's moe_gemv, about 8 super-blocks of work each (but no forced 2: with x
+        // pre-quantized, 2 rows of 2048 columns measured 2.5% slower).
+        let rpw = (2048 / cols).max(1);
+        self.run("moe_gemv_q", &spec, [rows.div_ceil(8 * rpw), k, z], &[&w, &ids, &xq, &y, &(stride as u64), &(w2 as u64), &(y2 as u64),
+            &(rows as u32), &nsb, &(xg as u32), &(ntok as u32), &(rpw as u32)])
     }
     fn dequant(&self, w: &GpuTensor, rows: usize, out: u64) -> anyhow::Result<()> {
         self.run("dequant", &self.wspec(w.ty), [rows, 1, 1], &[&w.ptr, &out, &nsb(w)?])
