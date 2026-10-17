@@ -2070,6 +2070,37 @@ code was not timed on that test. Full suite green, load 2.55.
   35B; manual reruns and a second full run were all same, so the first run was disturbed).
 - Not verified: parity (the change is bit-identical by construction: same values, same order).
 
+### 2026-10-17 #116 — Vulkan V4: attention prefill and decode loops unrolled (3f8c7d6, 20273b4)
+
+- Profile (`STRATA_VK_PROF`, 4B, pp4096): gemmi 6.8 ms per call (53%), attn_prefill_128 37.7 ms per layer (42%). The
+  CUDA kernel takes about 11 ms per layer (estimated from the CUDA pp512/pp4096 gap).
+- 3f8c7d6: attn_prefill moves the Q, K and V tiles as uvec4 instead of one half per load (37.7 -> 32.6 ms). On the
+  mma.sync accumulator layout (detected as in gemmi) the scores and rescales stay in registers as in CUDA instead of
+  a round trip through shared memory. `[[unroll]]` on the fixed-bound loops took it to 11.9 ms: without it the
+  score and output arrays were not kept in registers. A/B against 1034c40, interleaved, 3 rounds of
+  `--pp 512,4096 --tg 32 --reps 3 --mtp 0` (load 1.1-3.7):
+
+  | Model | pp512 before | pp512 after | pp4096 before | pp4096 after |
+  |---|---|---|---|---|
+  | 4B | 1590/1786/1815 | 1942/1928/1933 | 1268/1262/1273 | 1776/1801/1770 (+40%) |
+  | Default model | 826/614/925 | 923/796/963 | 1310/1115/1301 | 1545/1471/1616 |
+
+  (base rounds 1-2 of the default model had warm-up dips.)
+- 20273b4: the same `[[unroll]]` in attn_decode, deltanet, deq.glsl, quant_x and gemv_q. A/B against 3f8c7d6
+  (load 0.4-1.3): decode at 4096 tokens of context 4B 65.9/65.6/65.2 -> 82.1/82.5/82.2 (+25%), default model
+  87.4/88.1/87.8 -> 92.5/92.2/92.7 (+5%). Decode at 512: 96.0 -> 97.0 (4B), 95.9 -> 96.3. Prefill unchanged.
+- After both, against llama.cpp Vulkan (build 5d8ccdf9d) on the 4B (load 2.7-3.6): llama.cpp pp4096 2849 +-10,
+  tg32 at depth 4096 79.6 +-1.1. Strata Vulkan pp4096 about 1790, tg32 at depth 4096 82-83. Strata CUDA: pp4096 2043,
+  tg32 at depth 4096 69.5. Vulkan prefill is now 12% behind Strata CUDA. The gap to llama.cpp is in gemmi, whose
+  int8 epilogue keeps the results bit-identical to CUDA.
+- Tried and dropped:
+  - gemmi X loads moved one step ahead into registers, as CUDA's cp.async double buffer: Q4_K attn_q 4.8 -> 6.6 ms
+    and ffn_gate 11.3 -> 15.5 in `gemm_throughput` (register pressure).
+  - `[[unroll]]` in gemm_f, gemv_f, quant_q8, router_topk and argmax_rows: A/B neutral on both models.
+- Each commit: suite 72 passed; greedy `generate -n 64` CUDA == Vulkan on the 4B (mtp 0) and the default model
+  (mtp 0 and 2); `attn_prefill_matches_decode` bit-identical across backends.
+- Not verified: parity (results bit-identical to before).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
