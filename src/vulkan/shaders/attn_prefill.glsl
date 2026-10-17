@@ -30,8 +30,8 @@ void main() {
         uvec4 u;
         [[unroll]] for (uint j = 0; j < 2; j++) {
             vec4 v = q0 + r < p.t ? FV4(uint64_t(p.q)).v[o + j] * p.scale : vec4(0.0);
-            u[2 * j] = f2h(v.x) | f2h(v.y) << 16;
-            u[2 * j + 1] = f2h(v.z) | f2h(v.w) << 16;
+            u[2 * j] = packFloat2x16(f16vec2(v.xy));
+            u[2 * j + 1] = packFloat2x16(f16vec2(v.zw));
         }
         kvs[r * PQ + c] = u;
     }
@@ -121,17 +121,20 @@ void main() {
                 // l *= c fuses into the first add, as nvcc compiles it.
                 l[r] = nt == 0 && (e & 1) == 0 ? fma(l[r], c[r], pe) : l[r] + pe;
                 s[nt][e] = pe;
+                // The software f2h here: the hardware conversion took the shader from 168 to 239 registers.
                 if (!nva) ps[pb + (g + 8 * r) * PP + nt * 8 + 2 * t4 + (e & 1)] = uint16BitsToHalf(uint16_t(f2h(pe)));
             }
-        if (!nv && t4 == 0) { rs[rb + g] = c[0]; rs[rb + g + 8] = c[1]; }
-        subgroupMemoryBarrierShared();
-        subgroupBarrier();
+        if (!nva) {
+            if (!nv && t4 == 0) { rs[rb + g] = c[0]; rs[rb + g + 8] = c[1]; }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+        }
         [[unroll]] for (uint d = 0; d < HD / 16; d++)
             [[unroll]] for (uint i = 0; i < acc[d].length(); i++) acc[d][i] *= nv ? c[i >> 2] : rs[rb + uint(ri[i])];
         [[unroll]] for (uint kb = 0; kb < BK / 16; kb++) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> pa;
             if (nva) {
-                [[unroll]] for (uint i = 0; i < 8; i++) pa[i] = uint16BitsToHalf(uint16_t(f2h(s[2 * kb + (i >> 2)][i & 3])));
+                [[unroll]] for (uint i = 0; i < 8; i++) pa[i] = float16_t(s[2 * kb + (i >> 2)][i & 3]);
             } else coopMatLoad(pa, ps, pb + kb * 16, PP, gl_CooperativeMatrixLayoutRowMajor);
             [[unroll]] for (uint d = 0; d < HD / 16; d++) {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> vb;
