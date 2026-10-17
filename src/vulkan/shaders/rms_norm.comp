@@ -7,7 +7,13 @@ layout(push_constant) uniform P { F32 x; F32 w; F32 o; U32 q; uint xs; uint os; 
 void main() {
     uint r = gl_WorkGroupID.x, xo = r * p.xs, oo = r * p.os, h = 0;
     float s = 0.0;
-    for (uint i = gl_LocalInvocationID.x; i < p.n; i += 256) s += p.x.v[xo + i] * p.x.v[xo + i];
+    // Four loads in flight per step (the sum keeps its order).
+    uint i = gl_LocalInvocationID.x;
+    for (; i + 768 < p.n; i += 1024) {
+        float a = p.x.v[xo + i], b = p.x.v[xo + i + 256], c = p.x.v[xo + i + 512], e = p.x.v[xo + i + 768];
+        s += a * a; s += b * b; s += c * c; s += e * e;
+    }
+    for (; i < p.n; i += 256) s += p.x.v[xo + i] * p.x.v[xo + i];
     float sc = fdiv(1.0, sqrt_(fdiv(block_sum(s), float(p.n)) + p.eps));
     if (uint64_t(p.step) != 0) {
         h = p.n_rot / 2;
@@ -20,7 +26,12 @@ void main() {
         }
         h *= 2;
     }
-    for (uint i = h + gl_LocalInvocationID.x; i < p.n; i += 256) p.o.v[oo + i] = p.x.v[xo + i] * sc * p.w.v[i];
+    for (i = h + gl_LocalInvocationID.x; i + 768 < p.n; i += 1024) {
+        float v[4];  // loaded before any store, which may alias x
+        [[unroll]] for (uint j = 0; j < 4; j++) v[j] = p.x.v[xo + i + 256 * j] * sc * p.w.v[i + 256 * j];
+        [[unroll]] for (uint j = 0; j < 4; j++) p.o.v[oo + i + 256 * j] = v[j];
+    }
+    for (; i < p.n; i += 256) p.o.v[oo + i] = p.x.v[xo + i] * sc * p.w.v[i];
     if (uint64_t(p.q) != 0)
         quant_x(p.x, xo, p.n, p.w, sc, F32(0ul), p.q, r * p.n / 4, F32(uint64_t(p.q) + gl_NumWorkGroups.x * p.n), r * (p.n / 32));
 }
