@@ -14,8 +14,8 @@ const QTYPES: [GgmlType; 17] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL]
 };
-const KERNELS: [&str; 25] = [
-    "rms_norm", "quant_xq", "argmax_rows", "l2_norm", "rope_neox", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
+const KERNELS: [&str; 26] = [
+    "rms_norm", "quant_xq", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_decode", "attn_decode_gqa", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
 ];
@@ -371,6 +371,12 @@ impl Backend for Gpu {
 
     fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
         launch!(self, "rope_neox", cfg(((heads / per) as u32, 1), (n_rot / 2) as u32, 0), x, stride as i32, per as i32, n_rot as i32, step, base);
+        Ok(())
+    }
+
+    fn rms_norm_rope(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
+        anyhow::ensure!(n_rot <= n.min(512), "rms_norm_rope: head of {n}, n_rot {n_rot}");
+        launch!(self, "rms_norm_rope", cfg((rows as u32, 1), 256, 0), x, x_stride as i32, w, out, n as i32, eps, per as i32, n_rot as i32, step, base);
         Ok(())
     }
 
