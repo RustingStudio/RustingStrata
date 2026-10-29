@@ -705,17 +705,14 @@ impl Backend for Vk {
         self.rms_norm_q(x, x_stride, w, out, out_stride, n, rows, eps, 0, 0)
     }
     fn rms_norm_q(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32, xq: u64, res: u64) -> anyhow::Result<()> {
-        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &xq, &(x_stride as u32), &(out_stride as u32), &(n as u32), &eps, &0u64, &0f64, &0u32, &0u32, &res])
+        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &xq, &(x_stride as u32), &(out_stride as u32), &(n as u32), &eps, &0u64, &0f64, &0u32, &0u32, &res, &0u64, &0u64, &0u64])
     }
     fn rms_norm_rope(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
-        let ts = (base as f64).powf(-2.0 / n_rot as f64);
-        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &0u64, &(x_stride as u32), &(n as u32), &(n as u32), &eps, &step, &ts, &(per as u32), &(n_rot as u32), &0u64])
+        self.rms_norm_rope_kv(x, x_stride, w, out, n, rows, eps, per, n_rot, step, base, 0, 0, 0)
     }
-    /// The two kernels; kv_store reads out, so it gets a barrier inside a batch too.
     fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
-        self.rms_norm_rope(x, x_stride, w, out, n, rows, eps, per, n_rot, step, base)?;
-        { let mut st = self.0.st(); let cb = self.0.cb(&mut st)?; self.0.barrier(cb, false); }
-        self.kv_store(out, v, kc, vc, n * per, rows / per, step, n)
+        let ts = (base as f64).powf(-2.0 / n_rot as f64);
+        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &0u64, &(x_stride as u32), &(n as u32), &(n as u32), &eps, &step, &ts, &(per as u32), &(n_rot as u32), &0u64, &v, &kc, &vc])
     }
     fn argmax_rows(&self, x: u64, n: usize, rows: usize, out: u64) -> anyhow::Result<()> { self.run("argmax_rows", &[], [rows, 1, 1], &[&x, &out, &(n as u32)]) }
     fn l2_norm(&self, x: u64, n: usize, per: usize, stride: usize, rows: usize, eps: f32) -> anyhow::Result<()> {

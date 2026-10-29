@@ -3,7 +3,9 @@ layout(local_size_x = 256) in;
 #include "common.glsl"
 // Workgroup = row. out[r] = rmsnorm(x[r]) * w; with q not null, out is also quantized as quant_xq does. With step not
 // null, out is then rotated as rope_neox does (row r = a head of token r / per). With res not null, x += res first.
-layout(push_constant) uniform P { F32 x; F32 w; F32 o; U32 q; uint xs; uint os; uint n; float eps; I32 step; double ts; uint per; uint n_rot; F32 res; } p;
+// With kc not null, out and v (rows of n) are then stored as kv_store does.
+layout(push_constant) uniform P { F32 x; F32 w; F32 o; U32 q; uint xs; uint os; uint n; float eps; I32 step; double ts; uint per; uint n_rot; F32 res;
+                                  F32 v; U16 kc; U16 vc; } p;
 void main() {
     uint r = gl_WorkGroupID.x, xo = r * p.xs, oo = r * p.os, h = 0;
     float s = 0.0;
@@ -44,4 +46,13 @@ void main() {
     for (; i < p.n; i += 256) p.o.v[oo + i] = p.x.v[xo + i] * sc * p.w.v[i];
     if (uint64_t(p.q) != 0)
         quant_x(p.x, xo, p.n, p.w, sc, F32(0ul), p.q, r * p.n / 4, F32(uint64_t(p.q) + gl_NumWorkGroups.x * p.n), r * (p.n / 32));
+    if (uint64_t(p.kc) != 0) {
+        memoryBarrierBuffer();
+        barrier();
+        uint e = (uint(p.step.v[0]) * p.per + r) * p.n;
+        for (i = gl_LocalInvocationID.x; i < p.n; i += 256) {
+            p.kc.v[e + i] = uint16_t(f2h(p.o.v[oo + i]));
+            p.vc.v[e + i] = uint16_t(f2h(p.v.v[r * p.n + i]));
+        }
+    }
 }
