@@ -3,7 +3,7 @@
 
 use crate::config::LayerKind;
 use crate::cpu_worker::{CpuWorker, TMAX};
-use crate::backend::{ATT_SPLITS, Backend, Buf, GpuTensor};
+use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, Backend, Buf, GpuTensor};
 use crate::expert_cache::ExpertCache;
 use crate::model::Model;
 use crate::quant::GgmlType;
@@ -11,6 +11,14 @@ use anyhow::bail;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
+
+/// The decode attention `gq_min` for `nt` tokens from position `pos`. The kernels pick the regime per token; when all
+/// tokens fall on one side of ATT_GQA_MIN, i32::MAX (one head per block) or 0 (GQA) gives the same result and lets the
+/// backend launch only the kernel that works.
+fn gq_min(pos: usize, nt: usize) -> i32 {
+    let m = ATT_GQA_MIN as usize;
+    if pos + nt < m { i32::MAX } else if pos + 1 >= m { 0 } else { ATT_GQA_MIN }
+}
 
 
 mod prefill;
@@ -295,17 +303,20 @@ impl<'a> GpuModel<'a> {
         Ok(())
     }
 
-    /// Run the forward of `nt` tokens as a recorded graph (graph key `nt`), recorded on first use.
-    fn run(&self, nt: usize) -> anyhow::Result<()> { self.gpu.graph(nt as u64, &mut || self.forward(nt)) }
+    /// Run the forward of `nt` tokens as a recorded graph (graph key `nt` and the attention regime), recorded on first use.
+    fn run(&self, nt: usize) -> anyhow::Result<()> {
+        let gq = gq_min(self.pos, nt);
+        self.gpu.graph(nt as u64 | (gq as u32 as u64) << 8, &mut || self.forward(nt, gq))
+    }
 
     /// Enqueue (or record into a graph) the forward of `nt` tokens; per-token values come from `step_buf`.
-    fn forward(&self, nt: usize) -> anyhow::Result<()> {
+    fn forward(&self, nt: usize, gq: i32) -> anyhow::Result<()> {
         let c = &self.m.cfg;
         let (g, eps, ne, step) = (&self.gpu, c.eps, c.n_embd, self.step_buf.addr());
         let p = |n: &str| self.bufs[n].addr();
         let x = self.x.addr();
         let mut res = 0;
-        for (il, l) in self.layers.iter().enumerate() { res = self.layer(il, l, x, step, self.worker.as_ref(), nt, res)?; }
+        for (il, l) in self.layers.iter().enumerate() { res = self.layer(il, l, x, step, self.worker.as_ref(), nt, res, gq)?; }
         g.rms_norm_q(x, ne, self.output_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"), res)?;
         g.gemvq(&self.output, p("h"), ne, p("hq"), self.logits.addr(), c.n_vocab, nt)
     }
@@ -377,8 +388,9 @@ impl<'a> GpuModel<'a> {
         let steps: Vec<i32> = (0..nt).flat_map(|t| [(h.pos + t) as i32, seq as i32]).collect();
         g.put(&steps, &h.step_buf, 0)?;
         // `run` keys are token counts (below 8); the top bit keeps these keys apart from them.
-        let key = { let mut s = std::hash::DefaultHasher::new(); (hid, nt, head).hash(&mut s); s.finish() | 1 << 63 };
-        g.graph(key, &mut || self.mtp_forward(hid, nt, head))?;
+        let gq = gq_min(h.pos, nt);
+        let key = { let mut s = std::hash::DefaultHasher::new(); (hid, nt, head, gq).hash(&mut s); s.finish() | 1 << 63 };
+        g.graph(key, &mut || self.mtp_forward(hid, nt, head, gq))?;
         let d = if head { g.get::<i32>(&self.amax, 0, 1)?[0] as u32 } else { g.sync()?; 0 };
         let h = self.mtp.as_mut().unwrap();
         h.pos += nt;
@@ -389,14 +401,14 @@ impl<'a> GpuModel<'a> {
     }
 
     /// Enqueue the draft head (see `mtp_run`).
-    fn mtp_forward(&self, hid: u64, nt: usize, head: bool) -> anyhow::Result<()> {
+    fn mtp_forward(&self, hid: u64, nt: usize, head: bool, gq: i32) -> anyhow::Result<()> {
         let (c, g, h) = (&self.m.cfg, &self.gpu, self.mtp.as_ref().unwrap());
         let (eps, ne, hp) = (c.eps, c.n_embd, self.bufs["h"].addr());
         let (eh, x) = (h.eh.addr(), h.x.addr());
         g.rms_norm(h.emb.addr(), ne, h.enorm.ptr, eh, 2 * ne, ne, nt, eps)?;
         g.rms_norm(hid, ne, h.hnorm.ptr, eh + 4 * ne as u64, 2 * ne, ne, nt, eps)?;
         self.mv(&h.eh_proj, eh, 2 * ne, x, ne, nt)?;
-        let res = self.layer(c.n_layer, &h.layer, x, h.step_buf.addr(), Some(&h.worker), nt, 0)?;
+        let res = self.layer(c.n_layer, &h.layer, x, h.step_buf.addr(), Some(&h.worker), nt, 0, gq)?;
         if res != 0 { g.add(x, res, nt * ne)?; }
         if head {
             g.rms_norm(x + 4 * ((nt - 1) * ne) as u64, 0, h.head_norm.ptr, hp, 0, ne, 1, eps)?;
@@ -409,7 +421,7 @@ impl<'a> GpuModel<'a> {
     /// One decoder block on `nt` tokens at `x` (rows of n_embd); `step` points at [position, worker seq] per token.
     /// One layer on x, after adding `res` (the previous layer's pending FFN output, or 0) to it. Returns this
     /// layer's pending FFN output (a dense FFN's, added by the next norm) or 0.
-    fn layer(&self, il: usize, l: &Layer, x: u64, step: u64, worker: Option<&CpuWorker>, nt: usize, res: u64) -> anyhow::Result<u64> {
+    fn layer(&self, il: usize, l: &Layer, x: u64, step: u64, worker: Option<&CpuWorker>, nt: usize, res: u64, gq: i32) -> anyhow::Result<u64> {
         let c = &self.m.cfg;
         let (g, eps, ne) = (&self.gpu, c.eps, c.n_embd);
         let p = |n: &str| self.bufs[n].addr();
@@ -453,7 +465,7 @@ impl<'a> GpuModel<'a> {
                     g.batch(&mut || g.rms_norm_rope_qk(p("qg"), qs, qn.ptr, p("q"), nt * nh, nh, p("kraw"), kn.ptr, p("k"), nt * nkv, nkv,
                                                        hd, eps, c.n_rot, step, c.rope_base, p("v"), kc.addr(), vc.addr()))?;
                     let aq = g.attn_decode_q(p("q"), kc.addr(), vc.addr(), if c.q_gate { p("qg") } else { 0 }, p("att"), p("attp"), step, nh, nkv, hd,
-                                             1.0 / (hd as f32).sqrt(), nt, p("attq"))?;
+                                             1.0 / (hd as f32).sqrt(), gq, nt, p("attq"))?;
                     if aq != 0 { g.gemvq(o, p("att"), nh * hd, aq, p("mix"), ne, nt)?; } else { mv(o, "att", nh * hd, "mix", ne)?; }
                 }
             }

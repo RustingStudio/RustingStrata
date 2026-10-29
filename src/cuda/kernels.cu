@@ -1399,7 +1399,7 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
     }
 }
 
-// Two kernels, both in the decode graph; exactly one does work for a given context length. Below gq_min positions,
+// Two kernels, both in the decode graph unless gq_min fixes the regime; exactly one does work for a given context length. Below gq_min positions,
 // nt query tokens: block x serves token x % nt and head block x / nt (tokens side by side, so their blocks run at
 // the same time and share K/V rows in L2), with q, part and step at that token's offsets (pz part floats per token).
 // attn_decode (grid (nh, ns1 splits)) serves one head per block. From gq_min on, attn_decode_gqa (grid (nh / G, splits))
