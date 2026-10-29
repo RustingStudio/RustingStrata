@@ -450,10 +450,8 @@ impl<'a> GpuModel<'a> {
                 Mixer::Attn { q, k, v, qn, kn, o, kc, vc } => {
                     let qs = if c.q_gate { 2 * hd } else { hd };
                     g.batch(&mut || { mv2(q, k, "qg", "kraw")?; mv(v, "h", ne, "v", kv) })?;
-                    g.batch(&mut || {
-                        g.rms_norm_rope(p("qg"), qs, qn.ptr, p("q"), hd, nt * nh, eps, nh, c.n_rot, step, c.rope_base)?;
-                        g.rms_norm_rope_kv(p("kraw"), hd, kn.ptr, p("k"), hd, nt * nkv, eps, nkv, c.n_rot, step, c.rope_base, p("v"), kc.addr(), vc.addr())
-                    })?;
+                    g.batch(&mut || g.rms_norm_rope_qk(p("qg"), qs, qn.ptr, p("q"), nt * nh, nh, p("kraw"), kn.ptr, p("k"), nt * nkv, nkv,
+                                                       hd, eps, c.n_rot, step, c.rope_base, p("v"), kc.addr(), vc.addr()))?;
                     g.attn_decode(p("q"), kc.addr(), vc.addr(), if c.q_gate { p("qg") } else { 0 }, p("att"), p("attp"), step, nh, nkv, hd,
                                   1.0 / (hd as f32).sqrt(), nt)?;
                     mv(o, "att", nh * hd, "mix", ne)?;

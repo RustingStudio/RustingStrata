@@ -1150,10 +1150,14 @@ extern "C" __global__ void kv_store(const float* k, const float* v, u16* kc, u16
 
 // grid = rows (heads of n), block 256: rms_norm (out rows of n) then rope_neox of the head, in one launch with the same
 // bits. Head r belongs to token r / per. With kc, then kv_store of the head and its v (v rows of n, like out).
+// Blocks below qrows do the q heads (from qx etc., no cache store); the rest do x etc.
 extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const float* w, float* out, int n, float eps, int per,
-                                         int n_rot, const int* step, float base, const float* v, u16* kc, u16* vc) {
-    const float* xr = x + (size_t)blockIdx.x * x_stride;
-    float* o = out + (size_t)blockIdx.x * n;
+                                         int n_rot, const int* step, float base, const float* v, u16* kc, u16* vc,
+                                         int qrows, const float* qx, int q_stride, const float* qw, float* qo, int qper) {
+    int b = (int)blockIdx.x - qrows;
+    if (b < 0) { b = blockIdx.x; x = qx; x_stride = q_stride; w = qw; out = qo; per = qper; kc = 0; }
+    const float* xr = x + (size_t)b * x_stride;
+    float* o = out + (size_t)b * n;
     float s = 0.0f;
     for (int i = threadIdx.x; i < n; i += 256) s += xr[i] * xr[i];
     float sc = 1.0f / sqrtf(block_sum(s) / (float)n + eps);
@@ -1161,7 +1165,7 @@ extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const flo
     __syncthreads();
     int i = threadIdx.x, half = n_rot / 2;
     if (i < half) {
-        double theta = (double)(step[0] + (int)blockIdx.x / per) * pow((double)base, -2.0 * i / n_rot);
+        double theta = (double)(step[0] + b / per) * pow((double)base, -2.0 * i / n_rot);
         float sn = (float)sin(theta), c = (float)cos(theta);
         float a = o[i], b = o[i + half];
         o[i] = a * c - b * sn;
@@ -1169,8 +1173,8 @@ extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const flo
     }
     if (!kc) return;
     __syncthreads();
-    const float* vr = v + (size_t)blockIdx.x * n;
-    size_t e = ((size_t)(step[0] + (int)blockIdx.x / per) * per + blockIdx.x % per) * n;
+    const float* vr = v + (size_t)b * n;
+    size_t e = ((size_t)(step[0] + b / per) * per + b % per) * n;
     for (int j = threadIdx.x; j < n; j += 256) { kv_put(kc, e + j, n, o[j]); kv_put(vc, e + j, n, vr[j]); }
 }
 

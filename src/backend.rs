@@ -146,6 +146,12 @@ pub trait Backend: Send {
     }
     /// `rms_norm_rope` of the k heads (`per` per token), then `kv_store` of them and v (rows of n, like out).
     fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()>;
+    /// `rms_norm_rope` of the q heads (`qrows` rows, `qper` per token), then `rms_norm_rope_kv` of the k heads (rows of n).
+    fn rms_norm_rope_qk(&self, q: u64, q_stride: usize, qw: u64, qo: u64, qrows: usize, qper: usize, k: u64, kw: u64, ko: u64, krows: usize, kper: usize,
+                        n: usize, eps: f32, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
+        self.rms_norm_rope(q, q_stride, qw, qo, n, qrows, eps, qper, n_rot, step, base)?;
+        self.rms_norm_rope_kv(k, n, kw, ko, n, krows, eps, kper, n_rot, step, base, v, kc, vc)
+    }
     /// x += y.
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()>;
     /// g = silu(g) * u.
