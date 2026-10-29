@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 2eae27b (#139, `bench --mtp 0`, tg128 after pp512): CUDA decode 111.8 (4B 86.9), Vulkan 104.1 (4B 100.1).
+- At 9e3ccef (#140, `bench --mtp 0`, tg128 after pp512): CUDA decode 111.8 (4B 90.2), Vulkan 104.1 (4B 100.1).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2504,6 +2504,26 @@ code was not timed on that test. Full suite green, load 2.55.
 - Greedy md5 unchanged on Vulkan for 4B and 35B, mtp 0 and 1, and `STRATA_KV_Q8` (CUDA untouched).
 - The existing `rms_norm_rope_kv` and `rms_norm_rope_qk` tests compare the caches with `kv_store` byte for byte. 74 tests pass.
 - Not verified: CUDA bench (unchanged), prefill speed.
+
+### 2026-10-29 #140 — CUDA: one row per warp for dense GEMVs of 2049–8191 rows (9e3ccef)
+
+- Why the 4B is slower on CUDA (86.9) than on Vulkan (100.1): in nsys (256 tokens, us per token) the CUDA GEMVs take
+  ~9.8 ms, against ~8.1 ms for Vulkan's `gemv_q` (`STRATA_VK_PROF`). By shape (median us, default rows per warp →
+  `STRATA_RPW=1`): q+k pair (4096 rows) 28.2 → 26.6, o and Q4_K down (2560 rows) 30.2 → 27.1, Q6_K down (2560 rows,
+  ~236 GB/s) 86.4 → 78.4, gate+up pair (9728 rows) 90.0 → 90.8. `STRATA_RPW=4` was no better.
+- `rpw` now gives 2 rows per warp only for 2048 rows and from 8192 rows (it was from 2048). A first try with "from 8192"
+  alone cost the default model 0.6% (111.75 → 111.10): its 2048-row matrices (Q6_K and Q5_K out projections, the
+  shared expert down, Q8_0) were ~5% slower with 1. The default model has no dense matrix between 2048 and 8192 rows,
+  so its launches are unchanged.
+- Interleaved against 846f721 (load 1.6–1.9):
+
+  | Backend | Model | Before | After | Change |
+  |---|---|---|---|---|
+  | CUDA | 4B (×3) | 86.93 (86.8–87.1) | 90.20 (90.1–90.3) | +3.8% |
+  | CUDA | 35B (×6) | 111.90 (111.5–112.0) | 111.67 (110.6–112.0) | noise (4 ties, one 110.6 outlier; same launches) |
+
+- Greedy md5 unchanged on CUDA for 4B and 35B, mtp 0 and 1, and `STRATA_KV_Q8`. 74 tests pass.
+- Not verified: other GPUs (the best split depends on the SM count), prefill (separate GEMM path), MTP nt = 2 on the 4B.
 
 ## Next candidates
 
