@@ -192,10 +192,11 @@ impl Gpu {
     fn float_ty(ty: GgmlType) -> bool { matches!(ty, GgmlType::F32 | GgmlType::BF16) }
 
     /// Rows per warp for the integer GEMV (env STRATA_RPW overrides). Experts: about 8 super-blocks of work per
-    /// warp. Dense: 2 from 2048 rows, else 1 (fewer blocks hurt small matrices; measured in LOOP_LOG #50).
+    /// warp. Dense: 2 for 2048 and from 8192 rows, else 1 (measured per shape in LOOP_LOG #50, #140: the 4B's 2560 and
+    /// 4096 rows are ~10% faster with 1, the default model's 2048 rows ~5% slower).
     fn rpw(rows: usize, cols: usize, k: usize) -> usize {
         // The vocab head: more rows per block amortize gemvn's per-block x quantization (nt = 2: 1158 -> 1027 us).
-        let d = if k > 1 { (2048 / cols).max(1) } else if rows >= 65536 { 8 } else if rows >= 2048 { 2 } else { 1 };
+        let d = if k > 1 { (2048 / cols).max(1) } else if rows >= 65536 { 8 } else if rows >= 8192 || rows == 2048 { 2 } else { 1 };
         std::env::var("STRATA_RPW").ok().and_then(|v| v.parse().ok()).unwrap_or(d)
     }
 
