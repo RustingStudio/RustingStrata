@@ -716,6 +716,12 @@ impl Backend for Vk {
         let ts = (base as f64).powf(-2.0 / n_rot as f64);
         self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &0u64, &(x_stride as u32), &(n as u32), &(n as u32), &eps, &step, &ts, &(per as u32), &(n_rot as u32), &0u64])
     }
+    /// The two kernels; kv_store reads out, so it gets a barrier inside a batch too.
+    fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
+        self.rms_norm_rope(x, x_stride, w, out, n, rows, eps, per, n_rot, step, base)?;
+        { let mut st = self.0.st(); let cb = self.0.cb(&mut st)?; self.0.barrier(cb, false); }
+        self.kv_store(out, v, kc, vc, n * per, rows / per, step, n)
+    }
     fn argmax_rows(&self, x: u64, n: usize, rows: usize, out: u64) -> anyhow::Result<()> { self.run("argmax_rows", &[], [rows, 1, 1], &[&x, &out, &(n as u32)]) }
     fn l2_norm(&self, x: u64, n: usize, per: usize, stride: usize, rows: usize, eps: f32) -> anyhow::Result<()> {
         self.run("l2_norm", &[], [rows, 1, 1], &[&x, &(n as u32), &(per as u32), &(stride as u32), &eps])

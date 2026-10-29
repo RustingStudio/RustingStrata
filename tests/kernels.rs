@@ -710,6 +710,14 @@ fn norm_rope_and_gate_ops_match_cpu() {
         gpu.rope_neox(d1.addr(), hd, 6, 2, n_rot, step.addr(), 1e7).unwrap();
         gpu.rms_norm_rope(dx.addr(), 160, dw.addr(), d2.addr(), hd, 6, 1e-6, 2, n_rot, step.addr(), 1e7).unwrap();
         assert_eq!(down::<f32>(gpu, &d2), down::<f32>(gpu, &d1), "rms_norm_rope");
+        // rms_norm_rope_kv == rms_norm_rope then kv_store of 3 tokens of 2 heads.
+        let dv = up(gpu, &x[6 * hd..12 * hd]);
+        let c: Vec<_> = (0..4).map(|_| gpu.zeros::<u16>(gpu.kv_words((pos + 3) * 2 * hd)).unwrap()).collect();
+        let d3 = gpu.zeros::<f32>(6 * hd).unwrap();
+        gpu.kv_store(d2.addr(), dv.addr(), c[0].addr(), c[1].addr(), 2 * hd, 3, step.addr(), hd).unwrap();
+        gpu.rms_norm_rope_kv(dx.addr(), 160, dw.addr(), d3.addr(), hd, 6, 1e-6, 2, n_rot, step.addr(), 1e7, dv.addr(), c[2].addr(), c[3].addr()).unwrap();
+        assert_eq!(down::<f32>(gpu, &d3), down::<f32>(gpu, &d1), "rms_norm_rope_kv");
+        for i in 0..2 { assert_eq!(down::<u16>(gpu, &c[i + 2]), down::<u16>(gpu, &c[i]), "rms_norm_rope_kv cache {i}"); }
 
         // norm_gate over 4 heads of 128.
         let z = xs(4 * hn + 3)[3..].to_vec();
