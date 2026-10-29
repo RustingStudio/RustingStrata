@@ -11,6 +11,11 @@ void main() {
     uint i = gl_LocalInvocationID.x;
     if (uint64_t(p.res) != 0) {
         // Each invocation reads back only its own x below; quant_x reads others', hence the buffer barrier.
+        for (; i + 768 < p.n; i += 1024) {
+            float v[4];
+            [[unroll]] for (uint j = 0; j < 4; j++) v[j] = p.x.v[xo + i + 256 * j] + p.res.v[xo + i + 256 * j];
+            [[unroll]] for (uint j = 0; j < 4; j++) { p.x.v[xo + i + 256 * j] = v[j]; s += v[j] * v[j]; }
+        }
         for (; i < p.n; i += 256) { float a = p.x.v[xo + i] + p.res.v[xo + i]; p.x.v[xo + i] = a; s += a * a; }
         memoryBarrierBuffer();
     }

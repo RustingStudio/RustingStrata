@@ -302,8 +302,9 @@ impl<'a> GpuModel<'a> {
         let (g, eps, ne, step) = (&self.gpu, c.eps, c.n_embd, self.step_buf.addr());
         let p = |n: &str| self.bufs[n].addr();
         let x = self.x.addr();
-        for (il, l) in self.layers.iter().enumerate() { self.layer(il, l, x, step, self.worker.as_ref(), nt)?; }
-        g.rms_norm_q(x, ne, self.output_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"), 0)?;
+        let mut res = 0;
+        for (il, l) in self.layers.iter().enumerate() { res = self.layer(il, l, x, step, self.worker.as_ref(), nt, res)?; }
+        g.rms_norm_q(x, ne, self.output_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"), res)?;
         g.gemvq(&self.output, p("h"), ne, p("hq"), self.logits.addr(), c.n_vocab, nt)
     }
 
@@ -393,7 +394,8 @@ impl<'a> GpuModel<'a> {
         g.rms_norm(h.emb.addr(), ne, h.enorm.ptr, eh, 2 * ne, ne, nt, eps)?;
         g.rms_norm(hid, ne, h.hnorm.ptr, eh + 4 * ne as u64, 2 * ne, ne, nt, eps)?;
         self.mv(&h.eh_proj, eh, 2 * ne, x, ne, nt)?;
-        self.layer(c.n_layer, &h.layer, x, h.step_buf.addr(), Some(&h.worker), nt)?;
+        let res = self.layer(c.n_layer, &h.layer, x, h.step_buf.addr(), Some(&h.worker), nt, 0)?;
+        if res != 0 { g.add(x, res, nt * ne)?; }
         if head {
             g.rms_norm(x + 4 * ((nt - 1) * ne) as u64, 0, h.head_norm.ptr, hp, 0, ne, 1, eps)?;
             g.gemv(&self.output, hp, self.logits.addr())?;
@@ -403,7 +405,9 @@ impl<'a> GpuModel<'a> {
     }
 
     /// One decoder block on `nt` tokens at `x` (rows of n_embd); `step` points at [position, worker seq] per token.
-    fn layer(&self, il: usize, l: &Layer, x: u64, step: u64, worker: Option<&CpuWorker>, nt: usize) -> anyhow::Result<()> {
+    /// One layer on x, after adding `res` (the previous layer's pending FFN output, or 0) to it. Returns this
+    /// layer's pending FFN output (a dense FFN's, added by the next norm) or 0.
+    fn layer(&self, il: usize, l: &Layer, x: u64, step: u64, worker: Option<&CpuWorker>, nt: usize, res: u64) -> anyhow::Result<u64> {
         let c = &self.m.cfg;
         let (g, eps, ne) = (&self.gpu, c.eps, c.n_embd);
         let p = |n: &str| self.bufs[n].addr();
@@ -416,7 +420,7 @@ impl<'a> GpuModel<'a> {
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
         let kv = nkv * hd;
         {
-            g.rms_norm_q(x, ne, l.attn_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"), 0)?;
+            g.rms_norm_q(x, ne, l.attn_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"), res)?;
             match &l.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, snap } => {
                     let (sc, ss, ns) = snap.as_ref().map_or((0, 0, 0), |(a, b)| (a.addr(), b.addr(), self.k));
@@ -453,7 +457,7 @@ impl<'a> GpuModel<'a> {
                 Ffn::Dense { gate, up, down } => {
                     g.batch(&mut || mv2(gate, up, "ge", "ue"))?;
                     g.swiglu_gemv(p("ge"), p("ue"), down, p("ye"), ne, nt)?;
-                    g.add(x, p("ye"), nt * ne)?;
+                    return Ok(p("ye"));
                 }
                 Ffn::Moe { router, shared } => {
                     let k = c.n_expert_used;
@@ -497,7 +501,7 @@ impl<'a> GpuModel<'a> {
                 }
             }
         }
-        Ok(())
+        Ok(0)
     }
 
     /// Advance the position and update expert statistics and placement after a token.
