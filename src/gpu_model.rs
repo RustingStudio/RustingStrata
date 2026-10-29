@@ -6,6 +6,7 @@ use crate::cpu_worker::{CpuWorker, TMAX};
 use crate::backend::{ATT_SPLITS, Backend, Buf, GpuTensor};
 use crate::expert_cache::ExpertCache;
 use crate::model::Model;
+use crate::quant::GgmlType;
 use anyhow::bail;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -138,12 +139,13 @@ impl<'a> GpuModel<'a> {
 
         let ke = c.n_expert_used.max(1);
         let ff = (ke * c.n_ff_exp).max(c.n_ff);
-        let sizes: [(&'static str, usize); 26] = [
+        let sizes: [(&'static str, usize); 28] = [
             ("h", c.n_embd), ("hq", c.n_embd * 9 / 32), ("mix", c.n_embd), ("qkv", channels), ("z", c.ssm_d_inner), ("beta", nv), ("g", nv),
             ("y", channels), ("o", c.ssm_d_inner), ("qg", c.n_head * 2 * c.head_dim), ("q", c.n_head * c.head_dim),
             ("kraw", kv), ("k", kv), ("v", kv), ("att", c.n_head * c.head_dim), ("rl", c.n_expert), ("wts", ke),
             ("ge", ff), ("ue", ff), ("ye", ke * c.n_embd), ("shg", c.n_ff_shexp), ("shu", c.n_ff_shexp),
             ("shy", c.n_embd), ("sg", 1), ("wh", ke), ("attp", c.n_head * ATT_SPLITS * (c.head_dim + 2)),
+            ("ffq", ff * 9 / 32), ("shq", c.n_ff_shexp * 9 / 32),
         ];
         let bufs = sizes.into_iter().map(|(name, n)| Ok((name, gpu.zeros::<f32>(TMAX * n)?))).collect::<anyhow::Result<HashMap<_, _>>>()?;
         let (x, logits, ids) = (gpu.zeros::<f32>(TMAX * c.n_embd)?, gpu.zeros::<f32>(TMAX * c.n_vocab)?, gpu.zeros::<i32>(TMAX * ke)?);
@@ -415,6 +417,11 @@ impl<'a> GpuModel<'a> {
         let mv = |w: &GpuTensor, x: &str, xs: usize, y: &str, ys: usize|
             if x == "h" { g.gemvq(w, p(x), xs, p("hq"), p(y), ys, nt) } else { self.mv(w, p(x), xs, p(y), ys, nt) };
         let mv2 = |a: &GpuTensor, b: &GpuTensor, ya: &str, yb: &str| g.gemvq2(a, b, p("h"), ne, p("hq"), p(ya), p(yb), nt);
+        // The SwiGLU for a down GEMV of type `ty` (float weights read g itself). Returns the xq for the GEMV.
+        let sw = |ty: GgmlType, ga: &str, ua: &str, n: usize, rows: usize, q: &str| -> anyhow::Result<u64> {
+            if matches!(ty, GgmlType::F32 | GgmlType::BF16) { g.swiglu(p(ga), p(ua), rows * n)?; return Ok(0); }
+            g.swiglu_q(p(ga), p(ua), n, rows, p(q))
+        };
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
         let (dv, channels) = (c.ssm_dv(), c.ssm_d_inner + 2 * nk * dk);
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
@@ -456,7 +463,8 @@ impl<'a> GpuModel<'a> {
             match &l.ffn {
                 Ffn::Dense { gate, up, down } => {
                     g.batch(&mut || mv2(gate, up, "ge", "ue"))?;
-                    g.swiglu_gemv(p("ge"), p("ue"), down, p("ye"), ne, nt)?;
+                    let q = sw(down.ty, "ge", "ue", down.cols, nt, "ffq")?;
+                    g.gemvq(down, p("ge"), down.cols, q, p("ye"), ne, nt)?;
                     return Ok(p("ye"));
                 }
                 Ffn::Moe { router, shared } => {
@@ -476,6 +484,7 @@ impl<'a> GpuModel<'a> {
                     let (base, stride) = cache.base(lx);
                     let [mg, mu, md] = lx.mats;
                     let slots = self.slots.addr();
+                    let (mut sq, mut dq) = (0, 0);
                     let w = worker.unwrap();
                     let mb = w.dev + (4 * il * w.layout.stride) as u64;
                     g.moe_route(p("rl"), c.n_expert, k, c.expert_weights_scale, lx.table_dev.addr(), ids, p("wts"), slots, p("wh"), p("h"), mb, ne, w.layout.h, step, nt)?;
@@ -487,15 +496,15 @@ impl<'a> GpuModel<'a> {
                             g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, p("h"), ne, k, p("ge"), None, p("hq"))?;
                             g.moe_gemv(mu.ty, mu.rows, mu.cols, base + mu.off as u64, stride, slots, kt, p("h"), ne, k, p("ue"), None, p("hq"))?;
                         }
-                        if shared.is_some() { g.swiglu(p("shg"), p("shu"), nt * c.n_ff_shexp)?; }
+                        if let Some(s) = shared { sq = sw(s.down.ty, "shg", "shu", c.n_ff_shexp, nt, "shq")?; }
                         Ok(())
                     })?;
                     g.batch(&mut || {
-                        g.swiglu(p("ge"), p("ue"), kt * c.n_ff_exp)?;
-                        if let Some(s) = shared { mv(&s.down, "shg", c.n_ff_shexp, "shy", ne)?; }
+                        dq = sw(md.ty, "ge", "ue", c.n_ff_exp, kt, "ffq")?;
+                        if let Some(s) = shared { g.gemvq(&s.down, p("shg"), c.n_ff_shexp, sq, p("shy"), ne, nt)?; }
                         Ok(())
                     })?;
-                    g.moe_gemv(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, kt, p("ge"), c.n_ff_exp, 1, p("ye"), None, 0)?;
+                    g.moe_gemv(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, kt, p("ge"), c.n_ff_exp, 1, p("ye"), None, dq)?;
                     let (sh, sg) = if shared.is_some() { (p("shy"), p("sg")) } else { (0, 0) };
                     g.moe_combine(x, p("ye"), p("wh"), k, sh, sg, mb, w.layout.y, step, slots, ne, nt)?;
                 }

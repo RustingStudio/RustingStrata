@@ -696,15 +696,10 @@ impl Backend for Vk {
     fn quant_xq(&self, x: u64, x_stride: usize, n: usize, nt: usize, out: u64) -> anyhow::Result<()> {
         self.run("quant_xq", &[self.0.llama], [n.div_ceil(256), nt, 1], &[&x, &out, &0u64, &(x_stride as u32), &(n as u32)])
     }
-    // The SwiGLU is computed while quantizing x for the GEMV: one dispatch fewer.
-    fn swiglu_gemv(&self, g: u64, u: u64, w: &GpuTensor, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
-        if matches!(w.ty, GgmlType::F32 | GgmlType::BF16) {
-            self.swiglu(g, u, nt * w.cols)?;
-            return self.gemvn(w, g, w.cols, y, y_stride, nt);
-        }
-        ensure!(nt * w.cols * 9 / 8 <= XQ, "gemv: {nt} x {} inputs do not fit the quantized-x buffer", w.cols);
-        self.run("quant_xq", &[self.0.llama], [w.cols.div_ceil(256), nt, 1], &[&g, &self.1.addr(), &u, &(w.cols as u32), &(w.cols as u32)])?;
-        self.gemvq(w, g, w.cols, self.1.addr(), y, y_stride, nt)
+    // The SwiGLU computed while quantizing x for the GEMV: one dispatch fewer (on CUDA a separate quantization lost).
+    fn swiglu_q(&self, g: u64, u: u64, n: usize, rows: usize, xq: u64) -> anyhow::Result<u64> {
+        self.run("quant_xq", &[self.0.llama], [n.div_ceil(256), rows, 1], &[&g, &xq, &u, &(n as u32), &(n as u32)])?;
+        Ok(xq)
     }
     fn rms_norm(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32) -> anyhow::Result<()> {
         self.rms_norm_q(x, x_stride, w, out, out_stride, n, rows, eps, 0, 0)
