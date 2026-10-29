@@ -1,5 +1,5 @@
 //! CUDA context, NVRTC compile with a PTX disk cache, and launch wrappers for `kernels.cu`.
-//! One stream, event tracking off: buffers are passed to kernels as raw device pointers.
+//! One stream (plus a side stream for `batch`), event tracking off: buffers are passed to kernels as raw device pointers.
 
 use crate::quant::{GgmlType, tables::*};
 use anyhow::{Context, bail};
@@ -7,6 +7,7 @@ use crate::backend::{Backend, Buf};
 use cudarc::driver::{CudaContext, CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg, result, sys};
 use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -26,6 +27,10 @@ use crate::backend::ATT_SPLITS_1;
 pub struct Gpu {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
+    /// Takes every second launch inside `batch`, so a captured graph runs them as parallel branches.
+    side: Arc<CudaStream>,
+    /// Launches so far in the current `batch` (usize::MAX outside one).
+    nb: AtomicUsize,
     fns: HashMap<String, CudaFunction>,
     /// q8 rows of the last integer GEMM's X (see quant_q8 in kernels.cu), grown on demand.
     q8: std::sync::Mutex<CudaSlice<u8>>,
@@ -110,7 +115,7 @@ pub fn cfg(grid: (u32, u32), block: u32, smem: u32) -> LaunchConfig {
 macro_rules! launch {
     ($g:expr, $name:expr, $cfg:expr, $($a:expr),* $(,)?) => {{
         let f = $g.f($name);
-        let mut b = $g.stream.launch_builder(f);
+        let mut b = $g.st().launch_builder(f);
         $( let v = $a; b.arg(&v); )*
         unsafe { b.launch($cfg) }.with_context(|| format!("launch {}", $name))?;
     }};
@@ -142,10 +147,18 @@ impl Gpu {
             fns.insert(n, f);
         }
         let q8 = std::sync::Mutex::new(stream.alloc_zeros::<u8>(1)?);
-        Ok(Gpu { ctx, stream, fns, q8, kv_q8, graphs: Default::default() })
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_q8, graphs: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
+
+    /// The stream for the next launch: inside `batch`, odd launches go to `side`.
+    fn st(&self) -> &Arc<CudaStream> {
+        let n = self.nb.load(Relaxed);
+        if n == usize::MAX { return &self.stream; }
+        self.nb.store(n + 1, Relaxed);
+        if n % 2 == 1 { &self.side } else { &self.stream }
+    }
 
     pub fn ptr<T>(&self, s: &CudaSlice<T>) -> u64 { s.device_ptr(&self.stream).0 }
 
@@ -279,6 +292,16 @@ impl Backend for Gpu {
     fn mem_info(&self) -> anyhow::Result<(usize, usize)> { Ok(self.ctx.mem_get_info()?) }
 
     fn sync(&self) -> anyhow::Result<()> { Ok(self.stream.synchronize()?) }
+
+    // Every op batched on CUDA is one launch, so alternating launches never splits an op over the two streams.
+    fn batch(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
+        self.side.join(&self.stream)?;
+        self.nb.store(0, Relaxed);
+        let r = f();
+        self.nb.store(usize::MAX, Relaxed);
+        self.stream.join(&self.side)?;
+        r
+    }
 
     /// CUDA graph captured from the stream. `STRATA_NO_GRAPH` runs `f` every time instead.
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
