@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 200a5cc (#138, `bench --mtp 0`, tg128 after pp512): CUDA decode 111.8 (4B 86.9), Vulkan 103.7 (4B 99.6).
+- At 2eae27b (#139, `bench --mtp 0`, tg128 after pp512): CUDA decode 111.8 (4B 86.9), Vulkan 104.1 (4B 100.1).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2485,6 +2485,25 @@ code was not timed on that test. Full suite green, load 2.55.
 - Greedy md5 unchanged on both backends for 4B and 35B, mtp 0 and 1, and `STRATA_KV_Q8`.
 - New test: `rms_norm_rope_qk` matches `rms_norm_rope` + `rms_norm_rope_kv` bit for bit (outputs and caches). 74 tests pass.
 - Not verified: Vulkan bench (path unchanged there), prefill speed (same launch, more blocks).
+
+### 2026-10-29 #139 — Vulkan: kv_store inside the rms_norm_rope dispatch (2eae27b)
+
+- The `rms_norm` shader takes `v`, `kc` and `vc`. With `kc` set it stores its rotated output and v into the caches
+  after a workgroup barrier (`memoryBarrierBuffer` + `barrier`), as `kv_store` does. `rms_norm_rope_kv` drops a
+  barrier and the `kv_store` dispatch, so there is one dispatch fewer per attention layer.
+- Two interleaved runs against 7fc208e:
+
+  | Model | Load | Before | After | Change |
+  |---|---|---|---|---|
+  | Vulkan 35B (×4) | 2.9–3.5 | 104.00 (103.7–104.2) | 104.07 (103.1–104.5) | +0.07% |
+  | Vulkan 35B (×4) | 1.3–1.9 | 104.05 (103.9–104.2) | 104.15 (104.0–104.3) | +0.1% |
+  | Vulkan 4B (×4) | 2.3–2.8 | 99.88 (99.4–100.1) | 100.02 (99.7–100.6) | +0.14% |
+  | Vulkan 4B (×4) | 1.1–1.3 | 99.62 (99.2–99.9) | 100.12 (100.0–100.2) | +0.5% |
+
+  The gain is small. The 4B is ahead in 7 of 8 pairs and the 35B in 6 of 8.
+- Greedy md5 unchanged on Vulkan for 4B and 35B, mtp 0 and 1, and `STRATA_KV_Q8` (CUDA untouched).
+- The existing `rms_norm_rope_kv` and `rms_norm_rope_qk` tests compare the caches with `kv_store` byte for byte. 74 tests pass.
+- Not verified: CUDA bench (unchanged), prefill speed.
 
 ## Next candidates
 
