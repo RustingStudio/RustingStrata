@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 5a78b2c (#132, `bench --mtp 0`, tg128 after pp512): CUDA decode 107.7 (4B 84.1), Vulkan 102.8 (4B 98.4).
+- At 65df19b (#133, `bench --mtp 0`, tg128 after pp512): CUDA decode 110.5 (4B 83.9), Vulkan 102.8 (4B 98.4, #132).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2386,6 +2386,21 @@ code was not timed on that test. Full suite green, load 2.55.
 - Not verified: Vulkan bench after the final change (no Vulkan code path changed); MTP verify (nt = 2) speed, where
   pairs go through `gemvn` grid.z = 2; why the `moe_gemv` pairing gave more on the 4B (85.1 vs 84.1, different
   load).
+
+### 2026-10-29 #133 — GEMV pairs of different row counts in one launch (65df19b)
+
+- `gemv`/`gemvn` take a trailing `rows2`: with grid.z = 2 the second matrix may have fewer rows (the launch is sized
+  for the larger one, `gemvq2` swaps the pair if needed); only type and columns must match. Decode now also pairs
+  DeltaNet qkv/z, attention q/k and the router with the shared expert's gate input. Vulkan unchanged (default
+  `gemvq2`, two launches). New test: a half-height matrix paired with a full one, same bits as two `gemvq`. Greedy
+  md5 unchanged on both models and both backends, MTP 1 too; 74 tests pass.
+- First version wrapped the offsets in `if (blockIdx.z) { ... }`: every gemv kernel got slower (nsys: gemv_q6_k
+  14 to 18.4 us, LM head gemv_q4_k 909 to 987 us), default model 108.0 to 102.3. Unconditional
+  `w += blockIdx.z * w2` plus `if (blockIdx.z) rows = rows2` costs nothing measurable.
+- Interleaved against 5a78b2c, CUDA, load 0.9-1.1, GPU idle: default model 108.25 (108.2-108.3) to 110.52
+  (110.5-110.6), +2.1%, 6 of 6 pairs ahead; 4B 84.03 (84.0-84.1) to 83.90 (83.9-83.9), -0.15%, 3 of 3 behind by
+  0.1 (the q/k pair; small enough to keep).
+- Not verified: Vulkan bench (no Vulkan path changed); MTP verify (nt = 2) speed.
 
 ## Next candidates
 
