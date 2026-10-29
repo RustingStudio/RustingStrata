@@ -918,7 +918,13 @@ extern "C" __global__ void rms_norm(float* x, int x_stride, const float* w, floa
     // per step; the output values are all loaded before any store, as out may alias x. With res, x += res first.
     if (threadIdx.x < 256 && res) {
         const float* rr = res + (size_t)blockIdx.x * x_stride;
-        for (int i = threadIdx.x; i < n; i += 256) { float a = xr[i] + rr[i]; xr[i] = a; s += a * a; }
+        int i = threadIdx.x;
+        for (; i + 768 < n; i += 1024) {
+            float a = xr[i] + rr[i], b = xr[i + 256] + rr[i + 256], c = xr[i + 512] + rr[i + 512], d = xr[i + 768] + rr[i + 768];
+            xr[i] = a; xr[i + 256] = b; xr[i + 512] = c; xr[i + 768] = d;
+            s += a * a; s += b * b; s += c * c; s += d * d;
+        }
+        for (; i < n; i += 256) { float a = xr[i] + rr[i]; xr[i] = a; s += a * a; }
     } else if (threadIdx.x < 256) {
         int i = threadIdx.x;
         for (; i + 768 < n; i += 1024) {
