@@ -988,26 +988,6 @@ extern "C" __global__ void rope_neox(float* x, int stride, int per, int n_rot, c
     }
 }
 
-// grid = rows (heads of n), block 256: rms_norm (out rows of n) then rope_neox of the head, in one launch with the same
-// bits. Head r belongs to token r / per.
-extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const float* w, float* out, int n, float eps, int per,
-                                         int n_rot, const int* step, float base) {
-    const float* xr = x + (size_t)blockIdx.x * x_stride;
-    float* o = out + (size_t)blockIdx.x * n;
-    float s = 0.0f;
-    for (int i = threadIdx.x; i < n; i += 256) s += xr[i] * xr[i];
-    float sc = 1.0f / sqrtf(block_sum(s) / (float)n + eps);
-    for (int i = threadIdx.x; i < n; i += 256) o[i] = xr[i] * sc * w[i];
-    __syncthreads();
-    int i = threadIdx.x, half = n_rot / 2;
-    if (i >= half) return;
-    double theta = (double)(step[0] + (int)blockIdx.x / per) * pow((double)base, -2.0 * i / n_rot);
-    float sn = (float)sin(theta), c = (float)cos(theta);
-    float a = o[i], b = o[i + half];
-    o[i] = a * c - b * sn;
-    o[i + half] = a * sn + b * c;
-}
-
 extern "C" __global__ void add(float* x, const float* y, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] += y[i];
@@ -1160,6 +1140,32 @@ extern "C" __global__ void kv_store(const float* k, const float* v, u16* kc, u16
                                     int hd) {
     int i = blockIdx.x * blockDim.x + threadIdx.x, pos = step[0];
     if (i < total) { kv_put(kc, (size_t)pos * n + i, hd, k[i]); kv_put(vc, (size_t)pos * n + i, hd, v[i]); }
+}
+
+// grid = rows (heads of n), block 256: rms_norm (out rows of n) then rope_neox of the head, in one launch with the same
+// bits. Head r belongs to token r / per. With kc, then kv_store of the head and its v (v rows of n, like out).
+extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const float* w, float* out, int n, float eps, int per,
+                                         int n_rot, const int* step, float base, const float* v, u16* kc, u16* vc) {
+    const float* xr = x + (size_t)blockIdx.x * x_stride;
+    float* o = out + (size_t)blockIdx.x * n;
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < n; i += 256) s += xr[i] * xr[i];
+    float sc = 1.0f / sqrtf(block_sum(s) / (float)n + eps);
+    for (int i = threadIdx.x; i < n; i += 256) o[i] = xr[i] * sc * w[i];
+    __syncthreads();
+    int i = threadIdx.x, half = n_rot / 2;
+    if (i < half) {
+        double theta = (double)(step[0] + (int)blockIdx.x / per) * pow((double)base, -2.0 * i / n_rot);
+        float sn = (float)sin(theta), c = (float)cos(theta);
+        float a = o[i], b = o[i + half];
+        o[i] = a * c - b * sn;
+        o[i + half] = a * sn + b * c;
+    }
+    if (!kc) return;
+    __syncthreads();
+    const float* vr = v + (size_t)blockIdx.x * n;
+    size_t e = ((size_t)(step[0] + (int)blockIdx.x / per) * per + blockIdx.x % per) * n;
+    for (int j = threadIdx.x; j < n; j += 256) { kv_put(kc, e + j, n, o[j]); kv_put(vc, e + j, n, vr[j]); }
 }
 
 #define INFINITY __int_as_float(0x7f800000)

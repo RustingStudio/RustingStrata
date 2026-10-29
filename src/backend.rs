@@ -144,6 +144,8 @@ pub trait Backend: Send {
         self.rms_norm(x, x_stride, w, out, n, n, rows, eps)?;
         self.rope_neox(out, n, rows, per, n_rot, step, base)
     }
+    /// `rms_norm_rope` of the k heads (`per` per token), then `kv_store` of them and v (rows of n, like out).
+    fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()>;
     /// x += y.
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()>;
     /// g = silu(g) * u.
