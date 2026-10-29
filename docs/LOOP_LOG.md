@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 65df19b (#133, `bench --mtp 0`, tg128 after pp512): CUDA decode 110.5 (4B 83.9), Vulkan 102.8 (4B 98.4, #132).
+- At cececa4 (#134, `bench --mtp 0`, tg128 after pp512): CUDA decode 110.9 (4B 85.2), Vulkan 102.8 (4B 98.4, #132).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2401,6 +2401,19 @@ code was not timed on that test. Full suite green, load 2.55.
   (110.5-110.6), +2.1%, 6 of 6 pairs ahead; 4B 84.03 (84.0-84.1) to 83.90 (83.9-83.9), -0.15%, 3 of 3 behind by
   0.1 (the q/k pair; small enough to keep).
 - Not verified: Vulkan bench (no Vulkan path changed); MTP verify (nt = 2) speed.
+
+### 2026-10-29 #134 — `rms_norm_rope` in one CUDA kernel (cececa4)
+
+- CUDA ran `rms_norm_rope` as the trait default (`rms_norm` then `rope_neox`): two launches each for q and k in
+  every attention layer. New `rms_norm_rope` kernel: one block per head normalizes it (same sum order as
+  `rms_norm`) and rotates it (same f64 angle as `rope_neox`, now per head instead of per token, which is the same
+  latency since blocks run side by side). The existing kernel test checks it against the two-kernel path bit for
+  bit; greedy md5 unchanged on both models and both backends, MTP 1 too; 74 tests pass.
+- Interleaved against 65df19b, CUDA, load 1.6-2.1, GPU idle: default model 110.37 (109.9-110.6) to 110.93
+  (110.3-110.9), +0.5%, 6 of 6 pairs ahead (10 attention layers); 4B 83.87 (83.8-84.0) to 85.17 (85.1-85.3),
+  +1.55%, 3 of 3 (36 attention layers).
+- Not verified: Vulkan (unchanged, has its own fused kernel since #114); prefill (the same call, one launch for
+  all tokens, not timed).
 
 ## Next candidates
 
