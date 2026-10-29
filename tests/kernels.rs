@@ -686,6 +686,15 @@ fn norm_rope_and_gate_ops_match_cpu() {
         }
         assert_eq!(q[..rows * n], wq[..], "quant_xq values");
         assert_eq!(q[rows * n..], wd[..], "quant_xq scales");
+        // swiglu_q: either g = silu(g) * u, or the bytes of that through quant_xq.
+        let du = up(gpu, &xs(rows * n + 3)[3..]);
+        let dq2 = gpu.zeros::<u8>(rows * n * 9 / 8).unwrap();
+        let (dg, dr) = (up(gpu, &x), up(gpu, &x));
+        let r = gpu.swiglu_q(dg.addr(), du.addr(), n, rows, dq2.addr()).unwrap();
+        gpu.swiglu(dr.addr(), du.addr(), rows * n).unwrap();
+        gpu.quant_xq(dr.addr(), n, n, rows, dq.addr()).unwrap();
+        if r == 0 { assert_eq!(down::<f32>(gpu, &dg), down::<f32>(gpu, &dr), "swiglu_q g") }
+        else { assert_eq!(down::<u8>(gpu, &dq2), down::<u8>(gpu, &dq), "swiglu_q xq") }
 
         // l2_norm on vectors of 128, 2 per token, tokens 300 floats apart.
         let (hn, per, stride) = (128, 2, 300);

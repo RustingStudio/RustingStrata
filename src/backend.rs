@@ -150,10 +150,11 @@ pub trait Backend: Send {
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()>;
     /// g = silu(g) * u.
     fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()>;
-    /// y[t] = W (silu(g[t]) * u[t]) for t < nt (rows of `w.cols` floats; y rows `y_stride` apart); g may be overwritten.
-    fn swiglu_gemv(&self, g: u64, u: u64, w: &GpuTensor, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
-        self.swiglu(g, u, nt * w.cols)?;
-        if nt == 1 { self.gemv(w, g, y) } else { self.gemvn(w, g, w.cols, y, y_stride, nt) }
+    /// The SwiGLU of `rows` rows of n for a GEMV with quantized weights: either g = silu(g) * u (returns 0), or
+    /// silu(g) * u quantized into `xq` as `quant_xq` does (returns xq, for the GEMV's xq; g is then left as is).
+    fn swiglu_q(&self, g: u64, u: u64, n: usize, rows: usize, _xq: u64) -> anyhow::Result<u64> {
+        self.swiglu(g, u, rows * n)?;
+        Ok(0)
     }
     fn ssm_gates(&self, beta: u64, g: u64, dt_bias: u64, a: u64, n: usize, nv: usize) -> anyhow::Result<()>;
     /// One token's causal conv and SiLU; then the first `nn` groups of 128 channels are l2-normalized as `l2_norm` does.
