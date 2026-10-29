@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 9e3ccef (#140, `bench --mtp 0`, tg128 after pp512): CUDA decode 111.8 (4B 90.2), Vulkan 104.1 (4B 100.1).
+- At 99faaa5 (#141, `bench --mtp 0`, tg128 after pp512): CUDA decode 112.1 (4B 91.6), Vulkan 104.1 (4B 100.1).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2524,6 +2524,25 @@ code was not timed on that test. Full suite green, load 2.55.
 
 - Greedy md5 unchanged on CUDA for 4B and 35B, mtp 0 and 1, and `STRATA_KV_Q8`. 74 tests pass.
 - Not verified: other GPUs (the best split depends on the SM count), prefill (separate GEMM path), MTP nt = 2 on the 4B.
+
+### 2026-10-29 #141 — CUDA: attn_merge writes the o GEMV's quantized input (99faaa5)
+
+- After #140 the CUDA 4B's o GEMV (2560 x 4096) ran at ~220 GB/s against ~311 for the gate+up pair. Its input `att`
+  was the only dense GEMV input not pre-quantized, so each of its 320 blocks quantized 4096 floats (16 KB from L2,
+  ~5 MB per GEMV next to 5.9 MB of weights).
+- `attn_merge` holds a head's outputs one per thread, 32 to a warp, so it also writes them as `quant_xq` does into
+  `attq` (warp max, same rounding, bit-identical to the per-block quantization). New `Backend::attn_decode_q`
+  returns the xq to use; its default (Vulkan, and CUDA under `--llama-numerics`, whose scales span 256) returns 0
+  and the o GEMV quantizes as before. The kernels test checks the xq against `quant_xq` of the output.
+- Interleaved against fd6adcd (load 0.5–0.9):
+
+  | Backend | Model | Before | After | Change |
+  |---|---|---|---|---|
+  | CUDA | 4B (×3) | 90.33 (90.3–90.4) | 91.60 (91.6–91.6) | +1.4% |
+  | CUDA | 35B (×6) | 111.87 (111.7–112.1) | 112.10 (112.1–112.1) | +0.2% |
+
+- Greedy md5 unchanged on both backends for 4B and 35B, mtp 0 and 1, and `STRATA_KV_Q8`. 74 tests pass.
+- Not verified: the same for Vulkan's o GEMV (it already reads `gemv_q` inputs differently), nt > 1 speed (MTP verify).
 
 ## Next candidates
 
