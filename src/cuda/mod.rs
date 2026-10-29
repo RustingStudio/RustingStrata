@@ -209,8 +209,9 @@ impl Gpu {
 
     fn grid(n: usize) -> LaunchConfig { cfg((n.div_ceil(256) as u32, 1), 256, 0) }
 
-    /// `gemvq`; with z = 2 also the matrix at byte offset `pair.0` into the output at byte offset `pair.1`.
-    fn gemvq_pair(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize, pair: (i64, i64), z: u32) -> anyhow::Result<()> {
+    /// `gemvq`; with z = 2 also the matrix of `pair.2` rows at byte offset `pair.0` into the output at byte offset
+    /// `pair.1` (token stride `pair.2`).
+    fn gemvq_pair(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize, pair: (i64, i64, i32), z: u32) -> anyhow::Result<()> {
         if !(1..=4).contains(&nt) { bail!("gemvn: {nt} inputs (1 to 4)"); }
         let nsb = Self::nsb(w)?;
         let (mut c, rpw) = Self::gemv_cfg(w.ty, w.rows, w.cols, 1);
@@ -218,10 +219,10 @@ impl Gpu {
         c.grid_dim.2 = z;
         // One token: gemv, whose kernel has no nt branches (gemvn's nt = 4 path costs it registers).
         if nt == 1 {
-            launch!(self, &kname("gemv", w.ty), c, w.ptr, x, y, w.rows as i32, nsb, rpw, xq, pair.0, pair.1);
+            launch!(self, &kname("gemv", w.ty), c, w.ptr, x, y, w.rows as i32, nsb, rpw, xq, pair.0, pair.1, pair.2);
             return Ok(());
         }
-        launch!(self, &kname("gemvn", w.ty), c, w.ptr, x, x_stride as i32, y, y_stride as i32, w.rows as i32, nsb, rpw, nt as i32, xq, pair.0, pair.1);
+        launch!(self, &kname("gemvn", w.ty), c, w.ptr, x, x_stride as i32, y, y_stride as i32, w.rows as i32, nsb, rpw, nt as i32, xq, pair.0, pair.1, pair.2);
         Ok(())
     }
 }
@@ -304,7 +305,7 @@ impl Backend for Gpu {
     fn gemv(&self, w: &GpuTensor, x: u64, y: u64) -> anyhow::Result<()> {
         let nsb = Self::nsb(w)?;
         let (c, rpw) = Self::gemv_cfg(w.ty, w.rows, w.cols, 1);
-        launch!(self, &kname("gemv", w.ty), c, w.ptr, x, y, w.rows as i32, nsb, rpw, 0u64, 0i64, 0i64);
+        launch!(self, &kname("gemv", w.ty), c, w.ptr, x, y, w.rows as i32, nsb, rpw, 0u64, 0i64, 0i64, 0i32);
         Ok(())
     }
 
@@ -313,16 +314,18 @@ impl Backend for Gpu {
     }
 
     fn gemvq(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
-        self.gemvq_pair(w, x, x_stride, xq, y, y_stride, nt, (0, 0), 1)
+        self.gemvq_pair(w, x, x_stride, xq, y, y_stride, nt, (0, 0, 0), 1)
     }
 
     // One launch for both matrices.
     fn gemvq2(&self, a: &GpuTensor, b: &GpuTensor, x: u64, x_stride: usize, xq: u64, ya: u64, yb: u64, nt: usize) -> anyhow::Result<()> {
-        if a.ty != b.ty || (a.rows, a.cols) != (b.rows, b.cols) {
+        if a.ty != b.ty || a.cols != b.cols {
             self.gemvq(a, x, x_stride, xq, ya, a.rows, nt)?;
             return self.gemvq(b, x, x_stride, xq, yb, b.rows, nt);
         }
-        self.gemvq_pair(a, x, x_stride, xq, ya, a.rows, nt, (b.ptr as i64 - a.ptr as i64, yb as i64 - ya as i64), 2)
+        // The launch is sized for the larger matrix.
+        let ((a, ya), (b, yb)) = if a.rows >= b.rows { ((a, ya), (b, yb)) } else { ((b, yb), (a, ya)) };
+        self.gemvq_pair(a, x, x_stride, xq, ya, a.rows, nt, (b.ptr as i64 - a.ptr as i64, yb as i64 - ya as i64, b.rows as i32), 2)
     }
 
     fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()> {

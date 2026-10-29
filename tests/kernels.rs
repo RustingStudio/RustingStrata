@@ -2,7 +2,7 @@
 mod common;
 use common::{down, up};
 use rusting_strata::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM};
-use rusting_strata::{cuda::Gpu, gguf::Gguf, quant::GgmlType, weights::Weights};
+use rusting_strata::{cuda::Gpu, gguf::Gguf, quant::GgmlType, weights::{Tensor, Weights}};
 
 fn xs(n: usize) -> Vec<f32> {
     (0..n).map(|i| ((i as f32 * 0.7548777).fract() - 0.5) * 2.0).collect()
@@ -177,6 +177,14 @@ fn gemvn_matches_gemv() {
                 gpu.gemvq2(&dt, &dt, dx.addr(), t.cols, xq.addr(), dy.addr(), dz.addr(), nt).unwrap();
                 assert_eq!(down::<f32>(gpu, &dy), want[..nt * t.rows], "{} {name} gemvq2 a nt {nt}", ty.name());
                 assert_eq!(down::<f32>(gpu, &dz), want[..nt * t.rows], "{} {name} gemvq2 b nt {nt}", ty.name());
+                // A shorter first matrix (its first r2 rows): the pair still covers both.
+                let r2 = t.rows.div_ceil(2);
+                let dh = gpu.upload(&Tensor { rows: r2, data: &t.data[..t.data.len() / t.rows * r2], ..t }).unwrap();
+                let (dy, dz) = (gpu.zeros::<f32>(nt * r2).unwrap(), gpu.zeros::<f32>(nt * t.rows).unwrap());
+                gpu.gemvq2(&dh, &dt, dx.addr(), t.cols, xq.addr(), dy.addr(), dz.addr(), nt).unwrap();
+                let short: Vec<f32> = want.chunks(t.rows).take(nt).flat_map(|r| r[..r2].to_vec()).collect();
+                assert_eq!(down::<f32>(gpu, &dy), short, "{} {name} gemvq2 short nt {nt}", ty.name());
+                assert_eq!(down::<f32>(gpu, &dz), want[..nt * t.rows], "{} {name} gemvq2 long nt {nt}", ty.name());
             }
             // As a paired moe_gemv of one slot (expert 0 at stride 0): float types apply the pair offsets too.
             let (zid, dy) = (gpu.zeros::<i32>(1).unwrap(), gpu.zeros::<f32>(2 * t.rows).unwrap());

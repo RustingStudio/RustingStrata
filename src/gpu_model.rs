@@ -421,8 +421,7 @@ impl<'a> GpuModel<'a> {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, snap } => {
                     let (sc, ss, ns) = snap.as_ref().map_or((0, 0, 0), |(a, b)| (a.addr(), b.addr(), self.k));
                     g.batch(&mut || {
-                        mv(qkv, "h", ne, "qkv", channels)?;
-                        mv(gate, "h", ne, "z", c.ssm_d_inner)?;
+                        mv2(qkv, gate, "qkv", "z")?;
                         mv2(beta, alpha, "beta", "g")
                     })?;
                     // One token with 128-wide heads: conv_silu also does the q and k l2 norms.
@@ -439,7 +438,7 @@ impl<'a> GpuModel<'a> {
                 }
                 Mixer::Attn { q, k, v, qn, kn, o, kc, vc } => {
                     let qs = if c.q_gate { 2 * hd } else { hd };
-                    g.batch(&mut || { mv(q, "h", ne, "qg", nh * qs)?; mv(k, "h", ne, "kraw", kv)?; mv(v, "h", ne, "v", kv) })?;
+                    g.batch(&mut || { mv2(q, k, "qg", "kraw")?; mv(v, "h", ne, "v", kv) })?;
                     g.batch(&mut || {
                         g.rms_norm_rope(p("qg"), qs, qn.ptr, p("q"), hd, nt * nh, eps, nh, c.n_rot, step, c.rope_base)?;
                         g.rms_norm_rope(p("kraw"), hd, kn.ptr, p("k"), hd, nt * nkv, eps, nkv, c.n_rot, step, c.rope_base)
@@ -463,11 +462,10 @@ impl<'a> GpuModel<'a> {
                     let ids = self.ids.addr();
                     // The shared expert's GEMVs and swiglu share batches with the routed ones.
                     g.batch(&mut || {
-                        mv(router, "h", ne, "rl", c.n_expert)?;
                         if let Some(s) = shared {
-                            mv(&s.gate_inp, "h", ne, "sg", 1)?;
+                            mv2(router, &s.gate_inp, "rl", "sg")?;
                             mv2(&s.gate, &s.up, "shg", "shu")?;
-                        }
+                        } else { mv(router, "h", ne, "rl", c.n_expert)?; }
                         Ok(())
                     })?;
                     let cache = self.cache.as_ref().unwrap();
