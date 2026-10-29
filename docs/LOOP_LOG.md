@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At cfe0773 (#137, `bench --mtp 0`, tg128 after pp512): CUDA decode 111.3 (4B 85.5), Vulkan 103.7 (4B 99.6).
+- At 200a5cc (#138, `bench --mtp 0`, tg128 after pp512): CUDA decode 111.8 (4B 86.9), Vulkan 103.7 (4B 99.6).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2468,6 +2468,23 @@ code was not timed on that test. Full suite green, load 2.55.
 - Greedy md5 unchanged on both backends for 4B and 35B, mtp 0 and 1, and `STRATA_KV_Q8`.
 - New test: `swiglu_q` matches `swiglu` (when it returns 0) or `swiglu` + `quant_xq` byte for byte (Vulkan). 74 tests pass.
 - Not verified: prefill (it does not use this path), models with F32/BF16 down weights (they keep the plain swiglu).
+
+### 2026-10-29 #138 — CUDA: q and k rms_norm_rope in one launch (200a5cc)
+
+- `Backend::rms_norm_rope_qk` runs `rms_norm_rope` of the q heads and then `rms_norm_rope_kv` of the k heads. On CUDA
+  this is one `rms_norm_rope` launch: the first `qrows` blocks take the q heads (from their own x, weights and output,
+  with no cache store). Vulkan keeps the default (two calls in one batch). One launch fewer per attention layer.
+- Interleaved against cfe0773 (load 2.1–2.4, GPU idle):
+
+  | Backend | Model | Before | After | Change |
+  |---|---|---|---|---|
+  | CUDA | 35B (×6) | 111.20 (110.9–111.4) | 111.80 (111.4–112.0) | +0.54% |
+  | CUDA | 4B (×3) | 85.50 (85.4–85.6) | 86.93 (86.8–87.0) | +1.67% |
+
+  Every pair ahead. The 4B has attention in all 36 layers, the 35B only in every fourth.
+- Greedy md5 unchanged on both backends for 4B and 35B, mtp 0 and 1, and `STRATA_KV_Q8`.
+- New test: `rms_norm_rope_qk` matches `rms_norm_rope` + `rms_norm_rope_kv` bit for bit (outputs and caches). 74 tests pass.
+- Not verified: Vulkan bench (path unchanged there), prefill speed (same launch, more blocks).
 
 ## Next candidates
 
