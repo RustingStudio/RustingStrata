@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At cececa4 (#134, `bench --mtp 0`, tg128 after pp512): CUDA decode 110.9 (4B 85.2), Vulkan 102.8 (4B 98.4, #132).
+- At bb2410d (#135, `bench --mtp 0`, tg128 after pp512): CUDA decode 111.0 (4B 85.3), Vulkan 102.6 (4B 98.8).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2414,6 +2414,19 @@ code was not timed on that test. Full suite green, load 2.55.
   +1.55%, 3 of 3 (36 attention layers).
 - Not verified: Vulkan (unchanged, has its own fused kernel since #114); prefill (the same call, one launch for
   all tokens, not timed).
+
+### 2026-10-29 #135 — `kv_store` inside the k head's `rms_norm_rope` (CUDA) (bb2410d)
+
+- New `Backend::rms_norm_rope_kv`: CUDA's `rms_norm_rope` kernel optionally stores the rotated k head and its v row
+  into the KV cache (`kv_put`, so f16 and q8 alike), one launch fewer per attention layer. Vulkan runs
+  `rms_norm_rope` then `kv_store` with a barrier between them inside the q/k batch (same barrier count as
+  before). Kernel test: output and both caches equal `rms_norm_rope` then `kv_store` bit for bit. Greedy md5
+  unchanged on both models and both backends, MTP 1 too, and with `STRATA_KV_Q8`; 74 tests pass.
+- Interleaved against cececa4, load 1.4-3.7, GPU idle: CUDA default model 110.85 (110.7-111.0) to 111.03
+  (110.9-111.2), +0.16%, 6 of 6 pairs ahead; CUDA 4B 85.23 (85.2-85.3) to 85.30 (85.3), 3 of 3 ahead or equal.
+  Vulkan (no kernel change) default model 102.43 to 102.57, 4B 98.80 to 98.77: noise.
+- Small, but consistent on CUDA and it removes a kernel launch; kept.
+- Not verified: prefill (it still calls `kv_store`).
 
 ## Next candidates
 
