@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At b7a8f9e (#136, `bench --mtp 0`, tg128 after pp512): CUDA decode 111.2 (4B 85.5), Vulkan 103.1 (4B 99.7).
+- At cfe0773 (#137, `bench --mtp 0`, tg128 after pp512): CUDA decode 111.3 (4B 85.5), Vulkan 103.7 (4B 99.6).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2443,6 +2443,31 @@ code was not timed on that test. Full suite green, load 2.55.
   (102.9-103.3), +0.5%, 3 of 3; Vulkan 4B 98.73 (98.7-98.8) to 99.70 (99.5-100.0), +1.0%, 3 of 3.
 - Not verified: prefill (separate path, unchanged); which half of the change gives the default-model gain (it has
   no dense layer, so it is the unrolled post-norm).
+
+### 2026-10-29 #137 — Vulkan: SwiGLU inside the down GEMV's x quantization (cfe0773)
+
+- `Backend::swiglu_q` replaces `swiglu_gemv`. By default it is the plain `swiglu` and returns 0, so the GEMV
+  quantizes x itself. Vulkan instead quantizes silu(g) * u in `quant_xq` and returns that xq. This now covers the
+  routed and shared expert down GEMVs as well as the dense one. Vulkan drops one dispatch before each down GEMV.
+- CUDA tried first and was slower, so CUDA keeps the old path:
+  - `quant_xq` with a `u` argument, interleaved against b7a8f9e: 35B 111.08 → 110.97, 4B 85.53 → 83.77. The 4B
+    loss came from one block per 9728-value row.
+  - Rows split into 2048-value blocks: 35B 111.45 → 111.08, 4B 85.47 → 84.90.
+  - The GEMV's per-block quantization from L2 is cheaper than a separate launch that writes xq, even with the
+    swiglu launch removed.
+- Final, interleaved against b7a8f9e (load 1.7–5.0):
+
+  | Backend | Model | Before | After | Change |
+  |---|---|---|---|---|
+  | CUDA | 35B (×6) | 111.33 | 111.33 | 0 |
+  | CUDA | 4B (×3) | 85.50 | 85.50 | 0 |
+  | Vulkan | 35B (×3) | 103.03 (102.9–103.1) | 103.70 (103.6–103.8) | +0.65% |
+  | Vulkan | 4B (×3) | 99.37 (99.2–99.5) | 99.63 (99.4–99.8) | +0.26% |
+
+  The first Vulkan run (with the CUDA change) gave the same gain: +0.5% and +0.2%.
+- Greedy md5 unchanged on both backends for 4B and 35B, mtp 0 and 1, and `STRATA_KV_Q8`.
+- New test: `swiglu_q` matches `swiglu` (when it returns 0) or `swiglu` + `quant_xq` byte for byte (Vulkan). 74 tests pass.
+- Not verified: prefill (it does not use this path), models with F32/BF16 down weights (they keep the plain swiglu).
 
 ## Next candidates
 
