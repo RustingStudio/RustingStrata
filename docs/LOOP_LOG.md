@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 99faaa5 (#141, `bench --mtp 0`, tg128 after pp512): CUDA decode 112.1 (4B 91.6), Vulkan 104.1 (4B 100.1).
+- At 0334f06 (#142, `bench --mtp 0`, tg128 after pp512): CUDA decode 112.1 (4B 91.6), Vulkan 104.2 (4B 100.7).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2543,6 +2543,22 @@ code was not timed on that test. Full suite green, load 2.55.
 
 - Greedy md5 unchanged on both backends for 4B and 35B, mtp 0 and 1, and `STRATA_KV_Q8`. 74 tests pass.
 - Not verified: the same for Vulkan's o GEMV (it already reads `gemv_q` inputs differently), nt > 1 speed (MTP verify).
+
+### 2026-10-29 #142 — Vulkan: attn_merge writes the o GEMV's quantized input (0334f06)
+
+- Same change as #141 on Vulkan: `attn_merge.comp` quantizes its output (`subgroupMax` over the 32 values of a scale,
+  `roundEven` as `quant_x`) into `attq` through a new `U8 xq` push constant, so the o GEMV skips its `quant_xq`
+  dispatch and the barrier before it. Off under `--llama-numerics`.
+- Interleaved against fd6adcd (#141 is CUDA only; load 3.0–5.5, falling):
+
+  | Backend | Model | Before | After | Change |
+  |---|---|---|---|---|
+  | Vulkan | 4B (×4) | 100.25 (100.1–100.4) | 100.65 (100.5–100.8) | +0.4% (4 of 4 pairs) |
+  | Vulkan | 35B (×4) | 104.05 (103.9–104.2) | 104.20 (104.1–104.3) | +0.1% (3 of 4) |
+
+- Greedy md5 unchanged on both backends for 4B and 35B, mtp 0 and 1, and `STRATA_KV_Q8`. 74 tests pass (the
+  kernels test compares the xq with `quant_xq` on both backends).
+- Not verified: other GPUs, subgroup sizes other than 32 (the backend requires 32).
 
 ## Next candidates
 
