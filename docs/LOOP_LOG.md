@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 210d2fb (#143, `bench --mtp 0`, tg128 after pp512): CUDA decode 112.4 (4B 95.8), Vulkan 104.2 (4B 100.7).
+- At 7a3347f (#144, `bench --mtp 0`, tg128 after pp512): CUDA decode 111.7 (4B 95.0; #143 under lower load: 112.4 / 95.8), Vulkan 104.2 (4B 100.7).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2581,6 +2581,25 @@ code was not timed on that test. Full suite green, load 2.55.
   other than 128 and 256 on hardware.
 - Note: a first nsys and md5 run overlapped a CS2 session (the check in the command named only dota2); its 35B md5s
   differed even for the base binary. Those numbers were dropped and everything above was rerun with no game running.
+
+### 2026-10-29 #144 — CUDA batch on two streams (7a3347f)
+
+`Backend::batch` on CUDA now sends every second launch to a side stream, joined to the main stream by events at
+both ends, so the captured graph runs batched launches as parallel branches (Vulkan's batch already drops the
+barriers). Every op batched on CUDA is one launch, so alternating launches never splits an op. Target: the 4B's v
+GEMV (~7-10 us per layer) ran after the q+k pair instead of beside it.
+
+nsys (4B): v now starts 24.6 us into the 27 us q+k launch (median) — q+k's 1024 blocks occupy every SM, so v only
+fills its tail, and q+k slows 26.6 -> 27.4 us from the shared bandwidth.
+
+| CUDA decode, tg128 after pp512, load 2.1-2.7 | 7a3347f^ | 7a3347f |
+|---|---|---|
+| default model (6 interleaved pairs) | 111.37 (111.2-111.5) | 111.73 (111.4-111.9) |
+| 4B (3 pairs) | 95.07 (95.0-95.2) | 94.97 (94.3-95.4) |
+
+Greedy md5s unchanged (4B, default model mtp 0/1, kvq8, both backends). 74 tests pass (a first run failed
+`prefill_cached_reuses_history` with an error while CS2 started on the GPU mid-run; it passes alone and in the
+full rerun on an idle GPU). Not verified: prefill (no batch there) and other models' batches.
 
 ## Next candidates
 
