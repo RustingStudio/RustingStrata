@@ -3,7 +3,7 @@
 //! command buffer, which a host copy or `sync` submits and waits for. Every op ends with a full compute and transfer
 //! barrier, which also orders it before the work of later submissions.
 
-use crate::backend::{ATT_SPLITS, ATT_SPLITS_1, Backend, Buf, GpuTensor};
+use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, ATT_SPLITS_1, Backend, Buf, GpuTensor};
 use crate::quant::GgmlType;
 use anyhow::{Context, anyhow, ensure};
 use ash::vk;
@@ -444,6 +444,21 @@ impl Arg for i32 { fn put(&self, v: &mut Vec<u8>) { v.extend(self.to_le_bytes())
 impl Arg for f32 { fn put(&self, v: &mut Vec<u8>) { v.extend(self.to_le_bytes()) } }
 
 impl Vk {
+    /// As the CUDA one: both kernels run, the step decides which one works, then attn_merge combines the splits (and
+    /// writes out quantized into xq when not null).
+    fn attn(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64) -> anyhow::Result<()> {
+        ensure!([64, 128, 256, 512].contains(&hd), "attention head_dim {hd} unsupported (64, 128, 256 or 512)");
+        let (per, pz) = ((hd / 32) as u32, (nh * ATT_SPLITS * (hd + 2)) as u32);
+        if self.0.llama != 0 {  // one head per workgroup, merged as the attn_decode splits (empty ones weigh 0)
+            self.run("attn_decode_llama", &[0, hd as u32], [nh * nt, ATT_SPLITS_1, 1], &[&q, &kc, &vc, &part, &step, &(nh as u32), &(nkv as u32), &scale, &pz, &(nt as u32)])?;
+            return self.run("attn_merge", &[], [nh, 1, nt], &[&part, &qg, &out, &step, &(hd as u32), &(ATT_SPLITS as u32), &(ATT_SPLITS_1 as u32), &i32::MAX, &0u64]);
+        }
+        let g = [8, 4, 2, 1].into_iter().find(|&g| (nh / nkv) % g == 0 && g * hd <= 2048).unwrap();
+        let args: [&dyn Arg; 11] = [&q, &kc, &vc, &part, &step, &(nh as u32), &(nkv as u32), &scale, &gq_min, &pz, &(nt as u32)];
+        self.run("attn_decode", &[0, per, 1, 0], [nh * nt, ATT_SPLITS_1, 1], &args)?;
+        self.run("attn_decode", &[0, per, g as u32, 1], [nh / g * nt, ATT_SPLITS, 1], &args)?;
+        self.run("attn_merge", &[], [nh, 1, nt], &[&part, &qg, &out, &step, &(hd as u32), &(ATT_SPLITS as u32), &(ATT_SPLITS_1 as u32), &gq_min, &xq])
+    }
     /// Record kernel `name` over `groups` workgroups with push constants `args`.
     fn run(&self, name: &'static str, spec: &[u32], groups: [usize; 3], args: &[&dyn Arg]) -> anyhow::Result<()> {
         let mut pc = Vec::with_capacity(128);
@@ -760,19 +775,13 @@ impl Backend for Vk {
     fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()> {
         self.run("kv_store", &[], [(n * t).div_ceil(256), 1, 1], &[&k, &v, &kc, &vc, &step, &(n as u32), &((n * t) as u32)])
     }
-    /// As the CUDA one: both kernels run, the step decides which one works, then attn_merge combines the splits.
     fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize) -> anyhow::Result<()> {
-        ensure!([64, 128, 256, 512].contains(&hd), "attention head_dim {hd} unsupported (64, 128, 256 or 512)");
-        let (per, pz) = ((hd / 32) as u32, (nh * ATT_SPLITS * (hd + 2)) as u32);
-        if self.0.llama != 0 {  // one head per workgroup, merged as the attn_decode splits (empty ones weigh 0)
-            self.run("attn_decode_llama", &[0, hd as u32], [nh * nt, ATT_SPLITS_1, 1], &[&q, &kc, &vc, &part, &step, &(nh as u32), &(nkv as u32), &scale, &pz, &(nt as u32)])?;
-            return self.run("attn_merge", &[], [nh, 1, nt], &[&part, &qg, &out, &step, &(hd as u32), &(ATT_SPLITS as u32), &(ATT_SPLITS_1 as u32), &i32::MAX]);
-        }
-        let g = [8, 4, 2, 1].into_iter().find(|&g| (nh / nkv) % g == 0 && g * hd <= 2048).unwrap();
-        let args: [&dyn Arg; 11] = [&q, &kc, &vc, &part, &step, &(nh as u32), &(nkv as u32), &scale, &gq_min, &pz, &(nt as u32)];
-        self.run("attn_decode", &[0, per, 1, 0], [nh * nt, ATT_SPLITS_1, 1], &args)?;
-        self.run("attn_decode", &[0, per, g as u32, 1], [nh / g * nt, ATT_SPLITS, 1], &args)?;
-        self.run("attn_merge", &[], [nh, 1, nt], &[&part, &qg, &out, &step, &(hd as u32), &(ATT_SPLITS as u32), &(ATT_SPLITS_1 as u32), &gq_min])
+        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, 0)
+    }
+    fn attn_decode_q(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize, xq: u64) -> anyhow::Result<u64> {
+        let xq = if self.0.llama != 0 { 0 } else { xq };
+        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, ATT_GQA_MIN, nt, xq)?;
+        Ok(xq)
     }
     fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()> {
         ensure!(n <= 512 && k <= 32, "router_topk: {n} experts, top {k}");
