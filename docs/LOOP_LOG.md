@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 0334f06 (#142, `bench --mtp 0`, tg128 after pp512): CUDA decode 112.1 (4B 91.6), Vulkan 104.2 (4B 100.7).
+- At 210d2fb (#143, `bench --mtp 0`, tg128 after pp512): CUDA decode 112.4 (4B 95.8), Vulkan 104.2 (4B 100.7).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2559,6 +2559,28 @@ code was not timed on that test. Full suite green, load 2.55.
 - Greedy md5 unchanged on both backends for 4B and 35B, mtp 0 and 1, and `STRATA_KV_Q8`. 74 tests pass (the
   kernels test compares the xq with `quant_xq` on both backends).
 - Not verified: other GPUs, subgroup sizes other than 32 (the backend requires 32).
+
+### 2026-10-29 #143 — CUDA: one attention entry point per head size (210d2fb)
+
+- Vulkan's per-dispatch profile of the 4B (`STRATA_VK_PROF`, gemv names tagged with their workgroup count, load
+  4.6) put its GEMVs at ~211 us per layer against ~216 for CUDA's (nsys): the 4B gap is not in the GEMVs. CUDA's
+  attention was: `attn_decode` 35.7 us plus 4.8 us for the `attn_decode_gqa` launch that returns early, against
+  ~23 us for Vulkan's two dispatches.
+- Both CUDA kernels chose the head size with a switch, so each got the registers of hd 512: 122 per thread for
+  `attn_decode` (2 blocks of 256 per SM), 227 for `attn_decode_gqa`. One entry point per head size
+  (`attn_decode_128`, `attn_decode_gqa_128`, ...): 40 and 122 registers for hd 128. Same code per size.
+- Interleaved against 3b72202 (load 1.5–1.7):
+
+  | Backend | Model | Before | After | Change |
+  |---|---|---|---|---|
+  | CUDA | 35B (×6) | 111.95 (111.7–112.0) | 112.37 (112.3–112.6) | +0.4% (6 of 6 pairs) |
+  | CUDA | 4B (×3) | 91.37 (91.2–91.5) | 95.80 (95.7–95.9) | +4.8% |
+
+- Greedy md5 unchanged on both backends for 4B and 35B, mtp 0 and 1, and `STRATA_KV_Q8`. 74 tests pass.
+- Not verified: speed from 2048 positions (the `attn_decode_gqa` path; the bench decodes at 512–640), head sizes
+  other than 128 and 256 on hardware.
+- Note: a first nsys and md5 run overlapped a CS2 session (the check in the command named only dota2); its 35B md5s
+  differed even for the base binary. Those numbers were dropped and everything above was rerun with no game running.
 
 ## Next candidates
 
