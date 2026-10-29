@@ -2601,6 +2601,18 @@ Greedy md5s unchanged (4B, default model mtp 0/1, kvq8, both backends). 74 tests
 `prefill_cached_reuses_history` with an error while CS2 started on the GPU mid-run; it passes alone and in the
 full rerun on an idle GPU). Not verified: prefill (no batch there) and other models' batches.
 
+### 2026-10-30 #145 — CUDA SwiGLU quantized in one launch for the down GEMV: slower, reverted (no code commit)
+
+- Tried `swiglu_xq` (CUDA `swiglu_q`, as Vulkan's `quant_xq` with u): one warp per 256 values computes silu(g) * u
+  and writes it in the quant_xq layout, so the down GEMV (dense and routed) reads that xq instead of every block
+  quantizing x itself (the 4B's 320 down blocks each quantize 9728 values). Kernel test bit-identical; greedy md5s
+  unchanged (4B, default model mtp 0/1, kvq8, both backends).
+- Decode, interleaved against 94f590c (load 0.1-0.9): default model 113.02 (113.0-113.1) to 112.08 (112.0-112.1),
+  4B 96.40 (96.3-96.5) to 95.73 (95.7-95.8): -0.8% and -0.7%, every pair. The extra launch (plus its graph-node gap)
+  costs more than the per-block quantization it saves, which overlaps the blocks' weight loads. With #125 (SwiGLU
+  inside every block's quantization) and #131, the down GEMV's input path is now tried three ways.
+- Two earlier A/B runs were dropped: one overlapped a Dota 2 start, one ran with other GPU load (spread 93-110).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
