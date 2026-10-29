@@ -988,6 +988,26 @@ extern "C" __global__ void rope_neox(float* x, int stride, int per, int n_rot, c
     }
 }
 
+// grid = rows (heads of n), block 256: rms_norm (out rows of n) then rope_neox of the head, in one launch with the same
+// bits. Head r belongs to token r / per.
+extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const float* w, float* out, int n, float eps, int per,
+                                         int n_rot, const int* step, float base) {
+    const float* xr = x + (size_t)blockIdx.x * x_stride;
+    float* o = out + (size_t)blockIdx.x * n;
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < n; i += 256) s += xr[i] * xr[i];
+    float sc = 1.0f / sqrtf(block_sum(s) / (float)n + eps);
+    for (int i = threadIdx.x; i < n; i += 256) o[i] = xr[i] * sc * w[i];
+    __syncthreads();
+    int i = threadIdx.x, half = n_rot / 2;
+    if (i >= half) return;
+    double theta = (double)(step[0] + (int)blockIdx.x / per) * pow((double)base, -2.0 * i / n_rot);
+    float sn = (float)sin(theta), c = (float)cos(theta);
+    float a = o[i], b = o[i + half];
+    o[i] = a * c - b * sn;
+    o[i + half] = a * sn + b * c;
+}
+
 extern "C" __global__ void add(float* x, const float* y, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] += y[i];
