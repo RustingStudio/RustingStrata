@@ -423,6 +423,16 @@ fn attn_prefill_matches_decode() {
                 gpu.attn_decode_gq(dq.addr(), dk.addr(), dv.addr(), dg.addr(), dbat.addr(), pbat.addr(), ds.addr(),
                                    nh, nkv, hd, scale, gq_min, t).unwrap();
                 assert_eq!(down::<f32>(gpu, &dbat), want, "attn_decode batched nh {nh} nkv {nkv} hd {hd} gq_min {gq_min}");
+                if gq_min == ATT_GQA_MIN {  // attn_decode_q's xq (where written) is quant_xq of its output
+                    let (dxq, wxq) = (gpu.zeros::<u8>(t * nh * hd * 9 / 8).unwrap(), gpu.zeros::<u8>(t * nh * hd * 9 / 8).unwrap());
+                    let aq = gpu.attn_decode_q(dq.addr(), dk.addr(), dv.addr(), dg.addr(), dbat.addr(), pbat.addr(), ds.addr(),
+                                               nh, nkv, hd, scale, t, dxq.addr()).unwrap();
+                    assert_eq!(down::<f32>(gpu, &dbat), want, "attn_decode_q nh {nh} nkv {nkv} hd {hd}");
+                    if aq != 0 {
+                        gpu.quant_xq(dbat.addr(), nh * hd, nh * hd, t, wxq.addr()).unwrap();
+                        assert_eq!(down::<u8>(gpu, &dxq), down::<u8>(gpu, &wxq), "attn_decode_q xq nh {nh} nkv {nkv} hd {hd}");
+                    }
+                }
                 let Some(got) = &got else { continue };
                 let e = rel_l2(got, &want);
                 eprintln!("attn_prefill_{hd} nh {nh} nkv {nkv} gq_min {gq_min}: rel err vs decode {e:.2e}");

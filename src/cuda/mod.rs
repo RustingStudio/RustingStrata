@@ -226,6 +226,18 @@ impl Gpu {
         launch!(self, &kname("gemvn", w.ty), c, w.ptr, x, x_stride as i32, y, y_stride as i32, w.rows as i32, nsb, rpw, nt as i32, xq, pair.0, pair.1, pair.2);
         Ok(())
     }
+
+    /// attn_decode_gq; attn_merge also writes `out` quantized into xq when not null.
+    fn attn(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64) -> anyhow::Result<()> {
+        if ![64, 128, 256, 512].contains(&hd) { bail!("attention head_dim {hd} unsupported (64, 128, 256 or 512)"); }
+        let group = nh / nkv;  // query heads per KV head, served by one block (up to 8, G * hd <= 2048)
+        let g = [8, 4, 2, 1].into_iter().find(|&g| group % g == 0 && g * hd <= 2048).unwrap();
+        let pz = (nh * ATT_SPLITS * (hd + 2)) as i32;
+        launch!(self, "attn_decode", cfg(((nh * nt) as u32, ATT_SPLITS_1 as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32);
+        launch!(self, "attn_decode_gqa", cfg(((nh / g * nt) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32);
+        launch!(self, "attn_merge", LaunchConfig { grid_dim: (nh as u32, 1, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, part, qg, out, hd as i32, ATT_SPLITS as i32, step, ATT_SPLITS_1 as i32, gq_min, xq);
+        Ok(())
+    }
 }
 
 impl Backend for Gpu {
@@ -461,14 +473,13 @@ impl Backend for Gpu {
     /// (ATT_SPLITS_1 splits), from it on one block serves all query heads of a KV head (ATT_SPLITS splits). Both
     /// kernels are launched; the step decides which one works.
     fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize) -> anyhow::Result<()> {
-        if ![64, 128, 256, 512].contains(&hd) { bail!("attention head_dim {hd} unsupported (64, 128, 256 or 512)"); }
-        let group = nh / nkv;  // query heads per KV head, served by one block (up to 8, G * hd <= 2048)
-        let g = [8, 4, 2, 1].into_iter().find(|&g| group % g == 0 && g * hd <= 2048).unwrap();
-        let pz = (nh * ATT_SPLITS * (hd + 2)) as i32;
-        launch!(self, "attn_decode", cfg(((nh * nt) as u32, ATT_SPLITS_1 as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32);
-        launch!(self, "attn_decode_gqa", cfg(((nh / g * nt) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32);
-        launch!(self, "attn_merge", LaunchConfig { grid_dim: (nh as u32, 1, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, part, qg, out, hd as i32, ATT_SPLITS as i32, step, ATT_SPLITS_1 as i32, gq_min);
-        Ok(())
+        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, 0)
+    }
+
+    fn attn_decode_q(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize, xq: u64) -> anyhow::Result<u64> {
+        let xq = if llama_numerics() { 0 } else { xq };
+        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, ATT_GQA_MIN, nt, xq)?;
+        Ok(xq)
     }
 
     fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()> {

@@ -183,6 +183,11 @@ pub trait Backend: Send {
     fn attn_decode(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize) -> anyhow::Result<()> {
         self.attn_decode_gq(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, ATT_GQA_MIN, nt)
     }
+    /// `attn_decode`, also writing `out` quantized for `gemvq` into `xq` where supported; returns the xq to use (0: none).
+    fn attn_decode_q(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize, _xq: u64) -> anyhow::Result<u64> {
+        self.attn_decode(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, nt)?;
+        Ok(0)
+    }
     /// `attn_decode` that shares K/V loads across a GQA group from `gq_min` positions on (tests use 0 to force it).
     fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize) -> anyhow::Result<()>;
     /// Route `t` tokens (logit rows of n, ids / wts rows of k).
