@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At bb2410d (#135, `bench --mtp 0`, tg128 after pp512): CUDA decode 111.0 (4B 85.3), Vulkan 102.6 (4B 98.8).
+- At b7a8f9e (#136, `bench --mtp 0`, tg128 after pp512): CUDA decode 111.2 (4B 85.5), Vulkan 103.1 (4B 99.7).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2427,6 +2427,22 @@ code was not timed on that test. Full suite green, load 2.55.
   Vulkan (no kernel change) default model 102.43 to 102.57, 4B 98.80 to 98.77: noise.
 - Small, but consistent on CUDA and it removes a kernel launch; kept.
 - Not verified: prefill (it still calls `kv_store`).
+
+### 2026-10-29 #136 — Dense FFN residual added by the next norm; unrolled norm residual path (b7a8f9e)
+
+- A dense layer (4B) no longer launches `add(x, ye)`: `layer` returns the pending FFN output and the next layer's
+  `attn_norm` (or the output norm) adds it through `rms_norm_q`'s `res` path (the MTP head adds it itself, if
+  dense). Same sum order, same bits: greedy md5 unchanged on both models and both backends, MTP 1 and
+  `STRATA_KV_Q8` too; 74 tests pass.
+- First try alone, against bb2410d (load 1.2-3.3): 4B CUDA 85.33 to 85.0, Vulkan 98.87 to 98.5 (-0.4%, every
+  pair). The `res` path loaded one value per step (the plain path four), costing more than the `add` launch.
+- With that path unrolled to four loads per step on CUDA and Vulkan (it also serves the post-attention norm of
+  every layer of both models), interleaved against bb2410d, load 1.1-1.7, GPU idle:
+  CUDA default model 110.87 (110.8-111.0) to 111.18 (110.8-111.4), +0.3%, 5 of 6 pairs ahead, one tie;
+  CUDA 4B 85.27 (85.2-85.3) to 85.50 (85.5), +0.3%, 3 of 3; Vulkan default model 102.57 (102.5-102.6) to 103.10
+  (102.9-103.3), +0.5%, 3 of 3; Vulkan 4B 98.73 (98.7-98.8) to 99.70 (99.5-100.0), +1.0%, 3 of 3.
+- Not verified: prefill (separate path, unchanged); which half of the change gives the default-model gain (it has
+  no dense layer, so it is the unrolled post-norm).
 
 ## Next candidates
 
