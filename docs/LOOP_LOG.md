@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 7a3347f (#144, `bench --mtp 0`, tg128 after pp512): CUDA decode 111.7 (4B 95.0; #143 under lower load: 112.4 / 95.8), Vulkan 104.2 (4B 100.7).
+- At 5561aae (#146, `bench --mtp 0`, tg128 after pp512, load 1.3-2.4): CUDA decode 113.1 (4B 97.2), Vulkan 104.8 (4B 101.7).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2612,6 +2612,31 @@ full rerun on an idle GPU). Not verified: prefill (no batch there) and other mod
   costs more than the per-block quantization it saves, which overlaps the blocks' weight loads. With #125 (SwiGLU
   inside every block's quantization) and #131, the down GEMV's input path is now tried three ways.
 - Two earlier A/B runs were dropped: one overlapped a Dota 2 start, one ran with other GPU load (spread 93-110).
+
+### 2026-10-30 #146 — Decode launches only the attention kernel that works (5561aae)
+
+The decode attention launched both kernels per attention layer (one head per block below ATT_GQA_MIN = 2048
+positions, GQA from it on) and the step picked the one that works; the other was an empty launch (graph node on
+CUDA, dispatch plus barrier on Vulkan). The kernels pick the regime per token, so the host can fix it when all
+tokens of a forward fall on one side: `gq_min(pos, nt)` in gpu_model.rs gives i32::MAX (all below), 0 (all from
+2048 on) or ATT_GQA_MIN (a forward that straddles it; both launched as before). The decode and MTP graph keys
+carry it, so the graph is re-recorded when the regime changes. `attn_decode_q` now takes `gq_min` like
+`attn_decode_gq`.
+
+A/B interleaved against 94f590c (`bench --mtp 0`, tg128 after pp512, load 1.3-2.4):
+
+| | base | #146 |
+|---|---|---|
+| CUDA 35B (x6) | 112.9 (112.7-113.1) | 113.1 (112.5-113.4), +0.2% |
+| CUDA 4B (x3) | 96.5 (96.4-96.6) | 97.2 (97.2-97.3), +0.8% |
+| Vulkan 35B (x4) | 104.4 (104.2-104.8) | 104.8 (104.5-104.9), +0.3% |
+| Vulkan 4B (x4) | 101.1 (100.6-101.4) | 101.7 (101.3-102.2), +0.5% |
+
+Greedy md5 unchanged on both backends (4B 64bab3bb, 35B mtp0 06c92e18, mtp1 04cf91e9, kvq8 cuda 04cf91e9 /
+vulkan 06c92e18). A prompt of 2023 tokens, so decode crosses 2048 (35B mtp0 and mtp1, MTP verify straddling it),
+and a 1931-token prompt with 160 decoded on the 4B: md5 identical to base on CUDA and Vulkan. Tests 74 passed.
+Not verified: decode after 2048 positions in `bench` (the GQA regime skips the one-head kernel; md5 above covers
+its correctness, not its speed).
 
 ## Next candidates
 
