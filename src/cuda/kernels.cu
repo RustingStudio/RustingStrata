@@ -1430,8 +1430,9 @@ extern "C" __global__ void attn_decode_gqa(const float* q, const u16* kc, const 
 }
 
 // grid = query heads: out = (sum of split partials) / (sum of split sums) * sigmoid(gate), gate skipped when qg is null. Split 0 is never empty.
+// xq not null: out is also quantized there as quant_xq does (not under LLAMA_Q8, whose scales span 256 values).
 extern "C" __global__ void attn_merge(const float* part, const float* qg, float* out, int hd, int ns, const int* step,
-                                       int ns1, int gq_min) {
+                                       int ns1, int gq_min, signed char* xq) {
     int h = blockIdx.x;
     part += (size_t)blockIdx.z * gridDim.x * ns * (hd + 2); step += 2 * blockIdx.z;
     if (qg) qg += (size_t)blockIdx.z * gridDim.x * 2 * hd;
@@ -1450,7 +1451,14 @@ extern "C" __global__ void attn_merge(const float* part, const float* qg, float*
     for (int d = threadIdx.x; d < hd; d += blockDim.x) {
         float o = 0.0f;
         for (int s = 0; s < ns; s++) o += pp[s * (hd + 2) + d] * ws[s];
-        out[h * hd + d] = o / L * (qg ? sigmoid(qg[h * 2 * hd + hd + d]) : 1.0f);
+        o = o / L * (qg ? sigmoid(qg[h * 2 * hd + hd + d]) : 1.0f);
+        out[h * hd + d] = o;
+        if (xq) {  // hd is a multiple of 32: a warp holds one scale's 32 values
+            float mx = warp_max(fabsf(o)), id = mx > 0.0f ? 127.0f / mx : 0.0f;
+            size_t n = (size_t)gridDim.x * hd, i = blockIdx.z * n + h * hd + d;
+            xq[i] = (signed char)__float2int_rn(o * id);
+            if ((threadIdx.x & 31) == 0) ((float*)(xq + gridDim.z * n))[i >> 5] = mx / 127.0f;
+        }
     }
 }
 
