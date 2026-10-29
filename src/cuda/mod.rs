@@ -14,9 +14,9 @@ const QTYPES: [GgmlType; 17] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL]
 };
-const KERNELS: [&str; 26] = [
+const KERNELS: [&str; 24] = [
     "rms_norm", "quant_xq", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
-    "kv_store", "attn_decode", "attn_decode_gqa", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
+    "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
 ];
 
@@ -131,7 +131,8 @@ impl Gpu {
         let mut fns = HashMap::new();
         let names = KERNELS.iter().map(|s| s.to_string())
             .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm"].map(|p| kname(p, t))))
-            .chain(QTYPES.iter().filter(|&&t| !Self::float_ty(t)).map(|&t| kname("gemmi", t)));
+            .chain(QTYPES.iter().filter(|&&t| !Self::float_ty(t)).map(|&t| kname("gemmi", t)))
+            .chain([64, 128, 256, 512].iter().flat_map(|h| [format!("attn_decode_{h}"), format!("attn_decode_gqa_{h}")]));
         for n in names {
             let f = module.load_function(&n).with_context(|| format!("kernel {n}"))?;
             // gemvn caches nt quantized inputs: 4 x 17408 columns (Qwen3.8-27B ffn_down) need 77 KB.
@@ -233,8 +234,8 @@ impl Gpu {
         let group = nh / nkv;  // query heads per KV head, served by one block (up to 8, G * hd <= 2048)
         let g = [8, 4, 2, 1].into_iter().find(|&g| group % g == 0 && g * hd <= 2048).unwrap();
         let pz = (nh * ATT_SPLITS * (hd + 2)) as i32;
-        launch!(self, "attn_decode", cfg(((nh * nt) as u32, ATT_SPLITS_1 as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32);
-        launch!(self, "attn_decode_gqa", cfg(((nh / g * nt) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32);
+        launch!(self, &format!("attn_decode_{hd}"), cfg(((nh * nt) as u32, ATT_SPLITS_1 as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32);
+        launch!(self, &format!("attn_decode_gqa_{hd}"), cfg(((nh / g * nt) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32);
         launch!(self, "attn_merge", LaunchConfig { grid_dim: (nh as u32, 1, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, part, qg, out, hd as i32, ATT_SPLITS as i32, step, ATT_SPLITS_1 as i32, gq_min, xq);
         Ok(())
     }

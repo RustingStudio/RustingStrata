@@ -1404,30 +1404,28 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
 // the same time and share K/V rows in L2), with q, part and step at that token's offsets (pz part floats per token).
 // attn_decode (grid (nh, ns1 splits)) serves one head per block. From gq_min on, attn_decode_gqa (grid (nh / G, splits))
 // serves the G query heads of a KV head per block, reading each K/V row once; it needs ~230 registers per thread,
-// so it is a separate entry point to keep attn_decode's occupancy.
-#define ATT_PER(F) switch (hd) { case 64: F(2) break; case 128: F(4) break; case 256: F(8) break; case 512: F(16) break; }
-#define ATT_1(PER) attn_decode_t<PER, 1>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt);
-extern "C" __global__ void attn_decode(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
-                                       int nh, int nkv, int hd, float scale, int gq_min, int pz, int nt) {
-    int t = blockIdx.x % nt;
-    q += (size_t)t * nh * hd; part += (size_t)t * pz; step += 2 * t;
-    if (step[0] + 1 >= gq_min) return;
-    ATT_PER(ATT_1)
-}
-#define ATT_G(PER)                                                                             \
-    switch (nh * nt / gridDim.x) {                                                             \
-        case 1: attn_decode_t<PER, 1>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt); break;           \
-        case 2: attn_decode_t<PER, 2>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt); break;           \
-        case 4: if constexpr (PER <= 16) attn_decode_t<PER, 4>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt); break; \
-        case 8: if constexpr (PER <= 8) attn_decode_t<PER, 8>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt); break;  \
+// so it is a separate entry point to keep attn_decode's occupancy. Both have one entry point per head size
+// (attn_decode_128, ...): a switch over hd would give every size the registers of the largest.
+#define ATT_ARGS const float* q, const u16* kc, const u16* vc, float* part, const int* step, int nh, int nkv, int hd, \
+                 float scale, int gq_min, int pz, int nt
+#define ATT_TOK int t = blockIdx.x % nt; q += (size_t)t * nh * hd; part += (size_t)t * pz; step += 2 * t;
+#define ATT_RUN(G) attn_decode_t<PER, G>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt)
+#define DEF_ATT(HD)                                                                                          \
+    extern "C" __global__ void attn_decode_##HD(ATT_ARGS) {                                                  \
+        constexpr int PER = HD / 32; ATT_TOK                                                                 \
+        if (step[0] + 1 < gq_min) ATT_RUN(1);                                                                \
+    }                                                                                                        \
+    extern "C" __global__ void attn_decode_gqa_##HD(ATT_ARGS) {                                              \
+        constexpr int PER = HD / 32; ATT_TOK                                                                 \
+        if (step[0] + 1 < gq_min) return;                                                                    \
+        switch (nh * nt / gridDim.x) {                                                                       \
+            case 1: ATT_RUN(1); break;                                                                       \
+            case 2: ATT_RUN(2); break;                                                                       \
+            case 4: if constexpr (PER <= 16) ATT_RUN(4); break;                                              \
+            case 8: if constexpr (PER <= 8) ATT_RUN(8); break;                                               \
+        }                                                                                                    \
     }
-extern "C" __global__ void attn_decode_gqa(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
-                                           int nh, int nkv, int hd, float scale, int gq_min, int pz, int nt) {
-    int t = blockIdx.x % nt;
-    q += (size_t)t * nh * hd; part += (size_t)t * pz; step += 2 * t;
-    if (step[0] + 1 < gq_min) return;
-    ATT_PER(ATT_G)
-}
+DEF_ATT(64) DEF_ATT(128) DEF_ATT(256) DEF_ATT(512)
 
 // grid = query heads: out = (sum of split partials) / (sum of split sums) * sigmoid(gate), gate skipped when qg is null. Split 0 is never empty.
 // xq not null: out is also quantized there as quant_xq does (not under LLAMA_Q8, whose scales span 256 values).
