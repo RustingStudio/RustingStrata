@@ -13,6 +13,6 @@ void main() {
     if (uint64_t(p.q) != 0) {
         memoryBarrierBuffer();
         barrier();
-        quant_x(p.o, ho, p.n, F32(0ul), 0.0, F32(0ul), p.q, ho / 4, F32(uint64_t(p.q) + gl_NumWorkGroups.x * p.n), ho / 32);
+        quant_x(p.o, ho, p.n, F32(0ul), 0.0, F32(0ul), p.q, ho / 4, F32(uint64_t(p.q) + gl_NumWorkGroups.x * p.n), ho / 32, F32(0ul), 0);
     }
 }

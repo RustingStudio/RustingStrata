@@ -38,14 +38,17 @@ void main() {
         }
         h *= 2;
     }
-    for (i = h + gl_LocalInvocationID.x; i + 768 < p.n; i += 1024) {
-        float v[4];  // loaded before any store, which may alias x
-        [[unroll]] for (uint j = 0; j < 4; j++) v[j] = p.x.v[xo + i + 256 * j] * sc * p.w.v[i + 256 * j];
-        [[unroll]] for (uint j = 0; j < 4; j++) p.o.v[oo + i + 256 * j] = v[j];
-    }
-    for (; i < p.n; i += 256) p.o.v[oo + i] = p.x.v[xo + i] * sc * p.w.v[i];
+    // With q, quant_x stores out from the values it quantizes (same products), so x is read once.
     if (uint64_t(p.q) != 0)
-        quant_x(p.x, xo, p.n, p.w, sc, F32(0ul), p.q, r * p.n / 4, F32(uint64_t(p.q) + gl_NumWorkGroups.x * p.n), r * (p.n / 32));
+        quant_x(p.x, xo, p.n, p.w, sc, F32(0ul), p.q, r * p.n / 4, F32(uint64_t(p.q) + gl_NumWorkGroups.x * p.n), r * (p.n / 32), p.o, oo);
+    else {
+        for (i = h + gl_LocalInvocationID.x; i + 768 < p.n; i += 1024) {
+            float v[4];  // loaded before any store, which may alias x
+            [[unroll]] for (uint j = 0; j < 4; j++) v[j] = p.x.v[xo + i + 256 * j] * sc * p.w.v[i + 256 * j];
+            [[unroll]] for (uint j = 0; j < 4; j++) p.o.v[oo + i + 256 * j] = v[j];
+        }
+        for (; i < p.n; i += 256) p.o.v[oo + i] = p.x.v[xo + i] * sc * p.w.v[i];
+    }
     if (uint64_t(p.kc) != 0) {
         memoryBarrierBuffer();
         barrier();

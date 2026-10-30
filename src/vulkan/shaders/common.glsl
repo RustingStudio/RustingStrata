@@ -105,8 +105,8 @@ void rope_cs(double pos, double ts, uint i, out float sn, out float cs) {
 
 // Quantize x[0, n) (times sc * w[i] when w is not null, or silu(x) * u when u is not null) to int8 at q (as words, from word qo) with per-32 scales at
 // d[do_]; the whole workgroup takes part. As quant_x in kernels.cu; reading x, not an output just written, needs no
-// barrier.
-void quant_x(F32 x, uint xo, uint n, F32 w, float sc, F32 u, U32 q, uint qo, F32 d, uint do_) {
+// barrier. With o not null the values are also stored at o[oo, oo + n).
+void quant_x(F32 x, uint xo, uint n, F32 w, float sc, F32 u, U32 q, uint qo, F32 d, uint do_, F32 o, uint oo) {
     for (uint i = gl_LocalInvocationID.x * 8; i < n; i += gl_WorkGroupSize.x * 8) {
         float v[8], mx = 0.0;
         [[unroll]] for (uint j = 0; j < 8; j++) {
@@ -114,6 +114,7 @@ void quant_x(F32 x, uint xo, uint n, F32 w, float sc, F32 u, U32 q, uint qo, F32
             if (uint64_t(u) != 0) v[j] = silu(v[j]) * u.v[xo + i + j];
             mx = max(mx, abs(v[j]));
         }
+        if (uint64_t(o) != 0) [[unroll]] for (uint j = 0; j < 8; j++) o.v[oo + i + j] = v[j];
         float dd, id;
         if (LLAMA_Q8) {  // one scale per 256 (the subgroup): -127 / the signed value of largest magnitude, lowest index
             float sv = 0.0; uint si = 1u << 30;
