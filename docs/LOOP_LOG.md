@@ -3537,6 +3537,26 @@ close programs using VRAM)" above the cause. The 35B at `--ctx 131072` loads on 
 resident). Also checked: `calibrate --backend vulkan` on the 4B (38 s, chunk 2048, 1969 tok/s prefill, 105.1 decode;
 the file it wrote was removed again), and a clean build of `main` in a scratch clone (no warnings). 74 tests pass.
 
+### 2026-10-30 #216 — Vulkan pp512 and 32K prefill checks, MTP on prose (no code commit)
+
+- MTP on prose ("Explain how a hash map works.", -n 256, load 0.2-0.7), mtp 0 -> mtp 1 per run: CUDA 116.96 /
+  117.89 / 121.38 -> 111.45 (first, cold) / 136.88 / 140.38; Vulkan 110.62 / 120.34 / 120.65 -> 128.66 / 138.00 /
+  140.14. On prose Vulkan MTP gains ~16% like CUDA; the smaller Vulkan gain in the #212 table comes from that bench
+  text, so the README sentence "MTP gains less on Vulkan" is not general (see Questions for owner).
+- pp512 on Vulkan now measures 1275 / 1295 (load 1.3; first base run 637, cold), not the 1142 of #212 (load up to
+  5): about 3% below CUDA's 1329. Tried a 1536 MB host staging area (no queue drain while ~32 missed experts per
+  layer, ~1.25 GB, stream in each 512-token chunk; 8965/10240 resident): 1245 / 1289 / 1284 vs base 1275 / 1295, no
+  gain, reverted.
+- 32K prefill (load 1.0-1.2): Vulkan 1464.6 (1294.2-1551.8), CUDA 1690.5 (1689.8-1691.2). STRATA_VK_PROF at 32K:
+  attn_prefill_256 102 ms per call (34.1%, 80 calls), gemmi 33.5%, gemm_f 17.7%, deltanet 8.8%; CUDA's
+  attn_prefill_256 is ~70 ms (#80), so attention is ~2.6 s of the ~3 s gap. STRATA_VK_STATS: 255 registers and
+  16 bytes of local memory (CUDA 232, no spill), 48896 bytes shared of the 49152 limit. Two variants, both reverted:
+  dropping the non-mma.sync layout fallback (nv/nva fixed true): still 255 registers, 128 bytes spilled; the Q tile
+  kept in shared memory and loaded per step as CUDA's ldmatrix does (254 registers, no spill, but 81152 bytes
+  shared, above the reported limit, and one workgroup per SM): 171 ms per call. The 48 KB shared limit is why Q
+  lives in registers on Vulkan; closing the gap needs a different tiling (e.g. BQ = 32 per workgroup), which
+  changes no rounding but is a larger rewrite.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
@@ -3558,6 +3578,9 @@ the file it wrote was removed again), and a clean build of `main` in a scratch c
    MoE combine with the next norm: no gain, #147).
 
 ## Questions for owner
+
+- (#216) README line 30, "MTP gains less on Vulkan and depends on the text.": on prose Vulkan MTP gains ~16% like
+  CUDA (#216). Proposal: replace it with "MTP gains depend on the text."
 
 - (#215) Release version. `Cargo.toml` says 1.0.1 and the README "Status: v1.0.1", but since v1.0.0 the
   Vulkan backend, Qwen3/Qwen3-Next support and tool calling were added. Proposal: set `version = "1.1.0"` in
