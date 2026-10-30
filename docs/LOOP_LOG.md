@@ -3403,6 +3403,21 @@ copy of staged group 1 beside the resident up GEMM; the batch ends with a barrie
   1957.2 / 1957.3 / 1963.9 (mean 1955.2 -> 1959.5, +0.2%). The VK profile shows no change per kernel.
 - 74 tests passed; greedy md5s unchanged on both backends (12 pairs); parity 629 (base) / 625.
 
+### 2026-10-30 #205 — Vulkan staged expert copy as a kernel inside the batch: no gain (no code commit)
+
+Per-type `STRATA_VK_PROF` (temporary type suffix) at pp2048: IQ2_XS `gemm_f` 289 ms (CUDA `gemm_iq2_xs` 292), Q5_K
+`gemmi` 241 (258), IQ3_XXS 122 (103), Q6_K 97 (88), f32 22 (19), IQ4_XS 9.4 (8.0). A temporary timestamp after each
+staged copy (with its barrier) gives 46-51 ms of PCIe copies in ~1600 transfers of ~30 us; before, that time was
+counted in the next `gemm_f`. With no barrier inside the batch (#204) the copy still does not overlap the up GEMM
+(the up GEMM total did not drop). Tried a copy kernel (8 workgroups, 16-byte words from the host staging buffer)
+in place of `vkCmdCopyBuffer` inside the batch, and also the up GEMM recorded before the copy.
+- Single runs, rounds 1-2, load 0.9-1.0: transfer 1945.9 / 1951.2, transfer + up first 1946.7 / 1951.5, kernel (8
+  workgroups) 1957.3 / 1961.0, kernel + up first 1952.6 / 1957.2, 16 workgroups + up first 1955.0 / 1959.5.
+- Interleaved A/B against 8aabde1, rounds 1-3, load 1.16-1.21: 1955.5 / 1957.6 / 1957.1 -> 1958.1 / 1954.8 / 1959.1
+  (mean 1956.7 -> 1957.3). Within noise. Reverted.
+- Left: groups after the first still wait for their copy (one staging area). Overlapping them needs a second
+  staging area or a transfer queue.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
