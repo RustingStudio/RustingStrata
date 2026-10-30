@@ -3183,6 +3183,17 @@ IQ2_XS and IQ3_XXS and decodes through `QS<T>::get` (d times the signed grid byt
   noise. gemmi does 2 lookups per 8 weights per thread and is not lookup bound.
 - Not verified: `STRATA_EXPERT_MB=6000` (the kernel is the same; only more of its tiles are staged).
 
+### 2026-10-30 #186 — Vulkan gemm_f: IQ tables in shared memory, slower (no code commit)
+
+#185 on Vulkan: an `IQ_SHARED` block in deq.glsl copied iq2xs_grid, iq3xxs_grid and ksigns into shared arrays
+(5.6 KB) and redirected the table macros to them; gemm_f loaded them at workgroup start.
+
+- `bench --backend vulkan --pp 2048 --tg 16 --mtp 0`, default residency, 4 interleaved rounds (load 1.1-1.4, first
+  round cold in both, dropped): 1860 / 1872 / 1873 (mean 1868) before, 1772 / 1778 / 1782 (mean 1777) after, -4.9%.
+  Reverted. With #169 (expert GEMVs, no gain) this says the NVIDIA Vulkan driver already serves the read-only table
+  buffer well; the extra 5.6 KB of shared memory (gemm_f has 29.7 KB) likely costs a workgroup per SM.
+- Not verified: the occupancy cause (no Vulkan occupancy tool used).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
