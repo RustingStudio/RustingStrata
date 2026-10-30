@@ -2820,6 +2820,18 @@ pp512 there are no misses and it is 3.5 us, as on CUDA.)
 - Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, 2023-token prompt; `STRATA_EXPERT_MB=6000`, so
   the CPU miss path runs). 74 tests pass. Not verified: 4B A/B beyond one pair (103.3 vs 103.4; dense, not touched).
 
+### 2026-10-30 #159 — Vulkan post-mixer norm in the out GEMV's last workgroup: no gain (no code commit)
+
+- Tried: the mixer's out GEMV (`gemv_q`) counts finished workgroups in a device word; the last one runs
+  `rms_norm_q`'s steps (x += y, norm, quantize to hq) with the same operations in the same order, reading y through
+  a `coherent` reference. One dispatch and one barrier fewer per layer; greedy md5s unchanged (35B mtp0/mtp1).
+- Interleaved A/B against d679718, 35B Vulkan decode (`bench --mtp 0`, tg128 after pp512), 3 runs each:
+  load 1.4-1.5: 110.8 (110.3-111.1) -> 110.8 (110.7-110.9); load 1.7-1.9: 110.7 (110.6-110.8) -> 110.2 (110.1-110.3).
+  4B (dense, same path) 103.3 (103.1-103.5) -> 103.2 (103.0-103.3). Reverted.
+- Reading: the norm still runs serially on one workgroup after the GEMV drains, so only the barrier's launch gap is
+  saved, and it is smaller than for #156-#158; the `row < rows` guard and the tail may also cost the GEMV itself.
+  Patch kept at the session scratchpad (gemv_norm.diff), not in the repo.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
