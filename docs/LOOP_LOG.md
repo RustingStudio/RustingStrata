@@ -3418,6 +3418,16 @@ in place of `vkCmdCopyBuffer` inside the batch, and also the up GEMM recorded be
 - Left: groups after the first still wait for their copy (one staging area). Overlapping them needs a second
   staging area or a transfer queue.
 
+### 2026-10-30 #206 — Vulkan gemmi: X step stored after the products, slower (no code commit)
+
+`ldx` in `gemmi` loads step kb + 1 of X from global memory and stores it to shared memory at once, before step kb's
+products, so the load latency is not hidden (CUDA's `gemmi_q` uses `cp.async`; W is already held in registers and
+stored after the products). Tried the same for X: `ldx` into registers (2 uvec4 and the scales or sums), `stx` after
+the products. `gemm_throughput` (Vulkan, full tiles): IQ3_XXS 0.54 -> 0.52 ms, but Q5_K attn_qkv 7.81 -> 9.85,
+attn_gate 3.85 -> 4.93, Q6_K 4.71 -> 4.87. Probably the extra registers cost occupancy. Reverted without an
+end-to-end run. CUDA `gemmi_q` does not use the shared IQ tables (only `gemm_q` does, #185), so tables do not explain
+the IQ3_XXS gap (Vulkan 122 ms vs CUDA 103 at pp2048).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
