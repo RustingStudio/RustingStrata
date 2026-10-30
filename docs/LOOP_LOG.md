@@ -3456,6 +3456,14 @@ every Vulkan GEMM and GEMV includes. Same bits. `gemm_throughput` (Vulkan, 2 run
 equal, parity 628 / 626 (CUDA untouched, drift). CUDA keeps its `__device__` table (and the shared copy in
 `gemm_q`); the same change there is the next A/B.
 
+### 2026-10-30 #210 — CUDA IQ decode: ksigns from the parity, no gain (no code commit)
+
+The #209 change on CUDA (`__popc` instead of `ksigns_iq2xs`, also in the shared-table `QS` path of `gemm_q`).
+`gemm_throughput` (CUDA, interleaved new/old/new/old): IQ2_XS 0.69 / 0.74 vs 0.66 / 0.66 ms, IQ3_XXS 0.54 / 0.54 vs
+0.56 / 0.55, the rest within noise. CUDA's prefill GEMM already reads the sign table from shared memory, so the
+lookup is cheap there and the popcount adds ALU work. End-to-end pp2048 was unreadable (desktop apps on the GPU,
+every kernel ~15% slower than in the morning, round spread +-10%). Reverted.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
