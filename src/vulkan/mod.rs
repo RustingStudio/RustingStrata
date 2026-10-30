@@ -51,6 +51,8 @@ const SPV: &[(&str, &[u8])] = &[
     ("router_topk", include_bytes!("spv/router_topk.spv")),
     ("ssm_gates", include_bytes!("spv/ssm_gates.spv")),
     ("swiglu", include_bytes!("spv/swiglu.spv")),
+    // quant_xq under another name, so that it gets no barrier inside a batch: its output is read after the batch.
+    ("swiglu_q", include_bytes!("spv/quant_xq.spv")),
 ];
 
 /// The device, a scratch buffer of XQ bytes for x quantized by `quant_xq` when an op does that itself, the IQ lookup
@@ -714,7 +716,7 @@ impl Backend for Vk {
     }
     // The SwiGLU computed while quantizing x for the GEMV: one dispatch fewer (on CUDA a separate quantization lost).
     fn swiglu_q(&self, g: u64, u: u64, n: usize, rows: usize, xq: u64) -> anyhow::Result<u64> {
-        self.run("quant_xq", &[self.0.llama], [n.div_ceil(256), rows, 1], &[&g, &xq, &u, &(n as u32), &(n as u32)])?;
+        self.run("swiglu_q", &[self.0.llama], [n.div_ceil(256), rows, 1], &[&g, &xq, &u, &(n as u32), &(n as u32)])?;
         Ok(xq)
     }
     fn rms_norm(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32) -> anyhow::Result<()> {
