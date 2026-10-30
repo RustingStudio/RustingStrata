@@ -33,7 +33,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   632-634/640 (#124).
 - At 52b364e (#165, `bench --mtp 0`, tg128 after pp512, load 0.6-2.9): CUDA decode 117.5 (4B 98.5), Vulkan 117.0 (4B 104.0).
 - At d73cc1f (#179, same bench, load 0.8-1.5): CUDA decode 119.6, MTP k = 1 136.1 (4B not re-measured).
-- At ca27b19 (#181): Vulkan pp2048 with `STRATA_EXPERT_MB=6000` 1584 (was 1386).
+- At 8fe4e87 (#181, #182): Vulkan pp2048 with `STRATA_EXPERT_MB=6000` 1621 (was 1386); CUDA same config 1580.
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -3118,6 +3118,23 @@ queue order and the barrier keep it safe, and its wait frees the ring.
 - Long prompt (2023 tokens, default residency), Vulkan prefill: 1195-1206 before, 1432-1440 after.
   CUDA unchanged (1351-1463 both).
 - Vulkan decode (`abl.sh`, 3 rounds, load 4.2-5.4): 117.1-117.5 before, 117.3-117.4 after. No change.
+- Tests: 74 passed. Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, long prompt mtp0/mtp1).
+
+### 2026-10-30 #182 — Prefill staging per matrix, one copy per run of experts (8fe4e87)
+
+nsys of CUDA prefill (pp2048, `STRATA_EXPERT_MB=6000`, load 0.8): span 1308 ms, kernels 1116 ms, HtoD DMA 100 ms
+(2.45 GB in 7298 copies, one per expert matrix, 24 GB/s), and 75 ms of GPU idle between consecutive HtoD copies.
+Staging now holds each matrix in its own section (all gates, then ups, then downs of the group), so missed experts
+with consecutive ids are contiguous as in the weights and copy in one `htod` (`slice::chunk_by`).
+
+- Copies 7298 -> 5660, but the idle time between them stays 78 ms: CUDA's pageable path is bound by bytes
+  (~13.7 GB/s host staging), not by calls. Only pinned host memory would remove it (not done: it would pin the
+  mmap'd weights or add a host buffer API to the backend seam).
+- `bench --pp 2048 --tg 16 --mtp 0`, `STRATA_EXPERT_MB=6000`, 3 interleaved rounds (load 1.3-1.6):
+  Vulkan 1580 / 1587 / 1598 (mean 1588) before, 1620 / 1618 / 1624 (mean 1621) after, +2.1% (fewer submits).
+  CUDA 1586 / 1576 before (one cold 1028 dropped), 1571 / 1582 / 1577 after: no change.
+- Shared code, so CUDA parity spot check, 4 interleaved pairs: 626 / 627 / 624 / 626 before (625.75), 625 / 625 /
+  626 / 625 after (625.25); per-prompt results drift in both binaries (MTP nondeterminism, #166).
 - Tests: 74 passed. Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, long prompt mtp0/mtp1).
 
 ## Next candidates
