@@ -1,11 +1,11 @@
-//! CUDA context, NVRTC compile with a PTX disk cache, and launch wrappers for `kernels.cu`.
+//! CUDA context, NVRTC compile with a cubin disk cache, and launch wrappers for `kernels.cu`.
 //! One stream (plus a side stream for `batch`), event tracking off: buffers are passed to kernels as raw device pointers.
 
 use crate::quant::{GgmlType, tables::*};
 use anyhow::{Context, bail};
 use crate::backend::{Backend, Buf, SAME_X};
 use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice, LaunchConfig, PushKernelArg, result, sys};
-use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
+use cudarc::nvrtc::Ptx;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::hash::{Hash, Hasher};
@@ -89,33 +89,53 @@ fn source(kv_q8: bool) -> String {
     )
 }
 
-/// Compile `src` for `arch`, reusing `$XDG_CACHE_HOME/rusting_strata/<hash>.ptx` when present.
+/// Compile `src` to a cubin for `arch`, reusing `$XDG_CACHE_HOME/rusting_strata/<hash>.cubin` when present. A cubin,
+/// unlike PTX, needs no driver JIT at load (~6 s per start whenever the driver's own JIT cache missed).
 fn ptx(src: &str, arch: &'static str) -> anyhow::Result<Ptx> {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (src, arch).hash(&mut h);
     let dir = std::env::var_os("XDG_CACHE_HOME").map(Into::into)
         .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"))
         .join("rusting_strata");
-    let path = dir.join(format!("{:016x}.ptx", h.finish()));
-    if let Ok(s) = std::fs::read_to_string(&path) {
-        // Refresh mtime so pruning below keeps PTX that is still in use.
+    let path = dir.join(format!("{:016x}.cubin", h.finish()));
+    if let Ok(b) = std::fs::read(&path) {
+        // Refresh mtime so pruning below keeps a cubin that is still in use.
         let _ = std::fs::File::options().append(true).open(&path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
-        return Ok(Ptx::from_src(s));
+        return Ok(Ptx::from_binary(b));
     }
     prune_ptx(&dir, std::time::Duration::from_secs(7 * 86400));
-    let opts = CompileOptions { arch: Some(arch), options: vec!["-std=c++17".into()], ..Default::default() };
-    let p = compile_ptx_with_opts(src, opts).map_err(|e| anyhow::anyhow!("NVRTC compile of kernels.cu failed: {e}"))?;
-    let _ = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, p.to_src()));
-    Ok(p)
+    eprintln!("compiling CUDA kernels for {arch} (first run only, ~15 s)");
+    let b = cubin(src, arch)?;
+    let _ = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &b));
+    Ok(Ptx::from_binary(b))
 }
 
-/// Delete cached `.ptx` files in `dir` not used for `age`; every kernel edit leaves a stale ~4 MB file behind.
+fn cubin(src: &str, arch: &str) -> anyhow::Result<Vec<u8>> {
+    use cudarc::nvrtc::{result as nr, sys as ns};
+    let c = std::ffi::CString::new(src)?;
+    let prog = nr::create_program(&c, None)?;
+    let out = (|| unsafe {
+        if let Err(e) = nr::compile_program(prog, &[format!("--gpu-architecture={arch}"), "-std=c++17".into()]) {
+            let log = nr::get_program_log(prog).map(|l| std::ffi::CStr::from_ptr(l.as_ptr()).to_string_lossy().into_owned());
+            bail!("NVRTC compile of kernels.cu failed: {e}\n{}", log.unwrap_or_default());
+        }
+        let mut n = 0;
+        ns::nvrtcGetCUBINSize(prog, &mut n).result()?;
+        let mut b = vec![0u8; n];
+        ns::nvrtcGetCUBIN(prog, b.as_mut_ptr() as *mut std::ffi::c_char).result()?;
+        Ok(b)
+    })();
+    unsafe { nr::destroy_program(prog) }?;
+    out
+}
+
+/// Delete cached `.ptx`/`.cubin` files in `dir` not used for `age`; every kernel edit leaves a stale file behind.
 fn prune_ptx(dir: &std::path::Path, age: std::time::Duration) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let p = e.path();
         let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|d| d > age);
-        if old && p.extension().is_some_and(|x| x == "ptx") { let _ = std::fs::remove_file(p); }
+        if old && p.extension().is_some_and(|x| x == "ptx" || x == "cubin") { let _ = std::fs::remove_file(p); }
     }
 }
 
@@ -144,7 +164,7 @@ impl Gpu {
         let stream = ctx.new_stream()?;
         let (maj, min) = ctx.compute_capability()?;
         let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
-        let module = ctx.load_module(ptx(&source(kv_q8), arch)?).context("load PTX")?;
+        let module = ctx.load_module(ptx(&source(kv_q8), arch)?).context("load cubin")?;
         let mut fns = HashMap::new();
         let names = KERNELS.iter().map(|s| s.to_string())
             .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm"].map(|p| kname(p, t))))
