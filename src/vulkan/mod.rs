@@ -3,7 +3,7 @@
 //! command buffer, which a host copy or `sync` submits and waits for. Every op ends with a full compute and transfer
 //! barrier, which also orders it before the work of later submissions.
 
-use crate::backend::{ATT_SPLITS, ATT_SPLITS_1, Backend, Buf, GpuTensor};
+use crate::backend::{ATT_SPLITS, ATT_SPLITS_1, Backend, Buf, GpuTensor, SAME_X};
 use crate::quant::GgmlType;
 use anyhow::{Context, anyhow, ensure};
 use ash::vk;
@@ -58,7 +58,7 @@ const SPV: &[(&str, &[u8])] = &[
 
 /// The device, a scratch buffer of XQ bytes for x quantized by `quant_xq` when an op does that itself, the IQ lookup
 /// tables (`iq_tables`), and the q8 rows of x for `gemmi` (grown as needed).
-pub struct Vk(Arc<Inner>, Buf, Buf, Mutex<Buf>);
+pub struct Vk(Arc<Inner>, Buf, Buf, Mutex<(Buf, Option<[u64; 4]>)>);
 
 /// The IQ lookup tables in one buffer, and the `tables.glsl` that names each at its offset from the buffer's address
 /// (spec constants 3 and 4). As GLSL const arrays the tables went to per-thread local memory on NVIDIA, which made
@@ -309,7 +309,7 @@ impl Vk {
         unsafe { (p as *mut u32).write_volatile(0) };
         st.err = (b, m, p as usize, unsafe { inner.dev.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(b)) });
         drop(st);
-        let mut v = Vk(Arc::new(inner), Buf::new(0, 0, ()), Buf::new(0, 0, ()), Mutex::new(Buf::new(0, 0, ())));
+        let mut v = Vk(Arc::new(inner), Buf::new(0, 0, ()), Buf::new(0, 0, ()), Mutex::new((Buf::new(0, 0, ()), None)));
         v.1 = v.buf(XQ, DEVICE)?.0;
         let t = iq_tables().0;
         v.2 = v.alloc(t.len())?;
@@ -539,16 +539,21 @@ impl Vk {
         ensure!(cols % 256 == 0, "{} matrix with {cols} columns: GEMM needs a multiple of 256", ty.name());
         if n_tiles == 0 { return Ok(()); }
         let (spec, grid, nsb) = (self.wspec(ty), [rows.div_ceil(64), n_tiles, 1], (cols / 256) as u32);
+        let (same, act) = (act & SAME_X != 0, act & !SAME_X);
         let tail = [&(rows as u32) as &dyn Arg, &nsb, &act];
+        let mut q8 = self.3.lock().unwrap();
         if !crate::cuda::Gpu::mmq(ty) {
+            if !same { q8.1 = None; }
             return self.run(if self.0.coop { "gemm_f" } else { "gemm_f_dp" }, &spec, grid, &[&tiles, &wd, &x, &xrow, &y, &(nd as u32), &(x_stride as u32), &(y_stride as u32), tail[0], tail[1], tail[2]]);
         }
-        // ponytail: x is quantized on every call, also when several GEMMs read the same x (as on CUDA).
-        let mut q8 = self.3.lock().unwrap();
         let need = n_x * (cols + cols / 8 + cols / 4);
-        if q8.len() < need { *q8 = self.alloc(need)?; }  // dropping the old buffer waits for work that uses it
-        let xq = q8.addr();
-        self.run("quant_q8", &[self.0.llama], [n_x, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
+        if q8.0.len() < need { q8.0 = self.alloc(need)?; }  // dropping the old buffer waits for work that uses it
+        let xq = q8.0.addr();
+        let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);  // as on CUDA
+        if !(same && q8.1 == key) {
+            self.run("quant_q8", &[self.0.llama], [n_x, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
+            q8.1 = key;
+        }
         self.run(if self.0.coop { "gemmi" } else { "gemmi_dp" }, &spec, grid, &[&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2]])
     }
 }
