@@ -125,6 +125,8 @@ void main() {
         barrier();
         if (kb + 1 < p.nsb * 4) ldx(xr, xh, xok, xo, cols, kb + 1, xb ^ 1);
         if (kb + 1 < p.nsb * 4) ldw(wt, wr, wi, wok, n0, kb + 1, wv, d, m);
+        // Expert tiles are often part full; a subgroup whose 32 positions are all past cnt has nothing to multiply.
+        if (wm < cnt)
         [[unroll]] for (uint h = 0; h < 64 / KS; h++) {
 #if COOP
             coopmat<int8_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> a[2];
