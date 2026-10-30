@@ -33,7 +33,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   632-634/640 (#124).
 - At 52b364e (#165, `bench --mtp 0`, tg128 after pp512, load 0.6-2.9): CUDA decode 117.5 (4B 98.5), Vulkan 117.0 (4B 104.0).
 - At d73cc1f (#179, same bench, load 0.8-1.5): CUDA decode 119.6, MTP k = 1 136.1 (4B not re-measured).
-- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832, 1884 at 92c594b (#184), 2013 at febaded (#185), 2052 at 1aa1182 (#187), 2093 at b45136b (#191); #188 +0.7% CUDA, +0.6% Vulkan (Vulkan default residency ~1905).
+- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832, 1884 at 92c594b (#184), 2013 at febaded (#185), 2052 at 1aa1182 (#187), 2093 at b45136b (#191); #188 +0.7% CUDA, +0.6% Vulkan (Vulkan default residency ~1905). Vulkan pp2048 1925 at 603557f (#201-#202).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -3353,6 +3353,31 @@ read once less; outputs and int8 copies are bit-identical.
   117.6 / 117.8 / 117.7 / 117.4 -> 117.8 / 117.8 / 117.7 / 117.7 (mean 117.63 -> 117.75, +0.1%, never behind).
 - 74 tests passed; greedy md5s unchanged on both backends (12 pairs); parity 623 (base, load 3.7) / 625 (new).
   CUDA code unchanged.
+
+### 2026-10-30 #201 — Vulkan gemm_f skips all-padding subgroups, loops unrolled (3b154df)
+
+A temporary per-type split of `STRATA_VK_PROF` (pp2048) put the Vulkan prefill gap in the routed IQ2_XS gate/up
+`gemm_f`: 404 ms against CUDA `gemm_iq2_xs` 294 ms (IQ3_XXS `gemmi` 138 vs 103; Q5_K, Q6_K, f32 within ~10%).
+`gemm_throughput` with full 128-position tiles has Vulkan ahead (IQ2_XS 0.55 ms, CUDA 0.61). With the same
+positions in part-full tiles (temporary `HC` tile count in the test): 64 per tile CUDA 0.83 / Vulkan 0.85, 32 per
+tile 1.20 / 1.61. CUDA skips the products of all-padding warps (#184); Vulkan did not since #186, where that branch
+made gemm_f slower.
+- Cause of #186: with the `if (wm < cnt)` alone the driver keeps the coopmat loops rolled. Same branch, IQ2_XS
+  `gemm_throughput`: 128 per tile 0.55 -> 0.86 ms, 64: 0.85 -> 1.12, 32: 1.61 -> 1.35. With `[[unroll]]` on the kk,
+  load and product loops as well: 0.56 / 0.79 / 1.24. Committed that.
+- `bench --backend vulkan --pp 2048 --tg 16 --mtp 0`, interleaved rounds 1-3 (round 0 dropped), load 1.10-1.17:
+  1875.7 / 1890.6 / 1897.5 -> 1903.2 / 1912.2 / 1914.5 (mean 1887.9 -> 1910.0, +1.2%).
+- 74 tests passed; greedy md5s unchanged on both backends (12 pairs); parity 626 (base) / 627.
+
+### 2026-10-30 #202 — Vulkan gemmi skips all-padding subgroups (603557f)
+
+The #187 skip in `gemmi` (`if (wm < cnt)` around the already unrolled h loop). `gemm_throughput` IQ3_XXS down
+(Vulkan): 128 per tile 0.54 -> 0.54 ms, 64: 0.82 -> 0.75, 32: 1.46 -> 1.29 (CUDA 0.47 / 0.58 / 0.90); Q5_K and
+Q6_K full tiles unchanged.
+- `bench --backend vulkan --pp 2048 --tg 16 --mtp 0`, interleaved rounds 1-3, load 3.2-3.9 (another process ran):
+  1900.5 / 1909.7 / 1918.8 -> 1915.9 / 1926.9 / 1933.2 (mean 1909.7 -> 1925.3, +0.8%).
+- 74 tests passed; greedy md5s unchanged on both backends (12 pairs); parity 624 (base) / 628.
+- Left: part-full tiles are still slower on Vulkan than on CUDA (IQ3_XXS at 64 per tile 0.75 vs 0.58 ms).
 
 ## Next candidates
 
