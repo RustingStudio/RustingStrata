@@ -3464,6 +3464,18 @@ The #209 change on CUDA (`__popc` instead of `ksigns_iq2xs`, also in the shared-
 lookup is cheap there and the popcount adds ALU work. End-to-end pp2048 was unreadable (desktop apps on the GPU,
 every kernel ~15% slower than in the morning, round spread +-10%). Reverted.
 
+### 2026-10-30 #211 — CUDA: cache an NVRTC cubin, no driver JIT at load (a1e11dc)
+
+Release smoke test (every local model, both backends, `generate -n 32`): all seven supported models give the same
+text on CUDA and Vulkan; Bonsai PQ2_0 and Qwen3-ASR fail cleanly (unsupported quant type 142, unsupported
+architecture `qwen3vl`). But each CUDA start was slow: 35B 17-18 s vs 3 s on Vulkan, prompt 13 tok/s. The PTX
+disk cache still made the driver JIT the kernels whenever its own compute cache missed, and `~/.nv/ComputeCache`
+sat at its 1 GB limit, evicting. With `CUDA_CACHE_DISABLE=1` a 35B run took 7.9 s vs 1.8 s cached. Now NVRTC
+compiles straight to a cubin for the device's `sm_XX` and that is cached (3.6 MB): with the driver cache
+disabled a run takes 1.84-1.87 s. First compile prints a note (~15 s). pp512 / decode, interleaved x3 (load
+2.3-2.7): base 1285 / 1323 / 1325, 118.2 / 118.6 / 118.8 vs 1318 / 1320 / 1318, 118.3 / 118.9 / 118.8.
+Tests 74 passed, greedy md5s 12 pairs + long prompt 4 pairs equal.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
