@@ -103,6 +103,10 @@ fn ptx(src: &str, arch: &'static str) -> anyhow::Result<Ptx> {
         let _ = std::fs::File::options().append(true).open(&path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
         return Ok(Ptx::from_binary(b));
     }
+    // cudarc panics on a missing library; "CUDA init" lets `backend::open` fall back to Vulkan.
+    if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
+        return Err(anyhow::anyhow!("the CUDA 13 NVRTC library (libnvrtc.so) is not installed")).context("CUDA init");
+    }
     prune_ptx(&dir, std::time::Duration::from_secs(7 * 86400));
     eprintln!("compiling CUDA kernels for {arch} (first run only, ~15 s)");
     let b = cubin(src, arch)?;
@@ -159,6 +163,9 @@ impl Gpu {
     pub fn new(device: usize) -> anyhow::Result<Gpu> {
         let kv_q8 = kv_q8();
         anyhow::ensure!(!(kv_q8 && llama_numerics()), "--kv q8 does not combine with --llama-numerics (its attention reads f16 KV)");
+        if !unsafe { sys::is_culib_present() } {
+            return Err(anyhow::anyhow!("no NVIDIA driver (libcuda.so)")).context("CUDA init");
+        }
         let ctx = CudaContext::new(device).context("CUDA init")?;
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream()?;
