@@ -15,8 +15,8 @@ const QTYPES: [GgmlType; 17] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL]
 };
-const KERNELS: [&str; 24] = [
-    "rms_norm", "quant_xq", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
+const KERNELS: [&str; 25] = [
+    "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
 ];
@@ -36,6 +36,8 @@ pub struct Gpu {
     q8: std::sync::Mutex<CudaSlice<u8>>,
     /// The kernels were compiled for a q8 KV cache (`--kv q8`).
     pub kv_q8: bool,
+    /// `argmax_rows` partials, AMAX_PARTS per row.
+    am: CudaSlice<[i32; 2]>,
     /// Recorded graphs by `Backend::graph` key.
     graphs: std::sync::Mutex<HashMap<u64, Graph>>,
 }
@@ -43,6 +45,8 @@ pub struct Gpu {
 /// A recorded graph. Its handles are plain CUDA driver handles, which any thread may launch once the context is
 /// bound (cudarc leaves `CudaGraph` without `Send` only because it holds raw pointers).
 struct Graph(CudaGraph);
+
+const AMAX_PARTS: usize = 64;
 unsafe impl Send for Graph {}
 
 /// `--llama-numerics`: quantize activations like llama.cpp's CPU q8_K (one scale per 256) for every integer matmul,
@@ -147,7 +151,8 @@ impl Gpu {
             fns.insert(n, f);
         }
         let q8 = std::sync::Mutex::new(stream.alloc_zeros::<u8>(1)?);
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_q8, graphs: Default::default() })
+        let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_q8, am, graphs: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -398,7 +403,11 @@ impl Backend for Gpu {
     }
 
     fn argmax_rows(&self, x: u64, n: usize, rows: usize, out: u64) -> anyhow::Result<()> {
-        launch!(self, "argmax_rows", cfg((rows as u32, 1), 1024, 0), x, n as i32, out);
+        // One block per row reads 1 MB (a 248320-token vocabulary) in ~75 us; AMAX_PARTS blocks per row share it.
+        let part = self.ptr(&self.am);
+        anyhow::ensure!(rows * AMAX_PARTS <= self.am.len(), "argmax_rows: {rows} rows");
+        launch!(self, "argmax_part", cfg((AMAX_PARTS as u32, rows as u32), 256, 0), x, n as i32, part);
+        launch!(self, "argmax_rows", cfg((rows as u32, 1), AMAX_PARTS as u32, 0), part, n as i32, out);
         Ok(())
     }
 

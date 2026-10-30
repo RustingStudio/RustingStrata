@@ -946,11 +946,8 @@ extern "C" __global__ void rms_norm(float* x, int x_stride, const float* w, floa
     }
 }
 
-// grid = rows, block 1024. out[r] = index of the largest x in row r (first one on ties, like ops::argmax).
-extern "C" __global__ void argmax_rows(const float* x, int n, int* out) {
-    const float* xr = x + (size_t)blockIdx.x * n;
-    float b = __int_as_float(0xff800000); int bi = n;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) if (xr[i] > b || bi == n) { b = xr[i]; bi = i; }
+// Block-wide (largest b, first bi on ties) of the threads' (b, bi), in thread 0; bi == n marks no value yet.
+__device__ void amax_reduce(float& b, int& bi, int n) {
     for (int o = 16; o > 0; o >>= 1) {
         float v = __shfl_xor_sync(0xffffffff, b, o); int vi = __shfl_xor_sync(0xffffffff, bi, o);
         if (v > b || (v == b && vi < bi)) { b = v; bi = vi; }
@@ -965,8 +962,24 @@ extern "C" __global__ void argmax_rows(const float* x, int n, int* out) {
             float v = __shfl_xor_sync(0xffffffff, b, o); int vi = __shfl_xor_sync(0xffffffff, bi, o);
             if (v > b || (v == b && vi < bi)) { b = v; bi = vi; }
         }
-        if (lane == 0) out[blockIdx.x] = bi;
     }
+}
+
+// grid = (parts, rows). part[r * parts + p] = (largest x, its index) of row r over i = p * blockDim + t + k * parts * blockDim.
+extern "C" __global__ void argmax_part(const float* x, int n, int2* part) {
+    const float* xr = x + (size_t)blockIdx.y * n;
+    float b = __int_as_float(0xff800000); int bi = n;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) if (xr[i] > b || bi == n) { b = xr[i]; bi = i; }
+    amax_reduce(b, bi, n);
+    if (threadIdx.x == 0) part[blockIdx.y * gridDim.x + blockIdx.x] = make_int2(__float_as_int(b), bi);
+}
+
+// grid = rows, block = parts. out[r] = index of the largest x in row r (first one on ties, like ops::argmax).
+extern "C" __global__ void argmax_rows(const int2* part, int n, int* out) {
+    int2 p = part[blockIdx.x * blockDim.x + threadIdx.x];
+    float b = __int_as_float(p.x); int bi = p.y;
+    amax_reduce(b, bi, n);
+    if (threadIdx.x == 0) out[blockIdx.x] = bi;
 }
 
 // grid = rows, in place. Row r is vector r % per of token r / per (tokens `stride` floats apart).
