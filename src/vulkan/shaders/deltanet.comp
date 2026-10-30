@@ -25,7 +25,7 @@ void main() {
     if (j0 >= p.dv) return;  // whole subgroup past the end (R divides dv)
     uint row = (vh * p.dv + j) * dk, ns = min(p.nsnap, p.T - 1);
     precise float r[16];
-    [[unroll]] for (uint e = 0; e < 16; e++) r[e] = p.S.v[row + 4 * (s + L * (e / 4)) + e % 4];
+    [[unroll]] for (uint i = 0; i < 4; i++) { vec4 t = FV4(uint64_t(p.S)).v[row / 4 + s + L * i]; [[unroll]] for (uint e = 0; e < 4; e++) r[4 * i + e] = t[e]; }
     // Token inputs do not depend on the state: token tok + 1's are loaded while token tok computes.
     vec4 nk4[4], nq4[4];
     float ng, nb, nvv;
@@ -42,7 +42,7 @@ void main() {
         [[unroll]] for (uint off = L >> 1; off > 0; off >>= 1) oq += subgroupShuffleXor(oq, off);
         if (s == 0) p.o.v[tok * p.nv * p.dv + vh * p.dv + j] = oq * p.scale;
         if (tok < ns)
-            [[unroll]] for (uint e = 0; e < 16; e++) p.snap.v[tok * p.nv * p.dv * dk + row + 4 * (s + L * (e / 4)) + e % 4] = r[e];
+            [[unroll]] for (uint i = 0; i < 4; i++) FV4(uint64_t(p.snap)).v[(tok * p.nv * p.dv * dk + row) / 4 + s + L * i] = vec4(r[4 * i], r[4 * i + 1], r[4 * i + 2], r[4 * i + 3]);
     }
-    [[unroll]] for (uint e = 0; e < 16; e++) p.S.v[row + 4 * (s + L * (e / 4)) + e % 4] = r[e];
+    [[unroll]] for (uint i = 0; i < 4; i++) FV4(uint64_t(p.S)).v[row / 4 + s + L * i] = vec4(r[4 * i], r[4 * i + 1], r[4 * i + 2], r[4 * i + 3]);
 }
