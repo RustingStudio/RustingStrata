@@ -778,7 +778,13 @@ impl Backend for Vk {
         self.run("moe_combine_seq", &[], [(t * n).div_ceil(256), 1, 1], &[&x, &ye, &wts, &inv, &sh, &sg, &(k as u32), &(n as u32), &(t as u32)])
     }
     fn norm_gate(&self, o: u64, w: u64, z: u64, n: usize, heads: usize, eps: f32) -> anyhow::Result<()> {
-        self.run("norm_gate", &[], [heads, 1, 1], &[&o, &w, &z, &(n as u32), &eps])
+        self.run("norm_gate", &[], [heads, 1, 1], &[&o, &w, &z, &(n as u32), &eps, &0u64])
+    }
+    fn norm_gate_q(&self, o: u64, w: u64, z: u64, n: usize, heads: usize, eps: f32, xq: u64) -> anyhow::Result<u64> {
+        // llama numerics take one scale per 256 values, more than a head.
+        if self.0.llama != 0 || n % 32 != 0 { self.norm_gate(o, w, z, n, heads, eps)?; return Ok(0); }
+        self.run("norm_gate", &[], [heads, 1, 1], &[&o, &w, &z, &(n as u32), &eps, &xq])?;
+        Ok(xq)
     }
     fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()> {
         self.run("kv_store", &[], [(n * t).div_ceil(256), 1, 1], &[&k, &v, &kc, &vc, &step, &(n as u32), &((n * t) as u32)])
