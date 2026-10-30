@@ -3476,6 +3476,33 @@ disabled a run takes 1.84-1.87 s. First compile prints a note (~15 s). pp512 / d
 2.3-2.7): base 1285 / 1323 / 1325, 118.2 / 118.6 / 118.8 vs 1318 / 1320 / 1318, 118.3 / 118.9 / 118.8.
 Tests 74 passed, greedy md5s 12 pairs + long prompt 4 pairs equal.
 
+### 2026-10-30 #212 — release check: serve, chat, no-coop, headline numbers, llama.cpp today (no code commit)
+
+At 6e12946, default model, GPU quiet (630 MB used by the desktop).
+- `serve` on both backends (`$S/serve_smoke.py`): models, chat, stream, tool call (`get_weather` with
+  `{"city": "Paris"}`), sampled, bad JSON 400, no messages 400, unknown path 404, 6012-token prompt 400 ("fills the
+  context"), `max_tokens` 100000 OK, client dropping mid-stream (server logs the reset and keeps serving), two
+  concurrent requests (both answered). `chat` with two piped turns remembers the first on both backends.
+- `STRATA_VK_NO_COOP=1`: every test passes; pp4096 713, decode 113.0.
+- `bench --pp 512,4096,32768 --tg 128 --reps 3 --ctx 32896`, mean (min-max), load 0.5-5.0:
+
+| | pp512 | pp4096 | pp32768 | tg after 512 / 4096 / 32768 |
+|---|---|---|---|---|
+| CUDA | 1329 (1324-1337) | 2203 (2199-2205) | 1675 (1671-1679) | 119.0 / 111.5 / 88.0 |
+| CUDA `--mtp 1` | 1272-1279 | 2166-2172 | 1659 | 130.4-134.1 / 117.2-119.0 / 97.3 |
+| Vulkan | 1142 (1113-1165) | 2101 (2091-2109) | 1436 (1321-1494) | 116.8 / 112.8 / 87.3 |
+| Vulkan `--mtp 1` | 1080 | 2076 | 1429 | 118.8 / 110.6 / 87.8 |
+
+  One CUDA `--mtp 1` round had a 74 tok/s pp512 rep (load 4.96 at the time); two reruns did not repeat it.
+  MTP gains +10-13% on CUDA but ~0-2% on Vulkan: a candidate.
+- llama.cpp on the same file today. June build 5d8ccdf9d (`llama-bench -ncmoe 10 -fa 1`, defaults ub 512): CUDA
+  pp512 1060, pp4096 1048, tg128 68.8; Vulkan 947 / 948 / 51.1. The 2026-10-28 build 11876 (Unsloth's
+  `llama-server`, `/completion` timings, 4047-token prompt + 128, x3): `-ncmoe 10` 1511-1601 / 68.6-69.3;
+  `-ncmoe 10 -ub 1024 -b 2048` 1986-2078 / 69.1-69.6; `-ncmoe 12 -ub 2048 -b 2048` 2183-2310 / 66.4-66.7 (short
+  prompt decode 68.2-68.5); `-ncmoe 14 -ub 2048` 2147-2254 / 63.8-64.7. So against current llama.cpp with a
+  tuned ubatch, Strata's 4K prefill is level (2203 vs ~2236), and decode is ~1.65x (111.5 vs 66.5 after 4K,
+  119 vs 68.4 short; 134 with MTP). The README's "2x llama.cpp prefill" is out of date.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
@@ -3497,6 +3524,18 @@ Tests 74 passed, greedy md5s 12 pairs + long prompt 4 pairs equal.
    MoE combine with the next norm: no gain, #147).
 
 ## Questions for owner
+
+- (#212) Release / README. (1) May `vulkan` be merged into `main`? (2) Proposed README changes:
+  intro: "CUDA kernels are compiled at run time with NVRTC through cudarc (cached as a cubin), and the same kernels
+  also run on Vulkan (`--backend vulkan`, GLSL compiled to SPIR-V and committed): no C++ build step, no ggml.";
+  Numbers table replaced by the #212 table above, compared with current llama.cpp tuned (`-ncmoe 12 -ub 2048
+  -b 2048`, build 11876): prefill 4K 2203 (CUDA) / 2101 (Vulkan) vs ~2236, decode after 4K 111.5 / 112.8 vs 66.5,
+  short 119.0 / 116.8 vs 68.4, MTP 134 vs (none faster). Build: "Needs Rust (2024 edition) and either an NVIDIA
+  driver with the CUDA 13 NVRTC library (loaded at run time) or a Vulkan 1.3 driver with shaderFloat64, int8/16/64
+  and subgroup size 32 (tested only on an RTX 3060; Intel Arc lacks shaderFloat64, pre-RDNA AMD lacks subgroup size
+  32). The first CUDA run compiles the kernels (~15 s) and caches them." Other-models table refreshed from the #211
+  smoke run (2B 208, 4B 104-110, 9B Q5_K_S 51-53, 9B IQ3_M 49-51, 27B IQ3_XXS 20.5, 35B IQ4_XS 94-96 tok/s at
+  `-n 32`).
 
 - (#119) V4 on the 4B prefill: llama.cpp Vulkan pp4096 2849, Strata Vulkan ~1950, Strata CUDA ~2040. Three
   quarters of the 4B prefill is gemmi, whose int8 epilogue (each exact int32 sum scaled into f32 with the roundings
