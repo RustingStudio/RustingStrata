@@ -66,7 +66,7 @@ impl ExpertCache {
             layers.push(Some((off, mats)));
         }
         let total: usize = classes.iter().map(|(b, k)| b * k).sum();
-        let frac = (budget as f64 / total.max(1) as f64).min(1.0);
+        let mut frac = (budget as f64 / total.max(1) as f64).min(1.0);
         let profile = std::env::var_os("STRATA_FIXED_EXPERTS").is_none().then(|| profile_path(m));
         let counts = profile.as_ref().and_then(|p| std::fs::read(p).ok())
             .filter(|b| b.len() >= 4 * c.n_layer * n)
@@ -75,12 +75,23 @@ impl ExpertCache {
         let mut counts = counts;
         counts.resize(n_layers * n, 0.0);
 
-        let mut pools = Vec::new();
+        // The budget comes from the driver's free-memory estimate, which can be more than it will allocate (AMD's
+        // Windows driver): on a failed allocation, free the pools and try a tenth less.
+        let pools = loop {
+            let r = classes.iter().map(|(&slot_bytes, &k)| {
+                let slots = (frac * k as f64) as usize;
+                Ok(Pool { buf: gpu.zeros::<u8>(slots * slot_bytes)?, slot_bytes, owner: Vec::with_capacity(slots) })
+            }).collect::<anyhow::Result<Vec<_>>>();
+            match r {
+                Ok(p) => break p,
+                Err(e) if frac > 0.01 => {
+                    eprintln!("expert slots: {e:#}; trying {:.0} MB", 0.9 * frac * total as f64 / 1048576.0);
+                    frac *= 0.9;
+                }
+                Err(e) => return Err(e),
+            }
+        };
         let mut out: Vec<Option<LayerExperts>> = Vec::new();
-        for (&slot_bytes, &k) in &classes {
-            let slots = (frac * k as f64) as usize;
-            pools.push(Pool { buf: gpu.zeros::<u8>(slots * slot_bytes)?, slot_bytes, owner: Vec::with_capacity(slots) });
-        }
         for l in &layers {
             out.push(match l {
                 None => None,

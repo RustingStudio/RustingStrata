@@ -98,6 +98,10 @@ const HOST: &[vk::MemoryPropertyFlags] = &[vk::MemoryPropertyFlags::from_raw(0xe
 /// load; device memory written through the BAR is seen at once. Host reads of it are uncached and slow.
 const BAR: &[vk::MemoryPropertyFlags] = &[vk::MemoryPropertyFlags::from_raw(7), vk::MemoryPropertyFlags::from_raw(0xe),
     vk::MemoryPropertyFlags::from_raw(6)];
+/// `BAR` with VK_AMD_device_coherent_memory: AMD's GPU caches device memory without seeing host writes through the
+/// BAR (and holds its own writes from the host), so the mailbox is memory the GPU does not cache (flags 0x40, 0x80).
+const BAR_AMD: &[vk::MemoryPropertyFlags] = &[vk::MemoryPropertyFlags::from_raw(0xc7), vk::MemoryPropertyFlags::from_raw(0xc6),
+    vk::MemoryPropertyFlags::from_raw(7), vk::MemoryPropertyFlags::from_raw(0xe), vk::MemoryPropertyFlags::from_raw(6)];
 
 /// Bytes of the quantized-x scratch buffer.
 const XQ: usize = 4 << 20;
@@ -112,6 +116,8 @@ struct Inner {
     budget: bool,
     /// VK_KHR_cooperative_matrix with the 16 x 16 x 16 f16 / f32 and 16 x 16 x 32 int8 / int32 shapes is enabled.
     coop: bool,
+    /// VK_AMD_device_coherent_memory is enabled (the mailbox uses `BAR_AMD`).
+    amd_coherent: bool,
     /// Specialization constant 0 of kernels that quantize x: llama.cpp q8_K numerics (`--llama-numerics`).
     llama: u32,
     /// STRATA_VK_STATS: print the driver's statistics (registers, ...) of each pipeline as it is created.
@@ -268,6 +274,12 @@ impl Vk {
             && shape(32, vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32)
             && std::env::var_os("STRATA_VK_NO_COOP").is_none();  // STRATA_VK_NO_COOP: run the kernels for devices without them
         if coop { exts.push(ash::khr::cooperative_matrix::NAME.as_ptr()) }
+        let mut fdc = vk::PhysicalDeviceCoherentMemoryFeaturesAMD::default();
+        let amd_coherent = has(ash::amd::device_coherent_memory::NAME) && {
+            unsafe { instance.get_physical_device_features2(pd, &mut vk::PhysicalDeviceFeatures2::default().push_next(&mut fdc)) };
+            fdc.device_coherent_memory == vk::TRUE
+        };
+        if amd_coherent { exts.push(ash::amd::device_coherent_memory::NAME.as_ptr()) }
         let stats = std::env::var_os("STRATA_VK_STATS").is_some() && has(ash::khr::pipeline_executable_properties::NAME);
         if stats { exts.push(ash::khr::pipeline_executable_properties::NAME.as_ptr()) }
         let mut fstats = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default().pipeline_executable_info(true);
@@ -283,6 +295,7 @@ impl Vk {
         f.features.shader_float64 = vk::TRUE;
         if coop { f = f.push_next(&mut fcoop) }
         if stats { f = f.push_next(&mut fstats) }
+        if amd_coherent { f = f.push_next(&mut fdc) }
         let prio = [1.0];
         let qi = [vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio)];
         let dev = unsafe { instance.create_device(pd, &vk::DeviceCreateInfo::default().queue_create_infos(&qi)
@@ -298,7 +311,7 @@ impl Vk {
         let st = State { pool, spare: vec![], used: vec![], cur: None, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false,
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, coop, llama: crate::cuda::llama_numerics() as u32, stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, coop, amd_coherent, llama: crate::cuda::llama_numerics() as u32, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -329,8 +342,10 @@ impl Inner {
         let size = bytes.max(1).next_multiple_of(4) as u64;
         let buf = unsafe { self.dev.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(usage), None) }?;
         let req = unsafe { self.dev.get_buffer_memory_requirements(buf) };
+        // Memory the GPU does not cache (AMD flags 0xc0) only when asked for: it would be slow for anything else.
+        let ok = |f: vk::MemoryPropertyFlags, want| f.contains(want) && (f & vk::MemoryPropertyFlags::from_raw(0xc0) & !want).is_empty();
         let ty = wants.iter().find_map(|&want| (0..self.mem.memory_type_count).find(|&i| req.memory_type_bits & (1 << i) != 0
-            && self.mem.memory_types[i as usize].property_flags.contains(want)));
+            && ok(self.mem.memory_types[i as usize].property_flags, want)));
         let mut flags = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
         let r = ty.context("no memory type").and_then(|ty| Ok(unsafe { self.dev.allocate_memory(&vk::MemoryAllocateInfo::default()
             .allocation_size(req.size).memory_type_index(ty).push_next(&mut flags), None) }
@@ -688,9 +703,9 @@ impl Backend for Vk {
         self.0.submit(&mut st, Some(c), false)
     }
 
-    /// Device memory mapped through the BAR (`BAR`).
+    /// Device memory mapped through the BAR (`BAR`, or `BAR_AMD`).
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)> {
-        let (b, p) = self.buf(4 * words.max(1), BAR)?;
+        let (b, p) = self.buf(4 * words.max(1), if self.0.amd_coherent { BAR_AMD } else { BAR })?;
         Ok((b, p.cast()))
     }
     fn kv_words(&self, n: usize) -> usize { n }
