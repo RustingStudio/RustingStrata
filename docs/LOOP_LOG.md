@@ -33,7 +33,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   632-634/640 (#124).
 - At 52b364e (#165, `bench --mtp 0`, tg128 after pp512, load 0.6-2.9): CUDA decode 117.5 (4B 98.5), Vulkan 117.0 (4B 104.0).
 - At d73cc1f (#179, same bench, load 0.8-1.5): CUDA decode 119.6, MTP k = 1 136.1 (4B not re-measured).
-- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832, 1884 at 92c594b (#184), 2013 at febaded (#185), 2052 at 1aa1182 (#187).
+- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832, 1884 at 92c594b (#184), 2013 at febaded (#185), 2052 at 1aa1182 (#187); #188 +0.7% CUDA, +0.6% Vulkan (Vulkan default residency ~1905).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -3208,6 +3208,22 @@ IQ2_XS and IQ3_XXS and decodes through `QS<T>::get` (d times the signed grid byt
 - A/B, CUDA pp2048 default residency, 3 warm rounds each, load 0.93: base 2040.6 (2040.2-2040.8), new 2051.9
   (2051.6-2052.4), +0.55%; decode unchanged (116.1). Greedy md5s unchanged on both backends (short, kvq8, mtp1,
   long prompt), 74 tests pass, parity 626/640 (base 627, normal drift).
+
+### 2026-10-30 #188 — reuse the int8 x across consecutive prefill GEMMs (bb7eb6f)
+
+- Every integer prefill GEMM quantized its x with `quant_q8` (~30 ms of a CUDA pp2048), also when the GEMM before
+  had just quantized the same h. New `gemm` act flag `SAME_X` (backend.rs): x is unchanged since the previous gemm
+  call, which read the same x. Both backends keep the (x, stride, rows, cols) of their last quantization and skip
+  `quant_q8` on a match; a call without the flag that does not quantize (f32 router) clears it, so a stale int8 h
+  from before a norm cannot match.
+- Prefill flags the GEMMs that follow another one on h: SSM gate/beta/alpha, attention k/v, dense up, shared
+  gate_inp/gate/up, routed gate/up. The shared expert's down moved after the routed groups, so the first routed gate
+  reuses the shared up's int8 h. Staged groups after the first still quantize again (the routed down in between).
+- A/B pp2048 default residency, 3 warm rounds each, load 0.8-1.2: CUDA 2025.8 (2022.1-2030.2) -> 2040.8
+  (2038.2-2042.8), +0.7%; Vulkan 1893.5 (1889.9-1896.5) -> 1904.5 (1903.5-1905.3), +0.6%. Decode unchanged. The
+  base measured 2041 an hour earlier (#187); the GPU drifts between runs, so only interleaved pairs compare.
+- Greedy md5s unchanged on both backends (short, kvq8, mtp1, `STRATA_EXPERT_MB=6000`, long prompt), 74 tests pass,
+  parity 626/640 (base 629, normal drift).
 
 ## Next candidates
 
