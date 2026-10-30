@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 7475bd7 (#148, `bench --mtp 0`, tg128 after pp512, load 1.0-1.9): CUDA decode 115.4 (4B 98.0), Vulkan 106.9 (4B 102.8).
+- At 9a265d9 (#149, `bench --mtp 0`, tg128 after pp512, load 0.9-1.9): CUDA decode 116.1 (4B 98.4), Vulkan 106.9 (4B 102.8).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2677,6 +2677,22 @@ reads back only the id; `decode` uses it for greedy GPU runs without MTP. Same t
   `logits` command use `step` as before.
 - Left: the ~400 us `cuGraphLaunch` before the GPU starts. Splitting the decode graph so the first part starts while
   the rest is launched is the next try.
+
+### 2026-10-30 #149 — CUDA argmax over 64 blocks per row; decode graph cut in parts: no gain (9a265d9)
+
+- Graph in parts: #148's ~400 us `cuGraphLaunch` was nsys overhead of `--cuda-graph-trace node`; with `graph`-level
+  tracing the launch is ~97 us (still traced). A `graph_cut` that ended the capture at chosen layers and launched
+  the parts in order (cuts at layers {1,4}, {1,2,4,..,32}, {1,3,10}) gave 115.0-115.1 against 115.0-115.4 uncut on
+  the 35B (2 rounds, load 1.6-2.6). Reverted.
+- The graph-level trace showed `argmax_rows` at 75 us per token on the 35B: one block of 1024 threads read the
+  1 MB of logits. `argmax_part` (grid 64 x rows, 256 threads) reduces 64 slices of each row into a small partials
+  buffer, and `argmax_rows` (one block of 64 per row) reduces those. First index on ties as before.
+- A/B against 7475bd7, interleaved, `bench --mtp 0`: CUDA 35B 115.0 -> 115.9 (6+6, spread 0.5/0.5, both drift up
+  together; load 0.9-1.2), CUDA 4B 98.2 -> 98.4 (3+3, load 1.2-1.3).
+- Greedy md5s unchanged on CUDA: 4B `64bab3bb`, 35B mtp0 `06c92e18`, mtp1 `04cf91e9`, kvq8 `04cf91e9`, and the
+  2023-token prompt (mtp1 `d8774b12`, mtp0 `d03a4d33`). 74 tests pass (`argmax_rows_matches_ops_argmax` included).
+- Vulkan not changed: its `argmax_rows` takes 17 us per token on the 4B (STRATA_VK_PROF, 151936 tokens), ~28 us
+  expected on the 35B, so at most ~0.2%.
 
 ## Next candidates
 
