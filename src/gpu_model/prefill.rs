@@ -126,11 +126,14 @@ impl GpuModel<'_> {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, .. } => {
                     let (eb, eg) = (at(l.e), at(l.e + n * nv));
                     g.gemm_dense(qkv, t, h, ne, at(l.a), channels, 0)?;
-                    g.gemm_dense(beta, t, h, ne, eb, nv, SAME_X)?;
-                    g.gemm_dense(alpha, t, h, ne, eg, nv, SAME_X)?;
-                    g.ssm_gates(eb, eg, dt_bias.ptr, a.ptr, t * nv, nv)?;
                     g.conv_seq(at(l.a), conv.addr(), conv_w.ptr, at(l.c), channels, c.ssm_conv, t, 0, 0)?;
-                    g.l2_norm(at(l.c), dk, 2 * nk, channels, t * 2 * nk, eps)?;
+                    // The beta and alpha GEMMs (16 blocks each) run beside the norm: batch launches alternate streams.
+                    g.batch(&mut || {
+                        g.gemm_dense(beta, t, h, ne, eb, nv, SAME_X)?;
+                        g.l2_norm(at(l.c), dk, 2 * nk, channels, t * 2 * nk, eps)?;
+                        g.gemm_dense(alpha, t, h, ne, eg, nv, SAME_X)
+                    })?;
+                    g.ssm_gates(eb, eg, dt_bias.ptr, a.ptr, t * nv, nv)?;
                     // The z GEMM runs beside the scan, on the SMs its last wave of blocks leaves idle.
                     g.batch(&mut || {
                         g.deltanet(at(l.c), s.addr(), eb, eg, 0, 0, at(l.d), nk, nv, c.k_interleave, dk, dv, 1.0 / (dk as f32).sqrt(), t, channels, 0, 0)?;
