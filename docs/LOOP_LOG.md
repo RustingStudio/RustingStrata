@@ -3039,6 +3039,14 @@ Greedy md5s unchanged on both backends (4B 64bab3bb; 35B mtp0 06c92e18, mtp1 04c
 
 Not verified: parity not re-run (bit-identical by construction, md5s agree); the 4B was not benched; the Vulkan float GEMV is unchanged.
 
+### 2026-10-30 #175 — Vulkan F32 dequant and gemv_f x with 16-byte loads (no code commit)
+
+The #174 change ported to Vulkan: `deq8` for F32 and the x loads of `gemv_f` through a 16-byte-aligned `vec4` buffer reference instead of scalar floats.
+
+Vulkan A/B vs 6c54e18 (abl.sh, pp512 tg128 mtp0, 2 x 4 interleaved rounds, load 1.3-2.2): first run base 117.0/117.5/117.2/117.3 vs 115.2 (cold first round)/117.3/117.7/117.5; second run base 117.7/117.6/117.7/117.6 vs 117.7/117.7/117.5/117.7. Means of the second run: 117.65 both. No gain; the NVIDIA Vulkan compiler appears to merge the scalar loads already. Reverted.
+
+Not verified: Vulkan kernel times (no per-kernel profile was taken); greedy md5s were not run on the reverted change.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
