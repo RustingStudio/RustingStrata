@@ -3,7 +3,7 @@
 
 use crate::quant::{GgmlType, tables::*};
 use anyhow::{Context, bail};
-use crate::backend::{Backend, Buf};
+use crate::backend::{Backend, Buf, SAME_X};
 use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice, LaunchConfig, PushKernelArg, result, sys};
 use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
 use std::collections::{HashMap, VecDeque};
@@ -32,8 +32,9 @@ pub struct Gpu {
     /// Launches so far in the current `batch` (usize::MAX outside one).
     nb: AtomicUsize,
     fns: HashMap<String, CudaFunction>,
-    /// q8 rows of the last integer GEMM's X (see quant_q8 in kernels.cu), grown on demand.
-    q8: std::sync::Mutex<CudaSlice<u8>>,
+    /// q8 rows of the last integer GEMM's X (see quant_q8 in kernels.cu), grown on demand, and which x they hold
+    /// (x, x_stride, n_x, cols) for a `SAME_X` call; None after a call without it that did not quantize.
+    q8: std::sync::Mutex<(CudaSlice<u8>, Option<[u64; 4]>)>,
     /// The kernels were compiled for a q8 KV cache (`--kv q8`).
     pub kv_q8: bool,
     /// `argmax_rows` partials, AMAX_PARTS per row.
@@ -157,7 +158,7 @@ impl Gpu {
             }
             fns.insert(n, f);
         }
-        let q8 = std::sync::Mutex::new(stream.alloc_zeros::<u8>(1)?);
+        let q8 = std::sync::Mutex::new((stream.alloc_zeros::<u8>(1)?, None));
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_q8, am, graphs: Default::default(), ring })
@@ -195,17 +196,22 @@ impl Gpu {
         if cols % 256 != 0 { bail!("{} matrix with {cols} columns: GEMM needs a multiple of 256", ty.name()); }
         if n_tiles == 0 { return Ok(()); }
         let grid = (rows.div_ceil(64) as u32, n_tiles as u32);
+        let (same, act) = (act & SAME_X != 0, act & !SAME_X);
+        let mut q8 = self.q8.lock().unwrap();
         if !Self::mmq(ty) {
+            if !same { q8.1 = None; }
             launch!(self, &kname("gemm", ty), cfg(grid, 2 * GEMM_BM as u32, 0),
                 tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 256) as i32, act);
             return Ok(());
         }
-        // ponytail: X is quantized on every call, also when several GEMMs read the same x; reuse if it shows in profiles.
-        let mut q8 = self.q8.lock().unwrap();
         let need = n_x * (cols + cols / 8 + cols / 4);
-        if q8.len() < need { *q8 = self.stream.alloc_zeros::<u8>(need)?; }
-        let xq = self.ptr(&*q8);
-        launch!(self, "quant_q8", cfg((n_x as u32, 1), 256, 0), x, x_stride as i32, xq, cols as i32);
+        if q8.0.len() < need { q8.0 = self.stream.alloc_zeros::<u8>(need)?; }
+        let xq = self.ptr(&q8.0);
+        let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
+        if !(same && q8.1 == key) {
+            launch!(self, "quant_q8", cfg((n_x as u32, 1), 256, 0), x, x_stride as i32, xq, cols as i32);
+            q8.1 = key;
+        }
         launch!(self, &kname("gemmi", ty), cfg(grid, 2 * GEMM_BM as u32, 0),
             tiles, wd, nd as i32, xq, xrow, y, y_stride as i32, rows as i32, (cols / 256) as i32, act);
         Ok(())

@@ -69,6 +69,9 @@ pub fn open(kind: Option<&str>, device: usize) -> anyhow::Result<Box<dyn Backend
     }
 }
 
+/// `gemm` `act` flag: x is unchanged since the previous gemm call, which read the same x, so its int8 copy is reused.
+pub const SAME_X: i32 = 4;
+
 pub trait Backend: Send {
     /// "cuda" or "vulkan".
     fn name(&self) -> &'static str;
@@ -103,7 +106,8 @@ pub trait Backend: Send {
     fn kv_words(&self, n: usize) -> usize;
     /// GEMM over a tile list: for each tile, positions m0 .. m0 + cnt get y[m, 0..rows] = W_tile x[xrow[m]] (x row m
     /// when `xrow` is 0). `tiles` is a device array of [w, m0 | cnt << 32]. `act`: 0 stores, 1 computes
-    /// y = silu(y) * result (SwiGLU with the gate already in y), 2 adds to y. `n_x`: rows of x the tiles read.
+    /// y = silu(y) * result (SwiGLU with the gate already in y), 2 adds to y; `| SAME_X` as below. `n_x`: rows of x
+    /// the tiles read.
     fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()>;
     /// y[m] (op) W x[m] for positions m < n, x and y rows `x_stride` / `y_stride` floats apart.
     fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()>;

@@ -3,7 +3,7 @@
 //! copied into a small staging area, a group of them at a time.
 
 use super::{Ffn, GpuModel, Mixer};
-use crate::backend::{Backend, Buf, GEMM_BM};
+use crate::backend::{Backend, Buf, GEMM_BM, SAME_X};
 use crate::expert_cache::MATS;
 use crate::model::Model;
 
@@ -126,9 +126,9 @@ impl GpuModel<'_> {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, .. } => {
                     let (eb, eg) = (at(l.e), at(l.e + n * nv));
                     g.gemm_dense(qkv, t, h, ne, at(l.a), channels, 0)?;
-                    g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, 0)?;
-                    g.gemm_dense(beta, t, h, ne, eb, nv, 0)?;
-                    g.gemm_dense(alpha, t, h, ne, eg, nv, 0)?;
+                    g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, SAME_X)?;
+                    g.gemm_dense(beta, t, h, ne, eb, nv, SAME_X)?;
+                    g.gemm_dense(alpha, t, h, ne, eg, nv, SAME_X)?;
                     g.ssm_gates(eb, eg, dt_bias.ptr, a.ptr, t * nv, nv)?;
                     g.conv_seq(at(l.a), conv.addr(), conv_w.ptr, at(l.c), channels, c.ssm_conv, t, 0, 0)?;
                     g.l2_norm(at(l.c), dk, 2 * nk, channels, t * 2 * nk, eps)?;
@@ -142,8 +142,8 @@ impl GpuModel<'_> {
                     g.gemm_dense(q, t, h, ne, at(l.a), nh * qs, 0)?;
                     g.rms_norm(at(l.a), qs, qn.ptr, at(l.b), hd, hd, t * nh, eps)?;
                     g.rope_neox(at(l.b), hd, t * nh, nh, c.n_rot, step, c.rope_base)?;
-                    g.gemm_dense(k, t, h, ne, kraw, kv, 0)?;
-                    g.gemm_dense(v, t, h, ne, vv, kv, 0)?;
+                    g.gemm_dense(k, t, h, ne, kraw, kv, SAME_X)?;
+                    g.gemm_dense(v, t, h, ne, vv, kv, SAME_X)?;
                     g.rms_norm(kraw, hd, kn.ptr, kk, hd, hd, t * nkv, eps)?;
                     g.rope_neox(kk, hd, t * nkv, nkv, c.n_rot, step, c.rope_base)?;
                     g.kv_store(kk, vv, kc.addr(), vc.addr(), kv, t, step, hd)?;
@@ -155,7 +155,7 @@ impl GpuModel<'_> {
             match &ly.ffn {
                 Ffn::Dense { gate, up, down } => {
                     g.gemm_dense(gate, t, h, ne, at(l.ge), c.n_ff, 0)?;
-                    g.gemm_dense(up, t, h, ne, at(l.ge), c.n_ff, 1)?;
+                    g.gemm_dense(up, t, h, ne, at(l.ge), c.n_ff, 1 | SAME_X)?;
                     g.gemm_dense(down, t, at(l.ge), c.n_ff, x, ne, 2)?;
                 }
                 Ffn::Moe { router, shared } => {
@@ -165,10 +165,9 @@ impl GpuModel<'_> {
                     g.router_topk(at(l.rl), c.n_expert, k, c.expert_weights_scale, ids_d, at(l.wts), t)?;
                     let (sh, sg) = match shared {
                         Some(s) => {
-                            g.gemm_dense(&s.gate_inp, t, h, ne, at(l.sg), 1, 0)?;
-                            g.gemm_dense(&s.gate, t, h, ne, at(l.shg), c.n_ff_shexp, 0)?;
-                            g.gemm_dense(&s.up, t, h, ne, at(l.shg), c.n_ff_shexp, 1)?;
-                            g.gemm_dense(&s.down, t, at(l.shg), c.n_ff_shexp, at(l.shy), ne, 0)?;
+                            g.gemm_dense(&s.gate_inp, t, h, ne, at(l.sg), 1, SAME_X)?;
+                            g.gemm_dense(&s.gate, t, h, ne, at(l.shg), c.n_ff_shexp, SAME_X)?;
+                            g.gemm_dense(&s.up, t, h, ne, at(l.shg), c.n_ff_shexp, 1 | SAME_X)?;
                             (at(l.shy), at(l.sg))
                         }
                         None => (0, 0),
@@ -238,10 +237,12 @@ impl GpuModel<'_> {
                             }
                         }
                         let sp = spans[gi];
-                        g.gemm(mg.ty, mg.rows, mg.cols, tp(sp[0].0), sp[0].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 0)?;
-                        g.gemm(mu.ty, mu.rows, mu.cols, tp(sp[1].0), sp[1].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1)?;
+                        g.gemm(mg.ty, mg.rows, mg.cols, tp(sp[0].0), sp[0].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, SAME_X)?;
+                        g.gemm(mu.ty, mu.rows, mu.cols, tp(sp[1].0), sp[1].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X)?;
                         g.gemm(md.ty, md.rows, md.cols, tp(sp[2].0), sp[2].1, at(l.ge), c.n_ff_exp, t * k, 0, at(l.ye), ne, 0)?;
                     }
+                    // The shared down runs last, so the routed gate and up above reuse the int8 h of the shared up.
+                    if let Some(s) = shared { g.gemm_dense(&s.down, t, at(l.shg), c.n_ff_shexp, at(l.shy), ne, 0)?; }
                     g.moe_combine_seq(x, at(l.ye), at(l.wts), pf.ints.addr() + 4 * (2 * n * k) as u64, k, sh, sg, ne, t)?;
                 }
             }
