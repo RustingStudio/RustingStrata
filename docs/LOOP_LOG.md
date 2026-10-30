@@ -33,7 +33,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   632-634/640 (#124).
 - At 52b364e (#165, `bench --mtp 0`, tg128 after pp512, load 0.6-2.9): CUDA decode 117.5 (4B 98.5), Vulkan 117.0 (4B 104.0).
 - At d73cc1f (#179, same bench, load 0.8-1.5): CUDA decode 119.6, MTP k = 1 136.1 (4B not re-measured).
-- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832, 1884 at 92c594b (#184), 2013 at febaded (#185).
+- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832, 1884 at 92c594b (#184), 2013 at febaded (#185), 2052 at 1aa1182 (#187).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -3200,6 +3200,14 @@ IQ2_XS and IQ3_XXS and decodes through `QS<T>::get` (d times the signed grid byt
   change gives identical files, so the loss is real. Under `STRATA_VK_PROF` both run at ~1775 with gemm_f
   413-415 ms, so the loss does not show per dispatch. The driver reports 29.7 KB shared for the new gemm_f
   and 35.3 KB for the old (static arrays are 29.7 KB). Reason unknown; Vulkan gemm_f looks sensitive to any edit.
+
+### 2026-10-30 #187 — gemmi_q padding warp skip (1aa1182)
+
+- The gemm_q skip from #184 applied to `gemmi_q` (int8 MMQ): `if (wm < tl.cnt)` around the per-step mma loop, so a
+  warp whose 32 tile rows are all past the expert's count does no mma.
+- A/B, CUDA pp2048 default residency, 3 warm rounds each, load 0.93: base 2040.6 (2040.2-2040.8), new 2051.9
+  (2051.6-2052.4), +0.55%; decode unchanged (116.1). Greedy md5s unchanged on both backends (short, kvq8, mtp1,
+  long prompt), 74 tests pass, parity 626/640 (base 627, normal drift).
 
 ## Next candidates
 
