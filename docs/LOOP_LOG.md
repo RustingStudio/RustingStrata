@@ -3235,6 +3235,10 @@ IQ2_XS and IQ3_XXS and decodes through `QS<T>::get` (d times the signed grid byt
   row, so same bits). The compiler took 96 registers: 3810 -> 4903 us per pp2048 call. Reverted. With the scan's
   numerics fixed (greedy md5s), registers rule out a wave fit; the chunked form would change the output.
 
+### 2026-10-30 #190 — SSM z GEMM beside the deltanet scan (680cdb8)
+
+The SSM z GEMM (4096 rows, ~2.5 ms) only needs the int8 h of the qkv GEMM, so it moves from after qkv into a `batch` with `deltanet_seq`; it reuses the int8 x via `SAME_X`. `gemm_raw` now refuses a `quant_q8` inside a batch on both backends (the side stream would race on the shared int8 buffer). nsys pp2048: z starts ~2600 us into the ~3430 us scan, when the scan's third wave leaves SMs free (124 regs, 2 blocks/SM, so not earlier); the qkv-to-norm_gate span per SSM layer drops 11.08 -> 9.96 ms. End to end the gain is smaller: interleaved A/B rounds 1-3, load 0.7-1.3, CUDA 2039.6 (2037.6-2043.1) -> 2045.9 (2043.0-2048.1) +0.3%, Vulkan 1904.3 (1902.4-1905.4) -> 1912.3 (1909.3-1914.2) +0.4%. Greedy md5s unchanged, 74 tests green, parity 625/640 (base 626-627, normal drift).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
