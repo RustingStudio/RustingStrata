@@ -33,7 +33,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   632-634/640 (#124).
 - At 52b364e (#165, `bench --mtp 0`, tg128 after pp512, load 0.6-2.9): CUDA decode 117.5 (4B 98.5), Vulkan 117.0 (4B 104.0).
 - At d73cc1f (#179, same bench, load 0.8-1.5): CUDA decode 119.6, MTP k = 1 136.1 (4B not re-measured).
-- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832, 1884 at 92c594b (#184), 2013 at febaded (#185), 2052 at 1aa1182 (#187), 2093 at b45136b (#191); #188 +0.7% CUDA, +0.6% Vulkan (Vulkan default residency ~1905). Vulkan pp2048 1925 at 603557f (#201-#202).
+- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832, 1884 at 92c594b (#184), 2013 at febaded (#185), 2052 at 1aa1182 (#187), 2093 at b45136b (#191); #188 +0.7% CUDA, +0.6% Vulkan (Vulkan default residency ~1905). Vulkan pp2048 1925 at 603557f (#201-#202), 1929 at 415b742 (#203).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -3378,6 +3378,16 @@ Q6_K full tiles unchanged.
   1900.5 / 1909.7 / 1918.8 -> 1915.9 / 1926.9 / 1933.2 (mean 1909.7 -> 1925.3, +0.8%).
 - 74 tests passed; greedy md5s unchanged on both backends (12 pairs); parity 624 (base) / 628.
 - Left: part-full tiles are still slower on Vulkan than on CUDA (IQ3_XXS at 64 per tile 0.75 vs 0.58 ms).
+
+### 2026-10-30 #203 — Vulkan gemmi decodes weights packed through qw (415b742)
+
+`ldw` in `gemmi` loaded each weight word pair as eight int8 values (`qi8`) and packed them back (`pack4`). It now
+calls `qw` from deq.glsl, which applies IQ grids and sign masks on packed bytes. Same bytes. `gemm_throughput`
+(Vulkan, temporary `HC` tile count): IQ3_XXS 128 per tile 0.54 -> 0.53 ms, 64: 0.75 -> 0.74, 32: 1.29 -> 1.23;
+Q6_K 64 per tile 7.32 -> 7.05; Q5_K unchanged.
+- `bench --backend vulkan --pp 2048 --tg 16 --mtp 0`, interleaved rounds 1-3, load 1.50-1.64:
+  1895.1 / 1917.8 / 1922.1 -> 1919.6 / 1931.3 / 1936.1 (mean 1911.7 -> 1929.0, +0.9%).
+- 74 tests passed; greedy md5s unchanged on both backends (12 pairs); parity 627 (base) / 626.
 
 ## Next candidates
 
