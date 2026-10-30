@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At b0f7222 (#162, `bench --mtp 0`, tg128 after pp512, load 0.8-2.9): CUDA decode 117.5 (4B 98.6), Vulkan 111.1 (4B 103.4).
+- At 47472c6 (#163, `bench --mtp 0`, tg128 after pp512, load 0.6-0.9): CUDA decode 117.6 (4B 98.5), Vulkan 116.3 (4B 103.4).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2888,6 +2888,21 @@ already need sm_80 (cp.async, s8 mma), so there is no fallback.
   `(256, 6)` 32-39 us. No misses in the bench (hit rate 100%), so the miss spin was not the cost. Under CUDA
   graphs the extra launch is cheap, unlike a Vulkan dispatch + barrier. Diff kept outside the repo.
 - Not verified: Vulkan (untouched), prefill.
+
+### 2026-10-30 #163 — CPU worker: bulk read of the routing from the BAR mailbox (47472c6)
+
+- Cause, found by timing the host phases of a Vulkan decode token (temporary `Instant` prints, removed): the
+  `after_forward` step took 541 us mean (max 944) on Vulkan vs 14.5 us on CUDA, with the GPU idle. It reads each
+  CPU-cache layer's routing from the worker mailbox with per-word volatile reads, and on Vulkan the mailbox is BAR
+  memory (#2.3 note above: host reads uncached). Other phases: `put` 57.6 us (CUDA 13.4), tokenizer decode 13.8.
+- Change: `CpuWorker::routing` copies the layer's 3k words out of the mailbox with one `copy_nonoverlapping`, then
+  builds the tuples from the local copy. after_forward 541 -> 117 us mean (single run).
+- A/B vs 521462e, interleaved, load 0.6-0.9: Vulkan 35B 111.25 -> 116.25 (4 pairs, spread 115.9-116.5, all better),
+  Vulkan 4B 103.18 -> 103.35 (4 pairs, no CPU worker, neutral). CUDA 35B 117.58 -> 117.57 (6 pairs), 4B 98.50 ->
+  98.47 (3 pairs): neutral. Long prompt (2023 tokens, single run): Vulkan gen mtp0 53.8 -> 55.5, mtp1 49.7 -> 51.1.
+- Tests 74 passed. Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, long prompt mtp0/mtp1).
+- Not verified: what the remaining ~117 us is (still 8x CUDA); `put` (57.6 us) untouched; the worker thread's own
+  reads of the BAR mailbox (activations of missed experts) untouched; no miss-heavy run (the bench hits 100%).
 
 ## Next candidates
 
