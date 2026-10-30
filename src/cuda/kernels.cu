@@ -972,16 +972,28 @@ extern "C" __global__ void rms_norm(float* x, int x_stride, const float* w, floa
         for (; i < n; i += 256) s += xr[i] * xr[i];
     }
     float sc = 1.0f / sqrtf(block_sum(s) / (float)n + eps);
+    if (xq) {  // each thread scales, stores and quantizes its own 8 values, as quant_x would map them
+        signed char* q = xq + (size_t)blockIdx.x * n;
+        float* qd = (float*)(xq + (size_t)gridDim.x * n) + blockIdx.x * (n / 32);
+        for (int i0 = 0; i0 < n; i0 += blockDim.x * 8) {
+            int i = i0 + threadIdx.x * 8;
+            unsigned m = __ballot_sync(0xffffffff, i < n);
+            if (i >= n) continue;
+            float4 a = *(const float4*)(xr + i), c = *(const float4*)(xr + i + 4);
+            float4 wa = *(const float4*)(w + i), wc = *(const float4*)(w + i + 4);
+            a = make_float4(a.x * sc * wa.x, a.y * sc * wa.y, a.z * sc * wa.z, a.w * sc * wa.w);
+            c = make_float4(c.x * sc * wc.x, c.y * sc * wc.y, c.z * sc * wc.z, c.w * sc * wc.w);
+            *(float4*)(o + i) = a; *(float4*)(o + i + 4) = c;
+            quant8(a, c, i, q, qd, m);
+        }
+        return;
+    }
     int i = threadIdx.x, bd = blockDim.x;
     for (; i + 3 * bd < n; i += 4 * bd) {
         float a = xr[i] * sc * w[i], b = xr[i + bd] * sc * w[i + bd], c = xr[i + 2 * bd] * sc * w[i + 2 * bd], d = xr[i + 3 * bd] * sc * w[i + 3 * bd];
         o[i] = a; o[i + bd] = b; o[i + 2 * bd] = c; o[i + 3 * bd] = d;
     }
     for (; i < n; i += bd) o[i] = xr[i] * sc * w[i];
-    if (xq) {
-        __syncthreads();
-        quant_x(o, n, xq + (size_t)blockIdx.x * n, (float*)(xq + (size_t)gridDim.x * n) + blockIdx.x * (n / 32));
-    }
 }
 
 // Block-wide (largest b, first bi on ties) of the threads' (b, bi), in thread 0; bi == n marks no value yet.
