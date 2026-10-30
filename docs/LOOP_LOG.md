@@ -3289,6 +3289,17 @@ launches (conv_seq, conv_state), which the batch would put on different streams 
 - Parity (CUDA): base 627/640 (load 3.3), loop 628/640 (load 2.0).
 - Not tried yet: the shared expert's 1-row gate_inp GEMM (also 16 blocks, ~97 us, 40 calls) beside another op.
 
+### 2026-10-30 #195 — shared expert gate_inp GEMM beside the router GEMM (6671a06)
+
+The shared expert's gate_inp (1 row, `gemm_f32` grid 1 x 16, ~97 us, 40 calls per pp2048) ran alone after the router
+GEMM (256 rows, 64 blocks, ~216 us). Both read h and are float (F32 or BF16 in the local models, never MMQ), so each
+is one launch with no int8 x; they now go in one `batch`.
+- `bench --pp 2048 --tg 16 --mtp 0`, interleaved rounds 1-3, load 0.72-0.82: CUDA 2071.7 / 2071.6 / 2073.7 ->
+  2076.9 / 2079.5 / 2081.0 (mean 2072.3 -> 2079.1, +0.3%); Vulkan 1891.8 / 1901.1 / 1901.8 -> 1903.9 / 1903.5 /
+  1903.7 (mean 1898.2 -> 1903.7, +0.3%). This machine ran ~0.6% slower than in #194 (base 2072 vs 2085).
+- Tests: 74 passed. Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, long prompt mtp0/mtp1).
+- Parity (CUDA): base 628/640 (load 2.7), loop 626/640 (load 1.9), normal drift.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
