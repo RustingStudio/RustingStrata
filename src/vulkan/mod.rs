@@ -565,6 +565,18 @@ impl Backend for Vk {
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
         ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
         let mut st = self.0.st();
+        // A small copy goes inline into the open command buffer, with no staging round trip and no wait: the next
+        // submit (a graph replay or a flush) carries it.
+        if !src.is_empty() && src.len() <= 65536 && src.len() % 4 == 0 && st.rec.is_none() {
+            let (b, o) = st.find(dst.addr() + off as u64, src.len())?;
+            if o % 4 == 0 {
+                let cb = self.0.open_cb(&mut st)?;
+                self.0.barrier(cb, false);
+                unsafe { self.0.dev.cmd_update_buffer(cb, b, o, src) };
+                self.0.barrier(cb, false);
+                return Ok(());
+            }
+        }
         for (i, c) in src.chunks(STAGING).enumerate() {
             let (b, o) = st.find(dst.addr() + (off + i * STAGING) as u64, c.len())?;
             unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), st.map as *mut u8, c.len()) };
