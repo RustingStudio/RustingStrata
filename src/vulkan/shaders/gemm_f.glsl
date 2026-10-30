@@ -71,15 +71,17 @@ void main() {
         }
         barrier();
 #if COOP
-        for (uint kk = 0; kk < BK; kk += 16) {
+        // Expert tiles are often part full; a subgroup whose 32 positions are all past cnt has nothing to multiply.
+        if (wm < cnt)
+        [[unroll]] for (uint kk = 0; kk < BK; kk += 16) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a[2];
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b[2];
-            for (uint i = 0; i < 2; i++) {
+            [[unroll]] for (uint i = 0; i < 2; i++) {
                 coopMatLoad(a[i], xs, (wm + 16 * i) * PW + kk / 2, PW, gl_CooperativeMatrixLayoutRowMajor);
                 coopMatLoad(b[i], ws, (wn + 16 * i) * PW + kk / 2, PW, gl_CooperativeMatrixLayoutColumnMajor);
             }
-            for (uint mt = 0; mt < 2; mt++)
-                for (uint nt = 0; nt < 2; nt++) acc[mt][nt] = coopMatMulAdd(a[mt], b[nt], acc[mt][nt]);
+            [[unroll]] for (uint mt = 0; mt < 2; mt++)
+                [[unroll]] for (uint nt = 0; nt < 2; nt++) acc[mt][nt] = coopMatMulAdd(a[mt], b[nt], acc[mt][nt]);
         }
 #else
         for (uint k = 0; k < BK / 2; k++) {
