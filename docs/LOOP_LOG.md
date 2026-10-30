@@ -3256,6 +3256,16 @@ area) still wait for their copy. Vulkan records the copy with its barrier as bef
 - Parity (CUDA), 3 interleaved pairs, load 1.2-2.0: base 628 / 625 / 627, loop 624 / 627 / 627 (normal drift).
 - Not verified: prefill with a smaller expert cache (more staged groups per layer, where double buffering would pay).
 
+### 2026-10-30 #192 — staged copy after the up GEMM instead of before: no gain (no code commit)
+
+nsys of #191 (pp2048, CUDA) showed 52 ms of idle between the resident gate and up GEMMs: the up launch is enqueued
+only after the host has filled the pinned copy ring for group 1. Launching the up first and copying after it, in
+the same batch, moved the idle behind the up (193 ms between up and the next `quant_q8` under nsys, where the host
+side is slow). Under nsys the measured prefill also streams ~1 GB of experts (copies on both streams through the
+whole run), so its gaps overstate the bench case.
+- `bench --pp 2048 --tg 16 --mtp 0`, CUDA, interleaved rounds 1-3, load 0.68-0.75: base 2073.7 / 2082.1 / 2081.1
+  (mean 2079.0), up first 2076.3 / 2081.6 / 2084.9 (mean 2080.9): no change. Reverted.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
