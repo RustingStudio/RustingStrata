@@ -144,6 +144,8 @@ struct State {
     staging: (vk::Buffer, vk::DeviceMemory),
     /// Mapped `staging` (a pointer kept as an integer so the state is `Send`).
     map: usize,
+    /// Bytes of `staging` that queued host-to-device copies still read; freed by the next wait.
+    staged: usize,
     /// Live buffers by start address: (buffer, bytes).
     bufs: BTreeMap<u64, (vk::Buffer, usize)>,
     /// Host-mapped error word that `moe_combine` sets when the CPU worker does not answer: buffer, memory, host
@@ -294,7 +296,7 @@ impl Vk {
         let pc = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(128)];
         let layout = unsafe { dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc), None) }?;
         let st = State { pool, spare: vec![], used: vec![], cur: None, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false,
-            pipes: HashMap::new(), fence, staging: Default::default(), map: 0, bufs: BTreeMap::new(), err: Default::default(),
+            pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
         let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, coop, llama: crate::cuda::llama_numerics() as u32, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
@@ -393,6 +395,7 @@ impl Inner {
             let used = std::mem::take(&mut st.used);
             st.spare.extend(used);
             st.busy = false;
+            st.staged = 0;
             let e = st.err.2 as *mut u32;
             if !e.is_null() && unsafe { e.read_volatile() } != 0 {
                 unsafe { e.write_volatile(0) };
@@ -577,14 +580,20 @@ impl Backend for Vk {
                 return Ok(());
             }
         }
+        // Larger copies fill `staging` front to back and wait only when it is full, so a run of uploads (experts
+        // streamed in prefill) overlaps each copy on the GPU with the host filling the next.
+        ensure!(st.rec.is_none(), "a host copy while recording a graph");
         for (i, c) in src.chunks(STAGING).enumerate() {
+            if st.staged + c.len() > STAGING { self.0.flush(&mut st)?; }
             let (b, o) = st.find(dst.addr() + (off + i * STAGING) as u64, c.len())?;
-            unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), st.map as *mut u8, c.len()) };
-            let cb = self.0.cb(&mut st)?;
-            let r = vk::BufferCopy::default().dst_offset(o).size(c.len() as u64);
+            let at = st.staged;
+            unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), (st.map + at) as *mut u8, c.len()) };
+            let cb = self.0.open_cb(&mut st)?;
+            let r = vk::BufferCopy::default().src_offset(at as u64).dst_offset(o).size(c.len() as u64);
             unsafe { self.0.dev.cmd_copy_buffer(cb, st.staging.0, b, &[r]) };
             self.0.barrier(cb, false);
-            self.0.flush(&mut st)?;
+            st.staged = (at + c.len()).next_multiple_of(256);
+            self.0.submit(&mut st, None, false)?;
         }
         Ok(())
     }
