@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At f634692 (#152, `bench --mtp 0`, tg128 after pp512, load 0.9-1.9): CUDA decode 116.5 (4B 98.4), Vulkan 107.5 (4B 102.8).
+- At 35c937c (#153, `bench --mtp 0`, tg128 after pp512, load 0.9-1.9): CUDA decode 117.0 (4B 98.5), Vulkan 107.5 (4B 102.8).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2735,6 +2735,20 @@ pp512 there are no misses and it is 3.5 us, as on CUDA.)
 - Not verified: head dims other than 128 (the vec4 layout is the same for all of 32-256).
 - Also tried on CUDA (no gain, reverted): `gemv_row_q` unroll 2 or 8 for all types 116.6 -> 111.0-111.4; unroll 8
   for IQ2_XS only 116.5 -> 115.9.
+
+### 2026-10-30 #153 — CUDA IQ apply_signs as one add (35c937c)
+
+- `apply_signs` (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S grids in `QI`) now computes `(g ^ m) + n` with
+  n = 0x01 in each byte to negate and m = n * 0xFF, instead of `__vsub4(g ^ m, m)`. ~g + 1 never carries out
+  of a byte because no grid byte is 0 (checked for all five tables in `src/quant/tables.rs`), so the result is
+  bit-identical.
+- Interleaved A/B against d2cdf5e (`bench --mtp 0`, tg128 after pp512, load 1.0-1.7): 35B CUDA decode 116.4
+  (116.1-116.5) -> 117.0 (116.9-117.0), 6 runs each; 4B 98.4 -> 98.5 (3 runs, noise; 4B has no IQ grids).
+- Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, 2023-token prompt). 74 tests pass.
+- No gain, reverted (no code commit): `moe_gemv` handling 2 rows per warp pass (NR=2: 115.3 vs 116.5; NR=2 with
+  rpw 8: within noise; NR=4: 111); the IQ2_XS grid (512 x u64) copied to shared memory per block: neutral
+  (within +-0.2). Together with #151 this points at instruction count, not latency, in the MoE GEMVs.
+- Not verified: Vulkan `apply_signs` in `deq.glsl` still uses the 7-op bytewise subtract; next item.
 
 ## Next candidates
 
