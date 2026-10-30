@@ -3342,6 +3342,18 @@ trailing U+FFFD), so it now decodes from the first token not emitted yet.
 - Tests 74 passed; all 12 greedy md5 pairs unchanged; a Chinese and emoji reply (4B, greedy and `--temp 0.8 --seed
   1`) is byte-identical to the base; parity 625/640 (base 626/640, load 2.3-3.0).
 
+### 2026-10-30 #200 — Vulkan rms_norm stores its output from quant_x's values (972042a)
+
+#173 on Vulkan. With `q` set (the decode `rms_norm_q` calls), `quant_x` now also writes `out` from the 8 values per
+invocation it quantizes (the same `x * sc * w` products), and the separate output loop runs only without `q`. x is
+read once less; outputs and int8 copies are bit-identical.
+- Decode profile (`STRATA_VK_PROF=1 STRATA_NO_GRAPH=1`, pp512 tg256, one run each, load 1.3): rms_norm 4.19 -> 3.67
+  us per call (25957 calls).
+- `bench --backend vulkan --pp 512 --tg 256 --mtp 0`, interleaved rounds 1-4 (round 0 dropped), load 1.15-1.27:
+  117.6 / 117.8 / 117.7 / 117.4 -> 117.8 / 117.8 / 117.7 / 117.7 (mean 117.63 -> 117.75, +0.1%, never behind).
+- 74 tests passed; greedy md5s unchanged on both backends (12 pairs); parity 623 (base, load 3.7) / 625 (new).
+  CUDA code unchanged.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
