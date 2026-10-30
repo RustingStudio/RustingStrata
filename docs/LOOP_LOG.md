@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At fd355a0 (#155, `bench --mtp 0`, tg128 after pp512, load 0.8-2.7): CUDA decode 117.0 (4B 98.5), Vulkan 108.9 (4B 103.0).
+- At b128a7c (#156, `bench --mtp 0`, tg128 after pp512, load 0.8-2.7): CUDA decode 117.0 (4B 98.5), Vulkan 109.7 (4B 103.5).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2776,6 +2776,22 @@ pp512 there are no misses and it is 3.5 us, as on CUDA.)
 - 4B Vulkan 103.1 (102.9-103.5) -> 103.0 (102.7-103.3), noise.
 - Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, 2023-token prompt). 74 tests pass.
 - Not verified: the per-kernel time of the new passes (not profiled).
+
+### 2026-10-30 #156 — Vulkan norm_gate quantizes for the out GEMV (b128a7c)
+
+- The Vulkan decode profile had 110 `quant_xq` dispatches per token: 80 are the SwiGLU quantizations, 30 quantized
+  the DeltaNet `norm_gate` output before the `ssm_out` GEMV, each a dispatch plus a full barrier. `norm_gate` now
+  takes an xq pointer: after the head is written, a workgroup barrier, then `quant_x` over the head (heads of a token
+  are contiguous, so the rows are tokens as `quant_xq` lays them out). New `Backend::norm_gate_q`, default
+  `norm_gate` and 0 (CUDA keeps its in-GEMV quantization); new 9/32 x d_inner buffer "oq". Llama numerics keep the
+  separate quantization (their one scale per 256 values spans two 128-wide heads).
+- Same values quantized by the same `quant_x`, so bit-identical.
+- Interleaved A/B against 74184b5, 35B Vulkan decode (`bench --mtp 0`, tg128 after pp512):
+  - quick set, load 1.5-1.7: 108.6 (108.1-108.9) -> 109.5 (109.4-109.8), 3 runs each;
+  - full set, load 1.1-1.4: 109.1 (109.0-109.2) -> 109.7 (109.6-109.7), 4 runs each.
+- 4B Vulkan 103.1 (102.4-103.7) -> 103.5 (103.3-103.7); 4B has no DeltaNet, so noise.
+- Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, 2023-token prompt). 74 tests pass.
+- Not verified: `--llama-numerics` on Vulkan (path unchanged: falls back to the old dispatches).
 
 ## Next candidates
 
