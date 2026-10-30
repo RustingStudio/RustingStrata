@@ -193,23 +193,25 @@ impl GpuModel<'_> {
                     let (pool, stride) = cache.base(lx);
                     let used = |e: &usize| off[e + 1] > off[*e];
                     let missed: Vec<usize> = (0..c.n_expert).filter(used).filter(|&e| cache.slot(il, e) < 0).collect();
-                    // Group 0: resident experts; then staged groups of at most STAGE missed experts.
-                    let mut groups: Vec<Vec<(usize, u64)>> = vec![(0..c.n_expert).filter(used)
-                        .filter_map(|e| { let s = cache.slot(il, e); (s >= 0).then(|| (e, pool + (s as usize * stride) as u64)) }).collect()];
+                    // Group 0: resident experts; then staged groups of at most STAGE missed experts. Staging holds
+                    // each matrix in its own section (all gates, then ups, then downs), so experts with consecutive
+                    // ids are contiguous there as in the weights and copy in one call.
+                    let mut groups: Vec<Vec<(usize, [u64; 3])>> = vec![(0..c.n_expert).filter(used)
+                        .filter_map(|e| { let s = cache.slot(il, e); (s >= 0).then(|| (e, lx.mats.each_ref().map(|m| pool + (s as usize * stride + m.off) as u64))) }).collect()];
                     let sp = pf.staging.addr();
                     for grp in missed.chunks(STAGE) {
-                        groups.push(grp.iter().enumerate().map(|(i, &e)| (e, sp + (i * stride) as u64)).collect());
+                        groups.push(grp.iter().enumerate().map(|(i, &e)| (e, lx.mats.each_ref().map(|m| sp + (STAGE * m.off + i * m.bytes) as u64))).collect());
                     }
                     let mut tiles = Vec::new();
                     let mut spans = Vec::new(); // per group: [(start, count); 3]
                     for grp in &groups {
                         let mut sp = [(0, 0); 3];
-                        for (mi, mat) in lx.mats.iter().enumerate() {
+                        for mi in 0..3 {
                             let start = tiles.len() / 2;
                             for &(e, w) in grp {
                                 for m0 in (off[e]..off[e + 1]).step_by(GEMM_BM) {
                                     let cnt = GEMM_BM.min(off[e + 1] - m0);
-                                    tiles.extend([w + mat.off as u64, m0 as u64 | (cnt as u64) << 32]);
+                                    tiles.extend([w[mi], m0 as u64 | (cnt as u64) << 32]);
                                 }
                             }
                             sp[mi] = (start, tiles.len() / 2 - start);
@@ -225,12 +227,13 @@ impl GpuModel<'_> {
                         if gi > 0 {
                             // ponytail: synchronous pageable copies, not overlapped with compute; pinned double
                             // buffering on a copy stream if prefill of cold layers matters.
-                            for (i, &(e, _)) in grp.iter().enumerate() {
-                                for (name, mat) in MATS.iter().zip(&lx.mats) {
-                                    let src = self.m.w.layer(il, name)?.expert(e, c.n_expert);
-                                    let o = i * stride + mat.off;
-                                    debug_assert_eq!(src.data.len(), mat.bytes);
-                                    g.htod(src.data, &pf.staging, o)?;
+                            for (name, mat) in MATS.iter().zip(&lx.mats) {
+                                let w = self.m.w.layer(il, name)?;
+                                let mut i = 0;
+                                for run in grp.chunk_by(|a, b| b.0 == a.0 + 1) {
+                                    let e = run[0].0;
+                                    g.htod(&w.data[e * mat.bytes..(e + run.len()) * mat.bytes], &pf.staging, STAGE * mat.off + i * mat.bytes)?;
+                                    i += run.len();
                                 }
                             }
                         }
