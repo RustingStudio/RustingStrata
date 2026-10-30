@@ -2942,6 +2942,23 @@ already need sm_80 (cp.async, s8 mma), so there is no fallback.
 - Both backends stay under the plan's 98.5% as before (#94/#98 numbers: 628-630); nothing new.
 - Note: `--extra '--gpu'` fails in argparse (taken as an option); pass `--extra=--gpu`.
 
+### 2026-10-30 #167 — Vulkan pp4096: one slow rep per process, GPU-side (no code commit)
+
+- Symptom: `bench --pp 4096 --reps 4` on Vulkan gives per-rep prefill like 2139 / 1125 / 1940 / 2172 tok/s, so the
+  mean (~1840) hides a steady state above CUDA (CUDA 2109-2120 on every rep). Seen on 4 of 4 runs, load 0.4-1.6.
+- Pattern (temporary per-rep print): 10 reps give one slow rep (2nd), then 2150-2170 to the end. pp2048: the 3rd
+  rep is slow (912, next 1523). So it starts about 2 s into the first prefill work and lasts about 2-3 s.
+- Not the cause: VRAM pressure (`--vram-margin 2048` same), expert moves (`--fixed-experts` same), decode or graphs
+  (`--tg 0` same), time since load (8 s sleep before the reps: still the 2nd rep), the recent host-side changes
+  (521462e, before #163, same: 1025-2169 and 1128-2159), pipeline creation (8 ms total, #165 notes).
+- What the GPU shows in that window (nvidia-smi at 100 ms): memory controller utilization jumps from ~36% to
+  67-100%, power falls from the 170 W cap to 124-150 W, and the clock reason moves from SW power cap to
+  "Reliability" at 1987 MHz. Every kernel is slower in it (STRATA_VK_PROF: attn_prefill +83%, deltanet +80%, gemm
+  +24-30%), and there is no PCIe traffic. CUDA runs see brief "Reliability" events too, but memory utilization stays
+  at 34-37%. So something adds GPU memory traffic for a few seconds under the Vulkan driver; our queue is single
+  and nothing of ours runs then.
+- No fix found. Vulkan prefill numbers should be read from the per-rep steady state (or the max), not the mean.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
