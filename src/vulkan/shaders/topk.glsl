@@ -14,18 +14,17 @@ void topk(F32 p, uint b, uint n, uint k, float extra_scale, uint lane, out int i
     float sum = 0.0, mine = 0.0;
     id = 0;
     for (uint j = 0; j < k; j++) {
-        float bv = -1.0; int bi = 0x7fffffff;
+        // v >= 0, so its bits order like it; key = bits + 1 leaves 0 for "none". Max key, then the lowest index of it.
+        uint bk = 0, bi = 0xffffffffu;
         for (uint r = 0; r < R; r++) {
-            uint i = lane + 32 * r;
-            if (i < n && (taken >> r & 1) == 0 && v[r] > bv) { bv = v[r]; bi = int(i); }
+            uint i = lane + 32 * r, key = floatBitsToUint(v[r]) + 1;
+            if (i < n && (taken >> r & 1) == 0 && key > bk) { bk = key; bi = i; }
         }
-        for (uint d = 16; d > 0; d >>= 1) {
-            float ov = subgroupShuffleXor(bv, d);
-            int oi = subgroupShuffleXor(bi, d);
-            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-        }
-        if (uint(bi & 31) == lane) taken |= 1u << (bi >> 5);
-        if (lane == j) { id = bi; mine = bv; }
+        uint mk = subgroupMax(bk);
+        bi = subgroupMin(bk == mk ? bi : 0xffffffffu);
+        float bv = uintBitsToFloat(mk - 1);
+        if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
+        if (lane == j) { id = int(bi); mine = bv; }
         sum += bv;
     }
     float scale = fdiv(1.0, max(sum, 6.103515625e-5));
