@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At b128a7c (#156, `bench --mtp 0`, tg128 after pp512, load 0.8-2.7): CUDA decode 117.0 (4B 98.5), Vulkan 109.7 (4B 103.5).
+- At 180f59d (#157, `bench --mtp 0`, tg128 after pp512, load 0.8-2.7): CUDA decode 117.0 (4B 98.5), Vulkan 110.7 (4B 103.2).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2792,6 +2792,18 @@ pp512 there are no misses and it is 3.5 us, as on CUDA.)
 - 4B Vulkan 103.1 (102.4-103.7) -> 103.5 (103.3-103.7); 4B has no DeltaNet, so noise.
 - Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, 2023-token prompt). 74 tests pass.
 - Not verified: `--llama-numerics` on Vulkan (path unchanged: falls back to the old dispatches).
+
+### 2026-10-30 #157 — Vulkan swiglu_q without a barrier in batches (180f59d)
+
+- `run` adds a barrier after a `quant_xq` dispatch even inside `batch` (a GEMV that quantizes its own input reads
+  it next). `swiglu_q` dispatched the same shader under that name, so in each MoE layer it split the batch of the
+  routed SwiGLU and the shared expert's down GEMV (and added a second barrier at the end of the gate/up batch).
+  Its output is only read after the batch. Now the shader is also registered as "swiglu_q" and run under that name.
+- Interleaved A/B against 012ad7d, 35B Vulkan decode (`bench --mtp 0`, tg128 after pp512):
+  - quick set, load 1.4-1.6: 109.7 (109.6-109.8) -> 110.8 (110.8-110.9), 3 runs each;
+  - full set, load 1.0-1.2: 109.5 (109.4-109.6) -> 110.7 (110.6-110.9), 4 runs each.
+- 4B Vulkan 103.2 (102.7-103.8) -> 103.2 (102.8-103.5): dense FFN, its SwiGLU is not in a batch.
+- Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, 2023-token prompt). 74 tests pass.
 
 ## Next candidates
 
