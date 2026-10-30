@@ -3527,6 +3527,16 @@ print e.g. "CUDA unavailable (CUDA init: no NVIDIA driver (libcuda.so)), using V
 libcuda now fails with that error instead of a panic. Greedy md5 (4B and default model, both backends, mtp 0/1,
 `--kv q8`): all pairs equal to e10e999. 74 tests pass.
 
+### 2026-10-30 #215 — hint on GPU load failure (out of VRAM) (da24fee)
+
+Release check of user errors. A missing model file already says "No such file or directory". `--ctx 262144` on the 4B
+(KV alone ~36 GB) ended with a bare `DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")` on CUDA and "allocate
+536870912 bytes: A device memory allocation has failed" on Vulkan. Both `GpuModel::load` calls in `main.rs`
+(engine and calibrate) now add "loading the model onto the GPU failed (if VRAM ran out: lower --ctx, add --kv q8, or
+close programs using VRAM)" above the cause. The 35B at `--ctx 131072` loads on both backends (fewer experts
+resident). Also checked: `calibrate --backend vulkan` on the 4B (38 s, chunk 2048, 1969 tok/s prefill, 105.1 decode;
+the file it wrote was removed again), and a clean build of `main` in a scratch clone (no warnings). 74 tests pass.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
