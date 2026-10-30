@@ -33,7 +33,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   632-634/640 (#124).
 - At 52b364e (#165, `bench --mtp 0`, tg128 after pp512, load 0.6-2.9): CUDA decode 117.5 (4B 98.5), Vulkan 117.0 (4B 104.0).
 - At d73cc1f (#179, same bench, load 0.8-1.5): CUDA decode 119.6, MTP k = 1 136.1 (4B not re-measured).
-- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832, 1884 at 92c594b (#184).
+- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832, 1884 at 92c594b (#184), 2013 at febaded (#185).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -3167,6 +3167,21 @@ tensor-core prefill GEMM, 156 calls) 387 ms. Two changes to `gemm_q`:
   CUDA prefill 1595 -> 1611 (mtp0).
 - Tests: 74 passed. Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, long prompt mtp0/mtp1).
   CUDA parity 627/640 before, 628/640 after.
+
+### 2026-10-30 #185 — gemm_q: IQ tables in shared memory (febaded)
+
+After #184, gemm_iq2_xs was still bound by weight decode: `deq8<17>` looks up `iq2xs_grid` and `ksigns_iq2xs` in
+global memory, a random lookup per thread per 8 weights. `gemm_q` now loads the shared `QS` tables of #168 for
+IQ2_XS and IQ3_XXS and decodes through `QS<T>::get` (d times the signed grid bytes, the same floats as `deq8`).
+
+- nsys (pp2048, default residency): gemm_iq2_xs 2.39 -> 1.49 ms per call (373 -> 289 ms in the profiled rep).
+- `bench --pp 2048 --tg 16 --mtp 0`, default residency, 4 interleaved rounds (load 2.1-2.6): 1862 / 1862 / 1865 /
+  1870 (mean 1865) before, 2010 / 2011 / 2016 / 2016 (mean 2013) after, +7.9%. Decode unchanged (115.2-115.6).
+- Tests: 74 passed. Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, long prompt mtp0/mtp1).
+  CUDA parity 625 / 627 before, 627 / 625 after (2 interleaved pairs).
+- Tried, not kept: `gemmi` (int8 MMQ) through `QS<T>::get` as well: gemmi_iq3_xxs 114.4 -> 113.4 ms, inside the
+  noise. gemmi does 2 lookups per 8 weights per thread and is not lookup bound.
+- Not verified: `STRATA_EXPERT_MB=6000` (the kernel is the same; only more of its tiles are staged).
 
 ## Next candidates
 
