@@ -2971,8 +2971,10 @@ already need sm_80 (cp.async, s8 mma), so there is no fallback.
 - A/B, 35B `bench --mtp 0` (tg128 after pp512), 4 interleaved rounds, load 1.7-2.1: base f20d1e4 114.1 (first,
   warm-up) / 117.5 / 117.5 / 117.5, new 117.9 / 118.0 / 118.0 / 118.0. +0.4%, small but steady.
 - Greedy md5s unchanged on both backends (4B, 35B mtp 0/1, kvq8, long prompt mtp 0/1). Tests 74 passed.
-- Not verified: per-kernel times after the change (no nsys rerun), 4B decode (no IQ types there), Vulkan (its
-  shaders have their own table path).
+- nsys after the change (pp512 tg128, kernel average): down IQ3_XXS 22.47 -> 22.11 us, gate/up IQ2_XS pair 28.44 ->
+  28.59 us (the pair overlaps a second stream, so its duration says little). A variant with shared tables for IQ3_XXS
+  only: 117.6 / 117.6 / 117.5 against 118.0 x3 (4 rounds, load 1.6-1.9), so IQ2_XS stays shared too.
+- Not verified: 4B decode (no IQ types there), Vulkan (its shaders have their own table path; see #169).
 
 ### 2026-10-30 #169 — Vulkan expert GEMVs: IQ tables in shared memory, no gain (no code commit)
 
