@@ -482,6 +482,8 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
                 (ahead, row) = (Some(nx), rw);
                 toks
             }
+            // Greedy without MTP: the argmax on the GPU, so only the token id is copied back, not the logits.
+            Runner::Gpu(g) if smp.temp <= 0.0 => { ahead = Some(g.step_greedy(next)?); vec![next] }
             _ => { logits = r.step(next)?; vec![next] }
         };
         for t in toks {
