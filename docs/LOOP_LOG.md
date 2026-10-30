@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 9a265d9 (#149, `bench --mtp 0`, tg128 after pp512, load 0.9-1.9): CUDA decode 116.1 (4B 98.4), Vulkan 106.9 (4B 102.8).
+- At d2cdf5e (#150, `bench --mtp 0`, tg128 after pp512, load 0.9-1.9): CUDA decode 116.5 (4B 98.4), Vulkan 106.9 (4B 102.8).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2693,6 +2693,22 @@ reads back only the id; `decode` uses it for greedy GPU runs without MTP. Same t
   2023-token prompt (mtp1 `d8774b12`, mtp0 `d03a4d33`). 74 tests pass (`argmax_rows_matches_ops_argmax` included).
 - Vulkan not changed: its `argmax_rows` takes 17 us per token on the 4B (STRATA_VK_PROF, 151936 tokens), ~28 us
   expected on the 35B, so at most ~0.2%.
+
+### 2026-10-30 #150 — CUDA MoE GEMV: 16 rows per warp for 512-column experts (d2cdf5e)
+
+The 35B MoE GEMVs reach well under peak bandwidth (profile at 5561aae: gate/up IQ2_XS pair 4.8 MB in 28.9 us,
+~167 GB/s; down IQ3_XXS 3.2 MB in 24.4 us, ~131 GB/s). A sweep of rows per warp (temporary `STRATA_MOE_RPW=g,d`,
+35B `bench --mtp 0`, 2-3 rounds, load 1.1-2.5): gate/up 1/2/3/4 -> 115.4/116.1/115.6/115.7 (2, the default, is
+best); down 1/2/4/6/8/12/16/32/64 -> 111.1/114.5/116.1/116.1/116.4/114.1/116.6/110.8/99.2. Down at 16 rows per
+warp is 128 blocks, all resident in one wave; 12 leaves a ragged last block per expert. `rpw` now gives 16 for
+experts of at most 512 columns.
+
+- A/B against 9a265d9, interleaved: 35B mtp0 116.0 -> 116.5 (6+6, spread 0.8/0.4, load 1.4-1.7), 35B mtp1
+  130.9 -> 131.7 (4+4, base round 1 at 126.4 left out, load 1.4-1.6), 4B 98.4 = 98.4 (dense, untouched).
+- Greedy md5s unchanged on CUDA (same list as #149, long prompt included). 74 tests pass.
+- Not verified: other MoE models (only the 35B is at hand); experts of 512 columns with other quant types.
+- Gate/up IQ2_XS stays at ~167 GB/s: each lane loads 2 bytes of indices per superblock plus two table lookups,
+  so few bytes are in flight. A decode that reads more per lane is the next thing to try.
 
 ## Next candidates
 
