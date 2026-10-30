@@ -2710,6 +2710,15 @@ experts of at most 512 columns.
 - Gate/up IQ2_XS stays at ~167 GB/s: each lane loads 2 bytes of indices per superblock plus two table lookups,
   so few bytes are in flight. A decode that reads more per lane is the next thing to try.
 
+### 2026-10-30 #151 — MoE GEMV two rows per lane pass (CUDA); Vulkan MoE down rows per subgroup: no gain (no code commit)
+
+- CUDA: `gemv_row_q` templated on NR rows that share each x load, `moe_gemv` stepping 16 rows with NR=2. 35B
+  `bench --mtp 0`, 2 rounds, load 1.6: 116.2/116.3 -> 113.4/113.4, and greedy output changed (summation order
+  per row differs). Reverted. More registers per lane cut occupancy more than the shared x loads saved.
+- Vulkan: MoE down rows per subgroup swept on the 35B (`bench --mtp 0`, 2-3 rounds, load 1.0-1.8): 2/4/8/16 ->
+  107.1/107.0/106.7/105.8. The current 4 is within noise of 2; left as is.
+- Not verified: NR=2 for gate/up alone (the pair GEMV already shares x across gate and up).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
