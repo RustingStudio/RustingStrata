@@ -3503,6 +3503,18 @@ At 6e12946, default model, GPU quiet (630 MB used by the desktop).
   tuned ubatch, Strata's 4K prefill is level (2203 vs ~2236), and decode is ~1.65x (111.5 vs 66.5 after 4K,
   119 vs 68.4 short; 134 with MTP). The README's "2x llama.cpp prefill" is out of date.
 
+### 2026-10-30 #213 — README for the release: Vulkan, today's numbers, Qwen3 and Qwen3-Next rows (README commit)
+
+Owner approved #212 (merge and README). `main` fast-forwarded to c1565d6 locally, not pushed. README: intro names
+Vulkan, the cubin cache and the other architectures that run (`qwen3`, `qwen3moe`, `qwen3next`); Numbers is the
+#212 table against llama.cpp build 11876 tuned; a sentence says greedy output can change at near-ties between runs
+because the placement adapts (CPU and GPU expert kernels round differently); Build covers Vulkan and the first CUDA
+compile; IQ4_NL added to the supported types (the 80B uses it); Layout names `src/vulkan/` and `src/backend.rs`;
+Status says v1.0.1 like `Cargo.toml`. Other-models table from the #211 smoke run, plus two new rows, `generate -n 64`
+twice per backend (load 0.4-0.8), second run: Qwen3-30B-A3B-Instruct-2507 UD-Q2_K_XL CUDA 84.1 / 94.5, Vulkan
+112.0 / 114.3; Qwen3-Next-80B-A3B-Instruct UD-IQ1_S CUDA 17.6 / 24.3, Vulkan 26.8 / 29.9 tok/s. Output "Paris. ..."
+on all; the 30B Vulkan second run went on differently after "Rome." (placement drift, #1071 above). 74 tests pass.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
@@ -3525,17 +3537,8 @@ At 6e12946, default model, GPU quiet (630 MB used by the desktop).
 
 ## Questions for owner
 
-- (#212) Release / README. (1) May `vulkan` be merged into `main`? (2) Proposed README changes:
-  intro: "CUDA kernels are compiled at run time with NVRTC through cudarc (cached as a cubin), and the same kernels
-  also run on Vulkan (`--backend vulkan`, GLSL compiled to SPIR-V and committed): no C++ build step, no ggml.";
-  Numbers table replaced by the #212 table above, compared with current llama.cpp tuned (`-ncmoe 12 -ub 2048
-  -b 2048`, build 11876): prefill 4K 2203 (CUDA) / 2101 (Vulkan) vs ~2236, decode after 4K 111.5 / 112.8 vs 66.5,
-  short 119.0 / 116.8 vs 68.4, MTP 134 vs (none faster). Build: "Needs Rust (2024 edition) and either an NVIDIA
-  driver with the CUDA 13 NVRTC library (loaded at run time) or a Vulkan 1.3 driver with shaderFloat64, int8/16/64
-  and subgroup size 32 (tested only on an RTX 3060; Intel Arc lacks shaderFloat64, pre-RDNA AMD lacks subgroup size
-  32). The first CUDA run compiles the kernels (~15 s) and caches them." Other-models table refreshed from the #211
-  smoke run (2B 208, 4B 104-110, 9B Q5_K_S 51-53, 9B IQ3_M 49-51, 27B IQ3_XXS 20.5, 35B IQ4_XS 94-96 tok/s at
-  `-n 32`).
+- (#212) Release / README: answered "yes" 2026-10-30. `vulkan` fast-forwarded into `main` locally (not pushed); the
+  README text was applied in #213.
 
 - (#119) V4 on the 4B prefill: llama.cpp Vulkan pp4096 2849, Strata Vulkan ~1950, Strata CUDA ~2040. Three
   quarters of the 4B prefill is gemmi, whose int8 epilogue (each exact int32 sum scaled into f32 with the roundings
