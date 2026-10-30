@@ -17,7 +17,7 @@ struct Cli {
 
 #[derive(Args)]
 struct Engine {
-    /// Run on the GPU (static expert placement) instead of the CPU reference.
+    /// Run on the GPU (experts that do not fit in VRAM run on the CPU) instead of the CPU reference.
     #[arg(long)]
     gpu: bool,
     /// GPU context length (KV cache size) in tokens.
