@@ -214,6 +214,11 @@ impl<'a> GpuModel<'a> {
         Ok(logits)
     }
 
+    /// `step` that returns the greedy next token (argmax of the logits, first on ties) instead of the logits.
+    pub fn step_greedy(&mut self, token: u32) -> anyhow::Result<u32> {
+        Ok(self.verify_greedy(&[token], |_| 0)?.1)
+    }
+
     /// Run up to `TMAX` tokens at positions pos.. in one forward (each weight read once); returns logits per token.
     /// Hidden state t stays in row t of `x` (see `mtp_draft`).
     pub fn verify(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<Vec<f32>>> {
