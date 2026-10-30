@@ -3559,6 +3559,11 @@ the file it wrote was removed again), and a clean build of `main` in a scratch c
 
 ## Questions for owner
 
+- (#215) Release version. `Cargo.toml` says 1.0.1 and the README "Status: v1.0.1", but since v1.0.0 the
+  Vulkan backend, Qwen3/Qwen3-Next support and tool calling were added. Proposal: set `version = "1.1.0"` in
+  `Cargo.toml`, README "Status: v1.1.0", then (owner's call) push `main`, tag `v1.1.0`. Also #88 below (README text
+  for tool calling) is still open, and the Reddit draft says `serve` does tool calls.
+
 - (#212) Release / README: answered "yes" 2026-10-30. `vulkan` fast-forwarded into `main` locally (not pushed); the
   README text was applied in #213.
 
