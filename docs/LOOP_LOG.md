@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 9c8892f (#160, `bench --mtp 0`, tg128 after pp512, load 0.8-2.7): CUDA decode 117.0 (4B 98.5), Vulkan 111.1 (4B 103.4).
+- At 0a54e9a (#161, `bench --mtp 0`, tg128 after pp512, load 0.8-2.9): CUDA decode 116.9-117.2 (4B 98.4), Vulkan 111.1 (4B 103.4).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2852,6 +2852,23 @@ index as before, and the picked values are the same.
 - Greedy md5s unchanged: 4B `64bab3bb`; 35B mtp0 `06c92e18`, mtp1 `04cf91e9`; kvq8; long prompt `d8774b12` /
   `d03a4d33`. This holds on both backends.
 - Not verified: prefill routing time. router_topk runs once per prefill and is not timed.
+
+### 2026-10-30 #161 — CUDA topk: __reduce_max_sync / __reduce_min_sync (0a54e9a)
+
+This is #160 on CUDA. `topk_warp` (moe_route, router_topk) now finishes each of its k rounds with
+`__reduce_max_sync` on the value bits plus 1, then `__reduce_min_sync` on the index among the lanes that hold that
+max. That is one redux instruction each, in place of the five-step shuffle butterfly on (value, index). The kernels
+already need sm_80 (cp.async, s8 mma), so there is no fallback.
+
+- 35B CUDA decode, interleaved A/B against 907b33f (tg128 after pp512):
+  - Quick set, load 2.2-2.6, 3 runs each: 116.77 before, 117.20 after.
+  - Full set, load 2.0-2.9, 6 runs each: 116.53 (116.5-116.7) before, 116.93 (116.9-117.1) after.
+  - All 9 pairs gained.
+- 4B CUDA decode, load 2.1-2.3, 3 runs each: 98.37 before, 98.40 after (neutral).
+- Tests: 74 passed.
+- Greedy md5s unchanged on both backends: 4B `64bab3bb`; 35B mtp0 `06c92e18`, mtp1 `04cf91e9`; kvq8; long prompt
+  `d8774b12` / `d03a4d33`.
+- Not verified: the per-call kernel time (no nsys run this item).
 
 ## Next candidates
 
