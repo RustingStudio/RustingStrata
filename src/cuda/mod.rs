@@ -272,8 +272,8 @@ impl Backend for Gpu {
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
         anyhow::ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
         self.ctx.bind_to_thread()?;
-        unsafe { result::memcpy_htod_async(dst.addr() + off as u64, src, self.stream.cu_stream()) }?;
-        Ok(self.stream.synchronize()?)
+        // No stream sync: from pageable memory (every caller's) the driver has staged `src` when the call returns.
+        Ok(unsafe { result::memcpy_htod_async(dst.addr() + off as u64, src, self.stream.cu_stream()) }?)
     }
 
     // As cudarc's clone_dtoh: copy, then a stream sync.
