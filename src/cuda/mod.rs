@@ -4,9 +4,9 @@
 use crate::quant::{GgmlType, tables::*};
 use anyhow::{Context, bail};
 use crate::backend::{Backend, Buf};
-use cudarc::driver::{CudaContext, CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg, result, sys};
+use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice, LaunchConfig, PushKernelArg, result, sys};
 use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -40,7 +40,14 @@ pub struct Gpu {
     am: CudaSlice<[i32; 2]>,
     /// Recorded graphs by `Backend::graph` key.
     graphs: std::sync::Mutex<HashMap<u64, Graph>>,
+    /// Pinned staging for large `htod`, used as a ring: the copy returns before its DMA, so the host fills the next
+    /// one while the GPU works (expert streaming in prefill). Head offset and the regions queued copies still read.
+    ring: std::sync::Mutex<(PinnedHostSlice<u8>, usize, VecDeque<(usize, usize, CudaEvent)>)>,
 }
+
+const RING: usize = 64 << 20;
+/// Smaller copies take the driver's pageable path (staged before the call returns).
+const RING_MIN: usize = 256 << 10;
 
 /// A recorded graph. Its handles are plain CUDA driver handles, which any thread may launch once the context is
 /// bound (cudarc leaves `CudaGraph` without `Send` only because it holds raw pointers).
@@ -152,7 +159,8 @@ impl Gpu {
         }
         let q8 = std::sync::Mutex::new(stream.alloc_zeros::<u8>(1)?);
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_q8, am, graphs: Default::default() })
+        let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_q8, am, graphs: Default::default(), ring })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -268,12 +276,28 @@ impl Backend for Gpu {
         Ok(Buf::new(self.ptr(&s), s.len(), s))
     }
 
-    // Synced on purpose, unlike cudarc's memcpy_htod: without it greedy output breaks (LOOP_LOG #85).
+    // Returns once `src` is copied (LOOP_LOG #85: a copy still reading `src` after return broke greedy output).
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
         anyhow::ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
         self.ctx.bind_to_thread()?;
         // No stream sync: from pageable memory (every caller's) the driver has staged `src` when the call returns.
-        Ok(unsafe { result::memcpy_htod_async(dst.addr() + off as u64, src, self.stream.cu_stream()) }?)
+        if src.len() < RING_MIN { return Ok(unsafe { result::memcpy_htod_async(dst.addr() + off as u64, src, self.stream.cu_stream()) }?); }
+        let mut g = self.ring.lock().unwrap();
+        let (pin, head, busy) = &mut *g;
+        let base = pin.as_mut_ptr()?;
+        for (i, c) in src.chunks(RING).enumerate() {
+            if *head + c.len() > RING { *head = 0; }
+            let (a, b) = (*head, *head + c.len());
+            while busy.iter().any(|&(s, e, _)| s < b && a < e) { busy.pop_front().unwrap().2.synchronize()?; }
+            unsafe {
+                let p = base.add(a);
+                std::ptr::copy_nonoverlapping(c.as_ptr(), p, c.len());
+                result::memcpy_htod_async(dst.addr() + (off + i * RING) as u64, std::slice::from_raw_parts(p, c.len()), self.stream.cu_stream())?;
+            }
+            busy.push_back((a, b, self.stream.record_event(None)?));
+            *head = b;
+        }
+        Ok(())
     }
 
     // As cudarc's clone_dtoh: copy, then a stream sync.
