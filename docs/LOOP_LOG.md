@@ -3308,6 +3308,15 @@ In the 10 attention layers the q `rms_norm` (32768 rows, ~565 us) ran alone betw
   2084.7 / 2087.6 / 2092.4 (mean 2086.5 -> 2088.2, +0.08%); Vulkan 1910.6 / 1909.4 / 1912.3 -> 1908.5 / 1912.6 /
   1918.8 (mean 1910.8 -> 1913.3, +0.13%). Inside noise; the most it could hide is ~5.6 ms of ~980 ms. Reverted.
 
+### 2026-10-30 #197 — CUDA gemm_q in 64-position tiles for the routed gate/up: slower (no code commit)
+
+`gemm_iq2_xs` (routed gate/up, f16 mma) is 294 ms of the ~1120 ms pp2048 kernel time. With 16384 routed rows over
+256 experts an expert gets ~64 positions, so most 128-position tiles are about half full (the empty warps already
+skip their mma, #184, but each block still decodes 64 weight rows for all 256 threads). Tried `gemm_q` with BM 64
+(128 threads), 64-position tiles for the gate and up matrices, and dense float GEMMs at 64 positions per block.
+- `bench --pp 2048 --tg 16 --mtp 0`, CUDA, interleaved rounds 1-3, load 0.79-0.92: 2087.4 / 2092.8 / 2093.5 ->
+  2075.4 / 2074.5 / 2078.6 (mean 2091.2 -> 2076.2, -0.7%). Reverted; agrees with #13 (BM 64 slower overall).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
