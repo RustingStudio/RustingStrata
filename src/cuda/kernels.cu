@@ -693,15 +693,28 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
         xr[q] = r < tl.cnt ? x + (size_t)(xrow ? xrow[tl.m0 + r] : tl.m0 + r) * x_stride : nullptr;
     }
     float acc[2][4][4] = {};
-    for (int kb = 0; kb < nsb * (256 / BK); kb++) {
+    // W step kb is decoded into registers (as halves) during step kb - 1's mma and stored after it.
+    constexpr int WQ = 64 * SUBS / NT;
+    static_assert(64 * SUBS % NT == 0, "whole W groups per thread");
+    uint4 wv[WQ];
+    auto ldw = [&](int kb) {
         int sb = kb / (256 / BK), part = kb % (256 / BK);
         #pragma unroll
-        for (int i = tid; i < 64 * SUBS; i += NT) {
-            int r = i / SUBS, j = i % SUBS;
+        for (int q = 0; q < WQ; q++) {
+            int i = tid + q * NT, r = i / SUBS, j = i % SUBS;
             float v[8] = {};
             if (n0 + r < rows) deq8<T>(tl.w + ((size_t)(n0 + r) * nsb + sb) * SBB, part * SUBS + j, v);
-            *(uint4*)(ws + r * P + j * 8) = make_uint4(h2pack(v[0], v[1]), h2pack(v[2], v[3]), h2pack(v[4], v[5]), h2pack(v[6], v[7]));
+            wv[q] = make_uint4(h2pack(v[0], v[1]), h2pack(v[2], v[3]), h2pack(v[4], v[5]), h2pack(v[6], v[7]));
         }
+    };
+    auto stw = [&]() {
+        #pragma unroll
+        for (int q = 0; q < WQ; q++) { int i = tid + q * NT; *(uint4*)(ws + (i / SUBS) * P + (i % SUBS) * 8) = wv[q]; }
+    };
+    const int nk = nsb * (256 / BK);
+    ldw(0);
+    stw();
+    for (int kb = 0; kb < nk; kb++) {
         #pragma unroll
         for (int q = 0; q < BM * BK / 4 / NT; q++) {
             int i = tid + q * NT, r = i / (BK / 4), c = (i % (BK / 4)) * 4;
@@ -709,6 +722,9 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
             *(uint2*)(xs + r * P + c) = make_uint2(h2pack(v.x, v.y), h2pack(v.z, v.w));
         }
         __syncthreads();
+        if (kb + 1 < nk) ldw(kb + 1);
+        // Expert tiles are often part full; a warp whose 32 positions are all past cnt has nothing to multiply.
+        if (wm < tl.cnt)
 #pragma unroll
         for (int kk = 0; kk < BK; kk += 16) {
             u32 a[2][4], b[4][2];
@@ -728,6 +744,7 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
                 for (int nt = 0; nt < 4; nt++) mma16816(acc[mt][nt], a[mt][0], a[mt][1], a[mt][2], a[mt][3], b[nt][0], b[nt][1]);
         }
         __syncthreads();
+        if (kb + 1 < nk) stw();
     }
     #pragma unroll
     for (int mt = 0; mt < 2; mt++)
