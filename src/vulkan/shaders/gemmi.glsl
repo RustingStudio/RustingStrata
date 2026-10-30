@@ -42,17 +42,13 @@ void scale_add(inout precise float acc, int c, float dx, float dw, float sx, flo
 }
 // The 16 weights (subs 2 wi, 2 wi + 1 of step kb) of row n0 + wr, packed, with the first sub's scale and min.
 void ldw(U8 wt, uint wr, uint wi, bool wok, uint n0, uint kb, out uvec4 wv, out float d, out float m) {
-    int q[16]; float d1, m1;
-    d = 0.0; m = 0.0;
-    [[unroll]] for (uint j = 0; j < 16; j++) q[j] = 0;
+    float d1, m1;
+    d = 0.0; m = 0.0; wv = uvec4(0);
     if (wok) {
         uint b = ((n0 + wr) * p.nsb + kb / 4) * SBB, sub = (kb & 3) * 8 + 2 * wi;
-        int q0[8], q1[8];
-        qi8(wt, b, sub, q0, d, m);
-        qi8(wt, b, sub + 1, q1, d1, m1);
-        [[unroll]] for (uint j = 0; j < 8; j++) { q[j] = q0[j]; q[8 + j] = q1[j]; }
+        qw(wt, b, sub, wv.x, wv.y, d, m);
+        qw(wt, b, sub + 1, wv.z, wv.w, d1, m1);
     }
-    [[unroll]] for (uint j = 0; j < 4; j++) wv[j] = pack4(q[4 * j], q[4 * j + 1], q[4 * j + 2], q[4 * j + 3]);
 }
 // Step kb of x row xr (its half xh: 32 int8 and the scales, or the sums) into X buffer b. 16-byte loads: q8 rows
 // are 11 cols / 32 words, a multiple of 4.
