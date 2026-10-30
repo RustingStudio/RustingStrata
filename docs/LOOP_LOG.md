@@ -3266,6 +3266,16 @@ whole run), so its gaps overstate the bench case.
 - `bench --pp 2048 --tg 16 --mtp 0`, CUDA, interleaved rounds 1-3, load 0.68-0.75: base 2073.7 / 2082.1 / 2081.1
   (mean 2079.0), up first 2076.3 / 2081.6 / 2084.9 (mean 2080.9): no change. Reverted.
 
+### 2026-10-30 #193 — read the prefill routing before queueing the shared expert: no gain (no code commit)
+
+The MoE prefill reads the routed ids back (`get`, a stream sync) after queueing the shared expert's gate_inp, gate and
+up GEMMs, so the GPU idles while the host sorts the routing and builds the tile list (nsys: ~75 us per MoE layer,
+2.9 ms per pp2048). Reading the ids right after `router_topk` lets the host do that work while the shared expert
+runs.
+- `bench --pp 2048 --tg 16 --mtp 0`, interleaved rounds 1-3, load 0.46-0.70: CUDA base 2085.3 / 2084.9 / 2081.5
+  (mean 2083.9), loop 2084.0 / 2084.7 / 2085.3 (mean 2084.7); Vulkan base 1911.6 / 1917.2 / 1917.6 (mean 1915.5),
+  loop 1913.5 / 1913.7 / 1914.4 (mean 1913.9). Inside the noise on both. Reverted.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
