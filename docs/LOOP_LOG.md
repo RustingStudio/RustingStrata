@@ -3331,6 +3331,17 @@ slots to take at most 16 of each: ~350 us per call, 11 us per token. It now pick
   116.93, noise).
 - Tests 74 passed; all 12 greedy md5 pairs unchanged; parity 625/640 (base 623/640, load 2.5-3.1).
 
+### 2026-10-30 #199 — Text decode of only the new tokens (30508fb)
+
+`decode` turned the whole output into text after each token to find the new piece: 12 us per token at 256 tokens,
+growing with the reply. Byte-level BPE text splits cleanly where the text so far ends on a whole character (no
+trailing U+FFFD), so it now decodes from the first token not emitted yet.
+- `bench --pp 512 --tg 256 --mtp 0`, interleaved rounds 1-3, load 1.52-1.96 (falling): CUDA 116.6 / 117.9 / 119.4
+  -> 117.7 / 119.0 / 119.9 (mean 117.97 -> 118.87, +0.8%, rounds still warming, loop ahead in each); Vulkan 117.2 /
+  117.3 / 117.0 -> 117.5 / 117.6 / 117.3 (117.17 -> 117.47, +0.26%).
+- Tests 74 passed; all 12 greedy md5 pairs unchanged; a Chinese and emoji reply (4B, greedy and `--temp 0.8 --seed
+  1`) is byte-identical to the base; parity 625/640 (base 626/640, load 2.3-3.0).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
