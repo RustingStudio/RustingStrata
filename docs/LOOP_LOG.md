@@ -3055,6 +3055,12 @@ Kernel times (nsys decode): ssm_out 27.2 -> 27.3 us (base derived from the mixed
 
 ssm_out stays at ~250 GB/s whatever the block count; the limit is elsewhere (per-warp load depth for 16 super-blocks of q6_k).
 
+### 2026-10-30 #177 — gemv_row_q unroll 8 and unroll 2 (no code commit)
+
+The single-token integer GEMV loop (`gemv_row_q`, also the MoE GEMV row loop) unrolls 4 super-blocks. Tried 8 (more loads in flight) and 2 (fewer registers). Kernel averages, nsys decode, base f404a9d-equivalent (f4 profile) / unroll 8 / unroll 2, in us:
+gemv_q5_k (512,1,2) qkv+gate 59.1 / 59.5 / 59.0; moe_gemv_iq2_xs 28.3 / 30.5 / 29.2; gemv_q6_k (128,1,1) 14.9 / 17.8 / 15.9; moe_gemv_iq3_xxs 21.6 / 22.1 / 22.0; gemv_q5_k (64,1,2) shared gate/up 13.0 / 13.7 / 12.8; gemv_q5_k (128,1,1) 22.0 / 27.9 / 22.2.
+Unroll 4 is the best overall. Reverted, no bench run (the kernel times already rule both out; load 0.7-1.2).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
