@@ -899,7 +899,7 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
         const int b = kb & 1;
         constexpr int KS = scale32<T>() ? 32 : 16;  // depth of one mma (one weight scale)
         #pragma unroll
-        for (int h = 0; h < 64 / KS; h++) {
+        for (int h = 0; h < 64 / KS; h++) if (wm < tl.cnt) {
             u32 a[2][4], bw[4][2];
             float da[2][2], sa[2][2], dbv[4][2], mb[4][2];
             #pragma unroll
