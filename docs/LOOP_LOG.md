@@ -3317,6 +3317,20 @@ skip their mma, #184, but each block still decodes 64 weight rows for all 256 th
 - `bench --pp 2048 --tg 16 --mtp 0`, CUDA, interleaved rounds 1-3, load 0.79-0.92: 2087.4 / 2092.8 / 2093.5 ->
   2075.4 / 2074.5 / 2078.6 (mean 2091.2 -> 2076.2, -0.7%). Reverted; agrees with #13 (BM 64 slower overall).
 
+### 2026-10-30 #198 — Expert cache adapt without full sorts (47d3862)
+
+Decode host time between graphs, measured with temporary timers (`bench --pp 512 --tg 256 --mtp 0`, CUDA, per
+token): text decode of the whole output 12 us, `after_forward` 15.4 us, embed + puts + graph launch ~12 us. Inside
+`after_forward` the 40 mailbox `routing` reads are ~4 us; prefetching all mailbox lines first saved only ~0.8 us
+(dropped). The rest was `adapt`, which runs every 32 tokens and sorted all ~9000 missed experts and all resident
+slots to take at most 16 of each: ~350 us per call, 11 us per token. It now picks the 16 with
+`select_nth_unstable_by` and sorts only those, with an index tie-break so the order equals the old stable sort.
+- `adapt` 11 -> 3.5 us per token, `after_forward` 16.9 -> 9.5 us.
+- `bench --pp 512 --tg 256 --mtp 0`, interleaved rounds 1-3, load 1.33-1.67: CUDA 118.9 / 119.6 / 119.6 -> 119.8 /
+  119.7 / 119.9 (mean 119.37 -> 119.80, +0.36%); Vulkan 116.8 / 117.2 / 117.1 -> 116.8 / 117.2 / 116.8 (117.03 ->
+  116.93, noise).
+- Tests 74 passed; all 12 greedy md5 pairs unchanged; parity 625/640 (base 623/640, load 2.5-3.1).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
