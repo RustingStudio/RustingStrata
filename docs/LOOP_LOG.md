@@ -3009,6 +3009,16 @@ already need sm_80 (cp.async, s8 mma), so there is no fallback.
 - Decode DeltaNet is bandwidth-bound already. Prefill DeltaNet (~37 ms of a pp512) is the sequential scan that the
   kernel's ponytail note names; a chunked form is the way to speed it up.
 
+### 2026-10-30 #172 — shared expert gate/up moved next to the routed pair (no code commit)
+
+Idea: batch 1 held the router f32 pair plus the shared gate/up pair (13.5 us). Move the shared gate/up into the batch with the routed moe gate/up pair, then run shared swiglu, routed swiglu and shared down in one batch. On CUDA the batch alternates main/side streams, so shared swiglu and shared down both land on the main stream and stay ordered.
+
+CUDA A/B vs 4a0f306 (abl.sh, pp512 tg128 mtp0, 4 interleaved rounds, load 0.9-1.0): 118.5/118.5/118.5/118.5 base vs 118.9/118.8/118.7/118.8, mean +0.3 (+0.25%). CUDA greedy md5s all unchanged (4B, 35B mtp0/mtp1, kvq8, long prompt mtp0/mtp1).
+
+Vulkan breaks: 35B md5s change (mtp0 09fe232a, mtp1 c15927dc, kvq8 b38fc14f, long prompt 077a8b2b/2109f735), and decode drops to 79.9/105.4/109.2 against 116.9-117.4 (load 0.5-0.6). Vulkan launches inside one batch get no barrier between them, so shared down reads `shq` before shared swiglu writes it. The CUDA ordering relies on stream alternation that Vulkan does not have. A backend-neutral fix needs shared down in its own serial step, which costs about what the move gains. Reverted.
+
+Not verified: the serial-down variant was not measured.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
