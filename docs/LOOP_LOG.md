@@ -32,6 +32,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
 - At 52b364e (#165, `bench --mtp 0`, tg128 after pp512, load 0.6-2.9): CUDA decode 117.5 (4B 98.5), Vulkan 117.0 (4B 104.0).
+- At edd3bb7 (#168, same bench, load 1.7-2.1): CUDA decode 118.0 (4B not re-measured).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2958,6 +2959,20 @@ already need sm_80 (cp.async, s8 mma), so there is no fallback.
   at 34-37%. So something adds GPU memory traffic for a few seconds under the Vulkan driver; our queue is single
   and nothing of ours runs then.
 - No fix found. Vulkan prefill numbers should be read from the per-rep steady state (or the max), not the mean.
+
+### 2026-10-30 #168 — CUDA moe_gemv: IQ lookup tables in shared memory (edd3bb7)
+
+- Why: nsys (pp512 tg256, CUDA) puts the expert GEMVs at ~2050 us/tok and their bandwidth well below the dense
+  GEMVs: gate/up IQ2_XS pair 28.4 us for 4.85 MB (~171 GB/s), down IQ3_XXS 22.2 us for 3.2 MB (~145 GB/s), against
+  ~300 GB/s for q5_k. Each lane does random lookups into the `__device__` grid and sign tables.
+- Change: `moe_gemv` for IQ2_XS/IQ3_XXS copies iq2xs_grid (4 KB) or iq3xxs_grid (1 KB) plus ksigns (128 B) into
+  shared memory at block start and reads them there (`QS<T>` in kernels.cu). Down goes through `moe_gemv` on CUDA,
+  so it is covered too. Dense gemv/gemvn, prefill gemm and deq8 keep the global tables. Vulkan is unchanged.
+- A/B, 35B `bench --mtp 0` (tg128 after pp512), 4 interleaved rounds, load 1.7-2.1: base f20d1e4 114.1 (first,
+  warm-up) / 117.5 / 117.5 / 117.5, new 117.9 / 118.0 / 118.0 / 118.0. +0.4%, small but steady.
+- Greedy md5s unchanged on both backends (4B, 35B mtp 0/1, kvq8, long prompt mtp 0/1). Tests 74 passed.
+- Not verified: per-kernel times after the change (no nsys rerun), 4B decode (no IQ types there), Vulkan (its
+  shaders have their own table path).
 
 ## Next candidates
 
