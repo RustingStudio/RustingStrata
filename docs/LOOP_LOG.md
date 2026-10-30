@@ -3437,6 +3437,14 @@ Vulkan 1966.7 / 1978.2 / 1980.4 -> 1975.4 / 1978.0 / 1976.8 (mean 1975.1 -> 1976
 the waits do not shrink. A ping-pong staging area (copy group gi + 1 beside group gi's GEMMs) is the real fix but
 also costs a second staging area; not tried.
 
+### 2026-10-30 #208 — Prefill expert staging: ping-pong areas, no gain (no code commit)
+
+Two staging areas (group gi uses area gi % 2) so every staged group copies beside the previous group's up GEMM, not
+only group 1. pp2048, rounds 1-3, load 1.7-2.0: Vulkan 1992.0 / 1991.0 / 1991.0 -> 1988.5 / 1991.2 / 1994.2 (mean
+1991.3 both), CUDA 2108.8 / 2110.5 / 2110.4 -> 2109.4 / 2109.8 / 2110.7 (2109.9 -> 2110.0). With #207 this says the
+synchronous copies of groups 2+ are not on the critical path at pp2048; the staged copy time left is group 1's, or
+the copy engine is the limit. Reverted.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
