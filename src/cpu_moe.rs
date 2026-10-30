@@ -269,7 +269,8 @@ pub fn matvec(t: &Tensor, x: &[f32], y: &mut [f32]) {
     });
 }
 
-/// Rows `out.len()` of a batch of matrices: out[i] = mats[i / rows] row (i % rows) · xs[i / rows].
+/// Rows `out.len()` of a batch of matrices: out[i] = mats[i / rows] row (i % rows) · x of that matrix, where
+/// matrix j uses xs[j * xs.len() / mats.len()] (one x for all, or one each), so a shared x is quantized once.
 fn batch_rows(mats: &[Tensor], xs: &[&[f32]], out: &mut [f32]) {
     let rows = out.len() / mats.len();
     let dot = int_dot(mats[0].ty);
@@ -277,11 +278,11 @@ fn batch_rows(mats: &[Tensor], xs: &[&[f32]], out: &mut [f32]) {
     out.par_chunks_mut(16).enumerate().for_each_init(|| vec![0f32; mats[0].cols], |buf, (c, ys)| {
         for (k, v) in ys.iter_mut().enumerate() {
             let i = c * 16 + k;
-            let (t, r) = (&mats[i / rows], i % rows);
+            let (t, r, x) = (&mats[i / rows], i % rows, i / rows * xs.len() / mats.len());
             let rb = t.data.len() / t.rows;
             *v = match dot {
-                Some(d) => d(&t.data[r * rb..(r + 1) * rb], &xq[i / rows]),
-                None => { t.row(r, buf); buf.iter().zip(xs[i / rows]).map(|(a, b)| a * b).sum() }
+                Some(d) => d(&t.data[r * rb..(r + 1) * rb], &xq[x]),
+                None => { t.row(r, buf); buf.iter().zip(xs[x]).map(|(a, b)| a * b).sum() }
             };
         }
     });
@@ -299,7 +300,7 @@ pub fn experts(m: &Model, il: usize, h: &[f32], sel: &[(usize, f32)]) -> Vec<f32
     let gu: Vec<Tensor> = sel.iter().flat_map(|&(e, _)| [gate.expert(e, n), up.expert(e, n)]).collect();
     let mut a = vec![0f32; 2 * k * ff];
     if gate.ty == up.ty {
-        batch_rows(&gu, &vec![h; 2 * k], &mut a);
+        batch_rows(&gu, &[h], &mut a);
     } else {
         for (i, t) in gu.iter().enumerate() { matvec(t, h, &mut a[i * ff..(i + 1) * ff]); }
     }
