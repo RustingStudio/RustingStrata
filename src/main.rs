@@ -129,7 +129,7 @@ impl Engine {
         if let Some(n) = self.threads.or(get("threads")) { rayon::ThreadPoolBuilder::new().num_threads(n).build_global()?; }
         let Some(bk) = bk else { return Ok(Runner::Cpu(m, State::new(&m.cfg))) };
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
-        let mut g = GpuModel::load(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp())?;
+        let mut g = GpuModel::load(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp()).context(LOAD_HINT)?;
         g.short = self.short;
         Ok(Runner::Gpu(Box::new(g)))
     }
@@ -145,6 +145,8 @@ fn seed(s: Option<u64>) -> u64 {
     s.unwrap_or_else(|| SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64))
         .wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1
 }
+
+const LOAD_HINT: &str = "loading the model onto the GPU failed (if VRAM ran out: lower --ctx, add --kv q8, or close programs using VRAM)";
 
 /// Calibration file for `model` on `backend`; CUDA keeps the original name.
 fn calibration_path(model: &Path, backend: &str) -> PathBuf {
@@ -409,7 +411,7 @@ fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device
     anyhow::ensure!(n_pf >= 512, "--ctx too small to calibrate");
     let pf = prose(&tok, n_pf)?;
     let load = |chunk: usize| -> anyhow::Result<GpuModel> {
-        let mut gm = GpuModel::load(&m, backend::open(kind, device)?, ctx, chunk, margin, 3)?;
+        let mut gm = GpuModel::load(&m, backend::open(kind, device)?, ctx, chunk, margin, 3).context(LOAD_HINT)?;
         gm.adapt_every = 0; // fixed placement: steadier timings
         Ok(gm)
     };
