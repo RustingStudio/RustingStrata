@@ -6,9 +6,8 @@ cudarc (cached as a cubin), and the same kernels also run on Vulkan (`--backend 
 committed): no C++ build step, no ggml. Experts that do not fit in VRAM run on the CPU at the same time as the GPU
 work, and the expert placement adapts to the routing it sees.
 
-Status: v1.0.1. Milestones M0-M6 are done (M6: server, chat, calibration, bench); the v1 gate run is in
+Status: v1.1.0. Milestones M0-M6 are done (M6: server, chat, calibration, bench); the v1 gate run is in
 `docs/m6-results.md`.
-`docs/LOOP_LOG.md` has every change with its measurements.
 
 ## Numbers
 
@@ -26,11 +25,11 @@ does not fit in VRAM). llama.cpp is the 2026-10-28 build 11876, tuned for the sa
 | Greedy top-1 agreement with llama.cpp (20 prompts x 32 tokens), either llama.cpp mode | 98-99% | 98-99% | 98.3% (its batch vs token-by-token modes) |
 
 Measured 2026-10-30: `strata bench --gpu --pp 512,4096,32768 --tg 128 --reps 3 --ctx 32896`, mean of 3 rounds
-(range in brackets); llama.cpp from `llama-server` timings, 4047-token prompt + 128 tokens, 3 runs
-(`docs/LOOP_LOG.md` #212). MTP gains less on Vulkan and depends on the text.
+(range in brackets); llama.cpp from `llama-server` timings, 4047-token prompt + 128 tokens, 3 runs.
+MTP gains depend on the text.
 Agreement counts a token when it matches llama.cpp run token by token or with the context as one batch;
-llama.cpp's own two modes agree on only 98.3% (`docs/LOOP_LOG.md` #33). The remaining misses are near-ties where
-float rounding order picks a different token (#60-#64). The expert placement adapts between runs and the CPU and
+llama.cpp's own two modes agree on only 98.3%. The remaining misses are near-ties where
+float rounding order picks a different token. The expert placement adapts between runs and the CPU and
 GPU expert kernels round differently, so greedy output can change at such near-ties from one run to the next. MTP
 on and off give identical greedy tokens.
 
@@ -102,7 +101,6 @@ python -I tools/parity.py $M --extra "--gpu" --tag gpu   # agreement with llama.
 `src/cuda/` and `src/vulkan/` (GPU kernels and shaders, behind `src/backend.rs`), `src/gpu_model.rs` (GPU forward,
 MTP, verify), `src/gpu_model/prefill.rs` (chunked prefill), `src/expert_cache.rs` (expert placement), `src/cpu_moe.rs`
 and `src/cpu_worker.rs` (CPU expert compute), `src/serve.rs` (HTTP and chat template), `src/main.rs` (CLI).
-Design: `docs/superpowers/specs/2026-10-06-rusting-strata-v1-design.md`.
 
 ## License
 
