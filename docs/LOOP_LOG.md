@@ -33,7 +33,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   632-634/640 (#124).
 - At 52b364e (#165, `bench --mtp 0`, tg128 after pp512, load 0.6-2.9): CUDA decode 117.5 (4B 98.5), Vulkan 117.0 (4B 104.0).
 - At d73cc1f (#179, same bench, load 0.8-1.5): CUDA decode 119.6, MTP k = 1 136.1 (4B not re-measured).
-- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832.
+- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832, 1884 at 92c594b (#184).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -3152,6 +3152,21 @@ Model load goes through the ring too.
 - Long prompt (2023 tokens) CUDA prefill: 1202 / 1454 before, 1595 / 1604 after.
 - Tests: 74 passed. CUDA greedy md5s unchanged (4B, 35B mtp0/mtp1, kvq8, long prompt mtp0/mtp1); Vulkan untouched.
 - Not verified: an `htod` of 256 KB or more inside a CUDA graph capture (none today; the event sync would fail there).
+
+### 2026-10-30 #184 — gemm_q: weight register prefetch, skip all-padding warps (92c594b)
+
+nsys of CUDA prefill at default residency (pp2048, 0712f6b): kernels 1086 ms, of which gemm_iq2_xs (the f16
+tensor-core prefill GEMM, 156 calls) 387 ms. Two changes to `gemm_q`:
+
+- Step kb+1's weights are decoded into registers during step kb's mma and stored to shared memory after it (the
+  gemmi pattern from #40). gemm_iq2_xs 387 -> 383 ms; end to end +0.3% (3 rounds, 1853 -> 1858).
+- Expert tiles hold about 64 of 128 positions on average, so a warp whose 32 positions are all past the tile's
+  count now skips the mma. gemm_iq2_xs 383 -> 373 ms. The kernel is bound by weight decode, not by the mma.
+- Both, `bench --pp 2048 --tg 16 --mtp 0`, default residency, 4 interleaved rounds (load 1.5-1.65): 1868 / 1870 /
+  1870 / 1852 (mean 1865) before, 1893 / 1892 / 1873 / 1879 (mean 1884) after, +1.0%. Long prompt (2023 tokens)
+  CUDA prefill 1595 -> 1611 (mtp0).
+- Tests: 74 passed. Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, long prompt mtp0/mtp1).
+  CUDA parity 627/640 before, 628/640 after.
 
 ## Next candidates
 
