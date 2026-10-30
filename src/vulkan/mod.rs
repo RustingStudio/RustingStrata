@@ -730,7 +730,14 @@ impl Backend for Vk {
         let ts = (base as f64).powf(-2.0 / n_rot as f64);
         self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &0u64, &(x_stride as u32), &(n as u32), &(n as u32), &eps, &step, &ts, &(per as u32), &(n_rot as u32), &0u64, &v, &kc, &vc])
     }
-    fn argmax_rows(&self, x: u64, n: usize, rows: usize, out: u64) -> anyhow::Result<()> { self.run("argmax_rows", &[], [rows, 1, 1], &[&x, &out, &(n as u32)]) }
+    fn argmax_rows(&self, x: u64, n: usize, rows: usize, out: u64) -> anyhow::Result<()> {
+        // One workgroup per row reads 1 MB (a 248320-token vocabulary) in ~25 us; 64 per row share it. The partials go
+        // to the quantized-x scratch buffer, which no op reads before writing it.
+        ensure!(rows * 64 * 8 <= XQ, "argmax_rows: {rows} rows");
+        let part = self.1.addr();
+        self.run("argmax_rows", &[0, 0], [64, rows, 1], &[&x, &part, &out, &(n as u32)])?;
+        self.run("argmax_rows", &[0, 1], [rows, 1, 1], &[&x, &part, &out, &(n as u32)])
+    }
     fn l2_norm(&self, x: u64, n: usize, per: usize, stride: usize, rows: usize, eps: f32) -> anyhow::Result<()> {
         self.run("l2_norm", &[], [rows, 1, 1], &[&x, &(n as u32), &(per as u32), &(stride as u32), &eps])
     }
