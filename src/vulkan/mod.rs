@@ -551,6 +551,7 @@ impl Vk {
         let xq = q8.0.addr();
         let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);  // as on CUDA
         if !(same && q8.1 == key) {
+            ensure!(!self.0.st().batch, "gemm inside batch: x must be quantized already (SAME_X)");
             self.run("quant_q8", &[self.0.llama], [n_x, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
             q8.1 = key;
         }

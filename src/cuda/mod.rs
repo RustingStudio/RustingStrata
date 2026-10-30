@@ -209,6 +209,7 @@ impl Gpu {
         let xq = self.ptr(&q8.0);
         let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
         if !(same && q8.1 == key) {
+            anyhow::ensure!(self.nb.load(Relaxed) == usize::MAX, "gemm inside batch: x must be quantized already (SAME_X)");
             launch!(self, "quant_q8", cfg((n_x as u32, 1), 256, 0), x, x_stride as i32, xq, cols as i32);
             q8.1 = key;
         }
