@@ -40,8 +40,9 @@ __device__ float block_sum(float v) {
 template <int T> __device__ void deq8(const u8* b, int sub, float* o);
 
 template <> __device__ __forceinline__ void deq8<0>(const u8* b, int sub, float* o) {  // F32
-    const float* f = (const float*)b + 8 * sub;
-    for (int i = 0; i < 8; i++) o[i] = f[i];
+    const float4* f = (const float4*)b + 2 * sub;  // 16-byte loads: rows are 1024-byte multiples
+    float4 a = f[0], c = f[1];
+    o[0] = a.x; o[1] = a.y; o[2] = a.z; o[3] = a.w; o[4] = c.x; o[5] = c.y; o[6] = c.z; o[7] = c.w;
 }
 template <> __device__ __forceinline__ void deq8<30>(const u8* b, int sub, float* o) {  // BF16
     for (int i = 0; i < 8; i++) o[i] = __uint_as_float(ld16(b + 16 * sub + 2 * i) << 16);
