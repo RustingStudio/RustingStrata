@@ -39,6 +39,7 @@ const SPV: &[(&str, &[u8])] = &[
     ("kv_store", include_bytes!("spv/kv_store.spv")),
     ("l2_norm", include_bytes!("spv/l2_norm.spv")),
     ("moe_combine", include_bytes!("spv/moe_combine.spv")),
+    ("moe_down_combine", include_bytes!("spv/moe_down_combine.spv")),
     ("moe_combine_seq", include_bytes!("spv/moe_combine_seq.spv")),
     ("moe_gemv_f", include_bytes!("spv/moe_gemv_f.spv")),
     ("moe_gemv_q", include_bytes!("spv/moe_gemv_q.spv")),
@@ -810,5 +811,16 @@ impl Backend for Vk {
     fn moe_combine(&self, x: u64, ye: u64, w: u64, k: usize, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, slots: u64, n: usize, t: usize) -> anyhow::Result<()> {
         let err = self.0.st().err.3;
         self.run("moe_combine", &[], [n.div_ceil(256), t, 1], &[&x, &ye, &w, &sh, &sg, &mb, &step, &slots, &err, &(k as u32), &(y_off as u32), &(n as u32)])
+    }
+    fn moe_down_combine(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, slots: u64, k: usize, h: u64, ye: u64, xq: u64,
+                        x: u64, wh: u64, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, t: usize) -> anyhow::Result<()> {
+        if xq == 0 || cols % 256 != 0 {
+            self.moe_gemv(ty, rows, cols, w, stride, slots, t * k, h, cols, 1, ye, None, xq)?;
+            return self.moe_combine(x, ye, wh, k, sh, sg, mb, y_off, step, slots, rows, t);
+        }
+        // Rows per workgroup as moe_gemv's rows per subgroup: each subgroup takes a slot.
+        let (rpw, err) = ((2048 / cols).clamp(1, 8), self.0.st().err.3);
+        self.run("moe_down_combine", &self.wspec(ty), [rows.div_ceil(rpw), t, 1], &[&w, &slots, &xq, &(stride as u64), &x, &wh, &sh, &sg, &mb, &step,
+            &err, &(rows as u32), &((cols / 256) as u32), &((t * k) as u32), &(k as u32), &(y_off as u32), &(rpw as u32)])
     }
 }

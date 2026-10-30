@@ -520,9 +520,9 @@ impl<'a> GpuModel<'a> {
                         if let Some(s) = shared { g.gemvq(&s.down, p("shg"), c.n_ff_shexp, sq, p("shy"), ne, nt)?; }
                         Ok(())
                     })?;
-                    g.moe_gemv(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, kt, p("ge"), c.n_ff_exp, 1, p("ye"), None, dq)?;
                     let (sh, sg) = if shared.is_some() { (p("shy"), p("sg")) } else { (0, 0) };
-                    g.moe_combine(x, p("ye"), p("wh"), k, sh, sg, mb, w.layout.y, step, slots, ne, nt)?;
+                    g.moe_down_combine(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, k, p("ge"), p("ye"), dq,
+                                       x, p("wh"), sh, sg, mb, w.layout.y, step, nt)?;
                 }
             }
         }
