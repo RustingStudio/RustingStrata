@@ -33,6 +33,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   632-634/640 (#124).
 - At 52b364e (#165, `bench --mtp 0`, tg128 after pp512, load 0.6-2.9): CUDA decode 117.5 (4B 98.5), Vulkan 117.0 (4B 104.0).
 - At d73cc1f (#179, same bench, load 0.8-1.5): CUDA decode 119.6, MTP k = 1 136.1 (4B not re-measured).
+- At ca27b19 (#181): Vulkan pp2048 with `STRATA_EXPERT_MB=6000` 1584 (was 1386).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -3103,6 +3104,21 @@ stream sync (~8.5 us and ~2.9 us in the trace).
 logits' layout (16 ints per lane, issued with the logits) and picking the slot with 16 shuffles. nsys decode,
 5120 calls each: 5.09 us per call before (d73cc1f), 5.62 us after. The extra loads and shuffles cost more than the
 one L2 hit they replace. Reverted, no bench run (load 1.1-1.9).
+
+### 2026-10-30 #181 — Vulkan large htod: staging as a ring (ca27b19)
+
+Large Vulkan uploads (over 64 KB) copied each 64 MB staging chunk, then flushed and waited before the next upload.
+Prefill with partial residency streams cold experts through `htod` one matrix at a time, so the host memcpy and the
+GPU copy never overlapped. Now uploads fill staging front to back and submit without waiting; staging is reused
+after the next wait, or after a flush when the ring is full. `dtoh` still takes offset 0 after the queued copies:
+queue order and the barrier keep it safe, and its wait frees the ring.
+
+- Vulkan `bench --pp 2048 --tg 64 --mtp 0`, `STRATA_EXPERT_MB=6000`, 3 interleaved rounds (load 0.7):
+  prefill 1375 / 1388 / 1395 (mean 1386) before, 1581 / 1588 / 1584 (mean 1584) after, +14%.
+- Long prompt (2023 tokens, default residency), Vulkan prefill: 1195-1206 before, 1432-1440 after.
+  CUDA unchanged (1351-1463 both).
+- Vulkan decode (`abl.sh`, 3 rounds, load 4.2-5.4): 117.1-117.5 before, 117.3-117.4 after. No change.
+- Tests: 74 passed. Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, long prompt mtp0/mtp1).
 
 ## Next candidates
 
