@@ -3061,6 +3061,20 @@ The single-token integer GEMV loop (`gemv_row_q`, also the MoE GEMV row loop) un
 gemv_q5_k (512,1,2) qkv+gate 59.1 / 59.5 / 59.0; moe_gemv_iq2_xs 28.3 / 30.5 / 29.2; gemv_q6_k (128,1,1) 14.9 / 17.8 / 15.9; moe_gemv_iq3_xxs 21.6 / 22.1 / 22.0; gemv_q5_k (64,1,2) shared gate/up 13.0 / 13.7 / 12.8; gemv_q5_k (128,1,1) 22.0 / 27.9 / 22.2.
 Unroll 4 is the best overall. Reverted, no bench run (the kernel times already rule both out; load 0.7-1.2).
 
+### 2026-10-30 #178 — MoE GEMV rows per warp; moe_route mailbox writes (no code commit)
+
+Two probes on CUDA decode, 35B, no code kept.
+
+- MoE expert GEMVs (`STRATA_RPW` override, nsys decode, us per call):
+  - iq2_xs gate/up (rpw 2 today): 28.3; rpw 1 gives 28.4; rpw 4 gives 28.2.
+  - iq3_xxs down (rpw 16 today): 21.6; rpw 1 gives 26.3; rpw 4 gives 23.4.
+  - Today's choice is already the best. Both kernels sit at ~150-170 GB/s with ~4.9 MB and ~3.2 MB per call.
+- `moe_route` without the three mailbox stores of ids, weights and slots (probe build, which breaks the CPU expert
+  path). Interleaved A/B vs b470fcf, 3 rounds, load 1.1-1.3: base 119.7/119.5/119.5 (mean 119.57), probe
+  119.8/119.5/119.5 (mean 119.60). The host-memory stores do not cost decode time, so moving the routing record to
+  device memory would gain nothing.
+- Not verified: Vulkan (its BAR mailbox stores were measured at ~0.4 us per call in #160).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
