@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 0a54e9a (#161, `bench --mtp 0`, tg128 after pp512, load 0.8-2.9): CUDA decode 116.9-117.2 (4B 98.4), Vulkan 111.1 (4B 103.4).
+- At b0f7222 (#162, `bench --mtp 0`, tg128 after pp512, load 0.8-2.9): CUDA decode 117.5 (4B 98.6), Vulkan 111.1 (4B 103.4).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2869,6 +2869,25 @@ already need sm_80 (cp.async, s8 mma), so there is no fallback.
 - Greedy md5s unchanged on both backends: 4B `64bab3bb`; 35B mtp0 `06c92e18`, mtp1 `04cf91e9`; kvq8; long prompt
   `d8774b12` / `d03a4d33`.
 - Not verified: the per-call kernel time (no nsys run this item).
+
+### 2026-10-30 #162 — CUDA swiglu_q in registers; fused moe_down_combine: no gain (b0f7222)
+
+- Change: `swiglu_q` kernel, one warp per 256 values of a row, computes silu(g) * u in registers and quantizes it
+  with `quant8` (split out of `quant_x`) straight into the down GEMV's xq. Before: `swiglu` wrote g, `quant_xq`
+  read it back. Used for the dense FFN, the shared expert and the routed experts (float down weights keep `swiglu`).
+- Two earlier shapes lost: a 2048-value chunk per block (write g, sync, quant_x) gave 35B +0.6 but 4B -1.2 (n_ff
+  9728 = 5 blocks); a 256 chunk that still wrote g and read it back lost on both (35B -1.6, 4B -0.7). nsys had
+  that one at 4.46 us vs 1.6 us for swiglu.
+- A/B vs a50e152, interleaved, load 1.2-1.3: 35B 117.42 -> 117.50 (6 pairs, none worse), 4B 98.40 -> 98.57 (3
+  pairs). Quick run at load 1.7-1.8: 35B 117.30 -> 117.43, 4B 98.47 -> 98.67. Tests 74 passed; CUDA greedy md5s
+  unchanged (4B, 35B mtp0/mtp1, kvq8, long prompt mtp0/mtp1).
+- Step B, reverted (no code commit): CUDA port of the Vulkan `moe_down_combine` (#158). 35B decode 117.2 -> 111.3
+  (3 pairs, load 1.7-1.9). nsys: the fused kernel took 37-40 us vs 22.7 (`moe_gemv_iq3_xxs` down) + 3.2
+  (`moe_combine`) = 25.9 us. ptxas: 72 registers vs 48 for moe_gemv, so 3 blocks/SM instead of 5. With
+  `__launch_bounds__(256, 5)` and warps splitting the rows of one expert (experts in turn): 27.0 us, still slower;
+  `(256, 6)` 32-39 us. No misses in the bench (hit rate 100%), so the miss spin was not the cost. Under CUDA
+  graphs the extra launch is cheap, unlike a Vulkan dispatch + barrier. Diff kept outside the repo.
+- Not verified: Vulkan (untouched), prefill.
 
 ## Next candidates
 
