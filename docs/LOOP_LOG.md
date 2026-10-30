@@ -32,7 +32,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
 - At 52b364e (#165, `bench --mtp 0`, tg128 after pp512, load 0.6-2.9): CUDA decode 117.5 (4B 98.5), Vulkan 117.0 (4B 104.0).
-- At edd3bb7 (#168, same bench, load 1.7-2.1): CUDA decode 118.0 (4B not re-measured).
+- At c959c94 (#170, same bench, load 0.5-0.9): CUDA decode 118.7 (4B not re-measured).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2985,6 +2985,20 @@ already need sm_80 (cp.async, s8 mma), so there is no fallback.
   (mean 117.07 without the outlier). About +0.2%, inside the spread, so reverted. The Vulkan tables are already
   read through a buffer reference that the driver likely caches well; the CUDA `__device__` gathers gained more.
 - Not verified: whether the 99.6 round was a one-off (driver shader compile on new SPIR-V, or the #167 window).
+
+### 2026-10-30 #170 — CUDA norm_gate quantizes for the ssm_out GEMV (c959c94)
+
+- nsys after #168: the DeltaNet out GEMV (q6_k, 2048 x 4096, 6.88 MB) takes ~28 us, ~246 GB/s, against ~297 GB/s
+  for the q5_k qkv/gate pair. It has 128 blocks (rpw 2), and each quantized the whole 4096-wide x itself.
+- Change: #156's `norm_gate_q` on CUDA. `norm_gate` takes an xq pointer and, after a block barrier, quantizes its
+  head into quant_xq's layout. A 128-value head fills only 16 lanes of a warp, so `quant8` gets a shuffle mask
+  (default full, so the other callers are unchanged) from a ballot. Llama numerics and heads not a multiple of 32
+  keep the in-GEMV quantization.
+- Same values through the same `quant8`, so bit-identical: greedy md5s unchanged on CUDA (4B, 35B mtp 0/1, kvq8,
+  long prompt mtp 0/1). Tests 74 passed.
+- A/B against 95f379a, 35B CUDA `bench --mtp 0` (tg128 after pp512), 4 interleaved rounds, load 0.5-0.9: 117.6 /
+  118.2 / 118.1 / 118.1 -> 118.7 / 118.7 / 118.7 / 118.6 (+0.5%).
+- Not verified: `--llama-numerics` on CUDA (path unchanged), 4B (no DeltaNet), per-kernel time after the change.
 
 ## Next candidates
 
