@@ -3503,7 +3503,7 @@ At 6e12946, default model, GPU quiet (630 MB used by the desktop).
   tuned ubatch, Strata's 4K prefill is level (2203 vs ~2236), and decode is ~1.65x (111.5 vs 66.5 after 4K,
   119 vs 68.4 short; 134 with MTP). The README's "2x llama.cpp prefill" is out of date.
 
-### 2026-10-30 #213 — README for the release: Vulkan, today's numbers, Qwen3 and Qwen3-Next rows (README commit)
+### 2026-10-30 #213 — README for the release: Vulkan, today's numbers, Qwen3 and Qwen3-Next rows (a156c6b)
 
 Owner approved #212 (merge and README). `main` fast-forwarded to c1565d6 locally, not pushed. README: intro names
 Vulkan, the cubin cache and the other architectures that run (`qwen3`, `qwen3moe`, `qwen3next`); Numbers is the
@@ -3513,7 +3513,7 @@ compile; IQ4_NL added to the supported types (the 80B uses it); Layout names `sr
 Status says v1.0.1 like `Cargo.toml`. Other-models table from the #211 smoke run, plus two new rows, `generate -n 64`
 twice per backend (load 0.4-0.8), second run: Qwen3-30B-A3B-Instruct-2507 UD-Q2_K_XL CUDA 84.1 / 94.5, Vulkan
 112.0 / 114.3; Qwen3-Next-80B-A3B-Instruct UD-IQ1_S CUDA 17.6 / 24.3, Vulkan 26.8 / 29.9 tok/s. Output "Paris. ..."
-on all; the 30B Vulkan second run went on differently after "Rome." (placement drift, #1071 above). 74 tests pass.
+on all; the 30B Vulkan second run went on differently after "Rome." (placement drift between runs, as noted for parity above). 74 tests pass.
 
 ## Next candidates
 
