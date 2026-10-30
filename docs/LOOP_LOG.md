@@ -3000,6 +3000,15 @@ already need sm_80 (cp.async, s8 mma), so there is no fallback.
   118.2 / 118.1 / 118.1 -> 118.7 / 118.7 / 118.7 / 118.6 (+0.5%).
 - Not verified: `--llama-numerics` on CUDA (path unchanged), 4B (no DeltaNet), per-kernel time after the change.
 
+### 2026-10-30 #171 — CUDA deltanet_seq launch bounds: slower (no code commit)
+
+- nsys: `deltanet_seq` uses 124 registers at 256 threads (2 blocks per SM, so 128 blocks in 3 waves). The kernel
+  average (20.7 us) mixes prefill: decode launches take 11.3 us (2 MB state read + written, ~355 GB/s, at peak), the
+  30 pp512 launches 1223 us each.
+- `__launch_bounds__(256, 3)` (80 registers): decode 11.3 -> 21.2 us, prefill 1223 -> 1885 us (spills). Reverted.
+- Decode DeltaNet is bandwidth-bound already. Prefill DeltaNet (~37 ms of a pp512) is the sequential scan that the
+  kernel's ponytail note names; a chunked form is the way to speed it up.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
