@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 180f59d (#157, `bench --mtp 0`, tg128 after pp512, load 0.8-2.7): CUDA decode 117.0 (4B 98.5), Vulkan 110.7 (4B 103.2).
+- At c2ee2db (#158, `bench --mtp 0`, tg128 after pp512, load 0.8-2.7): CUDA decode 117.0 (4B 98.5), Vulkan 111.0 (4B 103.2).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2804,6 +2804,21 @@ pp512 there are no misses and it is 3.5 us, as on CUDA.)
   - full set, load 1.0-1.2: 109.5 (109.4-109.6) -> 110.7 (110.6-110.9), 4 runs each.
 - 4B Vulkan 103.2 (102.7-103.8) -> 103.2 (102.8-103.5): dense FFN, its SwiGLU is not in a batch.
 - Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, 2023-token prompt). 74 tests pass.
+
+### 2026-10-30 #158 — Vulkan down experts and combine in one dispatch (c2ee2db)
+
+- New `moe_down_combine` backend op (default: `moe_gemv` then `moe_combine`, so CUDA is unchanged). Vulkan runs
+  it as one shader: workgroup (block of rpw rows, token), subgroup w takes slots w, w + 8, .. and computes the
+  down GEMV of its rows as `moe_gemv_q`, the sums go to shared memory, then one invocation per row adds them into x
+  in `moe_combine`'s order (same miss wait on the CPU worker's flag). One dispatch and one barrier fewer per MoE
+  layer, and no `ye` round trip. Falls back to the two ops when x is not pre-quantized (float experts).
+- Interleaved A/B against d75ad25, 35B Vulkan decode (`bench --mtp 0`, tg128 after pp512):
+  - quick set, load 1.4-1.5: 110.6 (110.2-110.9) -> 111.0 (111.0-111.0), 3 runs each;
+  - full set, load 1.8-2.4: 110.1 (108.5-110.8) -> 110.6 (109.1-111.2), 4 runs each; every pair gained.
+- Rows per workgroup: 4 (= `moe_gemv`'s rows per subgroup) kept. 8: 110.4 -> 110.8 (load 1.4-1.7, same as 4);
+  2: 110.6 -> 108.3 (one run 104.3, others -0.3/-0.6; load 1.1-1.3).
+- Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, 2023-token prompt; `STRATA_EXPERT_MB=6000`, so
+  the CPU miss path runs). 74 tests pass. Not verified: 4B A/B beyond one pair (103.3 vs 103.4; dense, not touched).
 
 ## Next candidates
 
