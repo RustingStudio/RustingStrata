@@ -253,7 +253,7 @@ impl Gpu {
     fn float_ty(ty: GgmlType) -> bool { matches!(ty, GgmlType::F32 | GgmlType::BF16) }
 
     /// Rows per warp for the integer GEMV (env STRATA_RPW overrides). Experts: about 8 super-blocks of work per
-    /// warp. Dense: 2 for 2048 and from 8192 rows, else 1 (measured per shape in LOOP_LOG #50, #140: the 4B's 2560 and
+    /// warp. Dense: 2 for 2048 and from 8192 rows, else 1 (measured per shape: the 4B's 2560 and
     /// 4096 rows are ~10% faster with 1, the default model's 2048 rows ~5% slower).
     fn rpw(rows: usize, cols: usize, k: usize) -> usize {
         // The vocab head: more rows per block amortize gemvn's per-block x quantization (nt = 2: 1158 -> 1027 us).
@@ -310,7 +310,7 @@ impl Backend for Gpu {
         Ok(Buf::new(self.ptr(&s), s.len(), s))
     }
 
-    // Returns once `src` is copied (LOOP_LOG #85: a copy still reading `src` after return broke greedy output).
+    // Returns once `src` is copied (a copy still reading `src` after return broke greedy output).
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
         anyhow::ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
         self.ctx.bind_to_thread()?;
