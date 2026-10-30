@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 8aa5994 (#154, `bench --mtp 0`, tg128 after pp512, load 0.9-2.7): CUDA decode 117.0 (4B 98.5), Vulkan 108.2 (4B 103.0).
+- At fd355a0 (#155, `bench --mtp 0`, tg128 after pp512, load 0.8-2.7): CUDA decode 117.0 (4B 98.5), Vulkan 108.9 (4B 103.0).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2761,6 +2761,21 @@ pp512 there are no misses and it is 3.5 us, as on CUDA.)
 - 4B Vulkan 103.0 (102.6-103.4) -> 103.2 (102.8-103.4), noise; 4B has no IQ grids.
 - Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, 2023-token prompt). 74 tests pass.
 - Prefill is unaffected: only `gemv_q` and `moe_gemv_q` call `qw` (only their SPIR-V changed).
+
+### 2026-10-30 #155 — Vulkan two-pass argmax (fd355a0)
+
+- `argmax_rows` ran one 1024-wide workgroup per row over the 248320 logits (~27 us per token in the
+  `STRATA_VK_PROF` trace, #149). Now 64 workgroups of 256 per row write (value, index) partials to the
+  quantized-x scratch buffer, and a second dispatch of the same shader (spec constant 1 = final pass) reduces
+  them, as `argmax_part` / `argmax_rows` on CUDA. First index wins on ties in both passes (test
+  `argmax_rows_matches_ops_argmax` covers a tie, a last-element maximum and an all -inf row).
+- Interleaved A/B against f0236ab, 35B Vulkan decode (`bench --mtp 0`, tg128 after pp512), load 0.8-0.9:
+  - quick set: 107.9 (107.8-107.9) -> 108.2 (108.2-108.3), 3 runs each;
+  - full set: 108.7 (107.8-109.0) -> 108.9 (108.3-109.2), 4 runs each.
+  Seven pairs: +0.3 mean, none negative. The expected gain was ~0.25% (22 us of 9.2 ms).
+- 4B Vulkan 103.1 (102.9-103.5) -> 103.0 (102.7-103.3), noise.
+- Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, 2023-token prompt). 74 tests pass.
+- Not verified: the per-kernel time of the new passes (not profiled).
 
 ## Next candidates
 
