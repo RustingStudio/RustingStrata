@@ -3097,6 +3097,13 @@ stream sync (~8.5 us and ~2.9 us in the trace).
 - Not verified: 4B decode; pinned source memory (no caller passes any; with pinned memory the copy would read the
   buffer after return).
 
+### 2026-10-30 #180 — moe_route: cache table in registers (no code commit)
+
+`moe_route` reads `table[id]` after top-k, a dependent global load. Tried loading the whole table up front in the
+logits' layout (16 ints per lane, issued with the logits) and picking the slot with 16 shuffles. nsys decode,
+5120 calls each: 5.09 us per call before (d73cc1f), 5.62 us after. The extra loads and shuffles cost more than the
+one L2 hit they replace. Reverted, no bench run (load 1.1-1.9).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
