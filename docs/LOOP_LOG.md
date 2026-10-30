@@ -3047,6 +3047,14 @@ Vulkan A/B vs 6c54e18 (abl.sh, pp512 tg128 mtp0, 2 x 4 interleaved rounds, load 
 
 Not verified: Vulkan kernel times (no per-kernel profile was taken); greedy md5s were not run on the reverted change.
 
+### 2026-10-30 #176 — one row per warp for 2048-row GEMVs wider than 2048 (no code commit)
+
+`rpw` gave 2 rows per warp to every 2048-row dense GEMV. Tried 1 when cols > 2048 (ssm_out q6_k 2048 x 4096, attention output q5_k), doubling their blocks.
+
+Kernel times (nsys decode): ssm_out 27.2 -> 27.3 us (base derived from the mixed (128,1,1) average minus the shared down calls), attention output 22.0 -> 21.8 us. CUDA A/B vs f404a9d (4 interleaved rounds, load 1.2-1.3): base 119.2/119.8/119.7/119.6 (mean 119.58) vs 119.6/119.8/119.6/119.7 (mean 119.68), inside noise. Reverted.
+
+ssm_out stays at ~250 GB/s whatever the block count; the limit is elsewhere (per-warp load depth for 16 super-blocks of q6_k).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
