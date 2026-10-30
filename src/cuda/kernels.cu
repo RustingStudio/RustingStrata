@@ -470,14 +470,45 @@ extern "C" __global__ void quant_xq(const float* x, int xs, int n, signed char* 
     quant_x(x + (size_t)t * xs, n, out + (size_t)t * n, (float*)(out + (size_t)gridDim.x * n) + t * (n / 32));
 }
 
-template <int T, int SBB>
+// IQ2_XS and IQ3_XXS for the MoE GEMV with their grid and sign tables in shared memory: each lane looks up random
+// entries, which shared memory serves in fewer passes than L1.
+__shared__ u64 s_iq2xs_grid[512];
+__shared__ u32 s_iq3xxs_grid[256];
+__shared__ u8 s_ksigns_iq2xs[128];
+template <int T> struct QS : QI<T> { static constexpr bool SH = false; __device__ static void load() {} };
+__device__ __forceinline__ void load_ksigns() { for (int i = threadIdx.x; i < 128; i += blockDim.x) s_ksigns_iq2xs[i] = ksigns_iq2xs[i]; }
+template <> struct QS<17> : QI<17> {
+    static constexpr bool SH = true;
+    __device__ static void load() { for (int i = threadIdx.x; i < 512; i += blockDim.x) s_iq2xs_grid[i] = iq2xs_grid[i]; load_ksigns(); }
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        int ib = sub >> 2, l = sub & 3;
+        u32 q = ld16(b + 2 + 2 * (4 * ib + l));
+        u64 g = s_iq2xs_grid[q & 511];
+        u32 sg = s_ksigns_iq2xs[q >> 9], sc = b[66 + ib];
+        d = ldh(b) * (0.5f + (float)(l < 2 ? sc & 0xF : sc >> 4)) * 0.25f;
+        lo = apply_signs((u32)g, sg & 15); hi = apply_signs((u32)(g >> 32), sg >> 4);
+    }
+};
+template <> struct QS<18> : QI<18> {
+    static constexpr bool SH = true;
+    __device__ static void load() { for (int i = threadIdx.x; i < 256; i += blockDim.x) s_iq3xxs_grid[i] = iq3xxs_grid[i]; load_ksigns(); }
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        int ib = sub >> 2, l = sub & 3;
+        u32 aux = ld16(b + 66 + 4 * ib) | (ld16(b + 68 + 4 * ib) << 16);
+        d = ldh(b) * (0.5f + (float)(aux >> 28)) * 0.5f;
+        u32 sg = s_ksigns_iq2xs[(aux >> (7 * l)) & 127], qq = ld16(b + 2 + 8 * ib + 2 * l);
+        lo = apply_signs(s_iq3xxs_grid[qq & 255], sg & 15); hi = apply_signs(s_iq3xxs_grid[qq >> 8], sg >> 4);
+    }
+};
+
+template <int T, int SBB, class Q = QI<T>>
 __device__ __forceinline__ void gemv_row_q(const u8* __restrict__ w, const signed char* qs, const float* xd, float* y, int row, int nsb) {
     int lane = threadIdx.x & 31;
     float acc = 0.0f;
 #pragma unroll 4
     for (int s = 0; s < nsb; s++) {
         int lo, hi; float d, m = 0.0f;
-        QI<T>::get(w + (size_t)s * SBB, lane, lo, hi, d, m);
+        Q::get(w + (size_t)s * SBB, lane, lo, hi, d, m);
         int2 xq = *(const int2*)(qs + s * 256 + lane * 8);
         float dx = xd[s * 8 + (lane >> 2)];
         acc += d * dx * (float)__dp4a(lo, xq.x, __dp4a(hi, xq.y, 0));
@@ -576,11 +607,13 @@ FTYPES(DEF_FGEMV)
         extern __shared__ __align__(16) signed char sx[];                                                       \
         int k = blockIdx.y, e = ids[k];                                                                         \
         if (e < 0) return;                                                                                      \
+        QS<T>::load();                                                                                          \
         const signed char* xs; const float* xd;                                                                 \
         if (xq) {                                                                                               \
             int t = k / xg;                                                                                     \
             xs = xq + (size_t)t * 256 * nsb;                                                                    \
             xd = (const float*)(xq + (size_t)gridDim.y / xg * 256 * nsb) + t * 8 * nsb;                         \
+            if (QS<T>::SH) __syncthreads();                                                                     \
         } else {                                                                                                \
             quant_x(x + (size_t)(k / xg) * x_stride, 256 * nsb, sx, (float*)(sx + 256 * nsb));                  \
             xs = sx; xd = (const float*)(sx + 256 * nsb);                                                       \
@@ -589,7 +622,7 @@ FTYPES(DEF_FGEMV)
         y = (float*)((char*)y + blockIdx.z * y2);                                                               \
         int r0 = blockIdx.x * 8 * rpw + (threadIdx.x >> 5), r1 = min(rows, r0 - (threadIdx.x >> 5) + 8 * rpw);  \
         for (int row = r0; row < r1; row += 8)                                                                  \
-            gemv_row_q<T, SBB>(we + (size_t)row * nsb * SBB, xs, xd, y + (size_t)k * rows, row, nsb);           \
+            gemv_row_q<T, SBB, QS<T>>(we + (size_t)row * nsb * SBB, xs, xd, y + (size_t)k * rows, row, nsb);    \
     }
 ITYPES(DEF_IGEMV)
 
