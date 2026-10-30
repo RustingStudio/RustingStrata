@@ -1496,17 +1496,16 @@ __device__ void topk_warp(const float* p, int n, int k, float extra_scale, int l
     float sum = 0.0f, mine = 0.0f;
     id = 0;
     for (int j = 0; j < k; j++) {
-        float bv = -1.0f; int bi = 0x7fffffff;
+        // v >= 0, so its bits order like it; key = bits + 1 leaves 0 for "none". Max key, then the lowest index of it.
+        unsigned bk = 0, bi = 0xffffffffu;
 #pragma unroll
         for (int r = 0; r < TOPK_R; r++) {
-            int i = lane + 32 * r;
-            if (i < n && !(taken >> r & 1) && v[r] > bv) { bv = v[r]; bi = i; }
+            unsigned i = lane + 32 * r, key = __float_as_uint(v[r]) + 1;
+            if (i < n && !(taken >> r & 1) && key > bk) { bk = key; bi = i; }
         }
-        for (int o = 16; o > 0; o >>= 1) {
-            float ov = __shfl_xor_sync(0xffffffff, bv, o);
-            int oi = __shfl_xor_sync(0xffffffff, bi, o);
-            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-        }
+        unsigned mk = __reduce_max_sync(0xffffffff, bk);
+        bi = __reduce_min_sync(0xffffffff, bk == mk ? bi : 0xffffffffu);
+        float bv = __uint_as_float(mk - 1);
         if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
         if (lane == j) { id = bi; mine = bv; }
         sum += bv;
