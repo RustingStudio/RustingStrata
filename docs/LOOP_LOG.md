@@ -2930,6 +2930,18 @@ already need sm_80 (cp.async, s8 mma), so there is no fallback.
 - Tests 74 passed. Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, long prompt mtp0/mtp1).
 - Not verified: the new host time of `put` (no timer this item); prefill (few large copies, path unchanged).
 
+### 2026-10-30 #166 — Parity spot check after the shared CPU-worker change (no code commit)
+
+- Why: #163/#164 changed `cpu_worker.rs`, shared by both backends. `tools/parity.py`, default model, 640 tokens,
+  interleaved against 521462e (before #163), load 0.8-1.4.
+- Vulkan: 628 / 628 / 626 before, 629 / 627 / 629 after (627.3 -> 628.3).
+- CUDA: first 3 pairs 627 / 627 / 627 before, 626 / 625 / 626 after. Then 4 more pairs: 625 on all 8 runs, and the
+  per-prompt result files of the two binaries are byte-identical (two outcome sets, each seen with both binaries).
+  So the drop was run-to-run drift (MTP 1 from the CUDA calibration is nondeterministic), not the change: the
+  routing read only copies the same words, and greedy md5s are unchanged.
+- Both backends stay under the plan's 98.5% as before (#94/#98 numbers: 628-630); nothing new.
+- Note: `--extra '--gpu'` fails in argparse (taken as an option); pass `--extra=--gpu`.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
