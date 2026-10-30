@@ -167,11 +167,15 @@ impl GpuModel<'_> {
                 Ffn::Moe { router, shared } => {
                     let k = c.n_expert_used;
                     let ids_d = pf.ints.addr();
-                    g.gemm_dense(router, t, h, ne, at(l.rl), c.n_expert, 0)?;
+                    // The 1-row shared gate_inp GEMM runs beside the router GEMM (both float: one launch each).
+                    g.batch(&mut || {
+                        g.gemm_dense(router, t, h, ne, at(l.rl), c.n_expert, 0)?;
+                        if let Some(s) = shared { g.gemm_dense(&s.gate_inp, t, h, ne, at(l.sg), 1, SAME_X)?; }
+                        Ok(())
+                    })?;
                     g.router_topk(at(l.rl), c.n_expert, k, c.expert_weights_scale, ids_d, at(l.wts), t)?;
                     let (sh, sg) = match shared {
                         Some(s) => {
-                            g.gemm_dense(&s.gate_inp, t, h, ne, at(l.sg), 1, SAME_X)?;
                             g.gemm_dense(&s.gate, t, h, ne, at(l.shg), c.n_ff_shexp, SAME_X)?;
                             g.gemm_dense(&s.up, t, h, ne, at(l.shg), c.n_ff_shexp, 1 | SAME_X)?;
                             (at(l.shy), at(l.sg))
