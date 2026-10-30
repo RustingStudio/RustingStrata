@@ -814,7 +814,7 @@ impl Backend for Vk {
     }
     fn moe_down_combine(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, slots: u64, k: usize, h: u64, ye: u64, xq: u64,
                         x: u64, wh: u64, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, t: usize) -> anyhow::Result<()> {
-        if xq == 0 || cols % 256 != 0 {
+        if xq == 0 || cols % 256 != 0 || k > 32 {  // the shader keeps up to 32 slots in shared memory
             self.moe_gemv(ty, rows, cols, w, stride, slots, t * k, h, cols, 1, ye, None, xq)?;
             return self.moe_combine(x, ye, wh, k, sh, sg, mb, y_off, step, slots, rows, t);
         }
