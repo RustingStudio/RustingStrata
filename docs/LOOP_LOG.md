@@ -3225,6 +3225,16 @@ IQ2_XS and IQ3_XXS and decodes through `QS<T>::get` (d times the signed grid byt
 - Greedy md5s unchanged on both backends (short, kvq8, mtp1, `STRATA_EXPERT_MB=6000`, long prompt), 74 tests pass,
   parity 626/640 (base 629, normal drift).
 
+### 2026-10-30 #189 — CUDA deltanet_seq in 4-warp blocks, 5 per SM: slower (no code commit)
+
+- Prefill profile at bb7eb6f (nsys, CUDA pp2048): gemm_iq2_xs 313 ms, gemmi_q5_k 259 (the SSM qkv, 8192 x 2048:
+  4.0 ms a call, ~17 TOP/s), deltanet_seq 114, gemmi_iq3_xxs 108, gemmi_q6_k 95, attn_prefill_256 30, quant_q8 26
+  (now near DRAM bandwidth: 138 us for the 16384 x 512 routed down x, 75 us for 2048 x 2048).
+- deltanet_seq runs 128 blocks of 8 warps at 124 registers, 2 blocks per SM: 3 waves on 28 SMs, the last one 29%
+  full. Idea: 4-warp blocks with `__launch_bounds__(128, 5)` (140 block slots for 256 blocks, 2 waves; same math per
+  row, so same bits). The compiler took 96 registers: 3810 -> 4903 us per pp2048 call. Reverted. With the scan's
+  numerics fixed (greedy md5s), registers rule out a wave fit; the chunked form would change the output.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
