@@ -33,7 +33,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   632-634/640 (#124).
 - At 52b364e (#165, `bench --mtp 0`, tg128 after pp512, load 0.6-2.9): CUDA decode 117.5 (4B 98.5), Vulkan 117.0 (4B 104.0).
 - At d73cc1f (#179, same bench, load 0.8-1.5): CUDA decode 119.6, MTP k = 1 136.1 (4B not re-measured).
-- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832, 1884 at 92c594b (#184), 2013 at febaded (#185), 2052 at 1aa1182 (#187), 2093 at b45136b (#191); #188 +0.7% CUDA, +0.6% Vulkan (Vulkan default residency ~1905). Vulkan pp2048 1925 at 603557f (#201-#202), 1929 at 415b742 (#203).
+- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832, 1884 at 92c594b (#184), 2013 at febaded (#185), 2052 at 1aa1182 (#187), 2093 at b45136b (#191); #188 +0.7% CUDA, +0.6% Vulkan (Vulkan default residency ~1905). Vulkan pp2048 1925 at 603557f (#201-#202), 1929 at 415b742 (#203), ~1955-1960 at edaff5b (#204, warm GPU).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -3388,6 +3388,20 @@ Q6_K 64 per tile 7.32 -> 7.05; Q5_K unchanged.
 - `bench --backend vulkan --pp 2048 --tg 16 --mtp 0`, interleaved rounds 1-3, load 1.50-1.64:
   1895.1 / 1917.8 / 1922.1 -> 1919.6 / 1931.3 / 1936.1 (mean 1911.7 -> 1929.0, +0.9%).
 - 74 tests passed; greedy md5s unchanged on both backends (12 pairs); parity 627 (base) / 626.
+
+### 2026-10-30 #204 — Vulkan htod submits pending work before filling staging (edaff5b)
+
+Fresh per-kernel totals, pp2048 (`STRATA_VK_PROF` vs nsys): Vulkan `gemm_f` 339 ms (IQ2_XS plus f32) against CUDA
+`gemm_iq2_xs` + `gemm_f32` 311, `gemmi` 469 against 457; the kernel sum is ~1025 vs ~1003 ms, wall ~1048 vs ~980. The
+#202 note (404 vs 294) was stale. The `gemm_throughput` microbench, also with a different expert per tile (temporary
+change), has IQ2_XS equal on both backends at 128/64/32/16 positions per tile; IQ3_XXS stays ~10-30% slower on Vulkan.
+Most of the remaining gap is outside the kernels. Two changes in `htod`'s staged path: submit the open command buffer
+before the host memcpy (the recorded dispatches had waited for it), and inside `batch` no barrier after the copy (#191
+copy of staged group 1 beside the resident up GEMM; the batch ends with a barrier).
+- `bench --backend vulkan --pp 2048 --tg 16 --mtp 0`, interleaved rounds 1-3. Submit only, load 0.90-1.31:
+  1928.7 / 1940.3 / 1946.0 -> 1936.2 / 1944.1 / 1949.4 (+0.3%). Both, load 1.70-2.10: 1952.9 / 1954.1 / 1958.6 ->
+  1957.2 / 1957.3 / 1963.9 (mean 1955.2 -> 1959.5, +0.2%). The VK profile shows no change per kernel.
+- 74 tests passed; greedy md5s unchanged on both backends (12 pairs); parity 629 (base) / 625.
 
 ## Next candidates
 
