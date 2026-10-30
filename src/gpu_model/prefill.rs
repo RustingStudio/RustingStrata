@@ -225,23 +225,26 @@ impl GpuModel<'_> {
                     let tp = |s: usize| pf.tiles.addr() + 16 * s as u64;
                     let xrow_d = pf.ints.addr() + 4 * (n * k) as u64;
                     let [mg, mu, md] = lx.mats;
-                    for (gi, grp) in groups.iter().enumerate() {
-                        if gi > 0 {
-                            // ponytail: synchronous pageable copies, not overlapped with compute; pinned double
-                            // buffering on a copy stream if prefill of cold layers matters.
-                            for (name, mat) in MATS.iter().zip(&lx.mats) {
-                                let w = self.m.w.layer(il, name)?;
-                                let mut i = 0;
-                                for run in grp.chunk_by(|a, b| b.0 == a.0 + 1) {
-                                    let e = run[0].0;
-                                    g.htod(&w.data[e * mat.bytes..(e + run.len()) * mat.bytes], &pf.staging, STAGE * mat.off + i * mat.bytes)?;
-                                    i += run.len();
-                                }
+                    let copy = |grp: &[(usize, [u64; 3])]| -> anyhow::Result<()> {
+                        for (name, mat) in MATS.iter().zip(&lx.mats) {
+                            let w = self.m.w.layer(il, name)?;
+                            let mut i = 0;
+                            for run in grp.chunk_by(|a, b| b.0 == a.0 + 1) {
+                                let e = run[0].0;
+                                g.htod(&w.data[e * mat.bytes..(e + run.len()) * mat.bytes], &pf.staging, STAGE * mat.off + i * mat.bytes)?;
+                                i += run.len();
                             }
                         }
+                        Ok(())
+                    };
+                    for (gi, grp) in groups.iter().enumerate() {
+                        // ponytail: one staging area, so only group 1 copies beside compute (on CUDA, beside the up
+                        // GEMM of the resident group); later groups wait for their copy. Double buffer if they matter.
+                        if gi > 1 { copy(grp)?; }
                         let sp = spans[gi];
                         g.gemm(mg.ty, mg.rows, mg.cols, tp(sp[0].0), sp[0].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, SAME_X)?;
-                        g.gemm(mu.ty, mu.rows, mu.cols, tp(sp[1].0), sp[1].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X)?;
+                        let up = || g.gemm(mu.ty, mu.rows, mu.cols, tp(sp[1].0), sp[1].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X);
+                        if gi == 0 && groups.len() > 1 { g.batch(&mut || { copy(&groups[1])?; up() })?; } else { up()?; }
                         g.gemm(md.ty, md.rows, md.cols, tp(sp[2].0), sp[2].1, at(l.ge), c.n_ff_exp, t * k, 0, at(l.ye), ne, 0)?;
                     }
                     // The shared down runs last, so the routed gate and up above reuse the int8 h of the shared up.
