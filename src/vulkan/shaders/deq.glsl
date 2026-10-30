@@ -138,11 +138,9 @@ void iq_grid(U8 w, uint b, uint ib, uint l, out uint g0, out uint g1, out uint s
         }
     }
 }
-// The 4 bytes of g, negated where bit j of s is set (j < 4), as apply_signs in kernels.cu.
-uint apply_signs(uint g, uint s) {
-    uint m = ((s * 0x00204081u) & 0x01010101u) * 0xFFu, a = g ^ m;
-    return ((a | 0x80808080u) - (m & 0x7F7F7F7Fu)) ^ ((a ^ ~m) & 0x80808080u);  // bytewise a - m
-}
+// The 4 bytes of g, negated where bit j of s is set (j < 4), as apply_signs in kernels.cu: ~g + 1 per byte, one
+// 32-bit add since no grid byte is 0 (no carries).
+uint apply_signs(uint g, uint s) { uint n = (s * 0x00204081u) & 0x01010101u; return (g ^ (n * 0xFFu)) + n; }
 
 // Values [8 sub, 8 sub + 8) of the quantized super-block at byte b as value i = d * q[i] - m with q[i] an int8
 // (QI<T> in kernels.cu).
