@@ -3515,6 +3515,18 @@ twice per backend (load 0.4-0.8), second run: Qwen3-30B-A3B-Instruct-2507 UD-Q2_
 112.0 / 114.3; Qwen3-Next-80B-A3B-Instruct UD-IQ1_S CUDA 17.6 / 24.3, Vulkan 26.8 / 29.9 tok/s. Output "Paris. ..."
 on all; the 30B Vulkan second run went on differently after "Rome." (placement drift between runs, as noted for parity above). 74 tests pass.
 
+### 2026-10-30 #214 — fall back to Vulkan when libcuda or NVRTC is missing (31eeaf5)
+
+Release check of `--gpu` without `--backend` on machines with no usable CUDA, simulated with `bwrap` (libcuda bound to
+/dev/null; the CUDA lib dir replaced by an empty tmpfs with an empty cubin cache) and `CUDA_VISIBLE_DEVICES=`.
+Before: no libcuda and no NVRTC both panicked inside cudarc ("Unable to dynamically load the \"cuda\" shared
+library"), so AMD/Intel users and NVIDIA users without the CUDA toolkit could not use `--gpu` at all; no device fell
+back to Vulkan silently. Now `Gpu::new` checks `driver::sys::is_culib_present()`, and `ptx()` checks
+`nvrtc::sys::is_culib_present()` on a cache miss, returning "CUDA init" errors, so all three cases fall back and
+print e.g. "CUDA unavailable (CUDA init: no NVIDIA driver (libcuda.so)), using Vulkan". `--backend cuda` without
+libcuda now fails with that error instead of a panic. Greedy md5 (4B and default model, both backends, mtp 0/1,
+`--kv q8`): all pairs equal to e10e999. 74 tests pass.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
