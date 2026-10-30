@@ -176,6 +176,12 @@ pub trait Backend: Send {
     fn attn_prefill(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()>;
     fn moe_combine_seq(&self, x: u64, ye: u64, wts: u64, inv: u64, k: usize, sh: u64, sg: u64, n: usize, t: usize) -> anyhow::Result<()>;
     fn norm_gate(&self, o: u64, w: u64, z: u64, n: usize, heads: usize, eps: f32) -> anyhow::Result<()>;
+    /// `norm_gate`, then either returns 0, or also writes o (all heads of a token as one row) quantized as `quant_xq`
+    /// does to `xq` and returns xq, for the GEMV's xq.
+    fn norm_gate_q(&self, o: u64, w: u64, z: u64, n: usize, heads: usize, eps: f32, _xq: u64) -> anyhow::Result<u64> {
+        self.norm_gate(o, w, z, n, heads, eps)?;
+        Ok(0)
+    }
     /// Store `t` tokens of `n` values at positions step[0] ...
     fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()>;
     /// Decode attention for `nt` query tokens, token t over positions 0 ..= step[2 t] (rows of q, qg, out and step per

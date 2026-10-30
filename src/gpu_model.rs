@@ -147,13 +147,14 @@ impl<'a> GpuModel<'a> {
 
         let ke = c.n_expert_used.max(1);
         let ff = (ke * c.n_ff_exp).max(c.n_ff);
-        let sizes: [(&'static str, usize); 29] = [
+        let sizes: [(&'static str, usize); 30] = [
             ("h", c.n_embd), ("hq", c.n_embd * 9 / 32), ("mix", c.n_embd), ("qkv", channels), ("z", c.ssm_d_inner), ("beta", nv), ("g", nv),
             ("y", channels), ("o", c.ssm_d_inner), ("qg", c.n_head * 2 * c.head_dim), ("q", c.n_head * c.head_dim),
             ("kraw", kv), ("k", kv), ("v", kv), ("att", c.n_head * c.head_dim), ("rl", c.n_expert), ("wts", ke),
             ("ge", ff), ("ue", ff), ("ye", ke * c.n_embd), ("shg", c.n_ff_shexp), ("shu", c.n_ff_shexp),
             ("shy", c.n_embd), ("sg", 1), ("wh", ke), ("attp", c.n_head * ATT_SPLITS * (c.head_dim + 2)),
             ("ffq", ff * 9 / 32), ("shq", c.n_ff_shexp * 9 / 32), ("attq", c.n_head * c.head_dim * 9 / 32),
+            ("oq", c.ssm_d_inner * 9 / 32),
         ];
         let bufs = sizes.into_iter().map(|(name, n)| Ok((name, gpu.zeros::<f32>(TMAX * n)?))).collect::<anyhow::Result<HashMap<_, _>>>()?;
         let (x, logits, ids) = (gpu.zeros::<f32>(TMAX * c.n_embd)?, gpu.zeros::<f32>(TMAX * c.n_vocab)?, gpu.zeros::<i32>(TMAX * ke)?);
@@ -461,8 +462,8 @@ impl<'a> GpuModel<'a> {
                     }
                     if nn == 0 { g.l2_norm(p("y"), dk, 2 * nk, channels, nt * 2 * nk, eps)?; }
                     g.deltanet(p("y"), s.addr(), p("beta"), p("g"), dt_bias.ptr, a.ptr, p("o"), nk, nv, c.k_interleave, dk, dv, 1.0 / (dk as f32).sqrt(), nt, channels, ss, ns)?;
-                    g.norm_gate(p("o"), norm.ptr, p("z"), dv, nt * nv, eps)?;
-                    mv(out, "o", c.ssm_d_inner, "mix", ne)?;
+                    let oq = g.norm_gate_q(p("o"), norm.ptr, p("z"), dv, nt * nv, eps, p("oq"))?;
+                    if oq != 0 { g.gemvq(out, p("o"), c.ssm_d_inner, oq, p("mix"), ne, nt)?; } else { mv(out, "o", c.ssm_d_inner, "mix", ne)?; }
                 }
                 Mixer::Attn { q, k, v, qn, kn, o, kc, vc } => {
                     let qs = if c.q_gate { 2 * hd } else { hd };
