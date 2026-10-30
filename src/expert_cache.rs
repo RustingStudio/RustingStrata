@@ -150,10 +150,10 @@ impl ExpertCache {
         for p in 0..self.pools.len() {
             let mut hot: Vec<usize> = (0..self.counts.len())
                 .filter(|&i| self.layers[i / n].as_ref().is_some_and(|l| l.pool == p && l.table[i % n] < 0)).collect();
-            hot.sort_by(|&a, &b| self.counts[b].total_cmp(&self.counts[a]));
+            smallest(&mut hot, max_swaps, |&a, &b| self.counts[b].total_cmp(&self.counts[a]));
             let mut cold: Vec<usize> = (0..self.pools[p].owner.len()).collect();
             let cnt = |s: usize, me: &Self| { let (il, e) = me.pools[p].owner[s]; me.counts[il * n + e] };
-            cold.sort_by(|&a, &b| cnt(a, self).total_cmp(&cnt(b, self)));
+            smallest(&mut cold, max_swaps, |&a, &b| cnt(a, self).total_cmp(&cnt(b, self)));
             let mut touched = Vec::new();
             for (&h, &slot) in hot.iter().zip(&cold).take(max_swaps) {
                 if self.counts[h] < 1.5 * cnt(slot, self) + 2.0 { break; }
@@ -177,4 +177,14 @@ impl ExpertCache {
         std::fs::write(profile, self.counts.iter().flat_map(|c| c.to_le_bytes()).collect::<Vec<u8>>())?;
         Ok(())
     }
+}
+
+/// Keeps the `k` first elements of `v` in the order a stable sort by `cmp` gives, without sorting all of `v`.
+fn smallest(v: &mut Vec<usize>, k: usize, cmp: impl Fn(&usize, &usize) -> std::cmp::Ordering) {
+    let cmp = |a: &usize, b: &usize| cmp(a, b).then(a.cmp(b));
+    if k < v.len() {
+        v.select_nth_unstable_by(k, cmp);
+        v.truncate(k);
+    }
+    v.sort_by(cmp);
 }
