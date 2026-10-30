@@ -3557,6 +3557,16 @@ the file it wrote was removed again), and a clean build of `main` in a scratch c
   lives in registers on Vulkan; closing the gap needs a different tiling (e.g. BQ = 32 per workgroup), which
   changes no rounding but is a larger rewrite.
 
+### 2026-10-30 #217 — serve soak on both backends, --gpu help text (8575b3f)
+
+- `strata --help` said `--gpu` used "static expert placement"; placement has been adaptive by default for a long
+  time (static only with STRATA_FIXED_EXPERTS). The help now says experts that do not fit in VRAM run on the CPU.
+- Serve soak (Qwen3.6-35B-A3B UD-Q2_K_XL, ctx 4096, load 3.4-5.1): 150 sequential requests per backend, cycling a
+  long prose prompt (64 tokens out), a tool call, a growing multi-turn history (last 12 messages), a sampled stream
+  and a long repeated prompt (16 tokens out). CUDA: 0 errors, 117 s, RSS 12030 -> 12079 MB, VRAM 10138 MB flat.
+  Vulkan: 0 errors, 136 s, RSS 11686 -> 11730 MB, VRAM 10195 MB flat. RSS grows ~50 MB over the first 75 requests
+  and then holds (+1-4 MB over the last 75); no leak. The server stayed up after both runs.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
