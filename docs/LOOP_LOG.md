@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 47472c6 (#163, `bench --mtp 0`, tg128 after pp512, load 0.6-0.9): CUDA decode 117.6 (4B 98.5), Vulkan 116.3 (4B 103.4).
+- At 0b3dcba (#164, `bench --mtp 0`, tg128 after pp512, load 0.6-2.8): CUDA decode 117.5 (4B 98.5), Vulkan 116.7 (4B 103.4).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2903,6 +2903,20 @@ already need sm_80 (cp.async, s8 mma), so there is no fallback.
 - Tests 74 passed. Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, long prompt mtp0/mtp1).
 - Not verified: what the remaining ~117 us is (still 8x CUDA); `put` (57.6 us) untouched; the worker thread's own
   reads of the BAR mailbox (activations of missed experts) untouched; no miss-heavy run (the bench hits 100%).
+
+### 2026-10-30 #164 — CPU worker: streaming loads for the routing read (0b3dcba)
+
+- Change: `routing` reads the layer's words with `_mm_stream_load_si128` (movntdqa, `read_wc`; plain copy without
+  SSE4.1). On write-combining memory, which the Vulkan BAR mapping is, one movntdqa fetches the whole 64-byte line
+  and later loads of that line come from the streaming buffer; plain loads each make an uncached PCIe read. The
+  copy is rounded up to whole 16-byte chunks (still inside the layer's mailbox).
+- Vulkan after_forward (temporary timer, removed; single run, load 2.5): 117 -> 70 us mean, median 55 (CUDA 14.5).
+- A/B vs 6ed7690, interleaved, load 1.6-2.8: Vulkan 35B 116.13 -> 116.65 (8 pairs, 7 better, loop spread
+  115.9-117.1); CUDA 35B 117.50 -> 117.48 (4 pairs, neutral).
+- Tests 74 passed. Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, long prompt mtp0/mtp1).
+- Not verified: 4B (no CPU worker, path not taken). The remaining ~55 us is about 40 layers x 3 uncached line
+  reads (NTOK on line 0, the routing on lines 2-3); reading NTOK from `nt` or a contiguous routing area for all
+  layers would cut it further. The worker thread's reads of the mailbox (spin on REQ, activations) are untouched.
 
 ## Next candidates
 
