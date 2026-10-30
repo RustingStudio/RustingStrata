@@ -33,7 +33,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   632-634/640 (#124).
 - At 52b364e (#165, `bench --mtp 0`, tg128 after pp512, load 0.6-2.9): CUDA decode 117.5 (4B 98.5), Vulkan 117.0 (4B 104.0).
 - At d73cc1f (#179, same bench, load 0.8-1.5): CUDA decode 119.6, MTP k = 1 136.1 (4B not re-measured).
-- At 8fe4e87 (#181, #182): Vulkan pp2048 with `STRATA_EXPERT_MB=6000` 1621 (was 1386); CUDA same config 1580.
+- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832.
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -3136,6 +3136,22 @@ with consecutive ids are contiguous as in the weights and copy in one `htod` (`s
 - Shared code, so CUDA parity spot check, 4 interleaved pairs: 626 / 627 / 624 / 626 before (625.75), 625 / 625 /
   626 / 625 after (625.25); per-prompt results drift in both binaries (MTP nondeterminism, #166).
 - Tests: 74 passed. Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, long prompt mtp0/mtp1).
+
+### 2026-10-30 #183 — CUDA htod: pinned ring for copies of 256 KB and more (0712f6b)
+
+#182's nsys left 78 ms of GPU idle between expert copies in CUDA prefill: from pageable memory the driver blocks
+until its bounce buffer drains, so the host copy of a group never overlapped the GEMMs before it. Copies of 256 KB
+and more now go into a 64 MB pinned (write-combined) ring and return before the DMA; an event per copy marks its
+region, and a new copy waits only for the events of the regions it overwrites. Smaller copies keep the pageable path.
+Model load goes through the ring too.
+
+- `bench --pp 2048 --mtp 0`, 6 interleaved rounds (load 0.5-0.9, first base run cold at 661, dropped):
+  `STRATA_EXPERT_MB=6000` 1521 / 1532 / 1547 / 1555 / 1559 (mean 1543) before, 1624 / 1637 / 1643 / 1655 / 1654 /
+  1659 (mean 1645) after, +6.6%. Default residency 1804 / 1811 / 1818 before, 1828 / 1831 / 1836 after, +1.1%.
+  Decode unchanged (112-116 both).
+- Long prompt (2023 tokens) CUDA prefill: 1202 / 1454 before, 1595 / 1604 after.
+- Tests: 74 passed. CUDA greedy md5s unchanged (4B, 35B mtp0/mtp1, kvq8, long prompt mtp0/mtp1); Vulkan untouched.
+- Not verified: an `htod` of 256 KB or more inside a CUDA graph capture (none today; the event sync would fail there).
 
 ## Next candidates
 
