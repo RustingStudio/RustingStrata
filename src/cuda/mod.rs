@@ -215,7 +215,8 @@ impl Gpu {
     /// 4096 rows are ~10% faster with 1, the default model's 2048 rows ~5% slower).
     fn rpw(rows: usize, cols: usize, k: usize) -> usize {
         // The vocab head: more rows per block amortize gemvn's per-block x quantization (nt = 2: 1158 -> 1027 us).
-        let d = if k > 1 { (2048 / cols).max(1) } else if rows >= 65536 { 8 } else if rows >= 8192 || rows == 2048 { 2 } else { 1 };
+        // Experts of 512 columns (35B down, 2 superblocks a row): 16 rows per warp, 116.1 -> 116.6 tok/s.
+        let d = if k > 1 { if cols <= 512 { 16 } else { (2048 / cols).max(1) } } else if rows >= 65536 { 8 } else if rows >= 8192 || rows == 2048 { 2 } else { 1 };
         std::env::var("STRATA_RPW").ok().and_then(|v| v.parse().ok()).unwrap_or(d)
     }
 
