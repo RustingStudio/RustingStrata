@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 5561aae (#146, `bench --mtp 0`, tg128 after pp512, load 1.3-2.4): CUDA decode 113.1 (4B 97.2), Vulkan 104.8 (4B 101.7).
+- At 7475bd7 (#148, `bench --mtp 0`, tg128 after pp512, load 1.0-1.9): CUDA decode 115.4 (4B 98.0), Vulkan 106.9 (4B 102.8).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2659,6 +2659,24 @@ CUDA 35B decode, interleaved A/B against 5561aae (`bench --mtp 0`, tg128 after p
 One block cannot stream the k expert outputs fast enough; the last-block variant is within noise and adds a counter
 buffer and a fence protocol, so it was not kept (patch kept outside the repo). The launch gap between two graph
 nodes this small is about 1 us, which caps such fusions at ~0.4% on the 35B.
+
+### 2026-10-30 #148 — Greedy decode without MTP: argmax on the GPU (7475bd7)
+
+An nsys profile of the 35B CUDA decode (5561aae) showed ~0.6 ms per token with the GPU idle between graphs: ~207 us
+from the logits readback to the next upload, and ~400 us from that upload to the first kernel (`cuGraphLaunch`
+median 397 us for a 692-node graph). The first part was plain greedy decode copying all 248320 logits (1 MB) back
+and taking the argmax on the CPU. `GpuModel::step_greedy` runs `argmax_rows` on the GPU (as the MTP path does) and
+reads back only the id; `decode` uses it for greedy GPU runs without MTP. Same tie rule (first index).
+
+- A/B against 5561aae, interleaved, `bench --mtp 0`: CUDA 35B 113.5 -> 115.4 (6+6, spread 0.1/0.1, load 1.6-1.8),
+  CUDA 4B 97.2 -> 98.0 (3+3, load 1.6); Vulkan 35B 104.4 -> 106.9 (4+4, spread 0.4/0.3, load 1.2-1.7),
+  Vulkan 4B 101.4 -> 102.8 (4+4, spread 1.0/0.9, load 1.0-1.1).
+- Greedy md5s unchanged: 4B both backends `64bab3bb`, 35B mtp0 `06c92e18`, mtp1 `04cf91e9`, kvq8 cuda `04cf91e9` /
+  vulkan `06c92e18`, and the 2023-token prompt crossing 2048 (mtp1 `d8774b12`, mtp0 `d03a4d33`) on both backends.
+- 74 tests pass. Not verified: sampling (temp > 0) is untouched and still reads the logits; `perplexity` and the
+  `logits` command use `step` as before.
+- Left: the ~400 us `cuGraphLaunch` before the GPU starts. Splitting the decode graph so the first part starts while
+  the rest is launched is the next try.
 
 ## Next candidates
 
