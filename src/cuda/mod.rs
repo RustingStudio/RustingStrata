@@ -287,8 +287,10 @@ impl Backend for Gpu {
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
         anyhow::ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
         self.ctx.bind_to_thread()?;
+        // Inside `batch` a copy goes to the side stream, beside the next launch on the main stream.
+        let st = if self.nb.load(Relaxed) == usize::MAX { &self.stream } else { &self.side };
         // No stream sync: from pageable memory (every caller's) the driver has staged `src` when the call returns.
-        if src.len() < RING_MIN { return Ok(unsafe { result::memcpy_htod_async(dst.addr() + off as u64, src, self.stream.cu_stream()) }?); }
+        if src.len() < RING_MIN { return Ok(unsafe { result::memcpy_htod_async(dst.addr() + off as u64, src, st.cu_stream()) }?); }
         let mut g = self.ring.lock().unwrap();
         let (pin, head, busy) = &mut *g;
         let base = pin.as_mut_ptr()?;
@@ -299,9 +301,9 @@ impl Backend for Gpu {
             unsafe {
                 let p = base.add(a);
                 std::ptr::copy_nonoverlapping(c.as_ptr(), p, c.len());
-                result::memcpy_htod_async(dst.addr() + (off + i * RING) as u64, std::slice::from_raw_parts(p, c.len()), self.stream.cu_stream())?;
+                result::memcpy_htod_async(dst.addr() + (off + i * RING) as u64, std::slice::from_raw_parts(p, c.len()), st.cu_stream())?;
             }
-            busy.push_back((a, b, self.stream.record_event(None)?));
+            busy.push_back((a, b, st.record_event(None)?));
             *head = b;
         }
         Ok(())
@@ -331,7 +333,8 @@ impl Backend for Gpu {
 
     fn sync(&self) -> anyhow::Result<()> { Ok(self.stream.synchronize()?) }
 
-    // Every op batched on CUDA is one launch, so alternating launches never splits an op over the two streams.
+    // Every op batched on CUDA is one launch, so alternating launches never splits an op over the two streams. Copies
+    // do not count: they all go to the side stream.
     fn batch(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
         self.side.join(&self.stream)?;
         self.nb.store(0, Relaxed);
