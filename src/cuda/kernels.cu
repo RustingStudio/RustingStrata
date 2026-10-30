@@ -433,8 +433,8 @@ __device__ __forceinline__ void q8k_scale(float v, int i, float& d, float& id) {
 }
 
 // Quantize the 8 values a, c at x + i into qs + i and, by the lane with i % 32 == 0, its scale into xd[i / 32]; the
-// warp's 32 lanes cover 256 consecutive values.
-__device__ __forceinline__ void quant8(float4 a, float4 c, int i, signed char* qs, float* xd) {
+// warp's 32 lanes cover 256 consecutive values (or the lanes in m, whole groups of 4).
+__device__ __forceinline__ void quant8(float4 a, float4 c, int i, signed char* qs, float* xd, unsigned m = 0xffffffff) {
     float mx = fmaxf(fmaxf(fmaxf(fabsf(a.x), fabsf(a.y)), fmaxf(fabsf(a.z), fabsf(a.w))),
                      fmaxf(fmaxf(fabsf(c.x), fabsf(c.y)), fmaxf(fabsf(c.z), fabsf(c.w))));
 #if LLAMA_Q8
@@ -446,8 +446,8 @@ __device__ __forceinline__ void quant8(float4 a, float4 c, int i, signed char* q
         q8k_scale(sv, si, d, id);
     }
 #else
-    mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 1));
-    mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
+    mx = fmaxf(mx, __shfl_xor_sync(m, mx, 1));
+    mx = fmaxf(mx, __shfl_xor_sync(m, mx, 2));
     float d = mx / 127.0f, id = mx > 0.0f ? 127.0f / mx : 0.0f;
 #endif
     int2 q = make_int2(pack4(__float2int_rn(a.x * id), __float2int_rn(a.y * id), __float2int_rn(a.z * id), __float2int_rn(a.w * id)),
@@ -1177,14 +1177,23 @@ extern "C" __global__ void deltanet_seq(const float* y, float* S, const float* b
     for (int i = 0; i < 4; i++) row[s + L * i] = make_float4(r[4 * i], r[4 * i + 1], r[4 * i + 2], r[4 * i + 3]);
 }
 
-// grid = heads: out = rmsnorm(o_h) * w * silu(z_h), in place on o.
-extern "C" __global__ void norm_gate(float* o, const float* w, const float* z, int n, float eps) {
+// grid = heads: out = rmsnorm(o_h) * w * silu(z_h), in place on o. xq not null: also quant_xq's layout of out (heads of
+// a token are contiguous, so its rows are tokens) for the out GEMV.
+extern "C" __global__ void norm_gate(float* o, const float* w, const float* z, int n, float eps, signed char* xq) {
     float* h = o + (size_t)blockIdx.x * n;
     const float* zh = z + (size_t)blockIdx.x * n;
     float s = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) s += h[i] * h[i];
     float sc = 1.0f / sqrtf(block_sum(s) / (float)n + eps);
     for (int i = threadIdx.x; i < n; i += blockDim.x) h[i] = h[i] * sc * w[i] * silu(zh[i]);
+    if (!xq) return;
+    __syncthreads();
+    size_t b = (size_t)blockIdx.x * n;
+    for (int i0 = 0; i0 < n; i0 += blockDim.x * 8) {
+        int i = i0 + threadIdx.x * 8;
+        unsigned m = __ballot_sync(0xffffffff, i < n);
+        if (i < n) quant8(*(const float4*)(h + i), *(const float4*)(h + i + 4), i, xq + b, (float*)(xq + (size_t)gridDim.x * n) + b / 32, m);
+    }
 }
 
 // ---- attention ----
