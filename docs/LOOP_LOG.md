@@ -33,7 +33,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   632-634/640 (#124).
 - At 52b364e (#165, `bench --mtp 0`, tg128 after pp512, load 0.6-2.9): CUDA decode 117.5 (4B 98.5), Vulkan 117.0 (4B 104.0).
 - At d73cc1f (#179, same bench, load 0.8-1.5): CUDA decode 119.6, MTP k = 1 136.1 (4B not re-measured).
-- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832, 1884 at 92c594b (#184), 2013 at febaded (#185), 2052 at 1aa1182 (#187), 2093 at b45136b (#191); #188 +0.7% CUDA, +0.6% Vulkan (Vulkan default residency ~1905). Vulkan pp2048 1925 at 603557f (#201-#202), 1929 at 415b742 (#203), ~1955-1960 at edaff5b (#204, warm GPU).
+- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832, 1884 at 92c594b (#184), 2013 at febaded (#185), 2052 at 1aa1182 (#187), 2093 at b45136b (#191); #188 +0.7% CUDA, +0.6% Vulkan (Vulkan default residency ~1905). Vulkan pp2048 1925 at 603557f (#201-#202), 1929 at 415b742 (#203), ~1955-1960 at edaff5b (#204, warm GPU), 2024 at e0c7703 (#209, base 1988 in the same run; decode 115.4).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -3444,6 +3444,17 @@ only group 1. pp2048, rounds 1-3, load 1.7-2.0: Vulkan 1992.0 / 1991.0 / 1991.0 
 1991.3 both), CUDA 2108.8 / 2110.5 / 2110.4 -> 2109.4 / 2109.8 / 2110.7 (2109.9 -> 2110.0). With #207 this says the
 synchronous copies of groups 2+ are not on the critical path at pp2048; the staged copy time left is group 1's, or
 the copy engine is the limit. Reverted.
+
+### 2026-10-30 #209 — Vulkan IQ decode: ksigns from the parity (e0c7703)
+
+`ksigns_iq2xs[i]` is `i` with its parity as bit 7, so `i | (bitCount(i) & 1) << 7` replaces the table load (a
+dependent global-memory lookup after the `aux` load) in the IQ2_XXS, IQ2_XS and IQ3_XXS decode of `deq.glsl`, which
+every Vulkan GEMM and GEMV includes. Same bits. `gemm_throughput` (Vulkan, 2 runs each): IQ2_XS 0.57/0.59 ->
+0.55/0.54 ms, IQ3_XXS 0.53/0.54 -> 0.52/0.52, the rest equal. pp2048 tg64, rounds 1-4, load 1.1-1.4: prefill
+1989.0 / 1987.8 / 1987.0 / 1986.6 -> 2020.0 / 2022.9 / 2027.1 / 2025.3 (mean 1987.6 -> 2023.8, +1.8%), decode
+114.3 / 114.4 / 114.3 / 114.3 -> 115.6 / 115.3 / 115.6 / 114.9 (+0.9%). Tests 74 passed, greedy md5s 12 pairs
+equal, parity 628 / 626 (CUDA untouched, drift). CUDA keeps its `__device__` table (and the shared copy in
+`gemm_q`); the same change there is the next A/B.
 
 ## Next candidates
 
