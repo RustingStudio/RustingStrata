@@ -15,8 +15,8 @@ const QTYPES: [GgmlType; 17] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL]
 };
-const KERNELS: [&str; 25] = [
-    "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
+const KERNELS: [&str; 26] = [
+    "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
 ];
@@ -450,6 +450,10 @@ impl Backend for Gpu {
     fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()> {
         launch!(self, "swiglu", Self::grid(n), g, u, n as i32);
         Ok(())
+    }
+    fn swiglu_q(&self, g: u64, u: u64, n: usize, rows: usize, xq: u64) -> anyhow::Result<u64> {
+        launch!(self, "swiglu_q", cfg(((n / 256) as u32, rows as u32), 32, 0), g, u, n as i32, xq);
+        Ok(xq)
     }
 
     fn ssm_gates(&self, beta: u64, g: u64, dt_bias: u64, a: u64, n: usize, nv: usize) -> anyhow::Result<()> {
