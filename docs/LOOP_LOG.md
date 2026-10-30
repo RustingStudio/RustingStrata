@@ -3428,6 +3428,15 @@ attn_gate 3.85 -> 4.93, Q6_K 4.71 -> 4.87. Probably the extra registers cost occ
 end-to-end run. CUDA `gemmi_q` does not use the shared IQ tables (only `gemm_q` does, #185), so tables do not explain
 the IQ3_XXS gap (Vulkan 122 ms vs CUDA 103 at pp2048).
 
+### 2026-10-30 #207 — Prefill expert staging: 32 experts per group, no gain (no code commit)
+
+Groups after the first copy their missed experts synchronously (`if gi > 1 { copy(grp)?; }` in `prefill.rs`), so
+fewer, larger groups could cut the waits. `STAGE` 16 -> 32 (staging 2x) at pp2048, rounds 1-3, load 1.5-1.6:
+Vulkan 1966.7 / 1978.2 / 1980.4 -> 1975.4 / 1978.0 / 1976.8 (mean 1975.1 -> 1976.7, +0.1%), CUDA 2096.8 / 2095.0 /
+2096.4 -> 2098.0 / 2096.0 / 2097.3 (+0.0%). The copy bytes stay the same and only one group overlaps either way, so
+the waits do not shrink. A ping-pong staging area (copy group gi + 1 beside group gi's GEMMs) is the real fix but
+also costs a second staging area; not tried.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
