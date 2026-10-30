@@ -101,20 +101,22 @@ void qw_k(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out flo
 // IQ2_XXS (16), IQ2_XS (17), IQ2_S (22), IQ3_XXS (18), IQ3_S (21): grid bytes of sub-block l of block ib (4 in g0,
 // 4 in g1), their 8 sign bits and the scale.
 const bool IQG = T == 16 || T == 17 || T == 22 || T == 18 || T == 21;
+// ksigns_iq2xs[i]: the 7 sign bits i and their parity as bit 7, computed instead of a table load.
+uint ksign(uint i) { return i | (bitCount(i) & 1) << 7; }
 void iq_grid(U8 w, uint b, uint ib, uint l, out uint g0, out uint g1, out uint sg, out float d) {
     if (T == 16 || T == 17 || T == 22) {
         uint64_t g;
         if (T == 16) {
             uint aux = ld32(w, b + 6 + 8 * ib);
             g = iq2xxs_grid[u8_(w, b + 2 + 8 * ib + l)];
-            sg = ksigns_iq2xs[(aux >> (7 * l)) & 127];
+            sg = ksign((aux >> (7 * l)) & 127);
             d = ldh(w, b) * (0.5 + float(aux >> 28)) * 0.25;
         } else {
             uint sc = u8_(w, b + (T == 22 ? 74 : 66) + ib);
             if (T == 17) {
                 uint k = ld16(w, b + 2 + 2 * (4 * ib + l));
                 g = iq2xs_grid[k & 511];
-                sg = ksigns_iq2xs[k >> 9];
+                sg = ksign(k >> 9);
             } else {
                 g = iq2s_grid[u8_(w, b + 2 + 4 * ib + l) | ((u8_(w, b + 66 + ib) << (8 - 2 * l)) & 0x300)];
                 sg = u8_(w, b + 34 + 4 * ib + l);
@@ -127,7 +129,7 @@ void iq_grid(U8 w, uint b, uint ib, uint l, out uint g0, out uint g1, out uint s
         if (T == 18) {
             uint aux = ld32(w, b + 66 + 4 * ib);
             d = ldh(w, b) * (0.5 + float(aux >> 28)) * 0.5;
-            sg = ksigns_iq2xs[(aux >> (7 * l)) & 127];
+            sg = ksign((aux >> (7 * l)) & 127);
             g0 = iq3xxs_grid[qq & 255]; g1 = iq3xxs_grid[qq >> 8];
         } else {
             uint hb = u8_(w, b + 66 + ib);
