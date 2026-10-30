@@ -432,30 +432,34 @@ __device__ __forceinline__ void q8k_scale(float v, int i, float& d, float& id) {
     d = v != 0.0f ? 1.0f / id : 0.0f;
 }
 
+// Quantize the 8 values a, c at x + i into qs + i and, by the lane with i % 32 == 0, its scale into xd[i / 32]; the
+// warp's 32 lanes cover 256 consecutive values.
+__device__ __forceinline__ void quant8(float4 a, float4 c, int i, signed char* qs, float* xd) {
+    float mx = fmaxf(fmaxf(fmaxf(fabsf(a.x), fabsf(a.y)), fmaxf(fabsf(a.z), fabsf(a.w))),
+                     fmaxf(fmaxf(fabsf(c.x), fabsf(c.y)), fmaxf(fabsf(c.z), fabsf(c.w))));
+#if LLAMA_Q8
+    float d, id;
+    {  // llama.cpp q8_K: one scale per 256 (the warp), -127 / the signed value of largest magnitude
+        float sv = 0.f; int si = 1 << 30;
+        float vv[8] = {a.x, a.y, a.z, a.w, c.x, c.y, c.z, c.w};
+        for (int j = 0; j < 8; j++) if (fabsf(vv[j]) == mx && si > i + j) { sv = vv[j]; si = i + j; }
+        q8k_scale(sv, si, d, id);
+    }
+#else
+    mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 1));
+    mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
+    float d = mx / 127.0f, id = mx > 0.0f ? 127.0f / mx : 0.0f;
+#endif
+    int2 q = make_int2(pack4(__float2int_rn(a.x * id), __float2int_rn(a.y * id), __float2int_rn(a.z * id), __float2int_rn(a.w * id)),
+                       pack4(__float2int_rn(c.x * id), __float2int_rn(c.y * id), __float2int_rn(c.z * id), __float2int_rn(c.w * id)));
+    *(int2*)(qs + i) = q;
+    if ((threadIdx.x & 3) == 0) xd[i >> 5] = d;
+}
+
 // Quantize x[0, n) into shared int8 qs[n] and per-32 scales xd[n / 32]; the whole block participates.
 __device__ __forceinline__ void quant_x(const float* __restrict__ x, int n, signed char* qs, float* xd) {
-    for (int i = threadIdx.x * 8; i < n; i += blockDim.x * 8) {
-        float4 a = *(const float4*)(x + i), c = *(const float4*)(x + i + 4);
-        float mx = fmaxf(fmaxf(fmaxf(fabsf(a.x), fabsf(a.y)), fmaxf(fabsf(a.z), fabsf(a.w))),
-                         fmaxf(fmaxf(fabsf(c.x), fabsf(c.y)), fmaxf(fabsf(c.z), fabsf(c.w))));
-#if LLAMA_Q8
-        float d, id;
-        {  // llama.cpp q8_K: one scale per 256 (the warp), -127 / the signed value of largest magnitude
-            float sv = 0.f; int si = 1 << 30;
-            float vv[8] = {a.x, a.y, a.z, a.w, c.x, c.y, c.z, c.w};
-            for (int j = 0; j < 8; j++) if (fabsf(vv[j]) == mx && si > i + j) { sv = vv[j]; si = i + j; }
-            q8k_scale(sv, si, d, id);
-        }
-#else
-        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 1));
-        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
-        float d = mx / 127.0f, id = mx > 0.0f ? 127.0f / mx : 0.0f;
-#endif
-        int2 q = make_int2(pack4(__float2int_rn(a.x * id), __float2int_rn(a.y * id), __float2int_rn(a.z * id), __float2int_rn(a.w * id)),
-                           pack4(__float2int_rn(c.x * id), __float2int_rn(c.y * id), __float2int_rn(c.z * id), __float2int_rn(c.w * id)));
-        *(int2*)(qs + i) = q;
-        if ((threadIdx.x & 3) == 0) xd[i >> 5] = d;
-    }
+    for (int i = threadIdx.x * 8; i < n; i += blockDim.x * 8)
+        quant8(*(const float4*)(x + i), *(const float4*)(x + i + 4), i, qs, xd);
     __syncthreads();
 }
 
@@ -1016,6 +1020,18 @@ extern "C" __global__ void add(float* x, const float* y, int n) {
 extern "C" __global__ void swiglu(float* g, const float* u, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) g[i] = silu(g[i]) * u[i];
+}
+
+// swiglu on rows of n (a multiple of 256) quantized as quant_xq does into out; g is left as is. Block (c, t) of one
+// warp: values c * 256 .. of row t.
+extern "C" __global__ void swiglu_q(const float* g, const float* u, int n, signed char* out) {
+    size_t o = (size_t)blockIdx.y * n + blockIdx.x * 256;
+    int i = threadIdx.x * 8;
+    float4 a = *(const float4*)(g + o + i), c = *(const float4*)(g + o + i + 4);
+    float4 ua = *(const float4*)(u + o + i), uc = *(const float4*)(u + o + i + 4);
+    a = make_float4(silu(a.x) * ua.x, silu(a.y) * ua.y, silu(a.z) * ua.z, silu(a.w) * ua.w);
+    c = make_float4(silu(c.x) * uc.x, silu(c.y) * uc.y, silu(c.z) * uc.z, silu(c.w) * uc.w);
+    quant8(a, c, i, out + o, (float*)(out + (size_t)gridDim.y * n) + o / 32);
 }
 
 // ---- Gated DeltaNet ----
