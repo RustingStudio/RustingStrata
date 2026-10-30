@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At d2cdf5e (#150, `bench --mtp 0`, tg128 after pp512, load 0.9-1.9): CUDA decode 116.5 (4B 98.4), Vulkan 106.9 (4B 102.8).
+- At f634692 (#152, `bench --mtp 0`, tg128 after pp512, load 0.9-1.9): CUDA decode 116.5 (4B 98.4), Vulkan 107.5 (4B 102.8).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2718,6 +2718,23 @@ experts of at most 512 columns.
 - Vulkan: MoE down rows per subgroup swept on the 35B (`bench --mtp 0`, 2-3 rounds, load 1.0-1.8): 2/4/8/16 ->
   107.1/107.0/106.7/105.8. The current 4 is within noise of 2; left as is.
 - Not verified: NR=2 for gate/up alone (the pair GEMV already shares x across gate and up).
+
+### 2026-10-30 #152 — Vulkan deltanet state in vec4 loads and stores (f634692)
+
+A per-kernel comparison of the 35B decode (`STRATA_VK_PROF=1 STRATA_NO_GRAPH=1` against nsys with
+`STRATA_NO_GRAPH=1`, pp512 tg128, load 0.4-1.0) left deltanet as the clearest single gap: Vulkan 24.5 us per call,
+CUDA `deltanet_seq` 18.2 us (30 layers, ~0.19 ms per token). The shader read and wrote each lane's 16 state floats
+as scalars; they are now four vec4 chunks (the snapshots too). Decode deltanet: 24.5 -> 19.5 us.
+(A pp16 profile shows `moe_combine` at 25 us: that run had 111 expert misses, so combine waited for the CPU. At
+pp512 there are no misses and it is 3.5 us, as on CUDA.)
+
+- A/B against d2cdf5e, interleaved, 4+4, load 0.9-1.3: Vulkan 35B decode 106.6 (106.4-106.8) -> 107.5
+  (107.2-107.8), prefill pp512 1056.6 (1050.6-1060.5) -> 1087.9 (1083.0-1092.9); 4B 103.1 -> 102.9 (no deltanet,
+  noise).
+- Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, long prompt). 74 tests pass.
+- Not verified: head dims other than 128 (the vec4 layout is the same for all of 32-256).
+- Also tried on CUDA (no gain, reverted): `gemv_row_q` unroll 2 or 8 for all types 116.6 -> 111.0-111.4; unroll 8
+  for IQ2_XS only 116.5 -> 115.9.
 
 ## Next candidates
 
