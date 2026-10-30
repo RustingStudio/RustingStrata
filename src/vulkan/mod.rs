@@ -591,13 +591,16 @@ impl Backend for Vk {
         ensure!(st.rec.is_none(), "a host copy while recording a graph");
         for (i, c) in src.chunks(STAGING).enumerate() {
             if st.staged + c.len() > STAGING { self.0.flush(&mut st)?; }
+            // Submit the work recorded so far first, so the GPU runs it while the host fills staging.
+            if st.cur.is_some() { self.0.submit(&mut st, None, false)?; }
             let (b, o) = st.find(dst.addr() + (off + i * STAGING) as u64, c.len())?;
             let at = st.staged;
             unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), (st.map + at) as *mut u8, c.len()) };
             let cb = self.0.open_cb(&mut st)?;
             let r = vk::BufferCopy::default().src_offset(at as u64).dst_offset(o).size(c.len() as u64);
             unsafe { self.0.dev.cmd_copy_buffer(cb, st.staging.0, b, &[r]) };
-            self.0.barrier(cb, false);
+            // Inside `batch` the copy may overlap the dispatches after it; the batch ends with a barrier.
+            if !st.batch { self.0.barrier(cb, false); }
             st.staged = (at + c.len()).next_multiple_of(256);
             self.0.submit(&mut st, None, false)?;
         }
