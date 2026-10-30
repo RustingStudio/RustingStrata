@@ -495,8 +495,14 @@ impl Backend for Gpu {
     }
 
     fn norm_gate(&self, o: u64, w: u64, z: u64, n: usize, heads: usize, eps: f32) -> anyhow::Result<()> {
-        launch!(self, "norm_gate", cfg((heads as u32, 1), 128, 0), o, w, z, n as i32, eps);
-        Ok(())
+        self.norm_gate_q(o, w, z, n, heads, eps, 0).map(|_| ())
+    }
+
+    fn norm_gate_q(&self, o: u64, w: u64, z: u64, n: usize, heads: usize, eps: f32, xq: u64) -> anyhow::Result<u64> {
+        // llama numerics take one scale per 256 values, more than a head.
+        let xq = if llama_numerics() || n % 32 != 0 { 0 } else { xq };
+        launch!(self, "norm_gate", cfg((heads as u32, 1), 128, 0), o, w, z, n as i32, eps, xq);
+        Ok(xq)
     }
 
     fn kv_words(&self, n: usize) -> usize { if self.kv_q8 { n * 17 / 32 } else { n } }
