@@ -33,7 +33,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   632-634/640 (#124).
 - At 52b364e (#165, `bench --mtp 0`, tg128 after pp512, load 0.6-2.9): CUDA decode 117.5 (4B 98.5), Vulkan 117.0 (4B 104.0).
 - At d73cc1f (#179, same bench, load 0.8-1.5): CUDA decode 119.6, MTP k = 1 136.1 (4B not re-measured).
-- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832, 1884 at 92c594b (#184), 2013 at febaded (#185), 2052 at 1aa1182 (#187); #188 +0.7% CUDA, +0.6% Vulkan (Vulkan default residency ~1905).
+- At 0712f6b (#181-#183): pp2048 with `STRATA_EXPERT_MB=6000` Vulkan 1621 (was 1386), CUDA 1645 (was 1543); CUDA default residency pp2048 1832, 1884 at 92c594b (#184), 2013 at febaded (#185), 2052 at 1aa1182 (#187), 2093 at b45136b (#191); #188 +0.7% CUDA, +0.6% Vulkan (Vulkan default residency ~1905).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -3238,6 +3238,23 @@ IQ2_XS and IQ3_XXS and decodes through `QS<T>::get` (d times the signed grid byt
 ### 2026-10-30 #190 — SSM z GEMM beside the deltanet scan (680cdb8)
 
 The SSM z GEMM (4096 rows, ~2.5 ms) only needs the int8 h of the qkv GEMM, so it moves from after qkv into a `batch` with `deltanet_seq`; it reuses the int8 x via `SAME_X`. `gemm_raw` now refuses a `quant_q8` inside a batch on both backends (the side stream would race on the shared int8 buffer). nsys pp2048: z starts ~2600 us into the ~3430 us scan, when the scan's third wave leaves SMs free (124 regs, 2 blocks/SM, so not earlier); the qkv-to-norm_gate span per SSM layer drops 11.08 -> 9.96 ms. End to end the gain is smaller: interleaved A/B rounds 1-3, load 0.7-1.3, CUDA 2039.6 (2037.6-2043.1) -> 2045.9 (2043.0-2048.1) +0.3%, Vulkan 1904.3 (1902.4-1905.4) -> 1912.3 (1909.3-1914.2) +0.4%. Greedy md5s unchanged, 74 tests green, parity 625/640 (base 626-627, normal drift).
+
+### 2026-10-30 #191 — first staged expert group copies beside the resident up GEMM (b45136b)
+
+nsys of CUDA prefill at #190 (pp2048, default residency): 60.6 ms of GPU idle, of which 19.3 ms in 43 gaps of ~450 us
+between `gemmi_iq3_xxs` (resident routed down) and `gemm_iq2_xs` (staged gate): the PCIe copy of the missed experts,
+on the same stream as the GEMMs. Most layers have one staged group (43 groups over 40 MoE layers). The copy of staged
+group 1 now runs in a `batch` with the up GEMM of the resident group; on CUDA a copy inside a batch goes to the side
+stream (not counted in the launch alternation), so the DMA overlaps the GEMM. The side stream joins the main stream
+when the batch starts, so the previous layer's staged GEMMs are done with the staging area. Groups 2+ (one staging
+area) still wait for their copy. Vulkan records the copy with its barrier as before (no overlap, no change).
+
+- `bench --pp 2048 --tg 16 --mtp 0`, interleaved rounds 1-3 (round 0 cold, dropped), load 0.83-0.89:
+  CUDA 2066.3 / 2066.6 / 2066.2 -> 2093.9 / 2094.4 / 2091.6 (mean 2066.4 -> 2093.3, +1.3%);
+  Vulkan 1926.7 / 1928.5 / 1930.5 -> 1928.5 / 1928.3 / 1929.3 (no change).
+- Tests: 74 passed. Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, long prompt mtp0/mtp1).
+- Parity (CUDA), 3 interleaved pairs, load 1.2-2.0: base 628 / 625 / 627, loop 624 / 627 / 627 (normal drift).
+- Not verified: prefill with a smaller expert cache (more staged groups per layer, where double buffering would pay).
 
 ## Next candidates
 
