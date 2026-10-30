@@ -1,48 +1,60 @@
 # RustingStrata
 
-A pure-Rust inference engine for the Qwen3.5/3.6 hybrid model family (`qwen35moe`, `qwen35`) in GGUF. CUDA kernels
-are compiled at run time with NVRTC through cudarc: no C++ build step, no ggml. Experts that do not fit in VRAM run
-on the CPU at the same time as the GPU work, and the expert placement adapts to the routing it sees.
+A pure-Rust inference engine for the Qwen3.5/3.6 hybrid model family (`qwen35moe`, `qwen35`) in GGUF; Qwen3-Next
+(`qwen3next`) and Qwen3 (`qwen3`, `qwen3moe`) also run. CUDA kernels are compiled at run time with NVRTC through
+cudarc (cached as a cubin), and the same kernels also run on Vulkan (`--backend vulkan`, GLSL compiled to SPIR-V and
+committed): no C++ build step, no ggml. Experts that do not fit in VRAM run on the CPU at the same time as the GPU
+work, and the expert placement adapts to the routing it sees.
 
-Status: v1.0.0. Milestones M0-M6 are done (M6: server, chat, calibration, bench); the v1 gate run is in
+Status: v1.0.1. Milestones M0-M6 are done (M6: server, chat, calibration, bench); the v1 gate run is in
 `docs/m6-results.md`.
 `docs/LOOP_LOG.md` has every change with its measurements.
 
 ## Numbers
 
 Reference machine: RTX 3060 12 GB, Ryzen 5 7600X, 32 GB RAM. Model: `Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf` (11.7 GiB,
-does not fit in VRAM). llama.cpp is tuned for the same file (`--n-cpu-moe 10`, flash attention, see
-`docs/baseline.md`).
+does not fit in VRAM). llama.cpp is the 2026-10-28 build 11876, tuned for the same file (`-ncmoe 12 -ub 2048
+-b 2048`, flash attention; with its default ubatch its 4K prefill is ~1550).
 
-| | RustingStrata | llama.cpp |
-|---|---|---|
-| Prefill, 4K prompt | **2093 tok/s** (2089-2096) | 1017 |
-| Decode after 4K prompt | **95.6 tok/s** (95.4-95.8) | 65.8 |
-| Decode, short prompt (like tg128) | **101.2 tok/s** (100.6-101.5) | 65.8 |
-| Decode with MTP drafts (`--mtp 1`, greedy), short / after 4K | **110.9 / 99.0 tok/s**, 63% of drafts accepted | 61.6 (its MTP is slower) |
-| 32K: prefill / decode / decode with MTP | **1562 / 77.4 / 80.8 tok/s** | 814 (pp512 at depth) / 56.4 |
-| Greedy top-1 agreement with llama.cpp (20 prompts x 32 tokens), either llama.cpp mode | 98.9%; **99.3%** with `--llama-numerics --fixed-experts` | 98.3% (its batch vs token-by-token modes) |
+| | CUDA | Vulkan | llama.cpp |
+|---|---|---|---|
+| Prefill, 4K prompt | **2203 tok/s** (2199-2205) | 2101 (2091-2109) | ~2236 (2183-2310) |
+| Decode after 4K prompt | **111.5 tok/s** (110.4-112.6) | 112.8 | 66.5 |
+| Decode, short prompt (like tg128) | **119.0 tok/s** (118.7-119.3) | 116.8 | 68.4 |
+| Decode with MTP drafts (`--mtp 1`, greedy), short / after 4K | **130-134 / 117-119 tok/s** | 119 / 111 | (its MTP is slower) |
+| 32K: prefill / decode | **1675 / 88.0 tok/s** | 1436 / 87.3 | |
+| Greedy top-1 agreement with llama.cpp (20 prompts x 32 tokens), either llama.cpp mode | 98-99% | 98-99% | 98.3% (its batch vs token-by-token modes) |
 
-Measured 2026-10-09 at 654a270: `strata bench --gpu --pp 512,4096 --tg 128 --reps 3`, mean of 3 rounds (range of
-the round means in brackets), CPU load 4-7 from other jobs; 32K is one round of 3 reps with `--ctx 33280`.
+Measured 2026-10-30: `strata bench --gpu --pp 512,4096,32768 --tg 128 --reps 3 --ctx 32896`, mean of 3 rounds
+(range in brackets); llama.cpp from `llama-server` timings, 4047-token prompt + 128 tokens, 3 runs
+(`docs/LOOP_LOG.md` #212). MTP gains less on Vulkan and depends on the text.
 Agreement counts a token when it matches llama.cpp run token by token or with the context as one batch;
 llama.cpp's own two modes agree on only 98.3% (`docs/LOOP_LOG.md` #33). The remaining misses are near-ties where
-float rounding order picks a different token (#60-#64). MTP on and off give identical greedy tokens.
+float rounding order picks a different token (#60-#64). The expert placement adapts between runs and the CPU and
+GPU expert kernels round differently, so greedy output can change at such near-ties from one run to the next. MTP
+on and off give identical greedy tokens.
 
-Other models, greedy "The capital of France is" with `--gpu` (output identical to llama.cpp for 24 tokens):
+Other models, greedy "The capital of France is" with `--gpu` (2026-10-30, CUDA / Vulkan, second run):
 
 | Model | Types | Decode |
 |---|---|---|
-| Qwen3.5-2B Q4_K_M | Q4_K, Q6_K, ... | 182 tok/s |
-| Qwen3.5-9B IQ3_M | IQ3_S, Q4_K, BF16 | 48.8 tok/s |
-| Qwen3.8-27B UD-IQ3_XXS (dense, 10.8 GB on GPU) | IQ1_S to IQ4_XS, Q2_K to Q8_0 | 19.3 tok/s |
-| Qwen3.6-35B-A3B UD-IQ4_XS (57% of experts fit in VRAM) | IQ3_S, IQ4_XS, Q6_K, Q8_0 | 34-47 tok/s cold, 83 tok/s once the placement has adapted |
+| Qwen3.5-2B (fine-tune) Q4_K_M | Q4_K, Q6_K, ... | 208 / 208 tok/s |
+| Qwen3-4B-Instruct-2507 Q4_K_M (dense) | Q4_K, Q6_K | 104 / 110 tok/s |
+| Qwen3.5-9B Q5_K_S | Q5_K, Q6_K, Q8_0 | 51 / 53 tok/s |
+| Qwen3-30B-A3B-Instruct-2507 UD-Q2_K_XL | Q2_K to Q6_K | 94 / 114 tok/s |
+| Qwen3.8-27B UD-IQ3_XXS (dense, 10.8 GB on GPU) | IQ1_S to IQ4_XS, Q2_K to Q8_0 | 20.6 / 20.5 tok/s |
+| Qwen3.6-35B-A3B UD-IQ4_XS (57% of experts fit in VRAM) | IQ3_S, IQ4_XS, Q6_K, Q8_0 | 94 / 96 tok/s |
+| Qwen3-Next-80B-A3B-Instruct UD-IQ1_S (most experts on the CPU) | IQ1_S to IQ4_NL, Q4_K to Q8_0, BF16 | 24 / 30 tok/s |
 
-Supported GGUF types: F32, BF16, Q8_0, Q2_K-Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS.
+Supported GGUF types: F32, BF16, Q8_0, Q2_K-Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
+IQ4_NL.
 
 ## Build
 
-Needs Rust (2024 edition), an NVIDIA driver and the CUDA 13 NVRTC library (loaded at run time).
+Needs Rust (2024 edition) and either an NVIDIA driver with the CUDA 13 NVRTC library (loaded at run time) or a
+Vulkan 1.3 driver with shaderFloat64, int8/16/64 and subgroup size 32 (tested only on an RTX 3060; Intel Arc lacks
+shaderFloat64, pre-RDNA AMD lacks subgroup size 32). `--gpu` picks CUDA when it loads, else Vulkan; `--backend`
+chooses. The first CUDA run compiles the kernels (~15 s) and caches them.
 
 ```sh
 cargo build --release
@@ -87,9 +99,9 @@ python -I tools/parity.py $M --extra "--gpu" --tag gpu   # agreement with llama.
 ## Layout
 
 `src/gguf.rs` (file reader), `src/quant/` (dequantization), `src/model.rs` (CPU reference forward),
-`src/cuda/` (GPU kernels), `src/gpu_model.rs` (GPU forward, MTP, verify),
-`src/gpu_model/prefill.rs` (chunked prefill), `src/expert_cache.rs` (expert placement), `src/cpu_moe.rs` and `src/cpu_worker.rs`
-(CPU expert compute), `src/serve.rs` (HTTP and chat template), `src/main.rs` (CLI).
+`src/cuda/` and `src/vulkan/` (GPU kernels and shaders, behind `src/backend.rs`), `src/gpu_model.rs` (GPU forward,
+MTP, verify), `src/gpu_model/prefill.rs` (chunked prefill), `src/expert_cache.rs` (expert placement), `src/cpu_moe.rs`
+and `src/cpu_worker.rs` (CPU expert compute), `src/serve.rs` (HTTP and chat template), `src/main.rs` (CLI).
 Design: `docs/superpowers/specs/2026-10-06-rusting-strata-v1-design.md`.
 
 ## License
