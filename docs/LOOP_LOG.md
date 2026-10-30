@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At c2ee2db (#158, `bench --mtp 0`, tg128 after pp512, load 0.8-2.7): CUDA decode 117.0 (4B 98.5), Vulkan 111.0 (4B 103.2).
+- At 9c8892f (#160, `bench --mtp 0`, tg128 after pp512, load 0.8-2.7): CUDA decode 117.0 (4B 98.5), Vulkan 111.1 (4B 103.4).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2831,6 +2831,27 @@ pp512 there are no misses and it is 3.5 us, as on CUDA.)
 - Reading: the norm still runs serially on one workgroup after the GEMV drains, so only the barrier's launch gap is
   saved, and it is smaller than for #156-#158; the `row < rows` guard and the tail may also cost the GEMV itself.
   Patch kept at the session scratchpad (gemv_norm.diff), not in the repo.
+
+### 2026-10-30 #160 — Vulkan topk: subgroupMax/Min in place of the shuffle argmax (9c8892f)
+
+Each of topk's k selection rounds (moe_route and router_topk) did a five-step shuffle butterfly on (value, index)
+pairs. Now it does one `subgroupMax` of the value bits plus 1, with 0 meaning "none". The values are >= 0, so their
+bits order like them. Then a `subgroupMin` of the index over the lanes that hold that max. The ties go to the lower
+index as before, and the picked values are the same.
+
+- Per-call `moe_route` (`STRATA_NO_GRAPH=1 STRATA_VK_PROF=1`, 35B, load 0.8-1.0): 5.38 / 5.90 us before, 5.15 /
+  5.16 us after. Probes on the same build: without topk the call is ~3.3 us; the mailbox writes cost ~0.4 us and
+  the release fence ~0.1 us. So topk is now ~1.4 us of the call.
+- A 4-level tree over 64-bit (key, r) keys in place of each round's linear 16-value scan was slower (5.7-6.4 us),
+  so it was dropped.
+- 35B Vulkan decode, interleaved A/B against 757c888 (tg128 after pp512):
+  - Quick set, load 1.1-1.3, 3 runs each: 110.70 before, 110.77 after.
+  - Full set, load 1.3-1.6, 4 runs each: 110.80 before, 111.10 after. 3 pairs gained and 1 tied.
+- 4B Vulkan decode, load 1.1-1.3, 4 runs each: 103.20 before, 103.35 after.
+- Tests: 74 passed.
+- Greedy md5s unchanged: 4B `64bab3bb`; 35B mtp0 `06c92e18`, mtp1 `04cf91e9`; kvq8; long prompt `d8774b12` /
+  `d03a4d33`. This holds on both backends.
+- Not verified: prefill routing time. router_topk runs once per prefill and is not timed.
 
 ## Next candidates
 
