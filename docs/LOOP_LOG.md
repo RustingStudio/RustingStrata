@@ -3019,6 +3019,16 @@ Vulkan breaks: 35B md5s change (mtp0 09fe232a, mtp1 c15927dc, kvq8 b38fc14f, lon
 
 Not verified: the serial-down variant was not measured.
 
+### 2026-10-30 #173 — CUDA rms_norm quantizes from registers (88ada93)
+
+With `xq` set, rms_norm now scales, stores and quantizes 8 values per thread in the same mapping `quant_x` uses (quant8 with a ballot mask), instead of a second pass over the output after a `__syncthreads`. The values and the quantization are bit-identical.
+
+Decode rms_norm (nsys, gridX=1, 10369 calls): 2767 -> 2610 ns average, about -13 us/tok over 81 calls.
+CUDA A/B vs 4a0f306 (abl.sh, pp512 tg128 mtp0, 4 interleaved rounds, load 1.4-1.5): base 118.1/118.4/118.5/118.5 (mean 118.38) vs 118.2/118.6/118.6/118.6 (mean 118.50), +0.1%, ahead in every round.
+Greedy md5s unchanged on both backends (4B 64bab3bb; 35B mtp0 06c92e18, mtp1 04cf91e9; kvq8 cuda 04cf91e9, vulkan 06c92e18; long prompt mtp1 d8774b12, mtp0 d03a4d33). 74 tests passed.
+
+Not verified: parity was not re-run (the outputs are bit-identical by construction and the md5s agree); the Vulkan rms_norm shader is unchanged.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
