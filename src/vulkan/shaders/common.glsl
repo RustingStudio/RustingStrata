@@ -14,8 +14,14 @@ layout(buffer_reference, std430, buffer_reference_align = 1) buffer U8 { uint8_t
 // Host-mapped memory that the host reads or writes while kernels run (the CPU expert mailbox).
 layout(buffer_reference, std430, buffer_reference_align = 4) coherent volatile buffer MB { uint v[]; };
 
-// a / b and sqrt(x) refined to the IEEE (CUDA) result: GLSL's are a few ulp off. `precise` keeps fma fused.
-float fdiv(float a, float b) { float y = 1.0 / b, q = a * y; precise float r = fma(fma(-q, b, a), y, q); return r; }
+// a / b and sqrt(x) refined to the IEEE (CUDA) result: GLSL's are a few ulp off. `precise` keeps fma fused. 1 / b
+// gets its own Newton step first: Vulkan allows it 2.5 ulp, and AMD's is rough enough that one step on the quotient
+// still ends 1 ulp low.
+float fdiv(float a, float b) {
+    float y0 = 1.0 / b;
+    precise float y = fma(fma(-b, y0, 1.0), y0, y0), q = a * y, r = fma(fma(-q, b, a), y, q);
+    return r;
+}
 float sqrt_(float x) { float s = sqrt(x); precise float r = fma(fma(-s, s, x), fdiv(0.5, s), s); return x > 0.0 ? r : s; }
 
 // expf as CUDA compiles it (its PTX): x = j ln2 + r with j from a rounded-down fma, then ex2.approx(r) * 2^j.
