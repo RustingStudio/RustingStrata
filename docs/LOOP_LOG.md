@@ -2638,6 +2638,28 @@ and a 1931-token prompt with 160 decoded on the 4B: md5 identical to base on CUD
 Not verified: decode after 2048 positions in `bench` (the GQA regime skips the one-head kernel; md5 above covers
 its correctness, not its speed).
 
+### 2026-10-30 #147 — CUDA MoE combine fused with the next layer's rms_norm: no gain, reverted (no code commit)
+
+nsys of the 35B CUDA decode at 5561aae (pp512 + tg128): per token about 81 rms_norm launches (3.0 us median) and
+40 moe_combine launches (3.1 us), so fusing each MoE combine with the following norm (next layer's attn_norm, or
+the output norm) would drop 40 launches. The norm moved to the end of `layer` (it takes the next norm weight;
+dense layers call `rms_norm_q` with the FFN output as residual there, identical to before), and a new
+`moe_combine_norm` backend op (default: the two launches) got a CUDA kernel. Greedy md5 unchanged in all
+variants (4B 64bab3bb, 35B mtp0 06c92e18, mtp1 04cf91e9, kvq8 04cf91e9; a 2023-token prompt crossing 2048
+identical too).
+
+CUDA 35B decode, interleaved A/B against 5561aae (`bench --mtp 0`, tg128 after pp512):
+
+| variant | base | fused | load |
+|---|---|---|---|
+| one block of 512 per token (combine, then norm) | 113.3 (x6, flat) | 111.7 (111.4-111.8), -1.4% | 1.3-1.5 |
+| one block of 1024 per token | 113.5 (113.4-113.5, x3) | 112.8 (112.7-112.8), -0.6% | 1.0-1.3 |
+| combine on n/256 blocks, the last block to finish (atomic counter per token) runs the norm | 113.3 (113.2-113.5, x4) | 113.5 (113.3-114.0), +0.2% | 1.0-1.1 |
+
+One block cannot stream the k expert outputs fast enough; the last-block variant is within noise and adds a counter
+buffer and a fence protocol, so it was not kept (patch kept outside the repo). The launch gap between two graph
+nodes this small is about 1 us, which caps such fusions at ~0.4% on the 35B.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
@@ -2655,7 +2677,8 @@ its correctness, not its speed).
    moe_gemv_iq3_xxs 933, LM head gemvn_q4_k 877 (bandwidth bound), attn_decode_gqa 646, gemvn_f32 626 (140 calls,
    router and SSM projections kept f32 like llama.cpp), rms_norm 495 (100 calls, 4.9 us each), moe_publish 249,
    router_topk 219, gemv_q5_k 205; about 1.5 ms of small launch-bound kernels in all. Fusing rms_norm into the
-   following GEMV and the router GEMV with router_topk are the next levers (SwiGLU into the down GEMV: no gain, #125).
+   following GEMV and the router GEMV with router_topk are the next levers (SwiGLU into the down GEMV: no gain, #125;
+   MoE combine with the next norm: no gain, #147).
 
 ## Questions for owner
 
