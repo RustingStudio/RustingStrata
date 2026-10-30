@@ -115,7 +115,10 @@ impl CpuWorker {
         let b = il * self.layout.stride;
         let rd = |o: usize| unsafe { (self.host as *const u32).add(b + o).read_volatile() };
         let k = self.layout.k * (rd(NTOK) as usize).clamp(1, TMAX);
-        (0..k).map(|j| (rd(IDS + j) as i32, f32::from_bits(rd(IDS + k + j)), rd(IDS + 2 * k + j) as i32)).collect()
+        // One bulk copy: on Vulkan the mailbox is BAR memory, where each host read is a slow uncached access.
+        let mut v = vec![0u32; 3 * k];
+        unsafe { std::ptr::copy_nonoverlapping((self.host as *const u32).add(b + IDS), v.as_mut_ptr(), 3 * k) };
+        (0..k).map(|j| (v[j] as i32, f32::from_bits(v[k + j]), v[2 * k + j] as i32)).collect()
     }
 
     /// Total time the worker spent computing experts.
