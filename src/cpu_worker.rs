@@ -115,14 +115,26 @@ impl CpuWorker {
         let b = il * self.layout.stride;
         let rd = |o: usize| unsafe { (self.host as *const u32).add(b + o).read_volatile() };
         let k = self.layout.k * (rd(NTOK) as usize).clamp(1, TMAX);
-        // One bulk copy: on Vulkan the mailbox is BAR memory, where each host read is a slow uncached access.
-        let mut v = vec![0u32; 3 * k];
-        unsafe { std::ptr::copy_nonoverlapping((self.host as *const u32).add(b + IDS), v.as_mut_ptr(), 3 * k) };
+        // One bulk read: on Vulkan the mailbox is BAR memory, where each host read is a slow uncached access.
+        let mut v = vec![0u32; (3 * k).next_multiple_of(4)];
+        unsafe { read_wc((self.host as *const u32).add(b + IDS), &mut v) };
         (0..k).map(|j| (v[j] as i32, f32::from_bits(v[k + j]), v[2 * k + j] as i32)).collect()
     }
 
     /// Total time the worker spent computing experts.
     pub fn busy(&self) -> Duration { Duration::from_nanos(self.busy_ns.load(Ordering::Relaxed)) }
+}
+
+/// Copies `out.len()` (a multiple of 4) words from 16-byte aligned `p`. On write-combining memory (the Vulkan BAR
+/// mailbox) streaming loads fetch a whole 64-byte line per read instead of one uncached read per load.
+unsafe fn read_wc(p: *const u32, out: &mut [u32]) {
+    #[cfg(target_feature = "sse4.1")]
+    for (i, c) in out.chunks_exact_mut(4).enumerate() {
+        use std::arch::x86_64::*;
+        unsafe { _mm_storeu_si128(c.as_mut_ptr() as *mut __m128i, _mm_stream_load_si128(p.add(4 * i) as *const __m128i)) };
+    }
+    #[cfg(not(target_feature = "sse4.1"))]
+    unsafe { std::ptr::copy_nonoverlapping(p, out.as_mut_ptr(), out.len()) };
 }
 
 impl Drop for CpuWorker {
