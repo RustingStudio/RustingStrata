@@ -114,8 +114,10 @@ struct Inner {
     queue: vk::Queue,
     mem: vk::PhysicalDeviceMemoryProperties,
     budget: bool,
-    /// VK_KHR_cooperative_matrix with the 16 x 16 x 16 f16 / f32 and 16 x 16 x 32 int8 / int32 shapes is enabled.
+    /// VK_KHR_cooperative_matrix with the 16 x 16 x 16 f16 / f32 shape is enabled (`gemm_f`, `attn_prefill`).
     coop: bool,
+    /// The 16 x 16 x 32 int8 / int32 shape is there too (`gemmi`).
+    coop_i8: bool,
     /// VK_AMD_device_coherent_memory is enabled (the mailbox uses `BAR_AMD`).
     amd_coherent: bool,
     /// Specialization constant 0 of kernels that quantize x: llama.cpp q8_K numerics (`--llama-numerics`).
@@ -264,15 +266,15 @@ impl Vk {
         let mut exts = if budget { vec![ash::ext::memory_budget::NAME.as_ptr()] } else { vec![] };
         // 16 x 16 x 16 f16 products summed in f32 and 16 x 16 x 32 int8 ones summed in int32, per subgroup: the
         // mma.sync shapes of the CUDA kernels.
-        // ponytail: both or neither; split the flag when a device has only one (RDNA3 int8 is 16 x 16 x 16).
+        // AMD RDNA has the f16 shape but int8 only as 16 x 16 x 16, so its gemmi runs without them.
         let cm = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
         let props = if has(ash::khr::cooperative_matrix::NAME) { unsafe { cm.get_physical_device_cooperative_matrix_properties(pd) }
             .unwrap_or_default() } else { vec![] };
         let shape = |k, ab, cr| props.iter().any(|c| (c.m_size, c.n_size, c.k_size) == (16, 16, k) && c.scope == vk::ScopeKHR::SUBGROUP
             && c.a_type == ab && c.b_type == ab && c.c_type == cr && c.result_type == cr);
         let coop = shape(16, vk::ComponentTypeKHR::FLOAT16, vk::ComponentTypeKHR::FLOAT32)
-            && shape(32, vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32)
             && std::env::var_os("STRATA_VK_NO_COOP").is_none();  // STRATA_VK_NO_COOP: run the kernels for devices without them
+        let coop_i8 = coop && shape(32, vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32);
         if coop { exts.push(ash::khr::cooperative_matrix::NAME.as_ptr()) }
         let mut fdc = vk::PhysicalDeviceCoherentMemoryFeaturesAMD::default();
         let amd_coherent = has(ash::amd::device_coherent_memory::NAME) && {
@@ -311,7 +313,7 @@ impl Vk {
         let st = State { pool, spare: vec![], used: vec![], cur: None, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false,
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, coop, amd_coherent, llama: crate::cuda::llama_numerics() as u32, stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, coop, coop_i8, amd_coherent, llama: crate::cuda::llama_numerics() as u32, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -570,7 +572,7 @@ impl Vk {
             self.run("quant_q8", &[self.0.llama], [n_x, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
             q8.1 = key;
         }
-        self.run(if self.0.coop { "gemmi" } else { "gemmi_dp" }, &spec, grid, &[&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2]])
+        self.run(if self.0.coop_i8 { "gemmi" } else { "gemmi_dp" }, &spec, grid, &[&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2]])
     }
 }
 
