@@ -31,7 +31,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   2849, default model 47.1 / 124 / 582. Greedy tokens identical to CUDA. 4B prefill gap: see Questions for owner.
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
-- At 35c937c (#153, `bench --mtp 0`, tg128 after pp512, load 0.9-1.9): CUDA decode 117.0 (4B 98.5), Vulkan 107.5 (4B 102.8).
+- At 8aa5994 (#154, `bench --mtp 0`, tg128 after pp512, load 0.9-2.7): CUDA decode 117.0 (4B 98.5), Vulkan 108.2 (4B 103.0).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -2749,6 +2749,18 @@ pp512 there are no misses and it is 3.5 us, as on CUDA.)
   rpw 8: within noise; NR=4: 111); the IQ2_XS grid (512 x u64) copied to shared memory per block: neutral
   (within +-0.2). Together with #151 this points at instruction count, not latency, in the MoE GEMVs.
 - Not verified: Vulkan `apply_signs` in `deq.glsl` still uses the 7-op bytewise subtract; next item.
+
+### 2026-10-30 #154 — Vulkan IQ apply_signs as one add (8aa5994)
+
+- `apply_signs` in `deq.glsl` (IQ grid types in `qw`, used by `gemv_q` and `moe_gemv_q`) replaced its 7-op
+  bytewise subtract with the one-add form from #153. Bit-identical for the same reason (no grid byte is 0).
+- Interleaved A/B against f634692, 35B Vulkan decode (`bench --mtp 0`, tg128 after pp512):
+  - first set, load 1.1-1.3: 107.6 (107.5-107.8) -> 108.3 (108.1-108.6), 3 runs each; one more loop run
+    read 95.8 and is dropped as an outlier (load had been 2.7 a minute earlier);
+  - second set, load 2.0-2.7: 107.1 (106.8-107.4) -> 108.1 (107.9-108.3), 4 runs each.
+- 4B Vulkan 103.0 (102.6-103.4) -> 103.2 (102.8-103.4), noise; 4B has no IQ grids.
+- Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, 2023-token prompt). 74 tests pass.
+- Prefill is unaffected: only `gemv_q` and `moe_gemv_q` call `qw` (only their SPIR-V changed).
 
 ## Next candidates
 
