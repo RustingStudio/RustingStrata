@@ -32,7 +32,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
 - At 52b364e (#165, `bench --mtp 0`, tg128 after pp512, load 0.6-2.9): CUDA decode 117.5 (4B 98.5), Vulkan 117.0 (4B 104.0).
-- At 1f11cb4 (#174, same bench, load 1.1): CUDA decode 119.5 (4B not re-measured).
+- At d73cc1f (#179, same bench, load 0.8-1.5): CUDA decode 119.6, MTP k = 1 136.1 (4B not re-measured).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -3074,6 +3074,28 @@ Two probes on CUDA decode, 35B, no code kept.
   119.8/119.5/119.5 (mean 119.60). The host-memory stores do not cost decode time, so moving the routing record to
   device memory would gain nothing.
 - Not verified: Vulkan (its BAR mailbox stores were measured at ~0.4 us per call in #160).
+
+### 2026-10-30 #179 — CUDA htod returns without a stream sync (d73cc1f)
+
+nsys shows a ~450 us gap per token between `argmax_rows` and the next `rms_norm`, but nearly all of it is
+`cuGraphLaunch` under node tracing. Timed in the binary without nsys, a graph launch takes 1 us (median of 127, max
+4 us). The real host gap is the two uploads before the launch (embedding row and step words), each followed by a
+stream sync (~8.5 us and ~2.9 us in the trace).
+
+- Change: `htod` on CUDA no longer syncs the stream. For pageable source memory (every caller's: `Vec`s and the
+  mmap'd GGUF) the driver has staged the bytes when `cuMemcpyHtoDAsync` returns. Stream order still puts the copy
+  before the kernels that read it. Vulkan is unchanged.
+- 35B CUDA decode, interleaved A/B vs b470fcf (tg128 after pp512):
+  - mtp 0, load 0.8-1.0, 4 rounds: 119.43 (119.2-119.6) before, 119.60 (all 119.6) after. 3 pairs gained, 1 tied.
+  - mtp 0, load 1.3-1.5, 3 rounds: 118.97 before, 119.07 after.
+  - mtp 1, load 1.0-1.2, rounds 2-3 (round 1 base was an outlier at 124.8): 135.95 before, 136.10 after.
+- Prefill that streams experts (`STRATA_EXPERT_MB=6000`, pp2048, load 1.9-2.1, 3 rounds): 1445.7 (1411-1463)
+  before, 1572.8 (1570-1575) after, +8.8%. The expert uploads no longer wait for each copy. Decode in that setup
+  (CPU experts) is too noisy to read (93-112).
+- Tests: 74 passed. Greedy md5s unchanged on both backends: 4B `64bab3bb`; 35B mtp0 `06c92e18`, mtp1 `04cf91e9`;
+  kvq8 (CUDA `04cf91e9`, Vulkan `06c92e18`); long prompt `d8774b12` / `d03a4d33`.
+- Not verified: 4B decode; pinned source memory (no caller passes any; with pinned memory the copy would read the
+  buffer after return).
 
 ## Next candidates
 
