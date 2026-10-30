@@ -231,7 +231,8 @@ __device__ __forceinline__ uint2 ld8a2(const u8* p) {
 }
 // Byte j of the result is 0xFF when bit j of s is set (j < 4).
 __device__ __forceinline__ u32 smask4(u32 s) { return ((s * 0x00204081u) & 0x01010101u) * 0xFFu; }
-__device__ __forceinline__ int apply_signs(u32 g, u32 s) { u32 m = smask4(s); return (int)__vsub4(g ^ m, m); }
+// Bytes of g negated where s has bits: ~g + 1 per byte, one 32-bit add since no grid byte is 0 (no carries).
+__device__ __forceinline__ int apply_signs(u32 g, u32 s) { u32 n = (s * 0x00204081u) & 0x01010101u; return (int)((g ^ (n * 0xFFu)) + n); }
 
 // QI form of scale_min_k4: d and dmin from one 4-byte load at b; with WORDS the 12 scale bytes from three 4-byte
 // loads too (faster for the Q4_K output head in gemv_bandwidth, slower for the Q5_K shapes).
