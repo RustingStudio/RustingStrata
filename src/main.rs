@@ -471,7 +471,8 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
           emit: &mut dyn FnMut(&str) -> anyhow::Result<()>) -> anyhow::Result<(Vec<u32>, bool)> {
     let eos = tok.eos_ids();
     // `ahead`: the next token when `spec_step` already picked it (greedy) without copying logits back.
-    let (mut out, mut printed, mut row, mut ahead) = (Vec::new(), 0, 0, None);
+    // `start`: the first token whose text is not emitted yet (the text before it ends on a whole character).
+    let (mut out, mut start, mut row, mut ahead) = (Vec::new(), 0, 0, None);
     while out.len() < n {
         let next = match ahead.take() { Some(t) => t, None => smp.pick(&logits) as u32 };
         if eos.contains(&next) { return Ok((out, true)); }
@@ -490,10 +491,10 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
             if eos.contains(&t) { return Ok((out, true)); }
             if out.len() == n { break; }
             out.push(t);
-            let s = tok.decode(&out)?;
+            let s = tok.decode(&out[start..])?;
             if !s.ends_with('\u{fffd}') {
-                emit(&s[printed..])?;
-                printed = s.len();
+                emit(&s)?;
+                start = out.len();
             }
         }
     }
