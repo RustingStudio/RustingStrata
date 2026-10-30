@@ -3276,6 +3276,19 @@ runs.
   (mean 2083.9), loop 2084.0 / 2084.7 / 2085.3 (mean 2084.7); Vulkan base 1911.6 / 1917.2 / 1917.6 (mean 1915.5),
   loop 1913.5 / 1913.7 / 1914.4 (mean 1913.9). Inside the noise on both. Reverted.
 
+### 2026-10-30 #194 — SSM beta and alpha GEMMs beside the l2 norm (2b58dce)
+
+nsys at #191: the SSM beta and alpha GEMMs (`gemm_f32`, 32 rows, grid 1 x 16, so 16 blocks on 28 SMs) take ~97 us
+each, one after the other, then `l2_norm` ~240 us. They now go in a `batch` (beta, l2_norm, alpha): beta and alpha
+on the main stream, the norm beside them on the side stream. `conv_seq` stays outside the batch: on CUDA it is two
+launches (conv_seq, conv_state), which the batch would put on different streams (a race on the conv state).
+- `bench --pp 2048 --tg 16 --mtp 0`, interleaved rounds 1-3, load 1.05-1.26: CUDA 2081.9 / 2083.9 / 2088.0 ->
+  2091.4 / 2095.6 / 2094.0 (mean 2084.6 -> 2093.7, +0.4%); Vulkan 1922.9 / 1924.1 / 1922.2 -> 1923.1 / 1924.3 /
+  1923.7 (no change).
+- Tests: 74 passed. Greedy md5s unchanged on both backends (4B, 35B mtp0/mtp1, kvq8, long prompt mtp0/mtp1).
+- Parity (CUDA): base 627/640 (load 3.3), loop 628/640 (load 2.0).
+- Not tried yet: the shared expert's 1-row gate_inp GEMM (also 16 blocks, ~97 us, 40 calls) beside another op.
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
