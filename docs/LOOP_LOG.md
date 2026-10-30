@@ -32,7 +32,7 @@ Each iteration: one verified item. Newest entry last. Loop instructions: `/home/
   Without cooperative matrices (#123, `STRATA_VK_NO_COOP=1`): 4B pp4096 457, default model pp4096 786, parity
   632-634/640 (#124).
 - At 52b364e (#165, `bench --mtp 0`, tg128 after pp512, load 0.6-2.9): CUDA decode 117.5 (4B 98.5), Vulkan 117.0 (4B 104.0).
-- At c959c94 (#170, same bench, load 0.5-0.9): CUDA decode 118.7 (4B not re-measured).
+- At 1f11cb4 (#174, same bench, load 1.1): CUDA decode 119.5 (4B not re-measured).
 - At 654a270 (#69): 4K prefill 2093 tok/s; decode 101.2 after 512, 95.6 after 4096; MTP k = 1 110.9 /
   99.0 (63% accepted); 32K prefill 1562, decode 77.4, MTP 80.8. Parity 629/640 default, 633/640 with
   `--llama-numerics --fixed-experts` (the baseline for single changes, #62). All local GGUF quant types load (#68).
@@ -3028,6 +3028,16 @@ CUDA A/B vs 4a0f306 (abl.sh, pp512 tg128 mtp0, 4 interleaved rounds, load 1.4-1.
 Greedy md5s unchanged on both backends (4B 64bab3bb; 35B mtp0 06c92e18, mtp1 04cf91e9; kvq8 cuda 04cf91e9, vulkan 06c92e18; long prompt mtp1 d8774b12, mtp0 d03a4d33). 74 tests passed.
 
 Not verified: parity was not re-run (the outputs are bit-identical by construction and the md5s agree); the Vulkan rms_norm shader is unchanged.
+
+### 2026-10-30 #174 — CUDA F32 dequant reads 16-byte vectors (1f11cb4)
+
+`deq8<0>` (F32) loaded its 8 floats with scalar loads; it now uses two float4 loads (rows are multiples of 1024 bytes). Same values, same summation order. It feeds `gemv_f32`: the MoE router (with the shared-expert gate) and the f32 SSM projections, kept f32 like llama.cpp.
+
+Kernel times (nsys, decode + prefill decode-shaped calls): gemv_f32 (256,1,2) router 10464 -> 9420 ns, gemv_f32 (32,1,2) 7084 -> 5307 ns.
+CUDA A/B vs cc7dfdd (abl.sh, pp512 tg128 mtp0, 4 interleaved rounds, load 1.1): base 118.0/118.5/118.6/118.6 (mean 118.43) vs 119.2/119.6/119.6/119.5 (mean 119.48), +0.9%, ahead in every round.
+Greedy md5s unchanged on both backends (4B 64bab3bb; 35B mtp0 06c92e18, mtp1 04cf91e9; kvq8 cuda 04cf91e9, vulkan 06c92e18; long prompt mtp1 d8774b12, mtp0 d03a4d33). 74 tests passed.
+
+Not verified: parity not re-run (bit-identical by construction, md5s agree); the 4B was not benched; the Vulkan float GEMV is unchanged.
 
 ## Next candidates
 
