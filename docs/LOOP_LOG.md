@@ -2974,6 +2974,16 @@ already need sm_80 (cp.async, s8 mma), so there is no fallback.
 - Not verified: per-kernel times after the change (no nsys rerun), 4B decode (no IQ types there), Vulkan (its
   shaders have their own table path).
 
+### 2026-10-30 #169 — Vulkan expert GEMVs: IQ tables in shared memory, no gain (no code commit)
+
+- Same idea as #168 on Vulkan: an `IQ_SHARED` block in deq.glsl that copies iq2xs_grid / iq3xxs_grid / ksigns to
+  shared arrays and redirects the table macros to them, used by moe_gemv_q and moe_down_combine.
+- A/B, 35B `bench --mtp 0`, 7 interleaved rounds, load 1.3-1.7: base f20d1e4 117.0 / 117.0 / 117.3 / 117.1 / 116.6 /
+  116.5 / 116.6 (mean 116.87), new 99.6 (first round, outlier) / 117.3 / 117.2 / 117.3 / 117.0 / 116.5 / 117.1
+  (mean 117.07 without the outlier). About +0.2%, inside the spread, so reverted. The Vulkan tables are already
+  read through a buffer reference that the driver likely caches well; the CUDA `__device__` gathers gained more.
+- Not verified: whether the 99.6 round was a one-off (driver shader compile on new SPIR-V, or the #167 window).
+
 ## Next candidates
 
 1. MTP cost: the draft head output GEMV (`gemv_q4_k`, ~0.9 ms per step) is the largest draft cost. The catch-up
