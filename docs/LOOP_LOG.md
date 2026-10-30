@@ -3191,8 +3191,15 @@ IQ2_XS and IQ3_XXS and decodes through `QS<T>::get` (d times the signed grid byt
 - `bench --backend vulkan --pp 2048 --tg 16 --mtp 0`, default residency, 4 interleaved rounds (load 1.1-1.4, first
   round cold in both, dropped): 1860 / 1872 / 1873 (mean 1868) before, 1772 / 1778 / 1782 (mean 1777) after, -4.9%.
   Reverted. With #169 (expert GEMVs, no gain) this says the NVIDIA Vulkan driver already serves the read-only table
-  buffer well; the extra 5.6 KB of shared memory (gemm_f has 29.7 KB) likely costs a workgroup per SM.
-- Not verified: the occupancy cause (no Vulkan occupancy tool used).
+  buffer well. Not occupancy: `STRATA_VK_STATS` puts gemm_f at 104 registers and 35.3 KB shared, already 2
+  workgroups per SM, and 40.9 KB keeps 2. Cause not found.
+- Also tried and reverted: #184's skip of all-padding subgroups in gemm_f (`if (wm < cnt)` around the coopmat
+  loop). 4 interleaved rounds (load 1.6-1.8, first round cold, dropped): 1882 / 1892 / 1889 (mean 1888) before,
+  1770 / 1776 / 1775 (mean 1774) after, -6%. `--reps 4` in one process: base max 1888, new 1787-1800. A control
+  with the same SPIR-V in both binaries was equal (1887-1892 both), and regenerating the SPIR-V without a source
+  change gives identical files, so the loss is real. Under `STRATA_VK_PROF` both run at ~1775 with gemm_f
+  413-415 ms, so the loss does not show per dispatch. The driver reports 29.7 KB shared for the new gemm_f
+  and 35.3 KB for the old (static arrays are 29.7 KB). Reason unknown; Vulkan gemm_f looks sensitive to any edit.
 
 ## Next candidates
 
