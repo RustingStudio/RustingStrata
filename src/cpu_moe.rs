@@ -268,7 +268,7 @@ fn dot_q6k(row: &[u8], xq: &[Q8K]) -> f32 {
 /// AVX2 versions of the kernels above (llama.cpp `arch/x86/quants.c`).
 #[cfg(target_feature = "avx2")]
 mod avx2 {
-    use super::{Q8K, SIGNS, d16, iq1m_d, iq1m_ls};
+    use super::{Q8K, SIGNS, d16, iq1m_d};
     use crate::quant::tables::*;
     use std::arch::x86_64::*;
 
@@ -463,18 +463,25 @@ mod avx2 {
 
     pub fn dot_iq1m(row: &[u8], xq: &[Q8K]) -> f32 {
         unsafe {
+            // Group l of 8 values takes its delta sign from bit 3 (l even) or 7 (l odd) of qh byte l / 2.
+            let pick = _mm256_set_m128i(_mm_set1_epi8(1), _mm_setzero_si128());
+            let bit = _mm256_set_epi64x(0x8080808080808080u64 as i64, 0x0808080808080808, 0x8080808080808080u64 as i64, 0x0808080808080808);
+            let one = _mm256_set1_epi8(1);
             let mut acc = _mm256_setzero_ps();
             for (b, y) in row.chunks_exact(56).zip(xq) {
-                // 8 * grid dot + delta dot, so one 0.125 at the end gives grid + delta / 8.
+                // Weights 8 * grid + delta (-9..=9), so one 0.125 at the end gives grid + delta / 8.
                 let mut sumi = _mm256_setzero_si256();
+                let sc = u64::from_le_bytes(b[48..56].try_into().unwrap());
                 for ib in 0..8 {
+                    let ls = |h: usize| 2 * ((sc >> (16 * (ib / 2) + 6 * (ib % 2) + 3 * h)) & 7) as i32 + 1;
                     let qh = |l: usize| (b[32 + 2 * ib + l / 2] as usize) >> (4 * (l % 2));
                     let g = |l: usize| IQ1S_GRID[b[4 * ib + l] as usize | (qh(l) & 7) << 8] as i64;
-                    let dl = |l: usize| if qh(l) & 8 != 0 { -1i64 } else { 0x0101010101010101 };
-                    let q = q8(y, 32 * ib);
-                    let p = _mm256_add_epi16(_mm256_slli_epi16(dot1(_mm256_set_epi64x(g(3), g(2), g(1), g(0)), q), 3),
-                                             _mm256_maddubs_epi16(_mm256_set1_epi8(1), _mm256_sign_epi8(q, _mm256_set_epi64x(dl(3), dl(2), dl(1), dl(0)))));
-                    sumi = _mm256_add_epi32(sumi, udot_scale(p, iq1m_ls(b, ib, 0), iq1m_ls(b, ib, 1)));
+                    let g = _mm256_set_epi64x(g(3), g(2), g(1), g(0));
+                    let (g2, h) = (_mm256_add_epi8(g, g), _mm256_set1_epi16(u16::from_le_bytes([b[32 + 2 * ib], b[33 + 2 * ib]]) as i16));
+                    let neg = _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(h, pick), bit), bit);
+                    let g8 = _mm256_add_epi8(_mm256_add_epi8(g2, g2), _mm256_add_epi8(g2, g2));
+                    let p = dot1(_mm256_add_epi8(g8, _mm256_or_si256(neg, one)), q8(y, 32 * ib));
+                    sumi = _mm256_add_epi32(sumi, udot_scale(p, ls(0), ls(1)));
                 }
                 acc = _mm256_fmadd_ps(_mm256_set1_ps(iq1m_d(b) * y.d), _mm256_cvtepi32_ps(sumi), acc);
             }
