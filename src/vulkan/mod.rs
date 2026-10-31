@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Host-visible buffer that host copies go through, in chunks of this size.
 const STAGING: usize = 64 << 20;
+/// Staged copies are submitted once this many bytes are queued: a submit per expert matrix costs more than the copy.
+const SUBMIT_BYTES: usize = 4 << 20;
 
 /// SPIR-V of every kernel, from `tools/gen_spirv.sh`.
 const SPV: &[(&str, &[u8])] = &[
@@ -154,6 +156,10 @@ struct State {
     map: usize,
     /// Bytes of `staging` that queued host-to-device copies still read; freed by the next wait.
     staged: usize,
+    /// `open_cb` calls; `copied` holds its value after the last staged copy and the staged bytes in `cur` not yet
+    /// submitted, so `htod` knows when `cur` holds nothing but its own copies.
+    ops: usize,
+    copied: (usize, usize),
     /// Live buffers by start address: (buffer, bytes).
     bufs: BTreeMap<u64, (vk::Buffer, usize)>,
     /// Host-mapped error word that `moe_combine` sets when the CPU worker does not answer: buffer, memory, host
@@ -311,7 +317,7 @@ impl Vk {
         let pc = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(128)];
         let layout = unsafe { dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc), None) }?;
         let st = State { pool, spare: vec![], used: vec![], cur: None, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false,
-            pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, bufs: BTreeMap::new(), err: Default::default(),
+            pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
         let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, coop, coop_i8, amd_coherent, llama: crate::cuda::llama_numerics() as u32, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
@@ -364,6 +370,7 @@ impl Inner {
 
     /// The open command buffer, begun if needed.
     fn open_cb(&self, st: &mut State) -> anyhow::Result<vk::CommandBuffer> {
+        st.ops += 1;
         if let Some(c) = st.cur { return Ok(c); }
         let c = match st.spare.pop() { Some(c) => c, None => unsafe { self.dev.allocate_command_buffers(
             &vk::CommandBufferAllocateInfo::default().command_pool(st.pool).command_buffer_count(1)) }?[0] };
@@ -388,6 +395,7 @@ impl Inner {
     fn submit(&self, st: &mut State, graph: Option<vk::CommandBuffer>, wait: bool) -> anyhow::Result<()> {
         let mut cbs = vec![];
         if let Some(c) = st.cur.take() {
+            st.copied.1 = 0;
             unsafe { self.dev.end_command_buffer(c) }?;
             st.used.push(c);
             cbs.push(c);
@@ -609,7 +617,7 @@ impl Backend for Vk {
         for (i, c) in src.chunks(STAGING).enumerate() {
             if st.staged + c.len() > STAGING { self.0.flush(&mut st)?; }
             // Submit the work recorded so far first, so the GPU runs it while the host fills staging.
-            if st.cur.is_some() { self.0.submit(&mut st, None, false)?; }
+            if st.cur.is_some() && st.ops != st.copied.0 { self.0.submit(&mut st, None, false)?; }
             let (b, o) = st.find(dst.addr() + (off + i * STAGING) as u64, c.len())?;
             let at = st.staged;
             unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), (st.map + at) as *mut u8, c.len()) };
@@ -619,7 +627,8 @@ impl Backend for Vk {
             // Inside `batch` the copy may overlap the dispatches after it; the batch ends with a barrier.
             if !st.batch { self.0.barrier(cb, false); }
             st.staged = (at + c.len()).next_multiple_of(256);
-            self.0.submit(&mut st, None, false)?;
+            st.copied = (st.ops, st.copied.1 + c.len());
+            if st.copied.1 >= SUBMIT_BYTES { self.0.submit(&mut st, None, false)?; }
         }
         Ok(())
     }
