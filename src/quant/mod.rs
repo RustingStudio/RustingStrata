@@ -44,7 +44,7 @@ impl GgmlType {
 #[inline]
 fn h(b: &[u8], o: usize) -> f32 { f16::from_le_bytes([b[o], b[o + 1]]).to_f32() }
 
-fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+pub(crate) fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 { (q[j] & 63, q[j + 4] & 63) }
     else { ((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4)) }
 }
@@ -80,8 +80,8 @@ fn q2k(b: &[u8], y: &mut [f32]) {
     }
 }
 
-fn q3k(b: &[u8], y: &mut [f32]) {
-    let (hm, d_all) = (&b[0..32], h(b, 108));
+/// The 16 6-bit scales of a Q3_K block (bias 32 not removed).
+pub(crate) fn q3k_scales(b: &[u8]) -> [i8; 16] {
     let mut aux = [0u32; 4];
     for i in 0..3 { aux[i] = u32::from_le_bytes(b[96 + 4 * i..100 + 4 * i].try_into().unwrap()); }
     let (k1, k2, tmp) = (0x03030303u32, 0x0f0f0f0fu32, aux[2]);
@@ -93,6 +93,11 @@ fn q3k(b: &[u8], y: &mut [f32]) {
     for (i, a) in aux.iter().enumerate() {
         for (j, x) in a.to_le_bytes().into_iter().enumerate() { scales[4 * i + j] = x as i8; }
     }
+    scales
+}
+
+fn q3k(b: &[u8], y: &mut [f32]) {
+    let (hm, d_all, scales) = (&b[0..32], h(b, 108), q3k_scales(b));
     let (mut q, mut is, mut o, mut m) = (32usize, 0, 0, 1u8);
     for _ in 0..2 {
         for shift in [0, 2, 4, 6] {

@@ -9,7 +9,8 @@ use crate::weights::Tensor;
 use half::f16;
 use rayon::prelude::*;
 
-pub struct Q8K { d: f32, qs: [i8; 256] }
+/// `bs` holds the sums of the 16 groups of 16 `qs`, for the min terms of Q2_K and Q4_K.
+pub struct Q8K { d: f32, qs: [i8; 256], bs: [i16; 16] }
 
 /// Signs of IQ2/IQ3 sub-blocks as ±1 bytes, indexed by the 7-bit sign field.
 static SIGNS: [[i8; 8]; 128] = {
@@ -26,9 +27,10 @@ static SIGNS: [[i8; 8]; 128] = {
 pub fn quantize_q8k(x: &[f32]) -> Vec<Q8K> {
     x.chunks_exact(256).map(|b| {
         let max = b.iter().fold(0f32, |m, &v| if v.abs() > m.abs() { v } else { m });
-        if max == 0.0 { return Q8K { d: 0.0, qs: [0; 256] }; }
+        if max == 0.0 { return Q8K { d: 0.0, qs: [0; 256], bs: [0; 16] }; }
         let is = -127.0 / max;
-        Q8K { d: 1.0 / is, qs: std::array::from_fn(|j| ((is * b[j]).round_ties_even() as i32).min(127) as i8) }
+        let qs: [i8; 256] = std::array::from_fn(|j| ((is * b[j]).round_ties_even() as i32).min(127) as i8);
+        Q8K { d: 1.0 / is, qs, bs: std::array::from_fn(|j| qs[16 * j..16 * j + 16].iter().map(|&v| v as i16).sum()) }
     }).collect()
 }
 
@@ -115,6 +117,52 @@ fn dot_iq4xs(row: &[u8], xq: &[Q8K]) -> f32 {
             }).sum();
             sumf += dd * (ls - 32) as f32 * s as f32;
         }
+    }
+    sumf
+}
+
+/// Sum over the 16 groups of 16 of `sc(group) * (a · q)`, written so the compiler vectorizes it.
+#[inline(always)]
+fn grouped(a: &[i8; 256], q: &[i8; 256], sc: impl Fn(usize) -> i32) -> i32 {
+    (0..16).map(|j| sc(j) * (16 * j..16 * j + 16).map(|i| a[i] as i32 * q[i] as i32).sum::<i32>()).sum()
+}
+
+fn dot_q2k(row: &[u8], xq: &[Q8K]) -> f32 {
+    let mut sumf = 0.0;
+    for (b, y) in row.chunks_exact(84).zip(xq) {
+        let sc = &b[0..16];
+        let mut a = [0i8; 256];
+        for i in 0..256 { a[i] = (b[16 + 32 * (i / 128) + i % 32] >> (2 * (i / 32 % 4)) & 3) as i8; }
+        let s = grouped(&a, &y.qs, |j| (sc[j] & 0xF) as i32);
+        let m: i32 = (0..16).map(|j| (sc[j] >> 4) as i32 * y.bs[j] as i32).sum();
+        sumf += y.d * d16(&b[80..]) * s as f32 - y.d * d16(&b[82..]) * m as f32;
+    }
+    sumf
+}
+
+fn dot_q3k(row: &[u8], xq: &[Q8K]) -> f32 {
+    let mut sumf = 0.0;
+    for (b, y) in row.chunks_exact(110).zip(xq) {
+        let (hm, sc) = (&b[0..32], crate::quant::q3k_scales(b));
+        let mut a = [0i8; 256];
+        for i in 0..256 {
+            let k = i / 32 % 4 + 4 * (i / 128);
+            a[i] = (b[32 + 32 * (i / 128) + i % 32] >> (2 * (k % 4)) & 3) as i8 - if hm[i % 32] >> k & 1 != 0 { 0 } else { 4 };
+        }
+        sumf += d16(&b[108..]) * y.d * grouped(&a, &y.qs, |j| sc[j] as i32 - 32) as f32;
+    }
+    sumf
+}
+
+fn dot_q4k(row: &[u8], xq: &[Q8K]) -> f32 {
+    let mut sumf = 0.0;
+    for (b, y) in row.chunks_exact(144).zip(xq) {
+        let sm: [(u8, u8); 8] = std::array::from_fn(|j| crate::quant::scale_min_k4(j, &b[4..16]));
+        let mut a = [0i8; 256];
+        for i in 0..256 { a[i] = (b[16 + 32 * (i / 64) + i % 32] >> (4 * (i / 32 % 2)) & 0xF) as i8; }
+        let s = grouped(&a, &y.qs, |j| sm[j / 2].0 as i32);
+        let m: i32 = (0..8).map(|j| sm[j].1 as i32 * (y.bs[2 * j] + y.bs[2 * j + 1]) as i32).sum();
+        sumf += d16(b) * y.d * s as f32 - d16(&b[2..]) * y.d * m as f32;
     }
     sumf
 }
@@ -246,14 +294,98 @@ mod avx2 {
             hsum(acc)
         }
     }
+
+    /// `(w · q8)` per 16 values times `lo` (first 16) and `hi` (last 16), for 32 weights in 0..=127.
+    #[inline(always)]
+    unsafe fn udot32(w: __m256i, q8: __m256i, lo: i32, hi: i32) -> __m256i { unsafe {
+        _mm256_madd_epi16(_mm256_maddubs_epi16(w, q8), _mm256_set_m128i(_mm_set1_epi16(hi as i16), _mm_set1_epi16(lo as i16)))
+    } }
+    #[inline(always)]
+    unsafe fn q8(y: &Q8K, i: usize) -> __m256i { unsafe { _mm256_loadu_si256(y.qs.as_ptr().add(i) as *const __m256i) } }
+    #[inline(always)]
+    unsafe fn ld(b: &[u8], i: usize) -> __m256i { unsafe { _mm256_loadu_si256(b[i..i + 32].as_ptr() as *const __m256i) } }
+    /// Crumb `k` (bits 2k, 2k+1) of every byte.
+    #[inline(always)]
+    unsafe fn crumb(v: __m256i, k: usize) -> __m256i { unsafe {
+        _mm256_and_si256(_mm256_srl_epi16(v, _mm_cvtsi32_si128(2 * k as i32)), _mm256_set1_epi8(3))
+    } }
+
+    pub fn dot_q2k(row: &[u8], xq: &[Q8K]) -> f32 {
+        unsafe {
+            let mut acc = _mm256_setzero_ps();
+            for (b, y) in row.chunks_exact(84).zip(xq) {
+                let sc = &b[0..16];
+                let mut sumi = _mm256_setzero_si256();
+                for n in 0..2 {
+                    let bits = ld(b, 16 + 32 * n);
+                    for k in 0..4 {
+                        let g = 8 * n + 2 * k;
+                        sumi = _mm256_add_epi32(sumi, udot32(crumb(bits, k), q8(y, 32 * (4 * n + k)), (sc[g] & 0xF) as i32, (sc[g + 1] & 0xF) as i32));
+                    }
+                }
+                let mins = _mm256_cvtepu8_epi16(_mm_and_si128(_mm_srli_epi16(_mm_loadu_si128(sc.as_ptr() as *const __m128i), 4), _mm_set1_epi8(0xF)));
+                let m = _mm256_madd_epi16(mins, _mm256_loadu_si256(y.bs.as_ptr() as *const __m256i));
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(y.d * d16(&b[80..])), _mm256_cvtepi32_ps(sumi), acc);
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(-y.d * d16(&b[82..])), _mm256_cvtepi32_ps(m), acc);
+            }
+            hsum(acc)
+        }
+    }
+
+    pub fn dot_q3k(row: &[u8], xq: &[Q8K]) -> f32 {
+        unsafe {
+            let mut acc = _mm256_setzero_ps();
+            for (b, y) in row.chunks_exact(110).zip(xq) {
+                let (hm, sc) = (ld(b, 0), crate::quant::q3k_scales(b));
+                let mut sumi = _mm256_setzero_si256();
+                for n in 0..2 {
+                    let bits = ld(b, 32 + 32 * n);
+                    for k in 0..4 {
+                        let kk = 4 * n + k;
+                        // Weight = crumb - 4 where the high bit is clear; signs moved onto q8 for maddubs.
+                        let mask = _mm256_set1_epi8(1 << kk);
+                        let low = _mm256_cmpeq_epi8(_mm256_and_si256(hm, mask), _mm256_setzero_si256());
+                        let w = _mm256_sub_epi8(crumb(bits, k), _mm256_and_si256(low, _mm256_set1_epi8(4)));
+                        let p = _mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(q8(y, 32 * kk), w));
+                        let s = _mm256_set_m128i(_mm_set1_epi16(sc[2 * kk + 1] as i16 - 32), _mm_set1_epi16(sc[2 * kk] as i16 - 32));
+                        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(p, s));
+                    }
+                }
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(y.d * d16(&b[108..])), _mm256_cvtepi32_ps(sumi), acc);
+            }
+            hsum(acc)
+        }
+    }
+
+    pub fn dot_q4k(row: &[u8], xq: &[Q8K]) -> f32 {
+        unsafe {
+            let m4 = _mm256_set1_epi8(0xF);
+            let mut acc = _mm256_setzero_ps();
+            let mut sumf = 0.0;
+            for (b, y) in row.chunks_exact(144).zip(xq) {
+                let sm: [(u8, u8); 8] = std::array::from_fn(|j| crate::quant::scale_min_k4(j, &b[4..16]));
+                let mut sumi = _mm256_setzero_si256();
+                for j in 0..4 {
+                    let bits = ld(b, 16 + 32 * j);
+                    let (s0, s1) = (sm[2 * j].0 as i32, sm[2 * j + 1].0 as i32);
+                    sumi = _mm256_add_epi32(sumi, udot32(_mm256_and_si256(bits, m4), q8(y, 64 * j), s0, s0));
+                    sumi = _mm256_add_epi32(sumi, udot32(_mm256_and_si256(_mm256_srli_epi16(bits, 4), m4), q8(y, 64 * j + 32), s1, s1));
+                }
+                let m: i32 = (0..8).map(|j| sm[j].1 as i32 * (y.bs[2 * j] + y.bs[2 * j + 1]) as i32).sum();
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(y.d * d16(b)), _mm256_cvtepi32_ps(sumi), acc);
+                sumf -= y.d * d16(&b[2..]) * m as f32;
+            }
+            hsum(acc) + sumf
+        }
+    }
 }
 
 fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
     #[cfg(target_feature = "avx2")]
     if std::env::var_os("STRATA_SCALAR").is_none() {
-        return match ty { GgmlType::IQ2XS => Some(avx2::dot_iq2xs), GgmlType::IQ3XXS => Some(avx2::dot_iq3xxs), GgmlType::IQ4XS => Some(avx2::dot_iq4xs), GgmlType::IQ3S => Some(avx2::dot_iq3s), GgmlType::Q6K => Some(dot_q6k), _ => None };
+        return match ty { GgmlType::IQ2XS => Some(avx2::dot_iq2xs), GgmlType::IQ3XXS => Some(avx2::dot_iq3xxs), GgmlType::IQ4XS => Some(avx2::dot_iq4xs), GgmlType::IQ3S => Some(avx2::dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::Q2K => Some(avx2::dot_q2k), GgmlType::Q3K => Some(avx2::dot_q3k), GgmlType::Q4K => Some(avx2::dot_q4k), _ => None };
     }
-    match ty { GgmlType::IQ2XS => Some(dot_iq2xs), GgmlType::IQ3XXS => Some(dot_iq3xxs), GgmlType::IQ4XS => Some(dot_iq4xs), GgmlType::IQ3S => Some(dot_iq3s), GgmlType::Q6K => Some(dot_q6k), _ => None }
+    match ty { GgmlType::IQ2XS => Some(dot_iq2xs), GgmlType::IQ3XXS => Some(dot_iq3xxs), GgmlType::IQ4XS => Some(dot_iq4xs), GgmlType::IQ3S => Some(dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::Q2K => Some(dot_q2k), GgmlType::Q3K => Some(dot_q3k), GgmlType::Q4K => Some(dot_q4k), _ => None }
 }
 
 /// y = t · x for every row, using the integer kernel when the type has one.
@@ -325,13 +457,15 @@ mod tests {
         let mut rnd = || { r ^= r << 13; r ^= r >> 7; r ^= r << 17; r as u8 };
         let x: Vec<f32> = (0..1024).map(|i| ((i as f32 * 0.7548777).fract() - 0.5) * 2.0).collect();
         let xq = quantize_q8k(&x);
-        for ty in [GgmlType::IQ2XS, GgmlType::IQ3XXS, GgmlType::IQ3S, GgmlType::IQ4XS, GgmlType::Q6K] {
+        for ty in [GgmlType::IQ2XS, GgmlType::IQ3XXS, GgmlType::IQ3S, GgmlType::IQ4XS, GgmlType::Q6K, GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K] {
             let mut row: Vec<u8> = (0..4 * ty.block_bytes()).map(|_| rnd()).collect();
-            for b in row.chunks_exact_mut(ty.block_bytes()) { let o = if ty == GgmlType::Q6K { 208 } else { 0 }; b[o..o + 2].copy_from_slice(&f16::from_f32(0.01).to_le_bytes()); }
+            // Offsets of the f16 scales (d, and dmin where the type has one).
+            let fs: &[usize] = match ty { GgmlType::Q6K => &[208], GgmlType::Q2K => &[80, 82], GgmlType::Q3K => &[108], GgmlType::Q4K => &[0, 2], _ => &[0] };
+            for b in row.chunks_exact_mut(ty.block_bytes()) { for &o in fs { b[o..o + 2].copy_from_slice(&f16::from_f32(0.01).to_le_bytes()); } }
             let mut w = vec![0f32; 1024];
             crate::quant::dequant_row(ty, &row, &mut w);
             let want: f64 = w.iter().enumerate().map(|(i, &v)| v as f64 * (xq[i / 256].d * xq[i / 256].qs[i % 256] as f32) as f64).sum();
-            let scalar = match ty { GgmlType::IQ2XS => dot_iq2xs, GgmlType::IQ3XXS => dot_iq3xxs, GgmlType::IQ3S => dot_iq3s, GgmlType::Q6K => dot_q6k, _ => dot_iq4xs };
+            let scalar = match ty { GgmlType::IQ2XS => dot_iq2xs, GgmlType::IQ3XXS => dot_iq3xxs, GgmlType::IQ3S => dot_iq3s, GgmlType::Q6K => dot_q6k, GgmlType::Q2K => dot_q2k, GgmlType::Q3K => dot_q3k, GgmlType::Q4K => dot_q4k, _ => dot_iq4xs };
             for got in [scalar(&row, &xq), int_dot(ty).unwrap()(&row, &xq)] {
                 assert!(((got as f64 - want) / want.abs().max(1e-3)).abs() < 1e-5, "{}: {got} vs {want}", ty.name());
             }
