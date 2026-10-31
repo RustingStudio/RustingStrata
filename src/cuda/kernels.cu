@@ -1440,13 +1440,11 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
         unsigned kr[J][PER / 2], vr[J][PER / 2];
 #pragma unroll
         for (int j = 0; j < J; j++) {
+            // Positions past p1 load the row p1 - 1 and keep zeros: a select, not a branch around the loads.
             int t = c0 + w * J + j;
-            if (t < p1) {
-                size_t r = ((size_t)t * nkv + g) * hd + lane * PER;
-                ldkv<PER>(kc, r, hd, kr[j]); ldkv<PER>(vc, r, hd, vr[j]);
-            } else {
-                for (int d = 0; d < PER / 2; d++) kr[j][d] = vr[j][d] = 0;
-            }
+            size_t r = ((size_t)min(t, p1 - 1) * nkv + g) * hd + lane * PER;
+            ldkv<PER>(kc, r, hd, kr[j]); ldkv<PER>(vc, r, hd, vr[j]);
+            for (int d = 0; d < PER / 2; d++) if (t >= p1) kr[j][d] = vr[j][d] = 0;
         }
         float kf[J][PER], p[J * G];
 #pragma unroll
