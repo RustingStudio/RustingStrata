@@ -20,7 +20,7 @@ does not fit in VRAM). llama.cpp is the 2026-10-28 build 11876, tuned for the sa
 | Prefill, 4K prompt | **2216 tok/s** (2169-2252) | 2154 (2140-2162) | ~2236 (2183-2310) |
 | Decode after 4K prompt | **113.4 tok/s** (110.9-114.8) | 113.6 | 66.5 |
 | Decode, short prompt (like tg128) | **118.2 tok/s** (117.0-118.8) | 117.3 | 68.4 |
-| Decode with MTP drafts (`--mtp 1`, greedy), short / after 4K | **up to 160-161 / 154 tok/s** | 159 / 151 | (its MTP is slower) |
+| Decode with MTP drafts (`--mtp 1`, greedy), short / after 4K | **up to 160 / 152 tok/s** | 158 / 154 | (its MTP is slower) |
 | 32K: prefill / decode | **1800 / 91.9 tok/s** | 1582 / 90.7 | |
 | Greedy top-1 agreement with llama.cpp (20 prompts x 32 tokens), either llama.cpp mode | 98-99% | 98-99% | 98.3% (its batch vs token-by-token modes) |
 
