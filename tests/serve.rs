@@ -179,6 +179,10 @@ fn parses_stop_and_n() {
     assert_eq!(q(r#","stop":["a","","b"]"#).unwrap(), vec!["a", "b"]);
     assert!(q(r#","stop":[1]"#).is_err());
     assert!(q(r#","stop":5"#).is_err());
+    assert!(q(&format!(r#","stop":{:?}"#, vec!["x"; 16])).is_ok());
+    assert!(q(&format!(r#","stop":{:?}"#, vec!["x"; 17])).is_err());
+    assert!(q(&format!(r#","stop":"{}""#, "x".repeat(256))).is_ok());
+    assert!(q(&format!(r#","stop":"{}""#, "x".repeat(257))).is_err());
     assert!(q(r#","n":1"#).is_ok());
     assert!(q(r#","n":2"#).is_err());
 }

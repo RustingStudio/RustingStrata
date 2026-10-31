@@ -112,7 +112,9 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
         Value::String(s) => Some(vec![s.clone()]),
         Value::Array(a) => a.iter().map(|s| s.as_str().map(str::to_owned)).collect(),
         _ => None,
-    }.context("stop must be a string or an array of strings")?.into_iter().filter(|s| !s.is_empty()).collect();
+    }.context("stop must be a string or an array of strings")?.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
+    // Hold checks every prefix of every stop string at each token, so both are bounded.
+    if stop.len() > 16 || stop.iter().any(|s| s.len() > 256) { bail!("stop takes at most 16 strings of at most 256 bytes"); }
     let think = v["chat_template_kwargs"]["enable_thinking"].as_bool().unwrap_or(false);
     Ok(ChatRequest { messages, tools, tool_calls, max_tokens, stream: v["stream"].as_bool().unwrap_or(false), think,
         temperature: num("temperature", |f| f >= 0.0, "a number >= 0")?, top_k: int("top_k", 0)?.map(|n| n as usize),
