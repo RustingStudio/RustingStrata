@@ -63,6 +63,21 @@ impl Sampler {
 
     pub fn pick(&mut self, logits: &[f32]) -> usize {
         if self.temp <= 0.0 { return argmax(logits); }
+        let c = self.cands(logits);
+        self.draw(&c)
+    }
+
+    /// Speculative sampling with a fixed draft `d`: keeps `d` (None) with its probability under this sampler, else
+    /// returns a token drawn from the others, renormalized. The result has the distribution of `pick`. `temp` > 0.
+    pub fn accept(&mut self, logits: &[f32], d: usize) -> Option<usize> {
+        let c = self.cands(logits);
+        let q = c.iter().find(|x| x.0 == d).map_or(0.0, |x| x.1);
+        if self.rand() * c.iter().map(|x| x.1).sum::<f32>() < q { return None; }
+        Some(self.draw(&c.into_iter().filter(|x| x.0 != d).collect::<Vec<_>>()))
+    }
+
+    /// The tokens `pick` draws from, with their weights (exp of the scaled logit, not normalized), most likely first.
+    fn cands(&self, logits: &[f32]) -> Vec<(usize, f32)> {
         // The max in 16 lanes, which vectorizes (a scan with `total_cmp` does not): 0.3 ms per token less on a
         // 248K vocabulary, with the logits that are below e^-21 of the best skipped before the divide.
         let ch = logits.chunks_exact(16);
@@ -81,14 +96,25 @@ impl Sampler {
             acc += x.1;
             if acc >= self.top_p * total { n = j + 1; break; }
         }
-        self.rng ^= self.rng << 13;
-        self.rng ^= self.rng >> 7;
-        self.rng ^= self.rng << 17;
-        let mut r = (self.rng >> 40) as f32 / (1u64 << 24) as f32 * c[..n].iter().map(|x| x.1).sum::<f32>();
-        for &(i, p) in &c[..n] {
+        c.truncate(n);
+        c
+    }
+
+    /// A token drawn from `c` in proportion to the weights.
+    fn draw(&mut self, c: &[(usize, f32)]) -> usize {
+        let mut r = self.rand() * c.iter().map(|x| x.1).sum::<f32>();
+        for &(i, p) in c {
             r -= p;
             if r < 0.0 { return i; }
         }
-        c[n - 1].0
+        c[c.len() - 1].0
+    }
+
+    /// Uniform in [0, 1).
+    fn rand(&mut self) -> f32 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        (self.rng >> 40) as f32 / (1u64 << 24) as f32
     }
 }

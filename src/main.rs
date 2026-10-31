@@ -29,11 +29,11 @@ struct Engine {
     /// VRAM left free after placing expert layers, in MB.
     #[arg(long, default_value_t = 512)]
     vram_margin: usize,
-    /// Speculative decoding with the model's MTP draft head, N drafts per step (GPU, greedy output unchanged)
+    /// Speculative decoding with the model's MTP draft head, N drafts per step (GPU; greedy output unchanged, sampling keeps its distribution)
     /// [default: calibrated, else 0].
     #[arg(long, value_name = "N", default_missing_value = "1", num_args = 0..=1)]
     mtp: Option<usize>,
-    /// Sampling temperature; 0 is greedy (and the only mode MTP speeds up).
+    /// Sampling temperature; 0 is greedy.
     #[arg(long, default_value_t = 0.0)]
     temp: f32,
     /// Sample only from the K most likely tokens (0 = all).
@@ -472,16 +472,15 @@ fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device
 fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut logits: Vec<f32>, n: usize,
           emit: &mut dyn FnMut(&str) -> anyhow::Result<()>) -> anyhow::Result<(Vec<u32>, bool)> {
     let eos = tok.eos_ids();
-    // `ahead`: the next token when `spec_step` already picked it (greedy) without copying logits back.
+    // `ahead`: the next token when `spec_step` or `step_greedy` already picked it.
     // `start`: the first token whose text is not emitted yet (the text before it ends on a whole character).
     let (mut out, mut start, mut row, mut ahead) = (Vec::new(), 0, 0, None);
     while out.len() < n {
         let next = match ahead.take() { Some(t) => t, None => smp.pick(&logits) as u32 };
         if eos.contains(&next) { return Ok((out, true)); }
         let toks = match r {
-            // ponytail: MTP drafts are checked greedily, so sampling decodes one token per step
-            Runner::Gpu(g) if mtp && smp.temp <= 0.0 => {
-                let (toks, nx, rw) = g.spec_step(next, row)?;
+            Runner::Gpu(g) if mtp => {
+                let (toks, nx, rw) = g.spec_step(next, row, smp)?;
                 (ahead, row) = (Some(nx), rw);
                 toks
             }
