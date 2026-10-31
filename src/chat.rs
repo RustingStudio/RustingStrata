@@ -358,23 +358,37 @@ fn xml_call(inner: &str, tools: &[Json]) -> Option<(String, String)> {
     Some((name.to_string(), Json::Obj(args).dump()))
 }
 
-/// Streams reply text but holds back everything from a `<tool_call>` tag on, so a call is never sent as content.
+/// Streams reply text but holds back everything from a `<tool_call>` tag on (unless `no_tag`), so a call is never
+/// sent as content, and ends the reply before the first of the `stops` strings.
 #[derive(Default)]
-pub struct Hold { pub text: String, sent: usize, held: bool }
+pub struct Hold { pub text: String, sent: usize, held: bool, no_tag: bool, stops: Vec<String>, pub stopped: bool }
 
 impl Hold {
+    pub fn new(tag: bool, stops: Vec<String>) -> Hold { Hold { no_tag: !tag, stops, ..Hold::default() } }
     /// Adds a piece of the reply; returns the text that is safe to send now.
     pub fn push(&mut self, piece: &str) -> &str {
-        self.text += piece;
         let from = self.sent;
+        if self.stopped { return ""; }
+        self.text += piece;
+        // A stop string starts in the unsent text: a tail that could start one is never sent.
+        if let Some(p) = self.stops.iter().filter_map(|s| self.text[from..].find(s.as_str())).min() {
+            self.text.truncate(from + p);
+            self.stopped = true;
+        }
         if !self.held {
-            self.sent = match self.text[from..].find(TAG) {
+            self.sent = match self.text[from..].find(TAG).filter(|_| !self.no_tag) {
                 Some(p) => { self.held = true; from + p }
-                // Keep back a tail that could be the start of the tag (ASCII, so the cut is a char boundary).
-                None => (self.text.len() - (1..TAG.len()).rev().find(|&k| self.text.ends_with(&TAG[..k])).unwrap_or(0)).max(from),
+                None if self.stopped => self.text.len(),
+                None => (self.text.len() - self.tail()).max(from),
             };
         }
         &self.text[from..self.sent]
+    }
+    /// The longest end of the text that could be the start of the tag or of a stop string.
+    fn tail(&self) -> usize {
+        (!self.no_tag).then_some(TAG).into_iter().chain(self.stops.iter().map(String::as_str))
+            .flat_map(|s| s.char_indices().skip(1).map(move |(k, _)| &s[..k]))
+            .filter(|p| self.text.ends_with(p)).map(str::len).max().unwrap_or(0)
     }
     /// The text not sent yet.
     pub fn rest(&self) -> &str { &self.text[self.sent..] }

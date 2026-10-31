@@ -312,7 +312,7 @@ fn main() -> anyhow::Result<()> {
             let t1 = Instant::now();
             let cpu0 = r.cpu_secs();
             let n = room(&engine, ids.len(), n);
-            let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut engine.sampler(), logits, n, &mut |t| { print!("{t}"); Ok(std::io::stdout().flush()?) })?;
+            let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut engine.sampler(), logits, n, &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
             let (pp, tg) = ((t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
             eprintln!("\nprompt {} tok {:.2} tok/s | gen {} tok {:.2} tok/s", ids.len(), ids.len() as f64 / pp, out.len(), out.len() as f64 / tg);
             if engine.gpu { eprintln!("CPU expert compute, share of gen time: {:.1}%", 100.0 * (r.cpu_secs() - cpu0) / tg); }
@@ -333,7 +333,7 @@ fn main() -> anyhow::Result<()> {
                     let l = r.prefill(&ids)?;
                     p.push(n as f64 / t.elapsed().as_secs_f64());
                     let t = Instant::now();
-                    let k = decode(&mut r, &tok, engine.mtp() > 0, &mut Sampler::greedy(), l, tg, &mut |_| Ok(()))?.0.len();
+                    let k = decode(&mut r, &tok, engine.mtp() > 0, &mut Sampler::greedy(), l, tg, &mut |_| Ok(false))?.0.len();
                     d.push(k as f64 / t.elapsed().as_secs_f64());
                 }
                 let stat = |v: &[f64]| {
@@ -362,7 +362,7 @@ fn main() -> anyhow::Result<()> {
                 if line.trim().is_empty() { continue; }
                 msgs.push(Msg::new("user", line.trim_end()));
                 let (ids, logits, _) = r.chat(&tok, &tpl.render(&msgs, &[], think, true), &tpl.render(&msgs, &[], think, false))?;
-                let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut smp, logits, room(&engine, ids.len(), n), &mut |t| { print!("{t}"); Ok(std::io::stdout().flush()?) })?;
+                let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut smp, logits, room(&engine, ids.len(), n), &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
                 println!();
                 msgs.push(Msg::new("assistant", &answer(&tok.decode(&out)?)));
             }
@@ -454,7 +454,7 @@ fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device
         let t = best(&mut || {
             r.reset()?;
             let l = r.prefill(&dec)?;
-            toks = decode(&mut r, &tok, k > 0, &mut Sampler::greedy(), l, 128, &mut |_| Ok(()))?.0.len();
+            toks = decode(&mut r, &tok, k > 0, &mut Sampler::greedy(), l, 128, &mut |_| Ok(false))?.0.len();
             Ok(())
         })?;
         // `best` times prefill too; it is the same for every k, so the ranking holds.
@@ -473,10 +473,10 @@ fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device
     Ok(())
 }
 
-/// Decoding of up to `n` tokens after `logits`; `emit` gets each new complete piece of text.
-/// Returns the tokens and whether an end-of-turn token stopped it.
+/// Decoding of up to `n` tokens after `logits`; `emit` gets each new complete piece of text and returns true to stop.
+/// Returns the tokens and whether an end-of-turn token or `emit` stopped it.
 fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut logits: Vec<f32>, n: usize,
-          emit: &mut dyn FnMut(&str) -> anyhow::Result<()>) -> anyhow::Result<(Vec<u32>, bool)> {
+          emit: &mut dyn FnMut(&str) -> anyhow::Result<bool>) -> anyhow::Result<(Vec<u32>, bool)> {
     let eos = tok.eos_ids();
     // `ahead`: the next token when `spec_step` or `step_greedy` already picked it.
     // `start`: the first token whose text is not emitted yet (the text before it ends on a whole character).
@@ -500,7 +500,7 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
             out.push(t);
             let s = tok.decode(&out[start..])?;
             if !s.ends_with('\u{fffd}') {
-                emit(&s)?;
+                if emit(&s)? { return Ok((out, true)); }
                 start = out.len();
             }
         }
@@ -568,7 +568,7 @@ fn handle(c: TcpStream, r: &mut Runner, tok: &Tokenizer, tpl: Template, e: &Engi
             // With tools, a stream holds back the text from a `<tool_call>` tag on until the reply is parsed.
             let tools = req.tool_calls && !req.tools.is_empty();
             let mut cached = 0;
-            let mut hold = Hold::default();
+            let mut hold = Hold::new(tools, req.stop);
             let res = (|| -> anyhow::Result<(Vec<u32>, bool)> {
                 let logits;
                 (_, logits, cached) = r.chat(tok, &prompt, &tpl.render(&req.messages, &req.tools, req.think, false))?;
@@ -577,9 +577,9 @@ fn handle(c: TcpStream, r: &mut Runner, tok: &Tokenizer, tpl: Template, e: &Engi
                     write!(w, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), None))?;
                 }
                 decode(r, tok, e.mtp() > 0, &mut smp, logits, n, &mut |t| {
-                    let t = if tools { hold.push(t) } else { hold.text += t; t };
+                    let t = hold.push(t);
                     if req.stream && !t.is_empty() { write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?; }
-                    Ok(())
+                    Ok(hold.stopped)
                 })
             })();
             // The next request starts from the saved history state or from scratch. A stream that already started is just cut off.
