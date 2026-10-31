@@ -456,60 +456,65 @@ mod avx2 {
         }
     }
 
-    /// Products of 32 IQ1 grid values (-1, 0, 1) with q8, in pairs (maddubs needs an unsigned first operand).
-    #[inline(always)]
-    unsafe fn dot1(g: __m256i, q: __m256i) -> __m256i { unsafe { _mm256_maddubs_epi16(_mm256_sign_epi8(g, g), _mm256_sign_epi8(q, g)) } }
+    /// IQ1_S grid values plus 1 (0..=2, unsigned for maddubs).
+    static IQ1S_U: std::sync::LazyLock<Box<[u64; 2048]>> =
+        std::sync::LazyLock::new(|| Box::new(std::array::from_fn(|i| u64::from_le_bytes(IQ1S_GRID[i].to_le_bytes().map(|g| g.wrapping_add(1))))));
 
     pub fn dot_iq1s(row: &[u8], xq: &[Q8K]) -> f32 {
         unsafe {
+            let t = &**IQ1S_U;
             let mut acc = _mm256_setzero_ps();
-            let mut sumf = 0.0;
             for (b, y) in row.chunks_exact(50).zip(xq) {
                 let mut sumi = _mm256_setzero_si256();
                 for ib in 0..8 {
                     let qh = u16::from_le_bytes([b[34 + 2 * ib], b[35 + 2 * ib]]) as usize;
-                    let g = |l: usize| IQ1S_GRID[b[2 + 4 * ib + l] as usize | ((qh >> (3 * l)) & 7) << 8] as i64;
-                    let ls = 2 * ((qh >> 12) & 7) as i32 + 1;
-                    let p = dot1(_mm256_set_epi64x(g(3), g(2), g(1), g(0)), q8(y, 32 * ib));
-                    sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(p, _mm256_set1_epi16(ls as i16)));
+                    let g = |l: usize| t[b[2 + 4 * ib + l] as usize | ((qh >> (3 * l)) & 7) << 8] as i64;
+                    let p = _mm256_maddubs_epi16(_mm256_set_epi64x(g(3), g(2), g(1), g(0)), q8(y, 32 * ib));
+                    sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(p, _mm256_set1_epi16(2 * ((qh >> 12) & 7) as i16 + 1)));
                 }
-                // Delta term: sum of ±scale (sign in bit 15 of qh) times each 32 values' q8 sum.
+                // In eighths: 8 * scale * (grid + 1) · q8, then per 32 values (±scale - 8 * scale) times the q8 sum
+                // (the delta, sign in bit 15 of qh, less the 1 added to the grid).
                 let qh = _mm_loadu_si128(b[34..50].as_ptr() as *const __m128i);
                 let ls = _mm_or_si128(_mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh, 12), _mm_set1_epi16(7)), 1), _mm_set1_epi16(1));
-                let ls = _mm_sign_epi16(ls, _mm_or_si128(qh, _mm_set1_epi16(1)));
+                let c = _mm_sub_epi16(_mm_sign_epi16(ls, _mm_or_si128(qh, _mm_set1_epi16(1))), _mm_slli_epi16(ls, 3));
                 let bs = |i: usize| _mm_loadu_si128(y.bs[8 * i..].as_ptr() as *const __m128i);
-                let s = _mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(ls, ls), bs(0)), _mm_madd_epi16(_mm_unpackhi_epi16(ls, ls), bs(1)));
-                let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b01_00_11_10));
-                let s1 = _mm_cvtsi128_si32(_mm_add_epi32(s, _mm_shuffle_epi32(s, 0b10_11_00_01)));
+                let s = _mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(c, c), bs(0)), _mm_madd_epi16(_mm_unpackhi_epi16(c, c), bs(1)));
+                let sumi = _mm256_add_epi32(_mm256_slli_epi32(sumi, 3), _mm256_zextsi128_si256(s));
                 acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(sumi), acc);
-                sumf += d16(b) * y.d * 0.125 * s1 as f32;
             }
-            hsum(acc) + sumf
+            0.125 * hsum(acc)
         }
     }
 
+    /// IQ1_M weights plus 9 (8 * grid + 8, plus 2 when the delta is +1), indexed by the 8 grid bits, then 3 high grid
+    /// bits and the delta sign bit (a qh nibble).
+    static IQ1M_W: std::sync::LazyLock<Box<[u64; 4096]>> = std::sync::LazyLock::new(|| {
+        let mut t = Box::new([0u64; 4096]);
+        for (i, w) in t.iter_mut().enumerate() {
+            let d = if i & 2048 != 0 { 8 } else { 10 };
+            *w = u64::from_le_bytes(IQ1S_GRID[i & 2047].to_le_bytes().map(|g| (8 * g as i8 + d) as u8));
+        }
+        t
+    });
+
     pub fn dot_iq1m(row: &[u8], xq: &[Q8K]) -> f32 {
         unsafe {
-            // Group l of 8 values takes its delta sign from bit 3 (l even) or 7 (l odd) of qh byte l / 2.
-            let pick = _mm256_set_m128i(_mm_set1_epi8(1), _mm_setzero_si128());
-            let bit = _mm256_set_epi64x(0x8080808080808080u64 as i64, 0x0808080808080808, 0x8080808080808080u64 as i64, 0x0808080808080808);
-            let one = _mm256_set1_epi8(1);
+            let t = &**IQ1M_W;
             let mut acc = _mm256_setzero_ps();
             for (b, y) in row.chunks_exact(56).zip(xq) {
-                // Weights 8 * grid + delta (-9..=9), so one 0.125 at the end gives grid + delta / 8.
-                let mut sumi = _mm256_setzero_si256();
+                // Weights 8 * grid + delta (-9..=9), so one 0.125 at the end gives grid + delta / 8. The table holds
+                // them plus 9 (unsigned for maddubs); the 9 * q8 part comes off with the 16-value sums.
                 let sc = u64::from_le_bytes(b[48..56].try_into().unwrap());
+                let ls: [i16; 16] = std::array::from_fn(|i| 2 * ((sc >> (16 * (i / 4) + 3 * (i % 4))) & 7) as i16 + 1);
+                let mut sumi = _mm256_setzero_si256();
                 for ib in 0..8 {
-                    let ls = |h: usize| 2 * ((sc >> (16 * (ib / 2) + 6 * (ib % 2) + 3 * h)) & 7) as i32 + 1;
-                    let qh = |l: usize| (b[32 + 2 * ib + l / 2] as usize) >> (4 * (l % 2));
-                    let g = |l: usize| IQ1S_GRID[b[4 * ib + l] as usize | (qh(l) & 7) << 8] as i64;
-                    let g = _mm256_set_epi64x(g(3), g(2), g(1), g(0));
-                    let (g2, h) = (_mm256_add_epi8(g, g), _mm256_set1_epi16(u16::from_le_bytes([b[32 + 2 * ib], b[33 + 2 * ib]]) as i16));
-                    let neg = _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(h, pick), bit), bit);
-                    let g8 = _mm256_add_epi8(_mm256_add_epi8(g2, g2), _mm256_add_epi8(g2, g2));
-                    let p = dot1(_mm256_add_epi8(g8, _mm256_or_si256(neg, one)), q8(y, 32 * ib));
-                    sumi = _mm256_add_epi32(sumi, udot_scale(p, ls(0), ls(1)));
+                    let qh = u16::from_le_bytes([b[32 + 2 * ib], b[33 + 2 * ib]]) as usize;
+                    let g = |l: usize| t[b[4 * ib + l] as usize | ((qh >> (4 * l)) & 15) << 8] as i64;
+                    let p = _mm256_maddubs_epi16(_mm256_set_epi64x(g(3), g(2), g(1), g(0)), q8(y, 32 * ib));
+                    sumi = _mm256_add_epi32(sumi, udot_scale(p, ls[2 * ib] as i32, ls[2 * ib + 1] as i32));
                 }
+                let ls9 = _mm256_mullo_epi16(_mm256_loadu_si256(ls.as_ptr() as *const __m256i), _mm256_set1_epi16(9));
+                sumi = _mm256_sub_epi32(sumi, _mm256_madd_epi16(ls9, _mm256_loadu_si256(y.bs.as_ptr() as *const __m256i)));
                 acc = _mm256_fmadd_ps(_mm256_set1_ps(iq1m_d(b) * y.d), _mm256_cvtepi32_ps(sumi), acc);
             }
             0.125 * hsum(acc)
