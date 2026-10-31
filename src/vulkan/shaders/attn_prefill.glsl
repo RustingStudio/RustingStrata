@@ -1,8 +1,9 @@
 // Flash attention prefill, as attn_prefill_t in kernels.cu, with cooperative matrices in place of mma.sync (the same
 // 16 x 16 x 16 f16 products summed in f32, in the same order) and the softmax done per lane as CUDA's fragment layout
-// assigns it, so results match bit for bit. Include after defining HD. Workgroup (x, h): queries 64x .. 64x + 63 of
-// head h; subgroup w owns queries 16w .. 16w + 15. Query t (position step[0] + t) attends to cached keys
-// 0 .. step[0] + t. out = softmax(q K^T * scale) V * sigmoid(gate), the gate at +HD per head of qg (qg may be null).
+// assigns it, so results match bit for bit. Include after defining HD. Workgroup (x, h): queries 64x' .. 64x' + 63
+// of head h, x' = gridX - 1 - x (the longest tiles first, ~2% at 32K); subgroup w owns queries 16w .. 16w + 15.
+// Query t (position step[0] + t) attends to cached keys 0 .. step[0] + t. out = softmax(q K^T * scale) V *
+// sigmoid(gate), the gate at +HD per head of qg (qg may be null).
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_shader_subgroup_vote : require
@@ -22,7 +23,7 @@ shared float16_t ps[4 * 16 * PP];  // softmax weights of each subgroup
 shared float rs[4 * 16];           // per row: the rescale factor, at the end the sum l
 
 void main() {
-    uint pos0 = uint(p.step.v[0]), q0 = gl_WorkGroupID.x * BQ, h = gl_WorkGroupID.y, kvh = h / (p.nh / p.nkv), kvd = p.nkv * HD;
+    uint pos0 = uint(p.step.v[0]), q0 = (gl_NumWorkGroups.x - 1 - gl_WorkGroupID.x) * BQ, h = gl_WorkGroupID.y, kvh = h / (p.nh / p.nkv), kvd = p.nkv * HD;
     uint tid = gl_LocalInvocationID.x, w = gl_SubgroupID, lane = gl_SubgroupInvocationID, g = lane >> 2, t4 = lane & 3;
     float ninf = uintBitsToFloat(0xff800000u);
     for (uint i = tid; i < BQ * HD / 8; i += 128) {

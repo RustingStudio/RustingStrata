@@ -1743,7 +1743,8 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
     constexpr int PQ = HD + 8;
     extern __shared__ __align__(16) u16 fa_sm[];
     u16 *qs = fa_sm, *ks = qs + FA_BQ * PQ, *vs = ks + FA_BK * PQ;
-    int pos0 = step[0], q0 = blockIdx.x * FA_BQ, h = blockIdx.y, kvh = h / (nh / nkv), kvd = nkv * HD;
+    // The last query tiles see the most keys: start them first so the short ones fill the tail.
+    int pos0 = step[0], q0 = (gridDim.x - 1 - blockIdx.x) * FA_BQ, h = blockIdx.y, kvh = h / (nh / nkv), kvd = nkv * HD;
     int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
     int lr = (lane & 7) + ((lane >> 3) & 1) * 8, lc = (lane >> 4) * 8;  // ldmatrix row / column offsets of this lane
     for (int i = tid; i < FA_BQ * HD / 4; i += 128) {
