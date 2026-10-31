@@ -60,6 +60,85 @@ fn dot_iq2xs(row: &[u8], xq: &[Q8K]) -> f32 {
     0.125 * sumf
 }
 
+fn dot_iq2xxs(row: &[u8], xq: &[Q8K]) -> f32 {
+    let mut sumf = 0.0;
+    for (b, y) in row.chunks_exact(66).zip(xq) {
+        let mut bsum = 0i32;
+        for ib in 0..8 {
+            let aux = u32::from_le_bytes(b[6 + 8 * ib..10 + 8 * ib].try_into().unwrap());
+            let s: i32 = (0..4).map(|l| dot8(IQ2XXS_GRID[b[2 + 8 * ib + l] as usize].to_le_bytes(), &SIGNS[((aux >> (7 * l)) & 127) as usize], &y.qs[32 * ib + 8 * l..])).sum();
+            bsum += s * (2 * (aux >> 28) as i32 + 1);
+        }
+        sumf += d16(b) * y.d * bsum as f32;
+    }
+    0.125 * sumf
+}
+
+fn dot_iq2s(row: &[u8], xq: &[Q8K]) -> f32 {
+    let mut sumf = 0.0;
+    for (b, y) in row.chunks_exact(82).zip(xq) {
+        let (qs, signs, qh, sc) = (&b[2..34], &b[34..66], &b[66..74], &b[74..82]);
+        let mut bsum = 0i32;
+        for ib in 0..8 {
+            let s: [i32; 2] = std::array::from_fn(|h| (2 * h..2 * h + 2).map(|l| {
+                let g = IQ2S_GRID[qs[4 * ib + l] as usize | ((qh[ib] as usize) << (8 - 2 * l) & 0x300)].to_le_bytes();
+                let sg: [i8; 8] = std::array::from_fn(|j| 1 - 2 * (signs[4 * ib + l] >> j & 1) as i8);
+                dot8(g, &sg, &y.qs[32 * ib + 8 * l..])
+            }).sum());
+            bsum += s[0] * (2 * (sc[ib] & 0xF) as i32 + 1) + s[1] * (2 * (sc[ib] >> 4) as i32 + 1);
+        }
+        sumf += d16(b) * y.d * bsum as f32;
+    }
+    0.125 * sumf
+}
+
+/// Dot of 8 IQ1 grid values (-1, 0, 1) with `q`.
+fn dot1(g: u64, q: &[i8]) -> i32 { g.to_le_bytes().iter().zip(&q[..8]).map(|(&a, &b)| a as i8 as i32 * b as i32).sum() }
+
+fn dot_iq1s(row: &[u8], xq: &[Q8K]) -> f32 {
+    let mut sumf = 0.0;
+    for (b, y) in row.chunks_exact(50).zip(xq) {
+        let (mut s, mut s1) = (0i32, 0i32);
+        for ib in 0..8 {
+            let qh = u16::from_le_bytes([b[34 + 2 * ib], b[35 + 2 * ib]]) as usize;
+            let ls = 2 * ((qh >> 12) & 7) as i32 + 1;
+            s += ls * (0..4).map(|l| dot1(IQ1S_GRID[b[2 + 4 * ib + l] as usize | ((qh >> (3 * l)) & 7) << 8], &y.qs[32 * ib + 8 * l..])).sum::<i32>();
+            s1 += ls * if qh & 0x8000 != 0 { -1 } else { 1 } * (y.bs[2 * ib] + y.bs[2 * ib + 1]) as i32;
+        }
+        sumf += d16(b) * y.d * (s as f32 + 0.125 * s1 as f32);
+    }
+    sumf
+}
+
+/// IQ1_M block scale: the top 4 bits of the four scale words.
+fn iq1m_d(b: &[u8]) -> f32 {
+    let sc = |i: usize| u16::from_le_bytes([b[48 + 2 * i], b[49 + 2 * i]]);
+    f16::from_bits((sc(0) >> 12) | ((sc(1) >> 8) & 0xF0) | ((sc(2) >> 4) & 0xF00) | (sc(3) & 0xF000)).to_f32()
+}
+
+/// Scale of values 16 * (2 * ib + h)..+16 of an IQ1_M block.
+fn iq1m_ls(b: &[u8], ib: usize, h: usize) -> i32 {
+    2 * ((u16::from_le_bytes([b[48 + ib / 2 * 2], b[49 + ib / 2 * 2]]) >> (6 * (ib % 2) + 3 * h)) & 7) as i32 + 1
+}
+
+fn dot_iq1m(row: &[u8], xq: &[Q8K]) -> f32 {
+    let mut sumf = 0.0;
+    for (b, y) in row.chunks_exact(56).zip(xq) {
+        let (mut s1, mut s2) = (0i32, 0i32);
+        for ib in 0..8 {
+            for l in 0..4 {
+                let qh = b[32 + 2 * ib + l / 2] as usize >> (4 * (l % 2));
+                let q = &y.qs[32 * ib + 8 * l..32 * ib + 8 * l + 8];
+                let ls = iq1m_ls(b, ib, l / 2);
+                s1 += ls * dot1(IQ1S_GRID[b[4 * ib + l] as usize | (qh & 7) << 8], q);
+                s2 += ls * if qh & 8 != 0 { -1 } else { 1 } * q.iter().map(|&v| v as i32).sum::<i32>();
+            }
+        }
+        sumf += iq1m_d(b) * y.d * (s1 as f32 + 0.125 * s2 as f32);
+    }
+    sumf
+}
+
 fn dot_iq3xxs(row: &[u8], xq: &[Q8K]) -> f32 {
     let mut sumf = 0.0;
     for (b, y) in row.chunks_exact(98).zip(xq) {
@@ -189,7 +268,7 @@ fn dot_q6k(row: &[u8], xq: &[Q8K]) -> f32 {
 /// AVX2 versions of the kernels above (llama.cpp `arch/x86/quants.c`).
 #[cfg(target_feature = "avx2")]
 mod avx2 {
-    use super::{Q8K, SIGNS, d16};
+    use super::{Q8K, SIGNS, d16, iq1m_d, iq1m_ls};
     use crate::quant::tables::*;
     use std::arch::x86_64::*;
 
@@ -295,11 +374,14 @@ mod avx2 {
         }
     }
 
+    /// Pair sums `p` (16 i16) times `lo` (first 8, values 0..16) and `hi` (last 8), summed into 8 i32.
+    #[inline(always)]
+    unsafe fn udot_scale(p: __m256i, lo: i32, hi: i32) -> __m256i { unsafe {
+        _mm256_madd_epi16(p, _mm256_set_m128i(_mm_set1_epi16(hi as i16), _mm_set1_epi16(lo as i16)))
+    } }
     /// `(w · q8)` per 16 values times `lo` (first 16) and `hi` (last 16), for 32 weights in 0..=127.
     #[inline(always)]
-    unsafe fn udot32(w: __m256i, q8: __m256i, lo: i32, hi: i32) -> __m256i { unsafe {
-        _mm256_madd_epi16(_mm256_maddubs_epi16(w, q8), _mm256_set_m128i(_mm_set1_epi16(hi as i16), _mm_set1_epi16(lo as i16)))
-    } }
+    unsafe fn udot32(w: __m256i, q8: __m256i, lo: i32, hi: i32) -> __m256i { unsafe { udot_scale(_mm256_maddubs_epi16(w, q8), lo, hi) } }
     #[inline(always)]
     unsafe fn q8(y: &Q8K, i: usize) -> __m256i { unsafe { _mm256_loadu_si256(y.qs.as_ptr().add(i) as *const __m256i) } }
     #[inline(always)]
@@ -309,6 +391,96 @@ mod avx2 {
     unsafe fn crumb(v: __m256i, k: usize) -> __m256i { unsafe {
         _mm256_and_si256(_mm256_srl_epi16(v, _mm_cvtsi32_si128(2 * k as i32)), _mm256_set1_epi8(3))
     } }
+
+    pub fn dot_iq2xxs(row: &[u8], xq: &[Q8K]) -> f32 {
+        unsafe {
+            let mut acc = _mm256_setzero_ps();
+            for (b, y) in row.chunks_exact(66).zip(xq) {
+                let mut sumi = _mm256_setzero_si256();
+                for ib in 0..8 {
+                    let g = |l: usize| IQ2XXS_GRID[b[2 + 8 * ib + l] as usize] as i64;
+                    let aux = u32::from_le_bytes(b[6 + 8 * ib..10 + 8 * ib].try_into().unwrap());
+                    let s = |l: u32| sg(((aux >> (7 * l)) & 127) as usize);
+                    let grid = _mm256_set_epi64x(g(3), g(2), g(1), g(0));
+                    let dot = _mm256_maddubs_epi16(grid, _mm256_sign_epi8(q8(y, 32 * ib), _mm256_set_epi64x(s(3), s(2), s(1), s(0))));
+                    sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(dot, _mm256_set1_epi16(2 * (aux >> 28) as i16 + 1)));
+                }
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(sumi), acc);
+            }
+            0.125 * hsum(acc)
+        }
+    }
+
+    pub fn dot_iq2s(row: &[u8], xq: &[Q8K]) -> f32 {
+        unsafe {
+            // As in dot_iq3s: byte k of a lane picks sign byte k / 8, then bit k % 8.
+            let m1 = _mm256_set_epi64x(0x0303030303030303, 0x0202020202020202, 0x0101010101010101, 0);
+            let m2 = _mm256_set1_epi64x(0x8040201008040201u64 as i64);
+            let mut acc = _mm256_setzero_ps();
+            for (b, y) in row.chunks_exact(82).zip(xq) {
+                let (qs, qh, sc) = (&b[2..34], &b[66..74], &b[74..82]);
+                let mut sumi = _mm256_setzero_si256();
+                for ib in 0..8 {
+                    let g = |l: usize| IQ2S_GRID[qs[4 * ib + l] as usize | ((qh[ib] as usize) << (8 - 2 * l) & 0x300)] as i64;
+                    let grid = _mm256_set_epi64x(g(3), g(2), g(1), g(0));
+                    let sb = i32::from_le_bytes(b[34 + 4 * ib..38 + 4 * ib].try_into().unwrap());
+                    let s = _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32(sb), m1), m2), m2);
+                    let q = q8(y, 32 * ib);
+                    let dot = _mm256_maddubs_epi16(grid, _mm256_sub_epi8(_mm256_xor_si256(s, q), s));
+                    sumi = _mm256_add_epi32(sumi, udot_scale(dot, 2 * (sc[ib] & 0xF) as i32 + 1, 2 * (sc[ib] >> 4) as i32 + 1));
+                }
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(sumi), acc);
+            }
+            0.125 * hsum(acc)
+        }
+    }
+
+    /// Products of 32 IQ1 grid values (-1, 0, 1) with q8, in pairs (maddubs needs an unsigned first operand).
+    #[inline(always)]
+    unsafe fn dot1(g: __m256i, q: __m256i) -> __m256i { unsafe { _mm256_maddubs_epi16(_mm256_sign_epi8(g, g), _mm256_sign_epi8(q, g)) } }
+
+    pub fn dot_iq1s(row: &[u8], xq: &[Q8K]) -> f32 {
+        unsafe {
+            let mut acc = _mm256_setzero_ps();
+            let mut sumf = 0.0;
+            for (b, y) in row.chunks_exact(50).zip(xq) {
+                let mut sumi = _mm256_setzero_si256();
+                let mut s1 = 0i32;
+                for ib in 0..8 {
+                    let qh = u16::from_le_bytes([b[34 + 2 * ib], b[35 + 2 * ib]]) as usize;
+                    let g = |l: usize| IQ1S_GRID[b[2 + 4 * ib + l] as usize | ((qh >> (3 * l)) & 7) << 8] as i64;
+                    let ls = 2 * ((qh >> 12) & 7) as i32 + 1;
+                    let p = dot1(_mm256_set_epi64x(g(3), g(2), g(1), g(0)), q8(y, 32 * ib));
+                    sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(p, _mm256_set1_epi16(ls as i16)));
+                    s1 += ls * if qh & 0x8000 != 0 { -1 } else { 1 } * (y.bs[2 * ib] + y.bs[2 * ib + 1]) as i32;
+                }
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(sumi), acc);
+                sumf += d16(b) * y.d * 0.125 * s1 as f32;
+            }
+            hsum(acc) + sumf
+        }
+    }
+
+    pub fn dot_iq1m(row: &[u8], xq: &[Q8K]) -> f32 {
+        unsafe {
+            let mut acc = _mm256_setzero_ps();
+            for (b, y) in row.chunks_exact(56).zip(xq) {
+                // 8 * grid dot + delta dot, so one 0.125 at the end gives grid + delta / 8.
+                let mut sumi = _mm256_setzero_si256();
+                for ib in 0..8 {
+                    let qh = |l: usize| (b[32 + 2 * ib + l / 2] as usize) >> (4 * (l % 2));
+                    let g = |l: usize| IQ1S_GRID[b[4 * ib + l] as usize | (qh(l) & 7) << 8] as i64;
+                    let dl = |l: usize| if qh(l) & 8 != 0 { -1i64 } else { 0x0101010101010101 };
+                    let q = q8(y, 32 * ib);
+                    let p = _mm256_add_epi16(_mm256_slli_epi16(dot1(_mm256_set_epi64x(g(3), g(2), g(1), g(0)), q), 3),
+                                             _mm256_maddubs_epi16(_mm256_set1_epi8(1), _mm256_sign_epi8(q, _mm256_set_epi64x(dl(3), dl(2), dl(1), dl(0)))));
+                    sumi = _mm256_add_epi32(sumi, udot_scale(p, iq1m_ls(b, ib, 0), iq1m_ls(b, ib, 1)));
+                }
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(iq1m_d(b) * y.d), _mm256_cvtepi32_ps(sumi), acc);
+            }
+            0.125 * hsum(acc)
+        }
+    }
 
     pub fn dot_q2k(row: &[u8], xq: &[Q8K]) -> f32 {
         unsafe {
@@ -383,9 +555,9 @@ mod avx2 {
 fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
     #[cfg(target_feature = "avx2")]
     if std::env::var_os("STRATA_SCALAR").is_none() {
-        return match ty { GgmlType::IQ2XS => Some(avx2::dot_iq2xs), GgmlType::IQ3XXS => Some(avx2::dot_iq3xxs), GgmlType::IQ4XS => Some(avx2::dot_iq4xs), GgmlType::IQ3S => Some(avx2::dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::Q2K => Some(avx2::dot_q2k), GgmlType::Q3K => Some(avx2::dot_q3k), GgmlType::Q4K => Some(avx2::dot_q4k), _ => None };
+        return match ty { GgmlType::IQ2XS => Some(avx2::dot_iq2xs), GgmlType::IQ3XXS => Some(avx2::dot_iq3xxs), GgmlType::IQ4XS => Some(avx2::dot_iq4xs), GgmlType::IQ3S => Some(avx2::dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::IQ2XXS => Some(avx2::dot_iq2xxs), GgmlType::IQ2S => Some(avx2::dot_iq2s), GgmlType::IQ1S => Some(avx2::dot_iq1s), GgmlType::IQ1M => Some(avx2::dot_iq1m), GgmlType::Q2K => Some(avx2::dot_q2k), GgmlType::Q3K => Some(avx2::dot_q3k), GgmlType::Q4K => Some(avx2::dot_q4k), _ => None };
     }
-    match ty { GgmlType::IQ2XS => Some(dot_iq2xs), GgmlType::IQ3XXS => Some(dot_iq3xxs), GgmlType::IQ4XS => Some(dot_iq4xs), GgmlType::IQ3S => Some(dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::Q2K => Some(dot_q2k), GgmlType::Q3K => Some(dot_q3k), GgmlType::Q4K => Some(dot_q4k), _ => None }
+    match ty { GgmlType::IQ2XS => Some(dot_iq2xs), GgmlType::IQ3XXS => Some(dot_iq3xxs), GgmlType::IQ4XS => Some(dot_iq4xs), GgmlType::IQ3S => Some(dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::IQ2XXS => Some(dot_iq2xxs), GgmlType::IQ2S => Some(dot_iq2s), GgmlType::IQ1S => Some(dot_iq1s), GgmlType::IQ1M => Some(dot_iq1m), GgmlType::Q2K => Some(dot_q2k), GgmlType::Q3K => Some(dot_q3k), GgmlType::Q4K => Some(dot_q4k), _ => None }
 }
 
 /// y = t · x for every row, using the integer kernel when the type has one.
@@ -457,15 +629,20 @@ mod tests {
         let mut rnd = || { r ^= r << 13; r ^= r >> 7; r ^= r << 17; r as u8 };
         let x: Vec<f32> = (0..1024).map(|i| ((i as f32 * 0.7548777).fract() - 0.5) * 2.0).collect();
         let xq = quantize_q8k(&x);
-        for ty in [GgmlType::IQ2XS, GgmlType::IQ3XXS, GgmlType::IQ3S, GgmlType::IQ4XS, GgmlType::Q6K, GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K] {
+        for ty in [GgmlType::IQ2XS, GgmlType::IQ3XXS, GgmlType::IQ3S, GgmlType::IQ4XS, GgmlType::Q6K, GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K, GgmlType::IQ2XXS, GgmlType::IQ2S, GgmlType::IQ1S, GgmlType::IQ1M] {
             let mut row: Vec<u8> = (0..4 * ty.block_bytes()).map(|_| rnd()).collect();
             // Offsets of the f16 scales (d, and dmin where the type has one).
-            let fs: &[usize] = match ty { GgmlType::Q6K => &[208], GgmlType::Q2K => &[80, 82], GgmlType::Q3K => &[108], GgmlType::Q4K => &[0, 2], _ => &[0] };
+            let fs: &[usize] = match ty { GgmlType::Q6K => &[208], GgmlType::Q2K => &[80, 82], GgmlType::Q3K => &[108], GgmlType::Q4K => &[0, 2], GgmlType::IQ1M => &[], _ => &[0] };
             for b in row.chunks_exact_mut(ty.block_bytes()) { for &o in fs { b[o..o + 2].copy_from_slice(&f16::from_f32(0.01).to_le_bytes()); } }
+            // IQ1_M keeps d in the top nibbles of its four scale words.
+            if ty == GgmlType::IQ1M {
+                let d = f16::from_f32(0.01).to_bits();
+                for b in row.chunks_exact_mut(56) { for i in 0..4 { b[49 + 2 * i] = b[49 + 2 * i] & 0xF | ((d >> (4 * i)) as u8 & 0xF) << 4; } }
+            }
             let mut w = vec![0f32; 1024];
             crate::quant::dequant_row(ty, &row, &mut w);
             let want: f64 = w.iter().enumerate().map(|(i, &v)| v as f64 * (xq[i / 256].d * xq[i / 256].qs[i % 256] as f32) as f64).sum();
-            let scalar = match ty { GgmlType::IQ2XS => dot_iq2xs, GgmlType::IQ3XXS => dot_iq3xxs, GgmlType::IQ3S => dot_iq3s, GgmlType::Q6K => dot_q6k, GgmlType::Q2K => dot_q2k, GgmlType::Q3K => dot_q3k, GgmlType::Q4K => dot_q4k, _ => dot_iq4xs };
+            let scalar = match ty { GgmlType::IQ2XS => dot_iq2xs, GgmlType::IQ3XXS => dot_iq3xxs, GgmlType::IQ3S => dot_iq3s, GgmlType::Q6K => dot_q6k, GgmlType::Q2K => dot_q2k, GgmlType::Q3K => dot_q3k, GgmlType::Q4K => dot_q4k, GgmlType::IQ2XXS => dot_iq2xxs, GgmlType::IQ2S => dot_iq2s, GgmlType::IQ1S => dot_iq1s, GgmlType::IQ1M => dot_iq1m, _ => dot_iq4xs };
             for got in [scalar(&row, &xq), int_dot(ty).unwrap()(&row, &xq)] {
                 assert!(((got as f64 - want) / want.abs().max(1e-3)).abs() < 1e-5, "{}: {got} vs {want}", ty.name());
             }
