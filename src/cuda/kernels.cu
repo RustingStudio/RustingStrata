@@ -1723,11 +1723,26 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
     int last = pos0 + min(q0 + FA_BQ, T) - 1;  // last key any query of the tile sees
     int qp[2] = {pos0 + q0 + warp * 16 + g, pos0 + q0 + warp * 16 + g + 8};
     float o[HD / 8][4] = {}, m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+    constexpr int N = FA_BK * HD / 8 / 128;
+#if !KV_Q8
+    // f16: cp.async the V tile while the scores use K, and the next K tile while the sums use V (one block per SM,
+    // so nothing else hides the loads). Rows past `last` are zero-filled.
+    auto ld = [&](int k0, u16* dst, const u16* src) {
+#pragma unroll
+        for (int n = 0; n < N; n++) {
+            int i = tid + n * 128, r = i / (HD / 8), c = (i % (HD / 8)) * 8;
+            cp_async16(dst + r * PQ + c, src + (size_t)min(k0 + r, last) * kvd + kvh * HD + c, k0 + r <= last);
+        }
+        cp_async_commit();
+    };
+    ld(0, ks, kc);
+    ld(0, vs, vc);
+#endif
     for (int k0 = 0; k0 <= last; k0 += FA_BK) {
+#if KV_Q8
         __syncthreads();
         // All of a thread's loads, then its stores: with q8 the dequant between them kept the compiler from
         // overlapping the loads. Rows past `last` load the row `last` and store zeros.
-        constexpr int N = FA_BK * HD / 8 / 128;
         uint4 kv[N], vv[N];
 #pragma unroll
         for (int n = 0; n < N; n++) {
@@ -1742,6 +1757,9 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
             *(uint4*)(ks + r * PQ + c) = k0 + r <= last ? kv[n] : z;
             *(uint4*)(vs + r * PQ + c) = k0 + r <= last ? vv[n] : z;
         }
+#else
+        cp_async_wait<1>();  // this K tile; its V tile may still be in flight
+#endif
         __syncthreads();
         float s[FA_BK / 8][4] = {};
 #pragma unroll
@@ -1755,6 +1773,11 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
                 mma16816(s[nt + 1], a[0], a[1], a[2], a[3], b[2], b[3]);
             }
         }
+#if !KV_Q8
+        __syncthreads();
+        if (k0 + FA_BK <= last) ld(k0 + FA_BK, ks, kc);
+        else cp_async_commit();  // keep one group per tile for the waits
+#endif
         float mx[2] = {m[0], m[1]};
         for (int nt = 0; nt < FA_BK / 8; nt++)
             for (int e = 0; e < 4; e++) {
@@ -1774,6 +1797,10 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
             for (int e = 0; e < 4; e++) { float p = expf(s[nt][e] - m[e >> 1]); s[nt][e] = p; l[e >> 1] += p; }
 #pragma unroll
         for (int d = 0; d < HD / 8; d++) { o[d][0] *= c[0]; o[d][1] *= c[0]; o[d][2] *= c[1]; o[d][3] *= c[1]; }
+#if !KV_Q8
+        cp_async_wait<1>();  // this V tile; the next K tile may still be in flight
+        __syncthreads();
+#endif
 #pragma unroll
         for (int kb = 0; kb < FA_BK / 16; kb++) {
             u32 a0 = h2pack(s[2 * kb][0], s[2 * kb][1]), a1 = h2pack(s[2 * kb][2], s[2 * kb][3]);
@@ -1786,6 +1813,11 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
                 mma16816(o[d + 1], a0, a1, a2, a3, b[2], b[3]);
             }
         }
+#if !KV_Q8
+        __syncthreads();
+        if (k0 + FA_BK <= last) ld(k0 + FA_BK, vs, vc);
+        else cp_async_commit();
+#endif
     }
     for (int r = 0; r < 2; r++) {
         l[r] += __shfl_xor_sync(0xffffffff, l[r], 1);
