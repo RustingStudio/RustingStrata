@@ -69,14 +69,20 @@ void main() {
     uint sb = w * 16 * BK, pb = w * 16 * PP, rb = w * 16;
     for (uint k0 = 0; k0 <= last; k0 += BK) {
         barrier();
-        [[unroll]] for (uint i = tid; i < BK * HD / 8; i += 128) {
-            // Rows past `last` load the row `last` and store zeros: a select, not a branch around the loads (#276).
-            uint r = i / (HD / 8), c = i % (HD / 8), off = (min(k0 + r, last) * kvd + kvh * HD) / 8 + c, o = off * 8;
+        // All of a thread's loads, then its stores, so the loads overlap (#279). Rows past `last` load the row
+        // `last` and store zeros: a select, not a branch around the loads (#276).
+        const uint N = BK * HD / 8 / 128;
+        uvec4 kl[N], vl[N];
+        [[unroll]] for (uint n = 0; n < N; n++) {
+            uint i = tid + n * 128, r = i / (HD / 8), c = i % (HD / 8), off = (min(k0 + r, last) * kvd + kvh * HD) / 8 + c, o = off * 8;
+            kl[n] = KV_Q8 ? uvec4(ldkv4(p.kc, o, HD), ldkv4(p.kc, o + 4, HD)) : UV4(uint64_t(p.kc)).v[off];
+            vl[n] = KV_Q8 ? uvec4(ldkv4(p.vc, o, HD), ldkv4(p.vc, o + 4, HD)) : UV4(uint64_t(p.vc)).v[off];
+        }
+        [[unroll]] for (uint n = 0; n < N; n++) {
+            uint i = tid + n * 128, r = i / (HD / 8), c = i % (HD / 8);
             bool in_ = k0 + r <= last;
-            uvec4 k = KV_Q8 ? uvec4(ldkv4(p.kc, o, HD), ldkv4(p.kc, o + 4, HD)) : UV4(uint64_t(p.kc)).v[off];
-            uvec4 v = KV_Q8 ? uvec4(ldkv4(p.vc, o, HD), ldkv4(p.vc, o + 4, HD)) : UV4(uint64_t(p.vc)).v[off];
-            kvs[r * PQ + c] = in_ ? k : uvec4(0);
-            kvs[(BK + r) * PQ + c] = in_ ? v : uvec4(0);
+            kvs[r * PQ + c] = in_ ? kl[n] : uvec4(0);
+            kvs[(BK + r) * PQ + c] = in_ ? vl[n] : uvec4(0);
         }
         barrier();
         ACC s0 = ACC(0.0), s1 = ACC(0.0);
