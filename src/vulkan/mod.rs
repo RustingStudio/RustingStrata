@@ -492,8 +492,9 @@ impl Vk {
         let g = [8, 4, 2, 1].into_iter().find(|&g| (nh / nkv) % g == 0 && g * hd <= 2048).unwrap();
         let args: [&dyn Arg; 11] = [&q, &kc, &vc, &part, &step, &(nh as u32), &(nkv as u32), &scale, &gq_min, &pz, &(nt as u32)];
         // gq_min i32::MAX or 0 fixes the regime, so the dispatch that would exit at once is skipped.
-        if gq_min != 0 { self.run("attn_decode", &[0, per, 1, 0], [nh * nt, ATT_SPLITS_1, 1], &args)?; }
-        if gq_min != i32::MAX { self.run("attn_decode", &[0, per, g as u32, 1], [nh / g * nt, ATT_SPLITS, 1], &args)?; }
+        let wide = (nt >= 2) as u32;
+        if gq_min != 0 { self.run("attn_decode", &[0, per, 1, 0, wide], [nh * nt, ATT_SPLITS_1, 1], &args)?; }
+        if gq_min != i32::MAX { self.run("attn_decode", &[0, per, g as u32, 1, wide], [nh / g * nt, ATT_SPLITS, 1], &args)?; }
         self.run("attn_merge", &[], [nh, 1, nt], &[&part, &qg, &out, &step, &(hd as u32), &(ATT_SPLITS as u32), &(ATT_SPLITS_1 as u32), &gq_min, &xq])
     }
     /// Record kernel `name` over `groups` workgroups with push constants `args`.

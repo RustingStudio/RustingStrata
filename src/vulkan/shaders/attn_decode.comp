@@ -7,9 +7,13 @@ layout(local_size_x = 256) in;
 layout(constant_id = 1) const uint PER = 4;
 layout(constant_id = 2) const uint G = 1;
 layout(constant_id = 3) const bool GQA = false;
+// WIDE (nt >= 2): f16 rows in uvec4 loads. They cut two-token (MTP) calls by up to 18% at 32K but cost one-token calls
+// 4-11% at 16K+, so one token keeps the word loads.
+layout(constant_id = 4) const bool WIDE = false;
 const uint HD = PER * 32, C = 32, J = 4, NW = 8;  // positions per chunk, per subgroup; subgroups
 layout(push_constant) uniform P { F32 q; U32 kc; U32 vc; F32 part; I32 step; uint nh; uint nkv; float scale; int gq_min;
                                   uint pz; uint nt; } p;
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer UV4 { uvec4 v[]; };
 shared float sq[PER * 256];  // G * HD query values, then NW * HD subgroup partials
 shared float ss[G * C], sc[G], sm[G], sl[G];
 
@@ -46,6 +50,13 @@ void main() {
                     if (tt >= p1) { k = uvec2(0); v = uvec2(0); }
                     kr[j * PER / 2 + d] = k.x; kr[j * PER / 2 + d + 1] = k.y;
                     vr[j * PER / 2 + d] = v.x; vr[j * PER / 2 + d + 1] = v.y;
+                }
+            } else if (!KV_Q8 && WIDE && PER % 8 == 0) {  // the lane's PER halves in PER / 8 uvec4 loads
+                [[unroll]] for (uint d = 0; d < PER / 2; d += 4) {
+                    uvec4 k = UV4(uint64_t(p.kc)).v[(r + d) / 4], v = UV4(uint64_t(p.vc)).v[(r + d) / 4];
+                    [[unroll]] for (uint e = 0; e < 4; e++) {
+                        kr[j * PER / 2 + d + e] = tt >= p1 ? 0 : k[e]; vr[j * PER / 2 + d + e] = tt >= p1 ? 0 : v[e];
+                    }
                 }
             } else {
                 [[unroll]] for (uint d = 0; d < PER / 2; d++) {
