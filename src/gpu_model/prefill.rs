@@ -214,20 +214,23 @@ impl GpuModel<'_> {
                         groups.push(grp.iter().enumerate().map(|(i, &e)| (e, lx.mats.each_ref().map(|m| sp + (STAGE * m.off + i * m.bytes) as u64))).collect());
                     }
                     let mut tiles = Vec::new();
-                    let mut spans = Vec::new(); // per group: [(start, count); 3]
+                    // Per group: [(start, count); 3] and the slot rows its experts cover. The down GEMM reads rows
+                    // lo..hi of `ge` only, so its tiles count from lo and it quantizes just those rows.
+                    let mut spans = Vec::new();
                     for grp in &groups {
-                        let mut sp = [(0, 0); 3];
+                        let (mut sp, lo, hi) = ([(0, 0); 3], grp.first().map_or(0, |g| off[g.0]), grp.last().map_or(0, |g| off[g.0 + 1]));
                         for mi in 0..3 {
                             let start = tiles.len() / 2;
+                            let base = if mi == 2 { lo } else { 0 };
                             for &(e, w) in grp {
                                 for m0 in (off[e]..off[e + 1]).step_by(GEMM_BM) {
                                     let cnt = GEMM_BM.min(off[e + 1] - m0);
-                                    tiles.extend([w[mi], m0 as u64 | (cnt as u64) << 32]);
+                                    tiles.extend([w[mi], (m0 - base) as u64 | (cnt as u64) << 32]);
                                 }
                             }
                             sp[mi] = (start, tiles.len() / 2 - start);
                         }
-                        spans.push(sp);
+                        spans.push((sp, lo, hi));
                     }
                     anyhow::ensure!(8 * tiles.len() <= pf.tiles.len(), "prefill tile list overflow");
                     g.put(&tiles, &pf.tiles, 0)?;
@@ -250,11 +253,11 @@ impl GpuModel<'_> {
                         // ponytail: one staging area, so only group 1 copies beside compute (on CUDA, beside the up
                         // GEMM of the resident group); later groups wait for their copy. Double buffer if they matter.
                         if gi > 1 { copy(grp)?; }
-                        let sp = spans[gi];
+                        let (sp, lo, hi) = spans[gi];
                         g.gemm(mg.ty, mg.rows, mg.cols, tp(sp[0].0), sp[0].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, SAME_X)?;
                         let up = || g.gemm(mu.ty, mu.rows, mu.cols, tp(sp[1].0), sp[1].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X);
                         if gi == 0 && groups.len() > 1 { g.batch(&mut || { copy(&groups[1])?; up() })?; } else { up()?; }
-                        g.gemm(md.ty, md.rows, md.cols, tp(sp[2].0), sp[2].1, at(l.ge), c.n_ff_exp, t * k, 0, at(l.ye), ne, 0)?;
+                        g.gemm(md.ty, md.rows, md.cols, tp(sp[2].0), sp[2].1, at(l.ge) + (4 * lo * c.n_ff_exp) as u64, c.n_ff_exp, hi - lo, 0, at(l.ye) + (4 * lo * ne) as u64, ne, 0)?;
                     }
                     // The shared down runs last, so the routed gate and up above reuse the int8 h of the shared up.
                     if let Some(s) = shared { g.gemm_dense(&s.down, t, at(l.shg), c.n_ff_shexp, at(l.shy), ne, 0)?; }
