@@ -182,7 +182,7 @@ impl Gpu {
         for n in names {
             let f = module.load_function(&n).with_context(|| format!("kernel {n}"))?;
             // gemvn caches nt quantized inputs: 4 x 17408 columns (Qwen3.8-27B ffn_down) need 77 KB.
-            if n.starts_with("attn_prefill") || n.starts_with("gemvn") {
+            if n.starts_with("attn_prefill") || n.starts_with("attn_decode_gqa") || n.starts_with("gemvn") {
                 f.set_attribute(cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 96 << 10)?;
             }
             fns.insert(n, f);
@@ -300,7 +300,9 @@ impl Gpu {
         let pz = (nh * ATT_SPLITS * (hd + 2)) as i32;
         // gq_min i32::MAX or 0 fixes the regime, so the kernel that would exit at once is not launched.
         if gq_min != 0 { launch!(self, &format!("attn_decode_{hd}"), cfg(((nh * nt) as u32, ATT_SPLITS_1 as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32); }
-        if gq_min != i32::MAX { launch!(self, &format!("attn_decode_gqa_{hd}"), cfg(((nh / g * nt) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32); }
+        // attn_decode_gqa with the f16 cache also holds 2 chunks of K and V (1 at head_dim 512) for its cp.async.
+        let cp = if !self.kv_q8 && hd >= 128 { (if hd <= 256 { 2 } else { 1 }) * 2 * 32 * hd * 2 } else { 0 };
+        if gq_min != i32::MAX { launch!(self, &format!("attn_decode_gqa_{hd}"), cfg(((nh / g * nt) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4 + cp) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32); }
         launch!(self, "attn_merge", LaunchConfig { grid_dim: (nh as u32, 1, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, part, qg, out, hd as i32, ATT_SPLITS as i32, step, ATT_SPLITS_1 as i32, gq_min, xq);
         Ok(())
     }
