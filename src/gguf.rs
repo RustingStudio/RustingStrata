@@ -104,6 +104,14 @@ impl Gguf {
         }
         let align = meta.get("general.alignment").and_then(Value::as_u64).unwrap_or(32) as usize;
         let data_offset = c.p.div_ceil(align) * align;
+        // A cut-off download keeps a valid header; catch it here, not as a slice panic in `bytes`.
+        for t in tensors.values() {
+            let Ok(ty) = GgmlType::from_u32(t.ty) else { continue };  // Weights::validate reports it
+            let n = t.dims.iter().skip(1).try_fold(ty.row_bytes(t.dims.first().copied().unwrap_or(0)) as u64, |a, &d| a.checked_mul(d));
+            if n.and_then(|n| n.checked_add(t.offset)).is_none_or(|e| e > (mmap.len() as u64).saturating_sub(data_offset as u64)) {
+                bail!("{}: GGUF truncated (tensor {} lies past the end of the file; re-download it)", path.display(), t.name);
+            }
+        }
         Ok(Gguf { meta, tensors, mmap, data_offset })
     }
 
