@@ -7,8 +7,9 @@ fn fast_experts_match_reference() {
     let Some(p) = common::model_path() else { return };
     let g = Gguf::open(&p).unwrap();
     let m = Model::load(&g).unwrap();
+    if m.cfg.n_expert == 0 { return eprintln!("SKIP: dense model"); }
     let h: Vec<f32> = (0..m.cfg.n_embd).map(|i| ((i as f32 * 0.7548777).fract() - 0.5) * 2.0).collect();
-    for il in [0, 17, 39] {
+    for il in [0, 17, m.cfg.n_layer - 1] {
         let sel = m.route(il, &h);
         let want = m.routed_experts(il, &h);
         let mut got = cpu_moe::experts(&m, il, &h, &sel);
@@ -29,7 +30,9 @@ fn kernel_throughput() {
     let Some(p) = common::model_path() else { return };
     let g = Gguf::open(&p).unwrap();
     let m = Model::load(&g).unwrap();
-    for name in ["blk.0.ffn_gate_exps.weight", "blk.0.ffn_down_exps.weight", "blk.39.ffn_down_exps.weight"] {
+    if m.cfg.n_expert == 0 { return eprintln!("SKIP: dense model"); }
+    let last = format!("blk.{}.ffn_down_exps.weight", m.cfg.n_layer - 1);
+    for name in ["blk.0.ffn_gate_exps.weight", "blk.0.ffn_down_exps.weight", &last] {
         let t = m.w.get(name).unwrap().expert(5, m.cfg.n_expert);
         let x: Vec<f32> = (0..t.cols).map(|i| ((i as f32 * 0.7548777).fract() - 0.5) * 2.0).collect();
         let mut y = vec![0f32; t.rows];

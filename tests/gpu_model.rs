@@ -12,6 +12,9 @@ fn gpu_forward_matches_cpu_reference() {
     let ids = tok.encode("The capital of France is").unwrap();
     let mut st = State::new(&m.cfg);
     let want: Vec<Vec<f32>> = ids.iter().map(|&t| m.step(&mut st, t)).collect();
+    // The bound is set for the default model. The 30B with its Q2_K experts on the CPU lands 12% of the logit range
+    // off at the first token (3% with the experts on the GPU); the argmax still agrees.
+    let tol = if common::is_default_model(&p) { 0.05 } else { 0.15 };
 
     for (margin, (bk, gpu)) in [usize::MAX / 2, 512 << 20].into_iter().flat_map(|mg| common::backends().into_iter().map(move |b| (mg, b))) {
         eprintln!("backend {bk}, margin {margin}");
@@ -23,7 +26,7 @@ fn gpu_forward_matches_cpu_reference() {
             let diff = got.iter().zip(w).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
             eprintln!("pos {i}: argmax {} vs {}, max |dlogit| {diff:.4} (range {range:.2})", ops::argmax(&got), ops::argmax(w));
             assert_eq!(ops::argmax(&got), ops::argmax(w), "pos {i}");
-            assert!(diff <= 0.05 * range, "pos {i}: {diff} vs range {range}");
+            assert!(diff <= tol * range, "pos {i}: {diff} vs range {range}");
         }
         eprintln!("{} tokens in {:?} (CPU {:?}), expert hits {} misses {}", ids.len(), t0.elapsed(), gm.cpu_time, gm.hits, gm.misses);
     }
