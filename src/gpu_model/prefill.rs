@@ -66,6 +66,8 @@ impl GpuModel<'_> {
         if tokens.len() < self.short { return self.step_all(tokens); }
         anyhow::ensure!(self.pos + tokens.len() <= self.ctx, "context full ({} tokens; raise --ctx)", self.ctx);
         for ch in tokens.chunks(chunk) { self.prefill_chunk(ch)?; }
+        // The prompt's routing predicts the reply's: place its hot experts now instead of 64 per adapt during decode.
+        if self.adapt_every > 0 && let Some(cache) = self.cache.as_mut() { cache.adapt(self.m, &*self.gpu, usize::MAX)?; }
         let (g, ne) = (&self.gpu, self.m.cfg.n_embd);
         let (pf, r) = (self.pf.as_ref().unwrap(), (tokens.len() - 1) % chunk);
         let h = self.bufs["h"].addr();
