@@ -47,6 +47,8 @@ struct Layer { attn_norm: GpuTensor, post_norm: GpuTensor, mixer: Mixer, ffn: Ff
 struct MtpHead {
     layer: Layer, eh_proj: GpuTensor, enorm: GpuTensor, hnorm: GpuTensor, head_norm: GpuTensor,
     worker: CpuWorker, step_buf: Buf, emb: Buf, eh: Buf, x: Buf, pos: usize,
+    /// Row 0 of the main model's `x` at `save_state` (the hidden state the next entry pairs with).
+    saved_x: Buf,
     /// Accepted drafts of the last `spec_step` whose draft head entries (from the main model's hidden rows 0..) are
     /// still to be written; the next `spec_step` writes them in its first draft pass.
     pend: Vec<u32>,
@@ -182,7 +184,7 @@ impl<'a> GpuModel<'a> {
         let mtp = match mtp_parts {
             Some((layer, eh_proj, enorm, hnorm, head_norm, step_buf, emb, eh, x)) => Some(MtpHead {
                 layer, eh_proj, enorm, hnorm, head_norm, worker: CpuWorker::new(m, &*gpu, vec![c.n_layer])?,
-                step_buf, emb, eh, x, pos: 0, pend: vec![],
+                step_buf, emb, eh, x, pos: 0, pend: vec![], saved_x: gpu.zeros::<f32>(c.n_embd)?,
             }),
             None => None,
         };
@@ -273,6 +275,7 @@ impl<'a> GpuModel<'a> {
                 g.dtod(s, 0, bs, 0, s.len())?;
             }
         }
+        if let Some(h) = &self.mtp { g.dtod(&self.x, 0, &h.saved_x, 0, 4 * self.m.cfg.n_embd)?; }
         self.saved_pos = self.pos;
         self.saved_ids.clear();
         Ok(())
@@ -307,8 +310,18 @@ impl<'a> GpuModel<'a> {
             }
         }
         self.pos = self.saved_pos;
+        // The draft head's entries before the saved position are still the ones its prompt fill wrote (see `mtp_synced`).
+        if let Some(h) = self.mtp.as_mut() {
+            g.dtod(&h.saved_x, 0, &self.x, 0, 4 * self.m.cfg.n_embd)?;
+            h.pos = self.pos.saturating_sub(1);
+            h.pend.clear();
+        }
         Ok(())
     }
+
+    /// Whether the draft head holds an entry for each token after the first (it is one entry behind the main model):
+    /// prefill then extends it with the prompt, so its drafts see the whole context.
+    fn mtp_synced(&self) -> bool { self.mtp.as_ref().is_some_and(|h| h.pend.is_empty() && h.pos + 1 == self.pos.max(1)) }
 
     /// Run the forward of `nt` tokens as a recorded graph (graph key `nt` and the attention regime), recorded on first use.
     fn run(&self, nt: usize) -> anyhow::Result<()> {

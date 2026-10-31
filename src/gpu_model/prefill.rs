@@ -39,7 +39,7 @@ impl Scratch {
         let (h, base) = (ne * chunk, 2 * ne * chunk); // x at 0, then h
         let mut at = base;
         let mut take = |n: usize| { let o = at; at += n * chunk; o };
-        let (a, b, c2, d, e) = (take((2 * q).max(channels)), take(q.max(c.ssm_d_inner)), take(channels.max(3 * kv)), take(q.max(c.ssm_d_inner)), take(2 * nv));
+        let (a, b, c2, d, e) = (take((2 * q).max(channels).max(2 * ne)), take(q.max(c.ssm_d_inner)), take(channels.max(3 * kv)), take(q.max(c.ssm_d_inner)), take(2 * nv));
         let mix_end = at;
         at = base;
         let mut take = |n: usize| { let o = at; at += n * chunk; o };
@@ -69,11 +69,9 @@ impl GpuModel<'_> {
         // The prompt's routing predicts the reply's: place its hot experts now instead of 64 per adapt during decode.
         if self.adapt_every > 0 && let Some(cache) = self.cache.as_mut() { cache.adapt(self.m, &*self.gpu, usize::MAX)?; }
         let (g, ne) = (&self.gpu, self.m.cfg.n_embd);
-        let (pf, r) = (self.pf.as_ref().unwrap(), (tokens.len() - 1) % chunk);
         let h = self.bufs["h"].addr();
-        // Row 0 of `x` holds the last hidden state, as after `step` (the MTP draft reads it).
-        g.dtod(&pf.slab, 4 * ne * r, &self.x, 0, 4 * ne)?;
-        g.rms_norm(pf.slab.addr() + (4 * ne * r) as u64, 0, self.output_norm.ptr, h, 0, ne, 1, self.m.cfg.eps)?;
+        // `prefill_chunk` leaves the last hidden state in row 0 of `x`, as after `step` (the MTP draft reads it).
+        g.rms_norm(self.x.addr(), 0, self.output_norm.ptr, h, 0, ne, 1, self.m.cfg.eps)?;
         g.gemv(&self.output, h, self.logits.addr())?;
         g.get::<f32>(&self.logits, 0, self.m.cfg.n_vocab)
     }
@@ -86,7 +84,6 @@ impl GpuModel<'_> {
         let hit = self.saved_ids.len();
         let reused = if hit > 0 && tokens[..keep].starts_with(&self.saved_ids) {
             self.restore_state()?;
-            if let Some(h) = self.mtp.as_mut() { h.pos = 0; h.pend.clear(); }
             hit
         } else {
             self.reset()?;
@@ -102,18 +99,22 @@ impl GpuModel<'_> {
 
     fn step_all(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
         let mut logits = Vec::new();
-        for &t in tokens { logits = self.step(t)?; }
+        for &t in tokens {
+            // The draft head's entry for `t` pairs it with the hidden state of the token before (row 0 of `x`).
+            if self.pos > 0 && self.mtp_synced() { let r = self.row_ptr(0); self.mtp_run(&[t], r, false)?; }
+            logits = self.step(t)?;
+        }
         Ok(logits)
     }
 
     fn prefill_chunk(&mut self, toks: &[u32]) -> anyhow::Result<()> {
         let c = &self.m.cfg;
         let pf = self.pf.as_ref().unwrap();
-        let (g, t, n, eps, ne) = (&self.gpu, toks.len(), pf.chunk, c.eps, c.n_embd);
+        let (g, mut t, n, eps, ne) = (&self.gpu, toks.len(), pf.chunk, c.eps, c.n_embd);
         let emb: Vec<f32> = toks.iter().flat_map(|&tk| self.m.embed(tk)).collect();
         g.put(&emb, &pf.slab, 0)?;
         g.put(&[self.pos as i32, 0], &self.step_buf, 0)?;
-        let step = self.step_buf.addr();
+        let mut step = self.step_buf.addr();
         let base = pf.slab.addr();
         let at = |o: usize| base + 4 * o as u64;
         let l = &pf.lay;
@@ -122,7 +123,26 @@ impl GpuModel<'_> {
         let (dv, channels) = (c.ssm_dv(), c.ssm_d_inner + 2 * nk * dk);
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
         let kv = nkv * hd;
-        for (il, ly) in self.layers.iter().enumerate() {
+        // The draft head runs as one more layer on the chunk while it is in step with the main model.
+        let fill = self.mtp_synced();
+        let mtp = self.mtp.as_ref().filter(|_| fill);
+        for (il, ly) in self.layers.iter().enumerate().chain(mtp.map(|mh| (c.n_layer, &mh.layer))) {
+            if let Some(mh) = mtp.filter(|_| il == c.n_layer) {
+                // Its entry for token i pairs the token with the hidden state before it (`mtp_run`): h gets the last
+                // hidden state of the previous chunk, then rows 0..t - 1; the first token of the sequence has none.
+                let skip = (self.pos == 0) as usize;
+                if skip == 0 { g.dtod(&self.x, 0, &pf.slab, 4 * l.h, 4 * ne)?; }
+                g.dtod(&pf.slab, 0, &pf.slab, 4 * (l.h + (1 - skip) * ne), 4 * (t - 1) * ne)?;
+                g.dtod(&pf.slab, 4 * (t - 1) * ne, &self.x, 0, 4 * ne)?;
+                let emb: Vec<f32> = toks[skip..].iter().flat_map(|&tk| self.m.embed(tk)).collect();
+                g.put(&emb, &pf.slab, 0)?;
+                t -= skip;
+                g.rms_norm(x, ne, mh.enorm.ptr, at(l.a), 2 * ne, ne, t, eps)?;
+                g.rms_norm(h, ne, mh.hnorm.ptr, at(l.a + ne), 2 * ne, ne, t, eps)?;
+                g.gemm_dense(&mh.eh_proj, t, at(l.a), 2 * ne, x, ne, 0)?;
+                g.put(&[mh.pos as i32, 0], &self.step_buf, 2)?;
+                step += 8;
+            }
             g.rms_norm(x, ne, ly.attn_norm.ptr, h, ne, ne, t, eps)?;
             match &ly.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, .. } => {
@@ -266,7 +286,12 @@ impl GpuModel<'_> {
                 }
             }
         }
-        self.pos += t;
+        match self.mtp.as_mut() {
+            Some(mh) if fill => mh.pos += t,
+            // Row 0 of `x` gets the last hidden state (with the draft head, the copy above did it).
+            _ => g.dtod(&pf.slab, 4 * (t - 1) * ne, &self.x, 0, 4 * ne)?,
+        }
+        self.pos += toks.len();
         Ok(())
     }
 }
