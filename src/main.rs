@@ -6,7 +6,7 @@ use rusting_strata::{config::ModelConfig, gguf::Gguf, ops, ops::Sampler, quant::
 use rusting_strata::chat::{Hold, Msg, Template};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::{collections::BTreeMap, net::{TcpListener, TcpStream}, path::{Path, PathBuf}, time::{Duration, Instant, SystemTime}};
+use std::{collections::BTreeMap, net::{TcpListener, TcpStream}, sync::atomic::Ordering::Relaxed, path::{Path, PathBuf}, time::{Duration, Instant, SystemTime}};
 
 #[derive(Parser)]
 #[command(name = "strata", version, about = "Rust inference engine for Qwen3.5/3.6-family GGUF models")]
@@ -379,8 +379,29 @@ fn main() -> anyhow::Result<()> {
             let name = model.file_stem().and_then(|s| s.to_str()).unwrap_or("strata").to_string();
             let listener = TcpListener::bind(&addr)?;
             eprintln!("listening on http://{addr}");
-            for (i, conn) in listener.incoming().enumerate() {
-                let res = conn.map_err(Into::into).and_then(|c| handle(c, &mut r, &tok, tpl, &engine, &name, &addr, api_key.as_deref(), i));
+            // Connections are read on their own threads, so a client that is slow to send its request does not hold
+            // up the others; complete requests run one at a time, in arrival order.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let waiting = open.clone();
+            std::thread::spawn(move || for (i, conn) in listener.incoming().enumerate() {
+                let c = match conn { Ok(c) => c, Err(e) => { eprintln!("request {i}: {e:#}"); continue } };
+                // ponytail: a fixed cap on connections read or queued (each may hold an 8 MB body).
+                if open.fetch_add(1, Relaxed) >= 16 {
+                    open.fetch_sub(1, Relaxed);
+                    eprintln!("request {i}: 16 requests already waiting, closed");
+                    continue;
+                }
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let q = c.set_read_timeout(Some(Duration::from_secs(30))).and_then(|_| c.set_write_timeout(Some(Duration::from_secs(30))))
+                        .map_err(Into::into).and_then(|_| serve::read_request(&mut BufReader::new(&c)));
+                    let _ = tx.send((c, q, i));
+                });
+            });
+            for (c, q, i) in rx {
+                let res = handle(c, q, &mut r, &tok, tpl, &engine, &name, &addr, api_key.as_deref(), i);
+                waiting.fetch_sub(1, Relaxed);
                 if let Err(e) = res { eprintln!("request {i}: {e:#}"); }
             }
         }
@@ -522,17 +543,13 @@ fn template(g: &Gguf) -> Template {
 fn answer(s: &str) -> String { s.rsplit_once("</think>").map_or(s, |x| x.1).trim().to_string() }
 
 #[allow(clippy::too_many_arguments)]
-fn handle(c: TcpStream, r: &mut Runner, tok: &Tokenizer, tpl: Template, e: &Engine, name: &str, addr: &str, key: Option<&str>, i: usize) -> anyhow::Result<()> {
-    // A stalled client must not hold the single request slot.
-    c.set_read_timeout(Some(Duration::from_secs(30)))?;
-    c.set_write_timeout(Some(Duration::from_secs(30)))?;
-    let mut w = c.try_clone()?;
+fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, r: &mut Runner, tok: &Tokenizer, tpl: Template, e: &Engine, name: &str, addr: &str, key: Option<&str>, i: usize) -> anyhow::Result<()> {
     let send = |w: &mut TcpStream, status: &str, v: serde_json::Value| -> anyhow::Result<()> {
         let b = v.to_string();
         Ok(write!(w, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len())?)
     };
     // A malformed request gets a 400 (best effort: the client may be gone) and is still logged.
-    let serve::Request { method, path, host, auth, json, body } = match serve::read_request(&mut BufReader::new(c)) {
+    let serve::Request { method, path, host, auth, json, body } = match q {
         Ok(q) => q,
         Err(err) => {
             let _ = send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}}));
