@@ -1316,7 +1316,12 @@ template <int PER> __device__ __forceinline__ void ldkv(const u16* c, size_t off
         asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(h), "r"(d));
         return r;
     };
-    if constexpr (PER % 4 == 0) {
+    if (PER % 8 == 0 && hd % 128 == 0) {  // rows 8-byte aligned
+        for (int i = 0; i < PER / 8; i++) {
+            uint2 x = ((const uint2*)(r + w))[i];
+            o[4 * i] = deq(x.x, 0x4140); o[4 * i + 1] = deq(x.x, 0x4342); o[4 * i + 2] = deq(x.y, 0x4140); o[4 * i + 3] = deq(x.y, 0x4342);
+        }
+    } else if constexpr (PER % 4 == 0) {
         for (int i = 0; i < PER / 4; i++) {
             unsigned x = ((const unsigned*)(r + w))[i];
             o[2 * i] = deq(x, 0x4140); o[2 * i + 1] = deq(x, 0x4342);
@@ -1720,15 +1725,22 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
     float o[HD / 8][4] = {}, m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
     for (int k0 = 0; k0 <= last; k0 += FA_BK) {
         __syncthreads();
-        for (int i = tid; i < FA_BK * HD / 8; i += 128) {
-            int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
-            uint4 kv = make_uint4(0, 0, 0, 0), vv = kv;
-            if (k0 + r <= last) {
-                size_t off = (size_t)(k0 + r) * kvd + kvh * HD + c;
-                ldkv<8>(kc, off, HD, (unsigned*)&kv); ldkv<8>(vc, off, HD, (unsigned*)&vv);
-            }
-            *(uint4*)(ks + r * PQ + c) = kv;
-            *(uint4*)(vs + r * PQ + c) = vv;
+        // All of a thread's loads, then its stores: with q8 the dequant between them kept the compiler from
+        // overlapping the loads. Rows past `last` load the row `last` and store zeros.
+        constexpr int N = FA_BK * HD / 8 / 128;
+        uint4 kv[N], vv[N];
+#pragma unroll
+        for (int n = 0; n < N; n++) {
+            int i = tid + n * 128, r = i / (HD / 8), c = (i % (HD / 8)) * 8;
+            size_t off = (size_t)min(k0 + r, last) * kvd + kvh * HD + c;
+            ldkv<8>(kc, off, HD, (unsigned*)&kv[n]); ldkv<8>(vc, off, HD, (unsigned*)&vv[n]);
+        }
+#pragma unroll
+        for (int n = 0; n < N; n++) {
+            int i = tid + n * 128, r = i / (HD / 8), c = (i % (HD / 8)) * 8;
+            uint4 z = make_uint4(0, 0, 0, 0);
+            *(uint4*)(ks + r * PQ + c) = k0 + r <= last ? kv[n] : z;
+            *(uint4*)(vs + r * PQ + c) = k0 + r <= last ? vv[n] : z;
         }
         __syncthreads();
         float s[FA_BK / 8][4] = {};
