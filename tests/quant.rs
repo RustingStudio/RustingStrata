@@ -46,21 +46,22 @@ fn matvec_matches_rowwise_dequant() {
     let g = rusting_strata::gguf::Gguf::open(&p).unwrap();
     let w = rusting_strata::weights::Weights::new(&g).unwrap();
     w.validate().unwrap();
-    let t = w.layer(0, "ffn_down_exps.weight").unwrap().expert(7, 256); // IQ3_XXS, 2048 rows x 512
-    assert_eq!((t.rows, t.cols), (2048, 512));
-    let x: Vec<f32> = (0..512).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
-    let mut y = vec![0f32; 2048];
+    let Ok(full) = w.layer(0, "ffn_down_exps.weight") else { return eprintln!("SKIP: dense model") };
+    let n_expert = rusting_strata::config::ModelConfig::from_gguf(&g).unwrap().n_expert;
+    let t = full.expert(7, n_expert); // IQ3_XXS, 2048 rows x 512 on the default model
+    if common::is_default_model(&p) { assert_eq!((t.rows, t.cols), (2048, 512)); }
+    let x: Vec<f32> = (0..t.cols).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+    let mut y = vec![0f32; t.rows];
     t.matvec(&x, &mut y);
-    let mut row = vec![0f32; 512];
-    for r in [0, 1, 1000, 2047] {
+    let mut row = vec![0f32; t.cols];
+    for r in [0, 1, 1000, t.rows - 1] {
         t.row(r, &mut row);
         let want: f32 = row.iter().zip(&x).map(|(a, b)| a * b).sum();
         assert!((y[r] - want).abs() < 1e-4, "row {r}");
     }
-    // Expert slice must point at the right bytes: expert 7 row 0 == full tensor row 7*2048.
-    let full = w.layer(0, "ffn_down_exps.weight").unwrap();
-    let mut a = vec![0f32; 512];
-    full.row(7 * 2048, &mut a);
+    // Expert slice must point at the right bytes: expert 7 row 0 == full tensor row 7*rows.
+    let mut a = vec![0f32; t.cols];
+    full.row(7 * t.rows, &mut a);
     t.row(0, &mut row);
     assert_eq!(a, row);
 }
