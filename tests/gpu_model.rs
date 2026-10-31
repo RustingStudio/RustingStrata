@@ -182,7 +182,7 @@ fn mtp_spec_matches_greedy() {
             let (mut out, mut row) = (vec![], 0);
             while out.len() < n {
                 if k > 0 {
-                    let (toks, nx, r) = gm.spec_step(t, row).unwrap();
+                    let (toks, nx, r) = gm.spec_step(t, row, &mut ops::Sampler::greedy()).unwrap();
                     (t, row) = (nx, r);
                     out.extend(toks);
                 } else {

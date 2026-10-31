@@ -55,3 +55,16 @@ fn sampler_cuts_and_matches_softmax() {
     let mut s = Sampler { temp: 1e-9, top_k: 0, top_p: 1.0, rng: 7 };
     assert_eq!(s.pick(&[1.0, 10.0, 3.0]), 1);
 }
+#[test]
+fn sampler_accept_keeps_the_distribution() {
+    // Keeping draft d with its probability, else drawing from the rest, must give the probabilities of `pick`, for a
+    // likely draft, an unlikely one and one outside the candidates.
+    let l = [2.0f32.ln(), 1.0f32.ln(), 1.0f32.ln(), -50.0]; // 1/2, 1/4, 1/4, ~0
+    for d in [0, 1, 3] {
+        let mut s = Sampler { temp: 1.0, top_k: 0, top_p: 1.0, rng: 7 };
+        let mut n = [0usize; 4];
+        for _ in 0..40000 { n[s.accept(&l, d).unwrap_or(d)] += 1; }
+        let f = |i: usize| n[i] as f32 / 40000.0;
+        assert!(n[3] == 0 && (f(0) - 0.5).abs() < 0.015 && (f(1) - 0.25).abs() < 0.015, "d {d}: {n:?}");
+    }
+}

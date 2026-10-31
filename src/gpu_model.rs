@@ -6,6 +6,7 @@ use crate::cpu_worker::{CpuWorker, TMAX};
 use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, Backend, Buf, GpuTensor};
 use crate::expert_cache::ExpertCache;
 use crate::model::Model;
+use crate::ops::Sampler;
 use crate::quant::GgmlType;
 use anyhow::bail;
 use std::collections::HashMap;
@@ -342,15 +343,16 @@ impl<'a> GpuModel<'a> {
         Ok(self.gpu.get::<f32>(&self.logits, 0, self.m.cfg.n_vocab)?)
     }
 
-    /// Speculative decode with MTP. `t` is the next token (argmax of the last logits), predicted by hidden row `row`.
-    /// Drafts `k` tokens after `t` (each from the previous draft's hidden state), verifies [t, drafts..] in one forward
-    /// and keeps the drafts up to the first one the main model disagrees with (`rollback`). Returns the accepted tokens,
-    /// the greedy token after the last one (argmax of its logits, first on ties) and its hidden row. Greedy output equals plain `step` decoding (verify is
-    /// bit-identical to steps). The draft head entries of accepted drafts wait for the next call's first draft pass,
+    /// Speculative decode with MTP. `t` is the next token (picked from the last logits), predicted by hidden row `row`.
+    /// Drafts `k` tokens after `t` (each the draft head's argmax after the previous one), verifies [t, drafts..] in one
+    /// forward and keeps the drafts up to the first one the main model rejects (`rollback`). Returns the accepted
+    /// tokens, the token `smp` picks after the last one and its hidden row. Greedy: a draft is kept when it is the
+    /// argmax, and the output equals plain `step` decoding (verify is bit-identical to steps). Sampling: a draft is
+    /// kept with its probability (`Sampler::accept`), so tokens have the distribution of plain sampling. The draft head entries of accepted drafts wait for the next call's first draft pass,
     /// which runs them with `t` in one batch (their main model rows 0..n precede `t`'s row n).
-    pub fn spec_step(&mut self, t: u32, row: usize) -> anyhow::Result<(Vec<u32>, u32, usize)> {
+    pub fn spec_step(&mut self, t: u32, row: usize, smp: &mut Sampler) -> anyhow::Result<(Vec<u32>, u32, usize)> {
         let k = self.k;
-        if self.pos + k + 1 > self.ctx { return Ok((vec![t], crate::ops::argmax(&self.step(t)?) as u32, 0)); }
+        if self.pos + k + 1 > self.ctx { return Ok((vec![t], smp.pick(&self.step(t)?) as u32, 0)); }
         let h = self.mtp.as_mut().unwrap();
         let mut first = std::mem::take(&mut h.pend);
         if first.len() != row { first.clear(); }
@@ -365,7 +367,16 @@ impl<'a> GpuModel<'a> {
             toks.push(d);
         }
         let start = self.pos;
-        let (n, next) = self.verify_greedy(&toks, |am| (0..k).take_while(|&i| am[i] == toks[i + 1]).count())?;
+        let (n, next) = if smp.temp <= 0.0 {
+            self.verify_greedy(&toks, |am| (0..k).take_while(|&i| am[i] == toks[i + 1]).count())?
+        } else {
+            let l = self.verify(&toks)?;
+            let mut n = 0;
+            loop {
+                if n == k { break (n, smp.pick(&l[n]) as u32); }
+                match smp.accept(&l[n], toks[n + 1] as usize) { None => n += 1, Some(x) => break (n, x as u32) }
+            }
+        };
         self.drafts.0 += k;
         self.drafts.1 += n;
         if n < k { self.rollback(start, n + 1)?; }
