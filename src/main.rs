@@ -131,6 +131,10 @@ impl Engine {
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
         let mut g = GpuModel::load(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp()).context(LOAD_HINT)?;
         g.short = self.short;
+        if self.mtp() > 0 && g.k == 0 {
+            eprintln!("--mtp: this model has no MTP draft head, decoding without it");
+            self.mtp = Some(0);
+        }
         Ok(Runner::Gpu(Box::new(g)))
     }
     fn sampler(&self) -> Sampler {
