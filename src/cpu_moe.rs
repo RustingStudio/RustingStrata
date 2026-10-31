@@ -285,10 +285,10 @@ mod avx2 {
         unsafe {
             let mut acc = _mm256_setzero_ps();
             for (b, y) in row.chunks_exact(74).zip(xq) {
-                let q = |i: usize| u16::from_le_bytes([b[2 + 2 * i], b[3 + 2 * i]]);
                 let mut sumi = _mm256_setzero_si256();
                 for ib in 0..8 {
-                    let (q0, q1, q2, q3) = (q(4 * ib), q(4 * ib + 1), q(4 * ib + 2), q(4 * ib + 3));
+                    let v = u64::from_le_bytes(b[2 + 8 * ib..10 + 8 * ib].try_into().unwrap());
+                    let (q0, q1, q2, q3) = (v as u16, (v >> 16) as u16, (v >> 32) as u16, (v >> 48) as u16);
                     let g = |q: u16| IQ2XS_GRID[(q & 511) as usize] as i64;
                     let grid = _mm256_set_epi64x(g(q3), g(q2), g(q1), g(q0));
                     let signs = _mm256_set_epi64x(sg((q3 >> 9) as usize), sg((q2 >> 9) as usize), sg((q1 >> 9) as usize), sg((q0 >> 9) as usize));
@@ -311,7 +311,8 @@ mod avx2 {
                 let (qs, gas) = (&b[2..66], &b[66..98]);
                 let mut sumi = _mm256_setzero_si256();
                 for ib in 0..8 {
-                    let g = |i: usize| IQ3XXS_GRID[qs[8 * ib + i] as usize] as i32;
+                    let v = u64::from_le_bytes(qs[8 * ib..8 * ib + 8].try_into().unwrap());
+                    let g = |i: usize| IQ3XXS_GRID[(v >> (8 * i)) as u8 as usize] as i32;
                     let grid = _mm256_set_epi32(g(7), g(6), g(5), g(4), g(3), g(2), g(1), g(0));
                     let aux = u32::from_le_bytes(gas[4 * ib..4 * ib + 4].try_into().unwrap());
                     let s = |l: u32| sg(((aux >> (7 * l)) & 127) as usize);
