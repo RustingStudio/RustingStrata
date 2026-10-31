@@ -38,10 +38,21 @@ void main() {
     for (uint c0 = p0; c0 < p1; c0 += C) {
         uint kr[J * PER / 2], vr[J * PER / 2];
         [[unroll]] for (uint j = 0; j < J; j++) {
-            uint tt = c0 + w * J + j, r = ((tt * p.nkv + g) * HD + lane * PER) / 2;
-            [[unroll]] for (uint d = 0; d < PER / 2; d++) {
-                kr[j * PER / 2 + d] = tt >= p1 ? 0 : KV_Q8 ? ldkv2(U16(uint64_t(p.kc)), 2 * (r + d), HD) : p.kc.v[r + d];
-                vr[j * PER / 2 + d] = tt >= p1 ? 0 : KV_Q8 ? ldkv2(U16(uint64_t(p.vc)), 2 * (r + d), HD) : p.vc.v[r + d];
+            // Positions past p1 load the row p1 - 1 and keep zeros: a select, not a branch around the loads (#276).
+            uint tt = c0 + w * J + j, r = ((min(tt, p1 - 1) * p.nkv + g) * HD + lane * PER) / 2;
+            if (KV_Q8 && PER % 4 == 0) {  // the lane's PER values in PER / 4 word loads
+                [[unroll]] for (uint d = 0; d < PER / 2; d += 2) {
+                    uvec2 k = ldkv4(U16(uint64_t(p.kc)), 2 * (r + d), HD), v = ldkv4(U16(uint64_t(p.vc)), 2 * (r + d), HD);
+                    if (tt >= p1) { k = uvec2(0); v = uvec2(0); }
+                    kr[j * PER / 2 + d] = k.x; kr[j * PER / 2 + d + 1] = k.y;
+                    vr[j * PER / 2 + d] = v.x; vr[j * PER / 2 + d + 1] = v.y;
+                }
+            } else {
+                [[unroll]] for (uint d = 0; d < PER / 2; d++) {
+                    uint k = KV_Q8 ? ldkv2(U16(uint64_t(p.kc)), 2 * (r + d), HD) : p.kc.v[r + d];
+                    uint v = KV_Q8 ? ldkv2(U16(uint64_t(p.vc)), 2 * (r + d), HD) : p.vc.v[r + d];
+                    kr[j * PER / 2 + d] = tt >= p1 ? 0 : k; vr[j * PER / 2 + d] = tt >= p1 ? 0 : v;
+                }
             }
         }
         float kf[J * PER], sp[J * G];

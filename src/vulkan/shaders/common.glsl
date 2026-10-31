@@ -118,6 +118,18 @@ uint ldkv2(U16 c, uint off, uint hd) {
     float d = unpackHalf2x16(uint(c.v[(r + hd) / 2 + w / 32])).x;
     return packHalf2x16(vec2(rh(float(int(b << 24) >> 24) * d), rh(float(int(b << 16) >> 24) * d)));
 }
+// q8 values off .. off + 3 (off % 4 == 0) as two f16 pair words, from one 4-byte load and one scale. Rows start
+// 4-byte aligned only when hd % 64 == 0 (hd * 17 / 16 bytes each); otherwise two ldkv2.
+uvec2 ldkv4(U16 c, uint off, uint hd) {
+    if (hd % 64 != 0) return uvec2(ldkv2(c, off, hd), ldkv2(c, off + 2, hd));
+    uint w = off % hd, r = off / hd * (hd + hd / 16), b = U32(uint64_t(c)).v[(r + w) / 4];
+    // q + 128 as the low mantissa bits of 1024 gives the f16 1152 + q, so q comes out exact without int -> float
+    // converts. The f16 product q * d is rounded once, as rh(float(q) * d).
+    uint x = b ^ 0x80808080u, lo = (x & 0xffu) | (x & 0xff00u) << 8, hi = (x >> 16 & 0xffu) | (x >> 8 & 0xff0000u);
+    float16_t d = uint16BitsToHalf(c.v[(r + hd) / 2 + w / 32]);
+    precise f16vec2 m = f16vec2(1152.0hf), a = (unpackFloat2x16(lo | 0x64006400u) - m) * d, z = (unpackFloat2x16(hi | 0x64006400u) - m) * d;
+    return uvec2(packFloat2x16(a), packFloat2x16(z));
+}
 
 // sin and cos of theta = pos * ts^i (ts = base^(-2 / n_rot) from the host) in f64, as the CPU and CUDA take them
 // (GLSL has no f64 pow, sin or cos).
