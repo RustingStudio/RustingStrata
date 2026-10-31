@@ -306,10 +306,12 @@ fn main() -> anyhow::Result<()> {
                 s
             } else { prompt };
             let ids = tok.encode(&prompt)?;
+            anyhow::ensure!(!ids.is_empty(), "empty prompt");
             let t0 = Instant::now();
             let logits = r.prefill(&ids)?;
             let t1 = Instant::now();
             let cpu0 = r.cpu_secs();
+            let n = room(&engine, ids.len(), n);
             let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut engine.sampler(), logits, n, &mut |t| { print!("{t}"); Ok(std::io::stdout().flush()?) })?;
             let (pp, tg) = ((t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
             eprintln!("\nprompt {} tok {:.2} tok/s | gen {} tok {:.2} tok/s", ids.len(), ids.len() as f64 / pp, out.len(), out.len() as f64 / tg);
