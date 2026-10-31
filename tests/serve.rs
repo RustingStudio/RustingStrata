@@ -145,3 +145,40 @@ fn checks_api_key() {
     assert!(!key_ok("Bearer s3cres", "s3cret") && !key_ok("Bearer s3cret2", "s3cret") && !key_ok("s3cret", "s3cret") && !key_ok("", "s3cret"));
     assert!(!key_ok("", "") && !key_ok("Bearer ", ""));
 }
+
+#[test]
+fn hold_stops_before_a_stop_string() {
+    let reply = "1 2 3 4 5 6 7";
+    for step in 1..5 {
+        let mut h = Hold::new(false, vec!["4 5".into(), "zz".into()]);
+        let mut sent = String::new();
+        for c in reply.as_bytes().chunks(step) {
+            sent += h.push(std::str::from_utf8(c).unwrap());
+            if h.stopped { break; }
+        }
+        assert!(h.stopped, "step {step}");
+        assert_eq!((sent.as_str(), h.text.as_str(), h.rest()), ("1 2 3 ", "1 2 3 ", ""), "step {step}");
+    }
+    // A partial match is held back, then sent when the text goes another way; multi-byte stops cut on a char boundary.
+    let mut h = Hold::new(false, vec!["кіт!".into()]);
+    assert_eq!(h.push("a кі"), "a ");
+    assert_eq!(h.push("тя"), "кітя");
+    assert_eq!(h.push(" кіт!b"), " ");
+    assert!(h.stopped);
+    // With the tag held too, a stop inside a held call still ends the reply.
+    let mut h = Hold::new(true, vec!["</tool_call>".into()]);
+    assert_eq!(h.push("x <tool_call>{}</tool_call>y"), "x ");
+    assert_eq!((h.stopped, h.rest()), (true, "<tool_call>{}"));
+}
+
+#[test]
+fn parses_stop_and_n() {
+    let q = |extra: &str| chat_request(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{extra}}}"#).as_bytes()).map(|q| q.stop);
+    assert_eq!(q("").unwrap(), Vec::<String>::new());
+    assert_eq!(q(r#","stop":"\n""#).unwrap(), vec!["\n"]);
+    assert_eq!(q(r#","stop":["a","","b"]"#).unwrap(), vec!["a", "b"]);
+    assert!(q(r#","stop":[1]"#).is_err());
+    assert!(q(r#","stop":5"#).is_err());
+    assert!(q(r#","n":1"#).is_ok());
+    assert!(q(r#","n":2"#).is_err());
+}

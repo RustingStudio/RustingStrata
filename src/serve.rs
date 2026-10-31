@@ -74,6 +74,8 @@ pub struct ChatRequest {
     pub top_k: Option<usize>,
     pub top_p: Option<f32>,
     pub seed: Option<u64>,
+    /// The reply ends before the first of these strings (`stop`).
+    pub stop: Vec<String>,
 }
 
 pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
@@ -104,8 +106,15 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
         x => x.as_f64().filter(|&f| ok(f)).map(|f| Some(f as f32)).with_context(|| format!("{k} must be {want}")),
     };
     let max_tokens = int("max_completion_tokens", 1)?.or(int("max_tokens", 1)?).map(|n| n as usize);
+    if int("n", 1)?.is_some_and(|n| n != 1) { bail!("only n = 1 is supported"); }
+    let stop = match &v["stop"] {
+        Value::Null => Some(vec![]),
+        Value::String(s) => Some(vec![s.clone()]),
+        Value::Array(a) => a.iter().map(|s| s.as_str().map(str::to_owned)).collect(),
+        _ => None,
+    }.context("stop must be a string or an array of strings")?.into_iter().filter(|s| !s.is_empty()).collect();
     let think = v["chat_template_kwargs"]["enable_thinking"].as_bool().unwrap_or(false);
     Ok(ChatRequest { messages, tools, tool_calls, max_tokens, stream: v["stream"].as_bool().unwrap_or(false), think,
         temperature: num("temperature", |f| f >= 0.0, "a number >= 0")?, top_k: int("top_k", 0)?.map(|n| n as usize),
-        top_p: num("top_p", |f| f > 0.0 && f <= 1.0, "a number in (0, 1]")?, seed: int("seed", 0)? })
+        top_p: num("top_p", |f| f > 0.0 && f <= 1.0, "a number in (0, 1]")?, seed: int("seed", 0)?, stop })
 }
