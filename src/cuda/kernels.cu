@@ -1416,8 +1416,8 @@ __device__ void attn_decode_llama(const float* q, const u16* kc, const u16* vc, 
 // scores, warp h runs the online softmax of head h over the chunk, then warps add the weighted V rows. All warps
 // share one running max per head, so their partials just add up. The block writes per head its unnormalized partial
 // [acc (hd) | max | sum] to part; attn_merge combines the splits.
-// CP (f16 cache, the GQA entry point): each lane cp.asyncs its own slice of the next chunks into shared memory while
-// the block works on this one (ST chunks in flight). Only the lane that copies a slice reads it, so the copies need
+// CP (f16 cache, the GQA entry point, head_dim 128 or 256): each lane cp.asyncs its own slice of the next two chunks
+// into shared memory while the block works on this one. Only the lane that copies a slice reads it, so the copies need
 // no barriers of their own.
 template <int PER, int G, bool CP = false>
 __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
@@ -1436,7 +1436,7 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
         return;
     }
     extern __shared__ float sq[];  // G * hd query values, then nw * hd warp partials; with CP the K/V chunks at 8 * hd
-    constexpr int ST = hd <= 256 ? 2 : 1;
+    constexpr int ST = 2;
     u16* kb = (u16*)(sq + 8 * hd);  // [ST][K, V][C][hd]
     __shared__ float ss[G][C], sc[G], sm[G], sl[G];
     int h0 = bx * G, g = h0 / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
@@ -1452,15 +1452,14 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
             for (int j = 0; j < J; j++) {
                 size_t r = ((size_t)min(c0 + w * J + j, p1 - 1) * nkv + g) * hd + lane * PER;
                 u16 *dk = kb + ((b * 2) * C + w * J + j) * hd + lane * PER, *dv = dk + C * hd;
-                if constexpr (PER >= 8) {
-                    for (int c = 0; c < PER / 8; c++) { cp_async16(dk + 8 * c, kc + r + 8 * c, true); cp_async16(dv + 8 * c, vc + r + 8 * c, true); }
-                } else { cp_async8(dk, kc + r, true); cp_async8(dv, vc + r, true); }
+                if constexpr (PER == 8) { cp_async16(dk, kc + r, true); cp_async16(dv, vc + r, true); }
+                else { cp_async8(dk, kc + r, true); cp_async8(dv, vc + r, true); }
             }
         cp_async_commit();
     };
     if constexpr (CP) {
         cp(p0, 0);
-        if (ST == 2) cp(p0 + C, 1);
+        cp(p0 + C, 1);
     }
     __syncthreads();
     for (int c0 = p0, it = 0; c0 < p1; c0 += C, it++) {
@@ -1553,7 +1552,7 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
                  float scale, int gq_min, int pz, int nt
 #define ATT_TOK int t = blockIdx.x % nt; q += (size_t)t * nh * hd; part += (size_t)t * pz; step += 2 * t;
 #define ATT_RUN(G) attn_decode_t<PER, G>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt)
-#define ATT_RUN_CP(G) attn_decode_t<PER, G, !KV_Q8 && PER >= 4>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt)
+#define ATT_RUN_CP(G) attn_decode_t<PER, G, !KV_Q8 && (PER == 4 || PER == 8)>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt)
 #define DEF_ATT(HD)                                                                                          \
     extern "C" __global__ void attn_decode_##HD(ATT_ARGS) {                                                  \
         constexpr int PER = HD / 32; ATT_TOK                                                                 \
