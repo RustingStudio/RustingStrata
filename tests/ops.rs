@@ -51,4 +51,7 @@ fn sampler_cuts_and_matches_softmax() {
     assert!((0..100).all(|_| s.pick(&l) == 0));
     let mut s = Sampler { temp: 1.0, top_k: 2, top_p: 1.0, rng: 7 };
     assert!((0..100).all(|_| s.pick(&l) < 2));
+    // A temperature so small that m - 21 * temp rounds to m must still keep the best token.
+    let mut s = Sampler { temp: 1e-9, top_k: 0, top_p: 1.0, rng: 7 };
+    assert_eq!(s.pick(&[1.0, 10.0, 3.0]), 1);
 }
