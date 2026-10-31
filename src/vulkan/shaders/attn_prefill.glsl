@@ -70,16 +70,13 @@ void main() {
     for (uint k0 = 0; k0 <= last; k0 += BK) {
         barrier();
         [[unroll]] for (uint i = tid; i < BK * HD / 8; i += 128) {
-            uint r = i / (HD / 8), c = i % (HD / 8), off = ((k0 + r) * kvd + kvh * HD) / 8 + c;
+            // Rows past `last` load the row `last` and store zeros: a select, not a branch around the loads (#276).
+            uint r = i / (HD / 8), c = i % (HD / 8), off = (min(k0 + r, last) * kvd + kvh * HD) / 8 + c, o = off * 8;
             bool in_ = k0 + r <= last;
-            if (KV_Q8) {
-                uint o = off * 8;
-                kvs[r * PQ + c] = in_ ? uvec4(ldkv2(p.kc, o, HD), ldkv2(p.kc, o + 2, HD), ldkv2(p.kc, o + 4, HD), ldkv2(p.kc, o + 6, HD)) : uvec4(0);
-                kvs[(BK + r) * PQ + c] = in_ ? uvec4(ldkv2(p.vc, o, HD), ldkv2(p.vc, o + 2, HD), ldkv2(p.vc, o + 4, HD), ldkv2(p.vc, o + 6, HD)) : uvec4(0);
-            } else {
-                kvs[r * PQ + c] = in_ ? UV4(uint64_t(p.kc)).v[off] : uvec4(0);
-                kvs[(BK + r) * PQ + c] = in_ ? UV4(uint64_t(p.vc)).v[off] : uvec4(0);
-            }
+            uvec4 k = KV_Q8 ? uvec4(ldkv4(p.kc, o, HD), ldkv4(p.kc, o + 4, HD)) : UV4(uint64_t(p.kc)).v[off];
+            uvec4 v = KV_Q8 ? uvec4(ldkv4(p.vc, o, HD), ldkv4(p.vc, o + 4, HD)) : UV4(uint64_t(p.vc)).v[off];
+            kvs[r * PQ + c] = in_ ? k : uvec4(0);
+            kvs[(BK + r) * PQ + c] = in_ ? v : uvec4(0);
         }
         barrier();
         ACC s0 = ACC(0.0), s1 = ACC(0.0);
