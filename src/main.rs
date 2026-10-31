@@ -299,7 +299,6 @@ fn main() -> anyhow::Result<()> {
             let g = Gguf::open(&model)?;
             let m = Model::load(&g)?;
             let tok = Tokenizer::from_gguf(&g)?;
-            let mut r = engine.runner(&m, &model)?;
             let prompt = if prompt == "-" {
                 let mut s = String::new();
                 std::io::stdin().read_to_string(&mut s)?;
@@ -307,13 +306,15 @@ fn main() -> anyhow::Result<()> {
             } else { prompt };
             let ids = tok.encode(&prompt)?;
             anyhow::ensure!(!ids.is_empty(), "empty prompt");
+            let mut r = engine.runner(&m, &model)?;
             let t0 = Instant::now();
             let logits = r.prefill(&ids)?;
             let t1 = Instant::now();
             let cpu0 = r.cpu_secs();
-            let n = room(&engine, ids.len(), n);
-            let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut engine.sampler(), logits, n, &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
+            let cap = room(&engine, ids.len(), n);
+            let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut engine.sampler(), logits, cap, &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
             let (pp, tg) = ((t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
+            if out.len() == cap && cap < n { eprint!("\n(stopped: the context is full at {} tokens; raise --ctx)", engine.ctx); }
             eprintln!("\nprompt {} tok {:.2} tok/s | gen {} tok {:.2} tok/s", ids.len(), ids.len() as f64 / pp, out.len(), out.len() as f64 / tg);
             if engine.gpu { eprintln!("CPU expert compute, share of gen time: {:.1}%", 100.0 * (r.cpu_secs() - cpu0) / tg); }
             r.finish()?;
