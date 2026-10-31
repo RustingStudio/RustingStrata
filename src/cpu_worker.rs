@@ -82,16 +82,24 @@ impl CpuWorker {
                         std::hint::spin_loop();
                     }
                     if r != seq { continue; }
-                    fence(Ordering::Acquire);
+                    // mfence: loads of write-combining memory (the Vulkan BAR mailbox) are weakly ordered, so an
+                    // acquire fence (no instruction on x86) would not keep them after the REQ load.
+                    fence(Ordering::SeqCst);
                     let t0 = Instant::now();
                     let rd = |o: usize| unsafe { at(o).read_volatile() };
                     let nt = (rd(NTOK) as usize).clamp(1, TMAX);
                     let (k, kt, n) = (lay.k, lay.k * nt, lay.n);
+                    // Bulk streaming reads, as in `routing`: plain loads of the Vulkan BAR mailbox are each an
+                    // uncached read (~130 us for one activation).
+                    let mut v = vec![0u32; (3 * kt).next_multiple_of(4)];
+                    unsafe { read_wc(at(IDS), &mut v) };
                     for t in 0..nt {
-                        let sel: Vec<(usize, f32)> = (t * k..(t + 1) * k).filter(|&j| (rd(IDS + 2 * kt + j) as i32) < 0)
-                            .map(|j| (rd(IDS + j) as usize, f32::from_bits(rd(IDS + kt + j)))).collect();
+                        let sel: Vec<(usize, f32)> = (t * k..(t + 1) * k).filter(|&j| (v[2 * kt + j] as i32) < 0)
+                            .map(|j| (v[j] as usize, f32::from_bits(v[kt + j]))).collect();
                         if sel.is_empty() { continue; }
-                        let h = unsafe { std::slice::from_raw_parts(at(lay.h + t * n) as *const f32, n) }.to_vec();
+                        let mut h = vec![0u32; n];
+                        unsafe { read_wc(at(lay.h + t * n), &mut h) };
+                        let h: Vec<f32> = h.into_iter().map(f32::from_bits).collect();
                         let y = crate::cpu_moe::experts(m, il, &h, &sel);
                         unsafe { std::ptr::copy_nonoverlapping(y.as_ptr(), at(lay.y + t * n) as *mut f32, n) };
                     }
