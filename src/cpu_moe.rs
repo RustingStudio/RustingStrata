@@ -350,13 +350,15 @@ mod avx2 {
             // Byte k of a lane picks sign byte k / 8, then bit k % 8 (llama.cpp k_mask1 / k_mask2).
             let m1 = _mm256_set_epi64x(0x0303030303030303, 0x0202020202020202, 0x0101010101010101, 0);
             let m2 = _mm256_set1_epi64x(0x8040201008040201u64 as i64);
+            let shl = _mm256_set_epi32(1, 2, 3, 4, 5, 6, 7, 8);
             let mut acc = _mm256_setzero_ps();
             for (b, y) in row.chunks_exact(110).zip(xq) {
                 let (qs, qh) = (&b[2..66], &b[66..74]);
                 let mut sumi = _mm256_setzero_si256();
                 for ib in 0..8 {
-                    let g = |i: usize| IQ3S_GRID[qs[8 * ib + i] as usize | ((qh[ib] as usize) << (8 - i) & 256)] as i32;
-                    let grid = _mm256_set_epi32(g(7), g(6), g(5), g(4), g(3), g(2), g(1), g(0));
+                    let lo = _mm256_cvtepu8_epi32(_mm_loadl_epi64(qs[8 * ib..].as_ptr() as *const __m128i));
+                    let hi = _mm256_and_si256(_mm256_sllv_epi32(_mm256_set1_epi32(qh[ib] as i32), shl), _mm256_set1_epi32(256));
+                    let grid = _mm256_i32gather_epi32(IQ3S_GRID.as_ptr() as *const i32, _mm256_or_si256(lo, hi), 4);
                     let sb = i32::from_le_bytes(b[74 + 4 * ib..78 + 4 * ib].try_into().unwrap());
                     let s = _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32(sb), m1), m2), m2);
                     let q8 = _mm256_loadu_si256(y.qs.as_ptr().add(32 * ib) as *const __m256i);
@@ -464,15 +466,21 @@ mod avx2 {
             let mut sumf = 0.0;
             for (b, y) in row.chunks_exact(50).zip(xq) {
                 let mut sumi = _mm256_setzero_si256();
-                let mut s1 = 0i32;
                 for ib in 0..8 {
                     let qh = u16::from_le_bytes([b[34 + 2 * ib], b[35 + 2 * ib]]) as usize;
                     let g = |l: usize| IQ1S_GRID[b[2 + 4 * ib + l] as usize | ((qh >> (3 * l)) & 7) << 8] as i64;
                     let ls = 2 * ((qh >> 12) & 7) as i32 + 1;
                     let p = dot1(_mm256_set_epi64x(g(3), g(2), g(1), g(0)), q8(y, 32 * ib));
                     sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(p, _mm256_set1_epi16(ls as i16)));
-                    s1 += ls * if qh & 0x8000 != 0 { -1 } else { 1 } * (y.bs[2 * ib] + y.bs[2 * ib + 1]) as i32;
                 }
+                // Delta term: sum of ±scale (sign in bit 15 of qh) times each 32 values' q8 sum.
+                let qh = _mm_loadu_si128(b[34..50].as_ptr() as *const __m128i);
+                let ls = _mm_or_si128(_mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh, 12), _mm_set1_epi16(7)), 1), _mm_set1_epi16(1));
+                let ls = _mm_sign_epi16(ls, _mm_or_si128(qh, _mm_set1_epi16(1)));
+                let bs = |i: usize| _mm_loadu_si128(y.bs[8 * i..].as_ptr() as *const __m128i);
+                let s = _mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(ls, ls), bs(0)), _mm_madd_epi16(_mm_unpackhi_epi16(ls, ls), bs(1)));
+                let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b01_00_11_10));
+                let s1 = _mm_cvtsi128_si32(_mm_add_epi32(s, _mm_shuffle_epi32(s, 0b10_11_00_01)));
                 acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(sumi), acc);
                 sumf += d16(b) * y.d * 0.125 * s1 as f32;
             }
