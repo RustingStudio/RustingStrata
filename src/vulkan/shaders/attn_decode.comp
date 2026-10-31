@@ -40,8 +40,8 @@ void main() {
         [[unroll]] for (uint j = 0; j < J; j++) {
             uint tt = c0 + w * J + j, r = ((tt * p.nkv + g) * HD + lane * PER) / 2;
             [[unroll]] for (uint d = 0; d < PER / 2; d++) {
-                kr[j * PER / 2 + d] = tt < p1 ? p.kc.v[r + d] : 0;
-                vr[j * PER / 2 + d] = tt < p1 ? p.vc.v[r + d] : 0;
+                kr[j * PER / 2 + d] = tt >= p1 ? 0 : KV_Q8 ? ldkv2(U16(uint64_t(p.kc)), 2 * (r + d), HD) : p.kc.v[r + d];
+                vr[j * PER / 2 + d] = tt >= p1 ? 0 : KV_Q8 ? ldkv2(U16(uint64_t(p.vc)), 2 * (r + d), HD) : p.vc.v[r + d];
             }
         }
         float kf[J * PER], sp[J * G];

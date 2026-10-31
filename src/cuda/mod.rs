@@ -63,8 +63,8 @@ unsafe impl Send for Graph {}
 /// and run attention as its CPU flash attention does (LLAMA_Q8 in kernels.cu).
 pub fn llama_numerics() -> bool { std::env::var_os("STRATA_LLAMA_NUMERICS").is_some() }
 
-/// `--kv q8`: KV cache rows in ggml q8_0 form (KV_Q8 in kernels.cu), read once by Gpu::new.
-fn kv_q8() -> bool { std::env::var_os("STRATA_KV_Q8").is_some() }
+/// `--kv q8`: KV cache rows in ggml q8_0 form (KV_Q8 in kernels.cu), read once by Gpu::new and Vk::new.
+pub fn kv_q8() -> bool { std::env::var_os("STRATA_KV_Q8").is_some() }
 
 fn source(kv_q8: bool) -> String {
     let join = |v: Vec<String>| v.join(",");

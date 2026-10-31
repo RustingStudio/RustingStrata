@@ -55,7 +55,7 @@ struct Engine {
     /// repeat exactly.
     #[arg(long)]
     fixed_experts: bool,
-    /// KV cache format (GPU): f16, or q8 (CUDA only; q8_0 blocks, half the KV memory; numerics differ slightly from
+    /// KV cache format (GPU): f16, or q8 (q8_0 blocks, half the KV memory; numerics differ slightly from
     /// llama.cpp's default f16 cache).
     #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
     kv: String,
@@ -117,7 +117,7 @@ impl Engine {
     /// Fills settings not given on the command line from the model's calibration file, else built-in defaults.
     fn runner<'a>(&mut self, m: &'a Model<'a>, model: &Path) -> anyhow::Result<Runner<'a>> {
         if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
-        if self.kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new
+        if self.kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
         let bk = if self.gpu { Some(backend::open(self.backend.as_deref(), self.device)?) } else { None };
         let path = calibration_path(model, bk.as_ref().map_or("cuda", |b| b.name()));
         let v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
@@ -128,7 +128,6 @@ impl Engine {
         self.short = get("short").unwrap_or(32);
         if let Some(n) = self.threads.or(get("threads")) { rayon::ThreadPoolBuilder::new().num_threads(n).build_global()?; }
         let Some(bk) = bk else { return Ok(Runner::Cpu(m, State::new(&m.cfg))) };
-        if self.kv == "q8" && bk.name() != "cuda" { eprintln!("--kv q8: the {} backend keeps an f16 KV cache, using f16", bk.name()); }
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
         let mut g = GpuModel::load(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp()).context(LOAD_HINT)?;
         g.short = self.short;
