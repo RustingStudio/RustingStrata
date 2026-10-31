@@ -1416,7 +1416,10 @@ __device__ void attn_decode_llama(const float* q, const u16* kc, const u16* vc, 
 // scores, warp h runs the online softmax of head h over the chunk, then warps add the weighted V rows. All warps
 // share one running max per head, so their partials just add up. The block writes per head its unnormalized partial
 // [acc (hd) | max | sum] to part; attn_merge combines the splits.
-template <int PER, int G>
+// CP (f16 cache, the GQA entry point): each lane cp.asyncs its own slice of the next chunks into shared memory while
+// the block works on this one (ST chunks in flight). Only the lane that copies a slice reads it, so the copies need
+// no barriers of their own.
+template <int PER, int G, bool CP = false>
 __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
                               int nh, int nkv, float scale, int bx) {
     constexpr int hd = PER * 32, C = 32, J = C / 8;  // positions per chunk, per warp
@@ -1432,7 +1435,9 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
                 part[((size_t)(bx * G + i) * ns + blockIdx.y) * (hd + 2) + d] = d == hd ? -INFINITY : 0.0f;
         return;
     }
-    extern __shared__ float sq[];  // G * hd query values, then nw * hd warp partials
+    extern __shared__ float sq[];  // G * hd query values, then nw * hd warp partials; with CP the K/V chunks at 8 * hd
+    constexpr int ST = hd <= 256 ? 2 : 1;
+    u16* kb = (u16*)(sq + 8 * hd);  // [ST][K, V][C][hd]
     __shared__ float ss[G][C], sc[G], sm[G], sl[G];
     int h0 = bx * G, g = h0 / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
     for (int i = threadIdx.x; i < G * hd; i += blockDim.x) sq[i] = q[h0 * hd + i];
@@ -1440,15 +1445,40 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
 #pragma unroll
     for (int i = 0; i < G; i++)
         for (int d = 0; d < PER; d++) acc[i][d] = 0.0f;
+    // Positions past p1 copy or load the row p1 - 1 and keep zeros: a select, not a branch around the loads.
+    auto cp = [&](int c0, int b) {
+        if (c0 < p1)
+#pragma unroll
+            for (int j = 0; j < J; j++) {
+                size_t r = ((size_t)min(c0 + w * J + j, p1 - 1) * nkv + g) * hd + lane * PER;
+                u16 *dk = kb + ((b * 2) * C + w * J + j) * hd + lane * PER, *dv = dk + C * hd;
+                if constexpr (PER >= 8) {
+                    for (int c = 0; c < PER / 8; c++) { cp_async16(dk + 8 * c, kc + r + 8 * c, true); cp_async16(dv + 8 * c, vc + r + 8 * c, true); }
+                } else { cp_async8(dk, kc + r, true); cp_async8(dv, vc + r, true); }
+            }
+        cp_async_commit();
+    };
+    if constexpr (CP) {
+        cp(p0, 0);
+        if (ST == 2) cp(p0 + C, 1);
+    }
     __syncthreads();
-    for (int c0 = p0; c0 < p1; c0 += C) {
+    for (int c0 = p0, it = 0; c0 < p1; c0 += C, it++) {
         unsigned kr[J][PER / 2], vr[J][PER / 2];
+        if constexpr (CP) {
+            cp_async_wait<ST - 1>();
+            asm volatile("" ::: "memory");  // the reads below stay after the wait
+        }
 #pragma unroll
         for (int j = 0; j < J; j++) {
-            // Positions past p1 load the row p1 - 1 and keep zeros: a select, not a branch around the loads.
             int t = c0 + w * J + j;
-            size_t r = ((size_t)min(t, p1 - 1) * nkv + g) * hd + lane * PER;
-            ldkv<PER>(kc, r, hd, kr[j]); ldkv<PER>(vc, r, hd, vr[j]);
+            if constexpr (CP) {
+                const u16* sk = kb + (((it % ST) * 2) * C + w * J + j) * hd + lane * PER;
+                ldh_raw<PER>(sk, kr[j]); ldh_raw<PER>(sk + C * hd, vr[j]);
+            } else {
+                size_t r = ((size_t)min(t, p1 - 1) * nkv + g) * hd + lane * PER;
+                ldkv<PER>(kc, r, hd, kr[j]); ldkv<PER>(vc, r, hd, vr[j]);
+            }
             for (int d = 0; d < PER / 2; d++) if (t >= p1) kr[j][d] = vr[j][d] = 0;
         }
         float kf[J][PER], p[J * G];
@@ -1493,6 +1523,7 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
                 for (int d = 0; d < PER; d++) acc[i][d] += e * hraw(vr[j], d);
             }
         __syncthreads();
+        if constexpr (CP) cp(c0 + ST * C, it % ST);
     }
     if (w < G && lane == 0) { sm[w] = m; sl[w] = l; }
     float* sacc = sq;  // the queries are no longer needed (the loop ends on a barrier)
@@ -1522,6 +1553,7 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
                  float scale, int gq_min, int pz, int nt
 #define ATT_TOK int t = blockIdx.x % nt; q += (size_t)t * nh * hd; part += (size_t)t * pz; step += 2 * t;
 #define ATT_RUN(G) attn_decode_t<PER, G>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt)
+#define ATT_RUN_CP(G) attn_decode_t<PER, G, !KV_Q8 && PER >= 4>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt)
 #define DEF_ATT(HD)                                                                                          \
     extern "C" __global__ void attn_decode_##HD(ATT_ARGS) {                                                  \
         constexpr int PER = HD / 32; ATT_TOK                                                                 \
@@ -1531,10 +1563,10 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
         constexpr int PER = HD / 32; ATT_TOK                                                                 \
         if (step[0] + 1 < gq_min) return;                                                                    \
         switch (nh * nt / gridDim.x) {                                                                       \
-            case 1: ATT_RUN(1); break;                                                                       \
-            case 2: ATT_RUN(2); break;                                                                       \
-            case 4: if constexpr (PER <= 16) ATT_RUN(4); break;                                              \
-            case 8: if constexpr (PER <= 8) ATT_RUN(8); break;                                               \
+            case 1: ATT_RUN_CP(1); break;                                                                    \
+            case 2: ATT_RUN_CP(2); break;                                                                    \
+            case 4: if constexpr (PER <= 16) ATT_RUN_CP(4); break;                                           \
+            case 8: if constexpr (PER <= 8) ATT_RUN_CP(8); break;                                            \
         }                                                                                                    \
     }
 DEF_ATT(64) DEF_ATT(128) DEF_ATT(256) DEF_ATT(512)
