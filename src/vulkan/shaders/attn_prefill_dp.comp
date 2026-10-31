@@ -19,11 +19,11 @@ void main() {
     }
     for (uint k = 0; k <= last; k++) {
         float s = 0.0;
-        [[unroll]] for (uint j = 0; j < PER; j++) s += q[j] * float(uint16BitsToHalf(p.kc.v[k * kvd + kvo + 32 * j]));
+        [[unroll]] for (uint j = 0; j < PER; j++) s += q[j] * ldkv(p.kc, k * kvd + kvo + 32 * j, HD);
         s = subgroupAdd(s);
         float mn = k == 0 ? s : max(m, s), c = expf_(m - mn), e = expf_(s - mn);
         l = k == 0 ? e : fma(l, c, e);
-        [[unroll]] for (uint j = 0; j < PER; j++) acc[j] = fma(e, float(uint16BitsToHalf(p.vc.v[k * kvd + kvo + 32 * j])), acc[j] * c);
+        [[unroll]] for (uint j = 0; j < PER; j++) acc[j] = fma(e, ldkv(p.vc, k * kvd + kvo + 32 * j, HD), acc[j] * c);
         m = mn;
     }
     [[unroll]] for (uint j = 0; j < PER; j++) {

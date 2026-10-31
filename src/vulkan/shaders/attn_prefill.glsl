@@ -72,8 +72,14 @@ void main() {
         [[unroll]] for (uint i = tid; i < BK * HD / 8; i += 128) {
             uint r = i / (HD / 8), c = i % (HD / 8), off = ((k0 + r) * kvd + kvh * HD) / 8 + c;
             bool in_ = k0 + r <= last;
-            kvs[r * PQ + c] = in_ ? UV4(uint64_t(p.kc)).v[off] : uvec4(0);
-            kvs[(BK + r) * PQ + c] = in_ ? UV4(uint64_t(p.vc)).v[off] : uvec4(0);
+            if (KV_Q8) {
+                uint o = off * 8;
+                kvs[r * PQ + c] = in_ ? uvec4(ldkv2(p.kc, o, HD), ldkv2(p.kc, o + 2, HD), ldkv2(p.kc, o + 4, HD), ldkv2(p.kc, o + 6, HD)) : uvec4(0);
+                kvs[(BK + r) * PQ + c] = in_ ? uvec4(ldkv2(p.vc, o, HD), ldkv2(p.vc, o + 2, HD), ldkv2(p.vc, o + 4, HD), ldkv2(p.vc, o + 6, HD)) : uvec4(0);
+            } else {
+                kvs[r * PQ + c] = in_ ? UV4(uint64_t(p.kc)).v[off] : uvec4(0);
+                kvs[(BK + r) * PQ + c] = in_ ? UV4(uint64_t(p.vc)).v[off] : uvec4(0);
+            }
         }
         barrier();
         ACC s0 = ACC(0.0), s1 = ACC(0.0);

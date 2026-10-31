@@ -54,8 +54,8 @@ void main() {
         barrier();
         uint e = (uint(p.step.v[0]) * p.per + r) * p.n;
         for (i = gl_LocalInvocationID.x; i < p.n; i += 256) {
-            p.kc.v[e + i] = uint16_t(f2h(p.o.v[oo + i]));
-            p.vc.v[e + i] = uint16_t(f2h(p.v.v[r * p.n + i]));
+            kv_put(p.kc, e + i, p.n, p.o.v[oo + i]);
+            kv_put(p.vc, e + i, p.n, p.v.v[r * p.n + i]);
         }
     }
 }

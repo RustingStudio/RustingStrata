@@ -124,6 +124,8 @@ struct Inner {
     amd_coherent: bool,
     /// Specialization constant 0 of kernels that quantize x: llama.cpp q8_K numerics (`--llama-numerics`).
     llama: u32,
+    /// Specialization constant 15 of every kernel: q8 KV cache rows (`--kv q8`, KV_Q8 in common.glsl).
+    kv_q8: bool,
     /// STRATA_VK_STATS: print the driver's statistics (registers, ...) of each pipeline as it is created.
     stats: bool,
     /// The one pipeline layout: a 128-byte push constant range (the Vulkan minimum), no descriptor sets.
@@ -248,6 +250,7 @@ fn features<'a>(f11: &'a mut vk::PhysicalDeviceVulkan11Features<'static>, f12: &
 impl Vk {
     /// The `device`-th usable GPU. Fails with "Vulkan init" (and the reasons) when there is none.
     pub fn new(device: usize) -> anyhow::Result<Vk> {
+        ensure!(!(crate::cuda::kv_q8() && crate::cuda::llama_numerics()), "--kv q8 does not combine with --llama-numerics (its attention reads f16 KV)");
         let entry = unsafe { ash::Entry::load() }.context("Vulkan init")?;
         let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
         let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None) }
@@ -319,7 +322,7 @@ impl Vk {
         let st = State { pool, spare: vec![], used: vec![], cur: None, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false,
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, coop, coop_i8, amd_coherent, llama: crate::cuda::llama_numerics() as u32, stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, coop, coop_i8, amd_coherent, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -442,8 +445,10 @@ impl Inner {
         let code = SPV.iter().find(|s| s.0 == name).with_context(|| format!("no Vulkan kernel {name}"))?.1;
         let words = ash::util::read_spv(&mut std::io::Cursor::new(code))?;
         let m = unsafe { self.dev.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None) }?;
-        let entries: Vec<_> = (0..spec.len() as u32).map(|i| vk::SpecializationMapEntry::default().constant_id(i).offset(4 * i).size(4)).collect();
-        let data: Vec<u8> = spec.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let n = spec.len() as u32;
+        let entries: Vec<_> = (0..n).map(|i| vk::SpecializationMapEntry::default().constant_id(i).offset(4 * i).size(4))
+            .chain([vk::SpecializationMapEntry::default().constant_id(15).offset(4 * n).size(4)]).collect();
+        let data: Vec<u8> = spec.iter().chain([&(self.kv_q8 as u32)]).flat_map(|v| v.to_le_bytes()).collect();
         let si = vk::SpecializationInfo::default().map_entries(&entries).data(&data);
         let mut sub = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32);
         let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(m).name(c"main")
@@ -719,7 +724,7 @@ impl Backend for Vk {
         let (b, p) = self.buf(4 * words.max(1), if self.0.amd_coherent { BAR_AMD } else { BAR })?;
         Ok((b, p.cast()))
     }
-    fn kv_words(&self, n: usize) -> usize { n }
+    fn kv_words(&self, n: usize) -> usize { if self.0.kv_q8 { n * 17 / 32 } else { n } }
 
     fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
         self.gemm_raw(ty, rows, cols, tiles, n_tiles, 0, 0, x, x_stride, n_x, xrow, y, y_stride, act)
@@ -846,7 +851,9 @@ impl Backend for Vk {
         Ok(xq)
     }
     fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()> {
-        self.run("kv_store", &[], [(n * t).div_ceil(256), 1, 1], &[&k, &v, &kc, &vc, &step, &(n as u32), &((n * t) as u32)])
+        // q8: each subgroup quantizes one 32-value block of one row.
+        ensure!(!self.0.kv_q8 || (hd % 32 == 0 && n % hd == 0), "q8 KV cache: head_dim {hd} is not a multiple of 32");
+        self.run("kv_store", &[], [(n * t).div_ceil(256), 1, 1], &[&k, &v, &kc, &vc, &step, &(n as u32), &((n * t) as u32), &(hd as u32)])
     }
     fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize) -> anyhow::Result<()> {
         self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, 0)

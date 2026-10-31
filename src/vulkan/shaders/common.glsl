@@ -93,6 +93,32 @@ uint pack4(int a, int b, int c, int d) { return uint(a & 255) | uint(b & 255) <<
 // llama.cpp q8_K numerics (--llama-numerics) for kernels that quantize x.
 layout(constant_id = 0) const bool LLAMA_Q8 = false;
 
+// KV cache rows (one per position and KV head) hold hd f16 values, or with KV_Q8 (`--kv q8`, set on every pipeline) hd
+// int8 values followed by hd / 32 f16 scales, as KV_Q8 in kernels.cu. Offsets below count values.
+layout(constant_id = 15) const bool KV_Q8 = false;
+// Store x at value offset e; with KV_Q8 the 32 lanes of the subgroup hold one 32-value block.
+void kv_put(U16 c, uint e, uint hd, float x) {
+    if (!KV_Q8) { c.v[e] = uint16_t(f2h(x)); return; }
+    float d = fdiv(warp_max(abs(x)), 127.0), y = d == 0.0 ? 0.0 : fdiv(x, d), q = trunc(y);
+    if (abs(y - q) >= 0.5) q += sign(y);  // roundf: halves away from zero
+    uint w = e % hd, r = e / hd * (hd + hd / 16);
+    U8(uint64_t(c)).v[r + w] = uint8_t(int(q) & 255);
+    if (w % 32 == 0) c.v[(r + hd) / 2 + w / 32] = uint16_t(f2h(d));
+}
+// The cache value at offset off. q8: q * d rounded once to f16 (the product is exact in f32), as ldkv in kernels.cu.
+float ldkv(U16 c, uint off, uint hd) {
+    if (!KV_Q8) return float(uint16BitsToHalf(c.v[off]));
+    uint w = off % hd, r = off / hd * (hd + hd / 16);
+    float d = unpackHalf2x16(uint(c.v[(r + hd) / 2 + w / 32])).x;
+    return rh(float(int(uint(U8(uint64_t(c)).v[r + w]) << 24) >> 24) * d);
+}
+// q8 values off and off + 1 (off even) as one f16 pair word, from one 2-byte load and one scale.
+uint ldkv2(U16 c, uint off, uint hd) {
+    uint w = off % hd, r = off / hd * (hd + hd / 16), b = uint(c.v[(r + w) / 2]);
+    float d = unpackHalf2x16(uint(c.v[(r + hd) / 2 + w / 32])).x;
+    return packHalf2x16(vec2(rh(float(int(b << 24) >> 24) * d), rh(float(int(b << 16) >> 24) * d)));
+}
+
 // sin and cos of theta = pos * ts^i (ts = base^(-2 / n_rot) from the host) in f64, as the CPU and CUDA take them
 // (GLSL has no f64 pow, sin or cos).
 void rope_cs(double pos, double ts, uint i, out float sn, out float cs) {
