@@ -26,11 +26,19 @@ static SIGNS: [[i8; 8]; 128] = {
 
 pub fn quantize_q8k(x: &[f32]) -> Vec<Q8K> {
     x.chunks_exact(256).map(|b| {
-        let max = b.iter().fold(0f32, |m, &v| if v.abs() > m.abs() { v } else { m });
-        if max == 0.0 { return Q8K { d: 0.0, qs: [0; 256], bs: [0; 16] }; }
+        // The first value of largest magnitude (a max over |v| first, which vectorizes).
+        let amax = b.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        if amax == 0.0 { return Q8K { d: 0.0, qs: [0; 256], bs: [0; 16] }; }
+        let max = *b.iter().find(|v| v.abs() == amax).unwrap();
         let is = -127.0 / max;
-        let qs: [i8; 256] = std::array::from_fn(|j| ((is * b[j]).round_ties_even() as i32).min(127) as i8);
-        Q8K { d: 1.0 / is, qs, bs: std::array::from_fn(|j| qs[16 * j..16 * j + 16].iter().map(|&v| v as i16).sum()) }
+        let mut qs = [0i8; 256];
+        #[cfg(target_feature = "avx2")]
+        avx2::quant_block(is, b, &mut qs);
+        #[cfg(not(target_feature = "avx2"))]
+        for (q, &v) in qs.iter_mut().zip(b) { *q = ((is * v).round_ties_even() as i32).min(127) as i8; }
+        let mut bs = [0i16; 16];
+        for (s, c) in bs.iter_mut().zip(qs.chunks_exact(16)) { *s = c.iter().map(|&v| v as i16).sum(); }
+        Q8K { d: 1.0 / is, qs, bs }
     }).collect()
 }
 
@@ -277,6 +285,16 @@ mod avx2 {
         let s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
         let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
         _mm_cvtss_f32(_mm_add_ss(s, _mm_movehdup_ps(s)))
+    } }
+    /// qs = round(is * b), as the scalar path (|is * b| <= 127, so the saturating packs equal its min(127)).
+    pub fn quant_block(is: f32, b: &[f32], qs: &mut [i8; 256]) { unsafe {
+        let s = _mm256_set1_ps(is);
+        let q = |i: usize| _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(s, _mm256_loadu_ps(b[i..i + 8].as_ptr())), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        let perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        for j in (0..256).step_by(32) {
+            let p = _mm256_packs_epi16(_mm256_packs_epi32(q(j), q(j + 8)), _mm256_packs_epi32(q(j + 16), q(j + 24)));
+            _mm256_storeu_si256(qs[j..j + 32].as_mut_ptr() as *mut __m256i, _mm256_permutevar8x32_epi32(p, perm));
+        }
     } }
     #[inline(always)]
     fn sg(i: usize) -> i64 { unsafe { std::mem::transmute::<[i8; 8], i64>(SIGNS[i]) } }
