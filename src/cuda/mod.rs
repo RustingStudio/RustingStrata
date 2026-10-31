@@ -44,6 +44,8 @@ pub struct Gpu {
     /// Pinned staging for large `htod`, used as a ring: the copy returns before its DMA, so the host fills the next
     /// one while the GPU works (expert streaming in prefill). Head offset and the regions queued copies still read.
     ring: std::sync::Mutex<(PinnedHostSlice<u8>, usize, VecDeque<(usize, usize, CudaEvent)>)>,
+    /// Recorded by `wait`.
+    done: CudaEvent,
 }
 
 const RING: usize = 64 << 20;
@@ -188,7 +190,8 @@ impl Gpu {
         let q8 = std::sync::Mutex::new((stream.alloc_zeros::<u8>(1)?, None));
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_q8, am, graphs: Default::default(), ring })
+        let done = ctx.new_event(None)?;
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_q8, am, graphs: Default::default(), ring, done })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -301,6 +304,18 @@ impl Gpu {
         launch!(self, "attn_merge", LaunchConfig { grid_dim: (nh as u32, 1, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, part, qg, out, hd as i32, ATT_SPLITS as i32, step, ATT_SPLITS_1 as i32, gq_min, xq);
         Ok(())
     }
+
+    /// Stream sync that polls an event with long pauses between queries. The driver's own sync (and the sync inside
+    /// a copy to pageable memory) queries in a tight loop, which slows the CPU expert threads (+2% decode with many
+    /// expert misses, 35B on a 7600X; blocking gains 4% but adds its wake-up latency to every token and prefill layer).
+    fn wait(&self) -> anyhow::Result<()> {
+        self.ctx.bind_to_thread()?;
+        self.done.record(&self.stream)?;
+        while !self.done.try_is_complete()? {
+            for _ in 0..256 { std::hint::spin_loop(); }
+        }
+        Ok(())
+    }
 }
 
 impl Backend for Gpu {
@@ -341,6 +356,8 @@ impl Backend for Gpu {
     fn dtoh(&self, src: &Buf, off: usize, dst: &mut [u8]) -> anyhow::Result<()> {
         anyhow::ensure!(off + dst.len() <= src.len(), "dtoh: {} bytes at {off} from {}", dst.len(), src.len());
         self.ctx.bind_to_thread()?;
+        // A copy into pageable memory waits for the stream inside the call, spinning; wait for the work first.
+        self.wait()?;
         unsafe { result::memcpy_dtoh_async(dst, src.addr() + off as u64, self.stream.cu_stream()) }?;
         Ok(self.stream.synchronize()?)
     }
@@ -358,7 +375,7 @@ impl Backend for Gpu {
 
     fn mem_info(&self) -> anyhow::Result<(usize, usize)> { Ok(self.ctx.mem_get_info()?) }
 
-    fn sync(&self) -> anyhow::Result<()> { Ok(self.stream.synchronize()?) }
+    fn sync(&self) -> anyhow::Result<()> { self.wait() }
 
     // Every op batched on CUDA is one launch, so alternating launches never splits an op over the two streams. Copies
     // do not count: they all go to the side stream.
