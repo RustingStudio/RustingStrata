@@ -31,6 +31,12 @@ fn parses_synthetic_file() {
     std::fs::write(&p, &b).unwrap();
     let g = Gguf::open(&p).unwrap();
     std::fs::remove_file(&p).ok();
+    // Cut 4 bytes off the tensor data: a clean error, not a panic in `bytes`. A new path, since `g` maps the file.
+    let cut = p.with_extension("cut.gguf");
+    std::fs::write(&cut, &b[..b.len() - 4]).unwrap();
+    let e = Gguf::open(&cut).err().unwrap();
+    std::fs::remove_file(&cut).ok();
+    assert!(format!("{e}").contains("GGUF truncated (tensor t "), "{e}");
     assert_eq!(g.get("general.architecture").unwrap().as_str(), Some("qwen35moe"));
     assert_eq!(g.get("qwen35moe.block_count").unwrap().as_u64(), Some(41));
     let t = &g.tensors["t"];
