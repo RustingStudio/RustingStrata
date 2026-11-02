@@ -122,6 +122,8 @@ struct Inner {
     coop_i8: bool,
     /// VK_AMD_device_coherent_memory is enabled (the mailbox uses `BAR_AMD`).
     amd_coherent: bool,
+    /// An AMD GPU without it: the CPU expert mailbox cannot work (the GPU caches it), so a timeout names the fix.
+    amd_plain: bool,
     /// Specialization constant 0 of kernels that quantize x: llama.cpp q8_K numerics (`--llama-numerics`).
     llama: u32,
     /// Specialization constant 15 of every kernel: q8 KV cache rows (`--kv q8`, KV_Q8 in common.glsl).
@@ -291,6 +293,7 @@ impl Vk {
             fdc.device_coherent_memory == vk::TRUE
         };
         if amd_coherent { exts.push(ash::amd::device_coherent_memory::NAME.as_ptr()) }
+        let amd_plain = !amd_coherent && unsafe { instance.get_physical_device_properties(pd) }.vendor_id == 0x1002;
         let stats = std::env::var_os("STRATA_VK_STATS").is_some() && has(ash::khr::pipeline_executable_properties::NAME);
         if stats { exts.push(ash::khr::pipeline_executable_properties::NAME.as_ptr()) }
         let mut fstats = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default().pipeline_executable_info(true);
@@ -322,7 +325,7 @@ impl Vk {
         let st = State { pool, spare: vec![], used: vec![], cur: None, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false,
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, coop, coop_i8, amd_coherent, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, coop, coop_i8, amd_coherent, amd_plain, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -427,6 +430,9 @@ impl Inner {
             let e = st.err.2 as *mut u32;
             if !e.is_null() && unsafe { e.read_volatile() } != 0 {
                 unsafe { e.write_volatile(0) };
+                anyhow::ensure!(!self.amd_plain, "moe_combine: the CPU expert worker did not answer within about 2 s. This AMD GPU \
+                    has no VK_AMD_device_coherent_memory, which the CPU expert path needs; RADV hides it on RDNA4 \
+                    (RX 9000) unless you set radv_device_coherent_memory=true in the environment");
                 anyhow::bail!("moe_combine: the CPU expert worker did not answer within about 2 s");
             }
         }

@@ -220,6 +220,9 @@ enum Cmd {
         backend: Option<String>,
         #[arg(long, default_value_t = 0)]
         device: usize,
+        /// KV cache format to calibrate with (q8 leaves more VRAM for experts), as `--kv` of the runs that use it.
+        #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
+        kv: String,
     },
     /// Speed test: for each prompt length, prefill that many tokens of prose, then greedily decode `tg` more at that
     /// depth. Prints prefill and decode tok/s as mean (min-max) over `reps` runs. `--ctx` grows to fit.
@@ -345,7 +348,10 @@ fn main() -> anyhow::Result<()> {
             }
             r.finish()?;
         }
-        Cmd::Calibrate { model, ctx, vram_margin, backend, device } => calibrate(&model, ctx, vram_margin << 20, backend.as_deref(), device)?,
+        Cmd::Calibrate { model, ctx, vram_margin, backend, device, kv } => {
+            if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
+            calibrate(&model, ctx, vram_margin << 20, backend.as_deref(), device)?
+        }
         Cmd::Chat { model, system, n, think, mut engine } => {
             let g = Gguf::open(&model)?;
             let m = Model::load(&g)?;
@@ -504,7 +510,7 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
     // `start`: the first token whose text is not emitted yet (the text before it ends on a whole character).
     let (mut out, mut start, mut row, mut ahead) = (Vec::new(), 0, 0, None);
     while out.len() < n {
-        let next = match ahead.take() { Some(t) => t, None => smp.pick(&logits) as u32 };
+        let next = match ahead.take() { Some(t) => t, None => smp.pick(&logits)? as u32 };
         if eos.contains(&next) { return Ok((out, true)); }
         let toks = match r {
             Runner::Gpu(g) if mtp => {

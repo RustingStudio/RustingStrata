@@ -177,7 +177,7 @@ impl<'a> GpuModel<'a> {
         let mb = |b: usize| b as f64 / 1048576.0;
         eprintln!(
             "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {ctx} tokens, prefill {:.0} MB), expert slots {:.0} MB, resident experts {}/{}",
-            mb(free0 - free1), mb(2 * 2 * gpu.kv_words(ctx * kv) * c.layers.iter().filter(|&&k| k == LayerKind::Attn).count()), mb(pf.as_ref().map_or(0, |p| p.bytes())),
+            mb(free0.saturating_sub(free1)), mb(2 * 2 * gpu.kv_words(ctx * kv) * c.layers.iter().filter(|&&k| k == LayerKind::Attn).count()), mb(pf.as_ref().map_or(0, |p| p.bytes())),
             mb(cache.as_ref().map_or(0, |x| x.slot_bytes_total())),
             cache.as_ref().map_or(0, |x| x.resident_count()), cache.as_ref().map_or(0, |x| x.total_experts()),
         );
@@ -365,7 +365,7 @@ impl<'a> GpuModel<'a> {
     /// which runs them with `t` in one batch (their main model rows 0..n precede `t`'s row n).
     pub fn spec_step(&mut self, t: u32, row: usize, smp: &mut Sampler) -> anyhow::Result<(Vec<u32>, u32, usize)> {
         let k = self.k;
-        if self.pos + k + 1 > self.ctx { return Ok((vec![t], smp.pick(&self.step(t)?) as u32, 0)); }
+        if self.pos + k + 1 > self.ctx { return Ok((vec![t], smp.pick(&self.step(t)?)? as u32, 0)); }
         let h = self.mtp.as_mut().unwrap();
         let mut first = std::mem::take(&mut h.pend);
         if first.len() != row { first.clear(); }
@@ -386,8 +386,8 @@ impl<'a> GpuModel<'a> {
             let l = self.verify(&toks)?;
             let mut n = 0;
             loop {
-                if n == k { break (n, smp.pick(&l[n]) as u32); }
-                match smp.accept(&l[n], toks[n + 1] as usize) { None => n += 1, Some(x) => break (n, x as u32) }
+                if n == k { break (n, smp.pick(&l[n])? as u32); }
+                match smp.accept(&l[n], toks[n + 1] as usize)? { None => n += 1, Some(x) => break (n, x as u32) }
             }
         };
         self.drafts.0 += k;

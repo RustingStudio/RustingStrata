@@ -47,6 +47,8 @@ pub fn argmax(x: &[f32]) -> usize {
     (1..x.len()).fold(0, |b, i| if x[i].total_cmp(&x[b]).is_gt() { i } else { b })
 }
 
+const NON_FINITE: &str = "the forward pass produced NaN or infinite logits";
+
 /// Token choice after the logits: greedy when `temp` is 0, else softmax(logits / temp) cut to the `top_k` most likely
 /// tokens (0 = no cut) and then to the smallest set whose probability reaches `top_p`.
 #[derive(Clone, Debug)]
@@ -61,19 +63,24 @@ pub struct Sampler {
 impl Sampler {
     pub fn greedy() -> Self { Sampler { temp: 0.0, top_k: 0, top_p: 1.0, rng: 1 } }
 
-    pub fn pick(&mut self, logits: &[f32]) -> usize {
-        if self.temp <= 0.0 { return argmax(logits); }
+    pub fn pick(&mut self, logits: &[f32]) -> anyhow::Result<usize> {
+        if self.temp <= 0.0 {
+            let i = argmax(logits);
+            anyhow::ensure!(logits[i].is_finite(), NON_FINITE);
+            return Ok(i);
+        }
         let c = self.cands(logits);
         self.draw(&c)
     }
 
     /// Speculative sampling with a fixed draft `d`: keeps `d` (None) with its probability under this sampler, else
     /// returns a token drawn from the others, renormalized. The result has the distribution of `pick`. `temp` > 0.
-    pub fn accept(&mut self, logits: &[f32], d: usize) -> Option<usize> {
+    pub fn accept(&mut self, logits: &[f32], d: usize) -> anyhow::Result<Option<usize>> {
         let c = self.cands(logits);
+        anyhow::ensure!(!c.is_empty(), NON_FINITE);
         let q = c.iter().find(|x| x.0 == d).map_or(0.0, |x| x.1);
-        if self.rand() * c.iter().map(|x| x.1).sum::<f32>() < q { return None; }
-        Some(self.draw(&c.into_iter().filter(|x| x.0 != d).collect::<Vec<_>>()))
+        if self.rand() * c.iter().map(|x| x.1).sum::<f32>() < q { return Ok(None); }
+        Ok(Some(self.draw(&c.into_iter().filter(|x| x.0 != d).collect::<Vec<_>>())?))
     }
 
     /// The tokens `pick` draws from, with their weights (exp of the scaled logit, not normalized), most likely first.
@@ -101,13 +108,15 @@ impl Sampler {
     }
 
     /// A token drawn from `c` in proportion to the weights.
-    fn draw(&mut self, c: &[(usize, f32)]) -> usize {
+    fn draw(&mut self, c: &[(usize, f32)]) -> anyhow::Result<usize> {
+        // Empty only when no logit is finite (`cands` drops NaN and infinity).
+        anyhow::ensure!(!c.is_empty(), NON_FINITE);
         let mut r = self.rand() * c.iter().map(|x| x.1).sum::<f32>();
         for &(i, p) in c {
             r -= p;
-            if r < 0.0 { return i; }
+            if r < 0.0 { return Ok(i); }
         }
-        c[c.len() - 1].0
+        Ok(c[c.len() - 1].0)
     }
 
     /// Uniform in [0, 1).
