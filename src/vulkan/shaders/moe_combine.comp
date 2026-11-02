@@ -21,7 +21,9 @@ void main() {
             // An acquire load under the Vulkan memory model: a plain volatile load (or an atomic add) keeps reading a
             // cached copy and never sees the host's write.
             while (atomicLoad(p.mb.v[16], gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquire | gl_SemanticsMakeVisible) != seq)
-                if (++spins == SPINS) { p.err.v[0] = 1; break; }
+                // After one wait timed out, later layers of the submission give up within 2^16 spins: waiting
+                // about 2 s each would outlast the driver's job timeout (amdgpu resets the GPU after 10 s).
+                if (++spins == SPINS || ((spins & 0xffffu) == 0 && p.err.v[0] != 0)) { p.err.v[0] = 1; break; }
         }
         miss = m;
     }
