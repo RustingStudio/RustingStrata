@@ -42,18 +42,21 @@ fn softmax_sums_to_one() {
 #[test]
 fn sampler_cuts_and_matches_softmax() {
     let l = [2.0f32.ln(), 1.0f32.ln(), 1.0f32.ln(), -50.0]; // probabilities 1/2, 1/4, 1/4, ~0
-    assert_eq!(Sampler::greedy().pick(&l), 0);
+    assert_eq!(Sampler::greedy().pick(&l).unwrap(), 0);
     let mut s = Sampler { temp: 1.0, top_k: 0, top_p: 1.0, rng: 7 };
     let mut n = [0usize; 4];
-    for _ in 0..20000 { n[s.pick(&l)] += 1; }
+    for _ in 0..20000 { n[s.pick(&l).unwrap()] += 1; }
     assert!(n[3] == 0 && (n[0] as f32 / 20000.0 - 0.5).abs() < 0.02 && (n[1] as f32 / 20000.0 - 0.25).abs() < 0.02, "{n:?}");
     let mut s = Sampler { temp: 1.0, top_k: 0, top_p: 0.5, rng: 7 };
-    assert!((0..100).all(|_| s.pick(&l) == 0));
+    assert!((0..100).all(|_| s.pick(&l).unwrap() == 0));
     let mut s = Sampler { temp: 1.0, top_k: 2, top_p: 1.0, rng: 7 };
-    assert!((0..100).all(|_| s.pick(&l) < 2));
+    assert!((0..100).all(|_| s.pick(&l).unwrap() < 2));
     // A temperature so small that m - 21 * temp rounds to m must still keep the best token.
     let mut s = Sampler { temp: 1e-9, top_k: 0, top_p: 1.0, rng: 7 };
-    assert_eq!(s.pick(&[1.0, 10.0, 3.0]), 1);
+    assert_eq!(s.pick(&[1.0, 10.0, 3.0]).unwrap(), 1);
+    // Logits with no finite value are an error, not a panic, sampled or greedy.
+    let bad = [f32::NAN, f32::INFINITY, f32::NAN];
+    assert!(s.pick(&bad).is_err() && s.accept(&bad, 0).is_err() && Sampler::greedy().pick(&bad).is_err());
 }
 #[test]
 fn sampler_accept_keeps_the_distribution() {
@@ -63,7 +66,7 @@ fn sampler_accept_keeps_the_distribution() {
     for d in [0, 1, 3] {
         let mut s = Sampler { temp: 1.0, top_k: 0, top_p: 1.0, rng: 7 };
         let mut n = [0usize; 4];
-        for _ in 0..40000 { n[s.accept(&l, d).unwrap_or(d)] += 1; }
+        for _ in 0..40000 { n[s.accept(&l, d).unwrap().unwrap_or(d)] += 1; }
         let f = |i: usize| n[i] as f32 / 40000.0;
         assert!(n[3] == 0 && (f(0) - 0.5).abs() < 0.015 && (f(1) - 0.25).abs() < 0.015, "d {d}: {n:?}");
     }
