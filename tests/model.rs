@@ -41,3 +41,35 @@ fn mtp_draft_acceptance() {
     eprintln!("MTP acceptance {n_ok}/{} on {:?}", hits.len(), tok.decode(&ids[n_prompt..]).unwrap());
     assert!(n_ok * 10 >= hits.len() * 6, "MTP acceptance {n_ok}/{}", hits.len());
 }
+
+const QWEN4EXP: &str = "/mnt/ollama/qwen4exp/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf";
+
+/// PLE n-gram hash against original Strata's oracle (src/kernels/ple_oracle_vectors.inc, case 0 "window
+/// direction": each token with its own synthetic predecessors, oldest first).
+#[test]
+fn qwen4exp_ple_rows() {
+    let p = std::path::Path::new(QWEN4EXP);
+    if !p.exists() { return }
+    let g = Gguf::open(p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let mut st = State::new(&m.cfg);
+    let case = [(11, [-1, -1]), (22, [11, -1]), (33, [22, 11]), (44, [33, 22])];
+    let rows: Vec<u64> = case.iter().flat_map(|&(t, [old, new])| { st.ple_prev = [new, old]; m.ple_rows(&mut st, t) }).collect();
+    assert_eq!(&rows[..16], &[13555483, 24877159, 54278900, 63631058, 98394898, 117447587, 136774765, 157274238,
+        173487882, 192109366, 213364329, 236577563, 258758149, 262164274, 283572184, 312653920]);
+    assert_eq!(&rows[48..], &[12721672, 27113445, 44309803, 60385209, 97021817, 115900810, 134219364, 151977589,
+        161183764, 181257609, 201344488, 221596875, 241635416, 261674107, 281687144, 301751935]);
+}
+
+#[test]
+fn qwen4exp_greedy_paris() {
+    let p = std::path::Path::new(QWEN4EXP);
+    if !p.exists() { return }
+    let g = Gguf::open(p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let mut st = State::new(&m.cfg);
+    let mut logits = vec![];
+    for t in tok.encode("The capital of France is").unwrap() { logits = m.step(&mut st, t); }
+    assert_eq!(tok.decode(&[ops::argmax(&logits) as u32]).unwrap().trim(), "Paris");
+}
