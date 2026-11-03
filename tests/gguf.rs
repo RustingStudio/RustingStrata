@@ -151,3 +151,57 @@ fn rejects_bad_ssm_dims() {
     let bad = qwen3next_syn("ssm-ba", &kv(2), &[emb, ("blk.0.ssm_ba.weight", [8, 6])]);
     assert!(Weights::new(&bad).is_err());
 }
+
+/// One shard: `split.count` (u16) = 2 and one 4-float F32 tensor `name` holding `v`.
+fn shard(name: &str, v: f32) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend(b"GGUF");
+    b.extend(3u32.to_le_bytes());
+    b.extend(1u64.to_le_bytes());
+    b.extend(1u64.to_le_bytes());
+    w_str(&mut b, "split.count");
+    b.extend(2u32.to_le_bytes());
+    b.extend(2u16.to_le_bytes());
+    w_str(&mut b, name);
+    b.extend(1u32.to_le_bytes());
+    b.extend(4u64.to_le_bytes());
+    b.extend(0u32.to_le_bytes());
+    b.extend(0u64.to_le_bytes());
+    while b.len() % 32 != 0 { b.push(0); }
+    for _ in 0..4 { b.extend(v.to_le_bytes()); }
+    b
+}
+
+#[test]
+fn opens_split_model() {
+    let d = std::env::temp_dir().join(format!("strata-{}-split", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    let (p1, p2) = (d.join("m-00001-of-00002.gguf"), d.join("m-00002-of-00002.gguf"));
+    std::fs::write(&p1, shard("a", 1.5)).unwrap();
+    std::fs::write(&p2, shard("b", 2.5)).unwrap();
+    let g = Gguf::open(&p1).unwrap();
+    let e = Gguf::open(&p2).err().unwrap();
+    std::fs::remove_file(&p1).ok();
+    std::fs::remove_file(&p2).ok();
+    std::fs::remove_dir(&d).ok();
+    assert!(format!("{e}").contains("open its first shard"), "{e}");
+    for (n, v) in [("a", 1.5f32), ("b", 2.5)] {
+        assert_eq!(f32::from_le_bytes(g.bytes(&g.tensors[n])[12..16].try_into().unwrap()), v, "{n}");
+    }
+}
+
+#[test]
+fn qwen4exp_config() {
+    let p = std::path::Path::new("/mnt/ollama/qwen4exp/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf");
+    if !p.exists() { return }
+    let g = Gguf::open(p).unwrap();
+    assert_eq!(g.tensors.len(), 1224); // both shards; shard 2 is the PLE table
+    assert!(g.tensors.contains_key("per_layer_token_embd.weight"));
+    let c = ModelConfig::from_gguf(&g).unwrap();
+    assert_eq!((c.n_layer, c.n_embd, c.n_head, c.n_head_kv, c.head_dim, c.n_rot), (48, 2560, 24, 2, 256, 64));
+    assert_eq!((c.n_expert, c.n_expert_used, c.n_ff_exp, c.n_ff_shexp), (512, 10, 640, 640));
+    assert_eq!((c.ssm_d_inner, c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank), (6144, 128, 16, 48));
+    assert_eq!((c.hc_n, c.hc_rank, c.n_embd_ple), (4, 320, 160));
+    assert!(c.layers.iter().enumerate().all(|(i, &k)| (k == LayerKind::Attn) == (i % 4 == 3)));
+    assert!(!c.k_interleave);
+}
