@@ -41,7 +41,14 @@ enum Ffn {
     Moe { router: GpuTensor, shared: Option<Shared> },
 }
 
-struct Layer { attn_norm: GpuTensor, post_norm: GpuTensor, mixer: Mixer, ffn: Ffn }
+/// qwen4exp hyper-connection read weights (`{p}norm/down/up/inject.weight`, see `Model::hc_read`).
+struct HcRead { norm: GpuTensor, down: GpuTensor, up: GpuTensor, inject: Option<GpuTensor> }
+
+/// qwen4exp PLE block weights (see `Model::ple`); `conv` as f32 [channel][tap].
+struct Ple { key: GpuTensor, value: GpuTensor, norm_key: GpuTensor, norm_query: GpuTensor, norm_conv: GpuTensor, conv: GpuTensor }
+
+/// `attn_norm` / `post_norm` for a plain residual; `hc` (attention and FFN reads) for hyper-connections.
+struct Layer { attn_norm: Option<GpuTensor>, post_norm: Option<GpuTensor>, hc: Option<[HcRead; 2]>, ple: Option<Ple>, mixer: Mixer, ffn: Ffn }
 
 /// MTP draft head: the `nextn` block (layer n_layer) with its own KV cache and CPU worker.
 struct MtpHead {
@@ -58,8 +65,15 @@ pub struct GpuModel<'a> {
     m: &'a Model<'a>,
     pub gpu: Box<dyn Backend>,
     layers: Vec<Layer>,
-    output_norm: GpuTensor,
+    output_norm: Option<GpuTensor>,
+    /// Hyper-connection read before the head (qwen4exp, in place of output_norm).
+    output_hc: Option<HcRead>,
     output: GpuTensor,
+    /// qwen4exp PLE: the normalized rows of the last 16 positions (see `ple_conv`), its copy at `save_state`, the two
+    /// previous tokens for the n-gram hash and their copy.
+    ple_ring: Option<(Buf, Buf)>,
+    ple_prev: [i64; 2],
+    saved_ple_prev: [i64; 2],
     /// Scratch activations by name.
     bufs: HashMap<&'static str, Buf>,
     x: Buf,
@@ -99,18 +113,28 @@ pub struct GpuModel<'a> {
 impl<'a> GpuModel<'a> {
     /// `chunk`: prefill batch in tokens (0 = no batched prefill). `mtp`: load the MTP draft head (needs `nextn`).
     pub fn load(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, k: usize) -> anyhow::Result<GpuModel<'a>> {
-        if let Some(t) = m.w.g.tensors.values().find(|t| GgmlType::from_u32(t.ty).is_ok_and(|ty| !ty.gpu(gpu.name()))) {
+        // The PLE conv (F16) is uploaded as f32, the PLE table stays on the CPU.
+        let cpu_only = |n: &str| n.ends_with("ple_conv1d.weight") || n == "per_layer_token_embd.weight";
+        if let Some(t) = m.w.g.tensors.values().find(|t| !cpu_only(&t.name) && GgmlType::from_u32(t.ty).is_ok_and(|ty| !ty.gpu(gpu.name()))) {
             anyhow::bail!("tensor {} has type {}, which the {} backend does not support yet", t.name, GgmlType::from_u32(t.ty)?.name(), gpu.name());
         }
         let c = &m.cfg;
         let up = |name: &str| -> anyhow::Result<GpuTensor> { gpu.upload(&m.w.get(name)?) };
         let lt = |il: usize, s: &str| up(&format!("blk.{il}.{s}"));
+        let hc_read = |p: &str| -> anyhow::Result<HcRead> {
+            let t = |s: &str| up(&format!("{p}{s}.weight"));
+            Ok(HcRead { norm: t("norm")?, down: t("down")?, up: t("up")?, inject: t("inject").ok() })
+        };
+        let hcn = c.hc_n.max(1);
+        if c.hc_n > 0 && !c.is_moe() { bail!("hyper-connections without MoE are not supported on the GPU"); }
         let (free0, _) = gpu.mem_info()?;
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
         let channels = c.ssm_d_inner + 2 * nk * dk;
         let kv = c.n_head_kv * c.head_dim;
 
-        let k = if c.n_nextn > 0 { k.min(TMAX - 1) } else { 0 };
+        // ponytail: no MTP or batched prefill with hyper-connections yet (their state and row layouts assume one stream).
+        let k = if c.n_nextn > 0 && c.hc_n == 0 { k.min(TMAX - 1) } else { 0 };
+        let chunk = if c.hc_n > 0 { 0 } else { chunk };
         let mtp = k > 0;
         let load_layer = |il: usize, kind: LayerKind| -> anyhow::Result<Layer> {
             let mixer = if kind == LayerKind::Delta {
@@ -139,7 +163,19 @@ impl<'a> GpuModel<'a> {
             } else {
                 Ffn::Dense { gate: lt(il, "ffn_gate.weight")?, up: lt(il, "ffn_up.weight")?, down: lt(il, "ffn_down.weight")? }
             };
-            Ok(Layer { attn_norm: lt(il, "attn_norm.weight")?, post_norm: lt(il, "post_attention_norm.weight")?, mixer, ffn })
+            let hc = if c.hc_n > 0 { Some([hc_read(&format!("blk.{il}.hc_attn_"))?, hc_read(&format!("blk.{il}.hc_ffn_"))?]) } else { None };
+            let ple = if m.w.layer(il, "ple_key.weight").is_ok() {
+                let kw = m.w.layer(il, "ple_conv1d.weight")?;
+                let conv = gpu.zeros::<f32>(kw.rows * kw.cols)?;
+                gpu.put(&kw.to_f32(), &conv, 0)?;
+                Some(Ple {
+                    key: lt(il, "ple_key.weight")?, value: lt(il, "ple_value.weight")?, norm_key: lt(il, "ple_norm_key.weight")?,
+                    norm_query: lt(il, "ple_norm_query.weight")?, norm_conv: lt(il, "ple_norm_conv.weight")?,
+                    conv: GpuTensor::new(GgmlType::F32, kw.rows, kw.cols, conv),
+                })
+            } else { None };
+            let (attn_norm, post_norm) = if hc.is_some() { (None, None) } else { (Some(lt(il, "attn_norm.weight")?), Some(lt(il, "post_attention_norm.weight")?)) };
+            Ok(Layer { attn_norm, post_norm, hc, ple, mixer, ffn })
         };
         let layers = c.layers.iter().enumerate().map(|(il, &kind)| load_layer(il, kind)).collect::<anyhow::Result<Vec<_>>>()?;
         let mtp_parts = if mtp {
@@ -148,12 +184,13 @@ impl<'a> GpuModel<'a> {
                   lt(il, "nextn.hnorm.weight")?, lt(il, "nextn.shared_head_norm.weight")?,
                   gpu.zeros::<i32>(2 * TMAX)?, gpu.zeros::<f32>(TMAX * c.n_embd)?, gpu.zeros::<f32>(TMAX * 2 * c.n_embd)?, gpu.zeros::<f32>(TMAX * c.n_embd)?))
         } else { None };
-        let output_norm = up("output_norm.weight")?;
+        let (output_norm, output_hc) = if c.hc_n > 0 { (None, Some(hc_read("output_hc_")?)) } else { (Some(up("output_norm.weight")?), None) };
+        let ple_ring = if c.n_embd_ple > 0 { Some((gpu.zeros::<f32>(16 * hcn * c.n_embd)?, gpu.zeros::<f32>(16 * hcn * c.n_embd)?)) } else { None };
         let output = up("output.weight").or_else(|_| up("token_embd.weight"))?;
 
         let ke = c.n_expert_used.max(1);
         let ff = (ke * c.n_ff_exp).max(c.n_ff);
-        let sizes: [(&'static str, usize); 30] = [
+        let mut sizes = vec![
             ("h", c.n_embd), ("hq", c.n_embd * 9 / 32), ("mix", c.n_embd), ("qkv", channels), ("z", c.ssm_d_inner), ("beta", nv), ("g", nv),
             ("y", channels), ("o", c.ssm_d_inner), ("qg", c.n_head * 2 * c.head_dim), ("q", c.n_head * c.head_dim),
             ("kraw", kv), ("k", kv), ("v", kv), ("att", c.n_head * c.head_dim), ("rl", c.n_expert), ("wts", ke),
@@ -162,8 +199,13 @@ impl<'a> GpuModel<'a> {
             ("ffq", ff * 9 / 32), ("shq", c.n_ff_shexp * 9 / 32), ("attq", c.n_head * c.head_dim * 9 / 32),
             ("oq", c.ssm_d_inner * 9 / 32),
         ];
+        if c.hc_n > 0 {
+            let d = c.hc_n * c.n_embd;
+            sizes.extend([("xn", d), ("lo", c.hc_rank), ("hg", d), ("inj", c.hc_n), ("mo", c.n_embd),
+                          ("pk", d), ("pq", d), ("pg", d), ("pn", d), ("pv", c.n_embd), ("emb", c.n_embd)]);
+        }
         let bufs = sizes.into_iter().map(|(name, n)| Ok((name, gpu.zeros::<f32>(TMAX * n)?))).collect::<anyhow::Result<HashMap<_, _>>>()?;
-        let (x, logits, ids) = (gpu.zeros::<f32>(TMAX * c.n_embd)?, gpu.zeros::<f32>(TMAX * c.n_vocab)?, gpu.zeros::<i32>(TMAX * ke)?);
+        let (x, logits, ids) = (gpu.zeros::<f32>(TMAX * hcn * c.n_embd)?, gpu.zeros::<f32>(TMAX * c.n_vocab)?, gpu.zeros::<i32>(TMAX * ke)?);
         let amax = gpu.zeros::<i32>(TMAX)?;
         let (slots, step_buf) = (gpu.zeros::<i32>(TMAX * ke)?, gpu.zeros::<i32>(2 * TMAX)?);
         let pf = if chunk > 0 { Some(prefill::Scratch::new(m, &*gpu, chunk.min(ctx))?) } else { None };
@@ -191,7 +233,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output, bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, drafts: (0, 0), k, short: 32, pf, mtp })
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, drafts: (0, 0), k, short: 32, pf, mtp })
     }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
@@ -205,6 +247,19 @@ impl<'a> GpuModel<'a> {
             }
         }
         self.pos = 0;
+        self.ple_prev = [-1, -1];
+        Ok(())
+    }
+
+    /// Put the embeddings of `tokens` into `x` (repeated per hyper-connection stream) and their PLE input into "emb".
+    fn put_embed(&mut self, tokens: &[u32]) -> anyhow::Result<()> {
+        let hc = self.m.cfg.hc_n.max(1);
+        let emb: Vec<f32> = tokens.iter().flat_map(|&t| self.m.embed(t).repeat(hc)).collect();
+        self.gpu.put(&emb, &self.x, 0)?;
+        if self.ple_ring.is_some() {
+            let pe: Vec<f32> = tokens.iter().flat_map(|&t| self.m.ple_embed(&mut self.ple_prev, t)).collect();
+            self.gpu.put(&pe, &self.bufs["emb"], 0)?;
+        }
         Ok(())
     }
 
@@ -212,9 +267,8 @@ impl<'a> GpuModel<'a> {
     pub fn step(&mut self, token: u32) -> anyhow::Result<Vec<f32>> {
         if self.pos >= self.ctx { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
         let seq = self.worker.as_mut().map_or(0, |w| w.begin());
-        let g = &self.gpu;
-        g.put(&self.m.embed(token), &self.x, 0)?;
-        g.put(&[self.pos as i32, seq as i32], &self.step_buf, 0)?;
+        self.put_embed(&[token])?;
+        self.gpu.put(&[self.pos as i32, seq as i32], &self.step_buf, 0)?;
         self.run(1)?;
         let logits = self.gpu.get::<f32>(&self.logits, 0, self.m.cfg.n_vocab)?;
         self.after_forward(1)?;
@@ -254,11 +308,9 @@ impl<'a> GpuModel<'a> {
         if !(1..=TMAX).contains(&nt) { bail!("verify: {nt} tokens (1 to {TMAX})"); }
         if self.pos + nt > self.ctx { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
         let seq = self.worker.as_mut().map_or(0, |w| w.begin());
-        let g = &self.gpu;
-        let emb: Vec<f32> = tokens.iter().flat_map(|&t| self.m.embed(t)).collect();
-        g.put(&emb, &self.x, 0)?;
+        self.put_embed(tokens)?;
         let steps: Vec<i32> = (0..nt).flat_map(|t| [(self.pos + t) as i32, seq as i32]).collect();
-        g.put(&steps, &self.step_buf, 0)?;
+        self.gpu.put(&steps, &self.step_buf, 0)?;
         self.run(nt)
     }
 
@@ -279,6 +331,8 @@ impl<'a> GpuModel<'a> {
             }
         }
         if let Some(h) = &self.mtp { g.dtod(&self.x, 0, &h.saved_x, 0, 4 * self.m.cfg.n_embd)?; }
+        if let Some((r, sr)) = &self.ple_ring { g.dtod(r, 0, sr, 0, r.len())?; }
+        self.saved_ple_prev = self.ple_prev;
         self.saved_pos = self.pos;
         self.saved_ids.clear();
         Ok(())
@@ -313,6 +367,8 @@ impl<'a> GpuModel<'a> {
             }
         }
         self.pos = self.saved_pos;
+        if let Some((r, sr)) = &self.ple_ring { g.dtod(sr, 0, r, 0, r.len())?; }
+        self.ple_prev = self.saved_ple_prev;
         // The draft head's entries before the saved position are still the ones its prompt fill wrote (see `mtp_synced`).
         if let Some(h) = self.mtp.as_mut() {
             g.dtod(&h.saved_x, 0, &self.x, 0, 4 * self.m.cfg.n_embd)?;
@@ -340,8 +396,53 @@ impl<'a> GpuModel<'a> {
         let x = self.x.addr();
         let mut res = 0;
         for (il, l) in self.layers.iter().enumerate() { res = self.layer(il, l, x, step, self.worker.as_ref(), nt, res, gq)?; }
-        g.rms_norm_q(x, ne, self.output_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"), res)?;
+        match (&self.output_norm, &self.output_hc) {
+            (Some(on), _) => g.rms_norm_q(x, ne, on.ptr, p("h"), ne, ne, nt, eps, p("hq"), res)?,
+            (None, Some(hr)) => self.hc_read(hr, x, nt)?,
+            _ => unreachable!(),
+        }
         g.gemvq(&self.output, p("h"), ne, p("hq"), self.logits.addr(), c.n_vocab, nt)
+    }
+
+    /// Per-stream RMSNorm of nt stacks (rows of hc * n_embd) at `x` with the hc * n_embd gamma `w` into `out`.
+    fn gnorm(&self, x: u64, w: u64, out: u64, nt: usize) -> anyhow::Result<()> {
+        let (ne, hc) = (self.m.cfg.n_embd, self.m.cfg.hc_n);
+        for s in 0..hc {
+            let o = 4 * (s * ne) as u64;
+            self.gpu.rms_norm(x + o, hc * ne, w + o, out + o, hc * ne, ne, nt, self.m.cfg.eps)?;
+        }
+        Ok(())
+    }
+
+    /// Hyper-connection read of the stacks at `r` (see `Model::hc_read`): the mixed vector into "h" (and "hq"), the
+    /// injection weights into "inj".
+    fn hc_read(&self, hr: &HcRead, r: u64, nt: usize) -> anyhow::Result<()> {
+        let (c, g) = (&self.m.cfg, &self.gpu);
+        let p = |n: &str| self.bufs[n].addr();
+        let (ne, hc, d) = (c.n_embd, c.hc_n, c.hc_n * c.n_embd);
+        self.gnorm(r, hr.norm.ptr, p("xn"), nt)?;
+        match &hr.inject {
+            Some(inj) => g.gemvq2(&hr.down, inj, p("xn"), d, 0, p("lo"), p("inj"), nt)?,
+            None => self.mv(&hr.down, p("xn"), d, p("lo"), c.hc_rank, nt)?,
+        }
+        g.hc_silu(p("lo"), 1.0 / hc as f32, nt * c.hc_rank)?;
+        self.mv(&hr.up, p("lo"), c.hc_rank, p("hg"), d, nt)?;
+        g.hc_mix(p("xn"), p("hg"), p("h"), ne, hc, nt)?;
+        g.quant_xq(p("h"), ne, ne, nt, p("hq"))
+    }
+
+    /// The PLE block (see `Model::ple`) on the stacks at `x`, PLE input in "emb".
+    fn ple(&self, pl: &Ple, x: u64, step: u64, nt: usize) -> anyhow::Result<()> {
+        let (c, g) = (&self.m.cfg, &self.gpu);
+        let p = |n: &str| self.bufs[n].addr();
+        let (ne, hc, d) = (c.n_embd, c.hc_n, c.hc_n * c.n_embd);
+        self.mv(&pl.key, p("emb"), ne, p("xn"), d, nt)?;
+        self.gnorm(p("xn"), pl.norm_key.ptr, p("pk"), nt)?;
+        self.gnorm(x, pl.norm_query.ptr, p("pq"), nt)?;
+        self.mv(&pl.value, p("emb"), ne, p("pv"), ne, nt)?;
+        g.ple_gate(p("pk"), p("pq"), p("pv"), p("pg"), ne, hc, nt)?;
+        self.gnorm(p("pg"), pl.norm_conv.ptr, p("pn"), nt)?;
+        g.ple_conv(x, p("pg"), p("pn"), pl.conv.ptr, self.ple_ring.as_ref().unwrap().0.addr(), step, d, nt)
     }
 
     /// y[t] = W x[t] for t < nt (strides in floats).
@@ -472,7 +573,12 @@ impl<'a> GpuModel<'a> {
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
         let kv = nkv * hd;
         {
-            g.rms_norm_q(x, ne, l.attn_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"), res)?;
+            if let Some(pl) = &l.ple { self.ple(pl, x, step, nt)?; }
+            match (&l.attn_norm, &l.hc) {
+                (Some(an), _) => g.rms_norm_q(x, ne, an.ptr, p("h"), ne, ne, nt, eps, p("hq"), res)?,
+                (None, Some(hc)) => self.hc_read(&hc[0], x, nt)?,
+                _ => unreachable!(),
+            }
             match &l.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, snap } => {
                     let (sc, ss, ns) = snap.as_ref().map_or((0, 0, 0), |(a, b)| (a.addr(), b.addr(), self.k));
@@ -489,7 +595,8 @@ impl<'a> GpuModel<'a> {
                     }
                     if nn == 0 { g.l2_norm(p("y"), dk, 2 * nk, channels, nt * 2 * nk, eps)?; }
                     g.deltanet(p("y"), s.addr(), p("beta"), p("g"), dt_bias.ptr, a.ptr, p("o"), nk, nv, c.k_interleave, dk, dv, 1.0 / (dk as f32).sqrt(), nt, channels, ss, ns)?;
-                    let oq = g.norm_gate_q(p("o"), norm.ptr, p("z"), dv, nt * nv, eps, p("oq"))?;
+                    let oq = if l.hc.is_some() { g.norm_gate_sig(p("o"), norm.ptr, p("z"), dv, nt * nv, eps, p("oq"))? }
+                             else { g.norm_gate_q(p("o"), norm.ptr, p("z"), dv, nt * nv, eps, p("oq"))? };
                     if oq != 0 { g.gemvq(out, p("o"), c.ssm_d_inner, oq, p("mix"), ne, nt)?; } else { mv(out, "o", c.ssm_d_inner, "mix", ne)?; }
                 }
                 Mixer::Attn { q, k, v, qn, kn, o, kc, vc } => {
@@ -502,7 +609,14 @@ impl<'a> GpuModel<'a> {
                     if aq != 0 { g.gemvq(o, p("att"), nh * hd, aq, p("mix"), ne, nt)?; } else { mv(o, "att", nh * hd, "mix", ne)?; }
                 }
             }
-            g.rms_norm_q(x, ne, l.post_norm.ptr, p("h"), ne, ne, nt, eps, p("hq"), p("mix"))?;
+            match (&l.post_norm, &l.hc) {
+                (Some(pn), _) => g.rms_norm_q(x, ne, pn.ptr, p("h"), ne, ne, nt, eps, p("hq"), p("mix"))?,
+                (None, Some(hc)) => {
+                    g.hc_write(x, p("mix"), p("inj"), ne, c.hc_n, nt, false)?;
+                    self.hc_read(&hc[1], x, nt)?;
+                }
+                _ => unreachable!(),
+            }
             match &l.ffn {
                 Ffn::Dense { gate, up, down } => {
                     g.batch(&mut || mv2(gate, up, "ge", "ue"))?;
@@ -548,8 +662,11 @@ impl<'a> GpuModel<'a> {
                         Ok(())
                     })?;
                     let (sh, sg) = if shared.is_some() { (p("shy"), p("sg")) } else { (0, 0) };
+                    // Hyper-connections: the FFN output collects in "mo" (zero) and goes to the streams from there.
+                    let fx = if l.hc.is_some() { p("mo") } else { x };
                     g.moe_down_combine(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, k, p("ge"), p("ye"), dq,
-                                       x, p("wh"), sh, sg, mb, w.layout.y, step, nt)?;
+                                       fx, p("wh"), sh, sg, mb, w.layout.y, step, nt)?;
+                    if l.hc.is_some() { g.hc_write(x, p("mo"), p("inj"), ne, c.hc_n, nt, true)?; }
                 }
             }
         }

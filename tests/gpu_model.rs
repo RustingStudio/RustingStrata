@@ -272,3 +272,33 @@ fn prefill_cached_reuses_history() {
         assert_eq!(got2, want2, "reused prefix");
     }
 }
+
+/// qwen4exp (hyper-connections, PLE) on the GPU against the CPU reference: token by token, then the same prompt as one
+/// batched forward after `reset`.
+#[test]
+fn qwen4exp_gpu_matches_cpu() {
+    let _gpu = common::gpu_lock();
+    let p = std::path::Path::new("/mnt/ollama/qwen4exp/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf");
+    if !p.exists() { return }
+    let g = Gguf::open(p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let ids = tok.encode("The capital of France is Paris. The capital of").unwrap();
+    let mut st = State::new(&m.cfg);
+    let want: Vec<Vec<f32>> = ids.iter().map(|&t| m.step(&mut st, t)).collect();
+    for (bk, gpu) in common::backends_except(&["vulkan"]) {
+        let mut gm = GpuModel::load(&m, gpu, 256, 0, 512 << 20, 0).unwrap();
+        let mut got: Vec<Vec<f32>> = ids.iter().map(|&t| gm.step(t).unwrap()).collect();
+        gm.reset().unwrap();
+        let n = ids.len().min(rusting_strata::cpu_worker::TMAX);
+        got.extend(gm.verify(&ids[..n]).unwrap());
+        for (i, (g, w)) in got.iter().zip(want.iter().chain(&want[..n])).enumerate() {
+            let range = w.iter().fold(f32::MIN, |a, &b| a.max(b)) - w.iter().fold(f32::MAX, |a, &b| a.min(b));
+            let diff = g.iter().zip(w).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+            eprintln!("{bk} row {i}: argmax {} vs {}, max |dlogit| {diff:.4} (range {range:.2})", ops::argmax(g), ops::argmax(w));
+            // A different argmax only on a near tie (the first token's logits are flat).
+            assert!(w[ops::argmax(g)] >= w[ops::argmax(w)] - 2.0 * diff, "row {i}");
+            assert!(diff <= 0.1 * range, "row {i}: {diff} vs range {range}");
+        }
+    }
+}

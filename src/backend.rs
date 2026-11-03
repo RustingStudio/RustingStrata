@@ -189,6 +189,21 @@ pub trait Backend: Send {
         self.norm_gate(o, w, z, n, heads, eps)?;
         Ok(0)
     }
+    /// `norm_gate_q` gating with sigmoid(z) in place of silu(z) (qwen4exp).
+    fn norm_gate_sig(&self, _o: u64, _w: u64, _z: u64, _n: usize, _heads: usize, _eps: f32, _xq: u64) -> anyhow::Result<u64> {
+        anyhow::bail!("{}: sigmoid-gated norm not implemented", self.name())
+    }
+    // qwen4exp hyper-connections (see `Model::hc_read`); the residual of a token is hc rows of n.
+    /// x = silu(x * sc) over n values.
+    fn hc_silu(&self, _x: u64, _sc: f32, _n: usize) -> anyhow::Result<()> { anyhow::bail!("{}: hyper-connections not implemented", self.name()) }
+    /// out[t] = sum over streams c of xn[t][c] * sigmoid(g[t][c]) / hc, for t < nt.
+    fn hc_mix(&self, _xn: u64, _g: u64, _out: u64, _n: usize, _hc: usize, _nt: usize) -> anyhow::Result<()> { anyhow::bail!("{}: hyper-connections not implemented", self.name()) }
+    /// Stream c of r[t] += out[t] * 2 sigmoid(inj[t][c] / hc), for t < nt; `clear`: zero out afterwards.
+    fn hc_write(&self, _r: u64, _out: u64, _inj: u64, _n: usize, _hc: usize, _nt: usize, _clear: bool) -> anyhow::Result<()> { anyhow::bail!("{}: hyper-connections not implemented", self.name()) }
+    /// PLE gate (see `Model::ple`): key and query rows of hc * n per token, value rows of n.
+    fn ple_gate(&self, _key: u64, _query: u64, _value: u64, _gated: u64, _n: usize, _hc: usize, _nt: usize) -> anyhow::Result<()> { anyhow::bail!("{}: PLE not implemented", self.name()) }
+    /// PLE conv and residual add for nt tokens at positions step[0] .. (rows of d); `ring`: 16 rows of d.
+    fn ple_conv(&self, _r: u64, _gated: u64, _norm: u64, _kw: u64, _ring: u64, _step: u64, _d: usize, _nt: usize) -> anyhow::Result<()> { anyhow::bail!("{}: PLE not implemented", self.name()) }
     /// Store `t` tokens of `n` values at positions step[0] ...
     fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()>;
     /// Decode attention for `nt` query tokens, token t over positions 0 ..= step[2 t] (rows of q, qg, out and step per

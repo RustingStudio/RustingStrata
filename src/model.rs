@@ -126,7 +126,7 @@ impl<'a> Model<'a> {
     fn step_hc(&self, st: &mut State, token: u32) -> (Vec<f32>, Vec<f32>) {
         let c = &self.cfg;
         let mut r = self.embed(token).repeat(c.hc_n);
-        let emb = self.ple_embed(st, token);
+        let emb = self.ple_embed(&mut st.ple_prev, token);
         for il in 0..c.n_layer {
             if self.w.layer(il, "ple_key.weight").is_ok() { self.ple(il, &mut r, &emb, &mut st.ple_hist); }
             let (h, inj) = self.hc_read(&r, &format!("blk.{il}.hc_attn_"));
@@ -176,18 +176,18 @@ impl<'a> Model<'a> {
 
     /// The PLE table rows of `token`: its 2- and 3-grams hashed (XOR of token x multiplier, mod each head's vocab,
     /// plus the head's offset), 8 heads per order. EOS or the sequence start cut the context: that position and
-    /// every older one read as EOS. Advances `st.ple_prev`.
+    /// every older one read as EOS. Advances `prev` (the last two tokens, -1 before the start).
     /// ponytail: image tokens are not mapped to `ple.image_token_id` (text only).
-    pub fn ple_rows(&self, st: &mut State, token: u32) -> Vec<u64> {
+    pub fn ple_rows(&self, prev: &mut [i64; 2], token: u32) -> Vec<u64> {
         let Some(p) = &self.ple else { return Vec::new() };
         let mut ctx = [token as i64; PLE_NGRAM];
         let mut cut = false;
         for s in 1..PLE_NGRAM {
-            let t = st.ple_prev[s - 1];
+            let t = prev[s - 1];
             cut = cut || t < 0 || t == p.eos;
             ctx[s] = if cut { p.eos } else { t };
         }
-        st.ple_prev = [token as i64, st.ple_prev[0]];
+        *prev = [token as i64, prev[0]];
         let mut rows = Vec::with_capacity(p.vocab.len());
         for n in 2..=PLE_NGRAM {
             let mut m = (ctx[0] as u64).wrapping_mul(p.mult[0]);
@@ -198,8 +198,8 @@ impl<'a> Model<'a> {
     }
 
     /// The PLE input of `token`: its 16 table rows, head after head (empty for models without PLE).
-    fn ple_embed(&self, st: &mut State, token: u32) -> Vec<f32> {
-        let rows = self.ple_rows(st, token);
+    pub fn ple_embed(&self, prev: &mut [i64; 2], token: u32) -> Vec<f32> {
+        let rows = self.ple_rows(prev, token);
         if rows.is_empty() { return Vec::new() }
         let (table, d) = (self.w.get("per_layer_token_embd.weight").unwrap(), self.cfg.n_embd_ple);
         let mut emb = vec![0f32; self.cfg.n_embd];
