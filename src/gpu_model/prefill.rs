@@ -71,7 +71,7 @@ impl GpuModel<'_> {
         let (g, ne) = (&self.gpu, self.m.cfg.n_embd);
         let h = self.bufs["h"].addr();
         // `prefill_chunk` leaves the last hidden state in row 0 of `x`, as after `step` (the MTP draft reads it).
-        g.rms_norm(self.x.addr(), 0, self.output_norm.ptr, h, 0, ne, 1, self.m.cfg.eps)?;
+        g.rms_norm(self.x.addr(), 0, self.output_norm.as_ref().unwrap().ptr, h, 0, ne, 1, self.m.cfg.eps)?;
         g.gemv(&self.output, h, self.logits.addr())?;
         g.get::<f32>(&self.logits, 0, self.m.cfg.n_vocab)
     }
@@ -99,6 +99,11 @@ impl GpuModel<'_> {
 
     fn step_all(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
         let mut logits = Vec::new();
+        // ponytail: hyper-connection models have no chunked prefill yet; TMAX tokens per forward instead.
+        if self.m.cfg.hc_n > 0 {
+            for ch in tokens.chunks(crate::cpu_worker::TMAX) { logits = self.verify(ch)?.pop().unwrap(); }
+            return Ok(logits);
+        }
         for &t in tokens {
             // The draft head's entry for `t` pairs it with the hidden state of the token before (row 0 of `x`).
             if self.pos > 0 && self.mtp_synced() { let r = self.row_ptr(0); self.mtp_run(&[t], r, false)?; }
@@ -143,7 +148,7 @@ impl GpuModel<'_> {
                 g.put(&[mh.pos as i32, 0], &self.step_buf, 2)?;
                 step += 8;
             }
-            g.rms_norm(x, ne, ly.attn_norm.ptr, h, ne, ne, t, eps)?;
+            g.rms_norm(x, ne, ly.attn_norm.as_ref().unwrap().ptr, h, ne, ne, t, eps)?;
             match &ly.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, .. } => {
                     let (eb, eg) = (at(l.e), at(l.e + n * nv));
@@ -179,7 +184,7 @@ impl GpuModel<'_> {
                     g.gemm_dense(o, t, at(l.d), nh * hd, x, ne, 2)?;
                 }
             }
-            g.rms_norm(x, ne, ly.post_norm.ptr, h, ne, ne, t, eps)?;
+            g.rms_norm(x, ne, ly.post_norm.as_ref().unwrap().ptr, h, ne, ne, t, eps)?;
             match &ly.ffn {
                 Ffn::Dense { gate, up, down } => {
                     g.gemm_dense(gate, t, h, ne, at(l.ge), c.n_ff, 0)?;

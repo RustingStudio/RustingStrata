@@ -1265,15 +1265,15 @@ extern "C" __global__ void deltanet_seq(const float* y, float* S, const float* b
     for (int i = 0; i < 4; i++) row[s + L * i] = make_float4(r[4 * i], r[4 * i + 1], r[4 * i + 2], r[4 * i + 3]);
 }
 
-// grid = heads: out = rmsnorm(o_h) * w * silu(z_h), in place on o. xq not null: also quant_xq's layout of out (heads of
+// grid = heads: out = rmsnorm(o_h) * w * silu(z_h) (sigmoid(z_h) when sig), in place on o. xq not null: also quant_xq's layout of out (heads of
 // a token are contiguous, so its rows are tokens) for the out GEMV.
-extern "C" __global__ void norm_gate(float* o, const float* w, const float* z, int n, float eps, signed char* xq) {
+extern "C" __global__ void norm_gate(float* o, const float* w, const float* z, int n, float eps, signed char* xq, int sig) {
     float* h = o + (size_t)blockIdx.x * n;
     const float* zh = z + (size_t)blockIdx.x * n;
     float s = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) s += h[i] * h[i];
     float sc = 1.0f / sqrtf(block_sum(s) / (float)n + eps);
-    for (int i = threadIdx.x; i < n; i += blockDim.x) h[i] = h[i] * sc * w[i] * silu(zh[i]);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) h[i] = h[i] * sc * w[i] * (sig ? sigmoid(zh[i]) : silu(zh[i]));
     if (!xq) return;
     __syncthreads();
     size_t b = (size_t)blockIdx.x * n;
@@ -1281,6 +1281,64 @@ extern "C" __global__ void norm_gate(float* o, const float* w, const float* z, i
         int i = i0 + threadIdx.x * 8;
         unsigned m = __ballot_sync(0xffffffff, i < n);
         if (i < n) quant8(*(const float4*)(h + i), *(const float4*)(h + i + 4), i, xq + b, (float*)(xq + (size_t)gridDim.x * n) + b / 32, m);
+    }
+}
+
+// ---- qwen4exp hyper-connections: the residual is hc streams of n values per token (rows of hc * n) ----
+
+// x = silu(x * sc) over n values.
+extern "C" __global__ void hc_silu(float* x, float sc, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = silu(x[i] * sc);
+}
+
+// grid.y = tokens: out[t][i] = sum over streams c of xn[t][c n + i] * sigmoid(g[t][c n + i]) / hc.
+extern "C" __global__ void hc_mix(const float* xn, const float* g, float* out, int n, int hc) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    size_t b = (size_t)blockIdx.y * hc * n + i;
+    float s = 0.0f;
+    for (int c = 0; c < hc; c++) s += xn[b + (size_t)c * n] * sigmoid(g[b + (size_t)c * n]) / (float)hc;
+    out[(size_t)blockIdx.y * n + i] = s;
+}
+
+// grid.y = tokens: stream c of r[t] += out[t] * 2 sigmoid(inj[t][c] / hc); clear: out[t] = 0 afterwards.
+extern "C" __global__ void hc_write(float* r, float* out, const float* inj, int n, int hc, int clear) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (i >= n) return;
+    float o = out[(size_t)t * n + i];
+    for (int c = 0; c < hc; c++) r[((size_t)t * hc + c) * n + i] += o * (2.0f * sigmoid(inj[t * hc + c] / (float)hc));
+    if (clear) out[(size_t)t * n + i] = 0.0f;
+}
+
+// PLE gate. Block (c, t): s = key . query over stream c of token t (rows of hc * n) / sqrt(n),
+// gated[t][c n + i] = value[t][i] * sigmoid(sign(s) sqrt(max(|s|, 1e-6))).
+extern "C" __global__ void ple_gate(const float* key, const float* query, const float* value, float* gated, int n) {
+    size_t b = ((size_t)blockIdx.y * gridDim.x + blockIdx.x) * n;
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += key[b + i] * query[b + i];
+    s = block_sum(s) / sqrtf((float)n);
+    float gate = sigmoid((s > 0.0f ? 1.0f : s < 0.0f ? -1.0f : 0.0f) * sqrtf(fmaxf(fabsf(s), 1e-6f)));
+    for (int i = threadIdx.x; i < n; i += blockDim.x) gated[b + i] = value[(size_t)blockIdx.y * n + i] * gate;
+}
+
+// PLE causal conv of d channels (4 taps, dilation 3) for nt tokens at positions step[0] ..: the normalized rows of
+// earlier positions live in `ring` (16 rows of d, position p in row p % 16; none before position 0).
+// r[t][i] += gated[t][i] + silu(kw[i][3] norm[t][i] + sum_k<3 kw[i][k] row(p - 9 + 3k)[i]), then row p = norm[t].
+extern "C" __global__ void ple_conv(float* r, const float* gated, const float* norm, const float* kw, float* ring,
+                                    const int* step, int d, int nt) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= d) return;
+    for (int t = 0; t < nt; t++) {
+        int p = step[0] + t;
+        size_t o = (size_t)t * d + i;
+        float acc = kw[i * 4 + 3] * norm[o];
+        for (int k = 0; k < 3; k++) {
+            int q = p - 9 + 3 * k;
+            if (q >= 0) acc += kw[i * 4 + k] * ring[(size_t)(q & 15) * d + i];
+        }
+        r[o] += gated[o] + silu(acc);
+        ring[(size_t)(p & 15) * d + i] = norm[o];
     }
 }
 

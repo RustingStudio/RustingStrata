@@ -54,7 +54,7 @@ fn qwen4exp_ple_rows() {
     let m = Model::load(&g).unwrap();
     let mut st = State::new(&m.cfg);
     let case = [(11, [-1, -1]), (22, [11, -1]), (33, [22, 11]), (44, [33, 22])];
-    let rows: Vec<u64> = case.iter().flat_map(|&(t, [old, new])| { st.ple_prev = [new, old]; m.ple_rows(&mut st, t) }).collect();
+    let rows: Vec<u64> = case.iter().flat_map(|&(t, [old, new])| { st.ple_prev = [new, old]; m.ple_rows(&mut st.ple_prev, t) }).collect();
     assert_eq!(&rows[..16], &[13555483, 24877159, 54278900, 63631058, 98394898, 117447587, 136774765, 157274238,
         173487882, 192109366, 213364329, 236577563, 258758149, 262164274, 283572184, 312653920]);
     assert_eq!(&rows[48..], &[12721672, 27113445, 44309803, 60385209, 97021817, 115900810, 134219364, 151977589,
