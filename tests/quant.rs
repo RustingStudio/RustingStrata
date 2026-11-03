@@ -65,3 +65,19 @@ fn matvec_matches_rowwise_dequant() {
     t.row(0, &mut row);
     assert_eq!(a, row);
 }
+
+#[test]
+fn f16_and_q2_0_blocks() {
+    assert_eq!(GgmlType::from_u32(1).unwrap(), GgmlType::F16);
+    assert_eq!(GgmlType::from_u32(42).unwrap(), GgmlType::Q2_0);
+    let mut y = [0f32; 2];
+    dequant_row(GgmlType::F16, &[0x00, 0x3c, 0x00, 0xc0], &mut y); // 1.0, -2.0
+    assert_eq!(y, [1.0, -2.0]);
+    // Q2_0: f16 d = 0.5, codes cycle 0,1,2,3 in each byte (0b11_10_01_00 = 0xE4) -> -1,0,1,2 times d.
+    let mut blk = vec![0x00, 0x38];
+    blk.extend([0xE4u8; 16]);
+    assert_eq!(GgmlType::Q2_0.row_bytes(64), 18);
+    let mut y = [0f32; 64];
+    dequant_row(GgmlType::Q2_0, &blk, &mut y);
+    for (j, v) in y.iter().enumerate() { assert_eq!(*v, [-0.5, 0.0, 0.5, 1.0][j % 4], "j={j}"); }
+}
