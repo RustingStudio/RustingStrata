@@ -31,13 +31,13 @@ impl Value {
 }
 
 #[derive(Clone, Debug)]
-pub struct TensorInfo { pub name: String, pub dims: Vec<u64>, pub ty: u32, pub offset: u64 }
+pub struct TensorInfo { pub name: String, pub dims: Vec<u64>, pub ty: u32, pub offset: u64, /** Shard index. */ pub file: usize }
 
 pub struct Gguf {
     pub meta: BTreeMap<String, Value>,
     pub tensors: BTreeMap<String, TensorInfo>,
-    mmap: Mmap,
-    data_offset: usize,
+    /// Each shard's map and data offset (one entry unless the model is split).
+    files: Vec<(Mmap, usize)>,
 }
 
 struct Cur<'a> { b: &'a [u8], p: usize }
@@ -80,7 +80,25 @@ impl<'a> Cur<'a> {
 }
 
 impl Gguf {
+    /// Open a GGUF; for a split model (`split.count` > 1), pass the `-00001-of-0000N` shard and the others are
+    /// opened from the same directory.
     pub fn open(path: &Path) -> anyhow::Result<Gguf> {
+        let mut g = Self::open_one(path, 0)?;
+        let n = g.meta.get("split.count").and_then(Value::as_u64).unwrap_or(1) as usize;
+        if n > 1 {
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let tag = format!("-00001-of-{n:05}.gguf");
+            let stem = name.strip_suffix(&tag).with_context(|| format!("{}: split model; open its first shard (*{tag})", path.display()))?;
+            for i in 1..n {
+                let s = Self::open_one(&path.with_file_name(format!("{stem}-{:05}-of-{n:05}.gguf", i + 1)), i)?;
+                g.files.extend(s.files);
+                for (k, t) in s.tensors { anyhow::ensure!(g.tensors.insert(k.clone(), t).is_none(), "tensor {k} in two shards"); }
+            }
+        }
+        Ok(g)
+    }
+
+    fn open_one(path: &Path, file: usize) -> anyhow::Result<Gguf> {
         let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
         let mmap = unsafe { Mmap::map(&f)? };
         let mut c = Cur { b: &mmap, p: 0 };
@@ -100,7 +118,7 @@ impl Gguf {
             let nd = c.u32()?;
             let dims = (0..nd).map(|_| c.u64()).collect::<anyhow::Result<Vec<_>>>()?;
             let (ty, offset) = (c.u32()?, c.u64()?);
-            tensors.insert(name.clone(), TensorInfo { name, dims, ty, offset });
+            tensors.insert(name.clone(), TensorInfo { name, dims, ty, offset, file });
         }
         let align = meta.get("general.alignment").and_then(Value::as_u64).unwrap_or(32) as usize;
         let data_offset = c.p.div_ceil(align) * align;
@@ -112,7 +130,7 @@ impl Gguf {
                 bail!("{}: GGUF truncated (tensor {} lies past the end of the file; re-download it)", path.display(), t.name);
             }
         }
-        Ok(Gguf { meta, tensors, mmap, data_offset })
+        Ok(Gguf { meta, tensors, files: vec![(mmap, data_offset)] })
     }
 
     pub fn get(&self, key: &str) -> anyhow::Result<&Value> {
@@ -123,7 +141,8 @@ impl Gguf {
     pub fn bytes(&self, t: &TensorInfo) -> &[u8] {
         let ty = GgmlType::from_u32(t.ty).unwrap();
         let n = ty.row_bytes(t.dims[0]) * t.dims[1..].iter().product::<u64>() as usize;
-        let o = self.data_offset + t.offset as usize;
-        &self.mmap[o..o + n]
+        let (mmap, data_offset) = &self.files[t.file];
+        let o = data_offset + t.offset as usize;
+        &mmap[o..o + n]
     }
 }

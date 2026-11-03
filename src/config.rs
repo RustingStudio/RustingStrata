@@ -22,6 +22,8 @@ fn arch(name: &str) -> Option<Arch> {
     const FFN_NORM: &[(&str, &str)] = &[("post_attention_norm.weight", "ffn_norm.weight")];
     Some(match name {
         "qwen35" | "qwen35moe" => Arch { hybrid: true, q_gate: true, k_interleave: false, aliases: &[] },
+        // Qwen3.8-Flash-Next: qwen35-style DeltaNet pairing, plus hyper-connections and PLE read from metadata.
+        "qwen4exp" => Arch { hybrid: true, q_gate: true, k_interleave: false, aliases: &[] },
         "qwen3next" => Arch { hybrid: true, q_gate: true, k_interleave: true, aliases: &[] },
         "qwen3" | "qwen3moe" => Arch { hybrid: false, q_gate: false, k_interleave: false, aliases: FFN_NORM },
         _ => return None,
@@ -55,6 +57,11 @@ pub struct ModelConfig {
     pub ssm_n_group: usize,
     pub ssm_dt_rank: usize,
     pub ssm_conv: usize,
+    /// Hyper-connection residual streams and their low rank (qwen4exp; 0 = plain residual).
+    pub hc_n: usize,
+    pub hc_rank: usize,
+    /// Per-layer (n-gram) embedding width (qwen4exp; 0 = none).
+    pub n_embd_ple: usize,
     /// Mixer of each main layer (MTP layers are attention).
     pub layers: Vec<LayerKind>,
     pub q_gate: bool,
@@ -66,7 +73,7 @@ impl ModelConfig {
     pub fn from_gguf(g: &Gguf) -> anyhow::Result<ModelConfig> {
         let arch = g.get("general.architecture")?.as_str().context("general.architecture")?.to_string();
         let Some(a) = self::arch(&arch) else {
-            bail!("unsupported architecture '{arch}' (supported: qwen3, qwen3moe, qwen3next, qwen35, qwen35moe)")
+            bail!("unsupported architecture '{arch}' (supported: qwen3, qwen3moe, qwen3next, qwen35, qwen35moe, qwen4exp)")
         };
         let opt = |k: &str| g.meta.get(&format!("{arch}.{k}")).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let req = |k: &str| -> anyhow::Result<usize> {
@@ -111,6 +118,9 @@ impl ModelConfig {
             ssm_n_group: ssm("ssm.group_count")?,
             ssm_dt_rank: ssm("ssm.time_step_rank")?,
             ssm_conv: ssm("ssm.conv_kernel")?,
+            hc_n: opt("hyper_connection.count"),
+            hc_rank: opt("hyper_connection.low_rank"),
+            n_embd_ple: opt("embedding_length_per_layer_input"),
             layers,
             q_gate: a.q_gate,
             k_interleave: a.k_interleave,

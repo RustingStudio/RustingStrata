@@ -55,6 +55,7 @@ fn mv(t: &Tensor, x: &[f32]) -> Vec<f32> {
 impl<'a> Model<'a> {
     pub fn load(g: &'a Gguf) -> anyhow::Result<Model<'a>> {
         let cfg = ModelConfig::from_gguf(g)?;
+        anyhow::ensure!(cfg.hc_n == 0, "{}: the forward pass (hyper-connections, PLE) is not implemented yet; only `info` reads it", cfg.arch);
         let w = Weights::new(g)?;
         w.validate()?;
         w.get("token_embd.weight")?;
