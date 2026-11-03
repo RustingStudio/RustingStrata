@@ -24,8 +24,11 @@ static SIGNS: [[i8; 8]; 128] = {
     t
 };
 
+/// Quantizes `x` in blocks of 256; a short last block is zero-padded (Q2_0 rows can hold 64 * k values).
 pub fn quantize_q8k(x: &[f32]) -> Vec<Q8K> {
-    x.chunks_exact(256).map(|b| {
+    x.chunks(256).map(|b| {
+        let mut pad = [0f32; 256];
+        let b = if b.len() == 256 { b } else { pad[..b.len()].copy_from_slice(b); &pad[..] };
         // The first value of largest magnitude (a max over |v| first, which vectorizes).
         let amax = b.iter().fold(0f32, |m, &v| m.max(v.abs()));
         if amax == 0.0 { return Q8K { d: 0.0, qs: [0; 256], bs: [0; 16] }; }
@@ -239,6 +242,16 @@ fn dot_q3k(row: &[u8], xq: &[Q8K]) -> f32 {
         sumf += d16(&b[108..]) * y.d * grouped(&a, &y.qs, |j| sc[j] as i32 - 32) as f32;
     }
     sumf
+}
+
+/// Q2_0: 64 values (q - 1) * d with q in 0..4, four to a byte; four blocks per Q8_K block.
+fn dot_q2_0(row: &[u8], xq: &[Q8K]) -> f32 {
+    row.chunks_exact(18).enumerate().map(|(i, b)| {
+        let (y, o) = (&xq[i / 4], i % 4 * 64);
+        let s: i32 = (0..64).map(|j| (b[2 + j / 4] >> (2 * (j % 4)) & 3) as i32 * y.qs[o + j] as i32).sum();
+        let m: i32 = y.bs[o / 16..o / 16 + 4].iter().map(|&v| v as i32).sum();
+        d16(b) * y.d * (s - m) as f32
+    }).sum()
 }
 
 fn dot_q4k(row: &[u8], xq: &[Q8K]) -> f32 {
@@ -570,6 +583,29 @@ mod avx2 {
         }
     }
 
+    pub fn dot_q2_0(row: &[u8], xq: &[Q8K]) -> f32 {
+        unsafe {
+            let (mut acc, mut sumf) = (_mm256_setzero_ps(), 0f32);
+            let (m3, ones) = (_mm_set1_epi8(3), _mm256_set1_epi16(1));
+            for (i, b) in row.chunks_exact(18).enumerate() {
+                let (y, o) = (&xq[i / 4], i % 4 * 64);
+                let v = _mm_loadu_si128(b[2..18].as_ptr() as *const __m128i);
+                let c = |k: i32| _mm_and_si128(_mm_srl_epi16(v, _mm_cvtsi32_si128(2 * k)), m3);
+                let (c0, c1, c2, c3) = (c(0), c(1), c(2), c(3));
+                // Re-interleave the crumbs into element order: byte k holds elements 4k..4k+3.
+                let (lo01, lo23) = (_mm_unpacklo_epi8(c0, c1), _mm_unpacklo_epi8(c2, c3));
+                let (hi01, hi23) = (_mm_unpackhi_epi8(c0, c1), _mm_unpackhi_epi8(c2, c3));
+                let w0 = _mm256_set_m128i(_mm_unpackhi_epi16(lo01, lo23), _mm_unpacklo_epi16(lo01, lo23));
+                let w1 = _mm256_set_m128i(_mm_unpackhi_epi16(hi01, hi23), _mm_unpacklo_epi16(hi01, hi23));
+                let p = _mm256_add_epi16(_mm256_maddubs_epi16(w0, q8(y, o)), _mm256_maddubs_epi16(w1, q8(y, o + 32)));
+                let d = d16(b) * y.d;
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_madd_epi16(p, ones)), acc);
+                sumf -= d * y.bs[o / 16..o / 16 + 4].iter().map(|&v| v as i32).sum::<i32>() as f32;
+            }
+            hsum(acc) + sumf
+        }
+    }
+
     pub fn dot_q4k(row: &[u8], xq: &[Q8K]) -> f32 {
         unsafe {
             let m4 = _mm256_set1_epi8(0xF);
@@ -596,9 +632,9 @@ mod avx2 {
 fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
     #[cfg(target_feature = "avx2")]
     if std::env::var_os("STRATA_SCALAR").is_none() {
-        return match ty { GgmlType::IQ2XS => Some(avx2::dot_iq2xs), GgmlType::IQ3XXS => Some(avx2::dot_iq3xxs), GgmlType::IQ4XS => Some(avx2::dot_iq4xs), GgmlType::IQ3S => Some(avx2::dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::IQ2XXS => Some(avx2::dot_iq2xxs), GgmlType::IQ2S => Some(avx2::dot_iq2s), GgmlType::IQ1S => Some(avx2::dot_iq1s), GgmlType::IQ1M => Some(avx2::dot_iq1m), GgmlType::Q2K => Some(avx2::dot_q2k), GgmlType::Q3K => Some(avx2::dot_q3k), GgmlType::Q4K => Some(avx2::dot_q4k), _ => None };
+        return match ty { GgmlType::IQ2XS => Some(avx2::dot_iq2xs), GgmlType::IQ3XXS => Some(avx2::dot_iq3xxs), GgmlType::IQ4XS => Some(avx2::dot_iq4xs), GgmlType::IQ3S => Some(avx2::dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::IQ2XXS => Some(avx2::dot_iq2xxs), GgmlType::IQ2S => Some(avx2::dot_iq2s), GgmlType::IQ1S => Some(avx2::dot_iq1s), GgmlType::IQ1M => Some(avx2::dot_iq1m), GgmlType::Q2K => Some(avx2::dot_q2k), GgmlType::Q3K => Some(avx2::dot_q3k), GgmlType::Q4K => Some(avx2::dot_q4k), GgmlType::Q2_0 => Some(avx2::dot_q2_0), _ => None };
     }
-    match ty { GgmlType::IQ2XS => Some(dot_iq2xs), GgmlType::IQ3XXS => Some(dot_iq3xxs), GgmlType::IQ4XS => Some(dot_iq4xs), GgmlType::IQ3S => Some(dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::IQ2XXS => Some(dot_iq2xxs), GgmlType::IQ2S => Some(dot_iq2s), GgmlType::IQ1S => Some(dot_iq1s), GgmlType::IQ1M => Some(dot_iq1m), GgmlType::Q2K => Some(dot_q2k), GgmlType::Q3K => Some(dot_q3k), GgmlType::Q4K => Some(dot_q4k), _ => None }
+    match ty { GgmlType::IQ2XS => Some(dot_iq2xs), GgmlType::IQ3XXS => Some(dot_iq3xxs), GgmlType::IQ4XS => Some(dot_iq4xs), GgmlType::IQ3S => Some(dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::IQ2XXS => Some(dot_iq2xxs), GgmlType::IQ2S => Some(dot_iq2s), GgmlType::IQ1S => Some(dot_iq1s), GgmlType::IQ1M => Some(dot_iq1m), GgmlType::Q2K => Some(dot_q2k), GgmlType::Q3K => Some(dot_q3k), GgmlType::Q4K => Some(dot_q4k), GgmlType::Q2_0 => Some(dot_q2_0), _ => None }
 }
 
 /// y = t · x for every row, using the integer kernel when the type has one.
@@ -669,9 +705,11 @@ mod tests {
         let mut r = 0x9E3779B97F4A7C15u64;
         let mut rnd = || { r ^= r << 13; r ^= r >> 7; r ^= r << 17; r as u8 };
         let x: Vec<f32> = (0..1024).map(|i| ((i as f32 * 0.7548777).fract() - 0.5) * 2.0).collect();
-        let xq = quantize_q8k(&x);
-        for ty in [GgmlType::IQ2XS, GgmlType::IQ3XXS, GgmlType::IQ3S, GgmlType::IQ4XS, GgmlType::Q6K, GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K, GgmlType::IQ2XXS, GgmlType::IQ2S, GgmlType::IQ1S, GgmlType::IQ1M] {
-            let mut row: Vec<u8> = (0..4 * ty.block_bytes()).map(|_| rnd()).collect();
+        for ty in [GgmlType::Q2_0, GgmlType::IQ2XS, GgmlType::IQ3XXS, GgmlType::IQ3S, GgmlType::IQ4XS, GgmlType::Q6K, GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K, GgmlType::IQ2XXS, GgmlType::IQ2S, GgmlType::IQ1S, GgmlType::IQ1M] {
+            // Q2_0 at 640 values exercises the zero-padded last Q8_K block.
+            let n = if ty == GgmlType::Q2_0 { 640 } else { 1024 };
+            let xq = quantize_q8k(&x[..n]);
+            let mut row: Vec<u8> = (0..n / ty.block_elems() * ty.block_bytes()).map(|_| rnd()).collect();
             // Offsets of the f16 scales (d, and dmin where the type has one).
             let fs: &[usize] = match ty { GgmlType::Q6K => &[208], GgmlType::Q2K => &[80, 82], GgmlType::Q3K => &[108], GgmlType::Q4K => &[0, 2], GgmlType::IQ1M => &[], _ => &[0] };
             for b in row.chunks_exact_mut(ty.block_bytes()) { for &o in fs { b[o..o + 2].copy_from_slice(&f16::from_f32(0.01).to_le_bytes()); } }
@@ -680,10 +718,10 @@ mod tests {
                 let d = f16::from_f32(0.01).to_bits();
                 for b in row.chunks_exact_mut(56) { for i in 0..4 { b[49 + 2 * i] = b[49 + 2 * i] & 0xF | ((d >> (4 * i)) as u8 & 0xF) << 4; } }
             }
-            let mut w = vec![0f32; 1024];
+            let mut w = vec![0f32; n];
             crate::quant::dequant_row(ty, &row, &mut w);
             let want: f64 = w.iter().enumerate().map(|(i, &v)| v as f64 * (xq[i / 256].d * xq[i / 256].qs[i % 256] as f32) as f64).sum();
-            let scalar = match ty { GgmlType::IQ2XS => dot_iq2xs, GgmlType::IQ3XXS => dot_iq3xxs, GgmlType::IQ3S => dot_iq3s, GgmlType::Q6K => dot_q6k, GgmlType::Q2K => dot_q2k, GgmlType::Q3K => dot_q3k, GgmlType::Q4K => dot_q4k, GgmlType::IQ2XXS => dot_iq2xxs, GgmlType::IQ2S => dot_iq2s, GgmlType::IQ1S => dot_iq1s, GgmlType::IQ1M => dot_iq1m, _ => dot_iq4xs };
+            let scalar = match ty { GgmlType::IQ2XS => dot_iq2xs, GgmlType::IQ3XXS => dot_iq3xxs, GgmlType::IQ3S => dot_iq3s, GgmlType::Q6K => dot_q6k, GgmlType::Q2K => dot_q2k, GgmlType::Q3K => dot_q3k, GgmlType::Q4K => dot_q4k, GgmlType::IQ2XXS => dot_iq2xxs, GgmlType::IQ2S => dot_iq2s, GgmlType::IQ1S => dot_iq1s, GgmlType::IQ1M => dot_iq1m, GgmlType::Q2_0 => dot_q2_0, _ => dot_iq4xs };
             for got in [scalar(&row, &xq), int_dot(ty).unwrap()(&row, &xq)] {
                 assert!(((got as f64 - want) / want.abs().max(1e-3)).abs() < 1e-5, "{}: {got} vs {want}", ty.name());
             }
