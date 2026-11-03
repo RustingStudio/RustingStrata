@@ -2,7 +2,7 @@
 //! run as grouped GEMMs over the chunk's (token, expert) pairs sorted by expert; experts not resident in the cache are
 //! copied into a small staging area, a group of them at a time, each group's copy beside the previous group's GEMMs.
 
-use super::{Ffn, GpuModel, Mixer};
+use super::{Ffn, GpuModel, HcAt, Mixer};
 use crate::backend::{Backend, Buf, GEMM_BM, SAME_X};
 use crate::expert_cache::MATS;
 use crate::model::Model;
@@ -10,8 +10,10 @@ use crate::model::Model;
 /// Experts staged per group when a layer routes to experts outside the cache. Staging holds two groups.
 const STAGE: usize = 16;
 
-/// Float offsets into the scratch slab (each region holds `chunk` rows). Mixer and FFN regions alias.
-struct Lay { h: usize, a: usize, b: usize, c: usize, d: usize, e: usize, rl: usize, wts: usize, ge: usize, ye: usize, shg: usize, shy: usize, sg: usize }
+/// Float offsets into the scratch slab (each region holds `chunk` rows). Mixer and FFN regions alias, and so do the
+/// hyper-connection read and PLE temporaries (`xn` .. `pv`), which run outside both.
+struct Lay { h: usize, a: usize, b: usize, c: usize, d: usize, e: usize, rl: usize, wts: usize, ge: usize, ye: usize, shg: usize, shy: usize, sg: usize,
+             xn: usize, lo: usize, hg: usize, pk: usize, pq: usize, pg: usize, pn: usize, pv: usize, inj: usize, mix: usize, mo: usize, emb: usize }
 
 pub(super) struct Scratch {
     pub chunk: usize,
@@ -36,7 +38,8 @@ impl Scratch {
         let (ne, k) = (c.n_embd, c.n_expert_used.max(1));
         let (nv, kv, channels) = (c.ssm_dt_rank, c.n_head_kv * c.head_dim, c.ssm_d_inner + 2 * c.ssm_n_group * c.ssm_d_state);
         let q = c.n_head * c.head_dim;
-        let (h, base) = (ne * chunk, 2 * ne * chunk); // x at 0, then h
+        let hd = c.hc_n.max(1) * ne;
+        let (h, base) = (hd * chunk, (hd + ne) * chunk); // x (hc_n streams a token) at 0, then h
         let mut at = base;
         let mut take = |n: usize| { let o = at; at += n * chunk; o };
         let (a, b, c2, d, e) = (take((2 * q).max(channels).max(2 * ne)), take(q.max(c.ssm_d_inner)), take(channels.max(3 * kv)), take(q.max(c.ssm_d_inner)), take(2 * nv));
@@ -45,10 +48,20 @@ impl Scratch {
         let mut take = |n: usize| { let o = at; at += n * chunk; o };
         let (rl, wts, ge) = (take(c.n_expert), take(k), take((k * c.n_ff_exp).max(c.n_ff)));
         let (ye, shg, shy, sg) = (take(k * ne), take(c.n_ff_shexp), take(ne), take(1));
-        let total = at.max(mix_end);
+        let mut total = at.max(mix_end);
+        let (mut xn, mut lo, mut hg, mut pk, mut pq, mut pg, mut pn, mut pv, mut inj, mut mix, mut mo, mut emb) = Default::default();
+        if c.hc_n > 0 {
+            at = base;
+            let mut take = |n: usize| { let o = at; at += n * chunk; o };
+            (xn, lo, hg, pk, pq, pg, pn, pv) = (take(hd), take(c.hc_rank), take(hd), take(hd), take(hd), take(hd), take(hd), take(ne));
+            at = at.max(total);
+            let mut take = |n: usize| { let o = at; at += n * chunk; o };
+            (inj, mix, mo, emb) = (take(c.hc_n), take(ne), take(ne), take(ne));
+            total = at;
+        }
         let n_tiles = 3 * (chunk * k / GEMM_BM + 2 * c.n_expert);
         Ok(Scratch {
-            chunk, lay: Lay { h, a, b, c: c2, d, e, rl, wts, ge, ye, shg, shy, sg },
+            chunk, lay: Lay { h, a, b, c: c2, d, e, rl, wts, ge, ye, shg, shy, sg, xn, lo, hg, pk, pq, pg, pn, pv, inj, mix, mo, emb },
             slab: gpu.zeros::<f32>(total)?, ints: gpu.zeros::<i32>(3 * chunk * k)?, tiles: gpu.zeros::<u64>(2 * n_tiles)?,
             staging: gpu.zeros::<u8>(if c.is_moe() { 2 * STAGE * stage_bytes } else { 0 })?,
         })
@@ -71,7 +84,11 @@ impl GpuModel<'_> {
         let (g, ne) = (&self.gpu, self.m.cfg.n_embd);
         let h = self.bufs["h"].addr();
         // `prefill_chunk` leaves the last hidden state in row 0 of `x`, as after `step` (the MTP draft reads it).
-        g.rms_norm(self.x.addr(), 0, self.output_norm.as_ref().unwrap().ptr, h, 0, ne, 1, self.m.cfg.eps)?;
+        match (&self.output_norm, &self.output_hc) {
+            (Some(on), _) => g.rms_norm(self.x.addr(), 0, on.ptr, h, 0, ne, 1, self.m.cfg.eps)?,
+            (None, Some(hr)) => self.hc_read(hr, self.x.addr(), 1, &self.hc_at())?,
+            _ => unreachable!(),
+        }
         g.gemv(&self.output, h, self.logits.addr())?;
         g.get::<f32>(&self.logits, 0, self.m.cfg.n_vocab)
     }
@@ -113,17 +130,24 @@ impl GpuModel<'_> {
     }
 
     fn prefill_chunk(&mut self, toks: &[u32]) -> anyhow::Result<()> {
+        let pe: Vec<f32> = if self.ple_ring.is_some() { toks.iter().flat_map(|&tk| self.m.ple_embed(&mut self.ple_prev, tk)).collect() } else { vec![] };
         let c = &self.m.cfg;
         let pf = self.pf.as_ref().unwrap();
         let (g, mut t, n, eps, ne) = (&self.gpu, toks.len(), pf.chunk, c.eps, c.n_embd);
-        let emb: Vec<f32> = toks.iter().flat_map(|&tk| self.m.embed(tk)).collect();
+        let (hcn, d) = (c.hc_n.max(1), c.hc_n.max(1) * ne);
+        let emb: Vec<f32> = toks.iter().flat_map(|&tk| self.m.embed(tk).repeat(hcn)).collect();
         g.put(&emb, &pf.slab, 0)?;
+        if !pe.is_empty() { g.put(&pe, &pf.slab, pf.lay.emb)?; }
         g.put(&[self.pos as i32, 0], &self.step_buf, 0)?;
         let mut step = self.step_buf.addr();
         let base = pf.slab.addr();
         let at = |o: usize| base + 4 * o as u64;
         let l = &pf.lay;
         let (x, h) = (at(0), at(l.h));
+        let ha = HcAt { xn: at(l.xn), lo: at(l.lo), hg: at(l.hg), inj: at(l.inj), h, hq: 0, emb: at(l.emb), pk: at(l.pk), pq: at(l.pq), pg: at(l.pg),
+                        pn: at(l.pn), pv: at(l.pv), gemm: true };
+        // Hyper-connections: the mixer and FFN outputs go to "mix" and "mo", then into the streams.
+        let (mx, mact) = if c.hc_n > 0 { (at(l.mix), 0) } else { (x, 2) };
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
         let (dv, channels) = (c.ssm_dv(), c.ssm_d_inner + 2 * nk * dk);
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
@@ -148,7 +172,12 @@ impl GpuModel<'_> {
                 g.put(&[mh.pos as i32, 0], &self.step_buf, 2)?;
                 step += 8;
             }
-            g.rms_norm(x, ne, ly.attn_norm.as_ref().unwrap().ptr, h, ne, ne, t, eps)?;
+            if let Some(pl) = &ly.ple { self.ple(pl, x, step, t, &ha)?; }
+            match (&ly.attn_norm, &ly.hc) {
+                (Some(an), _) => g.rms_norm(x, ne, an.ptr, h, ne, ne, t, eps)?,
+                (None, Some(hr)) => self.hc_read(&hr[0], x, t, &ha)?,
+                _ => unreachable!(),
+            }
             match &ly.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, .. } => {
                     let (eb, eg) = (at(l.e), at(l.e + n * nv));
@@ -166,8 +195,8 @@ impl GpuModel<'_> {
                         g.deltanet(at(l.c), s.addr(), eb, eg, 0, 0, at(l.d), nk, nv, c.k_interleave, dk, dv, 1.0 / (dk as f32).sqrt(), t, channels, 0, 0)?;
                         g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, SAME_X)
                     })?;
-                    g.norm_gate(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps)?;
-                    g.gemm_dense(out, t, at(l.d), c.ssm_d_inner, x, ne, 2)?;
+                    if ly.hc.is_some() { g.norm_gate_sig(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps, 0)?; } else { g.norm_gate(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps)?; }
+                    g.gemm_dense(out, t, at(l.d), c.ssm_d_inner, mx, ne, mact)?;
                 }
                 Mixer::Attn { q, k, v, qn, kn, o, kc, vc } => {
                     let (kraw, kk, vv) = (at(l.c), at(l.c + n * kv), at(l.c + 2 * n * kv));
@@ -181,10 +210,17 @@ impl GpuModel<'_> {
                     g.rope_neox(kk, hd, t * nkv, nkv, c.n_rot, step, c.rope_base)?;
                     g.kv_store(kk, vv, kc.addr(), vc.addr(), kv, t, step, hd)?;
                     g.attn_prefill(at(l.b), kc.addr(), vc.addr(), if c.q_gate { at(l.a) } else { 0 }, at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt())?;
-                    g.gemm_dense(o, t, at(l.d), nh * hd, x, ne, 2)?;
+                    g.gemm_dense(o, t, at(l.d), nh * hd, mx, ne, mact)?;
                 }
             }
-            g.rms_norm(x, ne, ly.post_norm.as_ref().unwrap().ptr, h, ne, ne, t, eps)?;
+            match (&ly.post_norm, &ly.hc) {
+                (Some(pn), _) => g.rms_norm(x, ne, pn.ptr, h, ne, ne, t, eps)?,
+                (None, Some(hr)) => {
+                    g.hc_write(x, mx, at(l.inj), ne, c.hc_n, t, false)?;
+                    self.hc_read(&hr[1], x, t, &ha)?;
+                }
+                _ => unreachable!(),
+            }
             match &ly.ffn {
                 Ffn::Dense { gate, up, down } => {
                     g.gemm_dense(gate, t, h, ne, at(l.ge), c.n_ff, 0)?;
@@ -287,14 +323,17 @@ impl GpuModel<'_> {
                     }
                     // The shared down runs last, so the routed gate and up above reuse the int8 h of the shared up.
                     if let Some(s) = shared { g.gemm_dense(&s.down, t, at(l.shg), c.n_ff_shexp, at(l.shy), ne, 0)?; }
-                    g.moe_combine_seq(x, at(l.ye), at(l.wts), pf.ints.addr() + 4 * (2 * n * k) as u64, k, sh, sg, ne, t)?;
+                    // "mo" is zero: hc_write clears it after use.
+                    let fx = if ly.hc.is_some() { at(l.mo) } else { x };
+                    g.moe_combine_seq(fx, at(l.ye), at(l.wts), pf.ints.addr() + 4 * (2 * n * k) as u64, k, sh, sg, ne, t)?;
+                    if ly.hc.is_some() { g.hc_write(x, fx, at(l.inj), ne, c.hc_n, t, true)?; }
                 }
             }
         }
         match self.mtp.as_mut() {
             Some(mh) if fill => mh.pos += t,
             // Row 0 of `x` gets the last hidden state (with the draft head, the copy above did it).
-            _ => g.dtod(&pf.slab, 4 * (t - 1) * ne, &self.x, 0, 4 * ne)?,
+            _ => g.dtod(&pf.slab, 4 * (t - 1) * d, &self.x, 0, 4 * d)?,
         }
         self.pos += toks.len();
         Ok(())

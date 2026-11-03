@@ -228,15 +228,17 @@ impl Gpu {
     }
 
     fn gemm_raw(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, wd: u64, nd: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
-        if cols % 256 != 0 { bail!("{} matrix with {cols} columns: GEMM needs a multiple of 256", ty.name()); }
+        // Partial super-blocks (Q2_0's 640 columns, BF16's 320) are fine: K steps are 64 deep.
+        if cols % 64 != 0 { bail!("{} matrix with {cols} columns: GEMM needs a multiple of 64", ty.name()); }
         if n_tiles == 0 { return Ok(()); }
         let grid = (rows.div_ceil(64) as u32, n_tiles as u32);
         let (same, act) = (act & SAME_X != 0, act & !SAME_X);
         let mut q8 = self.q8.lock().unwrap();
-        if !Self::mmq(ty) {
+        // The int8 path loads q8 rows 16 bytes at a time: their stride (cols * 11 / 8) is aligned only for cols % 128 == 0.
+        if !Self::mmq(ty) || cols % 128 != 0 {
             if !same { q8.1 = None; }
             launch!(self, &kname("gemm", ty), cfg(grid, 2 * GEMM_BM as u32, 0),
-                tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 256) as i32, act);
+                tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act);
             return Ok(());
         }
         let need = n_x * (cols + cols / 8 + cols / 4);
@@ -249,7 +251,7 @@ impl Gpu {
             q8.1 = key;
         }
         launch!(self, &kname("gemmi", ty), cfg(grid, 2 * GEMM_BM as u32, 0),
-            tiles, wd, nd as i32, xq, xrow, y, y_stride as i32, rows as i32, (cols / 256) as i32, act);
+            tiles, wd, nd as i32, xq, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act);
         Ok(())
     }
 
@@ -485,7 +487,12 @@ impl Backend for Gpu {
     }
 
     fn rms_norm_q(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32, xq: u64, res: u64) -> anyhow::Result<()> {
-        launch!(self, "rms_norm", cfg((rows as u32, 1), 512, 0), x, x_stride as i32, w, out, out_stride as i32, n as i32, eps, xq, res);
+        launch!(self, "rms_norm", cfg((rows as u32, 1), 512, 0), x, x_stride as i32, w, out, out_stride as i32, n as i32, eps, xq, res, 1i32);
+        Ok(())
+    }
+
+    fn rms_norm_streams(&self, x: u64, w: u64, out: u64, n: usize, hc: usize, nt: usize, eps: f32) -> anyhow::Result<()> {
+        launch!(self, "rms_norm", cfg(((nt * hc) as u32, 1), 512, 0), x, n as i32, w, out, n as i32, n as i32, eps, 0u64, 0u64, hc as i32);
         Ok(())
     }
 

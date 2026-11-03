@@ -140,6 +140,14 @@ pub trait Backend: Send {
     /// `rms_norm` that also writes its output quantized as `quant_xq` does to `xq` (when not 0), and first adds `res`
     /// (rows `x_stride` apart, when not 0) into x in place.
     fn rms_norm_q(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32, xq: u64, res: u64) -> anyhow::Result<()>;
+    /// Per-stream RMSNorm of nt stacks of hc rows of n (contiguous) with the hc x n gamma `w`.
+    fn rms_norm_streams(&self, x: u64, w: u64, out: u64, n: usize, hc: usize, nt: usize, eps: f32) -> anyhow::Result<()> {
+        for s in 0..hc {
+            let o = 4 * (s * n) as u64;
+            self.rms_norm(x + o, hc * n, w + o, out + o, hc * n, n, nt, eps)?;
+        }
+        Ok(())
+    }
     /// out[r] = argmax of row r of x (`rows` rows of n floats), first index on ties.
     fn argmax_rows(&self, x: u64, n: usize, rows: usize, out: u64) -> anyhow::Result<()>;
     /// Row r: vector r % per (n floats) of token r / per, tokens `stride` floats apart.
