@@ -726,7 +726,7 @@ __device__ __forceinline__ u32 h2pack(float a, float b) { return (u32)f2h(a) | (
 // BM positions x 64 rows per block, K in steps of BK; warps form a (BM / 32) x 2 grid, each owning 32 x 32 outputs.
 template <int T, int SBB, int BM, int BK>
 __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int nd, const float* __restrict__ x, int x_stride,
-                                       const int* xrow, float* y, int y_stride, int rows, int nsb, int act) {
+                                       const int* xrow, float* y, int y_stride, int rows, int n64, int act) {
     constexpr int P = BK + 8, NT = BM * 2, SUBS = BK / 8;  // smem pitch in halves (padding: conflict-free fragments)
     __shared__ __align__(16) u16 xs[BM * P], ws[64 * P];
     GemmTile tl = tiles ? tiles[blockIdx.y] : GemmTile{wd, (int)blockIdx.y * BM, min(BM, nd - (int)blockIdx.y * BM)};
@@ -749,7 +749,7 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
         for (int q = 0; q < WQ; q++) {
             int i = tid + q * NT, r = i / SUBS, j = i % SUBS;
             float v[8] = {};
-            const u8* blk = tl.w + ((size_t)(n0 + r) * nsb + sb) * SBB;
+            const u8* blk = tl.w + (size_t)(n0 + r) * ROWB(n64 * 64, SBB) + (size_t)sb * SBB;
             if (n0 + r >= rows) {
             } else if constexpr (T == 17 || T == 18) {  // QS tables; same values as deq8: d times the signed grid bytes
                 int lo, hi; float d, m;
@@ -763,7 +763,7 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
         #pragma unroll
         for (int q = 0; q < WQ; q++) { int i = tid + q * NT; *(uint4*)(ws + (i / SUBS) * P + (i % SUBS) * 8) = wv[q]; }
     };
-    const int nk = nsb * (256 / BK);
+    const int nk = n64 * 64 / BK;
     if constexpr (T == 17 || T == 18) { QS<T>::load(); __syncthreads(); }
     ldw(0);
     stw();
@@ -823,8 +823,8 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
 #endif
 #define DEF_GEMM(T, NAME, SBB)                                                                                    \
     extern "C" __global__ void __launch_bounds__(GEMM_BM * 2) gemm_##NAME(const GemmTile* tiles, const u8* wd, int nd, \
-            const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int nsb, int act) {  \
-        gemm_q<T, SBB, GEMM_BM, GEMM_BK>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, nsb, act);       \
+            const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act) {  \
+        gemm_q<T, SBB, GEMM_BM, GEMM_BK>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act);       \
     }
 QTYPES(DEF_GEMM)
 
@@ -892,7 +892,7 @@ template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile(
 
 template <int T, int SBB, int BM>
 __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int nd, const u8* __restrict__ x,
-                                        const int* xrow, float* y, int y_stride, int rows, int nsb, int act) {
+                                        const int* xrow, float* y, int y_stride, int rows, int n64, int act) {
     constexpr int P = 80;  // smem pitch in bytes: 64 int8 + padding (conflict-free fragments, 16-byte aligned rows)
     static_assert(BM == 128, "one X row half per thread");
     __shared__ __align__(16) signed char xq[2][BM * P], wq[64 * P];
@@ -900,7 +900,7 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
     __shared__ float wsc[64][4], wmn[64][4];
     GemmTile tl = tiles ? tiles[blockIdx.y] : GemmTile{wd, (int)blockIdx.y * BM, min(BM, nd - (int)blockIdx.y * BM)};
     int n0 = blockIdx.x * 64, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
-    int wm = (warp >> 1) * 32, wn = (warp & 1) * 32, cols = nsb * 256;
+    int wm = (warp >> 1) * 32, wn = (warp & 1) * 32, cols = n64 * 64;
     // X: thread copies 32 int8 (half of the row's 64) of row xr_, plus the row's scales (xh = 0) or sums (xh = 1).
     int xr_ = tid >> 1, xh = tid & 1;
     bool xok = xr_ < tl.cnt;
@@ -915,9 +915,9 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
     };
     // W: thread decodes the 16 weights (subs 2 wi, 2 wi + 1 of the step) of row wr_.
     int wr_ = tid >> 2, wi = tid & 3;
-    const u8* wp = n0 + wr_ < rows ? tl.w + (size_t)(n0 + wr_) * nsb * SBB : nullptr;
+    const u8* wp = n0 + wr_ < rows ? tl.w + (size_t)(n0 + wr_) * ROWB(cols, SBB) : nullptr;
     float acc[2][4][4] = {};
-    const int nk = nsb * 4;
+    const int nk = n64;
     // W step kb is decoded into registers during step kb - 1's mma and stored after it.
     int lo0, hi0, lo1, hi1; float wd0, wm0;
     auto ldw = [&](int kb) {
@@ -1010,16 +1010,18 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
 
 #define DEF_GEMMI(T, NAME, SBB)                                                                                   \
     extern "C" __global__ void __launch_bounds__(256) gemmi_##NAME(const GemmTile* tiles, const u8* wd, int nd,    \
-            const u8* x, const int* xrow, float* y, int y_stride, int rows, int nsb, int act) {                    \
-        gemmi_q<T, SBB, 128>(tiles, wd, nd, x, xrow, y, y_stride, rows, nsb, act);                              \
+            const u8* x, const int* xrow, float* y, int y_stride, int rows, int n64, int act) {                    \
+        gemmi_q<T, SBB, 128>(tiles, wd, nd, x, xrow, y, y_stride, rows, n64, act);                              \
     }
 ITYPES(DEF_GEMMI)
 
 // ---- elementwise / norm ----
 
 // grid = rows. out[r] = rmsnorm(x[r]) * w (same w for every row). xq (optional): out also quantized as quant_xq does.
+// Row r takes gamma row r % wr of w (wr > 1: hyper-connection streams, one gamma per stream).
 extern "C" __global__ void rms_norm(float* x, int x_stride, const float* w, float* out, int out_stride, int n, float eps,
-                                    signed char* xq, const float* res) {
+                                    signed char* xq, const float* res, int wr) {
+    w += (size_t)(blockIdx.x % wr) * n;
     float* xr = x + (size_t)blockIdx.x * x_stride;
     float* o = out + (size_t)blockIdx.x * out_stride;
     float s = 0.0f;

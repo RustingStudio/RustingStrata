@@ -274,7 +274,7 @@ fn prefill_cached_reuses_history() {
 }
 
 /// qwen4exp (hyper-connections, PLE) on the GPU against the CPU reference: token by token, then the same prompt as one
-/// batched forward after `reset`.
+/// batched forward after `reset`, then as a chunked prefill (last logits only).
 #[test]
 fn qwen4exp_gpu_matches_cpu() {
     let _gpu = common::gpu_lock();
@@ -287,12 +287,16 @@ fn qwen4exp_gpu_matches_cpu() {
     let mut st = State::new(&m.cfg);
     let want: Vec<Vec<f32>> = ids.iter().map(|&t| m.step(&mut st, t)).collect();
     for (bk, gpu) in common::backends_except(&["vulkan"]) {
-        let mut gm = GpuModel::load(&m, gpu, 256, 0, 512 << 20, 0).unwrap();
+        // Prefill chunks of 4 tokens: several chunks carry the recurrent, KV and PLE state between them.
+        let mut gm = GpuModel::load(&m, gpu, 256, 4, 512 << 20, 0).unwrap();
         let mut got: Vec<Vec<f32>> = ids.iter().map(|&t| gm.step(t).unwrap()).collect();
         gm.reset().unwrap();
         let n = ids.len().min(rusting_strata::cpu_worker::TMAX);
         got.extend(gm.verify(&ids[..n]).unwrap());
-        for (i, (g, w)) in got.iter().zip(want.iter().chain(&want[..n])).enumerate() {
+        gm.reset().unwrap();
+        gm.short = 0;
+        got.push(gm.prefill(&ids).unwrap());
+        for (i, (g, w)) in got.iter().zip(want.iter().chain(&want[..n]).chain(want.last())).enumerate() {
             let range = w.iter().fold(f32::MIN, |a, &b| a.max(b)) - w.iter().fold(f32::MAX, |a, &b| a.min(b));
             let diff = g.iter().zip(w).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
             eprintln!("{bk} row {i}: argmax {} vs {}, max |dlogit| {diff:.4} (range {range:.2})", ops::argmax(g), ops::argmax(w));

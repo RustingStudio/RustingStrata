@@ -24,6 +24,11 @@ fn gq_min(pos: usize, nt: usize) -> i32 {
 
 mod prefill;
 
+/// Scratch rows for `hc_read` and `ple`: the decode buffers (`GpuModel::hc_at`) or the prefill slab, where `gemm`
+/// runs their matrices as dense GEMMs over the chunk. `hq` 0: no int8 copy of h.
+#[derive(Clone, Copy)]
+struct HcAt { xn: u64, lo: u64, hg: u64, inj: u64, h: u64, hq: u64, emb: u64, pk: u64, pq: u64, pg: u64, pn: u64, pv: u64, gemm: bool }
+
 enum Mixer {
     Delta {
         qkv: GpuTensor, gate: GpuTensor, beta: GpuTensor, alpha: GpuTensor, dt_bias: GpuTensor, a: GpuTensor,
@@ -134,7 +139,6 @@ impl<'a> GpuModel<'a> {
 
         // ponytail: no MTP or batched prefill with hyper-connections yet (their state and row layouts assume one stream).
         let k = if c.n_nextn > 0 && c.hc_n == 0 { k.min(TMAX - 1) } else { 0 };
-        let chunk = if c.hc_n > 0 { 0 } else { chunk };
         let mtp = k > 0;
         let load_layer = |il: usize, kind: LayerKind| -> anyhow::Result<Layer> {
             let mixer = if kind == LayerKind::Delta {
@@ -208,6 +212,9 @@ impl<'a> GpuModel<'a> {
         let (x, logits, ids) = (gpu.zeros::<f32>(TMAX * hcn * c.n_embd)?, gpu.zeros::<f32>(TMAX * c.n_vocab)?, gpu.zeros::<i32>(TMAX * ke)?);
         let amax = gpu.zeros::<i32>(TMAX)?;
         let (slots, step_buf) = (gpu.zeros::<i32>(TMAX * ke)?, gpu.zeros::<i32>(2 * TMAX)?);
+        // Hyper-connection prefill scratch is ~4x larger a token; qwen4exp at 943 tokens (warm) prefills 447 tok/s with
+        // 1024, 347 with 4096 (fewer expert slots).
+        let chunk = if c.hc_n > 0 { chunk.min(1024) } else { chunk };
         let pf = if chunk > 0 { Some(prefill::Scratch::new(m, &*gpu, chunk.min(ctx))?) } else { None };
         let (free1, _) = gpu.mem_info()?;
 
@@ -398,7 +405,7 @@ impl<'a> GpuModel<'a> {
         for (il, l) in self.layers.iter().enumerate() { res = self.layer(il, l, x, step, self.worker.as_ref(), nt, res, gq)?; }
         match (&self.output_norm, &self.output_hc) {
             (Some(on), _) => g.rms_norm_q(x, ne, on.ptr, p("h"), ne, ne, nt, eps, p("hq"), res)?,
-            (None, Some(hr)) => self.hc_read(hr, x, nt)?,
+            (None, Some(hr)) => self.hc_read(hr, x, nt, &self.hc_at())?,
             _ => unreachable!(),
         }
         g.gemvq(&self.output, p("h"), ne, p("hq"), self.logits.addr(), c.n_vocab, nt)
@@ -406,43 +413,52 @@ impl<'a> GpuModel<'a> {
 
     /// Per-stream RMSNorm of nt stacks (rows of hc * n_embd) at `x` with the hc * n_embd gamma `w` into `out`.
     fn gnorm(&self, x: u64, w: u64, out: u64, nt: usize) -> anyhow::Result<()> {
-        let (ne, hc) = (self.m.cfg.n_embd, self.m.cfg.hc_n);
-        for s in 0..hc {
-            let o = 4 * (s * ne) as u64;
-            self.gpu.rms_norm(x + o, hc * ne, w + o, out + o, hc * ne, ne, nt, self.m.cfg.eps)?;
+        let c = &self.m.cfg;
+        self.gpu.rms_norm_streams(x, w, out, c.n_embd, c.hc_n, nt, c.eps)
+    }
+
+    fn hc_at(&self) -> HcAt {
+        let p = |n: &str| self.bufs.get(n).map_or(0, |b| b.addr());
+        HcAt { xn: p("xn"), lo: p("lo"), hg: p("hg"), inj: p("inj"), h: p("h"), hq: p("hq"), emb: p("emb"), pk: p("pk"), pq: p("pq"), pg: p("pg"), pn: p("pn"), pv: p("pv"), gemm: false }
+    }
+
+    /// y[t] = W x[t] for t < nt: GEMV, or a dense GEMM for `a.gemm`.
+    fn hmv(&self, a: &HcAt, w: &GpuTensor, x: u64, xs: usize, y: u64, ys: usize, nt: usize) -> anyhow::Result<()> {
+        if a.gemm { self.gpu.gemm_dense(w, nt, x, xs, y, ys, 0) } else { self.mv(w, x, xs, y, ys, nt) }
+    }
+
+    /// Hyper-connection read of the stacks at `r` (see `Model::hc_read`): the mixed vector into `a.h` (and `a.hq`),
+    /// the injection weights into `a.inj`.
+    fn hc_read(&self, hr: &HcRead, r: u64, nt: usize, a: &HcAt) -> anyhow::Result<()> {
+        let (c, g) = (&self.m.cfg, &self.gpu);
+        let (ne, hc, d) = (c.n_embd, c.hc_n, c.hc_n * c.n_embd);
+        self.gnorm(r, hr.norm.ptr, a.xn, nt)?;
+        match &hr.inject {
+            Some(inj) if a.gemm => {
+                g.gemm_dense(&hr.down, nt, a.xn, d, a.lo, c.hc_rank, 0)?;
+                g.gemm_dense(inj, nt, a.xn, d, a.inj, hc, 0)?;
+            }
+            Some(inj) => g.gemvq2(&hr.down, inj, a.xn, d, 0, a.lo, a.inj, nt)?,
+            None => self.hmv(a, &hr.down, a.xn, d, a.lo, c.hc_rank, nt)?,
         }
+        g.hc_silu(a.lo, 1.0 / hc as f32, nt * c.hc_rank)?;
+        self.hmv(a, &hr.up, a.lo, c.hc_rank, a.hg, d, nt)?;
+        g.hc_mix(a.xn, a.hg, a.h, ne, hc, nt)?;
+        if a.hq != 0 { g.quant_xq(a.h, ne, ne, nt, a.hq)?; }
         Ok(())
     }
 
-    /// Hyper-connection read of the stacks at `r` (see `Model::hc_read`): the mixed vector into "h" (and "hq"), the
-    /// injection weights into "inj".
-    fn hc_read(&self, hr: &HcRead, r: u64, nt: usize) -> anyhow::Result<()> {
+    /// The PLE block (see `Model::ple`) on the stacks at `x`, PLE input in `a.emb`.
+    fn ple(&self, pl: &Ple, x: u64, step: u64, nt: usize, a: &HcAt) -> anyhow::Result<()> {
         let (c, g) = (&self.m.cfg, &self.gpu);
-        let p = |n: &str| self.bufs[n].addr();
         let (ne, hc, d) = (c.n_embd, c.hc_n, c.hc_n * c.n_embd);
-        self.gnorm(r, hr.norm.ptr, p("xn"), nt)?;
-        match &hr.inject {
-            Some(inj) => g.gemvq2(&hr.down, inj, p("xn"), d, 0, p("lo"), p("inj"), nt)?,
-            None => self.mv(&hr.down, p("xn"), d, p("lo"), c.hc_rank, nt)?,
-        }
-        g.hc_silu(p("lo"), 1.0 / hc as f32, nt * c.hc_rank)?;
-        self.mv(&hr.up, p("lo"), c.hc_rank, p("hg"), d, nt)?;
-        g.hc_mix(p("xn"), p("hg"), p("h"), ne, hc, nt)?;
-        g.quant_xq(p("h"), ne, ne, nt, p("hq"))
-    }
-
-    /// The PLE block (see `Model::ple`) on the stacks at `x`, PLE input in "emb".
-    fn ple(&self, pl: &Ple, x: u64, step: u64, nt: usize) -> anyhow::Result<()> {
-        let (c, g) = (&self.m.cfg, &self.gpu);
-        let p = |n: &str| self.bufs[n].addr();
-        let (ne, hc, d) = (c.n_embd, c.hc_n, c.hc_n * c.n_embd);
-        self.mv(&pl.key, p("emb"), ne, p("xn"), d, nt)?;
-        self.gnorm(p("xn"), pl.norm_key.ptr, p("pk"), nt)?;
-        self.gnorm(x, pl.norm_query.ptr, p("pq"), nt)?;
-        self.mv(&pl.value, p("emb"), ne, p("pv"), ne, nt)?;
-        g.ple_gate(p("pk"), p("pq"), p("pv"), p("pg"), ne, hc, nt)?;
-        self.gnorm(p("pg"), pl.norm_conv.ptr, p("pn"), nt)?;
-        g.ple_conv(x, p("pg"), p("pn"), pl.conv.ptr, self.ple_ring.as_ref().unwrap().0.addr(), step, d, nt)
+        self.hmv(a, &pl.key, a.emb, ne, a.xn, d, nt)?;
+        self.gnorm(a.xn, pl.norm_key.ptr, a.pk, nt)?;
+        self.gnorm(x, pl.norm_query.ptr, a.pq, nt)?;
+        self.hmv(a, &pl.value, a.emb, ne, a.pv, ne, nt)?;
+        g.ple_gate(a.pk, a.pq, a.pv, a.pg, ne, hc, nt)?;
+        self.gnorm(a.pg, pl.norm_conv.ptr, a.pn, nt)?;
+        g.ple_conv(x, a.pg, a.pn, pl.conv.ptr, self.ple_ring.as_ref().unwrap().0.addr(), step, d, nt)
     }
 
     /// y[t] = W x[t] for t < nt (strides in floats).
@@ -573,10 +589,11 @@ impl<'a> GpuModel<'a> {
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
         let kv = nkv * hd;
         {
-            if let Some(pl) = &l.ple { self.ple(pl, x, step, nt)?; }
+            let ha = self.hc_at();
+            if let Some(pl) = &l.ple { self.ple(pl, x, step, nt, &ha)?; }
             match (&l.attn_norm, &l.hc) {
                 (Some(an), _) => g.rms_norm_q(x, ne, an.ptr, p("h"), ne, ne, nt, eps, p("hq"), res)?,
-                (None, Some(hc)) => self.hc_read(&hc[0], x, nt)?,
+                (None, Some(hc)) => self.hc_read(&hc[0], x, nt, &ha)?,
                 _ => unreachable!(),
             }
             match &l.mixer {
@@ -613,7 +630,7 @@ impl<'a> GpuModel<'a> {
                 (Some(pn), _) => g.rms_norm_q(x, ne, pn.ptr, p("h"), ne, ne, nt, eps, p("hq"), p("mix"))?,
                 (None, Some(hc)) => {
                     g.hc_write(x, p("mix"), p("inj"), ne, c.hc_n, nt, false)?;
-                    self.hc_read(&hc[1], x, nt)?;
+                    self.hc_read(&hc[1], x, nt, &ha)?;
                 }
                 _ => unreachable!(),
             }

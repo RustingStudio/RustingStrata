@@ -1045,6 +1045,22 @@ fn gemv_partial_superblocks_and_q2_0() {
                     let err = rel_l2(g, &w);
                     assert!(err <= 1e-4, "{what}: moe_gemv expert {e} rel err {err}");
                 }
+                // Prefill GEMM over 130 positions (a full and a partial tile), K in 64-deep steps.
+                let m = 130;
+                let xm = xs(m * cols);
+                let (dxm, dym) = (up(gpu, &xm), gpu.zeros::<f32>(m * rows).unwrap());
+                gpu.gemm_dense(&dt, m, dxm.addr(), cols, dym.addr(), rows, 0).unwrap();
+                let mut wr = vec![0f32; cols];
+                let mut want = vec![0f32; m * rows];
+                for r in 0..rows {
+                    t.row(r, &mut wr);
+                    for (i, xv) in xm.chunks(cols).enumerate() {
+                        want[i * rows + r] = if Gpu::mmq(ty) && cols % 128 == 0 { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
+                                             else { wr.iter().zip(xv).map(|(a, b)| f16r(*a) * f16r(*b)).sum() };
+                    }
+                }
+                let e = rel_l2(&down::<f32>(gpu, &dym), &want);
+                assert!(e <= 1e-4, "{what}: gemm rel err {e}");
             }
         }
         // swiglu_q on rows of 640: the bytes quant_xq gives for swiglu's output.
