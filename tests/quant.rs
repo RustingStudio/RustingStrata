@@ -77,7 +77,7 @@ fn f16_and_q2_0_blocks() {
     let mut blk = vec![0x00, 0x38];
     blk.extend([0xE4u8; 16]);
     assert_eq!(GgmlType::Q2_0.row_bytes(64), 18);
-    assert!(!GgmlType::F16.gpu() && !GgmlType::Q2_0.gpu() && GgmlType::IQ2XS.gpu());
+    assert!(!GgmlType::F16.gpu("cuda") && GgmlType::Q2_0.gpu("cuda") && !GgmlType::Q2_0.gpu("vulkan") && GgmlType::IQ2XS.gpu("vulkan"));
     let mut y = [0f32; 64];
     dequant_row(GgmlType::Q2_0, &blk, &mut y);
     for (j, v) in y.iter().enumerate() { assert_eq!(*v, [-0.5, 0.0, 0.5, 1.0][j % 4], "j={j}"); }

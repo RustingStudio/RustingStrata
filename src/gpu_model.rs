@@ -99,8 +99,8 @@ pub struct GpuModel<'a> {
 impl<'a> GpuModel<'a> {
     /// `chunk`: prefill batch in tokens (0 = no batched prefill). `mtp`: load the MTP draft head (needs `nextn`).
     pub fn load(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, k: usize) -> anyhow::Result<GpuModel<'a>> {
-        if let Some(t) = m.w.g.tensors.values().find(|t| GgmlType::from_u32(t.ty).is_ok_and(|ty| !ty.gpu())) {
-            anyhow::bail!("tensor {} has type {}, which the GPU backends do not support yet", t.name, GgmlType::from_u32(t.ty)?.name());
+        if let Some(t) = m.w.g.tensors.values().find(|t| GgmlType::from_u32(t.ty).is_ok_and(|ty| !ty.gpu(gpu.name()))) {
+            anyhow::bail!("tensor {} has type {}, which the {} backend does not support yet", t.name, GgmlType::from_u32(t.ty)?.name(), gpu.name());
         }
         let c = &m.cfg;
         let up = |name: &str| -> anyhow::Result<GpuTensor> { gpu.upload(&m.w.get(name)?) };
