@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-const QTYPES: [GgmlType; 17] = {
+const QTYPES: [GgmlType; 18] = {
     use GgmlType::*;
-    [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL]
+    [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0]
 };
 const KERNELS: [&str; 26] = [
     "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
@@ -177,6 +177,7 @@ impl Gpu {
         let mut fns = HashMap::new();
         let names = KERNELS.iter().map(|s| s.to_string())
             .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm"].map(|p| kname(p, t))))
+            .chain(QTYPES.iter().flat_map(|&t| ["gemv", "gemvn", "moe_gemv"].map(|p| kname(p, t) + "_p")))
             .chain(QTYPES.iter().filter(|&&t| !Self::float_ty(t)).map(|&t| kname("gemmi", t)))
             .chain([64, 128, 256, 512].iter().flat_map(|h| [format!("attn_decode_{h}"), format!("attn_decode_gqa_{h}")]));
         for n in names {
@@ -210,9 +211,12 @@ impl Gpu {
         Ok(self.stream.alloc_zeros::<T>(n.max(1))?)
     }
 
-    fn nsb(w: &GpuTensor) -> anyhow::Result<i32> {
-        if w.cols % 256 != 0 { bail!("{} tensor with {} columns: GEMV needs a multiple of 256", w.ty.name(), w.cols); }
-        Ok((w.cols / 256) as i32)
+    /// GEMV column count (a multiple of 32 and of the type's block) and kernel name: a partial last super-block
+    /// (cols % 256 != 0) takes the `_p` kernel, keeping its tail out of the full-row one.
+    fn gemv_cols(prefix: &str, ty: GgmlType, cols: usize) -> anyhow::Result<(i32, String)> {
+        let b = ty.block_elems().max(32);
+        if cols % b != 0 { bail!("{} tensor with {cols} columns: GEMV needs a multiple of {b}", ty.name()); }
+        Ok((cols as i32, kname(prefix, ty) + if cols % 256 != 0 { "_p" } else { "" }))
     }
 
     /// Whether the prefill GEMM for `ty` runs on int8 tensor cores (X quantized to int8 per 32) rather than f16.
@@ -279,16 +283,17 @@ impl Gpu {
     /// `pair.1` (token stride `pair.2`).
     fn gemvq_pair(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize, pair: (i64, i64, i32), z: u32) -> anyhow::Result<()> {
         if !(1..=4).contains(&nt) { bail!("gemvn: {nt} inputs (1 to 4)"); }
-        let nsb = Self::nsb(w)?;
+        let (ncols, k1) = Self::gemv_cols("gemv", w.ty, w.cols)?;
         let (mut c, rpw) = Self::gemv_cfg(w.ty, w.rows, w.cols, 1);
         c.shared_mem_bytes = if xq == 0 { c.shared_mem_bytes * nt as u32 } else { 0 };
         c.grid_dim.2 = z;
         // One token: gemv, whose kernel has no nt branches (gemvn's nt = 4 path costs it registers).
         if nt == 1 {
-            launch!(self, &kname("gemv", w.ty), c, w.ptr, x, y, w.rows as i32, nsb, rpw, xq, pair.0, pair.1, pair.2);
+            launch!(self, &k1, c, w.ptr, x, y, w.rows as i32, ncols, rpw, xq, pair.0, pair.1, pair.2);
             return Ok(());
         }
-        launch!(self, &kname("gemvn", w.ty), c, w.ptr, x, x_stride as i32, y, y_stride as i32, w.rows as i32, nsb, rpw, nt as i32, xq, pair.0, pair.1, pair.2);
+        let kn = k1.replacen("gemv", "gemvn", 1);
+        launch!(self, &kn, c, w.ptr, x, x_stride as i32, y, y_stride as i32, w.rows as i32, ncols, rpw, nt as i32, xq, pair.0, pair.1, pair.2);
         Ok(())
     }
 
@@ -427,9 +432,9 @@ impl Backend for Gpu {
     }
 
     fn gemv(&self, w: &GpuTensor, x: u64, y: u64) -> anyhow::Result<()> {
-        let nsb = Self::nsb(w)?;
+        let (ncols, kn) = Self::gemv_cols("gemv", w.ty, w.cols)?;
         let (c, rpw) = Self::gemv_cfg(w.ty, w.rows, w.cols, 1);
-        launch!(self, &kname("gemv", w.ty), c, w.ptr, x, y, w.rows as i32, nsb, rpw, 0u64, 0i64, 0i64, 0i32);
+        launch!(self, &kn, c, w.ptr, x, y, w.rows as i32, ncols, rpw, 0u64, 0i64, 0i64, 0i32);
         Ok(())
     }
 
@@ -453,19 +458,19 @@ impl Backend for Gpu {
     }
 
     fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()> {
-        if cols % 256 != 0 { bail!("{} expert with {cols} columns: GEMV needs a multiple of 256", ty.name()); }
+        let (ncols, kn) = Self::gemv_cols("moe_gemv", ty, cols)?;
         let (mut c, mut rpw) = Self::gemv_cfg(ty, rows, cols, k);
         // At least 2 rows per warp: an expert's x quantization (once per block) then covers 16 rows.
         if rpw == 1 && !Self::float_ty(ty) { rpw = 2; c.grid_dim.0 = rows.div_ceil(16) as u32; }
         let (w2, y2) = pair.unwrap_or((0, 0));
         c.grid_dim.2 = if pair.is_some() { 2 } else { 1 };
         if xq != 0 { c.shared_mem_bytes = 0; }
-        launch!(self, &kname("moe_gemv", ty), c, w, ids, stride as i64, x, x_stride as i32, xg as i32, y, rows as i32, (cols / 256) as i32, rpw, w2, y2, xq);
+        launch!(self, &kn, c, w, ids, stride as i64, x, x_stride as i32, xg as i32, y, rows as i32, ncols, rpw, w2, y2, xq);
         Ok(())
     }
 
     fn dequant(&self, w: &GpuTensor, rows: usize, out: u64) -> anyhow::Result<()> {
-        launch!(self, &kname("dequant", w.ty), cfg((rows as u32, 1), 256, 0), w.ptr, out, (w.cols / 256) as i32);
+        launch!(self, &kname("dequant", w.ty), cfg((rows as u32, 1), 256, 0), w.ptr, out, Self::gemv_cols("dequant", w.ty, w.cols)?.0);
         Ok(())
     }
 
@@ -532,7 +537,7 @@ impl Backend for Gpu {
         Ok(())
     }
     fn swiglu_q(&self, g: u64, u: u64, n: usize, rows: usize, xq: u64) -> anyhow::Result<u64> {
-        launch!(self, "swiglu_q", cfg(((n / 256) as u32, rows as u32), 32, 0), g, u, n as i32, xq);
+        launch!(self, "swiglu_q", cfg((n.div_ceil(256) as u32, rows as u32), 32, 0), g, u, n as i32, xq);
         Ok(xq)
     }
 

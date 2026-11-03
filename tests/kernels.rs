@@ -973,3 +973,88 @@ fn attn_decode_bandwidth() {
     }
 }
 
+
+/// Random rows of `ty` with sane block scales: f16 d in [0.01, 0.02) at each block's start (Q2_0, Q8_0, IQ4_NL), or
+/// float values (F32, BF16).
+fn random_tensor(ty: GgmlType, rows: usize, cols: usize, seed: u32) -> Vec<u8> {
+    let mut s = seed.wrapping_mul(2654435761) | 1;
+    let mut rnd = move || { s ^= s << 13; s ^= s >> 17; s ^= s << 5; s };
+    match ty {
+        GgmlType::F32 => (0..rows * cols).flat_map(|_| ((rnd() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()).collect(),
+        GgmlType::BF16 => (0..rows * cols).flat_map(|_| half::bf16::from_f32((rnd() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()).collect(),
+        _ => {
+            let (bb, n) = (ty.block_bytes(), rows * cols / ty.block_elems());
+            (0..n).flat_map(|_| {
+                let mut b: Vec<u8> = (0..bb).map(|_| rnd() as u8).collect();
+                b[..2].copy_from_slice(&half::f16::from_f32(0.01 + (rnd() % 100) as f32 * 1e-4).to_le_bytes());
+                b
+            }).collect()
+        }
+    }
+}
+
+#[test]
+fn gemv_partial_superblocks_and_q2_0() {
+    for (bk, gpu) in common::backends_except(&["vulkan"]) {
+        let gpu = &*gpu;
+        for ty in [GgmlType::Q2_0, GgmlType::Q8_0, GgmlType::IQ4NL, GgmlType::BF16, GgmlType::F32] {
+            for cols in [640, 320, 2560] {
+                if cols % ty.block_elems() != 0 { continue; }
+                let (rows, nt, ne) = (40, 3, 4);  // ne experts of `rows` rows for moe_gemv
+                let data = random_tensor(ty, ne * rows, cols, cols as u32 + ty as u32);
+                let all = Tensor { ty, cols, rows: ne * rows, data: &data };
+                let t = Tensor { rows, data: &data[..ty.row_bytes(cols as u64) * rows], ..all };
+                let (dt, dall) = (gpu.upload(&t).unwrap(), gpu.upload(&all).unwrap());
+                let what = format!("{bk} {} cols {cols}", ty.name());
+                // dequant
+                let dq = gpu.zeros::<f32>(rows * cols).unwrap();
+                gpu.dequant(&dt, rows, dq.addr()).unwrap();
+                let mut want = vec![0f32; rows * cols];
+                for (r, out) in want.chunks_exact_mut(cols).enumerate() { t.row(r, out); }
+                assert_eq!(down::<f32>(gpu, &dq), want, "{what}: dequant");
+                // gemv, gemvn (nt inputs) and gemvq on quant_xq's x
+                let x = xs(nt * cols + 5)[5..].to_vec();
+                let dx = up(gpu, &x);
+                let want: Vec<Vec<f32>> = x.chunks(cols).map(|xt| { let mut y = vec![0f32; rows]; t.matvec(&as_seen(ty, xt), &mut y); y }).collect();
+                let check = |got: &[f32], t: usize, op: &str| {
+                    let e = rel_l2(got, &want[t]);
+                    assert!(e <= 1e-4, "{what}: {op} token {t} rel err {e}");
+                };
+                let dy = gpu.zeros::<f32>(nt * rows).unwrap();
+                gpu.gemv(&dt, dx.addr(), dy.addr()).unwrap();
+                check(&down::<f32>(gpu, &dy)[..rows], 0, "gemv");
+                gpu.gemvn(&dt, dx.addr(), cols, dy.addr(), rows, nt).unwrap();
+                let got = down::<f32>(gpu, &dy);
+                for k in 0..nt { check(&got[k * rows..(k + 1) * rows], k, "gemvn"); }
+                let xq = gpu.zeros::<u8>(nt * cols * 9 / 8).unwrap();
+                gpu.quant_xq(dx.addr(), cols, cols, nt, xq.addr()).unwrap();
+                let dz = gpu.zeros::<f32>(nt * rows).unwrap();
+                gpu.gemvq(&dt, dx.addr(), cols, if ty.block_elems() > 1 { xq.addr() } else { 0 }, dz.addr(), rows, nt).unwrap();
+                assert_eq!(down::<f32>(gpu, &dz), got, "{what}: gemvq on quant_xq vs gemvn");
+                // moe_gemv: expert ids [3, -1, 1], token k / 1
+                let ids = [3i32, -1, 1];
+                let di = up(gpu, &ids);
+                let dm = gpu.zeros::<f32>(3 * rows).unwrap();
+                gpu.moe_gemv(ty, rows, cols, dall.ptr, dall.bytes() / ne, di.addr(), 3, dx.addr(), cols, 1, dm.addr(), None, 0).unwrap();
+                let got = down::<f32>(gpu, &dm);
+                for (k, &e) in ids.iter().enumerate() {
+                    let g = &got[k * rows..(k + 1) * rows];
+                    if e < 0 { assert!(g.iter().all(|&v| v == 0.0), "{what}: skipped slot written"); continue; }
+                    let mut w = vec![0f32; rows];
+                    all.expert(e as usize, ne).matvec(&as_seen(ty, &x[k * cols..(k + 1) * cols]), &mut w);
+                    let err = rel_l2(g, &w);
+                    assert!(err <= 1e-4, "{what}: moe_gemv expert {e} rel err {err}");
+                }
+            }
+        }
+        // swiglu_q on rows of 640: the bytes quant_xq gives for swiglu's output.
+        let (n, rows) = (640, 3);
+        let (g, u) = (xs(rows * n), xs(rows * n + 9)[9..].to_vec());
+        let (dg, du, dg2) = (up(gpu, &g), up(gpu, &u), up(gpu, &g));
+        let (q1, q2) = (gpu.zeros::<u8>(rows * n * 9 / 8).unwrap(), gpu.zeros::<u8>(rows * n * 9 / 8).unwrap());
+        assert_eq!(gpu.swiglu_q(dg.addr(), du.addr(), n, rows, q1.addr()).unwrap(), q1.addr());
+        gpu.swiglu(dg2.addr(), du.addr(), rows * n).unwrap();
+        gpu.quant_xq(dg2.addr(), n, n, rows, q2.addr()).unwrap();
+        assert_eq!(down::<u8>(gpu, &q1), down::<u8>(gpu, &q2), "{bk}: swiglu_q of 640");
+    }
+}

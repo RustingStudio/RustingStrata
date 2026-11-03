@@ -32,8 +32,8 @@ impl GgmlType {
             IQ1S => 50, IQ1M => 56, IQ2XXS => 66, IQ2XS => 74, IQ2S => 82, IQ3XXS => 98, IQ3S => 110, IQ4XS => 136, IQ4NL => 18,
         }
     }
-    /// The GPU backends have kernels for this type (F16 and Q2_0 are CPU-only so far).
-    pub fn gpu(self) -> bool { !matches!(self, F16 | Q2_0) }
+    /// Backend `backend` ("cuda" or "vulkan") has kernels for this type (F16 is CPU-only, Q2_0 CUDA-only so far).
+    pub fn gpu(self, backend: &str) -> bool { !matches!(self, F16) && (self != Q2_0 || backend == "cuda") }
     pub fn row_bytes(self, n: u64) -> usize { n as usize / self.block_elems() * self.block_bytes() }
     pub fn name(self) -> &'static str {
         match self {
