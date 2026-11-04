@@ -121,6 +121,13 @@ struct Inner {
     pd: vk::PhysicalDevice,
     dev: ash::Device,
     queue: vk::Queue,
+    /// A transfer-only queue (copy engines) for the copies inside `beside`, unless STRATA_VK_NO_TQ; its family and
+    /// the compute family, which every buffer is shared between.
+    tq: Option<vk::Queue>,
+    qfs: [u32; 2],
+    /// Timeline semaphores signalled by each compute submit (`State::cval`) and transfer submit (`State::tval`).
+    csem: vk::Semaphore,
+    tsem: vk::Semaphore,
     mem: vk::PhysicalDeviceMemoryProperties,
     budget: bool,
     /// VK_KHR_cooperative_matrix with the 16 x 16 x 16 f16 / f32 shape is enabled (`gemm_f`, `attn_prefill`).
@@ -160,6 +167,27 @@ struct State {
     /// Inside `batch`: dispatches get no barrier after them (except quant_xq, read by the GEMV after it). quant_xq
     /// output has one scratch buffer, so at most one GEMV in a batch may quantize its own input.
     batch: bool,
+    /// Inside `beside` (with a transfer queue): staged copies go to `tcur` on the transfer queue, after the compute
+    /// submit `bwait` (the work before `beside`).
+    beside: bool,
+    tpool: vk::CommandPool,
+    tcur: Option<vk::CommandBuffer>,
+    tspare: Vec<vk::CommandBuffer>,
+    tused: Vec<vk::CommandBuffer>,
+    /// Bytes copied in `tcur`, from `staging` at `tstart` on.
+    tbytes: usize,
+    tstart: usize,
+    /// Submitted transfer command buffers that may still read `staging`: (start, end, `tsem` value when done). The
+    /// copies inside `beside` use `staging` as a ring, waiting only for these; `cstaged`: a compute-queue copy reads
+    /// it too (until the next wait).
+    tring: std::collections::VecDeque<(usize, usize, u64)>,
+    cstaged: bool,
+    /// Last values signalled on `csem` and `tsem`; `bwait` as above; the next compute submit waits for `tsem` to
+    /// reach `twait` (0: no wait).
+    cval: u64,
+    tval: u64,
+    bwait: u64,
+    twait: u64,
     pipes: HashMap<(&'static str, Vec<u32>), vk::Pipeline>,
     fence: vk::Fence,
     staging: (vk::Buffer, vk::DeviceMemory),
@@ -176,7 +204,8 @@ struct State {
     /// Host-mapped error word that `moe_combine` sets when the CPU worker does not answer: buffer, memory, host
     /// pointer, device address.
     err: (vk::Buffer, vk::DeviceMemory, usize, u64),
-    /// STRATA_VK_PROF: timestamps after each dispatch outside graphs, names in order, and per-name totals (ns, calls)
+    /// STRATA_VK_PROF: timestamps before and after each dispatch outside graphs (its own time, without the copies and
+    /// waits before it), names in order, and per-name totals (ns, calls)
     /// printed on drop.
     prof: Option<(vk::QueryPool, Vec<&'static str>, HashMap<&'static str, (u64, usize)>)>,
 }
@@ -211,6 +240,9 @@ impl Drop for Inner {
             self.dev.destroy_fence(st.fence, None);
             self.dev.destroy_command_pool(st.pool, None);
             self.dev.destroy_command_pool(st.gpool, None);
+            self.dev.destroy_command_pool(st.tpool, None);
+            self.dev.destroy_semaphore(self.csem, None);
+            self.dev.destroy_semaphore(self.tsem, None);
             for &p in st.pipes.values() { self.dev.destroy_pipeline(p, None) }
             self.dev.destroy_pipeline_layout(self.layout, None);
             self.dev.destroy_device(None);
@@ -307,7 +339,7 @@ impl Vk {
         let mut fcoop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
         let mut f11 = vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(true);
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true)
-            .storage_buffer8_bit_access(true).shader_int8(true).shader_float16(true).vulkan_memory_model(true).vulkan_memory_model_device_scope(true);
+            .storage_buffer8_bit_access(true).timeline_semaphore(true).shader_int8(true).shader_float16(true).vulkan_memory_model(true).vulkan_memory_model_device_scope(true);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default().subgroup_size_control(true).compute_full_subgroups(true)
             .shader_integer_dot_product(true);
         let mut f = features(&mut f11, &mut f12, &mut f13);
@@ -318,10 +350,18 @@ impl Vk {
         if stats { f = f.push_next(&mut fstats) }
         if amd_coherent { f = f.push_next(&mut fdc) }
         let prio = [1.0];
-        let qi = [vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio)];
+        let tf = unsafe { instance.get_physical_device_queue_family_properties(pd) }.iter()
+            .position(|q| q.queue_flags.contains(vk::QueueFlags::TRANSFER) && !q.queue_flags.intersects(vk::QueueFlags::COMPUTE | vk::QueueFlags::GRAPHICS))
+            .filter(|_| std::env::var_os("STRATA_VK_NO_TQ").is_none()).map(|i| i as u32);
+        let qi: Vec<_> = [qf].into_iter().chain(tf).map(|f| vk::DeviceQueueCreateInfo::default().queue_family_index(f).queue_priorities(&prio)).collect();
         let dev = unsafe { instance.create_device(pd, &vk::DeviceCreateInfo::default().queue_create_infos(&qi)
             .enabled_extension_names(&exts).push_next(&mut f), None) }.with_context(|| format!("create device {name}"))?;
         let queue = unsafe { dev.get_device_queue(qf, 0) };
+        let tq = tf.map(|f| unsafe { dev.get_device_queue(f, 0) });
+        let tpool = unsafe { dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(tf.unwrap_or(qf)), None) }?;
+        let mut sti = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+        let csem = unsafe { dev.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut sti), None) }?;
+        let tsem = unsafe { dev.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut sti), None) }?;
         let mem = unsafe { instance.get_physical_device_memory_properties(pd) };
         let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(qf);
         let pool = unsafe { dev.create_command_pool(&pool_info, None) }?;
@@ -329,10 +369,11 @@ impl Vk {
         let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None) }?;
         let pc = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(128)];
         let layout = unsafe { dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc), None) }?;
-        let st = State { pool, spare: vec![], used: vec![], cur: None, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false,
+        let st = State { pool, spare: vec![], used: vec![], cur: None, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false, beside: false, tpool, tcur: None,
+            tspare: vec![], tused: vec![], tbytes: 0, tstart: 0, tring: Default::default(), cstaged: false, cval: 0, tval: 0, bwait: 0, twait: 0,
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, mem, budget, coop, coop_i8, amd_coherent, amd_plain, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, coop, coop_i8, amd_coherent, amd_plain, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -361,7 +402,9 @@ impl Inner {
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
         let size = bytes.max(1).next_multiple_of(4) as u64;
-        let buf = unsafe { self.dev.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(usage), None) }?;
+        let mut bi = vk::BufferCreateInfo::default().size(size).usage(usage);
+        if self.tq.is_some() { bi = bi.sharing_mode(vk::SharingMode::CONCURRENT).queue_family_indices(&self.qfs); }
+        let buf = unsafe { self.dev.create_buffer(&bi, None) }?;
         let req = unsafe { self.dev.get_buffer_memory_requirements(buf) };
         // Memory the GPU does not cache (AMD flags 0xc0) only when asked for: it would be slow for anything else.
         let ok = |f: vk::MemoryPropertyFlags, want| f.contains(want) && (f & vk::MemoryPropertyFlags::from_raw(0xc0) & !want).is_empty();
@@ -416,19 +459,34 @@ impl Inner {
         cbs.extend(graph);
         if cbs.is_empty() && !(wait && st.busy) { return Ok(()); }
         let fence = if wait { st.fence } else { vk::Fence::null() };
-        unsafe { self.dev.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&cbs)], fence) }?;
+        st.cval += 1;
+        let (wv, sv, ws, ss, wst) = ([st.twait], [st.cval], [self.tsem], [self.csem], [vk::PipelineStageFlags::ALL_COMMANDS]);
+        let n = (st.twait > 0) as usize;
+        let mut tl = vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&wv[..n]).signal_semaphore_values(&sv);
+        let si = vk::SubmitInfo::default().command_buffers(&cbs).wait_semaphores(&ws[..n]).wait_dst_stage_mask(&wst[..n])
+            .signal_semaphores(&ss).push_next(&mut tl);
+        unsafe { self.dev.queue_submit(self.queue, &[si], fence) }?;
+        st.twait = 0;
         st.busy = true;
         if wait {
-            // A fence also covers every earlier submission on the queue.
+            // A fence also covers every earlier submission on the queue; the transfer queue's copies are waited too.
             unsafe {
                 self.dev.wait_for_fences(&[st.fence], true, u64::MAX)?;
                 self.dev.reset_fences(&[st.fence])?;
                 self.dev.reset_command_pool(st.pool, vk::CommandPoolResetFlags::empty())?;
+                if st.tval > 0 {
+                    self.dev.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&[self.tsem]).values(&[st.tval]), u64::MAX)?;
+                    self.dev.reset_command_pool(st.tpool, vk::CommandPoolResetFlags::empty())?;
+                    let t = std::mem::take(&mut st.tused);
+                    st.tspare.extend(t);
+                }
+                st.tring.clear();
+                st.cstaged = false;
             }
             if let Some((qp, names, tot)) = &mut st.prof { if !names.is_empty() {
-                let mut t = vec![0u64; names.len() + 1];
+                let mut t = vec![0u64; 2 * names.len()];
                 unsafe { self.dev.get_query_pool_results(*qp, 0, &mut t, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT) }?;
-                for (i, n) in names.drain(..).enumerate() { let e = tot.entry(n).or_default(); e.0 += t[i + 1] - t[i]; e.1 += 1; }
+                for (i, n) in names.drain(..).enumerate() { let e = tot.entry(n).or_default(); e.0 += t[2 * i + 1] - t[2 * i]; e.1 += 1; }
             } }
             let used = std::mem::take(&mut st.used);
             st.spare.extend(used);
@@ -449,7 +507,48 @@ impl Inner {
     /// Submit and wait for everything queued.
     fn flush(&self, st: &mut State) -> anyhow::Result<()> {
         ensure!(st.rec.is_none(), "a host copy or sync while recording a graph");
+        self.tsubmit(st)?;
         self.submit(st, None, true)
+    }
+
+    /// Submit the open transfer command buffer, after compute submit `bwait`.
+    fn tsubmit(&self, st: &mut State) -> anyhow::Result<()> {
+        let (Some(c), Some(q)) = (st.tcur.take(), self.tq) else { return Ok(()) };
+        unsafe { self.dev.end_command_buffer(c) }?;
+        st.tused.push(c);
+        st.tval += 1;
+        let (a, b, v) = (st.tstart, st.staged, st.tval);
+        st.tring.push_back((a, b, v));
+        st.tbytes = 0;
+        let (wv, sv, ws, ss, wst) = ([st.bwait], [st.tval], [self.csem], [self.tsem], [vk::PipelineStageFlags::TRANSFER]);
+        let mut tl = vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&wv).signal_semaphore_values(&sv);
+        let cs = [c];
+        let si = vk::SubmitInfo::default().command_buffers(&cs).wait_semaphores(&ws).wait_dst_stage_mask(&wst)
+            .signal_semaphores(&ss).push_next(&mut tl);
+        unsafe { self.dev.queue_submit(q, &[si], vk::Fence::null()) }?;
+        st.busy = true;
+        Ok(())
+    }
+
+    /// Wait for the transfer submits that read `staging` bytes `at .. at + n`.
+    fn ring_wait(&self, st: &mut State, at: usize, n: usize) -> anyhow::Result<()> {
+        if let Some(v) = st.tring.iter().filter(|r| r.0 < at + n && at < r.1).map(|r| r.2).max() {
+            unsafe { self.dev.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&[self.tsem]).values(&[v]), u64::MAX) }?;
+            st.tring.retain(|r| r.2 > v);
+        }
+        Ok(())
+    }
+
+    /// The open transfer command buffer, begun if needed.
+    fn topen(&self, st: &mut State) -> anyhow::Result<vk::CommandBuffer> {
+        if let Some(c) = st.tcur { return Ok(c); }
+        st.tstart = st.staged;
+        let c = match st.tspare.pop() { Some(c) => c, None => unsafe { self.dev.allocate_command_buffers(
+            &vk::CommandBufferAllocateInfo::default().command_pool(st.tpool).command_buffer_count(1)) }?[0] };
+        unsafe { self.dev.begin_command_buffer(c, &vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)) }?;
+        st.tcur = Some(c);
+        Ok(c)
     }
 
     /// The pipeline of kernel `name` with specialization constants `spec` (ids 0, 1, ...), created on first use.
@@ -522,13 +621,14 @@ impl Vk {
         unsafe {
             d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, p);
             d.cmd_push_constants(cb, self.0.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
-            if st.rec.is_none() { if let Some((qp, names, _)) = &mut st.prof { if names.is_empty() {
-                d.cmd_reset_query_pool(cb, *qp, 0, 65536); d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, *qp, 0); } } }
+            if st.rec.is_none() { if let Some((qp, names, _)) = &mut st.prof { if names.len() < 32767 {
+                if names.is_empty() { d.cmd_reset_query_pool(cb, *qp, 0, 65536); }
+                d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, *qp, 2 * names.len() as u32); } } }
             d.cmd_dispatch(cb, groups[0] as u32, groups[1] as u32, groups[2] as u32);
         }
         if !st.batch || name == "quant_xq" { self.0.barrier(cb, false); }
-        if st.rec.is_none() { if let Some((qp, names, _)) = &mut st.prof { if names.len() < 65535 {
-            names.push(name); unsafe { d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, *qp, names.len() as u32) } } } }
+        if st.rec.is_none() { if let Some((qp, names, _)) = &mut st.prof { if names.len() < 32767 {
+            unsafe { d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, *qp, 2 * names.len() as u32 + 1) }; names.push(name); } } }
         Ok(())
     }
 
@@ -649,12 +749,32 @@ impl Backend for Vk {
         // Larger copies fill `staging` front to back and wait only when it is full, so a run of uploads (experts
         // streamed in prefill) overlaps each copy on the GPU with the host filling the next.
         ensure!(st.rec.is_none(), "a host copy while recording a graph");
+        if st.beside {
+            for (i, c) in src.chunks(STAGING).enumerate() {
+                if st.staged + c.len() > STAGING {
+                    // Wrap to the start of the ring, past the copies of the open command buffer.
+                    if st.cstaged { self.0.flush(&mut st)?; } else { self.0.tsubmit(&mut st)?; st.staged = 0; }
+                }
+                let at = st.staged;
+                self.0.ring_wait(&mut st, at, c.len())?;
+                let (b, o) = st.find(dst.addr() + (off + i * STAGING) as u64, c.len())?;
+                unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), (st.map + at) as *mut u8, c.len()) };
+                let cb = self.0.topen(&mut st)?;
+                let r = vk::BufferCopy::default().src_offset(at as u64).dst_offset(o).size(c.len() as u64);
+                unsafe { self.0.dev.cmd_copy_buffer(cb, st.staging.0, b, &[r]) };
+                st.staged = (at + c.len()).next_multiple_of(256);
+                st.tbytes += c.len();
+                if st.tbytes >= SUBMIT_BYTES { self.0.tsubmit(&mut st)?; }
+            }
+            return Ok(());
+        }
         for (i, c) in src.chunks(STAGING).enumerate() {
             if st.staged + c.len() > STAGING { self.0.flush(&mut st)?; }
             // Submit the work recorded so far first, so the GPU runs it while the host fills staging.
             if st.cur.is_some() && st.ops != st.copied.0 { self.0.submit(&mut st, None, false)?; }
             let (b, o) = st.find(dst.addr() + (off + i * STAGING) as u64, c.len())?;
             let at = st.staged;
+            self.0.ring_wait(&mut st, at, c.len())?;
             unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), (st.map + at) as *mut u8, c.len()) };
             let cb = self.0.open_cb(&mut st)?;
             let r = vk::BufferCopy::default().src_offset(at as u64).dst_offset(o).size(c.len() as u64);
@@ -662,6 +782,7 @@ impl Backend for Vk {
             // Inside `batch` the copy may overlap the dispatches after it; the batch ends with a barrier.
             if !st.batch { self.0.barrier(cb, false); }
             st.staged = (at + c.len()).next_multiple_of(256);
+            st.cstaged = true;
             st.copied = (st.ops, st.copied.1 + c.len());
             if st.copied.1 >= SUBMIT_BYTES { self.0.submit(&mut st, None, false)?; }
         }
@@ -673,6 +794,7 @@ impl Backend for Vk {
         let mut st = self.0.st();
         for (i, c) in dst.chunks_mut(STAGING).enumerate() {
             let (b, o) = st.find(src.addr() + (off + i * STAGING) as u64, c.len())?;
+            self.0.ring_wait(&mut st, 0, c.len())?;  // transfer-queue copies may still read staging
             let cb = self.0.cb(&mut st)?;
             let r = vk::BufferCopy::default().src_offset(o).size(c.len() as u64);
             unsafe { self.0.dev.cmd_copy_buffer(cb, b, st.staging.0, &[r]) };
@@ -728,6 +850,26 @@ impl Backend for Vk {
         st.batch = false;
         let cb = self.0.cb(&mut st)?;
         self.0.barrier(cb, false);
+        r
+    }
+    fn beside_overlaps(&self) -> bool { self.0.tq.is_some() }
+    /// With a transfer queue: the work so far is submitted, the copies of `f` go to the transfer queue after it, and
+    /// `f`'s dispatches are submitted without waiting for them; the next compute submit waits for the copies.
+    fn beside(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
+        if self.0.tq.is_none() { return f(); }
+        {
+            let mut st = self.0.st();
+            ensure!(st.rec.is_none() && !st.batch, "beside inside a graph or batch");
+            self.0.submit(&mut st, None, false)?;
+            st.bwait = st.cval;
+            st.beside = true;
+        }
+        let r = f();
+        let mut st = self.0.st();
+        st.beside = false;
+        self.0.tsubmit(&mut st)?;
+        self.0.submit(&mut st, None, false)?;
+        st.twait = st.tval;
         r
     }
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
