@@ -44,14 +44,15 @@ struct Cur<'a> { b: &'a [u8], p: usize }
 
 impl<'a> Cur<'a> {
     fn take(&mut self, n: usize) -> anyhow::Result<&'a [u8]> {
-        let s = self.b.get(self.p..self.p + n).context("GGUF truncated")?;
-        self.p += n;
+        let end = self.p.checked_add(n).context("GGUF truncated")?;
+        let s = self.b.get(self.p..end).context("GGUF truncated")?;
+        self.p = end;
         Ok(s)
     }
     fn u32(&mut self) -> anyhow::Result<u32> { Ok(u32::from_le_bytes(self.take(4)?.try_into()?)) }
     fn u64(&mut self) -> anyhow::Result<u64> { Ok(u64::from_le_bytes(self.take(8)?.try_into()?)) }
     fn str(&mut self) -> anyhow::Result<String> {
-        let n = self.u64()? as usize;
+        let n = usize::try_from(self.u64()?).context("GGUF string length out of range")?;
         Ok(String::from_utf8_lossy(self.take(n)?).into_owned())
     }
     fn val(&mut self, t: u32) -> anyhow::Result<Value> {
@@ -66,8 +67,9 @@ impl<'a> Cur<'a> {
             7 => Value::Bool(self.take(1)?[0] != 0),
             8 => Value::Str(self.str()?),
             9 => {
-                let (et, n) = (self.u32()?, self.u64()? as usize);
-                let mut a = Vec::with_capacity(n);
+                let (et, n) = (self.u32()?, usize::try_from(self.u64()?).context("GGUF array length out of range")?);
+                if n > self.b.len().saturating_sub(self.p) { bail!("GGUF array length exceeds remaining data"); }
+                let mut a = Vec::with_capacity(n.min(1024));
                 for _ in 0..n { a.push(self.val(et)?); }
                 Value::Arr(a)
             }
@@ -120,8 +122,9 @@ impl Gguf {
             let (ty, offset) = (c.u32()?, c.u64()?);
             tensors.insert(name.clone(), TensorInfo { name, dims, ty, offset, file });
         }
-        let align = meta.get("general.alignment").and_then(Value::as_u64).unwrap_or(32) as usize;
-        let data_offset = c.p.div_ceil(align) * align;
+        let align = usize::try_from(meta.get("general.alignment").and_then(Value::as_u64).unwrap_or(32))
+            .context("GGUF alignment out of range")?;
+        let data_offset = c.p.checked_next_multiple_of(align).context("invalid GGUF alignment")?;
         // A cut-off download keeps a valid header; catch it here, not as a slice panic in `bytes`.
         for t in tensors.values() {
             let Ok(ty) = GgmlType::from_u32(t.ty) else { continue };  // Weights::validate reports it
