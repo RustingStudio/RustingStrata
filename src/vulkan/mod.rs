@@ -584,14 +584,19 @@ impl Vk {
         ensure!(cols % 64 == 0, "{} matrix with {cols} columns: GEMM needs a multiple of 64", ty.name());
         if n_tiles == 0 { return Ok(()); }
         let (spec, grid, nk) = (self.wspec(ty), [rows.div_ceil(64), n_tiles, 1], (cols / 64) as u32);
+        // A dense GEMM of few workgroups runs as gemm_fs/gemmi_s (cooperative matrices only), 32 positions a
+        // workgroup (as on CUDA).
+        let f = !crate::cuda::Gpu::mmq(ty) || cols % 128 != 0;
+        let sm = tiles == 0 && grid[0] * grid[1] < 112 && if f { self.0.coop } else { self.0.coop_i8 };
+        let grid = if sm { [grid[0], nd.div_ceil(32), 1] } else { grid };
         let (same, act) = (act & SAME_X != 0, act & !SAME_X);
         let tail = [&(rows as u32) as &dyn Arg, &nk, &act];
         let mut q8 = self.3.lock().unwrap();
         // gemmi loads q8 rows 16 bytes at a time: their stride (cols * 11 / 8) is aligned only for cols % 128 == 0.
-        if !crate::cuda::Gpu::mmq(ty) || cols % 128 != 0 {
+        if f {
             if !same { q8.1 = None; }
             let args: [&dyn Arg; 11] = [&tiles, &wd, &x, &xrow, &y, &(nd as u32), &(x_stride as u32), &(y_stride as u32), tail[0], tail[1], tail[2]];
-            self.run(if self.0.coop { "gemm_f" } else { "gemm_f_dp" }, &spec, grid, &args)?;
+            self.run(if !self.0.coop { "gemm_f_dp" } else if sm { "gemm_fs" } else { "gemm_f" }, &spec, grid, &args)?;
             // Tile lists: gemm_f skips the tiles of at most 32 positions, which gemm_fs takes (as gemms_* on CUDA).
             if self.0.coop && tiles != 0 { self.run("gemm_fs", &spec, grid, &args)?; }
             return Ok(());
@@ -606,7 +611,7 @@ impl Vk {
             q8.1 = key;
         }
         let args: [&dyn Arg; 10] = [&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2]];
-        self.run(if self.0.coop_i8 { "gemmi" } else { "gemmi_dp" }, &spec, grid, &args)?;
+        self.run(if !self.0.coop_i8 { "gemmi_dp" } else if sm { "gemmi_s" } else { "gemmi" }, &spec, grid, &args)?;
         if self.0.coop_i8 && tiles != 0 { self.run("gemmi_s", &spec, grid, &args)?; }
         Ok(())
     }

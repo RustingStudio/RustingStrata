@@ -84,7 +84,7 @@ void main() {
         uint64_t t = p.tiles.v[2 * gl_WorkGroupID.y + 1];
         wt = U8(p.tiles.v[2 * gl_WorkGroupID.y]); m0 = uint(t); cnt = uint(t >> 32);
     } else {
-        wt = U8(p.wd); m0 = gl_WorkGroupID.y * BM; cnt = min(BM, p.nd - m0);
+        wt = U8(p.wd); m0 = gl_WorkGroupID.y * XM; cnt = min(XM, p.nd - m0);
     }
 #if COOP
     if (uint64_t(p.tiles) != 0 && (cnt <= 32) != (SM != 0)) return;
