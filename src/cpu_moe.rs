@@ -450,18 +450,35 @@ mod avx2 {
             // As in dot_iq3s: byte k of a lane picks sign byte k / 8, then bit k % 8.
             let m1 = _mm256_set_epi64x(0x0303030303030303, 0x0202020202020202, 0x0101010101010101, 0);
             let m2 = _mm256_set1_epi64x(0x8040201008040201u64 as i64);
+            // Grid index high bits: word p of the 32 indices takes qh[p / 4] << (8 - 2 * (p % 4)) & 0x300.
+            let hq0 = _mm256_set_epi64x(0x8003800380038003u64 as i64, 0x8002800280028002u64 as i64, 0x8001800180018001u64 as i64, 0x8000800080008000u64 as i64);
+            let hq1 = _mm256_add_epi16(hq0, _mm256_set1_epi16(4));
+            let hmul = _mm256_set1_epi64x(0x0004_0010_0040_0100);
+            let h3 = _mm256_set1_epi16(0x300);
+            // Scale words: the low lane takes byte 2 ib of the 16 block scales, the high lane byte 2 ib + 1.
+            let sm0 = _mm256_set_epi64x(0x8001800180018001u64 as i64, 0x8001800180018001u64 as i64, 0x8000800080008000u64 as i64, 0x8000800080008000u64 as i64);
+            let (sstep, n15) = (_mm256_set1_epi16(2), _mm_set1_epi8(15));
             let mut acc = _mm256_setzero_ps();
             for (b, y) in row.chunks_exact(82).zip(xq) {
-                let (qs, qh, sc) = (&b[2..34], &b[66..74], &b[74..82]);
-                let mut sumi = _mm256_setzero_si256();
+                let qh = _mm256_broadcastsi128_si256(_mm_loadl_epi64(b[66..74].as_ptr() as *const __m128i));
+                let mut idx = [0u16; 32];
+                for (h, hq) in [hq0, hq1].into_iter().enumerate() {
+                    let lo = _mm256_cvtepu8_epi16(_mm_loadu_si128(b[2 + 16 * h..18 + 16 * h].as_ptr() as *const __m128i));
+                    let hi = _mm256_and_si256(_mm256_mullo_epi16(_mm256_shuffle_epi8(qh, hq), hmul), h3);
+                    _mm256_storeu_si256(idx[16 * h..].as_mut_ptr() as *mut __m256i, _mm256_or_si256(lo, hi));
+                }
+                let sc = _mm_loadl_epi64(b[74..82].as_ptr() as *const __m128i);
+                let sc = _mm_unpacklo_epi8(_mm_and_si128(sc, n15), _mm_and_si128(_mm_srli_epi16(sc, 4), n15));
+                let sc = _mm256_broadcastsi128_si256(_mm_add_epi8(_mm_add_epi8(sc, sc), _mm_set1_epi8(1)));
+                let (mut sm, mut sumi) = (sm0, _mm256_setzero_si256());
                 for ib in 0..8 {
-                    let g = |l: usize| IQ2S_GRID[qs[4 * ib + l] as usize | ((qh[ib] as usize) << (8 - 2 * l) & 0x300)] as i64;
+                    let g = |l: usize| IQ2S_GRID[idx[4 * ib + l] as usize & 1023] as i64;
                     let grid = _mm256_set_epi64x(g(3), g(2), g(1), g(0));
                     let sb = i32::from_le_bytes(b[34 + 4 * ib..38 + 4 * ib].try_into().unwrap());
                     let s = _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32(sb), m1), m2), m2);
-                    let q = q8(y, 32 * ib);
-                    let dot = _mm256_maddubs_epi16(grid, _mm256_sub_epi8(_mm256_xor_si256(s, q), s));
-                    sumi = _mm256_add_epi32(sumi, udot_scale(dot, 2 * (sc[ib] & 0xF) as i32 + 1, 2 * (sc[ib] >> 4) as i32 + 1));
+                    let dot = _mm256_maddubs_epi16(grid, _mm256_sub_epi8(_mm256_xor_si256(s, q8(y, 32 * ib)), s));
+                    sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(dot, _mm256_shuffle_epi8(sc, sm)));
+                    sm = _mm256_add_epi16(sm, sstep);
                 }
                 acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(sumi), acc);
             }
@@ -583,24 +600,43 @@ mod avx2 {
         }
     }
 
+    /// The 64 crumbs of a Q2_0 block in element order, as two vectors of 32 bytes.
+    #[cfg(all(target_feature = "avx512vbmi", target_feature = "avx512vl"))]
+    #[inline(always)]
+    unsafe fn q2_0_crumbs(b: &[u8]) -> (__m256i, __m256i) { unsafe {
+        // Output byte i of qword t takes bits 16 t + 2 i of the source qword: element 8 t + i of 32.
+        let ctl = _mm256_set_epi64x(0x3e3c3a3836343230, 0x2e2c2a2826242220, 0x1e1c1a1816141210, 0x0e0c0a0806040200);
+        let h = |o: usize| _mm256_and_si256(_mm256_multishift_epi64_epi8(ctl, _mm256_set1_epi64x(i64::from_le_bytes(b[o..o + 8].try_into().unwrap()))), _mm256_set1_epi8(3));
+        (h(2), h(10))
+    } }
+    #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "avx512vl")))]
+    #[inline(always)]
+    unsafe fn q2_0_crumbs(b: &[u8]) -> (__m256i, __m256i) { unsafe {
+        let v = _mm_loadu_si128(b[2..18].as_ptr() as *const __m128i);
+        let c = |k: i32| _mm_and_si128(_mm_srl_epi16(v, _mm_cvtsi32_si128(2 * k)), _mm_set1_epi8(3));
+        let (c0, c1, c2, c3) = (c(0), c(1), c(2), c(3));
+        // Re-interleave the crumbs into element order: byte k holds elements 4k..4k+3.
+        let (lo01, lo23) = (_mm_unpacklo_epi8(c0, c1), _mm_unpacklo_epi8(c2, c3));
+        let (hi01, hi23) = (_mm_unpackhi_epi8(c0, c1), _mm_unpackhi_epi8(c2, c3));
+        (_mm256_set_m128i(_mm_unpackhi_epi16(lo01, lo23), _mm_unpacklo_epi16(lo01, lo23)),
+         _mm256_set_m128i(_mm_unpackhi_epi16(hi01, hi23), _mm_unpacklo_epi16(hi01, hi23)))
+    } }
     pub fn dot_q2_0(row: &[u8], xq: &[Q8K]) -> f32 {
         unsafe {
             let (mut acc, mut sumf) = (_mm256_setzero_ps(), 0f32);
-            let (m3, ones) = (_mm_set1_epi8(3), _mm256_set1_epi16(1));
-            for (i, b) in row.chunks_exact(18).enumerate() {
-                let (y, o) = (&xq[i / 4], i % 4 * 64);
-                let v = _mm_loadu_si128(b[2..18].as_ptr() as *const __m128i);
-                let c = |k: i32| _mm_and_si128(_mm_srl_epi16(v, _mm_cvtsi32_si128(2 * k)), m3);
-                let (c0, c1, c2, c3) = (c(0), c(1), c(2), c(3));
-                // Re-interleave the crumbs into element order: byte k holds elements 4k..4k+3.
-                let (lo01, lo23) = (_mm_unpacklo_epi8(c0, c1), _mm_unpacklo_epi8(c2, c3));
-                let (hi01, hi23) = (_mm_unpackhi_epi8(c0, c1), _mm_unpackhi_epi8(c2, c3));
-                let w0 = _mm256_set_m128i(_mm_unpackhi_epi16(lo01, lo23), _mm_unpacklo_epi16(lo01, lo23));
-                let w1 = _mm256_set_m128i(_mm_unpackhi_epi16(hi01, hi23), _mm_unpacklo_epi16(hi01, hi23));
-                let p = _mm256_add_epi16(_mm256_maddubs_epi16(w0, q8(y, o)), _mm256_maddubs_epi16(w1, q8(y, o + 32)));
-                let d = d16(b) * y.d;
-                acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_madd_epi16(p, ones)), acc);
-                sumf -= d * y.bs[o / 16..o / 16 + 4].iter().map(|&v| v as i32).sum::<i32>() as f32;
+            let ones = _mm256_set1_epi16(1);
+            for (sb, y) in row.chunks(72).zip(xq) {
+                // The sums of y over each 64 values, in lanes 0, 1, 4 and 5.
+                let bs = _mm256_madd_epi16(_mm256_loadu_si256(y.bs.as_ptr() as *const __m256i), ones);
+                let mut m = [0f32; 8];
+                _mm256_storeu_ps(m.as_mut_ptr(), _mm256_cvtepi32_ps(_mm256_hadd_epi32(bs, bs)));
+                for (j, b) in sb.chunks_exact(18).enumerate() {
+                    let (w0, w1) = q2_0_crumbs(b);
+                    let p = _mm256_add_epi16(_mm256_maddubs_epi16(w0, q8(y, 64 * j)), _mm256_maddubs_epi16(w1, q8(y, 64 * j + 32)));
+                    let d = d16(b) * y.d;
+                    acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_madd_epi16(p, ones)), acc);
+                    sumf -= d * m[j + j / 2 * 2];
+                }
             }
             hsum(acc) + sumf
         }
