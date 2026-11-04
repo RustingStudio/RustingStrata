@@ -20,7 +20,9 @@ html, body { height: 100%; margin: 0; }
 body { background: var(--bg); color: var(--text); font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; display: flex; flex-direction: column; }
 header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
 header h1 { font-size: 16px; margin: 0; letter-spacing: .02em; }
-#model { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+#model { font: inherit; font-size: 13px; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; min-width: 0; max-width: 360px; }
+#status { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+#status.bad { color: var(--bad); }
 button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
 button:disabled { opacity: .5; cursor: default; }
@@ -44,6 +46,13 @@ aside label { display: block; font-size: 13px; color: var(--muted); margin: 12px
 aside input, aside textarea, aside select { width: 100%; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
 aside .row { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
 aside .row input { width: auto; }
+aside h2 { font-size: 14px; margin: 0 0 4px; }
+aside h2 + label { margin-top: 4px; }
+aside hr { border: 0; border-top: 1px solid var(--line); margin: 18px 0; }
+aside button { margin-top: 8px; }
+aside progress { width: 100%; margin-top: 10px; accent-color: var(--accent); }
+.note { font-size: 13px; color: var(--muted); margin-top: 6px; overflow-wrap: anywhere; }
+.note.bad { color: var(--bad); }
 form { border-top: 1px solid var(--line); background: var(--panel); padding: 12px 16px; }
 form .in { max-width: 820px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
 textarea#input { flex: 1; resize: none; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; max-height: 40vh; }
@@ -53,13 +62,24 @@ textarea#input { flex: 1; resize: none; font: inherit; color: var(--text); backg
 <body>
 <header>
   <h1>Strata</h1>
-  <div id="model">connecting…</div>
+  <select id="model" aria-label="Model"></select>
+  <div id="status">connecting…</div>
   <button id="clear" type="button">New chat</button>
   <button id="toggle" type="button">Settings</button>
 </header>
 <main>
   <div id="chat"><div class="msgs" id="msgs"><div class="empty" id="empty">Ask anything. Everything runs on this computer.</div></div></div>
   <aside id="settings" hidden>
+    <h2>Download a model</h2>
+    <label for="repo">Hugging Face repo or link</label>
+    <input id="repo" placeholder="unsloth/Qwen3-4B-Instruct-2507-GGUF" autocomplete="off">
+    <button id="list" type="button">Show files</button>
+    <select id="files" hidden aria-label="File"></select>
+    <button id="get" class="primary" type="button" hidden>Download</button>
+    <div id="dl" hidden><progress id="bar" max="1" value="0"></progress><button id="cancel" type="button">Cancel</button></div>
+    <div class="note" id="dlnote"></div>
+    <hr>
+    <h2>Chat</h2>
     <label for="system">System prompt</label>
     <textarea id="system" rows="4" placeholder="You are a helpful assistant."></textarea>
     <label for="temp">Temperature (0 = always the most likely word)</label>
@@ -69,6 +89,7 @@ textarea#input { flex: 1; resize: none; font: inherit; color: var(--text); backg
     <div class="row"><input id="think" type="checkbox"><label for="think" style="margin:0">Let the model think first</label></div>
     <label for="key">API key (only if the server was started with one)</label>
     <input id="key" type="password" autocomplete="off">
+    <div class="note" id="dir"></div>
   </aside>
 </main>
 <form id="form">
@@ -97,14 +118,85 @@ const headers = () => {
   return h;
 };
 
-async function loadModel() {
+const status = (t, bad) => { $('status').textContent = t; $('status').className = bad ? 'bad' : ''; };
+const gb = n => (n / 2 ** 30).toFixed(1) + ' GB';
+const opt = (value, text) => { const o = document.createElement('option'); o.value = value; o.textContent = text; return o; };
+
+// The model list comes from the server's models folder; picking one loads it (the request returns once loaded).
+async function models() {
   try {
-    const r = await fetch('/v1/models', { headers: headers() });
+    const r = await fetch('/api/models', { headers: headers() });
     const j = await r.json();
-    $('model').textContent = r.ok ? j.data.map(m => m.id).join(', ') : (j.error?.message || r.statusText);
-  } catch (e) { $('model').textContent = 'server not reachable'; }
+    if (!r.ok) { status(j.error?.message || r.statusText, true); return; }
+    const sel = $('model'), cur = j.models.find(m => m.loaded);
+    sel.replaceChildren(...(cur ? [] : [opt('', j.models.length ? 'Choose a model…' : 'No models found')]),
+      ...j.models.map(m => opt(m.id, `${m.id} (${gb(m.bytes)})`)));
+    sel.value = cur ? cur.id : '';
+    status(cur ? '' : j.models.length ? 'No model loaded' : 'No models yet: download one in Settings');
+    $('dir').textContent = 'Models are kept in ' + j.dir + '. Other .gguf files put there show up too.';
+    if (!j.models.length) $('settings').hidden = false;
+  } catch (e) { status('server not reachable', true); }
 }
-loadModel();
+$('model').onchange = async () => {
+  const id = $('model').value;
+  if (!id) return;
+  $('model').disabled = $('send').disabled = true;
+  status('Loading ' + id + '…');
+  try {
+    const r = await fetch('/api/load', { method: 'POST', headers: headers(), body: JSON.stringify({ model: id }) });
+    const j = await r.json().catch(() => ({}));
+    await models();
+    if (!r.ok) status(j.error?.message || r.statusText, true);
+  } catch (e) { status('server not reachable', true); }
+  $('model').disabled = $('send').disabled = false;
+};
+$('key').addEventListener('change', models);
+models();
+
+const dlnote = (t, bad) => { $('dlnote').textContent = t; $('dlnote').className = 'note' + (bad ? ' bad' : ''); };
+const repo = () => ($('repo').value.trim() || $('repo').placeholder).replace(/^https?:\/\/huggingface\.co\//, '').split(/[/?#]/).slice(0, 2).join('/');
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: 'POST', headers: headers(), body: JSON.stringify(body) } : { headers: headers() });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error?.message || r.statusText);
+  return j;
+}
+$('list').onclick = async () => {
+  $('list').disabled = true;
+  dlnote('Looking up ' + repo() + '…');
+  try {
+    const j = await api('/api/hf/files', { repo: repo() });
+    $('files').replaceChildren(...j.files.map(f => opt(f.file, `${f.file} (${gb(f.bytes)})`)));
+    $('files').hidden = $('get').hidden = !j.files.length;
+    dlnote(j.files.length ? 'Pick a file. Smaller files are faster, larger ones answer better (Q4_K_M is a good start).' : 'No .gguf files in ' + repo(), !j.files.length);
+  } catch (e) { dlnote(e.message, true); }
+  $('list').disabled = false;
+};
+$('get').onclick = async () => {
+  try { await api('/api/download', { repo: repo(), file: $('files').value }); poll(); } catch (e) { dlnote(e.message, true); }
+};
+$('cancel').onclick = () => api('/api/download/cancel', {}).catch(e => dlnote(e.message, true));
+let last = null;   // previous poll {t, done}, for the speed
+// On page load only a running download is shown.
+async function poll(load) {
+  let p;
+  try { p = await api('/api/download'); } catch (e) { return; }
+  if (!p.file || load && !p.running) return;
+  $('dl').hidden = !p.running;
+  $('get').disabled = p.running;
+  $('bar').max = p.total || 1; $('bar').value = p.done;
+  if (p.running) {
+    const now = performance.now(), speed = last && now > last.t ? (p.done - last.done) / ((now - last.t) / 1000) : 0;
+    last = { t: now, done: p.done };
+    dlnote(`${p.file}: ${gb(p.done)} of ${gb(p.total)}` + (speed > 0 ? `, ${(speed / 2 ** 20).toFixed(1)} MB/s` : ''));
+    setTimeout(poll, 1000);
+  } else {
+    last = null;
+    if (p.error) dlnote(p.error, true);
+    else { dlnote(p.file + ' downloaded. Pick it in the model list at the top.'); models(); }
+  }
+}
+poll(true);
 
 const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
 // Small Markdown subset: code fences, inline code, bold, paragraphs.

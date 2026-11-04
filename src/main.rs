@@ -2,7 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use anyhow::Context;
 use rusting_strata::model::{Model, State};
 use rusting_strata::{backend, gpu_model::GpuModel};
-use rusting_strata::{config::ModelConfig, gguf::Gguf, ops, ops::Sampler, quant::GgmlType, serve, tokenizer::Tokenizer};
+use rusting_strata::{config::ModelConfig, gguf::Gguf, hf, ops, ops::Sampler, quant::GgmlType, serve, tokenizer::Tokenizer};
 use rusting_strata::chat::{Hold, Msg, Template};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -11,11 +11,13 @@ use std::{collections::BTreeMap, net::{TcpListener, TcpStream}, sync::atomic::Or
 #[derive(Parser)]
 #[command(name = "strata", version, about = "Rust inference engine for Qwen3.5/3.6-family GGUF models")]
 struct Cli {
+    /// Without a command, strata serves the chat page on 127.0.0.1:8080 on the GPU (else the CPU) and opens it in
+    /// the browser.
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 struct Engine {
     /// Run on the GPU (experts that do not fit in VRAM run on the CPU) instead of the CPU reference.
     #[arg(long)]
@@ -68,6 +70,9 @@ struct Engine {
     /// Prompts shorter than this skip the batched prefill (from `strata calibrate`, else 32).
     #[arg(skip)]
     short: usize,
+    /// Run on the CPU when no GPU backend opens (the bare `strata` launch).
+    #[arg(skip)]
+    cpu_fallback: bool,
 }
 
 enum Runner<'a> { Cpu(&'a Model<'a>, State), Gpu(Box<GpuModel<'a>>) }
@@ -122,7 +127,10 @@ impl Engine {
     fn runner<'a>(&mut self, m: &'a Model<'a>, model: &Path) -> anyhow::Result<Runner<'a>> {
         if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
         if self.kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
-        let bk = if self.gpu { Some(backend::open(self.backend.as_deref(), self.device)?) } else { None };
+        let bk = match self.gpu.then(|| backend::open(self.backend.as_deref(), self.device)).transpose() {
+            Err(e) if self.cpu_fallback => { eprintln!("no GPU backend ({e:#}), running on the CPU"); None }
+            r => r?,
+        };
         let path = calibration_path(model, bk.as_ref().map_or("cuda", |b| b.name()));
         let v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         if !v.is_null() { eprintln!("calibration: {}", path.display()); }
@@ -130,7 +138,8 @@ impl Engine {
         self.chunk.get_or_insert(get("chunk").unwrap_or(4096));
         self.mtp.get_or_insert(get("mtp").unwrap_or(0));
         self.short = get("short").unwrap_or(32);
-        if let Some(n) = self.threads.or(get("threads")) { rayon::ThreadPoolBuilder::new().num_threads(n).build_global()?; }
+        // The global pool can be built once; a model loaded later by `serve` keeps the first one's threads.
+        if let Some(n) = self.threads.or(get("threads")) { let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global(); }
         let Some(bk) = bk else { return Ok(Runner::Cpu(m, State::new(&m.cfg))) };
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
         let mut g = GpuModel::load(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp()).context(LOAD_HINT)?;
@@ -214,11 +223,20 @@ enum Cmd {
     /// One request at a time; temperature, top_k, top_p and seed are honored, greedy when left out. A request that
     /// extends the previous one's messages prefills only the new part (usage.prompt_tokens_details.cached_tokens);
     /// one that keeps only the system prompt and tools (a compacted conversation) starts after them.
+    /// GET / is a chat page that can also switch between the models in `--models-dir` (POST /api/load), so the
+    /// server can start without `--model`.
     Serve {
         #[arg(long)]
-        model: PathBuf,
+        model: Option<PathBuf>,
+        /// Folder of .gguf models the chat page offers [default: $XDG_DATA_HOME/rusting_strata/models,
+        /// %LOCALAPPDATA%\rusting_strata\models on Windows, else ~/.local/share/rusting_strata/models].
+        #[arg(long)]
+        models_dir: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
+        /// Open the chat page in the browser (if the address is taken, open it and exit: strata already runs there).
+        #[arg(long)]
+        open: bool,
         /// Require `Authorization: Bearer <key>` on every request [default: $STRATA_API_KEY, which keeps the key out
         /// of the process list].
         #[arg(long)]
@@ -293,7 +311,22 @@ enum Cmd {
 }
 
 fn main() -> anyhow::Result<()> {
-    match Cli::parse().cmd {
+    let Some(cmd) = Cli::parse().cmd else {
+        // Started without arguments, as by a double click: keep the window open on an error so it can be read.
+        let Some(Cmd::Serve { model, models_dir, addr, api_key, open, mut engine }) = Cli::parse_from(["strata", "serve", "--gpu", "--open"]).cmd else { unreachable!() };
+        engine.cpu_fallback = true;
+        let r = run(Cmd::Serve { model, models_dir, addr, api_key, open, engine });
+        if let Err(e) = &r {
+            eprintln!("error: {e:#}\npress Enter to close");
+            let _ = std::io::stdin().read_line(&mut String::new());
+        }
+        return r;
+    };
+    run(cmd)
+}
+
+fn run(cmd: Cmd) -> anyhow::Result<()> {
+    match cmd {
         Cmd::Info { model } => {
             let g = Gguf::open(&model)?;
             println!("{:#?}", ModelConfig::from_gguf(&g)?);
@@ -450,27 +483,24 @@ fn main() -> anyhow::Result<()> {
             }
             r.finish()?;
         }
-        Cmd::Serve { model, addr, api_key, mut engine } => {
+        Cmd::Serve { model, models_dir, addr, api_key, open, engine } => {
             let api_key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
             anyhow::ensure!(api_key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
-            let g = Gguf::open(&model)?;
-            let m = Model::load(&g)?;
-            let tok = Tokenizer::from_gguf(&g)?;
-            let tpl = template(&g);
-            let mut r = engine.runner(&m, &model)?;
-            let name = model.file_stem().and_then(|s| s.to_str()).unwrap_or("strata").to_string();
-            let listener = TcpListener::bind(&addr)?;
-            eprintln!("listening on http://{addr}");
+            let url = format!("http://{addr}/");
+            let listener = match TcpListener::bind(&addr) {
+                Err(e) if open && e.kind() == std::io::ErrorKind::AddrInUse => { open_browser(&url); return Ok(()); }
+                l => l?,
+            };
             // Connections are read on their own threads, so a client that is slow to send its request does not hold
             // up the others; complete requests run one at a time, in arrival order.
             let (tx, rx) = std::sync::mpsc::channel();
-            let open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let waiting = open.clone();
+            let open_conns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let waiting = open_conns.clone();
             std::thread::spawn(move || for (i, conn) in listener.incoming().enumerate() {
                 let c = match conn { Ok(c) => c, Err(e) => { eprintln!("request {i}: {e:#}"); continue } };
                 // ponytail: a fixed cap on connections read or queued (each may hold an 8 MB body).
-                if open.fetch_add(1, Relaxed) >= 16 {
-                    open.fetch_sub(1, Relaxed);
+                if open_conns.fetch_add(1, Relaxed) >= 16 {
+                    open_conns.fetch_sub(1, Relaxed);
                     eprintln!("request {i}: 16 requests already waiting, closed");
                     continue;
                 }
@@ -481,10 +511,28 @@ fn main() -> anyhow::Result<()> {
                     let _ = tx.send((c, q, i));
                 });
             });
-            for (c, q, i) in rx {
-                let res = handle(c, q, &mut r, &tok, tpl, &engine, &name, &addr, api_key.as_deref(), i);
-                waiting.fetch_sub(1, Relaxed);
-                if let Err(e) = res { eprintln!("request {i}: {e:#}"); }
+            let s = Serving { rx, waiting, addr, key: api_key, dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(),
+                dl: Default::default() };
+            // The model to load next and the /api/load request waiting for the outcome (none for --model).
+            let mut next = model.map(|p| (p, None));
+            eprintln!("listening on {url} (models folder: {})", s.dir.display());
+            // Requests wait while a model loads, so the page may take that long to show.
+            if open { open_browser(&url); }
+            loop {
+                let (p, mut w) = match next.take() {
+                    Some(x) => x,
+                    None => match s.serve(None, &engine) { Some((p, w)) => (p, Some(w)), None => return Ok(()) },
+                };
+                match serve_model(&p, engine.clone(), &s, &mut w) {
+                    Ok(Some((p, w))) => next = Some((p, Some(w))),
+                    Ok(None) => return Ok(()),
+                    Err(e) if w.is_none() => return Err(e),
+                    Err(e) => {
+                        eprintln!("loading {}: {e:#}", p.display());
+                        let b = json!({"error": {"message": format!("{e:#}"), "type": "server_error"}}).to_string();
+                        let _ = write!(w.unwrap(), "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+                    }
+                }
             }
         }
     }
@@ -625,8 +673,84 @@ fn template(g: &Gguf) -> Template {
 /// Reply text without the thinking part (the template drops it from history too).
 fn answer(s: &str) -> String { s.rsplit_once("</think>").map_or(s, |x| x.1).trim().to_string() }
 
-#[allow(clippy::too_many_arguments)]
-fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, r: &mut Runner, tok: &Tokenizer, tpl: Template, e: &Engine, name: &str, addr: &str, key: Option<&str>, i: usize) -> anyhow::Result<()> {
+/// A model `serve` has loaded.
+struct Loaded<'a> { r: Runner<'a>, tok: Tokenizer, tpl: Template, name: String, path: PathBuf }
+
+/// What `serve` keeps across model loads.
+struct Serving {
+    rx: std::sync::mpsc::Receiver<(TcpStream, anyhow::Result<serve::Request>, usize)>,
+    waiting: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    addr: String,
+    key: Option<String>,
+    dir: PathBuf,
+    /// The --model, offered beside the models folder.
+    model: Option<PathBuf>,
+    /// The Hugging Face download running on its own thread, or the last one.
+    dl: std::sync::Arc<std::sync::Mutex<hf::Progress>>,
+}
+
+impl Serving {
+    /// Answers requests until one asks for a model to be loaded; returns its path and connection (None once the
+    /// listener is gone).
+    fn serve(&self, mut l: Option<&mut Loaded>, e: &Engine) -> Option<(PathBuf, TcpStream)> {
+        for (c, q, i) in &self.rx {
+            let mut next = None;
+            let res = handle(c, q, l.as_deref_mut(), e, self, i, &mut next);
+            self.waiting.fetch_sub(1, Relaxed);
+            if let Err(e) = res { eprintln!("request {i}: {e:#}"); }
+            if next.is_some() { return next; }
+        }
+        None
+    }
+    /// The models the page offers: the models folder, then --model if it is elsewhere.
+    fn models(&self) -> Vec<(String, PathBuf, u64)> {
+        let mut v = serve::list_models(&self.dir);
+        if let Some(p) = self.model.as_ref().filter(|p| !v.iter().any(|x| &x.1 == *p)) {
+            v.push((p.display().to_string(), p.clone(), std::fs::metadata(p).map_or(0, |m| m.len())));
+        }
+        v
+    }
+}
+
+/// Loads `model`, answers `w` (the /api/load request that asked for it) and serves until another model is asked
+/// for. The model and its GPU memory are freed on return.
+fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<TcpStream>) -> anyhow::Result<Option<(PathBuf, TcpStream)>> {
+    eprintln!("loading {}", model.display());
+    let g = Gguf::open(model)?;
+    let m = Model::load(&g)?;
+    let tok = Tokenizer::from_gguf(&g)?;
+    let r = engine.runner(&m, model)?;
+    let name = model.file_stem().and_then(|s| s.to_str()).unwrap_or("strata").to_string();
+    let mut l = Loaded { r, tok, tpl: template(&g), name, path: model.to_path_buf() };
+    eprintln!("loaded {}", l.name);
+    if let Some(mut w) = w.take() {
+        let b = json!({"loaded": l.name}).to_string();
+        let _ = write!(w, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+    }
+    let next = s.serve(Some(&mut l), &engine);
+    l.r.finish()?;
+    Ok(next)
+}
+
+/// Default models folder: `$XDG_DATA_HOME`, `%LOCALAPPDATA%` on Windows, else `~/.local/share`.
+fn models_dir_default() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME").or_else(|| std::env::var_os("LOCALAPPDATA")).map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"))
+        .join("rusting_strata").join("models")
+}
+
+fn open_browser(url: &str) {
+    #[cfg(windows)]
+    let r = std::process::Command::new("cmd").args(["/c", "start", "", url]).spawn();
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let r = std::process::Command::new("xdg-open").arg(url).spawn();
+    if let Err(e) = r { eprintln!("could not open a browser ({e}); open {url}"); }
+}
+
+fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Loaded>, e: &Engine, s: &Serving, i: usize,
+    next: &mut Option<(PathBuf, TcpStream)>) -> anyhow::Result<()> {
     let send = |w: &mut TcpStream, status: &str, v: serde_json::Value| -> anyhow::Result<()> {
         let b = v.to_string();
         Ok(write!(w, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len())?)
@@ -642,17 +766,57 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, r: &mut Runner, t
     let created = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
     // Browsers can reach a loopback server: the Host check stops DNS rebinding, and requiring a JSON content type
     // makes a cross-site POST need a CORS preflight, which is never answered.
-    if !serve::host_ok(&host, addr) { return send(&mut w, "403 Forbidden", json!({"error": {"message": "bad Host header", "type": "forbidden"}})); }
+    if !serve::host_ok(&host, &s.addr) { return send(&mut w, "403 Forbidden", json!({"error": {"message": "bad Host header", "type": "forbidden"}})); }
     // The chat page holds no secret, so it loads without the key (the page asks for it).
     if method == "GET" && path == "/" {
         const PAGE: &str = include_str!("web/index.html");
         return Ok(write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PAGE}", PAGE.len())?);
     }
-    if key.is_some_and(|k| !serve::key_ok(&auth, k)) { return send(&mut w, "401 Unauthorized", json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}})); }
+    if s.key.as_deref().is_some_and(|k| !serve::key_ok(&auth, k)) { return send(&mut w, "401 Unauthorized", json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}})); }
     if method == "POST" && !json { return send(&mut w, "415 Unsupported Media Type", json!({"error": {"message": "Content-Type must be application/json", "type": "invalid_request_error"}})); }
     match (method.as_str(), path.as_str()) {
-        ("GET", "/v1/models") => send(&mut w, "200 OK", json!({"object": "list", "data": [{"id": name, "object": "model", "created": created, "owned_by": "strata"}]})),
+        ("GET", "/v1/models") => send(&mut w, "200 OK", json!({"object": "list", "data": l.map(|l| json!([{"id": l.name, "object": "model", "created": created, "owned_by": "strata"}])).unwrap_or(json!([]))})),
+        ("GET", "/api/models") => {
+            let models: Vec<_> = s.models().into_iter().map(|(id, p, n)| json!({"id": id, "bytes": n, "loaded": l.as_ref().is_some_and(|l| l.path == p)})).collect();
+            send(&mut w, "200 OK", json!({"dir": s.dir, "models": models}))
+        }
+        // Answered once the model has loaded (or failed to).
+        ("POST", "/api/load") => {
+            let id = serde_json::from_slice::<serde_json::Value>(&body).ok().and_then(|v| v["model"].as_str().map(String::from)).unwrap_or_default();
+            match s.models().into_iter().find(|m| m.0 == id) {
+                Some((_, p, _)) => { *next = Some((p, w)); Ok(()) }
+                None => send(&mut w, "404 Not Found", json!({"error": {"message": format!("no model {id:?} in {}", s.dir.display()), "type": "not_found"}})),
+            }
+        }
+        ("POST", "/api/hf/files") => {
+            let repo = serde_json::from_slice::<serde_json::Value>(&body).ok().and_then(|v| v["repo"].as_str().map(String::from)).unwrap_or_default();
+            match hf::list(&repo) {
+                Ok(f) => send(&mut w, "200 OK", json!({"files": f.into_iter().map(|(f, n)| json!({"file": f, "bytes": n})).collect::<Vec<_>>()})),
+                Err(err) => send(&mut w, "502 Bad Gateway", json!({"error": {"message": format!("{err:#}"), "type": "server_error"}})),
+            }
+        }
+        ("GET", "/api/download") => send(&mut w, "200 OK", json!(*s.dl.lock().unwrap())),
+        ("POST", "/api/download/cancel") => { s.dl.lock().unwrap().cancel = true; send(&mut w, "200 OK", json!(*s.dl.lock().unwrap())) }
+        // Runs on its own thread so chats go on meanwhile; the page polls GET /api/download.
+        ("POST", "/api/download") => {
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let (repo, file) = (v["repo"].as_str().unwrap_or_default().to_string(), v["file"].as_str().unwrap_or_default().to_string());
+            let mut g = s.dl.lock().unwrap();
+            if g.running { drop(g); return send(&mut w, "409 Conflict", json!({"error": {"message": "a download is already running", "type": "conflict"}})); }
+            *g = hf::Progress { repo: repo.clone(), file: file.clone(), running: true, ..Default::default() };
+            drop(g);
+            let (dl, dir) = (s.dl.clone(), s.dir.clone());
+            std::thread::spawn(move || {
+                let r = hf::download(&repo, &file, &dir, &dl);
+                if let Err(e) = &r { eprintln!("download {repo} {file}: {e:#}"); } else { eprintln!("downloaded {repo} {file}"); }
+                let mut g = dl.lock().unwrap();
+                (g.running, g.error) = (false, r.err().map(|e| format!("{e:#}")));
+            });
+            send(&mut w, "202 Accepted", json!(*s.dl.lock().unwrap()))
+        }
         ("POST", "/v1/chat/completions") => {
+            let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
+            let (r, tok, tpl, name) = (&mut l.r, &l.tok, l.tpl, l.name.as_str());
             let req = match serve::chat_request(&body) {
                 Ok(q) => q,
                 Err(err) => return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
