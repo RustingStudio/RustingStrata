@@ -768,7 +768,7 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
                                        const int* xrow, float* y, int y_stride, int rows, int n64, int act) {
     constexpr int P = BK + 8, NT = BM * 2, SUBS = BK / 8, XM = SM ? 32 : BM;  // smem pitch in halves (padding: conflict-free fragments)
     __shared__ __align__(16) u16 xs[XM * P], ws[64 * P];
-    GemmTile tl = tiles ? tiles[blockIdx.y] : GemmTile{wd, (int)blockIdx.y * BM, min(BM, nd - (int)blockIdx.y * BM)};
+    GemmTile tl = tiles ? tiles[blockIdx.y] : GemmTile{wd, (int)blockIdx.y * XM, min(XM, nd - (int)blockIdx.y * XM)};
     if (tiles && (tl.cnt <= 32) != SM) return;
     int n0 = blockIdx.x * 64, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     int wm = SM ? 16 * (warp & 1) : (warp >> 1) * 32, wn = SM ? 16 * (warp >> 1) : (warp & 1) * 32;
@@ -944,7 +944,7 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
     __shared__ __align__(16) signed char xq[2][XM * P], wq[64 * P];
     __shared__ __align__(16) float xd[2][XM][2], xsum[2][XM][4];
     __shared__ float wsc[64][4], wmn[64][4];
-    GemmTile tl = tiles ? tiles[blockIdx.y] : GemmTile{wd, (int)blockIdx.y * BM, min(BM, nd - (int)blockIdx.y * BM)};
+    GemmTile tl = tiles ? tiles[blockIdx.y] : GemmTile{wd, (int)blockIdx.y * XM, min(XM, nd - (int)blockIdx.y * XM)};
     if (tiles && (tl.cnt <= 32) != SM) return;
     int n0 = blockIdx.x * 64, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     int wm = SM ? 16 * (warp & 1) : (warp >> 1) * 32, wn = SM ? 16 * (warp >> 1) : (warp & 1) * 32, cols = n64 * 64;
