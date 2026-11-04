@@ -11,6 +11,7 @@
 #extension GL_EXT_control_flow_attributes : require
 layout(local_size_x = 256) in;
 #include "common.glsl"
+#define SHARED_TABLES
 #include "deq.glsl"
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64 { uint64_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer V4 { vec4 v[]; };
@@ -30,6 +31,20 @@ shared uint xs[BM * PW], ws[64 * PW];
 uint h2(float a, float b) { return packFloat2x16(f16vec2(a, b)); }
 shared float ix[512];  // the row and column index matrices
 
+// W step kb as halves: invocation decodes values 8 j .. 8 j + 7 of rows tid / 8 + 32 q (q < 2) into wv[4 q ..].
+void ldw(U8 wt, uint n0, uint kb, uint tid, out uint wv[8]) {
+    uint sb = kb / 4, part = kb % 4;
+    [[unroll]] for (uint q = 0; q < 2; q++) {
+        uint r = tid / 8 + 32 * q, j = tid % 8;
+        float v[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        if (n0 + r < p.rows) deq8(wt, (n0 + r) * rowb(p.nk * 64) + sb * SBB, part * 8 + j, v);
+        [[unroll]] for (uint e = 0; e < 4; e++) wv[4 * q + e] = h2(v[2 * e], v[2 * e + 1]);
+    }
+}
+void stw(uint tid, uint wv[8]) {
+    [[unroll]] for (uint q = 0; q < 2; q++) [[unroll]] for (uint e = 0; e < 4; e++) ws[(tid / 8 + 32 * q) * PW + (tid % 8) * 4 + e] = wv[4 * q + e];
+}
+
 void main() {
     uint tid = gl_LocalInvocationID.x, w = gl_SubgroupID, n0 = gl_WorkGroupID.x * 64;
     uint wm = (w >> 1) * 32, wn = (w & 1) * 32, m0, cnt;
@@ -41,6 +56,7 @@ void main() {
         wt = U8(p.wd); m0 = gl_WorkGroupID.y * BM; cnt = min(BM, p.nd - m0);
     }
     for (uint i = tid; i < 256; i += 256) { ix[i] = float(i / 16); ix[256 + i] = float(i % 16); }
+    load_tables();
     uint g = gl_SubgroupInvocationID >> 2, t = gl_SubgroupInvocationID & 3;
 #if COOP
     ACC acc[2][2];
@@ -56,20 +72,18 @@ void main() {
         uint r = (tid >> 4) + 16 * q;
         xb[q] = r < cnt ? ((uint64_t(p.xrow) != 0 ? uint(p.xrow.v[m0 + r]) : m0 + r) * p.xs + xc) / 4 : ~0u;
     }
+    // W step kb + 1 is decoded into registers during step kb's products and stored after them (gemm_q in kernels.cu).
+    uint wv[8];
+    ldw(wt, n0, 0, tid, wv);
+    stw(tid, wv);
     for (uint kb = 0; kb < p.nk; kb++) {
-        uint sb = kb / 4, part = kb % 4;
-        [[unroll]] for (uint q = 0; q < 2; q++) {
-            uint r = tid / 8 + 32 * q, j = tid % 8;
-            float v[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-            if (n0 + r < p.rows) deq8(wt, (n0 + r) * rowb(p.nk * 64) + sb * SBB, part * 8 + j, v);
-            [[unroll]] for (uint e = 0; e < 4; e++) ws[r * PW + j * 4 + e] = h2(v[2 * e], v[2 * e + 1]);
-        }
         [[unroll]] for (uint q = 0; q < 8; q++) {
             uint r = (tid >> 4) + 16 * q;
             vec4 v = xb[q] != ~0u ? p.x.v[xb[q] + kb * BK / 4] : vec4(0.0);
             xs[r * PW + xc / 2] = h2(v.x, v.y); xs[r * PW + xc / 2 + 1] = h2(v.z, v.w);
         }
         barrier();
+        if (kb + 1 < p.nk) ldw(wt, n0, kb + 1, tid, wv);
 #if COOP
         // Expert tiles are often part full; a subgroup whose 32 positions are all past cnt has nothing to multiply.
         if (wm < cnt)
@@ -95,6 +109,7 @@ void main() {
         }
 #endif
         barrier();
+        if (kb + 1 < p.nk) stw(tid, wv);
     }
 #if COOP
     // Accumulator element i of this invocation is at row ri[i], column ci[i] (the layout is the implementation's).
