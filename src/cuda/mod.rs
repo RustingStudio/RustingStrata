@@ -234,12 +234,16 @@ impl Gpu {
         if cols % 64 != 0 { bail!("{} matrix with {cols} columns: GEMM needs a multiple of 64", ty.name()); }
         if n_tiles == 0 { return Ok(()); }
         let grid = (rows.div_ceil(64) as u32, n_tiles as u32);
+        // A dense GEMM of few blocks (hc_*_inject: 4 rows, 8 blocks) runs as gemms_*/gemmis_*, 32 positions a block
+        // instead of 128: four times the blocks, the same sums.
+        let sm = tiles == 0 && grid.0 * grid.1 < 112;
+        let grid = if sm { (grid.0, nd.div_ceil(32) as u32) } else { grid };
         let (same, act) = (act & SAME_X != 0, act & !SAME_X);
         let mut q8 = self.q8.lock().unwrap();
         // The int8 path loads q8 rows 16 bytes at a time: their stride (cols * 11 / 8) is aligned only for cols % 128 == 0.
         if !Self::mmq(ty) || cols % 128 != 0 {
             if !same { q8.1 = None; }
-            launch!(self, &kname("gemm", ty), cfg(grid, 2 * GEMM_BM as u32, 0),
+            launch!(self, &kname(if sm { "gemms" } else { "gemm" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
                 tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act);
             // Tile lists: gemm_* skips the tiles of at most 32 positions, which gemms_* takes.
             if tiles != 0 {
@@ -257,7 +261,7 @@ impl Gpu {
             launch!(self, "quant_q8", cfg((n_x as u32, 1), 256, 0), x, x_stride as i32, xq, cols as i32);
             q8.1 = key;
         }
-        launch!(self, &kname("gemmi", ty), cfg(grid, 2 * GEMM_BM as u32, 0),
+        launch!(self, &kname(if sm { "gemmis" } else { "gemmi" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
             tiles, wd, nd as i32, xq, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act);
         if tiles != 0 {
             launch!(self, &kname("gemmis", ty), cfg(grid, 2 * GEMM_BM as u32, 0),
