@@ -955,6 +955,11 @@ impl Backend for Vk {
         st.twait = std::mem::replace(&mut st.tlag, tv);
         r
     }
+    fn kick(&self) -> anyhow::Result<()> {
+        let mut st = self.0.st();
+        if st.rec.is_some() || st.batch || st.beside { return Ok(()); }
+        self.0.submit(&mut st, None, false)
+    }
     fn beside_join(&self) -> anyhow::Result<()> {
         if self.0.tq.is_none() { return Ok(()); }
         let mut st = self.0.st();

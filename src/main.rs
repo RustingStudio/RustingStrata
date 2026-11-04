@@ -453,7 +453,8 @@ fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device
 
     let mut chunk = (0, 0.0);
     for c in [512, 1024, 2048, 4096].into_iter().filter(|&c| c <= ctx) {
-        let mut gm = load(c)?;
+        // A larger chunk's prefill scratch may not fit beside a long --ctx: keep the chunks measured so far.
+        let mut gm = match load(c) { Ok(gm) => gm, Err(e) if chunk.0 > 0 => { eprintln!("chunk {c:5}: {e:#}"); break } Err(e) => return Err(e) };
         let t = best(&mut || { gm.reset()?; gm.prefill(&pf).map(drop) })?;
         let tps = n_pf as f64 / t;
         eprintln!("chunk {c:5}: prefill {n_pf} tok {tps:.0} tok/s");

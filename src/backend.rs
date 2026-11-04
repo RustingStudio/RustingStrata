@@ -101,6 +101,9 @@ pub trait Backend: Send {
     fn beside(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> { f() }
     /// Ops after this see the copies of every `beside` so far.
     fn beside_join(&self) -> anyhow::Result<()> { Ok(()) }
+    /// Submit the ops queued so far without waiting. Long prefills call it per layer: amdgpu resets the GPU when one
+    /// submission runs over its timeout (10 s).
+    fn kick(&self) -> anyhow::Result<()> { Ok(()) }
     /// Whether `beside` really overlaps its copies with its other ops (else it queues them in order).
     fn beside_overlaps(&self) -> bool { false }
     /// Whether a MoE combine gave up waiting for the CPU worker since the last call (checked after a wait). Its layer
