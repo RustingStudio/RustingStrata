@@ -221,6 +221,11 @@ impl<'a> GpuModel<'a> {
         let chunk = if c.hc_n > 0 { chunk.min(1024) } else { chunk };
         let pf = if chunk > 0 { Some(prefill::Scratch::new(m, &*gpu, chunk.min(ctx))?) } else { None };
         let (free1, _) = gpu.mem_info()?;
+        // Past the budget the driver spills buffers to system memory: RADV then runs a long prefill slowly enough to
+        // hit amdgpu's job timeout and lose the device. A margin above 512 MB only leaves fewer expert slots.
+        let floor = vram_margin.min(512 << 20);
+        ensure!(free1 >= floor, "the model, KV cache and prefill scratch leave {} MB of VRAM free, under the {} MB \
+            margin: lower --ctx, use --kv q8 or a smaller --chunk (--vram-margin 0 skips this check)", free1 >> 20, floor >> 20);
 
         let cache = if c.is_moe() {
             // STRATA_EXPERT_MB caps the expert slots, so that runs place the same experts whatever VRAM is free (a

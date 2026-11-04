@@ -371,6 +371,7 @@ impl GpuModel<'_> {
                     if ly.hc.is_some() { g.hc_write(x, fx, at(l.inj), ne, c.hc_n, t, true)?; }
                 }
             }
+            g.kick()?;
         }
         match self.mtp.as_mut() {
             Some(mh) if fill => mh.pos += t,
