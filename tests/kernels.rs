@@ -331,6 +331,40 @@ fn gemm_throughput() {
     }
 }
 
+/// Expert GEMM throughput as in prefill: every expert of layer 0 with `c` positions in one tile each. Run with --ignored.
+#[test]
+#[ignore]
+fn gemm_expert_throughput() {
+    let Some(p) = common::model_path() else { return };
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        eprintln!("backend {bk}");
+        let g = Gguf::open(&p).unwrap();
+        let w = Weights::new(&g).unwrap();
+        for name in ["blk.0.ffn_gate_exps.weight", "blk.0.ffn_down_exps.weight"] {
+            if !g.tensors.contains_key(name) { continue; }
+            let t = w.get(name).unwrap();
+            let ne = g.tensors[name].dims[2] as usize;
+            let (rows, eb) = (t.rows / ne, t.data.len() / ne);
+            let dt = gpu.upload(&t).unwrap();
+            for c in [8usize, 32, 64] {
+                let m = ne * c;
+                let tiles: Vec<u64> = (0..ne).flat_map(|e| [dt.ptr + (e * eb) as u64, (c * e) as u64 | (c as u64) << 32]).collect();
+                let (dtl, dx) = (up(gpu, &tiles), up(gpu, &xs(m * t.cols)));
+                let dy = gpu.zeros::<f32>(m * rows).unwrap();
+                let run = || gpu.gemm(t.ty, rows, t.cols, dtl.addr(), ne, dx.addr(), t.cols, m, 0, dy.addr(), rows, 0).unwrap();
+                for _ in 0..3 { run(); }
+                gpu.sync().unwrap();
+                let t0 = std::time::Instant::now();
+                for _ in 0..10 { run(); }
+                gpu.sync().unwrap();
+                let s = t0.elapsed().as_secs_f64() / 10.0;
+                eprintln!("{:8} {name:28} {ne:3} x {rows:5}x{:5}, {c:2} per expert: {:8.3} ms", t.ty.name(), t.cols, s * 1e3);
+            }
+        }
+    }
+}
+
 /// Decode attention (both kernels) matches a CPU softmax over the f16 cache that kv_store writes; prefill attention
 /// (tensor cores, f16 Q and P, 64-query tiles), where the backend has it, matches decode attention at every position,
 /// with keys cached before the chunk, a chunk that does not fill its last tile, and early positions that leave decode
