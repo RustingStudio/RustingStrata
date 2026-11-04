@@ -273,15 +273,37 @@ impl GpuModel<'_> {
                         pre.send(missed.chunks(STAGE).flat_map(|grp| w.iter().zip(&lx.mats).flat_map(move |(w, mat)| grp.chunk_by(|a, b| *b == a + 1)
                             .map(move |run| (w.data.as_ptr() as usize + run[0] * mat.bytes, run.len() * mat.bytes)))).collect());
                     }
-                    // Group 0: resident experts; then staged groups of at most STAGE missed experts. Staging holds
+                    // Staged groups of at most STAGE missed experts, group j in staging half j % 2. Staging holds
                     // each matrix in its own section (all gates, then ups, then downs), so experts with consecutive
                     // ids are contiguous there as in the weights and copy in one call.
-                    let mut groups: Vec<Vec<(usize, [u64; 3])>> = vec![(0..c.n_expert).filter(used)
-                        .filter_map(|e| { let s = cache.slot(il, e); (s >= 0).then(|| (e, lx.mats.each_ref().map(|m| pool + (s as usize * stride + m.off) as u64))) }).collect()];
                     let sp = pf.staging.addr();
                     let half = |j: usize| j % 2 * pf.staging.len() / 2;
-                    for (j, grp) in missed.chunks(STAGE).enumerate() {
-                        groups.push(grp.iter().enumerate().map(|(i, &e)| (e, lx.mats.each_ref().map(|m| sp + (half(j) + STAGE * m.off + i * m.bytes) as u64))).collect());
+                    let staged: Vec<Vec<(usize, [u64; 3])>> = missed.chunks(STAGE).enumerate()
+                        .map(|(j, grp)| grp.iter().enumerate().map(|(i, &e)| (e, lx.mats.each_ref().map(|m| sp + (half(j) + STAGE * m.off + i * m.bytes) as u64))).collect())
+                        .collect();
+                    // The resident experts split into one chunk per staged group, of about equal positions, so the
+                    // copies run beside them too: step 0 runs chunk 0 beside the copy of group 0, step j runs group
+                    // j - 1 and chunk j beside the copy of group j (into the half group j - 2 used, done in step j - 1).
+                    // Without overlap (Vulkan) one chunk: more, smaller GEMMs only cost there.
+                    let ns = if g.beside_overlaps() { staged.len().max(1) } else { 1 };
+                    let res: Vec<(usize, [u64; 3])> = (0..c.n_expert).filter(used)
+                        .filter_map(|e| { let s = cache.slot(il, e); (s >= 0).then(|| (e, lx.mats.each_ref().map(|m| pool + (s as usize * stride + m.off) as u64))) }).collect();
+                    let total = res.iter().map(|r| off[r.0 + 1] - off[r.0]).sum::<usize>().max(1);
+                    let mut chunks = vec![Vec::new(); ns];
+                    let mut acc = 0;
+                    for &r in &res {
+                        chunks[(acc * ns / total).min(ns - 1)].push(r);
+                        acc += off[r.0 + 1] - off[r.0];
+                    }
+                    let mut chunks = chunks.into_iter();
+                    let mut groups = vec![chunks.next().unwrap()];
+                    // Per step: its groups and the staged group it copies.
+                    let mut steps = vec![(0..1, (!staged.is_empty()).then_some(0))];
+                    for (j, grp) in staged.iter().enumerate() {
+                        let g0 = groups.len();
+                        groups.push(grp.clone());
+                        groups.extend(chunks.next());
+                        steps.push((g0..groups.len(), (j + 1 < staged.len()).then_some(j + 1)));
                     }
                     let mut tiles = Vec::new();
                     // Per group: [(start, count); 3] and the slot rows its experts cover. The down GEMM reads rows
@@ -307,29 +329,30 @@ impl GpuModel<'_> {
                     let tp = |s: usize| pf.tiles.addr() + 16 * s as u64;
                     let xrow_d = pf.ints.addr() + 4 * (n * k) as u64;
                     let [mg, mu, md] = lx.mats;
-                    let copy = |gi: usize| -> anyhow::Result<()> {
-                        let grp = &groups[gi];
+                    let copy = |j: usize| -> anyhow::Result<()> {
+                        let grp = &staged[j];
                         for (name, mat) in MATS.iter().zip(&lx.mats) {
                             let w = self.m.w.layer(il, name)?;
                             let mut i = 0;
                             for run in grp.chunk_by(|a, b| b.0 == a.0 + 1) {
                                 let e = run[0].0;
-                                g.htod(&w.data[e * mat.bytes..(e + run.len()) * mat.bytes], &pf.staging, half(gi - 1) + STAGE * mat.off + i * mat.bytes)?;
+                                g.htod(&w.data[e * mat.bytes..(e + run.len()) * mat.bytes], &pf.staging, half(j) + STAGE * mat.off + i * mat.bytes)?;
                                 i += run.len();
                             }
                         }
                         Ok(())
                     };
-                    // Group gi + 1 copies into the staging half group gi - 1 used, beside group gi's GEMMs (`beside`
-                    // starts the copies after group gi - 1's down GEMM). They queue last, so the GEMMs need not wait
-                    // for the host to stage them.
-                    for gi in 0..groups.len() {
-                        let (sp, lo, hi) = spans[gi];
+                    // `beside` starts a step's copies after the GEMMs before it. They queue last, so the GEMMs need not
+                    // wait for the host to stage them.
+                    for (gs, cp) in &steps {
                         g.beside(&mut || {
-                            g.gemm(mg.ty, mg.rows, mg.cols, tp(sp[0].0), sp[0].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, SAME_X)?;
-                            g.gemm(mu.ty, mu.rows, mu.cols, tp(sp[1].0), sp[1].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X)?;
-                            g.gemm(md.ty, md.rows, md.cols, tp(sp[2].0), sp[2].1, at(l.ge) + (4 * lo * c.n_ff_exp) as u64, c.n_ff_exp, hi - lo, 0, at(l.ye) + (4 * lo * ne) as u64, ne, 0)?;
-                            if gi + 1 < groups.len() { copy(gi + 1)?; }
+                            for gi in gs.clone().filter(|&gi| !groups[gi].is_empty()) {
+                                let (sp, lo, hi) = spans[gi];
+                                g.gemm(mg.ty, mg.rows, mg.cols, tp(sp[0].0), sp[0].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, SAME_X)?;
+                                g.gemm(mu.ty, mu.rows, mu.cols, tp(sp[1].0), sp[1].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X)?;
+                                g.gemm(md.ty, md.rows, md.cols, tp(sp[2].0), sp[2].1, at(l.ge) + (4 * lo * c.n_ff_exp) as u64, c.n_ff_exp, hi - lo, 0, at(l.ye) + (4 * lo * ne) as u64, ne, 0)?;
+                            }
+                            if let Some(j) = *cp { copy(j)?; }
                             Ok(())
                         })?;
                     }

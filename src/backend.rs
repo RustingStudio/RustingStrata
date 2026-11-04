@@ -98,6 +98,8 @@ pub trait Backend: Send {
     /// Queue the ops of `f` in order, its host copies beside its other ops (CUDA: on a side stream), so none of
     /// those ops may read what a copy writes; ops after `f` see the copies, and the copies see the ops before `f`.
     fn beside(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> { f() }
+    /// Whether `beside` really overlaps its copies with its other ops (else it queues them in order).
+    fn beside_overlaps(&self) -> bool { false }
     /// Zeroed host memory of `words` u32 that kernels read and write at the `Buf` address. The host pointer is
     /// valid while the `Buf` lives.
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)>;

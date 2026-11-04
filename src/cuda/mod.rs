@@ -413,6 +413,8 @@ impl Backend for Gpu {
         r
     }
 
+    fn beside_overlaps(&self) -> bool { true }
+
     fn beside(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
         self.side.join(&self.stream)?;
         self.nb.store(BESIDE, Relaxed);
