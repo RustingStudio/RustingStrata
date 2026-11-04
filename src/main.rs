@@ -643,6 +643,11 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, r: &mut Runner, t
     // Browsers can reach a loopback server: the Host check stops DNS rebinding, and requiring a JSON content type
     // makes a cross-site POST need a CORS preflight, which is never answered.
     if !serve::host_ok(&host, addr) { return send(&mut w, "403 Forbidden", json!({"error": {"message": "bad Host header", "type": "forbidden"}})); }
+    // The chat page holds no secret, so it loads without the key (the page asks for it).
+    if method == "GET" && path == "/" {
+        const PAGE: &str = include_str!("web/index.html");
+        return Ok(write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PAGE}", PAGE.len())?);
+    }
     if key.is_some_and(|k| !serve::key_ok(&auth, k)) { return send(&mut w, "401 Unauthorized", json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}})); }
     if method == "POST" && !json { return send(&mut w, "415 Unsupported Media Type", json!({"error": {"message": "Content-Type must be application/json", "type": "invalid_request_error"}})); }
     match (method.as_str(), path.as_str()) {
