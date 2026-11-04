@@ -393,7 +393,7 @@ function md(s) {
         const t = m[1] ? 'ol' : 'ul';
         if (listTag !== t) { close(); out += `<${t}>`; listTag = t; }
         out += `<li>${inline(m[2])}</li>`;
-      } else if (listTag && /^\s+/.test(l) && !para.length) out = out.replace(/<\/li>$/, '<br>' + inline(l.trim()) + '</li>');
+      } else if (listTag && /^\s+/.test(l) && !para.length) out = out.slice(0, -5) + '<br>' + inline(l.trim()) + '</li>';
       else { close(); para.push(l); }
     }
     flush(); close();
