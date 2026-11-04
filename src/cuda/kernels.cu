@@ -241,6 +241,16 @@ __device__ __forceinline__ void gemv_row(const u8* __restrict__ w, const float* 
 
 __device__ __forceinline__ int pack4(int a, int b, int c, int d) { return (a & 255) | ((b & 255) << 8) | ((c & 255) << 16) | (d << 24); }
 __device__ __forceinline__ u32 ldu32(const u8* p) { return *(const u32*)p; }  // 4-byte aligned only
+// kvalues_iq4nl of the 8 nibbles of q (llama.cpp's get_int_from_table_16): .x the low nibbles of its 4 bytes, .y
+// the high, in byte order. The table lives in 4 registers, so the lookups take no loads.
+__device__ __forceinline__ int2 iq4nl_lut(u32 q) {
+    const u32 t0 = 0xBFAD9881u, t1 = 0xF6EADDCFu, t2 = 0x26190D01u, t3 = 0x71594535u;  // -127 .. -65, ..., 53 .. 113
+    u32 hs = 0x32103210u | ((q & 0x88888888u) >> 1), lo = __byte_perm(t0, t1, q), hi = __byte_perm(t2, t3, q);
+    u32 a = __byte_perm(lo, hi, hs);
+    lo = __byte_perm(t0, t1, q >> 16); hi = __byte_perm(t2, t3, q >> 16);
+    u32 b = __byte_perm(lo, hi, hs >> 16);
+    return make_int2((int)__byte_perm(a, b, 0x6420), (int)__byte_perm(a, b, 0x7531));
+}
 // 8 bytes at 2-aligned p with 4-byte loads: at p when 4-aligned, else at p - 2, p + 2, p + 6 and shifted (so the
 // 2 bytes either side must be readable). Superblock offsets keep p's alignment uniform across a warp.
 __device__ __forceinline__ uint2 ld8a2(const u8* p) {
@@ -407,15 +417,14 @@ template <> struct QI<21> {  // IQ3_S (110 bytes: rows 2-aligned)
 template <> struct QI<23> {  // IQ4_XS (136 bytes)
     static constexpr bool MIN = false;
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        // Super-blocks are 8-aligned (136 bytes, rows of whole super-blocks): the header (d, scales_h, scales_l) and
+        // each lane's 8 quant bytes are one 8-byte load each.
         int ib = sub >> 2, r = (sub & 3) * 8;
-        u32 sh = ld16(b + 2);
-        int ls = ((b[4 + ib / 2] >> (4 * (ib & 1))) & 0xF) | (((sh >> (2 * ib)) & 3) << 4);
-        d = ldh(b) * (float)(ls - 32);
-        const u8* q = b + 8 + 16 * ib + (r & 15);
-        u32 w0 = ldu32(q), w1 = ldu32(q + 4), sft = r < 16 ? 0 : 4;
-        int v[8];
-        for (int i = 0; i < 4; i++) { v[i] = kvalues_iq4nl[(w0 >> (8 * i + sft)) & 0xF]; v[i + 4] = kvalues_iq4nl[(w1 >> (8 * i + sft)) & 0xF]; }
-        lo = pack4(v[0], v[1], v[2], v[3]); hi = pack4(v[4], v[5], v[6], v[7]);
+        uint2 hd = *(const uint2*)b, w = *(const uint2*)(b + 8 + 16 * ib + (r & 15));
+        int ls = ((hd.y >> (4 * ib)) & 0xF) | (((hd.x >> (16 + 2 * ib)) & 3) << 4);
+        d = h2f((u16)hd.x) * (float)(ls - 32);
+        int2 a = iq4nl_lut(w.x), c = iq4nl_lut(w.y);
+        lo = r < 16 ? a.x : a.y; hi = r < 16 ? c.x : c.y;
     }
 };
 template <> struct QI<42> {  // Q2_0
@@ -435,10 +444,8 @@ template <> struct QI<20> {  // IQ4_NL, 8 blocks of 18 (2-byte aligned: ld16 onl
         int r = (sub & 3) * 8;
         d = ldh(p);
         const u8* q = p + 2 + (r & 15);
-        u32 w0 = ld16(q) | (ld16(q + 2) << 16), w1 = ld16(q + 4) | (ld16(q + 6) << 16), sft = r < 16 ? 0 : 4;
-        int v[8];
-        for (int i = 0; i < 4; i++) { v[i] = kvalues_iq4nl[(w0 >> (8 * i + sft)) & 0xF]; v[i + 4] = kvalues_iq4nl[(w1 >> (8 * i + sft)) & 0xF]; }
-        lo = pack4(v[0], v[1], v[2], v[3]); hi = pack4(v[4], v[5], v[6], v[7]);
+        int2 a = iq4nl_lut(ld16(q) | (ld16(q + 2) << 16)), c = iq4nl_lut(ld16(q + 4) | (ld16(q + 6) << 16));
+        lo = r < 16 ? a.x : a.y; hi = r < 16 ? c.x : c.y;
     }
 };
 
