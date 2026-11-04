@@ -20,9 +20,10 @@ layout(buffer_reference, std430, buffer_reference_align = 4) coherent volatile b
 float fdiv(float a, float b) {
     float y0 = 1.0 / b;
     precise float y = fma(fma(-b, y0, 1.0), y0, y0), q = a * y, r = fma(fma(-q, b, a), y, q);
-    return r;
+    // An infinite operand or b = 0 makes the steps inf * 0 = NaN (sigmoid(-100): 1 / inf); a / b is exact there.
+    return isinf(a) || isinf(b) || b == 0.0 ? a / b : r;
 }
-float sqrt_(float x) { float s = sqrt(x); precise float r = fma(fma(-s, s, x), fdiv(0.5, s), s); return x > 0.0 ? r : s; }
+float sqrt_(float x) { float s = sqrt(x); precise float r = fma(fma(-s, s, x), fdiv(0.5, s), s); return x > 0.0 && !isinf(x) ? r : s; }
 
 // expf as CUDA compiles it (its PTX): x = j ln2 + r with j from a rounded-down fma, then ex2.approx(r) * 2^j.
 float expf_(float x) {

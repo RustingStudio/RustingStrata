@@ -343,7 +343,7 @@ fn attn_prefill_matches_decode() {
         eprintln!("backend {bk}");
         // Long contexts give each split several 32-position chunks.
         for (pos0, t, nh, nkv, hd) in [(5, 100, 4, 2, 64), (5, 100, 4, 2, 128), (5, 100, 4, 2, 256), (5, 100, 16, 2, 256),
-                                       (5, 100, 8, 8, 128), (5, 100, 32, 8, 128), (2100, 3, 32, 8, 128), (1000, 3, 16, 2, 256)] {
+                                       (5, 100, 8, 8, 128), (5, 100, 32, 8, 128), (2100, 3, 32, 8, 128), (1000, 3, 16, 2, 256), (0, 40, 24, 2, 256)] {
             let n = (pos0 + t) * nkv * hd;
             let (kf, vf) = (xs(n), xs(n + 5)[5..].to_vec());
             let (dk, dv) = (gpu.zeros::<u16>(n).unwrap(), gpu.zeros::<u16>(n).unwrap());
@@ -1072,5 +1072,77 @@ fn gemv_partial_superblocks_and_q2_0() {
         gpu.swiglu(dg2.addr(), du.addr(), rows * n).unwrap();
         gpu.quant_xq(dg2.addr(), n, n, rows, q2.addr()).unwrap();
         assert_eq!(down::<u8>(gpu, &q1), down::<u8>(gpu, &q2), "{bk}: swiglu_q of 640");
+    }
+}
+
+/// qwen4exp hyper-connection and PLE kernels against loops over the same f32 inputs.
+#[test]
+fn hc_and_ple_kernels_match_reference() {
+    let sig = |x: f32| 1.0 / (1.0 + (-x).exp());
+    let (n, hc, nt) = (300, 4, 3);
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        let near = |what: &str, got: &[f32], want: &[f32]| {
+            let e = rel_l2(got, want);
+            assert!(e <= 1e-5, "{bk} {what}: rel err {e}");
+        };
+        // hc_silu (and hc_mix below) on values past expf's overflow: silu(-100) is -0, not 0 / inf = NaN.
+        let x: Vec<f32> = xs(nt * n).iter().map(|v| 400.0 * v).collect();
+        let b = up(gpu, &x);
+        gpu.hc_silu(b.addr(), 0.25, nt * n).unwrap();
+        near("hc_silu", &down::<f32>(gpu, &b), &x.iter().map(|v| v * 0.25 * sig(v * 0.25)).collect::<Vec<_>>());
+        // hc_mix
+        let (xn, g) = (xs(nt * hc * n + 7)[7..].to_vec(), xs(nt * hc * n + 3)[3..].iter().map(|v| 120.0 * v).collect::<Vec<f32>>());
+        let out = gpu.zeros::<f32>(nt * n).unwrap();
+        gpu.hc_mix(up(gpu, &xn).addr(), up(gpu, &g).addr(), out.addr(), n, hc, nt).unwrap();
+        let want: Vec<f32> = (0..nt * n).map(|j| {
+            let (t, i) = (j / n, j % n);
+            (0..hc).map(|c| xn[(t * hc + c) * n + i] * sig(g[(t * hc + c) * n + i]) / hc as f32).sum()
+        }).collect();
+        near("hc_mix", &down::<f32>(gpu, &out), &want);
+        // hc_write, then clear
+        let (r0, o, inj) = (xs(nt * hc * n + 1)[1..].to_vec(), xs(nt * n + 5)[5..].to_vec(), xs(nt * hc + 2)[2..].iter().map(|v| 4.0 * v).collect::<Vec<f32>>());
+        let (r, ob) = (up(gpu, &r0), up(gpu, &o));
+        gpu.hc_write(r.addr(), ob.addr(), up(gpu, &inj).addr(), n, hc, nt, true).unwrap();
+        let want: Vec<f32> = (0..nt * hc * n).map(|j| {
+            let (t, c, i) = (j / (hc * n), j / n % hc, j % n);
+            r0[j] + o[t * n + i] * 2.0 * sig(inj[t * hc + c] / hc as f32)
+        }).collect();
+        near("hc_write", &down::<f32>(gpu, &r), &want);
+        assert!(down::<f32>(gpu, &ob).iter().all(|&v| v == 0.0), "{bk} hc_write clear");
+        // ple_gate
+        let (key, query, value) = (xs(nt * hc * n + 11)[11..].to_vec(), xs(nt * hc * n + 13)[13..].to_vec(), xs(nt * n + 17)[17..].to_vec());
+        let gated = gpu.zeros::<f32>(nt * hc * n).unwrap();
+        gpu.ple_gate(up(gpu, &key).addr(), up(gpu, &query).addr(), up(gpu, &value).addr(), gated.addr(), n, hc, nt).unwrap();
+        let want: Vec<f32> = (0..nt * hc).flat_map(|row| {
+            let s: f32 = (0..n).map(|i| key[row * n + i] * query[row * n + i]).sum::<f32>() / (n as f32).sqrt();
+            let gate = sig(s.signum() * s.abs().max(1e-6).sqrt());
+            let t = row / hc;
+            (0..n).map(|i| value[t * n + i] * gate).collect::<Vec<f32>>()
+        }).collect();
+        near("ple_gate", &down::<f32>(gpu, &gated), &want);
+        // ple_conv over 40 positions: one token at a time, then the same in chunks of 5
+        let (d, npos) = (hc * n, 40);
+        let kw = xs(4 * d + 19)[19..].to_vec();
+        let (gall, nall, rall) = (xs(npos * d + 23)[23..].to_vec(), xs(npos * d + 29)[29..].to_vec(), xs(npos * d + 31)[31..].to_vec());
+        let want: Vec<f32> = (0..npos * d).map(|j| {
+            let (q, i) = (j / d, j % d);
+            let mut acc = kw[i * 4 + 3] * nall[j];
+            for k in 0..3 { if q + 3 * k >= 9 { acc += kw[i * 4 + k] * nall[(q + 3 * k - 9) * d + i]; } }
+            rall[j] + gall[j] + acc * sig(acc)
+        }).collect();
+        for chunk in [1, 5] {
+            let ring = gpu.zeros::<f32>(16 * d).unwrap();
+            let kb = up(gpu, &kw);
+            let mut got = vec![];
+            for p0 in (0..npos).step_by(chunk) {
+                let s = |v: &[f32]| v[p0 * d..(p0 + chunk) * d].to_vec();
+                let rb = up(gpu, &s(&rall));
+                gpu.ple_conv(rb.addr(), up(gpu, &s(&gall)).addr(), up(gpu, &s(&nall)).addr(), kb.addr(), ring.addr(),
+                             up(gpu, &[p0 as i32]).addr(), d, chunk).unwrap();
+                got.extend(down::<f32>(gpu, &rb));
+            }
+            near(&format!("ple_conv chunk {chunk}"), &got, &want);
+        }
     }
 }
