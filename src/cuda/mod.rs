@@ -352,6 +352,7 @@ impl Gpu {
 
 impl Backend for Gpu {
     fn name(&self) -> &'static str { "cuda" }
+    fn device(&self) -> String { self.ctx.name().unwrap_or_default() }
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf> {
         let s = self.stream.alloc_zeros::<u8>(bytes.max(1))?;
         Ok(Buf::new(self.ptr(&s), s.len(), s))

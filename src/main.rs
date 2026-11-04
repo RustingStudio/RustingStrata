@@ -496,6 +496,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let (tx, rx) = std::sync::mpsc::channel();
             let open_conns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let waiting = open_conns.clone();
+            let stats = std::sync::Arc::new(std::sync::Mutex::new(serve::Stats::default()));
+            let (st, a, k, t0) = (stats.clone(), addr.clone(), api_key.clone(), Instant::now());
             std::thread::spawn(move || for (i, conn) in listener.incoming().enumerate() {
                 let c = match conn { Ok(c) => c, Err(e) => { eprintln!("request {i}: {e:#}"); continue } };
                 // ponytail: a fixed cap on connections read or queued (each may hold an 8 MB body).
@@ -504,15 +506,26 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     eprintln!("request {i}: 16 requests already waiting, closed");
                     continue;
                 }
-                let tx = tx.clone();
+                let (tx, oc, st, a, k) = (tx.clone(), open_conns.clone(), st.clone(), a.clone(), k.clone());
                 std::thread::spawn(move || {
                     let q = c.set_read_timeout(Some(Duration::from_secs(30))).and_then(|_| c.set_write_timeout(Some(Duration::from_secs(30))))
                         .map_err(Into::into).and_then(|_| serve::read_request(&mut BufReader::new(&c)));
+                    // The page's side panel is answered here, so it stays current while a reply is generated or a
+                    // model loads. A bad Host or key falls through to `handle`, which refuses it.
+                    if let Ok(r) = &q && r.method == "GET" && r.path == "/api/stats" && serve::host_ok(&r.host, &a)
+                        && k.as_deref().is_none_or(|k| serve::key_ok(&r.auth, k)) {
+                        let mut v = json!(*st.lock().unwrap());
+                        (v["system"], v["uptime_s"]) = (serve::system(), t0.elapsed().as_secs().into());
+                        let b = v.to_string();
+                        let _ = write!(&c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+                        oc.fetch_sub(1, Relaxed);
+                        return;
+                    }
                     let _ = tx.send((c, q, i));
                 });
             });
             let s = Serving { rx, waiting, addr, key: api_key, dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(),
-                dl: Default::default() };
+                dl: Default::default(), stats };
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
             eprintln!("listening on {url} (models folder: {})", s.dir.display());
@@ -528,6 +541,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     Ok(None) => return Ok(()),
                     Err(e) if w.is_none() => return Err(e),
                     Err(e) => {
+                        s.stats.lock().unwrap().unload(None);
                         eprintln!("loading {}: {e:#}", p.display());
                         let b = json!({"error": {"message": format!("{e:#}"), "type": "server_error"}}).to_string();
                         let _ = write!(w.unwrap(), "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
@@ -687,6 +701,7 @@ struct Serving {
     model: Option<PathBuf>,
     /// The Hugging Face download running on its own thread, or the last one.
     dl: std::sync::Arc<std::sync::Mutex<hf::Progress>>,
+    stats: std::sync::Arc<std::sync::Mutex<serve::Stats>>,
 }
 
 impl Serving {
@@ -716,11 +731,18 @@ impl Serving {
 /// for. The model and its GPU memory are freed on return.
 fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<TcpStream>) -> anyhow::Result<Option<(PathBuf, TcpStream)>> {
     eprintln!("loading {}", model.display());
+    let name = model.file_stem().and_then(|s| s.to_str()).unwrap_or("strata").to_string();
+    s.stats.lock().unwrap().unload(Some(name.clone()));
     let g = Gguf::open(model)?;
     let m = Model::load(&g)?;
     let tok = Tokenizer::from_gguf(&g)?;
     let r = engine.runner(&m, model)?;
-    let name = model.file_stem().and_then(|s| s.to_str()).unwrap_or("strata").to_string();
+    {
+        let mut st = s.stats.lock().unwrap();
+        st.loading = false;
+        (st.backend, st.device, st.ctx) = match &r { Runner::Gpu(g) => (g.gpu.name().into(), g.gpu.device(), engine.ctx), _ => ("cpu".into(), String::new(), engine.ctx) };
+        gpu_stats(&r, &mut st);
+    }
     let mut l = Loaded { r, tok, tpl: template(&g), name, path: model.to_path_buf() };
     eprintln!("loaded {}", l.name);
     if let Some(mut w) = w.take() {
@@ -728,8 +750,18 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
         let _ = write!(w, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
     }
     let next = s.serve(Some(&mut l), &engine);
+    s.stats.lock().unwrap().unload(None);
     l.r.finish()?;
     Ok(next)
+}
+
+/// The side panel's device memory, expert cache and MTP counts.
+fn gpu_stats(r: &Runner, s: &mut serve::Stats) {
+    if let Runner::Gpu(g) = r {
+        s.vram = g.gpu.mem_info().ok().map(|(f, t)| ((t - f) as u64, t as u64));
+        s.experts = g.cache.as_ref().map(|_| (g.hits as u64, g.misses as u64));
+        s.drafts = (g.drafts.0 > 0).then_some((g.drafts.0 as u64, g.drafts.1 as u64));
+    }
 }
 
 /// Default models folder: `$XDG_DATA_HOME`, `%LOCALAPPDATA%` on Windows, else `~/.local/share`.
@@ -841,19 +873,38 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let tools = req.tool_calls && !req.tools.is_empty();
             let mut cached = 0;
             let mut hold = Hold::new(tools, req.stop);
+            let n_system = tok.encode(&system)?.len();
+            let (t0, mut t1) = (Instant::now(), Instant::now());
+            {
+                let mut st = s.stats.lock().unwrap();
+                (st.busy, st.live_tokens) = (true, 0);
+            }
             let res = (|| -> anyhow::Result<(Vec<u32>, bool)> {
                 let logits;
                 (_, logits, cached) = r.chat(tok, &prompt, &tpl.render(&req.messages, &req.tools, req.think, false), &system)?;
+                t1 = Instant::now();
                 if req.stream {
                     write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
                     write!(w, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), None))?;
                 }
                 decode(r, tok, e.mtp() > 0, &mut smp, logits, n, &mut |t| {
+                    s.stats.lock().unwrap().live_tokens += 1;
                     let t = hold.push(t);
                     if req.stream && !t.is_empty() { write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?; }
                     Ok(hold.stopped)
                 })
             })();
+            {
+                let mut st = s.stats.lock().unwrap();
+                st.busy = false;
+                gpu_stats(r, &mut st);
+                if let Ok((out, stop)) = &res {
+                    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+                    st.record(serve::Last { at: created, model: name.into(), system_tokens: n_system, cached_tokens: cached, prompt_tokens: ids.len(),
+                        completion_tokens: out.len(), prefill_ms: ms(t1 - t0), decode_ms: ms(t1.elapsed()),
+                        finish: if *stop { "stop" } else { "length" }.into() });
+                }
+            }
             // The next request starts from the saved history state or from scratch. A stream that already started is just cut off.
             let (out, stop) = match res {
                 Ok(x) => x,

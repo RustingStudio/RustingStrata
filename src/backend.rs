@@ -78,6 +78,8 @@ pub const SAME_X: i32 = 4;
 pub trait Backend: Send {
     /// "cuda" or "vulkan".
     fn name(&self) -> &'static str;
+    /// The GPU's name as the driver reports it.
+    fn device(&self) -> String;
     /// Zeroed buffer of `bytes` (at least 1).
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf>;
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()>;

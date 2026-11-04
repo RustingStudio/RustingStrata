@@ -159,3 +159,118 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
         temperature: num("temperature", |f| f >= 0.0, "a number >= 0")?, top_k: int("top_k", 0)?.map(|n| n as usize),
         top_p: num("top_p", |f| f > 0.0 && f <= 1.0, "a number in (0, 1]")?, seed: int("seed", 0)?, stop })
 }
+
+/// What the chat page's side panel shows about the server, kept by the request loop and answered by the reader
+/// threads (`GET /api/stats`), so it is current while a reply is generated or a model loads.
+#[derive(Clone, Default, serde::Serialize)]
+pub struct Stats {
+    /// The loaded model's name, or the one loading.
+    pub model: Option<String>,
+    pub loading: bool,
+    /// "cuda", "vulkan" or "cpu", and the GPU's name.
+    pub backend: String,
+    pub device: String,
+    pub ctx: usize,
+    /// Device memory in use and in total, measured after the load and after each request.
+    pub vram: Option<(u64, u64)>,
+    /// MoE expert cache hits and misses, and MTP drafts tried and accepted, since the model loaded.
+    pub experts: Option<(u64, u64)>,
+    pub drafts: Option<(u64, u64)>,
+    /// A reply is being generated, and its tokens so far.
+    pub busy: bool,
+    pub live_tokens: usize,
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub cached_tokens: u64,
+    pub completion_tokens: u64,
+    /// The latest requests, oldest first (at most 40).
+    pub recent: std::collections::VecDeque<Last>,
+}
+
+/// One answered chat request.
+#[derive(Clone, Default, serde::Serialize)]
+pub struct Last {
+    /// Unix time in seconds when it finished.
+    pub at: u64,
+    pub model: String,
+    /// Prompt tokens: the system part, reused from the previous request (cached, which includes the system part
+    /// when it was kept) and in total; reply tokens.
+    pub system_tokens: usize,
+    pub cached_tokens: usize,
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    /// Prefill (up to the first token) and decode times in milliseconds.
+    pub prefill_ms: f64,
+    pub decode_ms: f64,
+    pub finish: String,
+}
+
+impl Stats {
+    pub fn record(&mut self, l: Last) {
+        self.requests += 1;
+        self.prompt_tokens += l.prompt_tokens as u64;
+        self.cached_tokens += l.cached_tokens as u64;
+        self.completion_tokens += l.completion_tokens as u64;
+        if self.recent.len() == 40 { self.recent.pop_front(); }
+        self.recent.push_back(l);
+    }
+
+    /// The stats with no model loaded (`model` while it loads), keeping the totals and recent requests since start.
+    pub fn unload(&mut self, model: Option<String>) {
+        let recent = std::mem::take(&mut self.recent);
+        *self = Stats { loading: model.is_some(), model, requests: self.requests, prompt_tokens: self.prompt_tokens,
+            cached_tokens: self.cached_tokens, completion_tokens: self.completion_tokens, recent, ..Default::default() };
+    }
+}
+
+/// This machine's memory and CPU use and this process's resident memory, as JSON for the chat page. CPU use is
+/// over the time since the previous call. Linux and Windows; elsewhere only the thread count.
+pub fn system() -> Value {
+    static PREV: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+    let mut v = serde_json::json!({"threads": std::thread::available_parallelism().map_or(0, |n| n.get())});
+    // (busy, total) CPU time since boot, in any unit.
+    let cpu_pct = |busy: u64, total: u64| -> Value {
+        let mut p = PREV.lock().unwrap();
+        let (db, dt) = (busy.saturating_sub(p.0), total.saturating_sub(p.1));
+        *p = (busy, total);
+        if dt > 0 { (100.0 * db as f64 / dt as f64).into() } else { Value::Null }
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+        let kb = |s: &str, k: &str| s.lines().find_map(|l| l.strip_prefix(k)?.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()).map(|n| n << 10);
+        if let Some(l) = read("/proc/stat").lines().next() {
+            let n: Vec<u64> = l.split_whitespace().skip(1).filter_map(|x| x.parse().ok()).collect();
+            if n.len() >= 5 { let total = n.iter().take(8).sum::<u64>(); v["cpu_pct"] = cpu_pct(total - n[3] - n[4], total); }
+        }
+        let m = read("/proc/meminfo");
+        if let (Some(t), Some(a)) = (kb(&m, "MemTotal:"), kb(&m, "MemAvailable:")) { (v["ram_total"], v["ram_used"]) = (t.into(), (t - a).into()); }
+        if let Some(r) = kb(&read("/proc/self/status"), "VmRSS:") { v["rss"] = r.into(); }
+        if let Some(n) = read("/proc/cpuinfo").lines().find_map(|l| l.strip_prefix("model name")?.split_once(':').map(|x| x.1.trim().to_string())) { v["cpu"] = n.into(); }
+    }
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct MemStatus { len: u32, load: u32, total: u64, avail: u64, rest: [u64; 5] }
+        #[repr(C)]
+        struct ProcMem { cb: u32, faults: u32, peak: usize, ws: usize, rest: [usize; 6] }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GlobalMemoryStatusEx(m: *mut MemStatus) -> i32;
+            fn GetSystemTimes(idle: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+            fn GetCurrentProcess() -> isize;
+            fn K32GetProcessMemoryInfo(p: isize, m: *mut ProcMem, cb: u32) -> i32;
+        }
+        let mut m = MemStatus { len: size_of::<MemStatus>() as u32, load: 0, total: 0, avail: 0, rest: [0; 5] };
+        if unsafe { GlobalMemoryStatusEx(&mut m) } != 0 { (v["ram_total"], v["ram_used"]) = (m.total.into(), (m.total - m.avail).into()); }
+        let (mut i, mut k, mut u) = (0, 0, 0);
+        // Kernel time includes idle time.
+        if unsafe { GetSystemTimes(&mut i, &mut k, &mut u) } != 0 { v["cpu_pct"] = cpu_pct(k + u - i, k + u); }
+        let mut p = ProcMem { cb: size_of::<ProcMem>() as u32, faults: 0, peak: 0, ws: 0, rest: [0; 6] };
+        if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut p, size_of::<ProcMem>() as u32) } != 0 { v["rss"] = (p.ws as u64).into(); }
+        if let Ok(n) = std::env::var("PROCESSOR_IDENTIFIER") { v["cpu"] = n.into(); }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let _ = cpu_pct;
+    v
+}
