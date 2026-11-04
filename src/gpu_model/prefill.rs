@@ -117,7 +117,7 @@ impl GpuModel<'_> {
 
     fn step_all(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
         let mut logits = Vec::new();
-        // ponytail: hyper-connection models have no chunked prefill yet; TMAX tokens per forward instead.
+        // Hyper-connection models: TMAX tokens per forward (prompts too short for the chunked GEMM prefill).
         if self.m.cfg.hc_n > 0 {
             for ch in tokens.chunks(crate::cpu_worker::TMAX) { logits = self.verify(ch)?.pop().unwrap(); }
             return Ok(logits);
