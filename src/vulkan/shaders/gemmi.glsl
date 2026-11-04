@@ -14,6 +14,7 @@
 #extension GL_EXT_control_flow_attributes : require
 layout(local_size_x = 256) in;
 #include "common.glsl"
+#define SHARED_TABLES
 #include "deq.glsl"
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64 { uint64_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer UV4 { uvec4 v[]; };
@@ -87,6 +88,7 @@ void main() {
     for (uint i = tid; i < 256; i += 256) { xq[IX + i] = i / 16; xq[IX + 256 + i] = i % 16; }
 #endif
     if (KS == 16) for (uint i = tid; i < 2 * 64 * PW; i += 256) wq[i] = 0;
+    load_tables();
     barrier();
     // nv: the layout of mma.sync (element i at row g + 8 (i >> 2), column 2 t + (i & 1) + 8 ((i >> 1) & 1)), as on NVIDIA.
     uint g = gl_SubgroupInvocationID >> 2, t = gl_SubgroupInvocationID & 3;
