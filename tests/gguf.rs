@@ -151,3 +151,50 @@ fn rejects_bad_ssm_dims() {
     let bad = qwen3next_syn("ssm-ba", &kv(2), &[emb, ("blk.0.ssm_ba.weight", [8, 6])]);
     assert!(Weights::new(&bad).is_err());
 }
+
+#[test]
+fn malformed_metadata_must_not_panic() {
+    let mut fixtures = Vec::new();
+    let mut zero_alignment = Vec::new();
+    zero_alignment.extend(b"GGUF");
+    zero_alignment.extend(3u32.to_le_bytes());
+    zero_alignment.extend(0u64.to_le_bytes());
+    zero_alignment.extend(1u64.to_le_bytes());
+    w_str(&mut zero_alignment, "general.alignment");
+    zero_alignment.extend(4u32.to_le_bytes());
+    zero_alignment.extend(0u32.to_le_bytes());
+    fixtures.push(("zero-alignment", zero_alignment));
+
+    let mut giant_key = Vec::new();
+    giant_key.extend(b"GGUF");
+    giant_key.extend(3u32.to_le_bytes());
+    giant_key.extend(0u64.to_le_bytes());
+    giant_key.extend(1u64.to_le_bytes());
+    giant_key.extend(u64::MAX.to_le_bytes());
+    fixtures.push(("oversized-key", giant_key));
+
+    let mut giant_array = Vec::new();
+    giant_array.extend(b"GGUF");
+    giant_array.extend(3u32.to_le_bytes());
+    giant_array.extend(0u64.to_le_bytes());
+    giant_array.extend(1u64.to_le_bytes());
+    w_str(&mut giant_array, "array");
+    giant_array.extend(9u32.to_le_bytes());
+    giant_array.extend(0u32.to_le_bytes());
+    giant_array.extend(u64::MAX.to_le_bytes());
+    fixtures.push(("oversized-array", giant_array));
+
+    let mut failures = Vec::new();
+    for (label, bytes) in fixtures {
+        let path = std::env::temp_dir().join(format!("rustingstrata-{}-{label}.gguf", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let outcome = std::panic::catch_unwind(|| Gguf::open(&path));
+        std::fs::remove_file(&path).ok();
+        match outcome {
+            Err(_) => failures.push(format!("parser panicked on {label}")),
+            Ok(Ok(_)) => failures.push(format!("parser accepted malformed {label}")),
+            Ok(Err(_)) => {}
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+}
