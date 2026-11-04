@@ -2,6 +2,20 @@
 // super-block (constant 2): ports of QI<T> and deq8<T> in kernels.cu, which port src/quant/mod.rs (from llama.cpp
 // ggml-quants.c, MIT License, ggml authors).
 #include "tables.glsl"
+// With SHARED_TABLES defined, the IQ4 values and IQ3_S / IQ2_S grids come from shared memory, which the shader fills
+// with load_tables (all its invocations) first: the table buffer costs a load per lookup (CUDA QS<T>).
+#ifdef SHARED_TABLES
+shared int s_kv[16];
+shared uint s_g3[512];
+shared uint64_t s_g2[1024];
+#define KV_IQ4NL s_kv
+#define IQ3S_GRID s_g3
+#define IQ2S_GRID s_g2
+#else
+#define KV_IQ4NL kvalues_iq4nl
+#define IQ3S_GRID iq3s_grid
+#define IQ2S_GRID iq2s_grid
+#endif
 
 layout(constant_id = 1) const uint T = 0;
 layout(constant_id = 2) const uint SBB = 1024;
@@ -36,6 +50,7 @@ void iq1_sub(U8 w, uint b, uint ib, uint l, out uint idx, out float dl, out bool
 int sgn(uint g, uint sg, uint j) { int v = int((g >> (8 * (j & 3))) & 255); return ((sg >> j) & 1) != 0 ? -v : v; }
 
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer U32x2 { uvec2 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer U32x4 { uvec4 v[]; };
 // Q4_K, Q5_K and IQ4_XS blocks (144, 176, 136 bytes) and every field ld8 reads in them are 8-aligned; Q2_K's (84) 4-aligned.
 const bool A8 = T == 12 || T == 13 || T == 23;
 const bool A4 = T == 10;
@@ -48,6 +63,14 @@ uvec2 ld8(U8 w, uint o) {
     uint sh = uint(a & 2) * 8, w0 = U32(a & ~3ul).v[0], w1 = U32((a & ~3ul) + 4).v[0], w2 = U32((a + 7) & ~3ul).v[0];
     return uvec2(uint(packUint2x32(uvec2(w0, w1)) >> sh), uint(packUint2x32(uvec2(w1, w2)) >> sh));
 }
+#ifdef SHARED_TABLES
+void load_tables() {
+    uint li = gl_LocalInvocationIndex, n = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
+    if (T == 20 || T == 23) { if (li < 16) s_kv[li] = kvalues_iq4nl[li]; barrier(); }
+    if (T == 21) { for (uint i = li; i < 512; i += n) s_g3[i] = iq3s_grid[i]; barrier(); }
+    if (T == 22) { for (uint i = li; i < 1024; i += n) s_g2[i] = iq2s_grid[i]; barrier(); }
+}
+#endif
 // Bytewise a - c (each byte of a below 128; CUDA __vsub4).
 uint vsub4(uint a, uint c) { return ((a | 0x80808080u) - c) ^ 0x80808080u; }
 // The types QI<T> in kernels.cu reads with word loads: Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K.
@@ -120,7 +143,7 @@ void iq_grid(U8 w, uint b, uint ib, uint l, out uint g0, out uint g1, out uint s
                 g = iq2xs_grid[k & 511];
                 sg = ksign(k >> 9);
             } else {
-                g = iq2s_grid[u8_(w, b + 2 + 4 * ib + l) | ((u8_(w, b + 66 + ib) << (8 - 2 * l)) & 0x300)];
+                g = IQ2S_GRID[u8_(w, b + 2 + 4 * ib + l) | ((u8_(w, b + 66 + ib) << (8 - 2 * l)) & 0x300)];
                 sg = u8_(w, b + 34 + 4 * ib + l);
             }
             d = ldh(w, b) * (0.5 + float(l < 2 ? sc & 15 : sc >> 4)) * 0.25;
@@ -137,8 +160,8 @@ void iq_grid(U8 w, uint b, uint ib, uint l, out uint g0, out uint g1, out uint s
             uint hb = u8_(w, b + 66 + ib);
             sg = u8_(w, b + 74 + 4 * ib + l);
             d = ldh(w, b) * float(1 + 2 * ((u8_(w, b + 106 + ib / 2) >> (4 * (ib & 1))) & 15));
-            g0 = iq3s_grid[(qq & 255) | ((hb << (8 - 2 * l)) & 256)];
-            g1 = iq3s_grid[(qq >> 8) | ((hb << (7 - 2 * l)) & 256)];
+            g0 = IQ3S_GRID[(qq & 255) | ((hb << (8 - 2 * l)) & 256)];
+            g1 = IQ3S_GRID[(qq >> 8) | ((hb << (7 - 2 * l)) & 256)];
         }
     }
 }
@@ -172,9 +195,9 @@ void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
     } else {  // IQ4_XS (23), IQ4_NL (20, 8 blocks of 18)
         uint r = l * 8, o;
         if (T == 23) {
-            uint sh = ld16(w, b + 2);
-            uint ls = ((u8_(w, b + 4 + ib / 2) >> (4 * (ib & 1))) & 15) | ((sh >> (2 * ib)) & 3) << 4;
-            d = ldh(w, b) * float(int(ls) - 32);
+            uvec2 hd = ld8(w, b);  // d, scales_h, scales_l
+            uint ls = ((hd.y >> (4 * ib)) & 15) | ((hd.x >> (16 + 2 * ib)) & 3) << 4;
+            d = h2f(hd.x & 0xFFFF) * float(int(ls) - 32);
             o = b + 8 + 16 * ib + (r & 15);
         } else {
             uint p = b + 18 * ib;
@@ -182,7 +205,7 @@ void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
             o = p + 2 + (r & 15);
         }
         uvec2 v = ld8(w, o);
-        [[unroll]] for (uint i = 0; i < 8; i++) q[i] = kvalues_iq4nl[((i < 4 ? v.x : v.y) >> (8 * (i & 3) + (r < 16 ? 0 : 4))) & 15];
+        [[unroll]] for (uint i = 0; i < 8; i++) q[i] = KV_IQ4NL[((i < 4 ? v.x : v.y) >> (8 * (i & 3) + (r < 16 ? 0 : 4))) & 15];
     }
 }
 
@@ -205,7 +228,8 @@ void deq8(U8 w, uint b, uint sub, out float o[8]) {
     if (T == 0) {  // F32
         [[unroll]] for (uint i = 0; i < 8; i++) o[i] = F32(uint64_t(w)).v[b / 4 + 8 * sub + i];
     } else if (T == 30) {  // BF16
-        [[unroll]] for (uint i = 0; i < 8; i++) o[i] = uintBitsToFloat(ld16(w, b + 16 * sub + 2 * i) << 16);
+        uvec4 q = U32x4(uint64_t(w) + b + 16 * sub).v[0];  // rows of BF16 start 16-aligned (cols % 8 == 0)
+        [[unroll]] for (uint i = 0; i < 4; i++) { o[2 * i] = uintBitsToFloat(q[i] << 16); o[2 * i + 1] = uintBitsToFloat(q[i] & 0xFFFF0000u); }
     } else {
         int q[8]; float d, m;
         qi8(w, b, sub, q, d, m);
