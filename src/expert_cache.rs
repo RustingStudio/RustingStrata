@@ -33,9 +33,10 @@ pub struct ExpertCache {
     pub swaps: usize,
 }
 
-/// Where routing profiles and calibration files live.
+/// Where routing profiles and calibration files live: `$XDG_CACHE_HOME`, `%LOCALAPPDATA%` on Windows, else
+/// `~/.cache`.
 pub fn cache_dir() -> PathBuf {
-    std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from)
+    std::env::var_os("XDG_CACHE_HOME").or_else(|| std::env::var_os("LOCALAPPDATA")).map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"))
         .join("rusting_strata")
 }

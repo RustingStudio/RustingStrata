@@ -4,6 +4,7 @@ use crate::chat::{Json, Msg, tool_def};
 use anyhow::{Context, bail};
 use serde_json::Value;
 use std::io::{BufRead, Read};
+use std::path::{Path, PathBuf};
 
 pub struct Request {
     pub method: String,
@@ -56,6 +57,44 @@ pub fn key_ok(auth: &str, key: &str) -> bool {
     if key.is_empty() { return false; }
     let a = auth.strip_prefix("Bearer ").unwrap_or("").as_bytes();
     a.len() == key.len() && a.iter().zip(key.as_bytes()).fold(0, |x, (p, q)| x | (p ^ q)) == 0
+}
+
+/// GGUF models under `dir` and two folder levels below it, as (name relative to `dir` with `/` separators, path,
+/// bytes over all shards), sorted by name; see `models`.
+pub fn list_models(dir: &Path) -> Vec<(String, PathBuf, u64)> {
+    let (mut files, mut dirs) = (Vec::new(), vec![(dir.to_path_buf(), 0)]);
+    while let Some((d, depth)) = dirs.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for p in rd.flatten().map(|e| e.path()) {
+            if p.is_dir() { if depth < 2 { dirs.push((p, depth + 1)); } continue; }
+            let id = p.strip_prefix(dir).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+            files.push((id, std::fs::metadata(&p).map_or(0, |m| m.len())));
+        }
+    }
+    let mut out: Vec<_> = models(&files).into_iter().map(|(id, n)| (id.clone(), dir.join(id), n)).collect();
+    out.sort();
+    out
+}
+
+/// The models among files given as (name, bytes): .gguf files, a split model once by its first shard with the
+/// bytes of all its shards, vision projectors (`mmproj*`) left out.
+pub fn models(files: &[(String, u64)]) -> Vec<(String, u64)> {
+    let parts = |stem: &str| files.iter().filter(|(m, _)| shard(m).is_some_and(|(s, _)| s == stem)).map(|x| x.1).sum();
+    files.iter().filter(|(n, _)| n.ends_with(".gguf") && !n.rsplit('/').next().unwrap_or(n).starts_with("mmproj"))
+        .filter_map(|(n, b)| match shard(n) {
+            Some((stem, 1)) => Some((n.clone(), parts(stem))),
+            Some(_) => None,
+            None => Some((n.clone(), *b)),
+        }).collect()
+}
+
+/// "dir/name-00002-of-00003.gguf" gives ("dir/name", 2).
+pub fn shard(n: &str) -> Option<(&str, u32)> {
+    let (head, total) = n.strip_suffix(".gguf")?.rsplit_once("-of-")?;
+    let (stem, i) = head.rsplit_once('-')?;
+    let digits = |s: &str| s.len() == 5 && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(total) || !digits(i) { return None; }
+    Some((stem, i.parse().ok()?))
 }
 
 /// The parts of an OpenAI chat completion request that strata uses. Sampling fields left out fall back to the

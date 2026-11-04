@@ -1,5 +1,5 @@
 use rusting_strata::chat::{Hold, Json, Msg, Template};
-use rusting_strata::serve::{chat_request, host_ok, key_ok, read_request};
+use rusting_strata::serve::{chat_request, host_ok, key_ok, list_models, read_request};
 
 /// Every request in tests/fixtures/chat renders byte-identical to llama.cpp's Jinja rendering of the model's own
 /// template (tools/gen_chat_fixtures.py); a request llama.cpp rejects must be rejected too.
@@ -185,4 +185,18 @@ fn parses_stop_and_n() {
     assert!(q(&format!(r#","stop":"{}""#, "x".repeat(257))).is_err());
     assert!(q(r#","n":1"#).is_ok());
     assert!(q(r#","n":2"#).is_err());
+}
+
+#[test]
+fn lists_models_once_per_split() {
+    let d = std::env::temp_dir().join(format!("strata-list-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(d.join("org/repo")).unwrap();
+    for (f, n) in [("a.gguf", 3), ("mmproj-a.gguf", 1), ("notes.txt", 1), ("org/repo/big-00001-of-00002.gguf", 5),
+        ("org/repo/big-00002-of-00002.gguf", 7)] {
+        std::fs::write(d.join(f), vec![0u8; n]).unwrap();
+    }
+    let l: Vec<_> = list_models(&d).into_iter().map(|(id, p, n)| (id, p.strip_prefix(&d).unwrap().to_path_buf(), n)).collect();
+    std::fs::remove_dir_all(&d).unwrap();
+    assert_eq!(l, [("a.gguf".into(), "a.gguf".into(), 3), ("org/repo/big-00001-of-00002.gguf".into(), "org/repo/big-00001-of-00002.gguf".into(), 12)]);
 }
