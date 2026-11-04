@@ -286,7 +286,7 @@ fn qwen4exp_gpu_matches_cpu() {
     let ids = tok.encode("The capital of France is Paris. The capital of").unwrap();
     let mut st = State::new(&m.cfg);
     let want: Vec<Vec<f32>> = ids.iter().map(|&t| m.step(&mut st, t)).collect();
-    for (bk, gpu) in common::backends_except(&["vulkan"]) {
+    for (bk, gpu) in common::backends() {
         // Prefill chunks of 4 tokens: several chunks carry the recurrent, KV and PLE state between them.
         let mut gm = GpuModel::load(&m, gpu, 256, 4, 512 << 20, 0).unwrap();
         let mut got: Vec<Vec<f32>> = ids.iter().map(|&t| gm.step(t).unwrap()).collect();

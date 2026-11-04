@@ -38,6 +38,9 @@ const SPV: &[(&str, &[u8])] = &[
     ("gemmi_dp", include_bytes!("spv/gemmi_dp.spv")),
     ("gemv_f", include_bytes!("spv/gemv_f.spv")),
     ("gemv_q", include_bytes!("spv/gemv_q.spv")),
+    ("hc_mix", include_bytes!("spv/hc_mix.spv")),
+    ("hc_silu", include_bytes!("spv/hc_silu.spv")),
+    ("hc_write", include_bytes!("spv/hc_write.spv")),
     ("kv_store", include_bytes!("spv/kv_store.spv")),
     ("l2_norm", include_bytes!("spv/l2_norm.spv")),
     ("moe_combine", include_bytes!("spv/moe_combine.spv")),
@@ -47,6 +50,8 @@ const SPV: &[(&str, &[u8])] = &[
     ("moe_gemv_q", include_bytes!("spv/moe_gemv_q.spv")),
     ("moe_route", include_bytes!("spv/moe_route.spv")),
     ("norm_gate", include_bytes!("spv/norm_gate.spv")),
+    ("ple_conv", include_bytes!("spv/ple_conv.spv")),
+    ("ple_gate", include_bytes!("spv/ple_gate.spv")),
     ("quant_q8", include_bytes!("spv/quant_q8.spv")),
     ("quant_xq", include_bytes!("spv/quant_xq.spv")),
     ("rms_norm", include_bytes!("spv/rms_norm.spv")),
@@ -573,13 +578,15 @@ impl Vk {
     /// `gemm` over a tile list, or (tiles = 0) the dense matrix `wd` over positions 0 .. nd; as `gemm_raw` in
     /// src/cuda/mod.rs, with the same choice of f16 or int8 products (`Gpu::mmq`).
     fn gemm_raw(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, wd: u64, nd: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
-        ensure!(cols % 256 == 0, "{} matrix with {cols} columns: GEMM needs a multiple of 256", ty.name());
+        // Partial super-blocks (Q2_0's 640 columns, BF16's 320) are fine: K steps are 64 deep.
+        ensure!(cols % 64 == 0, "{} matrix with {cols} columns: GEMM needs a multiple of 64", ty.name());
         if n_tiles == 0 { return Ok(()); }
-        let (spec, grid, nsb) = (self.wspec(ty), [rows.div_ceil(64), n_tiles, 1], (cols / 256) as u32);
+        let (spec, grid, nk) = (self.wspec(ty), [rows.div_ceil(64), n_tiles, 1], (cols / 64) as u32);
         let (same, act) = (act & SAME_X != 0, act & !SAME_X);
-        let tail = [&(rows as u32) as &dyn Arg, &nsb, &act];
+        let tail = [&(rows as u32) as &dyn Arg, &nk, &act];
         let mut q8 = self.3.lock().unwrap();
-        if !crate::cuda::Gpu::mmq(ty) {
+        // gemmi loads q8 rows 16 bytes at a time: their stride (cols * 11 / 8) is aligned only for cols % 128 == 0.
+        if !crate::cuda::Gpu::mmq(ty) || cols % 128 != 0 {
             if !same { q8.1 = None; }
             return self.run(if self.0.coop { "gemm_f" } else { "gemm_f_dp" }, &spec, grid, &[&tiles, &wd, &x, &xrow, &y, &(nd as u32), &(x_stride as u32), &(y_stride as u32), tail[0], tail[1], tail[2]]);
         }
@@ -596,10 +603,12 @@ impl Vk {
     }
 }
 
-/// Super-blocks per row of `w`.
-fn nsb(w: &GpuTensor) -> anyhow::Result<u32> {
-    ensure!(w.cols % 256 == 0, "{} tensor with {} columns: GEMV needs a multiple of 256", w.ty.name(), w.cols);
-    Ok((w.cols / 256) as u32)
+/// GEMV column count: a multiple of 32 and of the type's block (a partial last super-block is read by the lanes
+/// inside it). llama numerics take one x scale per 256 values, so they need whole super-blocks.
+fn gemv_cols(llama: u32, ty: GgmlType, cols: usize) -> anyhow::Result<u32> {
+    let b = if llama != 0 { 256 } else { ty.block_elems().max(32) };
+    ensure!(cols % b == 0, "{} tensor with {cols} columns: GEMV needs a multiple of {b}", ty.name());
+    Ok(cols as u32)
 }
 
 #[allow(unused_variables)]
@@ -745,26 +754,25 @@ impl Backend for Vk {
     }
     fn gemvq(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
         ensure!((1..=4).contains(&nt), "gemvn: {nt} inputs (1 to 4)");
-        let (nsb, spec) = (nsb(w)?, [&self.wspec(w.ty)[..], &[nt as u32]].concat());
+        let (nc, spec) = (gemv_cols(self.0.llama, w.ty, w.cols)?, [&self.wspec(w.ty)[..], &[nt as u32]].concat());
         if matches!(w.ty, GgmlType::F32 | GgmlType::BF16) {
-            return self.run("gemv_f", &spec, [w.rows, 1, 1], &[&w.ptr, &x, &y, &(x_stride as u32), &(y_stride as u32), &nsb]);
+            return self.run("gemv_f", &spec, [w.rows, 1, 1], &[&w.ptr, &x, &y, &(x_stride as u32), &(y_stride as u32), &nc]);
         }
         let xq = if xq != 0 { xq } else {
             ensure!(nt * w.cols * 9 / 8 <= XQ, "gemv: {nt} x {} inputs do not fit the quantized-x buffer", w.cols);
             self.quant_xq(x, x_stride, w.cols, nt, self.1.addr())?;
             self.1.addr()
         };
-        self.run("gemv_q", &spec, [w.rows.div_ceil(8), 1, 1], &[&w.ptr, &xq, &y, &(y_stride as u32), &(w.rows as u32), &nsb])
+        self.run("gemv_q", &spec, [w.rows.div_ceil(8), 1, 1], &[&w.ptr, &xq, &y, &(y_stride as u32), &(w.rows as u32), &nc])
     }
     fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()> {
-        ensure!(cols % 256 == 0, "{} expert with {cols} columns: GEMV needs a multiple of 256", ty.name());
         ensure!(xg > 0 && k % xg == 0, "moe_gemv: {k} slots in groups of {xg}");
-        let (nsb, spec, ntok) = ((cols / 256) as u32, self.wspec(ty), k / xg);
+        let (nc, spec, ntok) = (gemv_cols(self.0.llama, ty, cols)?, self.wspec(ty), k / xg);
         let (w2, y2) = pair.unwrap_or((0, 0));
         let z = if pair.is_some() { 2 } else { 1 };
         if matches!(ty, GgmlType::F32 | GgmlType::BF16) {
             return self.run("moe_gemv_f", &spec, [rows, k, z], &[&w, &ids, &x, &y, &(stride as u64), &(w2 as u64), &(y2 as u64),
-                &(x_stride as u32), &(rows as u32), &nsb, &(xg as u32)]);
+                &(x_stride as u32), &(rows as u32), &nc, &(xg as u32)]);
         }
         let xq = if xq != 0 { xq } else {
             ensure!(ntok * cols * 9 / 8 <= XQ, "moe_gemv: {ntok} x {cols} inputs do not fit the quantized-x buffer");
@@ -775,10 +783,10 @@ impl Backend for Vk {
         // pre-quantized, 2 rows of 2048 columns measured 2.5% slower).
         let rpw = (2048 / cols).max(1);
         self.run("moe_gemv_q", &spec, [rows.div_ceil(8 * rpw), k, z], &[&w, &ids, &xq, &y, &(stride as u64), &(w2 as u64), &(y2 as u64),
-            &(rows as u32), &nsb, &(xg as u32), &(ntok as u32), &(rpw as u32)])
+            &(rows as u32), &nc, &(xg as u32), &(ntok as u32), &(rpw as u32)])
     }
     fn dequant(&self, w: &GpuTensor, rows: usize, out: u64) -> anyhow::Result<()> {
-        self.run("dequant", &self.wspec(w.ty), [rows, 1, 1], &[&w.ptr, &out, &nsb(w)?])
+        self.run("dequant", &self.wspec(w.ty), [rows, 1, 1], &[&w.ptr, &out, &gemv_cols(0, w.ty, w.cols)?])
     }
     fn quant_xq(&self, x: u64, x_stride: usize, n: usize, nt: usize, out: u64) -> anyhow::Result<()> {
         self.run("quant_xq", &[self.0.llama], [n.div_ceil(256), nt, 1], &[&x, &out, &0u64, &(x_stride as u32), &(n as u32)])
@@ -849,13 +857,31 @@ impl Backend for Vk {
         self.run("moe_combine_seq", &[], [(t * n).div_ceil(256), 1, 1], &[&x, &ye, &wts, &inv, &sh, &sg, &(k as u32), &(n as u32), &(t as u32)])
     }
     fn norm_gate(&self, o: u64, w: u64, z: u64, n: usize, heads: usize, eps: f32) -> anyhow::Result<()> {
-        self.run("norm_gate", &[], [heads, 1, 1], &[&o, &w, &z, &(n as u32), &eps, &0u64])
+        self.run("norm_gate", &[], [heads, 1, 1], &[&o, &w, &z, &(n as u32), &eps, &0u64, &0u32])
     }
     fn norm_gate_q(&self, o: u64, w: u64, z: u64, n: usize, heads: usize, eps: f32, xq: u64) -> anyhow::Result<u64> {
         // llama numerics take one scale per 256 values, more than a head.
         if self.0.llama != 0 || n % 32 != 0 { self.norm_gate(o, w, z, n, heads, eps)?; return Ok(0); }
-        self.run("norm_gate", &[], [heads, 1, 1], &[&o, &w, &z, &(n as u32), &eps, &xq])?;
+        self.run("norm_gate", &[], [heads, 1, 1], &[&o, &w, &z, &(n as u32), &eps, &xq, &0u32])?;
         Ok(xq)
+    }
+    fn norm_gate_sig(&self, o: u64, w: u64, z: u64, n: usize, heads: usize, eps: f32, xq: u64) -> anyhow::Result<u64> {
+        let xq = if self.0.llama != 0 || n % 32 != 0 { 0 } else { xq };
+        self.run("norm_gate", &[], [heads, 1, 1], &[&o, &w, &z, &(n as u32), &eps, &xq, &1u32])?;
+        Ok(xq)
+    }
+    fn hc_silu(&self, x: u64, sc: f32, n: usize) -> anyhow::Result<()> { self.run("hc_silu", &[], [n.div_ceil(256), 1, 1], &[&x, &sc, &(n as u32)]) }
+    fn hc_mix(&self, xn: u64, g: u64, out: u64, n: usize, hc: usize, nt: usize) -> anyhow::Result<()> {
+        self.run("hc_mix", &[], [n.div_ceil(256), nt, 1], &[&xn, &g, &out, &(n as u32), &(hc as u32)])
+    }
+    fn hc_write(&self, r: u64, out: u64, inj: u64, n: usize, hc: usize, nt: usize, clear: bool) -> anyhow::Result<()> {
+        self.run("hc_write", &[], [n.div_ceil(256), nt, 1], &[&r, &out, &inj, &(n as u32), &(hc as u32), &(clear as u32)])
+    }
+    fn ple_gate(&self, key: u64, query: u64, value: u64, gated: u64, n: usize, hc: usize, nt: usize) -> anyhow::Result<()> {
+        self.run("ple_gate", &[], [hc, nt, 1], &[&key, &query, &value, &gated, &(n as u32)])
+    }
+    fn ple_conv(&self, r: u64, gated: u64, norm: u64, kw: u64, ring: u64, step: u64, d: usize, nt: usize) -> anyhow::Result<()> {
+        self.run("ple_conv", &[], [d.div_ceil(256), 1, 1], &[&r, &gated, &norm, &kw, &ring, &step, &(d as u32), &(nt as u32)])
     }
     fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()> {
         // q8: each subgroup quantizes one 32-value block of one row.
