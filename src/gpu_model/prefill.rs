@@ -158,15 +158,16 @@ impl GpuModel<'_> {
         // The draft head runs as one more layer on the chunk while it is in step with the main model.
         let fill = self.mtp_synced();
         let mtp = self.mtp.as_ref().filter(|_| fill);
-        // STRATA_NAN_TRACE: after each layer's mixer and FFN, print the hidden state's largest magnitude and first
-        // non-finite token. It waits for the GPU each time: diagnostic runs only.
+        // STRATA_NAN_TRACE: one line per layer with the largest magnitude of each intermediate buffer, and the first
+        // row of one holding a non-finite value. Each probe waits for the GPU: diagnostic runs only.
         let trace = std::env::var_os("STRATA_NAN_TRACE").is_some();
-        let nan_trace = |il: usize, what: &str, t: usize| -> anyhow::Result<()> {
+        let mut tr = String::new();
+        let probe = |tr: &mut String, what: &str, b: &Buf, o: u64, w: usize, rows: usize| -> anyhow::Result<()> {
             if !trace { return Ok(()); }
-            let v: Vec<f32> = g.get(&pf.slab, 0, t * d)?;
+            let v: Vec<f32> = g.get(b, ((o - b.addr()) / 4) as usize, rows * w)?;
             let max = v.iter().filter(|a| a.is_finite()).fold(0f32, |m, a| m.max(a.abs()));
-            let bad = v.iter().position(|a| !a.is_finite()).map(|i| i / d);
-            eprintln!("nan-trace pos {} layer {il} {what}: max |x| {max:.3e}, first non-finite token {bad:?}", self.pos);
+            tr.push_str(&format!(" {what} {max:.2e}"));
+            if let Some(i) = v.iter().position(|a| !a.is_finite()) { tr.push_str(&format!(" (non-finite row {})", i / w)); }
             Ok(())
         };
         for (il, ly) in self.layers.iter().enumerate().chain(mtp.map(|mh| (c.n_layer, &mh.layer))) {
@@ -204,11 +205,18 @@ impl GpuModel<'_> {
                         g.gemm_dense(alpha, t, h, ne, eg, nv, SAME_X)
                     })?;
                     g.ssm_gates(eb, eg, dt_bias.ptr, a.ptr, t * nv, nv)?;
+                    probe(&mut tr, "qkv", &pf.slab, at(l.a), channels, t)?;
+                    probe(&mut tr, "conv", &pf.slab, at(l.c), channels, t)?;
+                    probe(&mut tr, "beta", &pf.slab, eb, nv, t)?;
+                    probe(&mut tr, "alpha", &pf.slab, eg, nv, t)?;
                     // The z GEMM runs beside the scan, on the SMs its last wave of blocks leaves idle.
                     g.batch(&mut || {
                         g.deltanet(at(l.c), s.addr(), eb, eg, 0, 0, at(l.d), nk, nv, c.k_interleave, dk, dv, 1.0 / (dk as f32).sqrt(), t, channels, 0, 0)?;
                         g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, SAME_X)
                     })?;
+                    probe(&mut tr, "deltanet", &pf.slab, at(l.d), c.ssm_d_inner, t)?;
+                    probe(&mut tr, "state", s, s.addr(), s.len() / 4, 1)?;
+                    probe(&mut tr, "z", &pf.slab, at(l.b), c.ssm_d_inner, t)?;
                     if ly.hc.is_some() { g.norm_gate_sig(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps, 0)?; } else { g.norm_gate(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps)?; }
                     g.gemm_dense(out, t, at(l.d), c.ssm_d_inner, mx, ne, mact)?;
                 }
@@ -224,10 +232,14 @@ impl GpuModel<'_> {
                     g.rope_neox(kk, hd, t * nkv, nkv, c.n_rot, step, c.rope_base)?;
                     g.kv_store(kk, vv, kc.addr(), vc.addr(), kv, t, step, hd)?;
                     g.attn_prefill(at(l.b), kc.addr(), vc.addr(), if c.q_gate { at(l.a) } else { 0 }, at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt())?;
+                    probe(&mut tr, "q", &pf.slab, at(l.a), nh * qs, t)?;
+                    probe(&mut tr, "k", &pf.slab, kk, kv, t)?;
+                    probe(&mut tr, "v", &pf.slab, vv, kv, t)?;
+                    probe(&mut tr, "attn", &pf.slab, at(l.d), nh * hd, t)?;
                     g.gemm_dense(o, t, at(l.d), nh * hd, mx, ne, mact)?;
                 }
             }
-            nan_trace(il, "mixer", t)?;
+            probe(&mut tr, "| mixer", &pf.slab, x, d, t)?;
             match (&ly.post_norm, &ly.hc) {
                 (Some(pn), _) => g.rms_norm(x, ne, pn.ptr, h, ne, ne, t, eps)?,
                 (None, Some(hr)) => {
@@ -240,6 +252,7 @@ impl GpuModel<'_> {
                 Ffn::Dense { gate, up, down } => {
                     g.gemm_dense(gate, t, h, ne, at(l.ge), c.n_ff, 0)?;
                     g.gemm_dense(up, t, h, ne, at(l.ge), c.n_ff, 1 | SAME_X)?;
+                    probe(&mut tr, "gate_up", &pf.slab, at(l.ge), c.n_ff, t)?;
                     g.gemm_dense(down, t, at(l.ge), c.n_ff, x, ne, 2)?;
                 }
                 Ffn::Moe { router, shared } => {
@@ -260,6 +273,8 @@ impl GpuModel<'_> {
                         }
                         None => (0, 0),
                     };
+                    probe(&mut tr, "router", &pf.slab, at(l.rl), c.n_expert, t)?;
+                    probe(&mut tr, "weights", &pf.slab, at(l.wts), k, t)?;
                     let ids = g.get::<i32>(&pf.ints, 0, t * k)?;
                     let cache = self.cache.as_mut().unwrap();
                     cache.record(il, &ids);
@@ -377,13 +392,22 @@ impl GpuModel<'_> {
                     g.beside_join()?;
                     // The shared down runs last, so the routed gate and up above reuse the int8 h of the shared up.
                     if let Some(s) = shared { g.gemm_dense(&s.down, t, at(l.shg), c.n_ff_shexp, at(l.shy), ne, 0)?; }
+                    // Expert rows are slots (token, j) sorted by expert, not tokens.
+                    probe(&mut tr, "experts_gate_up", &pf.slab, at(l.ge), c.n_ff_exp, t * k)?;
+                    probe(&mut tr, "experts_down", &pf.slab, at(l.ye), ne, t * k)?;
+                    if shared.is_some() {
+                        probe(&mut tr, "shared_gate_up", &pf.slab, at(l.shg), c.n_ff_shexp, t)?;
+                        probe(&mut tr, "shared_down", &pf.slab, at(l.shy), ne, t)?;
+                        probe(&mut tr, "shared_gate", &pf.slab, at(l.sg), 1, t)?;
+                    }
                     // "mo" is zero: hc_write clears it after use.
                     let fx = if ly.hc.is_some() { at(l.mo) } else { x };
                     g.moe_combine_seq(fx, at(l.ye), at(l.wts), pf.ints.addr() + 4 * (2 * n * k) as u64, k, sh, sg, ne, t)?;
                     if ly.hc.is_some() { g.hc_write(x, fx, at(l.inj), ne, c.hc_n, t, true)?; }
                 }
             }
-            nan_trace(il, "ffn", t)?;
+            probe(&mut tr, "| ffn", &pf.slab, x, d, t)?;
+            if trace { eprintln!("nan-trace pos {} layer {il}:{tr}", self.pos); tr.clear(); }
             g.kick()?;
         }
         match self.mtp.as_mut() {
