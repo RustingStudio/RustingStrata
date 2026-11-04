@@ -809,6 +809,10 @@ fn gemv_cols(llama: u32, ty: GgmlType, cols: usize) -> anyhow::Result<u32> {
 #[allow(unused_variables)]
 impl Backend for Vk {
     fn name(&self) -> &'static str { "vulkan" }
+    fn device(&self) -> String {
+        let p = unsafe { self.0.instance.get_physical_device_properties(self.0.pd) };
+        p.device_name_as_c_str().map_or(String::new(), |s| s.to_string_lossy().into_owned())
+    }
 
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf> { Ok(self.buf(bytes, DEVICE)?.0) }
 

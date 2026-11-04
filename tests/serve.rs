@@ -209,3 +209,22 @@ fn download_names_stay_in_the_models_folder() {
         assert_eq!(local_name(bad), None, "{bad:?}");
     }
 }
+
+/// The side panel's totals count every request since the server started, across model loads, and keep the last 40.
+#[test]
+fn stats_keep_totals_across_loads() {
+    use rusting_strata::serve::{Last, Stats};
+    let mut s = Stats::default();
+    s.unload(Some("a".into()));
+    assert!(s.loading && s.model.as_deref() == Some("a"));
+    for i in 0..45 {
+        s.record(Last { at: i, prompt_tokens: 10, cached_tokens: 4, completion_tokens: 2, finish: "stop".into(), ..Default::default() });
+    }
+    s.vram = Some((1, 2));
+    s.unload(Some("b".into()));
+    assert_eq!((s.requests, s.prompt_tokens, s.cached_tokens, s.completion_tokens), (45, 450, 180, 90));
+    assert_eq!((s.recent.len(), s.recent[0].at), (40, 5));
+    assert!(s.loading && s.vram.is_none() && s.model.as_deref() == Some("b"));
+    s.unload(None);
+    assert!(!s.loading && s.model.is_none() && s.requests == 45);
+}
