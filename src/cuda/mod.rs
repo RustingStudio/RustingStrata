@@ -179,7 +179,7 @@ impl Gpu {
         let names = KERNELS.iter().map(|s| s.to_string())
             .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm", "gemms"].map(|p| kname(p, t))))
             .chain(QTYPES.iter().flat_map(|&t| ["gemv", "gemvn", "moe_gemv"].map(|p| kname(p, t) + "_p")))
-            .chain(QTYPES.iter().filter(|&&t| !Self::float_ty(t)).map(|&t| kname("gemmi", t)))
+            .chain(QTYPES.iter().filter(|&&t| !Self::float_ty(t)).flat_map(|&t| [kname("gemmi", t), kname("gemmis", t)]))
             .chain([64, 128, 256, 512].iter().flat_map(|h| [format!("attn_decode_{h}"), format!("attn_decode_gqa_{h}")]));
         for n in names {
             let f = module.load_function(&n).with_context(|| format!("kernel {n}"))?;
@@ -257,6 +257,10 @@ impl Gpu {
         }
         launch!(self, &kname("gemmi", ty), cfg(grid, 2 * GEMM_BM as u32, 0),
             tiles, wd, nd as i32, xq, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act);
+        if tiles != 0 {
+            launch!(self, &kname("gemmis", ty), cfg(grid, 2 * GEMM_BM as u32, 0),
+                tiles, wd, nd as i32, xq, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act);
+        }
         Ok(())
     }
 
