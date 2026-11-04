@@ -2,12 +2,15 @@
 // super-block (constant 2): ports of QI<T> and deq8<T> in kernels.cu, which port src/quant/mod.rs (from llama.cpp
 // ggml-quants.c, MIT License, ggml authors).
 #include "tables.glsl"
+layout(constant_id = 1) const uint T = 0;
+layout(constant_id = 2) const uint SBB = 1024;
 // With SHARED_TABLES defined, the IQ4 values and IQ3_S / IQ2_S grids come from shared memory, which the shader fills
 // with load_tables (all its invocations) first: the table buffer costs a load per lookup (CUDA QS<T>).
 #ifdef SHARED_TABLES
-shared int s_kv[16];
-shared uint s_g3[512];
-shared uint64_t s_g2[1024];
+// Sized by T (1 entry for the other types), so only the table in use takes shared memory.
+shared int s_kv[T == 20 || T == 23 ? 16 : 1];
+shared uint s_g3[T == 21 ? 512 : 1];
+shared uint64_t s_g2[T == 22 ? 1024 : 1];
 #define KV_IQ4NL s_kv
 #define IQ3S_GRID s_g3
 #define IQ2S_GRID s_g2
@@ -17,8 +20,6 @@ shared uint64_t s_g2[1024];
 #define IQ2S_GRID iq2s_grid
 #endif
 
-layout(constant_id = 1) const uint T = 0;
-layout(constant_id = 2) const uint SBB = 1024;
 
 uint u8_(U8 w, uint o) { return uint(w.v[o]); }
 uint ld16(U8 w, uint o) { return uint(U16(uint64_t(w)).v[o >> 1]); }  // 2-aligned only (every quant field is)
