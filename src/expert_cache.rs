@@ -46,15 +46,16 @@ fn profile_path(m: &Model) -> PathBuf {
 }
 
 impl ExpertCache {
-    /// Allocate slots worth at most `budget` bytes for layers `0..n_layers` (n_layer, plus one with the MTP layer) and
-    /// fill them from the saved routing profile, or in layer order.
-    pub fn new(m: &Model, gpu: &dyn Backend, budget: usize, n_layers: usize) -> anyhow::Result<ExpertCache> {
+    /// Allocate slots worth at most `budget` bytes for the layers in `range` (up to n_layer, or n_layer + 1 with the
+    /// MTP layer) and fill them from the saved routing profile, or in layer order.
+    pub fn new(m: &Model, gpu: &dyn Backend, budget: usize, range: std::ops::Range<usize>) -> anyhow::Result<ExpertCache> {
+        let n_layers = range.end;
         let c = &m.cfg;
         let n = c.n_expert;
         let mut layers: Vec<Option<(usize, [Mat; 3])>> = Vec::new();
         let mut classes = BTreeMap::<usize, usize>::new(); // slot bytes -> experts of that size
         for il in 0..n_layers {
-            if !c.is_moe() { layers.push(None); continue; }
+            if !c.is_moe() || !range.contains(&il) { layers.push(None); continue; }
             let mut off = 0;
             let mut mats = [Mat { ty: GgmlType::F32, rows: 0, cols: 0, off: 0, bytes: 0 }; 3];
             for (i, name) in MATS.iter().enumerate() {
@@ -193,7 +194,14 @@ impl ExpertCache {
     pub fn save_profile(&self) -> anyhow::Result<()> {
         let Some(profile) = &self.profile else { return Ok(()) };
         std::fs::create_dir_all(profile.parent().unwrap())?;
-        std::fs::write(profile, self.counts.iter().flat_map(|c| c.to_le_bytes()).collect::<Vec<u8>>())?;
+        // Layers of other caches (a model split over devices) keep the counts their caches saved.
+        let mut all: Vec<f32> = std::fs::read(profile).unwrap_or_default().chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect();
+        all.resize(all.len().max(self.counts.len()), 0.0);
+        let n = self.n_expert;
+        for (il, l) in self.layers.iter().enumerate() {
+            if l.is_some() { all[il * n..(il + 1) * n].copy_from_slice(&self.counts[il * n..(il + 1) * n]); }
+        }
+        std::fs::write(profile, all.iter().flat_map(|c| c.to_le_bytes()).collect::<Vec<u8>>())?;
         Ok(())
     }
 }

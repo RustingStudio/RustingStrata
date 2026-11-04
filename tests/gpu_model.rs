@@ -331,3 +331,58 @@ fn qwen4exp_gpu_matches_cpu() {
         }
     }
 }
+
+/// A model split over two devices (here the same GPU opened twice) gives the same logits as one device: steps, a
+/// batched verify and a chunked prefill. No expert slots, so both runs compute every expert on the CPU.
+#[test]
+fn split_matches_single() {
+    let _gpu = common::gpu_lock();
+    let models = [
+        common::model_path(),
+        Some("/home/vasylt/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf".into()),
+        Some("/mnt/ollama/qwen4exp/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf".into()),
+    ];
+    // SAFETY: the GPU lock serializes every test that loads a model, the only readers of this variable.
+    unsafe { std::env::set_var("STRATA_EXPERT_MB", "0") };
+    for p in models.into_iter().flatten().filter(|p: &std::path::PathBuf| p.exists()) {
+        let g = Gguf::open(&p).unwrap();
+        let m = Model::load(&g).unwrap();
+        let tok = Tokenizer::from_gguf(&g).unwrap();
+        let ids = tok.encode("The capital of France is Paris, and the capital of Spain is").unwrap();
+        let n = ids.len().min(rusting_strata::cpu_worker::TMAX);
+        for bk in ["cuda", "vulkan"] {
+            let open = || -> Option<Box<dyn rusting_strata::backend::Backend>> {
+                Some(match bk { "cuda" => Box::new(rusting_strata::cuda::Gpu::new(0).ok()?), _ => Box::new(rusting_strata::vulkan::Vk::new(0).ok()?) })
+            };
+            let Some(one) = open() else { continue };
+            let run = |gm: &mut GpuModel| -> Vec<Vec<f32>> {
+                gm.adapt_every = 0;
+                let mut out: Vec<Vec<f32>> = ids.iter().map(|&t| gm.step(t).unwrap()).collect();
+                gm.reset().unwrap();
+                out.extend(gm.verify(&ids[..n]).unwrap());
+                gm.reset().unwrap();
+                gm.short = 0;
+                out.push(gm.prefill(&ids).unwrap());
+                // prefill_cached: a fresh prompt with a system prefix, decode steps, then the same prompt again, which
+                // restores the stashed history on every part.
+                gm.reset().unwrap();
+                let h = ids.len() - 2;
+                for _ in 0..2 {
+                    out.push(gm.prefill_cached(&ids, 3, h).unwrap().0);
+                    for t in [11u32, 22] { out.push(gm.step(t).unwrap()); }
+                }
+                out
+            };
+            let want = run(&mut GpuModel::load(&m, one, 256, 4, 512 << 20, 0).unwrap());
+            let mut gm = GpuModel::load_split(&m, vec![open().unwrap(), open().unwrap()], 256, 4, 512 << 20, 0).unwrap();
+            assert_eq!(gm.parts().count(), 2);
+            let got = run(&mut gm);
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                let diff = g.iter().zip(w).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+                eprintln!("{} {bk} row {i}: argmax {} vs {}, max |dlogit| {diff}", p.display(), ops::argmax(g), ops::argmax(w));
+                assert_eq!(g, w, "row {i}");
+            }
+        }
+    }
+    unsafe { std::env::remove_var("STRATA_EXPERT_MB") };
+}

@@ -62,9 +62,10 @@ struct Engine {
     /// GPU backend: cuda or vulkan [default: cuda if it loads, else vulkan].
     #[arg(long)]
     backend: Option<String>,
-    /// GPU index.
-    #[arg(long, default_value_t = 0)]
-    device: usize,
+    /// GPU index, or several separated by commas (such as 0,1) to split the layers over those GPUs in proportion to
+    /// their free VRAM.
+    #[arg(long, default_value = "0", value_delimiter = ',')]
+    device: Vec<usize>,
     /// Prompts shorter than this skip the batched prefill (from `strata calibrate`, else 32).
     #[arg(skip)]
     short: usize,
@@ -103,15 +104,17 @@ impl Runner<'_> {
         match self { Runner::Cpu(m, st) => { *st = State::new(&m.cfg); Ok(()) } Runner::Gpu(g) => g.reset() }
     }
     /// Seconds spent waiting on CPU experts so far (GPU only).
-    fn cpu_secs(&self) -> f64 { if let Runner::Gpu(g) = self { g.cpu_time.as_secs_f64() } else { 0.0 } }
+    fn cpu_secs(&self) -> f64 { if let Runner::Gpu(g) = self { g.parts().map(|p| p.cpu_time.as_secs_f64()).sum() } else { 0.0 } }
     fn finish(&self) -> anyhow::Result<()> {
         if let Runner::Gpu(g) = self {
-            let n = (g.hits + g.misses).max(1);
+            let sum = |f: &dyn Fn(&GpuModel) -> usize| g.parts().map(f).sum::<usize>();
+            let (hits, misses) = (sum(&|p| p.hits), sum(&|p| p.misses));
             if g.drafts.0 > 0 { eprintln!("MTP drafts accepted {}/{} ({:.1}%)", g.drafts.1, g.drafts.0, 100.0 * g.drafts.1 as f64 / g.drafts.0 as f64); }
-            eprintln!("expert hit rate {:.1}% ({} misses), cache swaps {}", 100.0 * g.hits as f64 / n as f64, g.misses,
-                g.cache.as_ref().map_or(0, |c| c.swaps));
-            if g.resumed.get() > 0 { eprintln!("GPU waits for the CPU expert worker that timed out and resumed: {}", g.resumed.get()); }
-            if let Some(c) = &g.cache { c.save_profile()?; }
+            eprintln!("expert hit rate {:.1}% ({} misses), cache swaps {}", 100.0 * hits as f64 / (hits + misses).max(1) as f64, misses,
+                sum(&|p| p.cache.as_ref().map_or(0, |c| c.swaps)));
+            let resumed = sum(&|p| p.resumed.get());
+            if resumed > 0 { eprintln!("GPU waits for the CPU expert worker that timed out and resumed: {resumed}"); }
+            for p in g.parts() { if let Some(c) = &p.cache { c.save_profile()?; } }
         }
         Ok(())
     }
@@ -122,8 +125,8 @@ impl Engine {
     fn runner<'a>(&mut self, m: &'a Model<'a>, model: &Path) -> anyhow::Result<Runner<'a>> {
         if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
         if self.kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
-        let bk = if self.gpu { Some(backend::open(self.backend.as_deref(), self.device)?) } else { None };
-        let path = calibration_path(model, bk.as_ref().map_or("cuda", |b| b.name()));
+        let bk = if self.gpu { Some(self.device.iter().map(|&d| backend::open(self.backend.as_deref(), d)).collect::<anyhow::Result<Vec<_>>>()?) } else { None };
+        let path = calibration_path(model, bk.as_ref().map_or("cuda", |b| b[0].name()));
         let v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         if !v.is_null() { eprintln!("calibration: {}", path.display()); }
         let get = |k: &str| v[k].as_u64().map(|x| x as usize);
@@ -133,10 +136,10 @@ impl Engine {
         if let Some(n) = self.threads.or(get("threads")) { rayon::ThreadPoolBuilder::new().num_threads(n).build_global()?; }
         let Some(bk) = bk else { return Ok(Runner::Cpu(m, State::new(&m.cfg))) };
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
-        let mut g = GpuModel::load(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp()).context(LOAD_HINT)?;
+        let mut g = GpuModel::load_split(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp()).context(LOAD_HINT)?;
         g.short = self.short;
         if self.mtp() > 0 && g.k == 0 {
-            eprintln!("--mtp: this model has no MTP draft head, decoding without it");
+            eprintln!("--mtp: this model has no MTP draft head (or it is split over GPUs), decoding without it");
             self.mtp = Some(0);
         }
         Ok(Runner::Gpu(Box::new(g)))

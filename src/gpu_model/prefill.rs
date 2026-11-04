@@ -79,19 +79,25 @@ impl GpuModel<'_> {
         let Some(chunk) = self.pf.as_ref().map(|p| p.chunk) else { return self.step_all(tokens) };
         if tokens.len() < self.short { return self.step_all(tokens); }
         anyhow::ensure!(self.pos + tokens.len() <= self.ctx, "context full ({} tokens; raise --ctx)", self.ctx);
-        for ch in tokens.chunks(chunk) { self.prefill_chunk(ch)?; }
+        for ch in tokens.chunks(chunk) { self.prefill_chunk(ch, None)?; }
         // The prompt's routing predicts the reply's: place its hot experts now instead of 64 per adapt during decode.
-        if self.adapt_every > 0 && let Some(cache) = self.cache.as_mut() { cache.adapt(self.m, &*self.gpu, usize::MAX)?; }
-        let (g, ne) = (&self.gpu, self.m.cfg.n_embd);
-        let h = self.bufs["h"].addr();
+        let adapt = self.adapt_every > 0;
+        let mut p = Some(&mut *self);
+        while let Some(q) = p {
+            if adapt && let Some(cache) = q.cache.as_mut() { cache.adapt(q.m, &*q.gpu, usize::MAX)?; }
+            p = q.next.as_deref_mut();
+        }
+        let s = self.tail();
+        let (g, ne) = (&s.gpu, s.m.cfg.n_embd);
+        let h = s.bufs["h"].addr();
         // `prefill_chunk` leaves the last hidden state in row 0 of `x`, as after `step` (the MTP draft reads it).
-        match (&self.output_norm, &self.output_hc) {
-            (Some(on), _) => g.rms_norm(self.x.addr(), 0, on.ptr, h, 0, ne, 1, self.m.cfg.eps)?,
-            (None, Some(hr)) => self.hc_read(hr, self.x.addr(), 1, &self.hc_at())?,
+        match (&s.output_norm, &s.output_hc) {
+            (Some(on), _) => g.rms_norm(s.x.addr(), 0, on.ptr, h, 0, ne, 1, s.m.cfg.eps)?,
+            (None, Some(hr)) => s.hc_read(hr, s.x.addr(), 1, &s.hc_at())?,
             _ => unreachable!(),
         }
-        g.gemv(&self.output, h, self.logits.addr())?;
-        g.get::<f32>(&self.logits, 0, self.m.cfg.n_vocab)
+        g.gemv(s.output.as_ref().unwrap(), h, s.logits.addr())?;
+        g.get::<f32>(&s.logits, 0, s.m.cfg.n_vocab)
     }
 
     /// A fresh sequence: `prefill(tokens)` from position 0, reusing earlier work. The state after `tokens[..keep]` is
@@ -143,17 +149,26 @@ impl GpuModel<'_> {
         Ok(logits)
     }
 
-    fn prefill_chunk(&mut self, toks: &[u32]) -> anyhow::Result<()> {
+    /// `input`: the hidden rows and PLE input from the part before (None: embed `toks`).
+    fn prefill_chunk(&mut self, toks: &[u32], input: Option<(&[f32], &[f32])>) -> anyhow::Result<()> {
         // Missed experts are read from the mapped weights in the order the staging copies take them.
         let pre = self.cache.is_some().then(Prefetch::start);
-        let pe: Vec<f32> = if self.ple_ring.is_some() { toks.iter().flat_map(|&tk| self.m.ple_embed(&mut self.ple_prev, tk)).collect() } else { vec![] };
+        let owned: (Vec<f32>, Vec<f32>);
+        let (emb, pe): (&[f32], &[f32]) = match input {
+            Some(v) => v,
+            None => {
+                let hcn = self.m.cfg.hc_n.max(1);
+                let pe = if self.ple_ring.is_some() { toks.iter().flat_map(|&tk| self.m.ple_embed(&mut self.ple_prev, tk)).collect() } else { vec![] };
+                owned = (toks.iter().flat_map(|&tk| self.m.embed(tk).repeat(hcn)).collect(), pe);
+                (&owned.0, &owned.1)
+            }
+        };
         let c = &self.m.cfg;
         let pf = self.pf.as_ref().unwrap();
         let (g, mut t, n, eps, ne) = (&self.gpu, toks.len(), pf.chunk, c.eps, c.n_embd);
-        let (hcn, d) = (c.hc_n.max(1), c.hc_n.max(1) * ne);
-        let emb: Vec<f32> = toks.iter().flat_map(|&tk| self.m.embed(tk).repeat(hcn)).collect();
-        g.put(&emb, &pf.slab, 0)?;
-        if !pe.is_empty() { g.put(&pe, &pf.slab, pf.lay.emb)?; }
+        let d = c.hc_n.max(1) * ne;
+        g.put(emb, &pf.slab, 0)?;
+        if !pe.is_empty() { g.put(pe, &pf.slab, pf.lay.emb)?; }
         g.put(&[self.pos as i32, 0], &self.step_buf, 0)?;
         let mut step = self.step_buf.addr();
         let base = pf.slab.addr();
@@ -183,7 +198,7 @@ impl GpuModel<'_> {
             if let Some(i) = v.iter().position(|a| !a.is_finite()) { tr.push_str(&format!(" (non-finite row {})", i / w)); }
             Ok(())
         };
-        for (il, ly) in self.layers.iter().enumerate().chain(mtp.map(|mh| (c.n_layer, &mh.layer))) {
+        for (il, ly) in self.layers.iter().enumerate().map(|(i, ly)| (self.first + i, ly)).chain(mtp.map(|mh| (c.n_layer, &mh.layer))) {
             if let Some(mh) = mtp.filter(|_| il == c.n_layer) {
                 // Its entry for token i pairs the token with the hidden state before it (`mtp_run`): h gets the last
                 // hidden state of the previous chunk, then rows 0..t - 1; the first token of the sequence has none.
@@ -429,6 +444,8 @@ impl GpuModel<'_> {
             _ => g.dtod(&pf.slab, 4 * (t - 1) * d, &self.x, 0, 4 * d)?,
         }
         self.pos += toks.len();
-        Ok(())
+        let Some(nx) = self.next.as_deref_mut() else { return Ok(()) };
+        let xs = self.gpu.get::<f32>(&self.pf.as_ref().unwrap().slab, 0, toks.len() * d)?;
+        nx.prefill_chunk(toks, Some((&xs, pe)))
     }
 }
