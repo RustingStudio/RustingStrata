@@ -963,13 +963,31 @@ fn moe_mailbox_round_trip() {
         assert_eq!(unsafe { (at(SKIP).read_volatile(), at(REQ).read_volatile()) }, want);
         gpu.put(&table, &dtable, 0).unwrap();
         if bk == "vulkan" {
+            // Unanswered: with conditional rendering the combine adds nothing, the rest of the submission (the add) is
+            // skipped and stalled() tells the caller; without it the wait is an error.
+            let before = down::<f32>(gpu, &dx);
             gpu.put(&[0i32, 5], &step, 0).unwrap();
             let t0 = std::time::Instant::now();
-            let e = ops(&step).unwrap_err();
-            eprintln!("unanswered: {e} after {:.2} s", t0.elapsed().as_secs_f64());
-            assert!(format!("{e}").contains("did not answer"), "{e}");
+            let r = (|| {
+                gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), mb.addr(), n, lay.h, step.addr(), t)?;
+                gpu.moe_combine(dx.addr(), dye.addr(), wh.addr(), k, dsh.addr(), dsg.addr(), mb.addr(), lay.y, step.addr(), slots.addr(), n, t)?;
+                gpu.add(dx.addr(), dx.addr(), n)?;
+                gpu.sync()
+            })();
+            eprintln!("unanswered: {r:?} after {:.2} s", t0.elapsed().as_secs_f64());
+            match r {
+                Ok(()) => {
+                    assert!(gpu.stalled(), "an unanswered combine must report a stall");
+                    assert!(!gpu.stalled(), "stalled() clears the flag");
+                    assert_eq!(down::<f32>(gpu, &dx), before, "a combine that gave up and the ops after it must not run");
+                }
+                Err(e) => assert!(format!("{e}").contains("did not answer"), "{e}"),
+            }
+            // The next submission runs normally.
             gpu.add(dx.addr(), dx.addr(), n).unwrap();
             gpu.sync().unwrap();
+            assert!(!gpu.stalled());
+            assert_eq!(down::<f32>(gpu, &dx), before.iter().enumerate().map(|(i, v)| if i < n { v + v } else { *v }).collect::<Vec<_>>());
         }
     }
 }
@@ -1178,5 +1196,41 @@ fn hc_and_ple_kernels_match_reference() {
             }
             near(&format!("ple_conv chunk {chunk}"), &got, &want);
         }
+    }
+}
+
+/// An F16 weight (InstinctRazor-Qwen3.5-122B has two, `blk.0.attn_gate` and `blk.0.ssm_out`) uploads as F32 and gives
+/// the products of the F16 values through the decode and prefill paths.
+#[test]
+fn f16_weight_uploads_as_f32() {
+    let (rows, cols) = (96, 512);
+    let w: Vec<f32> = xs(rows * cols).iter().map(|v| v * 3.0).collect();
+    let data: Vec<u8> = w.iter().flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes()).collect();
+    let t = Tensor { ty: GgmlType::F16, rows, cols, data: &data };
+    let wf: Vec<f32> = w.iter().map(|v| half::f16::from_f32(*v).to_f32()).collect();
+    let nt = 40;
+    let x = xs(nt * cols);
+    let want: Vec<f32> = (0..nt * rows).map(|i| {
+        let (m, r) = (i / rows, i % rows);
+        (0..cols).map(|c| wf[r * cols + c] as f64 * x[m * cols + c] as f64).sum::<f64>() as f32
+    }).collect();
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        let dt = gpu.upload(&t).unwrap();
+        assert_eq!(dt.ty, GgmlType::F32, "{bk}");
+        let dx = up(gpu, &x);
+        let dy = gpu.zeros::<f32>(rows).unwrap();
+        gpu.gemv(&dt, dx.addr(), dy.addr()).unwrap();
+        let e = rel_l2(&down::<f32>(gpu, &dy), &want[..rows]);
+        assert!(e <= 1e-5, "{bk} gemv rel err {e}");
+        let dy = gpu.zeros::<f32>(4 * rows).unwrap();
+        gpu.gemvn(&dt, dx.addr(), cols, dy.addr(), rows, 4).unwrap();
+        let e = rel_l2(&down::<f32>(gpu, &dy), &want[..4 * rows]);
+        assert!(e <= 1e-5, "{bk} gemvn rel err {e}");
+        let dy = gpu.zeros::<f32>(nt * rows).unwrap();
+        gpu.gemm_dense(&dt, nt, dx.addr(), cols, dy.addr(), rows, 0).unwrap();
+        let e = rel_l2(&down::<f32>(gpu, &dy), &want);
+        eprintln!("{bk}: gemm_dense rel err {e:.2e}");
+        assert!(e <= 1e-5, "{bk} gemm_dense rel err {e}");
     }
 }

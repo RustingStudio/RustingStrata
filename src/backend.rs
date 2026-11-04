@@ -103,11 +103,22 @@ pub trait Backend: Send {
     fn beside_join(&self) -> anyhow::Result<()> { Ok(()) }
     /// Whether `beside` really overlaps its copies with its other ops (else it queues them in order).
     fn beside_overlaps(&self) -> bool { false }
+    /// Whether a MoE combine gave up waiting for the CPU worker since the last call (checked after a wait). Its layer
+    /// added nothing and the rest of that submission was skipped: the caller waits for the worker and runs the
+    /// forward again from that combine. Clears the flag. Backends whose combines never give up return false.
+    fn stalled(&self) -> bool { false }
     /// Zeroed host memory of `words` u32 that kernels read and write at the `Buf` address. The host pointer is
     /// valid while the `Buf` lives.
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)>;
 
     fn upload(&self, t: &Tensor) -> anyhow::Result<GpuTensor> {
+        if t.ty == GgmlType::F16 {  // no F16 kernels: uploaded as F32, which holds every F16 value exactly
+            let mut f = vec![0f32; t.rows * t.cols];
+            crate::quant::dequant_row(GgmlType::F16, t.data, &mut f);
+            let b = self.alloc(4 * f.len())?;
+            self.htod(&f.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), &b, 0)?;
+            return Ok(GpuTensor::new(GgmlType::F32, t.rows, t.cols, b));
+        }
         let b = self.alloc(t.data.len())?;
         self.htod(t.data, &b, 0)?;
         Ok(GpuTensor::new(t.ty, t.rows, t.cols, b))

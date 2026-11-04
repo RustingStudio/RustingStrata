@@ -45,7 +45,7 @@ fn matvec_matches_rowwise_dequant() {
     let Some(p) = common::model_path() else { return };
     let g = rusting_strata::gguf::Gguf::open(&p).unwrap();
     let w = rusting_strata::weights::Weights::new(&g).unwrap();
-    w.validate().unwrap();
+    assert!(w.validate(usize::MAX).unwrap());
     let Ok(full) = w.layer(0, "ffn_down_exps.weight") else { return eprintln!("SKIP: dense model") };
     let n_expert = rusting_strata::config::ModelConfig::from_gguf(&g).unwrap().n_expert;
     let t = full.expert(7, n_expert); // IQ3_XXS, 2048 rows x 512 on the default model

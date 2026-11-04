@@ -99,12 +99,18 @@ impl<'a> Weights<'a> {
 
     pub fn layer(&self, il: usize, suffix: &str) -> anyhow::Result<Tensor<'a>> { self.get(&format!("blk.{il}.{suffix}")) }
 
-    /// Refuse files containing quant types this engine does not implement.
-    pub fn validate(&self) -> anyhow::Result<()> {
+    /// Refuse files containing quant types this engine does not implement, except in the MTP (nextn) layers, blocks
+    /// `n_layer` on: false if one of those has such a type, so that the model loads without MTP.
+    pub fn validate(&self, n_layer: usize) -> anyhow::Result<bool> {
+        let mut nextn = true;
         for t in self.g.tensors.values() {
-            GgmlType::from_u32(t.ty).with_context(|| format!("tensor {}", t.name))?;
+            if let Err(e) = GgmlType::from_u32(t.ty) {
+                let il = t.name.strip_prefix("blk.").and_then(|r| r.split('.').next()).and_then(|i| i.parse::<usize>().ok());
+                if il.is_some_and(|il| il >= n_layer) { nextn = false; continue; }
+                return Err(e).with_context(|| format!("tensor {}", t.name));
+            }
         }
-        Ok(())
+        Ok(nextn)
     }
 }
 

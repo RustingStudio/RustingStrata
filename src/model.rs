@@ -71,9 +71,12 @@ fn mv(t: &Tensor, x: &[f32]) -> Vec<f32> {
 
 impl<'a> Model<'a> {
     pub fn load(g: &'a Gguf) -> anyhow::Result<Model<'a>> {
-        let cfg = ModelConfig::from_gguf(g)?;
+        let mut cfg = ModelConfig::from_gguf(g)?;
         let w = Weights::new(g)?;
-        w.validate()?;
+        if !w.validate(cfg.n_layer)? && cfg.n_nextn > 0 {
+            eprintln!("note: the MTP (nextn) layer has a quant type this engine does not support; loading without MTP");
+            cfg.n_nextn = 0;
+        }
         w.get("token_embd.weight")?;
         let ple = if cfg.n_embd_ple > 0 {
             let p = |k: &str| format!("{}.ple.{k}", cfg.arch);

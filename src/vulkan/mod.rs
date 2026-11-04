@@ -138,6 +138,9 @@ struct Inner {
     amd_coherent: bool,
     /// An AMD GPU without it: the CPU expert mailbox cannot work (the GPU caches it), so a timeout names the fix.
     amd_plain: bool,
+    /// VK_EXT_conditional_rendering, unless STRATA_VK_NO_COND or its self-test failed: a MoE combine whose wait for
+    /// the CPU worker gave up skips the rest of the submission (`skip_rest`), and the host finishes the forward.
+    cr: Option<ash::ext::conditional_rendering::Device>,
     /// Specialization constant 0 of kernels that quantize x: llama.cpp q8_K numerics (`--llama-numerics`).
     llama: u32,
     /// Specialization constant 15 of every kernel: q8 KV cache rows (`--kv q8`, KV_Q8 in common.glsl).
@@ -157,6 +160,12 @@ struct State {
     used: Vec<vk::CommandBuffer>,
     /// The open command buffer.
     cur: Option<vk::CommandBuffer>,
+    /// The command buffer with conditional rendering on (`cond_on`), ended before the buffer is.
+    cond: Option<vk::CommandBuffer>,
+    /// Conditional rendering failed the self-test in `Vk::new`: not used.
+    no_cond: bool,
+    /// A MoE combine gave up waiting for the CPU worker since the last `stalled` (see `Backend::stalled`).
+    stalled: bool,
     /// Work was submitted since the last wait.
     busy: bool,
     /// Graph command buffers, kept for the backend's life.
@@ -203,8 +212,9 @@ struct State {
     copied: (usize, usize),
     /// Live buffers by start address: (buffer, bytes).
     bufs: BTreeMap<u64, (vk::Buffer, usize)>,
-    /// Host-mapped error word that `moe_combine` sets when the CPU worker does not answer: buffer, memory, host
-    /// pointer, device address.
+    /// Host-mapped words: the error that `moe_combine` sets when it gives up waiting for the CPU worker, then the
+    /// polls the combines spent waiting since the last wait here (see mb_wait.glsl). Buffer, memory, host pointer,
+    /// device address.
     err: (vk::Buffer, vk::DeviceMemory, usize, u64),
     /// STRATA_VK_PROF: timestamps before and after each dispatch outside graphs (its own time, without the copies and
     /// waits before it), names in order, and per-name totals (ns, calls)
@@ -335,6 +345,13 @@ impl Vk {
         };
         if amd_coherent { exts.push(ash::amd::device_coherent_memory::NAME.as_ptr()) }
         let amd_plain = !amd_coherent && unsafe { instance.get_physical_device_properties(pd) }.vendor_id == 0x1002;
+        let mut fcr = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
+        let cond = has(ash::ext::conditional_rendering::NAME) && std::env::var_os("STRATA_VK_NO_COND").is_none() && {
+            unsafe { instance.get_physical_device_features2(pd, &mut vk::PhysicalDeviceFeatures2::default().push_next(&mut fcr)) };
+            fcr.conditional_rendering == vk::TRUE
+        };
+        if cond { exts.push(ash::ext::conditional_rendering::NAME.as_ptr()) }
+        let mut fcr = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default().conditional_rendering(true);
         let stats = std::env::var_os("STRATA_VK_STATS").is_some() && has(ash::khr::pipeline_executable_properties::NAME);
         if stats { exts.push(ash::khr::pipeline_executable_properties::NAME.as_ptr()) }
         let mut fstats = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default().pipeline_executable_info(true);
@@ -351,6 +368,7 @@ impl Vk {
         if coop { f = f.push_next(&mut fcoop) }
         if stats { f = f.push_next(&mut fstats) }
         if amd_coherent { f = f.push_next(&mut fdc) }
+        if cond { f = f.push_next(&mut fcr) }
         let prio = [1.0];
         let tf = unsafe { instance.get_physical_device_queue_family_properties(pd) }.iter()
             .position(|q| q.queue_flags.contains(vk::QueueFlags::TRANSFER) && !q.queue_flags.intersects(vk::QueueFlags::COMPUTE | vk::QueueFlags::GRAPHICS))
@@ -371,19 +389,20 @@ impl Vk {
         let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None) }?;
         let pc = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(128)];
         let layout = unsafe { dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc), None) }?;
-        let st = State { pool, spare: vec![], used: vec![], cur: None, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false, beside: false, tpool, tcur: None,
+        let st = State { pool, spare: vec![], used: vec![], cur: None, cond: None, no_cond: false, stalled: false, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false, beside: false, tpool, tcur: None,
             tspare: vec![], tused: vec![], tbytes: 0, tstart: 0, tring: Default::default(), cstaged: false, cval: 0, tval: 0, bwait: 0, twait: 0, tlag: 0,
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, coop, coop_i8, amd_coherent, amd_plain, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
+        let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, coop, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
         st.staging = staging;
         st.map = map? as usize;
-        let (b, m) = inner.buffer(4, HOST)?;
+        let (b, m) = inner.buffer(8, HOST)?;
         let p = unsafe { inner.dev.map_memory(m, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }?;
-        unsafe { (p as *mut u32).write_volatile(0) };
+        unsafe { (p as *mut [u32; 2]).write_volatile([0, 0]) };
         st.err = (b, m, p as usize, unsafe { inner.dev.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(b)) });
         drop(st);
         let mut v = Vk(Arc::new(inner), Buf::new(0, 0, ()), Buf::new(0, 0, ()), Mutex::new((Buf::new(0, 0, ()), None)));
@@ -391,7 +410,30 @@ impl Vk {
         let t = iq_tables().0;
         v.2 = v.alloc(t.len())?;
         v.htod(&t, &v.2, 0)?;
+        if v.0.cr.is_some() && !v.cond_test()? {
+            v.0.st().no_cond = true;
+            eprintln!("note: Vulkan conditional rendering failed its self-test; a CPU expert worker that is slow on \
+                a layer will be an error");
+        }
         Ok(v)
+    }
+
+    /// Whether conditional rendering skips dispatches after a nonzero error word and runs them after a zero one.
+    fn cond_test(&self) -> anyhow::Result<bool> {
+        let (mk, p) = self.buf(16, HOST)?;
+        let p = p.cast::<f32>();
+        unsafe { p.write_volatile(1.0) };
+        let (one, err) = (mk.addr(), self.0.st().err.3);
+        self.add(err, one, 1)?;  // err = bits of 1.0, nonzero
+        self.0.skip_rest(&mut self.0.st())?;
+        self.add(one + 4, one, 1)?;
+        self.sync()?;
+        let stalled = self.stalled();
+        let skipped = unsafe { p.add(1).read_volatile() } == 0.0 && stalled;
+        self.0.skip_rest(&mut self.0.st())?;
+        self.add(one + 8, one, 1)?;
+        self.sync()?;
+        Ok(skipped && unsafe { p.add(2).read_volatile() } == 1.0 && !self.stalled())
     }
 }
 
@@ -402,7 +444,8 @@ impl Inner {
     /// (`DEVICE`, `HOST` or `BAR`) there is.
     fn buffer(&self, bytes: usize, wants: &[vk::MemoryPropertyFlags]) -> anyhow::Result<(vk::Buffer, vk::DeviceMemory)> {
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC
-            | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+            | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+            | if self.cr.is_some() { vk::BufferUsageFlags::CONDITIONAL_RENDERING_EXT } else { vk::BufferUsageFlags::empty() };
         let size = bytes.max(1).next_multiple_of(4) as u64;
         let mut bi = vk::BufferCreateInfo::default().size(size).usage(usage);
         if self.tq.is_some() { bi = bi.sharing_mode(vk::SharingMode::CONCURRENT).queue_family_indices(&self.qfs); }
@@ -435,6 +478,7 @@ impl Inner {
         unsafe { self.dev.begin_command_buffer(c, &vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)) }?;
         st.cur = Some(c);
+        self.cond_on(st, c);
         Ok(c)
     }
 
@@ -449,11 +493,42 @@ impl Inner {
         unsafe { self.dev.cmd_pipeline_barrier(cb, all, dst, vk::DependencyFlags::empty(), &[m], &[], &[]) }
     }
 
+    /// After a MoE combine that may give up waiting for the CPU worker: the dispatches `cb` records next run only
+    /// while the error word is 0, so nothing after a combine that gave up runs until the host has seen it (no-op
+    /// without conditional rendering). Every compute command buffer starts this way too, for the submissions after.
+    fn skip_rest(&self, st: &mut State) -> anyhow::Result<()> {
+        let cb = self.cb(st)?;
+        self.end_cond(st, cb);
+        self.cond_on(st, cb);
+        Ok(())
+    }
+
+    fn cond_on(&self, st: &mut State, cb: vk::CommandBuffer) {
+        let Some(cr) = self.cr.as_ref().filter(|_| !st.no_cond) else { return };
+        let m = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::CONDITIONAL_RENDERING_READ_EXT);
+        unsafe {
+            self.dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::CONDITIONAL_RENDERING_EXT,
+                vk::DependencyFlags::empty(), &[m], &[], &[]);
+            (cr.fp().cmd_begin_conditional_rendering_ext)(cb, &vk::ConditionalRenderingBeginInfoEXT::default().buffer(st.err.0)
+                .flags(vk::ConditionalRenderingFlagsEXT::INVERTED));
+        }
+        st.cond = Some(cb);
+    }
+
+    /// End conditional rendering in `cb` if it is on there (before ending `cb`).
+    fn end_cond(&self, st: &mut State, cb: vk::CommandBuffer) {
+        if st.cond == Some(cb) {
+            unsafe { (self.cr.as_ref().unwrap().fp().cmd_end_conditional_rendering_ext)(cb) };
+            st.cond = None;
+        }
+    }
+
     /// Submit the open command buffer, then `graph`; with `wait`, wait for all submitted work.
     fn submit(&self, st: &mut State, graph: Option<vk::CommandBuffer>, wait: bool) -> anyhow::Result<()> {
         let mut cbs = vec![];
         if let Some(c) = st.cur.take() {
             st.copied.1 = 0;
+            self.end_cond(st, c);
             unsafe { self.dev.end_command_buffer(c) }?;
             st.used.push(c);
             cbs.push(c);
@@ -495,12 +570,16 @@ impl Inner {
             st.busy = false;
             st.staged = 0;
             let e = st.err.2 as *mut u32;
+            if !e.is_null() { unsafe { e.add(1).write_volatile(0) }; }
             if !e.is_null() && unsafe { e.read_volatile() } != 0 {
                 unsafe { e.write_volatile(0) };
-                anyhow::ensure!(!self.amd_plain, "moe_combine: the CPU expert worker did not answer within about 2 s. This AMD GPU \
+                if self.cr.is_some() && !st.no_cond { st.stalled = true; return Ok(()); }
+                anyhow::ensure!(!self.amd_plain, "moe_combine: the CPU expert worker did not answer in time. This AMD GPU \
                     has no VK_AMD_device_coherent_memory, which the CPU expert path needs; RADV hides it on RDNA4 \
                     (RX 9000) unless you set radv_device_coherent_memory=true in the environment");
-                anyhow::bail!("moe_combine: the CPU expert worker did not answer within about 2 s");
+                // Without conditional rendering the rest of the submission would run on a half-done layer.
+                anyhow::bail!("moe_combine: the CPU expert worker did not answer in time, and without Vulkan conditional \
+                    rendering the forward cannot resume");
             }
         }
         Ok(())
@@ -855,6 +934,7 @@ impl Backend for Vk {
         r
     }
     fn beside_overlaps(&self) -> bool { self.0.tq.is_some() }
+    fn stalled(&self) -> bool { std::mem::take(&mut self.0.st().stalled) }
     /// With a transfer queue: the work so far is submitted, the copies of `f` go to the transfer queue after it, and
     /// `f`'s dispatches are submitted without waiting for them; the compute submit after the next `beside` waits for them.
     fn beside(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
@@ -891,10 +971,12 @@ impl Backend for Vk {
         unsafe { self.0.dev.begin_command_buffer(c, &vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE)) }?;
         st.rec = Some(c);
+        self.0.cond_on(&mut st, c);
         drop(st);
         let r = f();
         let mut st = self.0.st();
         st.rec = None;
+        self.0.end_cond(&mut st, c);
         unsafe { self.0.dev.end_command_buffer(c) }?;
         if let Err(e) = r { unsafe { self.0.dev.free_command_buffers(st.gpool, &[c]) }; return Err(e); }
         st.graphs.insert(key, c);
@@ -1075,7 +1157,9 @@ impl Backend for Vk {
     }
     fn moe_combine(&self, x: u64, ye: u64, w: u64, k: usize, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, slots: u64, n: usize, t: usize) -> anyhow::Result<()> {
         let err = self.0.st().err.3;
-        self.run("moe_combine", &[], [n.div_ceil(256), t, 1], &[&x, &ye, &w, &sh, &sg, &mb, &step, &slots, &err, &(k as u32), &(y_off as u32), &(n as u32)])
+        self.run("moe_combine", &[], [n.div_ceil(256), t, 1], &[&x, &ye, &w, &sh, &sg, &mb, &step, &slots, &err, &(k as u32), &(y_off as u32), &(n as u32)])?;
+        if mb != 0 { self.0.skip_rest(&mut self.0.st())?; }
+        Ok(())
     }
     fn moe_down_combine(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, slots: u64, k: usize, h: u64, ye: u64, xq: u64,
                         x: u64, wh: u64, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, t: usize) -> anyhow::Result<()> {
@@ -1086,6 +1170,8 @@ impl Backend for Vk {
         // Rows per workgroup as moe_gemv's rows per subgroup: each subgroup takes a slot.
         let (rpw, err) = ((2048 / cols).clamp(1, 8), self.0.st().err.3);
         self.run("moe_down_combine", &self.wspec(ty), [rows.div_ceil(rpw), t, 1], &[&w, &slots, &xq, &(stride as u64), &x, &wh, &sh, &sg, &mb, &step,
-            &err, &(rows as u32), &((cols / 256) as u32), &((t * k) as u32), &(k as u32), &(y_off as u32), &(rpw as u32)])
+            &err, &(rows as u32), &((cols / 256) as u32), &((t * k) as u32), &(k as u32), &(y_off as u32), &(rpw as u32)])?;
+        if mb != 0 { self.0.skip_rest(&mut self.0.st())?; }
+        Ok(())
     }
 }
