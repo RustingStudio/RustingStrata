@@ -751,7 +751,8 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
     }
     let next = s.serve(Some(&mut l), &engine);
     s.stats.lock().unwrap().unload(None);
-    l.r.finish()?;
+    // A failed profile save must not stop the server between two models.
+    if let Err(e) = l.r.finish() { eprintln!("{e:#}"); }
     Ok(next)
 }
 
@@ -802,7 +803,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
     // The chat page holds no secret, so it loads without the key (the page asks for it).
     if method == "GET" && path == "/" {
         const PAGE: &str = include_str!("web/index.html");
-        return Ok(write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PAGE}", PAGE.len())?);
+        return Ok(write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PAGE}", PAGE.len())?);
     }
     if s.key.as_deref().is_some_and(|k| !serve::key_ok(&auth, k)) { return send(&mut w, "401 Unauthorized", json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}})); }
     if method == "POST" && !json { return send(&mut w, "415 Unsupported Media Type", json!({"error": {"message": "Content-Type must be application/json", "type": "invalid_request_error"}})); }

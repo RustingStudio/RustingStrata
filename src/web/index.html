@@ -630,6 +630,7 @@ async function stats() {
   clearTimeout(statsTimer);
   let s = null;
   try { s = await api('/api/stats'); } catch {}
+  clearTimeout(statsTimer);   // another call may have set one while this one waited
   statsTimer = setTimeout(stats, document.hidden ? 10000 : s?.busy || s?.loading ? 700 : 2500);
   const st = $('state');
   if (!s) { [st.textContent, st.className] = ['Offline', 'state']; return; }
