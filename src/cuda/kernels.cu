@@ -935,23 +935,26 @@ __device__ __forceinline__ void cp_async8(void* dst, const void* src, bool ok) {
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
 template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;" :: "n"(N)); }
 
-template <int T, int SBB, int BM>
+// SM: as in gemm_q (gemmis_*, the tiles of at most 32 positions, 16 x 16 outputs per warp).
+template <int T, int SBB, int BM, bool SM>
 __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int nd, const u8* __restrict__ x,
                                         const int* xrow, float* y, int y_stride, int rows, int n64, int act) {
-    constexpr int P = 80;  // smem pitch in bytes: 64 int8 + padding (conflict-free fragments, 16-byte aligned rows)
+    constexpr int P = 80, XM = SM ? 32 : BM;  // smem pitch in bytes: 64 int8 + padding (conflict-free fragments, 16-byte aligned rows)
     static_assert(BM == 128, "one X row half per thread");
-    __shared__ __align__(16) signed char xq[2][BM * P], wq[64 * P];
-    __shared__ __align__(16) float xd[2][BM][2], xsum[2][BM][4];
+    __shared__ __align__(16) signed char xq[2][XM * P], wq[64 * P];
+    __shared__ __align__(16) float xd[2][XM][2], xsum[2][XM][4];
     __shared__ float wsc[64][4], wmn[64][4];
     GemmTile tl = tiles ? tiles[blockIdx.y] : GemmTile{wd, (int)blockIdx.y * BM, min(BM, nd - (int)blockIdx.y * BM)};
+    if (tiles && (tl.cnt <= 32) != SM) return;
     int n0 = blockIdx.x * 64, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
-    int wm = (warp >> 1) * 32, wn = (warp & 1) * 32, cols = n64 * 64;
+    int wm = SM ? 16 * (warp & 1) : (warp >> 1) * 32, wn = SM ? 16 * (warp >> 1) : (warp & 1) * 32, cols = n64 * 64;
     // X: thread copies 32 int8 (half of the row's 64) of row xr_, plus the row's scales (xh = 0) or sums (xh = 1).
     int xr_ = tid >> 1, xh = tid & 1;
     bool xok = xr_ < tl.cnt;
     const u8* xp = x + (size_t)(xok ? (xrow ? xrow[tl.m0 + xr_] : tl.m0 + xr_) : 0) * Q8_ROW(cols);
     auto ldx = [&](int kb) {
         int b = kb & 1;
+        if (SM && xr_ >= XM) { cp_async_commit(); return; }
         cp_async16(&xq[b][xr_ * P + xh * 32], xp + kb * 64 + xh * 32, xok);
         cp_async16(&xq[b][xr_ * P + xh * 32 + 16], xp + kb * 64 + xh * 32 + 16, xok);
         if (xh) cp_async16(&xsum[b][xr_][0], xp + cols + cols / 8 + kb * 16, xok);
@@ -991,10 +994,11 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
         constexpr int KS = scale32<T>() ? 32 : 16;  // depth of one mma (one weight scale)
         #pragma unroll
         for (int h = 0; h < 64 / KS; h++) if (wm < tl.cnt) {
+            constexpr int MT = SM ? 1 : 2, NT8 = SM ? 2 : 4;
             u32 a[2][4], bw[4][2];
             float da[2][2], sa[2][2], dbv[4][2], mb[4][2];
             #pragma unroll
-            for (int mt = 0; mt < 2; mt++) {
+            for (int mt = 0; mt < MT; mt++) {
                 int r = wm + mt * 16 + g;
                 const signed char* p = &xq[b][r * P + h * KS + 4 * t];
                 a[mt][0] = *(const u32*)p; a[mt][1] = *(const u32*)(p + 8 * P);
@@ -1006,7 +1010,7 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
                 }
             }
             #pragma unroll
-            for (int nt = 0; nt < 4; nt++) {
+            for (int nt = 0; nt < NT8; nt++) {
                 int n = wn + nt * 8;
                 const signed char* p = wq + (n + g) * P + h * KS + 4 * t;
                 bw[nt][0] = *(const u32*)p;
@@ -1018,9 +1022,9 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
                 }
             }
             #pragma unroll
-            for (int mt = 0; mt < 2; mt++)
+            for (int mt = 0; mt < MT; mt++)
                 #pragma unroll
-                for (int nt = 0; nt < 4; nt++) {
+                for (int nt = 0; nt < NT8; nt++) {
                     int c[4] = {0, 0, 0, 0};
                     if (KS == 32) mma_s8_16832(c, a[mt][0], a[mt][1], a[mt][2], a[mt][3], bw[nt][0], bw[nt][1]);
                     else mma_s8_16816(c, a[mt][0], a[mt][1], bw[nt][0]);
@@ -1036,9 +1040,9 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
         if (kb + 1 < nk) stw();
     }
     #pragma unroll
-    for (int mt = 0; mt < 2; mt++)
+    for (int mt = 0; mt < (SM ? 1 : 2); mt++)
         #pragma unroll
-        for (int nt = 0; nt < 4; nt++)
+        for (int nt = 0; nt < (SM ? 2 : 4); nt++)
             #pragma unroll
             for (int h = 0; h < 2; h++) {
                 int r = wm + mt * 16 + g + 8 * h, n = n0 + wn + nt * 8 + 2 * t;
@@ -1056,7 +1060,11 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
 #define DEF_GEMMI(T, NAME, SBB)                                                                                   \
     extern "C" __global__ void __launch_bounds__(256) gemmi_##NAME(const GemmTile* tiles, const u8* wd, int nd,    \
             const u8* x, const int* xrow, float* y, int y_stride, int rows, int n64, int act) {                    \
-        gemmi_q<T, SBB, 128>(tiles, wd, nd, x, xrow, y, y_stride, rows, n64, act);                              \
+        gemmi_q<T, SBB, 128, false>(tiles, wd, nd, x, xrow, y, y_stride, rows, n64, act);                       \
+    }                                                                                                             \
+    extern "C" __global__ void __launch_bounds__(256) gemmis_##NAME(const GemmTile* tiles, const u8* wd, int nd,   \
+            const u8* x, const int* xrow, float* y, int y_stride, int rows, int n64, int act) {                    \
+        gemmi_q<T, SBB, 128, true>(tiles, wd, nd, x, xrow, y, y_stride, rows, n64, act);                        \
     }
 ITYPES(DEF_GEMMI)
 
