@@ -148,6 +148,21 @@ impl Engine {
     fn mtp(&self) -> usize { self.mtp.unwrap_or(0) }
 }
 
+/// The negative log-likelihood of `tok` under `logits`, and in `row` the log-probabilities as llama-perplexity stores
+/// them: scale and minimum as two f32, then each logit as a u16 step over the 16 nats below the largest (0 below
+/// that), padded to an even count. Same arithmetic as its `log_softmax`.
+fn log_probs(logits: &[f32], tok: u32, row: &mut Vec<u16>) -> f64 {
+    let max = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let min = logits.iter().fold(f32::INFINITY, |a, &b| a.min(b)).max(max - 16.0);
+    let lse = logits.iter().map(|&x| (x - max).exp() as f64).sum::<f64>().ln() as f32;
+    let scale = (max - min) / 65535.0;
+    row.clear();
+    for f in [scale, min - max - lse] { let b = f.to_bits(); row.extend([b as u16, (b >> 16) as u16]); }
+    row.extend(logits.iter().map(|&x| if scale != 0.0 && x > min { ((x - min) * (1.0 / scale)).round_ties_even() as u16 } else { 0 }));
+    if logits.len() % 2 == 1 { row.push(0); }
+    (max + lse - logits[tok as usize]) as f64
+}
+
 /// A nonzero xorshift state from `s`, or from the clock.
 fn seed(s: Option<u64>) -> u64 {
     s.unwrap_or_else(|| SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64))
@@ -243,6 +258,26 @@ enum Cmd {
         #[command(flatten)]
         engine: Engine,
     },
+    /// Perplexity over a text file as llama-perplexity computes it: chunks of `ctx-len` tokens, each from an empty
+    /// context, scored over their second half (the first half prefilled, the rest decoded token by token).
+    /// `--kld-base` writes the log-probabilities in llama-perplexity's format, so
+    /// `llama-perplexity -m MODEL --kl-divergence --kl-divergence-base FILE` compares llama.cpp's logits with these
+    /// (KLD, top-token agreement and both perplexities) on the same tokens.
+    Perplexity {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long, default_value_t = 512)]
+        ctx_len: usize,
+        /// Score only the first N chunks.
+        #[arg(long)]
+        chunks: Option<usize>,
+        #[arg(long)]
+        kld_base: Option<PathBuf>,
+        #[command(flatten)]
+        engine: Engine,
+    },
     /// Text generation (greedy unless --temp).
     Generate {
         #[arg(long)]
@@ -325,6 +360,41 @@ fn main() -> anyhow::Result<()> {
             if out.len() == cap && cap < n { eprint!("\n(stopped: the context is full at {} tokens; raise --ctx)", engine.ctx); }
             eprintln!("\nprompt {} tok {:.2} tok/s | gen {} tok {:.2} tok/s", ids.len(), ids.len() as f64 / pp, out.len(), out.len() as f64 / tg);
             if engine.gpu { eprintln!("CPU expert compute, share of gen time: {:.1}%", 100.0 * (r.cpu_secs() - cpu0) / tg); }
+            r.finish()?;
+        }
+        Cmd::Perplexity { model, file, ctx_len: n, chunks, kld_base, mut engine } => {
+            let g = Gguf::open(&model)?;
+            let m = Model::load(&g)?;
+            let tok = Tokenizer::from_gguf(&g)?;
+            // ponytail: no BOS at chunk starts (llama-perplexity adds one where the vocabulary asks for it; Qwen does not)
+            let ids = tok.encode(&std::fs::read_to_string(&file)?)?;
+            let n_chunk = (ids.len() / n).min(chunks.unwrap_or(usize::MAX));
+            anyhow::ensure!(n >= 4 && n_chunk > 0, "{} tokens: need at least one chunk of --ctx-len {n} (>= 4)", ids.len());
+            engine.ctx = engine.ctx.max(n);
+            let mut r = engine.runner(&m, &model)?;
+            let nv = m.cfg.n_vocab;
+            let mut out = kld_base.map(|p| std::fs::File::create(p).map(std::io::BufWriter::new)).transpose()?;
+            if let Some(o) = &mut out {
+                o.write_all(b"_logits_")?;
+                for v in [n, nv, n_chunk] { o.write_all(&(v as u32).to_le_bytes())?; }
+                for &t in &ids[..n_chunk * n] { o.write_all(&t.to_le_bytes())?; }
+            }
+            let (mut nll, mut count, mut row) = (0f64, 0usize, Vec::new());
+            let first = n / 2;
+            for c in ids.chunks_exact(n).take(n_chunk) {
+                r.reset()?;
+                let mut logits = r.prefill(&c[..=first])?;
+                for i in first..n - 1 {
+                    if i > first { logits = r.step(c[i])?; }
+                    anyhow::ensure!(logits.len() == nv, "{} logits, vocabulary {nv}", logits.len());
+                    nll += log_probs(&logits, c[i + 1], &mut row);
+                    if let Some(o) = &mut out { for v in &row { o.write_all(&v.to_le_bytes())?; } }
+                    count += 1;
+                }
+                eprint!("[{}]{:.4},", count / (n - 1 - first), (nll / count as f64).exp());
+            }
+            if let Some(o) = &mut out { o.flush()?; }
+            println!("\nPPL = {:.4} over {n_chunk} chunks of {n} tokens ({count} scored)", (nll / count as f64).exp());
             r.finish()?;
         }
         Cmd::Bench { model, pp, tg, reps, mut engine } => {
