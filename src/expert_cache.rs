@@ -60,7 +60,7 @@ impl ExpertCache {
             for (i, name) in MATS.iter().enumerate() {
                 let t = m.w.layer(il, name)?.expert(0, n);
                 mats[i] = Mat { ty: t.ty, rows: t.rows, cols: t.cols, off, bytes: t.data.len() };
-                off += t.data.len();
+                off = (off + t.data.len()).next_multiple_of(16);  // GEMV kernels read 8-byte words
             }
             *classes.entry(off).or_default() += n;
             layers.push(Some((off, mats)));

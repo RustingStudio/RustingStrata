@@ -33,7 +33,7 @@ impl Scratch {
         for il in 0..c.n_layer {
             if !c.is_moe() { break; }
             let mut b = 0;
-            for name in MATS { b += m.w.layer(il, name)?.expert(0, c.n_expert).data.len(); }
+            for name in MATS { b = (b + m.w.layer(il, name)?.expert(0, c.n_expert).data.len()).next_multiple_of(16); }  // as ExpertCache lays out a slot
             stage_bytes = stage_bytes.max(b);
         }
         let (ne, k) = (c.n_embd, c.n_expert_used.max(1));
