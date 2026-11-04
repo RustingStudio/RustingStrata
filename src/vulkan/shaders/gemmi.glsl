@@ -74,7 +74,7 @@ void ldx(uint xr, uint xh, bool xok, uint xo, uint cols, uint kb, uint b) {
 
 void main() {
     uint tid = gl_LocalInvocationID.x, w = gl_SubgroupID, n0 = gl_WorkGroupID.x * 64, cols = p.nk * 64;
-    uint wm = (w >> 1) * 32, wn = (w & 1) * 32, m0, cnt;
+    uint m0, cnt;
     U8 wt;
     if (uint64_t(p.tiles) != 0) {
         uint64_t t = p.tiles.v[2 * gl_WorkGroupID.y + 1];
@@ -90,6 +90,15 @@ void main() {
     if (KS == 16) for (uint i = tid; i < 2 * 64 * PW; i += 256) wq[i] = 0;
     load_tables();
     barrier();
+    // Subgroup w multiplies rows bm .. bm + 31 by columns bn .. bn + 31 of the tile, or with sm (at most 32 positions,
+    // most expert tiles) only the 16 x 16 at bm, bn, in acc[0][0], so the 8 output tiles are spread over all 8
+    // subgroups. Each output sums the same products in the same order either way.
+#if COOP
+    bool sm = cnt <= 32;
+#else
+    const bool sm = false;
+#endif
+    uint bm = sm ? 16 * (w & 1) : (w >> 1) * 32, bn = sm ? 16 * (w >> 1) : (w & 1) * 32;
     // nv: the layout of mma.sync (element i at row g + 8 (i >> 2), column 2 t + (i & 1) + 8 ((i >> 1) & 1)), as on NVIDIA.
     uint g = gl_SubgroupInvocationID >> 2, t = gl_SubgroupInvocationID & 3;
 #if COOP
@@ -124,14 +133,14 @@ void main() {
         if (kb + 1 < p.nk) ldx(xr, xh, xok, xo, cols, kb + 1, xb ^ 1);
         if (kb + 1 < p.nk) ldw(wt, wr, wi, wok, n0, kb + 1, wv, d, m);
         // Expert tiles are often part full; a subgroup whose 32 positions are all past cnt has nothing to multiply.
-        if (wm < cnt)
+        if (bm < cnt)
         [[unroll]] for (uint h = 0; h < 64 / KS; h++) {
 #if COOP
             coopmat<int8_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> a[2];
             coopmat<int8_t, gl_ScopeSubgroup, 32, 16, gl_MatrixUseB> b[2];
-            [[unroll]] for (uint i = 0; i < 2; i++) {
-                coopMatLoad(a[i], xq, (xb * BM + wm + 16 * i) * PX + h * KS / 4, PX, gl_CooperativeMatrixLayoutRowMajor);
-                coopMatLoad(b[i], wq, (xb * 64 + wn + 16 * i) * PW + h * 8, PW, gl_CooperativeMatrixLayoutColumnMajor);
+            [[unroll]] for (uint i = 0; i < 2; i++) if (!sm || i == 0) {
+                coopMatLoad(a[i], xq, (xb * BM + bm + 16 * i) * PX + h * KS / 4, PX, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(b[i], wq, (xb * 64 + bn + 16 * i) * PW + h * 8, PW, gl_CooperativeMatrixLayoutColumnMajor);
             }
 #endif
             // NVIDIA layout: a lane's scales are those of 2 rows per mt and 4 columns per nt, loaded once per h.
@@ -139,19 +148,19 @@ void main() {
             if (nv) {
                 [[unroll]] for (uint mt = 0; mt < 2; mt++)
                     [[unroll]] for (uint e = 0; e < 2; e++) {
-                        uint r = wm + 16 * mt + g + 8 * e;
+                        uint r = bm + 16 * mt + g + 8 * e;
                         da[mt][e] = xd[xb][r][h * KS / 32];
                         if (MIN) sa[mt][e] = KS == 32 ? xsum[xb][r][2 * h] + xsum[xb][r][2 * h + 1] : xsum[xb][r][h];
                     }
                 [[unroll]] for (uint nt = 0; nt < 2; nt++)
                     [[unroll]] for (uint e = 0; e < 4; e++) {
-                        uint n = wn + 16 * nt + 2 * t + (e & 1) + 8 * (e >> 1);
+                        uint n = bn + 16 * nt + 2 * t + (e & 1) + 8 * (e >> 1);
                         db[nt][e] = wsc[xb][n][h * KS / 16];
                         if (MIN) mb[nt][e] = wmn[xb][n][h * KS / 16];
                     }
             }
             [[unroll]] for (uint mt = 0; mt < 2; mt++)
-                [[unroll]] for (uint nt = 0; nt < 2; nt++) {
+                [[unroll]] for (uint nt = 0; nt < 2; nt++) if (!sm || mt + nt == 0) {
 #if COOP
                     IACC c = coopMatMulAdd(a[mt], b[nt], IACC(0));
 #else
@@ -159,8 +168,8 @@ void main() {
                     uint xw[2][KS / 4], ww[4][KS / 4];
                     int c[8];
                     [[unroll]] for (uint j = 0; j < KS / 4; j++) {
-                        [[unroll]] for (uint e = 0; e < 2; e++) xw[e][j] = xq[(xb * BM + wm + 16 * mt + RI(4 * e)) * PX + h * KS / 4 + j];
-                        [[unroll]] for (uint e = 0; e < 4; e++) ww[e][j] = wq[(xb * 64 + wn + 16 * nt + CI(e)) * PW + h * 8 + j];
+                        [[unroll]] for (uint e = 0; e < 2; e++) xw[e][j] = xq[(xb * BM + bm + 16 * mt + RI(4 * e)) * PX + h * KS / 4 + j];
+                        [[unroll]] for (uint e = 0; e < 4; e++) ww[e][j] = wq[(xb * 64 + bn + 16 * nt + CI(e)) * PW + h * 8 + j];
                     }
                     [[unroll]] for (uint i = 0; i < 8; i++) {
                         c[i] = 0;
@@ -174,7 +183,7 @@ void main() {
 #if COOP
                     else {
                         [[unroll]] for (uint i = 0; i < c.length(); i++) {
-                            uint r = wm + 16 * mt + ri[i], n = wn + 16 * nt + ci[i];
+                            uint r = bm + 16 * mt + ri[i], n = bn + 16 * nt + ci[i];
                             float s = KS == 32 ? xsum[xb][r][2 * h] + xsum[xb][r][2 * h + 1] : xsum[xb][r][h];
                             scale_add(acc[mt][nt][i], c[i], xd[xb][r][h * KS / 32], wsc[xb][n][h * KS / 16], s, wmn[xb][n][h * KS / 16]);
                         }
@@ -189,8 +198,8 @@ void main() {
     }
     [[unroll]] for (uint mt = 0; mt < 2; mt++)
         [[unroll]] for (uint nt = 0; nt < 2; nt++)
-            [[unroll]] for (uint i = 0; i < NE; i++) {
-                uint r = wm + 16 * mt + RI(i), n = n0 + wn + 16 * nt + CI(i);
+            [[unroll]] for (uint i = 0; i < NE; i++) if (!sm || mt + nt == 0) {
+                uint r = bm + 16 * mt + RI(i), n = n0 + bn + 16 * nt + CI(i);
                 if (r >= cnt || n >= p.rows) continue;
                 uint o = (m0 + r) * p.ys + n;
                 float v = acc[mt][nt][i];

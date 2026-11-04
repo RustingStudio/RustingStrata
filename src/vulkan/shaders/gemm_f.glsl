@@ -58,6 +58,15 @@ void main() {
     for (uint i = tid; i < 256; i += 256) { ix[i] = float(i / 16); ix[256 + i] = float(i % 16); }
     load_tables();
     uint g = gl_SubgroupInvocationID >> 2, t = gl_SubgroupInvocationID & 3;
+    // sm: at most 32 positions (most expert tiles), whose 2 x 4 output tiles of 16 x 16 go one per subgroup (rows
+    // tm, columns tn, in acc[0][0]) instead of four each to subgroups 0 and 1. Each output sums the same products in
+    // the same order either way. (Masking the four-tile loop for sm instead is slower.)
+#if COOP
+    bool sm = cnt <= 32;
+#else
+    const bool sm = false;
+#endif
+    uint tm = 16 * (w & 1), tn = 16 * (w >> 1);
 #if COOP
     ACC acc[2][2];
     for (uint a = 0; a < 2; a++) for (uint b = 0; b < 2; b++) acc[a][b] = ACC(0.0);
@@ -86,7 +95,16 @@ void main() {
         if (kb + 1 < p.nk) ldw(wt, n0, kb + 1, tid, wv);
 #if COOP
         // Expert tiles are often part full; a subgroup whose 32 positions are all past cnt has nothing to multiply.
-        if (wm < cnt)
+        if (sm) {
+            if (tm < cnt)
+            [[unroll]] for (uint kk = 0; kk < BK; kk += 16) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+                coopMatLoad(a, xs, tm * PW + kk / 2, PW, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(b, ws, tn * PW + kk / 2, PW, gl_CooperativeMatrixLayoutColumnMajor);
+                acc[0][0] = coopMatMulAdd(a, b, acc[0][0]);
+            }
+        } else if (wm < cnt)
         [[unroll]] for (uint kk = 0; kk < BK; kk += 16) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a[2];
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b[2];
@@ -120,7 +138,8 @@ void main() {
     for (uint mt = 0; mt < 2; mt++)
         for (uint nt = 0; nt < 2; nt++)
             for (uint i = 0; i < NE; i++) {
-                uint r = wm + 16 * mt + RI(i), n = n0 + wn + 16 * nt + CI(i);
+                if (sm && mt + nt != 0) break;
+                uint r = (sm ? tm : wm + 16 * mt) + RI(i), n = n0 + (sm ? tn : wn + 16 * nt) + CI(i);
                 if (r >= cnt || n >= p.rows) continue;
                 uint o = (m0 + r) * p.ys + n;
                 float v = acc[mt][nt][i];
