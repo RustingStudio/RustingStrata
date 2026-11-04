@@ -107,6 +107,7 @@ impl Runner<'_> {
             if g.drafts.0 > 0 { eprintln!("MTP drafts accepted {}/{} ({:.1}%)", g.drafts.1, g.drafts.0, 100.0 * g.drafts.1 as f64 / g.drafts.0 as f64); }
             eprintln!("expert hit rate {:.1}% ({} misses), cache swaps {}", 100.0 * g.hits as f64 / n as f64, g.misses,
                 g.cache.as_ref().map_or(0, |c| c.swaps));
+            if g.resumed.get() > 0 { eprintln!("GPU waits for the CPU expert worker that timed out and resumed: {}", g.resumed.get()); }
             if let Some(c) = &g.cache { c.save_profile()?; }
         }
         Ok(())

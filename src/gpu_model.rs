@@ -8,7 +8,7 @@ use crate::expert_cache::ExpertCache;
 use crate::model::Model;
 use crate::ops::Sampler;
 use crate::quant::GgmlType;
-use anyhow::bail;
+use anyhow::{bail, ensure, Context};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
@@ -104,6 +104,8 @@ pub struct GpuModel<'a> {
     pub misses: usize,
     /// Time the CPU worker spent computing missed experts (overlaps GPU work).
     pub cpu_time: Duration,
+    /// Forwards run again from a MoE combine that gave up waiting for the CPU worker (`finish`).
+    pub resumed: std::cell::Cell<usize>,
     /// MTP drafts (made, accepted).
     pub drafts: (usize, usize),
     /// MTP drafts per speculative step (0 = no draft head). May be lowered after `load`, never raised.
@@ -118,9 +120,11 @@ pub struct GpuModel<'a> {
 impl<'a> GpuModel<'a> {
     /// `chunk`: prefill batch in tokens (0 = no batched prefill). `mtp`: load the MTP draft head (needs `nextn`).
     pub fn load(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, k: usize) -> anyhow::Result<GpuModel<'a>> {
-        // The PLE conv (F16) is uploaded as f32, the PLE table stays on the CPU.
-        let cpu_only = |n: &str| n.ends_with("ple_conv1d.weight") || n == "per_layer_token_embd.weight";
-        if let Some(t) = m.w.g.tensors.values().find(|t| !cpu_only(&t.name) && GgmlType::from_u32(t.ty).is_ok_and(|ty| !ty.gpu(gpu.name()))) {
+        // The PLE table stays on the CPU; other F16 tensors but experts are uploaded as F32 (`Backend::upload`).
+        let cpu_only = |n: &str| n == "per_layer_token_embd.weight";
+        let f32_up = |n: &str, ty| ty == GgmlType::F16 && !n.contains("_exps.");
+        if let Some(t) = m.w.g.tensors.values().find(|t| !cpu_only(&t.name)
+            && GgmlType::from_u32(t.ty).is_ok_and(|ty| !ty.gpu(gpu.name()) && !f32_up(&t.name, ty))) {
             anyhow::bail!("tensor {} has type {}, which the {} backend does not support yet", t.name, GgmlType::from_u32(t.ty)?.name(), gpu.name());
         }
         let c = &m.cfg;
@@ -240,7 +244,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, drafts: (0, 0), k, short: 32, pf, mtp })
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), k, short: 32, pf, mtp })
     }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
@@ -277,7 +281,8 @@ impl<'a> GpuModel<'a> {
         self.put_embed(&[token])?;
         self.gpu.put(&[self.pos as i32, seq as i32], &self.step_buf, 0)?;
         self.run(1)?;
-        let logits = self.gpu.get::<f32>(&self.logits, 0, self.m.cfg.n_vocab)?;
+        let mut logits = self.gpu.get::<f32>(&self.logits, 0, self.m.cfg.n_vocab)?;
+        if self.finish(1, gq_min(self.pos, 1), None)? { logits = self.gpu.get::<f32>(&self.logits, 0, self.m.cfg.n_vocab)?; }
         self.after_forward(1)?;
         Ok(logits)
     }
@@ -292,7 +297,8 @@ impl<'a> GpuModel<'a> {
     pub fn verify(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<Vec<f32>>> {
         let nvoc = self.m.cfg.n_vocab;
         self.verify_run(tokens)?;
-        let logits = self.gpu.get::<f32>(&self.logits, 0, tokens.len() * nvoc)?;
+        let mut logits = self.gpu.get::<f32>(&self.logits, 0, tokens.len() * nvoc)?;
+        if self.finish(tokens.len(), gq_min(self.pos, tokens.len()), None)? { logits = self.gpu.get::<f32>(&self.logits, 0, tokens.len() * nvoc)?; }
         self.after_forward(tokens.len())?;
         Ok(logits.chunks(nvoc).map(|c| c.to_vec()).collect())
     }
@@ -303,7 +309,11 @@ impl<'a> GpuModel<'a> {
         self.verify_run(tokens)?;
         let g = &self.gpu;
         g.argmax_rows(self.logits.addr(), nvoc, nt, self.amax.addr())?;
-        let am: Vec<u32> = g.get::<i32>(&self.amax, 0, nt)?.into_iter().map(|x| x as u32).collect();
+        let mut am: Vec<u32> = g.get::<i32>(&self.amax, 0, nt)?.into_iter().map(|x| x as u32).collect();
+        if self.finish(nt, gq_min(self.pos, nt), None)? {
+            g.argmax_rows(self.logits.addr(), nvoc, nt, self.amax.addr())?;
+            am = g.get::<i32>(&self.amax, 0, nt)?.into_iter().map(|x| x as u32).collect();
+        }
         let n = keep(&am);
         self.after_forward(nt)?;
         Ok((n, am[n]))
@@ -392,17 +402,20 @@ impl<'a> GpuModel<'a> {
     /// Run the forward of `nt` tokens as a recorded graph (graph key `nt` and the attention regime), recorded on first use.
     fn run(&self, nt: usize) -> anyhow::Result<()> {
         let gq = gq_min(self.pos, nt);
-        self.gpu.graph(nt as u64 | (gq as u32 as u64) << 8, &mut || self.forward(nt, gq))
+        self.gpu.graph(nt as u64 | (gq as u32 as u64) << 8, &mut || self.forward(nt, gq, None))
     }
 
-    /// Enqueue (or record into a graph) the forward of `nt` tokens; per-token values come from `step_buf`.
-    fn forward(&self, nt: usize, gq: i32) -> anyhow::Result<()> {
+    /// Enqueue (or record into a graph) the forward of `nt` tokens; per-token values come from `step_buf`. `from`:
+    /// resume at that layer's MoE combine (see `finish`).
+    fn forward(&self, nt: usize, gq: i32, from: Option<usize>) -> anyhow::Result<()> {
         let c = &self.m.cfg;
         let (g, eps, ne, step) = (&self.gpu, c.eps, c.n_embd, self.step_buf.addr());
         let p = |n: &str| self.bufs[n].addr();
         let x = self.x.addr();
         let mut res = 0;
-        for (il, l) in self.layers.iter().enumerate() { res = self.layer(il, l, x, step, self.worker.as_ref(), nt, res, gq)?; }
+        for (il, l) in self.layers.iter().enumerate().skip(from.unwrap_or(0)) {
+            res = self.layer(il, l, x, step, self.worker.as_ref(), nt, res, gq, from == Some(il))?;
+        }
         match (&self.output_norm, &self.output_hc) {
             (Some(on), _) => g.rms_norm_q(x, ne, on.ptr, p("h"), ne, ne, nt, eps, p("hq"), res)?,
             (None, Some(hr)) => self.hc_read(hr, x, nt, &self.hc_at())?,
@@ -540,8 +553,9 @@ impl<'a> GpuModel<'a> {
         // `run` keys are token counts (below 8); the top bit keeps these keys apart from them.
         let gq = gq_min(h.pos, nt);
         let key = { let mut s = std::hash::DefaultHasher::new(); (hid, nt, head, gq).hash(&mut s); s.finish() | 1 << 63 };
-        g.graph(key, &mut || self.mtp_forward(hid, nt, head, gq))?;
-        let d = if head { g.get::<i32>(&self.amax, 0, 1)?[0] as u32 } else { g.sync()?; 0 };
+        g.graph(key, &mut || self.mtp_forward(hid, nt, head, gq, false))?;
+        let mut d = if head { g.get::<i32>(&self.amax, 0, 1)?[0] as u32 } else { g.sync()?; 0 };
+        if self.finish(nt, gq, Some((hid, head)))? && head { d = self.gpu.get::<i32>(&self.amax, 0, 1)?[0] as u32; }
         let h = self.mtp.as_mut().unwrap();
         h.pos += nt;
         if let Some(cache) = self.cache.as_mut() {
@@ -550,15 +564,43 @@ impl<'a> GpuModel<'a> {
         Ok(d)
     }
 
+    /// After a forward and its wait: while a MoE combine gave up waiting for the CPU worker (which may be reading
+    /// experts from a cold drive; one GPU submission must not outlast the driver's job timeout), wait for the worker
+    /// and run the rest of the forward from that combine. `mtp`: the draft head's forward (`mtp_run`'s hid, head)
+    /// instead of the model's. Returns whether anything ran again.
+    fn finish(&self, nt: usize, gq: i32, mtp: Option<(u64, bool)>) -> anyhow::Result<bool> {
+        let mut again = false;
+        let mut last = None;
+        while self.gpu.stalled() {
+            let w = match mtp { Some(_) => &self.mtp.as_ref().unwrap().worker, None => self.worker.as_ref().unwrap() };
+            let il = w.stalled_layer().context("a MoE combine gave up waiting, but no layer says so")?;
+            // The worker had answered the last time: the GPU does not see the mailbox.
+            ensure!(last != Some(il), "moe_combine: the GPU does not see the CPU expert worker's answers. On an AMD RX 9000 \
+                (RDNA4) GPU set radv_device_coherent_memory=true in the environment");
+            last = Some(il);
+            w.wait_done(il)?;
+            match mtp {
+                Some((hid, head)) => self.mtp_forward(hid, nt, head, gq, true)?,
+                None => self.forward(nt, gq, Some(il))?,
+            }
+            self.gpu.sync()?;
+            self.resumed.set(self.resumed.get() + 1);
+            again = true;
+        }
+        Ok(again)
+    }
+
     /// Enqueue the draft head (see `mtp_run`).
-    fn mtp_forward(&self, hid: u64, nt: usize, head: bool, gq: i32) -> anyhow::Result<()> {
+    fn mtp_forward(&self, hid: u64, nt: usize, head: bool, gq: i32, resume: bool) -> anyhow::Result<()> {
         let (c, g, h) = (&self.m.cfg, &self.gpu, self.mtp.as_ref().unwrap());
         let (eps, ne, hp) = (c.eps, c.n_embd, self.bufs["h"].addr());
         let (eh, x) = (h.eh.addr(), h.x.addr());
-        g.rms_norm(h.emb.addr(), ne, h.enorm.ptr, eh, 2 * ne, ne, nt, eps)?;
-        g.rms_norm(hid, ne, h.hnorm.ptr, eh + 4 * ne as u64, 2 * ne, ne, nt, eps)?;
-        self.mv(&h.eh_proj, eh, 2 * ne, x, ne, nt)?;
-        let res = self.layer(c.n_layer, &h.layer, x, h.step_buf.addr(), Some(&h.worker), nt, 0, gq)?;
+        if !resume {
+            g.rms_norm(h.emb.addr(), ne, h.enorm.ptr, eh, 2 * ne, ne, nt, eps)?;
+            g.rms_norm(hid, ne, h.hnorm.ptr, eh + 4 * ne as u64, 2 * ne, ne, nt, eps)?;
+            self.mv(&h.eh_proj, eh, 2 * ne, x, ne, nt)?;
+        }
+        let res = self.layer(c.n_layer, &h.layer, x, h.step_buf.addr(), Some(&h.worker), nt, 0, gq, resume)?;
         if res != 0 { g.add(x, res, nt * ne)?; }
         if head {
             g.rms_norm(x + 4 * ((nt - 1) * ne) as u64, 0, h.head_norm.ptr, hp, 0, ne, 1, eps)?;
@@ -570,8 +612,9 @@ impl<'a> GpuModel<'a> {
 
     /// One decoder block on `nt` tokens at `x` (rows of n_embd); `step` points at [position, worker seq] per token.
     /// One layer on x, after adding `res` (the previous layer's pending FFN output, or 0) to it. Returns this
-    /// layer's pending FFN output (a dense FFN's, added by the next norm) or 0.
-    fn layer(&self, il: usize, l: &Layer, x: u64, step: u64, worker: Option<&CpuWorker>, nt: usize, res: u64, gq: i32) -> anyhow::Result<u64> {
+    /// layer's pending FFN output (a dense FFN's, added by the next norm) or 0. `resume`: only the MoE down GEMV and
+    /// combine onward, after a combine that gave up waiting for the CPU worker (see `finish`).
+    fn layer(&self, il: usize, l: &Layer, x: u64, step: u64, worker: Option<&CpuWorker>, nt: usize, res: u64, gq: i32, resume: bool) -> anyhow::Result<u64> {
         let c = &self.m.cfg;
         let (g, eps, ne) = (&self.gpu, c.eps, c.n_embd);
         let p = |n: &str| self.bufs[n].addr();
@@ -588,7 +631,7 @@ impl<'a> GpuModel<'a> {
         let (dv, channels) = (c.ssm_dv(), c.ssm_d_inner + 2 * nk * dk);
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
         let kv = nkv * hd;
-        {
+        if !resume {
             let ha = self.hc_at();
             if let Some(pl) = &l.ple { self.ple(pl, x, step, nt, &ha)?; }
             match (&l.attn_norm, &l.hc) {
@@ -634,8 +677,11 @@ impl<'a> GpuModel<'a> {
                 }
                 _ => unreachable!(),
             }
+        }
+        {
             match &l.ffn {
                 Ffn::Dense { gate, up, down } => {
+                    debug_assert!(!resume);
                     g.batch(&mut || mv2(gate, up, "ge", "ue"))?;
                     let q = sw(down.ty, "ge", "ue", down.cols, nt, "ffq")?;
                     g.gemvq(down, p("ge"), down.cols, q, p("ye"), ne, nt)?;
@@ -645,14 +691,6 @@ impl<'a> GpuModel<'a> {
                     let k = c.n_expert_used;
                     let kt = nt * k;
                     let ids = self.ids.addr();
-                    // The shared expert's GEMVs and swiglu share batches with the routed ones.
-                    g.batch(&mut || {
-                        if let Some(s) = shared {
-                            mv2(router, &s.gate_inp, "rl", "sg")?;
-                            mv2(&s.gate, &s.up, "shg", "shu")?;
-                        } else { mv(router, "h", ne, "rl", c.n_expert)?; }
-                        Ok(())
-                    })?;
                     let cache = self.cache.as_ref().unwrap();
                     let lx = cache.layer(il).unwrap();
                     let (base, stride) = cache.base(lx);
@@ -661,6 +699,17 @@ impl<'a> GpuModel<'a> {
                     let (mut sq, mut dq) = (0, 0);
                     let w = worker.unwrap();
                     let mb = w.dev + (4 * il * w.layout.stride) as u64;
+                    // Resuming: what the skipped part left (the swiglu_q of Vulkan, the only backend that resumes).
+                    if resume { dq = if matches!(md.ty, GgmlType::F32 | GgmlType::BF16) { 0 } else { p("ffq") }; }
+                    // The shared expert's GEMVs and swiglu share batches with the routed ones.
+                    if !resume {
+                    g.batch(&mut || {
+                        if let Some(s) = shared {
+                            mv2(router, &s.gate_inp, "rl", "sg")?;
+                            mv2(&s.gate, &s.up, "shg", "shu")?;
+                        } else { mv(router, "h", ne, "rl", c.n_expert)?; }
+                        Ok(())
+                    })?;
                     g.moe_route(p("rl"), c.n_expert, k, c.expert_weights_scale, lx.table_dev.addr(), ids, p("wts"), slots, p("wh"), p("h"), mb, ne, w.layout.h, step, nt)?;
                     g.batch(&mut || {
                         if mg.ty == mu.ty && (mg.rows, mg.cols) == (mu.rows, mu.cols) {
@@ -678,6 +727,7 @@ impl<'a> GpuModel<'a> {
                         if let Some(s) = shared { g.gemvq(&s.down, p("shg"), c.n_ff_shexp, sq, p("shy"), ne, nt)?; }
                         Ok(())
                     })?;
+                    }
                     let (sh, sg) = if shared.is_some() { (p("shy"), p("sg")) } else { (0, 0) };
                     // Hyper-connections: the FFN output collects in "mo" (zero) and goes to the streams from there.
                     let fx = if l.hc.is_some() { p("mo") } else { x };

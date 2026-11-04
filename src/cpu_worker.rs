@@ -17,6 +17,8 @@ pub const REQ: usize = 0;
 pub const NTOK: usize = 1;
 /// Raised instead of REQ, with no data, when no expert of the layer missed (CUDA only; Vulkan raises REQ).
 pub const SKIP: usize = 2;
+/// Vulkan: the combine's verdict on its wait (0 open, 1 the worker answered, 2 gave up; see mb_wait.glsl).
+pub const VERDICT: usize = 8;
 pub const DONE: usize = 16;
 pub const IDS: usize = 32;
 
@@ -41,6 +43,7 @@ pub struct CpuWorker {
     pub dev: u64,
     pub layout: Mailbox,
     seq: u32,
+    layers: Vec<usize>,
     tx: Option<mpsc::Sender<u32>>,
     stop: Arc<AtomicBool>,
     busy_ns: Arc<AtomicU64>,
@@ -61,6 +64,10 @@ impl CpuWorker {
         let (st, bn) = (stop.clone(), busy_ns.clone());
         let mp = m as *const Model as usize;
         let lay = Mailbox::new(c.n_expert_used, c.n_embd);
+        let layers = moe_layers.clone();
+        // STRATA_TEST_WORKER_DELAY=ms: answer some requests (layer and seq picked by a hash) that much later, as a
+        // worker reading experts from a cold drive would (tests the combines that give up).
+        let delay = std::env::var("STRATA_TEST_WORKER_DELAY").ok().and_then(|v| v.parse::<u64>().ok()).map(Duration::from_millis);
         // The loop runs on a thread of its own pool, so the expert passes start on it at once and it takes part
         // in them instead of sleeping until a woken pool finishes (~12 us less per layer).
         let pool = rayon::ThreadPoolBuilder::new().num_threads(rayon::current_num_threads())
@@ -116,6 +123,7 @@ impl CpuWorker {
                     }
                     // SeqCst fences (mfence on x86) also order and flush write-combining stores (Vulkan maps the
                     // mailbox through the BAR): y before DONE, and DONE out now.
+                    if let Some(d) = delay { if (seq as usize * 31 + il) % 17 == 0 { std::thread::sleep(d) } }
                     fence(Ordering::SeqCst);
                     unsafe { at(DONE).write_volatile(seq) };
                     fence(Ordering::SeqCst);
@@ -123,7 +131,7 @@ impl CpuWorker {
                 }
             }
         }))?;
-        Ok(CpuWorker { _mem: mem, host, dev, layout, seq: 0, tx: Some(tx), stop, busy_ns, thread: Some(thread) })
+        Ok(CpuWorker { _mem: mem, host, dev, layout, seq: 0, layers, tx: Some(tx), stop, busy_ns, thread: Some(thread) })
     }
 
     /// Start a new token: returns the sequence number the GPU must publish with.
@@ -142,6 +150,24 @@ impl CpuWorker {
         let mut v = vec![0u32; (3 * k).next_multiple_of(4)];
         unsafe { read_wc((self.host as *const u32).add(b + IDS), &mut v) };
         (0..k).map(|j| (v[j] as i32, f32::from_bits(v[k + j]), v[2 * k + j] as i32)).collect()
+    }
+
+    /// The first layer whose combine gave up waiting (verdict 2) in the last request: the layers before it ran.
+    pub fn stalled_layer(&self) -> Option<usize> {
+        self.layers.iter().copied().find(|&il| unsafe { (self.host as *const u32).add(il * self.layout.stride + VERDICT).read_volatile() } == 2)
+    }
+
+    /// Wait until the worker has answered layer `il` of the current request, then reopen the layer's verdict so its
+    /// combine can run again.
+    pub fn wait_done(&self, il: usize) -> anyhow::Result<()> {
+        let at = |o: usize| unsafe { (self.host as *mut u32).add(il * self.layout.stride + o) };
+        while unsafe { at(DONE).read_volatile() } != self.seq {
+            anyhow::ensure!(!self.thread.as_ref().is_some_and(|t| t.is_finished()), "the CPU expert worker stopped");
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        unsafe { at(VERDICT).write_volatile(0) };
+        fence(Ordering::SeqCst);
+        Ok(())
     }
 
     /// Total time the worker spent computing experts.

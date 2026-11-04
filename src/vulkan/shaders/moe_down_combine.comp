@@ -24,10 +24,10 @@ void sb_step(U8 w, F32 xd, uint row, uint lane, uint t, uint s, inout precise fl
     if (T == 10 || T == 12 || T == 13) acc = fma(-(m * dx), float(sx), acc);  // types with a min
 }
 
-const uint SPINS = 1u << 23;
+#include "mb_wait.glsl"
 const uint RPW = 8;  // rows per workgroup (rpw) at most
 shared float part[32 * RPW];
-shared bool miss;
+shared bool miss, ok;
 void main() {
     uint tk = gl_WorkGroupID.y, k = p.k, lane = gl_SubgroupInvocationID, n = p.rows;
     uint rpw = p.rpw, r0 = gl_WorkGroupID.x * rpw;
@@ -47,20 +47,15 @@ void main() {
         }
     }
     if (gl_LocalInvocationID.x == 0) {
-        bool m = false;
-        if (uint64_t(p.mb) != 0) for (uint j = 0; j < k; j++) m = m || p.slots.v[tk * k + j] < 0;
-        if (m) {
-            uint seq = uint(p.step.v[1]), spins = 0;
-            while (atomicLoad(p.mb.v[16], gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquire | gl_SemanticsMakeVisible) != seq)
-                // After one wait timed out, later layers of the submission give up within 2^16 spins: waiting
-                // about 2 s each would outlast the driver's job timeout (amdgpu resets the GPU after 10 s).
-                if (++spins == SPINS || ((spins & 0xffffu) == 0 && p.err.v[0] != 0)) { p.err.v[0] = 1; break; }
-        }
+        // As moe_combine: all tokens wait if any missed, so all of x is written or none.
+        bool m = false, any = false;
+        if (uint64_t(p.mb) != 0) for (uint j = 0; j < gl_NumWorkGroups.y * k; j++) if (p.slots.v[j] < 0) { any = true; m = m || j / k == tk; }
+        ok = !any || mb_wait(p.mb, uint(p.step.v[1]), p.err);
         miss = m;
     }
     barrier();
     uint i = gl_LocalInvocationID.x, r = r0 + i;
-    if (i >= rpw || r >= n) return;
+    if (i >= rpw || r >= n || !ok) return;
     precise float y = 0.0;
     for (uint j = 0; j < k; j++) {
         float wj = p.wh.v[tk * k + j];
