@@ -32,6 +32,15 @@ pub fn valid_repo(r: &str) -> bool {
     r.split_once('/').is_some_and(|(a, b)| ok(a) && ok(b))
 }
 
+/// The name a repo file is saved under: its last path component, if that is a plain .gguf file name. The name comes
+/// from the repo, so `\` (a separator on Windows), `:` (a drive or stream on Windows) and control characters are
+/// refused.
+pub fn local_name(f: &str) -> Option<&str> {
+    let n = f.rsplit('/').next()?;
+    (n.ends_with(".gguf") && !n.starts_with('.') && !n.chars().any(|c| c == '\\' || c == ':' || c.is_control()))
+        .then_some(n)
+}
+
 /// Every file of `repo` with its size in bytes.
 fn files(repo: &str) -> anyhow::Result<Vec<(String, u64)>> {
     ensure!(valid_repo(repo), "{repo:?} is not a Hugging Face repo name (owner/name)");
@@ -58,7 +67,7 @@ pub fn download(repo: &str, file: &str, dir: &Path, p: &Mutex<Progress>) -> anyh
     p.lock().unwrap().total = want.iter().map(|x| x.1).sum();
     let mut before = 0;
     for (f, size) in &want {
-        let name = f.rsplit('/').next().unwrap_or(f);
+        let name = local_name(f).with_context(|| format!("{repo} has a file name strata does not save: {f:?}"))?;
         let (dst, part) = (dir.join(name), dir.join(format!("{name}.part")));
         if !dst.exists() {
             let mut have = std::fs::metadata(&part).map_or(0, |m| m.len());
