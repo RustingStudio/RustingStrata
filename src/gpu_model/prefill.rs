@@ -320,14 +320,18 @@ impl GpuModel<'_> {
                         }
                         Ok(())
                     };
-                    // Group gi + 1 copies into the staging half group gi - 1 used, beside group gi's up GEMM (the batch
-                    // starts after group gi - 1's down GEMM).
+                    // Group gi + 1 copies into the staging half group gi - 1 used, beside group gi's GEMMs (`beside`
+                    // starts the copies after group gi - 1's down GEMM). They queue last, so the GEMMs need not wait
+                    // for the host to stage them.
                     for gi in 0..groups.len() {
                         let (sp, lo, hi) = spans[gi];
-                        g.gemm(mg.ty, mg.rows, mg.cols, tp(sp[0].0), sp[0].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, SAME_X)?;
-                        let up = || g.gemm(mu.ty, mu.rows, mu.cols, tp(sp[1].0), sp[1].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X);
-                        if gi + 1 < groups.len() { g.batch(&mut || { copy(gi + 1)?; up() })?; } else { up()?; }
-                        g.gemm(md.ty, md.rows, md.cols, tp(sp[2].0), sp[2].1, at(l.ge) + (4 * lo * c.n_ff_exp) as u64, c.n_ff_exp, hi - lo, 0, at(l.ye) + (4 * lo * ne) as u64, ne, 0)?;
+                        g.beside(&mut || {
+                            g.gemm(mg.ty, mg.rows, mg.cols, tp(sp[0].0), sp[0].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, SAME_X)?;
+                            g.gemm(mu.ty, mu.rows, mu.cols, tp(sp[1].0), sp[1].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X)?;
+                            g.gemm(md.ty, md.rows, md.cols, tp(sp[2].0), sp[2].1, at(l.ge) + (4 * lo * c.n_ff_exp) as u64, c.n_ff_exp, hi - lo, 0, at(l.ye) + (4 * lo * ne) as u64, ne, 0)?;
+                            if gi + 1 < groups.len() { copy(gi + 1)?; }
+                            Ok(())
+                        })?;
                     }
                     // The shared down runs last, so the routed gate and up above reuse the int8 h of the shared up.
                     if let Some(s) = shared { g.gemm_dense(&s.down, t, at(l.shg), c.n_ff_shexp, at(l.shy), ne, 0)?; }

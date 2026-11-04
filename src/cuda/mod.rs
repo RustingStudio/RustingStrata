@@ -52,6 +52,8 @@ pub struct Gpu {
 const RING: usize = 64 << 20;
 /// Smaller copies take the driver's pageable path (staged before the call returns).
 const RING_MIN: usize = 256 << 10;
+/// `nb` inside `beside`: launches stay on the main stream, copies go to the side stream.
+const BESIDE: usize = usize::MAX - 1;
 
 /// A recorded graph. Its handles are plain CUDA driver handles, which any thread may launch once the context is
 /// bound (cudarc leaves `CudaGraph` without `Send` only because it holds raw pointers).
@@ -201,7 +203,7 @@ impl Gpu {
     /// The stream for the next launch: inside `batch`, odd launches go to `side`.
     fn st(&self) -> &Arc<CudaStream> {
         let n = self.nb.load(Relaxed);
-        if n == usize::MAX { return &self.stream; }
+        if n >= BESIDE { return &self.stream; }
         self.nb.store(n + 1, Relaxed);
         if n % 2 == 1 { &self.side } else { &self.stream }
     }
@@ -251,7 +253,7 @@ impl Gpu {
         let xq = self.ptr(&q8.0);
         let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
         if !(same && q8.1 == key) {
-            anyhow::ensure!(self.nb.load(Relaxed) == usize::MAX, "gemm inside batch: x must be quantized already (SAME_X)");
+            anyhow::ensure!(self.nb.load(Relaxed) >= BESIDE, "gemm inside batch: x must be quantized already (SAME_X)");
             launch!(self, "quant_q8", cfg((n_x as u32, 1), 256, 0), x, x_stride as i32, xq, cols as i32);
             q8.1 = key;
         }
@@ -352,7 +354,7 @@ impl Backend for Gpu {
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
         anyhow::ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
         self.ctx.bind_to_thread()?;
-        // Inside `batch` a copy goes to the side stream, beside the next launch on the main stream.
+        // Inside `batch` or `beside` a copy goes to the side stream, beside the next launch on the main stream.
         let st = if self.nb.load(Relaxed) == usize::MAX { &self.stream } else { &self.side };
         // No stream sync: from pageable memory (every caller's) the driver has staged `src` when the call returns.
         if src.len() < RING_MIN { return Ok(unsafe { result::memcpy_htod_async(dst.addr() + off as u64, src, st.cu_stream()) }?); }
@@ -405,6 +407,15 @@ impl Backend for Gpu {
     fn batch(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
         self.side.join(&self.stream)?;
         self.nb.store(0, Relaxed);
+        let r = f();
+        self.nb.store(usize::MAX, Relaxed);
+        self.stream.join(&self.side)?;
+        r
+    }
+
+    fn beside(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
+        self.side.join(&self.stream)?;
+        self.nb.store(BESIDE, Relaxed);
         let r = f();
         self.nb.store(usize::MAX, Relaxed);
         self.stream.join(&self.side)?;
