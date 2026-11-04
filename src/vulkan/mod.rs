@@ -756,7 +756,10 @@ impl Backend for Vk {
         ensure!((1..=4).contains(&nt), "gemvn: {nt} inputs (1 to 4)");
         let (nc, spec) = (gemv_cols(self.0.llama, w.ty, w.cols)?, [&self.wspec(w.ty)[..], &[nt as u32]].concat());
         if matches!(w.ty, GgmlType::F32 | GgmlType::BF16) {
-            return self.run("gemv_f", &spec, [w.rows, 1, 1], &[&w.ptr, &x, &y, &(x_stride as u32), &(y_stride as u32), &nc]);
+            // Rows per workgroup as CUDA gemv_cfg: 8 for tall matrices, else 1 (hc_attn_up 10240 x 320).
+            let wpb = if w.rows >= 4096 { 8 } else { 1 };
+            let spec = [&spec[..], &[32 * wpb as u32]].concat();
+            return self.run("gemv_f", &spec, [w.rows.div_ceil(wpb), 1, 1], &[&w.ptr, &x, &y, &(x_stride as u32), &(y_stride as u32), &nc, &(w.rows as u32)]);
         }
         let xq = if xq != 0 { xq } else {
             ensure!(nt * w.cols * 9 / 8 <= XQ, "gemv: {nt} x {} inputs do not fit the quantized-x buffer", w.cols);

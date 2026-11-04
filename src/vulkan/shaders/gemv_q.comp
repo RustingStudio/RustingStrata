@@ -5,6 +5,7 @@
 // nt is specialization constant 5, as CUDA's template NT: a runtime count leaves acc indexed dynamically.
 layout(local_size_x = 256) in;
 #include "common.glsl"
+#define SHARED_TABLES
 #include "deq.glsl"
 #extension GL_EXT_integer_dot_product : require
 #extension GL_EXT_control_flow_attributes : require
@@ -27,6 +28,7 @@ void sb_step(F32 xd, uint row, uint lane, uint s, inout precise float acc[NT]) {
 
 void main() {
     uint row = gl_WorkGroupID.x * 8 + gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    load_tables();
     if (row >= p.rows) return;
     F32 xd = F32(uint64_t(p.xq) + NT * p.cols);
     uint nsb = p.cols >> 8;

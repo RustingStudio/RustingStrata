@@ -5,6 +5,7 @@
 // (rpw of them; kernels.cu's rows per warp), so a workgroup covers 8 * rpw rows.
 layout(local_size_x = 256) in;
 #include "common.glsl"
+#define SHARED_TABLES
 #include "deq.glsl"
 #extension GL_EXT_integer_dot_product : require
 #extension GL_EXT_control_flow_attributes : require
@@ -25,7 +26,8 @@ void sb_step(U8 w, F32 xd, uint row, uint lane, uint t, uint s, inout precise fl
 void main() {
     uint k = gl_WorkGroupID.y, lane = gl_SubgroupInvocationID;
     int e = p.ids.v[k];
-    if (e < 0) return;
+    if (e < 0) return;  // the whole workgroup
+    load_tables();
     U8 w = U8(uint64_t(p.w) + uint64_t(e) * p.stride + gl_WorkGroupID.z * p.w2);
     F32 y = F32(uint64_t(p.y) + gl_WorkGroupID.z * p.y2);
     F32 xd = F32(uint64_t(p.xq) + p.ntok * p.cols);
