@@ -30,16 +30,20 @@ jobs:
     permissions:
       contents: write
     env:
-      GH_TOKEN: ${{ github.token }}
       # .cargo/config.toml builds for the local CPU; release binaries target x86-64-v3 (AVX2 and FMA: Intel Haswell,
       # AMD Zen and later) instead, without debug info.
       RUSTFLAGS: -C target-cpu=x86-64-v3
       CARGO_PROFILE_RELEASE_DEBUG: '0'
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - run: rustup update stable
       - run: cargo build --release --locked
-      - run: |
+      # Only the upload step gets the token, so build scripts of dependencies cannot read it.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
           cp target/release/${{ matrix.bin }} ${{ matrix.asset }}
           gh release upload "$GITHUB_REF_NAME" ${{ matrix.asset }} --repo "$GITHUB_REPOSITORY"
         shell: bash

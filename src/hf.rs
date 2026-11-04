@@ -20,8 +20,12 @@ pub struct Progress {
     pub error: Option<String>,
 }
 
-fn get(url: &str) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(30))).build().into();
+/// A GET with timeouts for a stalled connection: 30 s to connect, 60 s for the response and for each read of the
+/// body (so a stalled download fails and can be cancelled), and `whole` for everything.
+fn get(url: &str, whole: Option<Duration>) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
+    let s = Some(Duration::from_secs(60));
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_recv_response(s).timeout_per_read(s).timeout_global(whole).build().into();
     let r = agent.get(url);
     match std::env::var("HF_TOKEN") { Ok(t) if !t.is_empty() => r.header("Authorization", format!("Bearer {t}")), _ => r }
 }
@@ -41,10 +45,13 @@ pub fn local_name(f: &str) -> Option<&str> {
         .then_some(n)
 }
 
+/// FNV-1a: a hash that stays the same across builds, for file names.
+fn fnv(s: &str) -> u64 { s.bytes().fold(0xcbf29ce484222325, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3)) }
+
 /// Every file of `repo` with its size in bytes.
 fn files(repo: &str) -> anyhow::Result<Vec<(String, u64)>> {
     ensure!(valid_repo(repo), "{repo:?} is not a Hugging Face repo name (owner/name)");
-    let mut r = get(&format!("https://huggingface.co/api/models/{repo}?blobs=true")).call()
+    let mut r = get(&format!("https://huggingface.co/api/models/{repo}?blobs=true"), Some(Duration::from_secs(60))).call()
         .with_context(|| format!("Hugging Face repo {repo} (check the name; a private or gated repo needs HF_TOKEN)"))?;
     let v: serde_json::Value = serde_json::from_str(&r.body_mut().read_to_string()?)?;
     Ok(v["siblings"].as_array().context("no file list")?.iter()
@@ -68,12 +75,16 @@ pub fn download(repo: &str, file: &str, dir: &Path, p: &Mutex<Progress>) -> anyh
     let mut before = 0;
     for (f, size) in &want {
         let name = local_name(f).with_context(|| format!("{repo} has a file name strata does not save: {f:?}"))?;
-        let (dst, part) = (dir.join(name), dir.join(format!("{name}.part")));
-        if !dst.exists() {
+        // The .part name carries the repo and path, so a same-named file of another repo or folder is not resumed.
+        let (dst, part) = (dir.join(name), dir.join(format!("{name}.{:016x}.part", fnv(&format!("{repo}/{f}")))));
+        if let Ok(m) = std::fs::metadata(&dst) {
+            ensure!(*size == 0 || m.len() == *size, "{} already exists with another size; move it away to download {f}", dst.display());
+        } else {
             let mut have = std::fs::metadata(&part).map_or(0, |m| m.len());
+            if have > *size && *size > 0 { have = 0; }  // not this file: start over
             if have < *size || *size == 0 {
                 let url = format!("https://huggingface.co/{repo}/resolve/main/{f}");
-                let r = get(&url).header("Range", format!("bytes={have}-")).call().with_context(|| format!("download {f}"))?;
+                let r = get(&url, None).header("Range", format!("bytes={have}-")).call().with_context(|| format!("download {f}"))?;
                 if r.status() != 206 { have = 0; }  // the range was ignored: start over
                 let mut out = std::fs::OpenOptions::new().create(true).write(true).append(have > 0).truncate(have == 0).open(&part)?;
                 let (mut rd, mut buf) = (r.into_body().into_reader(), vec![0; 1 << 20]);
