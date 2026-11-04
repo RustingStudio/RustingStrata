@@ -67,6 +67,9 @@ impl CpuWorker {
             .thread_name(|i| format!("strata-experts-{i}")).build()?;
         let thread = std::thread::Builder::new().name("strata-cpu-experts".into()).spawn(move || pool.install(move || {
             let m = unsafe { &*(mp as *const Model) };
+            // Missed experts not in the page cache are read from the drive: reading all of a layer's ahead keeps
+            // the reads in flight together instead of one page fault at a time per compute thread.
+            let pre = crate::weights::Prefetch::start();
             let w = |i: usize| host as *mut u32 as usize + 4 * i;
             while let Ok(seq) = rx.recv() {
                 for &il in &moe_layers {
@@ -93,6 +96,14 @@ impl CpuWorker {
                     // uncached read (~130 us for one activation).
                     let mut v = vec![0u32; (3 * kt).next_multiple_of(4)];
                     unsafe { read_wc(at(IDS), &mut v) };
+                    let missed: Vec<usize> = (0..kt).filter(|&j| (v[2 * kt + j] as i32) < 0).map(|j| v[j] as usize).collect();
+                    if !missed.is_empty() {
+                        // Gate and up first: they are read first.
+                        pre.send(["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"].iter()
+                            .filter_map(|s| m.w.layer(il, s).ok())
+                            .flat_map(|t| missed.iter().map(move |&e| { let d = t.expert(e, m.cfg.n_expert).data; (d.as_ptr() as usize, d.len()) }).collect::<Vec<_>>())
+                            .collect());
+                    }
                     for t in 0..nt {
                         let sel: Vec<(usize, f32)> = (t * k..(t + 1) * k).filter(|&j| (v[2 * kt + j] as i32) < 0)
                             .map(|j| (v[j] as usize, f32::from_bits(v[kt + j]))).collect();
