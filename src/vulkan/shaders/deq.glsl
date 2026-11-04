@@ -218,6 +218,14 @@ void qw(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out float
         lo = apply_signs(g0, sg & 15); hi = apply_signs(g1, sg >> 4);
         return;
     }
+    if (T == 42) {  // Q2_0 as QI<42>: the 8 codes spread to bytes, minus 1 per byte (code 0 wraps to -1)
+        uint p0 = b + 18 * (sub >> 3), q = ld16(w, p0 + 2 + 2 * (sub & 7)), c = q >> 8;
+        d = ldh(w, p0); m = 0.0;
+        q = (q & 3) | ((q << 6) & 0x300) | ((q << 12) & 0x30000) | ((q << 18) & 0x3000000);
+        c = (c & 3) | ((c << 6) & 0x300) | ((c << 12) & 0x30000) | ((c << 18) & 0x3000000);
+        lo = vsub4(q, 0x01010101u); hi = vsub4(c, 0x01010101u);
+        return;
+    }
     int q[8];
     qi8(w, b, sub, q, d, m);
     lo = pack4(q[0], q[1], q[2], q[3]); hi = pack4(q[4], q[5], q[6], q[7]);
