@@ -200,3 +200,12 @@ fn lists_models_once_per_split() {
     std::fs::remove_dir_all(&d).unwrap();
     assert_eq!(l, [("a.gguf".into(), "a.gguf".into(), 3), ("org/repo/big-00001-of-00002.gguf".into(), "org/repo/big-00001-of-00002.gguf".into(), 12)]);
 }
+
+#[test]
+fn download_names_stay_in_the_models_folder() {
+    use rusting_strata::hf::local_name;
+    assert_eq!(local_name("Q4_K_M/m-00001-of-00002.gguf"), Some("m-00001-of-00002.gguf"));
+    for bad in ["a/..\\..\\x.gguf", "C:x.gguf", "x.gguf:s.gguf", ".gguf", "a\nb.gguf", "x.bin", "dir/"] {
+        assert_eq!(local_name(bad), None, "{bad:?}");
+    }
+}
