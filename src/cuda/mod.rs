@@ -47,9 +47,12 @@ pub struct Gpu {
     ring: std::sync::Mutex<(PinnedHostSlice<u8>, usize, VecDeque<(usize, usize, CudaEvent)>)>,
     /// Recorded by `wait`.
     done: CudaEvent,
+    /// The side stream after the last `beside`'s copies; the next `beside` makes the stream wait for it.
+    lag: std::sync::Mutex<Option<CudaEvent>>,
 }
 
 const RING: usize = 64 << 20;
+
 /// Smaller copies take the driver's pageable path (staged before the call returns).
 const RING_MIN: usize = 256 << 10;
 /// `nb` inside `beside`: launches stay on the main stream, copies go to the side stream.
@@ -195,7 +198,7 @@ impl Gpu {
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = ctx.new_event(None)?;
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_q8, am, graphs: Default::default(), ring, done })
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_q8, am, graphs: Default::default(), ring, done, lag: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -424,8 +427,14 @@ impl Backend for Gpu {
         self.nb.store(BESIDE, Relaxed);
         let r = f();
         self.nb.store(usize::MAX, Relaxed);
-        self.stream.join(&self.side)?;
+        let e = self.side.record_event(None)?;
+        if let Some(p) = self.lag.lock().unwrap().replace(e) { self.stream.wait(&p)?; }
         r
+    }
+
+    fn beside_join(&self) -> anyhow::Result<()> {
+        self.lag.lock().unwrap().take();
+        Ok(self.stream.join(&self.side)?)
     }
 
     /// CUDA graph captured from the stream. `STRATA_NO_GRAPH` runs `f` every time instead.
