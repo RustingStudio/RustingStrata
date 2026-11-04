@@ -96,19 +96,32 @@ impl GpuModel<'_> {
 
     /// A fresh sequence: `prefill(tokens)` from position 0, reusing earlier work. The state after `tokens[..keep]` is
     /// saved; when the saved tokens are a prefix of the next call's `tokens[..keep]`, that call starts from them
-    /// (KV past them is rewritten, the recurrent state is copied back). Returns the logits and the tokens reused.
-    pub fn prefill_cached(&mut self, tokens: &[u32], keep: usize) -> anyhow::Result<(Vec<f32>, usize)> {
-        anyhow::ensure!(keep < tokens.len(), "prefill_cached: keep {keep} of {} tokens", tokens.len());
+    /// (KV past them is rewritten, the recurrent state is copied back). The state after `tokens[..sys]` (the system
+    /// prompt, `sys <= keep`) is stashed in host memory: a call whose history does not extend the saved one but
+    /// starts with the same system prompt starts from there. Returns the logits and the tokens reused.
+    pub fn prefill_cached(&mut self, tokens: &[u32], sys: usize, keep: usize) -> anyhow::Result<(Vec<f32>, usize)> {
+        anyhow::ensure!(sys <= keep && keep < tokens.len(), "prefill_cached: sys {sys}, keep {keep} of {} tokens", tokens.len());
         let hit = self.saved_ids.len();
-        let reused = if hit > 0 && tokens[..keep].starts_with(&self.saved_ids) {
+        let stashed = self.sys.as_ref().map_or(0, |s| if tokens[..keep].starts_with(&s.3) { s.3.len() } else { 0 });
+        let reused = if hit > 0 && hit >= stashed && tokens[..keep].starts_with(&self.saved_ids) {
             self.restore_state()?;
             hit
+        } else if stashed > 0 {
+            self.unstash()?;
+            stashed
         } else {
             self.reset()?;
             0
         };
-        if keep > reused {
-            self.prefill(&tokens[reused..keep])?;
+        // The stash stays valid while its KV entries do: this prompt rewrites them only past `reused`.
+        if stashed == 0 && self.sys.as_ref().is_some_and(|s| reused < s.3.len()) { self.sys = None; }
+        if sys > reused {
+            self.prefill(&tokens[reused..sys])?;
+            self.stash(&tokens[..sys])?;
+        }
+        let from = reused.max(sys);
+        if keep > from {
+            self.prefill(&tokens[from..keep])?;
             self.save_state()?;
             self.saved_ids = tokens[..keep].to_vec();
         }
