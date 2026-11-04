@@ -158,6 +158,17 @@ impl GpuModel<'_> {
         // The draft head runs as one more layer on the chunk while it is in step with the main model.
         let fill = self.mtp_synced();
         let mtp = self.mtp.as_ref().filter(|_| fill);
+        // STRATA_NAN_TRACE: after each layer's mixer and FFN, print the hidden state's largest magnitude and first
+        // non-finite token. It waits for the GPU each time: diagnostic runs only.
+        let trace = std::env::var_os("STRATA_NAN_TRACE").is_some();
+        let nan_trace = |il: usize, what: &str, t: usize| -> anyhow::Result<()> {
+            if !trace { return Ok(()); }
+            let v: Vec<f32> = g.get(&pf.slab, 0, t * d)?;
+            let max = v.iter().filter(|a| a.is_finite()).fold(0f32, |m, a| m.max(a.abs()));
+            let bad = v.iter().position(|a| !a.is_finite()).map(|i| i / d);
+            eprintln!("nan-trace pos {} layer {il} {what}: max |x| {max:.3e}, first non-finite token {bad:?}", self.pos);
+            Ok(())
+        };
         for (il, ly) in self.layers.iter().enumerate().chain(mtp.map(|mh| (c.n_layer, &mh.layer))) {
             if let Some(mh) = mtp.filter(|_| il == c.n_layer) {
                 // Its entry for token i pairs the token with the hidden state before it (`mtp_run`): h gets the last
@@ -216,6 +227,7 @@ impl GpuModel<'_> {
                     g.gemm_dense(o, t, at(l.d), nh * hd, mx, ne, mact)?;
                 }
             }
+            nan_trace(il, "mixer", t)?;
             match (&ly.post_norm, &ly.hc) {
                 (Some(pn), _) => g.rms_norm(x, ne, pn.ptr, h, ne, ne, t, eps)?,
                 (None, Some(hr)) => {
@@ -371,6 +383,7 @@ impl GpuModel<'_> {
                     if ly.hc.is_some() { g.hc_write(x, fx, at(l.inj), ne, c.hc_n, t, true)?; }
                 }
             }
+            nan_trace(il, "ffn", t)?;
             g.kick()?;
         }
         match self.mtp.as_mut() {
