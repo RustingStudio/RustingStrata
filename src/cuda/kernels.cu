@@ -760,17 +760,21 @@ __device__ __forceinline__ u32 h2pack(float a, float b) { return (u32)f2h(a) | (
 // act: 0 = store, 1 = y = silu(y) * result (SwiGLU over a gate already in y), 2 = y += result.
 // tiles = null: one dense matrix wd over positions 0 .. nd, tile blockIdx.y = positions BM * blockIdx.y ...
 // BM positions x 64 rows per block, K in steps of BK; warps form a (BM / 32) x 2 grid, each owning 32 x 32 outputs.
-template <int T, int SBB, int BM, int BK>
+// SM (gemms_*, tile lists only): the tiles of at most 32 positions (most expert tiles), which the SM = false kernel
+// skips; their 32 x 64 outputs go 16 x 16 per warp (positions wm, rows wn, in acc[0][0..1]). Each output sums the
+// same products in the same order either way. (A runtime branch in one kernel costs the big tiles a third.)
+template <int T, int SBB, int BM, int BK, bool SM>
 __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int nd, const float* __restrict__ x, int x_stride,
                                        const int* xrow, float* y, int y_stride, int rows, int n64, int act) {
-    constexpr int P = BK + 8, NT = BM * 2, SUBS = BK / 8;  // smem pitch in halves (padding: conflict-free fragments)
-    __shared__ __align__(16) u16 xs[BM * P], ws[64 * P];
+    constexpr int P = BK + 8, NT = BM * 2, SUBS = BK / 8, XM = SM ? 32 : BM;  // smem pitch in halves (padding: conflict-free fragments)
+    __shared__ __align__(16) u16 xs[XM * P], ws[64 * P];
     GemmTile tl = tiles ? tiles[blockIdx.y] : GemmTile{wd, (int)blockIdx.y * BM, min(BM, nd - (int)blockIdx.y * BM)};
+    if (tiles && (tl.cnt <= 32) != SM) return;
     int n0 = blockIdx.x * 64, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
-    int wm = (warp >> 1) * 32, wn = (warp & 1) * 32;
-    const float* xr[BM * BK / 4 / NT];  // row pointers of the X elements this thread loads (null past cnt)
+    int wm = SM ? 16 * (warp & 1) : (warp >> 1) * 32, wn = SM ? 16 * (warp >> 1) : (warp & 1) * 32;
+    const float* xr[XM * BK / 4 / NT];  // row pointers of the X elements this thread loads (null past cnt)
     #pragma unroll
-    for (int q = 0; q < BM * BK / 4 / NT; q++) {
+    for (int q = 0; q < XM * BK / 4 / NT; q++) {
         int r = (tid + q * NT) / (BK / 4);
         xr[q] = r < tl.cnt ? x + (size_t)(xrow ? xrow[tl.m0 + r] : tl.m0 + r) * x_stride : nullptr;
     }
@@ -805,7 +809,7 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
     stw();
     for (int kb = 0; kb < nk; kb++) {
         #pragma unroll
-        for (int q = 0; q < BM * BK / 4 / NT; q++) {
+        for (int q = 0; q < XM * BK / 4 / NT; q++) {
             int i = tid + q * NT, r = i / (BK / 4), c = (i % (BK / 4)) * 4;
             float4 v = xr[q] ? *(const float4*)(xr[q] + kb * BK + c) : make_float4(0.f, 0.f, 0.f, 0.f);
             *(uint2*)(xs + r * P + c) = make_uint2(h2pack(v.x, v.y), h2pack(v.z, v.w));
@@ -816,29 +820,30 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
         if (wm < tl.cnt)
 #pragma unroll
         for (int kk = 0; kk < BK; kk += 16) {
+            constexpr int MT = SM ? 1 : 2, NT8 = SM ? 2 : 4;
             u32 a[2][4], b[4][2];
             #pragma unroll
-            for (int mt = 0; mt < 2; mt++) {
+            for (int mt = 0; mt < MT; mt++) {
                 const u16* p = xs + (wm + mt * 16 + g) * P + kk + 2 * t;
                 a[mt][0] = ld_s32(p); a[mt][1] = ld_s32(p + 8 * P); a[mt][2] = ld_s32(p + 8); a[mt][3] = ld_s32(p + 8 * P + 8);
             }
             #pragma unroll
-            for (int nt = 0; nt < 4; nt++) {
+            for (int nt = 0; nt < NT8; nt++) {
                 const u16* p = ws + (wn + nt * 8 + g) * P + kk + 2 * t;
                 b[nt][0] = ld_s32(p); b[nt][1] = ld_s32(p + 8);
             }
             #pragma unroll
-            for (int mt = 0; mt < 2; mt++)
+            for (int mt = 0; mt < MT; mt++)
                 #pragma unroll
-                for (int nt = 0; nt < 4; nt++) mma16816(acc[mt][nt], a[mt][0], a[mt][1], a[mt][2], a[mt][3], b[nt][0], b[nt][1]);
+                for (int nt = 0; nt < NT8; nt++) mma16816(acc[mt][nt], a[mt][0], a[mt][1], a[mt][2], a[mt][3], b[nt][0], b[nt][1]);
         }
         __syncthreads();
         if (kb + 1 < nk) stw();
     }
     #pragma unroll
-    for (int mt = 0; mt < 2; mt++)
+    for (int mt = 0; mt < (SM ? 1 : 2); mt++)
         #pragma unroll
-        for (int nt = 0; nt < 4; nt++)
+        for (int nt = 0; nt < (SM ? 2 : 4); nt++)
             #pragma unroll
             for (int h = 0; h < 2; h++) {
                 int r = wm + mt * 16 + g + 8 * h, n = n0 + wn + nt * 8 + 2 * t;
@@ -860,7 +865,11 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
 #define DEF_GEMM(T, NAME, SBB)                                                                                    \
     extern "C" __global__ void __launch_bounds__(GEMM_BM * 2) gemm_##NAME(const GemmTile* tiles, const u8* wd, int nd, \
             const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act) {  \
-        gemm_q<T, SBB, GEMM_BM, GEMM_BK>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act);       \
+        gemm_q<T, SBB, GEMM_BM, GEMM_BK, false>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act); \
+    }                                                                                                             \
+    extern "C" __global__ void __launch_bounds__(GEMM_BM * 2) gemms_##NAME(const GemmTile* tiles, const u8* wd, int nd, \
+            const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act) {  \
+        gemm_q<T, SBB, GEMM_BM, GEMM_BK, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act); \
     }
 QTYPES(DEF_GEMM)
 

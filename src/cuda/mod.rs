@@ -177,7 +177,7 @@ impl Gpu {
         let module = ctx.load_module(ptx(&source(kv_q8), arch)?).context("load cubin")?;
         let mut fns = HashMap::new();
         let names = KERNELS.iter().map(|s| s.to_string())
-            .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm"].map(|p| kname(p, t))))
+            .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm", "gemms"].map(|p| kname(p, t))))
             .chain(QTYPES.iter().flat_map(|&t| ["gemv", "gemvn", "moe_gemv"].map(|p| kname(p, t) + "_p")))
             .chain(QTYPES.iter().filter(|&&t| !Self::float_ty(t)).map(|&t| kname("gemmi", t)))
             .chain([64, 128, 256, 512].iter().flat_map(|h| [format!("attn_decode_{h}"), format!("attn_decode_gqa_{h}")]));
@@ -239,6 +239,11 @@ impl Gpu {
             if !same { q8.1 = None; }
             launch!(self, &kname("gemm", ty), cfg(grid, 2 * GEMM_BM as u32, 0),
                 tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act);
+            // Tile lists: gemm_* skips the tiles of at most 32 positions, which gemms_* takes.
+            if tiles != 0 {
+                launch!(self, &kname("gemms", ty), cfg(grid, 2 * GEMM_BM as u32, 0),
+                    tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act);
+            }
             return Ok(());
         }
         let need = n_x * (cols + cols / 8 + cols / 4);
