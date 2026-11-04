@@ -787,7 +787,7 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
             float v[8] = {};
             const u8* blk = tl.w + (size_t)(n0 + r) * ROWB(n64 * 64, SBB) + (size_t)sb * SBB;
             if (n0 + r >= rows) {
-            } else if constexpr (T == 17 || T == 18) {  // QS tables; same values as deq8: d times the signed grid bytes
+            } else if constexpr (T == 17 || T == 18 || T == 21 || T == 22) {  // QS tables; same values as deq8: d times the signed grid bytes
                 int lo, hi; float d, m;
                 QS<T>::get(blk, part * SUBS + j, lo, hi, d, m);
                 for (int e = 0; e < 4; e++) v[e] = d * (float)(signed char)(lo >> 8 * e), v[4 + e] = d * (float)(signed char)(hi >> 8 * e);
@@ -800,7 +800,7 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
         for (int q = 0; q < WQ; q++) { int i = tid + q * NT; *(uint4*)(ws + (i / SUBS) * P + (i % SUBS) * 8) = wv[q]; }
     };
     const int nk = n64 * 64 / BK;
-    if constexpr (T == 17 || T == 18) { QS<T>::load(); __syncthreads(); }
+    if constexpr (T == 17 || T == 18 || T == 21 || T == 22) { QS<T>::load(); __syncthreads(); }
     ldw(0);
     stw();
     for (int kb = 0; kb < nk; kb++) {
