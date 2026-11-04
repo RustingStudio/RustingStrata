@@ -8,7 +8,7 @@ use crate::expert_cache::MATS;
 use crate::model::Model;
 use crate::weights::Prefetch;
 
-/// Experts staged per group when a layer routes to experts outside the cache. Staging holds two groups.
+/// Experts staged per group when a layer routes to experts outside the cache. Staging holds three groups.
 const STAGE: usize = 16;
 
 /// Float offsets into the scratch slab (each region holds `chunk` rows). Mixer and FFN regions alias, and so do the
@@ -64,7 +64,7 @@ impl Scratch {
         Ok(Scratch {
             chunk, lay: Lay { h, a, b, c: c2, d, e, rl, wts, ge, ye, shg, shy, sg, xn, lo, hg, pk, pq, pg, pn, pv, inj, mix, mo, emb },
             slab: gpu.zeros::<f32>(total)?, ints: gpu.zeros::<i32>(3 * chunk * k)?, tiles: gpu.zeros::<u64>(2 * n_tiles)?,
-            staging: gpu.zeros::<u8>(if c.is_moe() { 2 * STAGE * stage_bytes } else { 0 })?,
+            staging: gpu.zeros::<u8>(if c.is_moe() { 3 * STAGE * stage_bytes } else { 0 })?,
         })
     }
 
@@ -273,18 +273,19 @@ impl GpuModel<'_> {
                         pre.send(missed.chunks(STAGE).flat_map(|grp| w.iter().zip(&lx.mats).flat_map(move |(w, mat)| grp.chunk_by(|a, b| *b == a + 1)
                             .map(move |run| (w.data.as_ptr() as usize + run[0] * mat.bytes, run.len() * mat.bytes)))).collect());
                     }
-                    // Staged groups of at most STAGE missed experts, group j in staging half j % 2. Staging holds
+                    // Staged groups of at most STAGE missed experts, group j in staging third j % 3. Staging holds
                     // each matrix in its own section (all gates, then ups, then downs), so experts with consecutive
                     // ids are contiguous there as in the weights and copy in one call.
                     let sp = pf.staging.addr();
-                    let half = |j: usize| j % 2 * pf.staging.len() / 2;
+                    let half = |j: usize| j % 3 * pf.staging.len() / 3;
                     let staged: Vec<Vec<(usize, [u64; 3])>> = missed.chunks(STAGE).enumerate()
                         .map(|(j, grp)| grp.iter().enumerate().map(|(i, &e)| (e, lx.mats.each_ref().map(|m| sp + (half(j) + STAGE * m.off + i * m.bytes) as u64))).collect())
                         .collect();
                     // The resident experts split into one chunk per staged group, of about equal positions, so the
-                    // copies run beside them too: step 0 runs chunk 0 beside the copy of group 0, step j runs group
-                    // j - 1 and chunk j beside the copy of group j (into the half group j - 2 used, done in step j - 1).
-                    // Without overlap (Vulkan) one chunk: more, smaller GEMMs only cost there.
+                    // copies run beside them too: step s runs group s - 2 and chunk s beside the copy of group s
+                    // (into the third group s - 3 used, done in step s - 1). A step waits only for the copies of the
+                    // step two before it (`beside`), so each copy has two steps of GEMMs to hide behind.
+                    // Without overlap (Vulkan without a transfer queue) one chunk: more, smaller GEMMs only cost there.
                     let ns = if g.beside_overlaps() { staged.len().max(1) } else { 1 };
                     let res: Vec<(usize, [u64; 3])> = (0..c.n_expert).filter(used)
                         .filter_map(|e| { let s = cache.slot(il, e); (s >= 0).then(|| (e, lx.mats.each_ref().map(|m| pool + (s as usize * stride + m.off) as u64))) }).collect();
@@ -296,33 +297,37 @@ impl GpuModel<'_> {
                         acc += off[r.0 + 1] - off[r.0];
                     }
                     let mut chunks = chunks.into_iter();
-                    let mut groups = vec![chunks.next().unwrap()];
+                    let mut groups = vec![];
                     // Per step: its groups and the staged group it copies.
-                    let mut steps = vec![(0..1, (!staged.is_empty()).then_some(0))];
-                    for (j, grp) in staged.iter().enumerate() {
+                    let mut steps = vec![];
+                    for s in 0..staged.len() + 2 {
                         let g0 = groups.len();
-                        groups.push(grp.clone());
+                        groups.extend(s.checked_sub(2).and_then(|j| staged.get(j)).cloned());
                         groups.extend(chunks.next());
-                        steps.push((g0..groups.len(), (j + 1 < staged.len()).then_some(j + 1)));
+                        steps.push((g0..groups.len(), (s < staged.len()).then_some(s)));
                     }
                     let mut tiles = Vec::new();
-                    // Per group: [(start, count); 3] and the slot rows its experts cover. The down GEMM reads rows
-                    // lo..hi of `ge` only, so its tiles count from lo and it quantizes just those rows.
-                    let mut spans = Vec::new();
-                    for grp in &groups {
-                        let (mut sp, lo, hi) = ([(0, 0); 3], grp.first().map_or(0, |g| off[g.0]), grp.last().map_or(0, |g| off[g.0 + 1]));
-                        for mi in 0..3 {
-                            let start = tiles.len() / 2;
-                            let base = if mi == 2 { lo } else { 0 };
-                            for &(e, w) in grp {
-                                for m0 in (off[e]..off[e + 1]).step_by(GEMM_BM) {
-                                    let cnt = GEMM_BM.min(off[e + 1] - m0);
-                                    tiles.extend([w[mi], (m0 - base) as u64 | (cnt as u64) << 32]);
-                                }
+                    let push = |tiles: &mut Vec<u64>, grp: &[(usize, [u64; 3])], mi: usize, base: usize| {
+                        let start = tiles.len() / 2;
+                        for &(e, w) in grp {
+                            for m0 in (off[e]..off[e + 1]).step_by(GEMM_BM) {
+                                tiles.extend([w[mi], (m0 - base) as u64 | (GEMM_BM.min(off[e + 1] - m0) as u64) << 32]);
                             }
-                            sp[mi] = (start, tiles.len() / 2 - start);
                         }
-                        spans.push((sp, lo, hi));
+                        (start, tiles.len() / 2 - start)
+                    };
+                    // Per step: the gate and up tiles of all its groups (one launch each: more blocks, less tail), then
+                    // per group its down tiles and the slot rows lo..hi it covers. The down GEMM reads rows lo..hi of
+                    // `ge` only, so its tiles count from lo and it quantizes just those rows.
+                    let mut spans = Vec::new();
+                    for (gs, _) in &steps {
+                        let gu = [0, 1].map(|mi| { let s = tiles.len() / 2; for gi in gs.clone() { push(&mut tiles, &groups[gi], mi, 0); } (s, tiles.len() / 2 - s) });
+                        let downs: Vec<_> = gs.clone().filter(|&gi| !groups[gi].is_empty()).map(|gi| {
+                            let grp = &groups[gi];
+                            let (lo, hi) = (off[grp[0].0], off[grp[grp.len() - 1].0 + 1]);
+                            (push(&mut tiles, grp, 2, lo), lo, hi)
+                        }).collect();
+                        spans.push((gu, downs));
                     }
                     anyhow::ensure!(8 * tiles.len() <= pf.tiles.len(), "prefill tile list overflow");
                     g.put(&tiles, &pf.tiles, 0)?;
@@ -344,18 +349,20 @@ impl GpuModel<'_> {
                     };
                     // `beside` starts a step's copies after the GEMMs before it. They queue last, so the GEMMs need not
                     // wait for the host to stage them.
-                    for (gs, cp) in &steps {
+                    for ((_, cp), (gu, downs)) in steps.iter().zip(&spans) {
                         g.beside(&mut || {
-                            for gi in gs.clone().filter(|&gi| !groups[gi].is_empty()) {
-                                let (sp, lo, hi) = spans[gi];
-                                g.gemm(mg.ty, mg.rows, mg.cols, tp(sp[0].0), sp[0].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, SAME_X)?;
-                                g.gemm(mu.ty, mu.rows, mu.cols, tp(sp[1].0), sp[1].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X)?;
-                                g.gemm(md.ty, md.rows, md.cols, tp(sp[2].0), sp[2].1, at(l.ge) + (4 * lo * c.n_ff_exp) as u64, c.n_ff_exp, hi - lo, 0, at(l.ye) + (4 * lo * ne) as u64, ne, 0)?;
+                            if gu[0].1 > 0 {
+                                g.gemm(mg.ty, mg.rows, mg.cols, tp(gu[0].0), gu[0].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, SAME_X)?;
+                                g.gemm(mu.ty, mu.rows, mu.cols, tp(gu[1].0), gu[1].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X)?;
+                            }
+                            for &((s0, n0), lo, hi) in downs {
+                                g.gemm(md.ty, md.rows, md.cols, tp(s0), n0, at(l.ge) + (4 * lo * c.n_ff_exp) as u64, c.n_ff_exp, hi - lo, 0, at(l.ye) + (4 * lo * ne) as u64, ne, 0)?;
                             }
                             if let Some(j) = *cp { copy(j)?; }
                             Ok(())
                         })?;
                     }
+                    g.beside_join()?;
                     // The shared down runs last, so the routed gate and up above reuse the int8 h of the shared up.
                     if let Some(s) = shared { g.gemm_dense(&s.down, t, at(l.shg), c.n_ff_shexp, at(l.shy), ne, 0)?; }
                     // "mo" is zero: hc_write clears it after use.

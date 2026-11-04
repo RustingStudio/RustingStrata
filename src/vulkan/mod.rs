@@ -188,6 +188,8 @@ struct State {
     tval: u64,
     bwait: u64,
     twait: u64,
+    /// `tval` after the last `beside`: the compute submit after the next `beside` waits for it.
+    tlag: u64,
     pipes: HashMap<(&'static str, Vec<u32>), vk::Pipeline>,
     fence: vk::Fence,
     staging: (vk::Buffer, vk::DeviceMemory),
@@ -370,7 +372,7 @@ impl Vk {
         let pc = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(128)];
         let layout = unsafe { dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc), None) }?;
         let st = State { pool, spare: vec![], used: vec![], cur: None, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false, beside: false, tpool, tcur: None,
-            tspare: vec![], tused: vec![], tbytes: 0, tstart: 0, tring: Default::default(), cstaged: false, cval: 0, tval: 0, bwait: 0, twait: 0,
+            tspare: vec![], tused: vec![], tbytes: 0, tstart: 0, tring: Default::default(), cstaged: false, cval: 0, tval: 0, bwait: 0, twait: 0, tlag: 0,
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
         let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, coop, coop_i8, amd_coherent, amd_plain, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
@@ -854,7 +856,7 @@ impl Backend for Vk {
     }
     fn beside_overlaps(&self) -> bool { self.0.tq.is_some() }
     /// With a transfer queue: the work so far is submitted, the copies of `f` go to the transfer queue after it, and
-    /// `f`'s dispatches are submitted without waiting for them; the next compute submit waits for the copies.
+    /// `f`'s dispatches are submitted without waiting for them; the compute submit after the next `beside` waits for them.
     fn beside(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
         if self.0.tq.is_none() { return f(); }
         {
@@ -869,8 +871,16 @@ impl Backend for Vk {
         st.beside = false;
         self.0.tsubmit(&mut st)?;
         self.0.submit(&mut st, None, false)?;
-        st.twait = st.tval;
+        let tv = st.tval;
+        st.twait = std::mem::replace(&mut st.tlag, tv);
         r
+    }
+    fn beside_join(&self) -> anyhow::Result<()> {
+        if self.0.tq.is_none() { return Ok(()); }
+        let mut st = self.0.st();
+        st.twait = st.tval;
+        st.tlag = 0;
+        Ok(())
     }
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
         let mut st = self.0.st();
