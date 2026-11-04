@@ -319,6 +319,7 @@ impl Vk {
             unsafe { instance.destroy_instance(None) };
             return Err(anyhow!("no usable Vulkan device {device} ({} usable; {})", usable.len(), why.join("; "))).context("Vulkan init");
         };
+        eprintln!("vulkan device {device}: {name}");
         // ponytail: the instance leaks if device setup below fails; it is a one-time startup error.
         let qf = unsafe { instance.get_physical_device_queue_family_properties(pd) }.iter()
             .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE)).context("no compute queue")? as u32;
