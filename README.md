@@ -1,7 +1,7 @@
 # RustingStrata
 
 A pure-Rust inference engine for the Qwen3.5/3.6 hybrid model family (`qwen35moe`, `qwen35`) in GGUF; Qwen3-Next
-(`qwen3next`) and Qwen3 (`qwen3`, `qwen3moe`) also run. CUDA kernels are compiled at run time with NVRTC through
+(`qwen3next`), Qwen3.8-Flash-Next (`qwen4exp`) and Qwen3 (`qwen3`, `qwen3moe`) also run. CUDA kernels are compiled at run time with NVRTC through
 cudarc (cached as a cubin), and the same kernels also run on Vulkan (`--backend vulkan`, GLSL compiled to SPIR-V and
 committed): no C++ build step, no ggml. Experts that do not fit in VRAM run on the CPU at the same time as the GPU
 work, and the expert placement adapts to the routing it sees.
@@ -47,8 +47,9 @@ Other models, greedy "The capital of France is" with `--gpu` (CUDA / Vulkan, sec
 | Qwen3.8-27B UD-IQ3_XXS (dense, 10.8 GB on GPU) | IQ1_S to IQ4_XS, Q2_K to Q8_0 | 20.6 / 20.5 tok/s |
 | Qwen3.6-35B-A3B UD-IQ4_XS (57% of experts fit in VRAM) | IQ3_S, IQ4_XS, Q6_K, Q8_0 | 94 / 96 tok/s |
 | Qwen3-Next-80B-A3B-Instruct UD-IQ1_S (most experts on the CPU) | IQ1_S to IQ4_NL, Q4_K to Q8_0, BF16 | 92 / 90 tok/s |
+| Qwen3.8-Flash-Next GSQ-RCO IQ2_XS (64 GB in two files, pass the `-00001-of-00002` one; 18% of experts fit in VRAM, and with 32 GB RAM the rest are partly read from disk) | Q2_0, IQ1_M to IQ4_XS, Q6_K, Q8_0, F16, BF16 | 22 / 20 tok/s |
 
-Supported GGUF types: F32, BF16, Q8_0, Q2_K-Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
+Supported GGUF types: F32, F16, BF16, Q8_0, Q2_0, Q2_K-Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
 IQ4_NL.
 
 ## Build
