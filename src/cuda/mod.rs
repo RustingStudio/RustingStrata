@@ -176,6 +176,7 @@ impl Gpu {
         }
         let ctx = CudaContext::new(device).context("CUDA init")?;
         unsafe { ctx.disable_event_tracking() };
+        eprintln!("cuda device {device}: {}", ctx.name().unwrap_or_default());
         let stream = ctx.new_stream()?;
         let (maj, min) = ctx.compute_capability()?;
         let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
