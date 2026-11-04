@@ -84,13 +84,16 @@ impl Runner<'_> {
         }
     }
     /// Feed a chat prompt as a fresh sequence, reusing the earlier request's state for the shared message history
-    /// (GPU; `history` is the prompt without the assistant header). Returns the logits and the number of tokens reused.
-    fn chat(&mut self, tok: &Tokenizer, prompt: &str, history: &str) -> anyhow::Result<(Vec<u32>, Vec<f32>, usize)> {
+    /// (GPU; `history` is the prompt without the assistant header, `system` its system and tools block, kept for
+    /// later requests that rewrite the history). Returns the logits and the number of tokens reused.
+    fn chat(&mut self, tok: &Tokenizer, prompt: &str, history: &str, system: &str) -> anyhow::Result<(Vec<u32>, Vec<f32>, usize)> {
         let ids = tok.encode(prompt)?;
         let h = tok.encode(history)?;
         let keep = if ids.starts_with(&h) { h.len() } else { 0 };
+        let s = if system.is_empty() { vec![] } else { tok.encode(system)? };
+        let sys = if ids.starts_with(&s) && s.len() <= keep { s.len() } else { 0 };
         let (logits, reused) = match self {
-            Runner::Gpu(g) => g.prefill_cached(&ids, keep)?,
+            Runner::Gpu(g) => g.prefill_cached(&ids, sys, keep)?,
             _ => { self.reset()?; (self.prefill(&ids)?, 0) }
         };
         Ok((ids, logits, reused))
@@ -194,7 +197,8 @@ enum Cmd {
     },
     /// OpenAI-compatible HTTP server: POST /v1/chat/completions (streaming or not), GET /v1/models.
     /// One request at a time; temperature, top_k, top_p and seed are honored, greedy when left out. A request that
-    /// extends the previous one's messages prefills only the new part (usage.prompt_tokens_details.cached_tokens).
+    /// extends the previous one's messages prefills only the new part (usage.prompt_tokens_details.cached_tokens);
+    /// one that keeps only the system prompt and tools (a compacted conversation) starts after them.
     Serve {
         #[arg(long)]
         model: PathBuf,
@@ -369,7 +373,7 @@ fn main() -> anyhow::Result<()> {
                 if stdin.lock().read_line(&mut line)? == 0 { break; }
                 if line.trim().is_empty() { continue; }
                 msgs.push(Msg::new("user", line.trim_end()));
-                let (ids, logits, _) = r.chat(&tok, &tpl.render(&msgs, &[], think, true), &tpl.render(&msgs, &[], think, false))?;
+                let (ids, logits, _) = r.chat(&tok, &tpl.render(&msgs, &[], think, true), &tpl.render(&msgs, &[], think, false), "")?;
                 let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut smp, logits, room(&engine, ids.len(), n), &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
                 println!();
                 msgs.push(Msg::new("assistant", &answer(&tok.decode(&out)?)));
@@ -580,6 +584,9 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, r: &mut Runner, t
             };
             // Room is checked on the full prompt before any state changes.
             let prompt = tpl.render(&req.messages, &req.tools, req.think, true);
+            // The system and tools block, which compacted or rewritten conversations keep.
+            let n_sys = req.messages.iter().take_while(|m| m.role == "system").count();
+            let system = tpl.render(&req.messages[..n_sys], &req.tools, req.think, false);
             let ids = tok.encode(&prompt)?;
             let mut smp = e.sampler();
             smp.temp = req.temperature.unwrap_or(smp.temp);
@@ -597,7 +604,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, r: &mut Runner, t
             let mut hold = Hold::new(tools, req.stop);
             let res = (|| -> anyhow::Result<(Vec<u32>, bool)> {
                 let logits;
-                (_, logits, cached) = r.chat(tok, &prompt, &tpl.render(&req.messages, &req.tools, req.think, false))?;
+                (_, logits, cached) = r.chat(tok, &prompt, &tpl.render(&req.messages, &req.tools, req.think, false), &system)?;
                 if req.stream {
                     write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
                     write!(w, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), None))?;

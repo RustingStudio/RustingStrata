@@ -95,6 +95,10 @@ pub struct GpuModel<'a> {
     saved_pos: usize,
     /// The tokens behind the saved state when `prefill_cached` saved it (else empty).
     saved_ids: Vec<u32>,
+    /// Host copy of the saved state at the end of the system prompt (`stash`): buffers, position, PLE tokens, the
+    /// tokens behind it. A request whose history no longer extends the saved one (a rewritten or compacted
+    /// conversation) restarts from it.
+    sys: Option<(Vec<Vec<u8>>, usize, [i64; 2], Vec<u32>)>,
     ctx: usize,
     pub pos: usize,
     pub cache: Option<ExpertCache>,
@@ -249,12 +253,13 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), k, short: 32, pf, mtp })
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], sys: None, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), k, short: 32, pf, mtp })
     }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
     pub fn reset(&mut self) -> anyhow::Result<()> {
         self.saved_ids.clear();
+        self.sys = None;
         if let Some(h) = self.mtp.as_mut() { h.pos = 0; h.pend.clear(); }
         for l in self.layers.iter().chain(self.mtp.as_ref().map(|h| &h.layer)) {
             match &l.mixer {
@@ -358,6 +363,31 @@ impl<'a> GpuModel<'a> {
         self.saved_pos = self.pos;
         self.saved_ids.clear();
         Ok(())
+    }
+
+    /// The buffers `save_state` fills.
+    fn slot(&self) -> Vec<&Buf> {
+        let mut v: Vec<&Buf> = self.saved.iter().flat_map(|(c, s)| [c, s]).collect();
+        v.extend(self.mtp.as_ref().map(|h| &h.saved_x));
+        v.extend(self.ple_ring.as_ref().map(|(_, sr)| sr));
+        v
+    }
+
+    /// `save_state`, and keep a host copy of it as the state after `ids` (the system prompt).
+    pub fn stash(&mut self, ids: &[u32]) -> anyhow::Result<()> {
+        self.save_state()?;
+        let data = self.slot().iter().map(|b| self.gpu.get::<u8>(b, 0, b.len())).collect::<anyhow::Result<_>>()?;
+        self.saved_ids = ids.to_vec();
+        self.sys = Some((data, self.saved_pos, self.saved_ple_prev, self.saved_ids.clone()));
+        Ok(())
+    }
+
+    /// Return to the state of the last `stash`, which also becomes the saved state.
+    pub fn unstash(&mut self) -> anyhow::Result<()> {
+        let s = self.sys.as_ref().ok_or_else(|| anyhow::anyhow!("unstash without stash"))?;
+        for (b, d) in self.slot().iter().zip(&s.0) { self.gpu.put(d, b, 0)?; }
+        (self.saved_pos, self.saved_ple_prev, self.saved_ids) = (s.1, s.2, s.3.clone());
+        self.restore_state()
     }
 
     /// Keep only the first `keep` tokens of the last `verify`, which started at position `start` (1 <= keep <= `k`):

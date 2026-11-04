@@ -258,18 +258,43 @@ fn prefill_cached_reuses_history() {
 
         let p1 = [&h1[..], &tail].concat();
         let want1 = fresh(&mut gm, &[&h1, &tail]);
-        let (got1, r1) = gm.prefill_cached(&p1, h1.len()).unwrap();
+        let (got1, r1) = gm.prefill_cached(&p1, 0, h1.len()).unwrap();
         assert_eq!((r1, &got1), (0, &want1));
         for t in [11u32, 22, 33] { gm.step(t).unwrap(); } // a reply that the next prompt does not contain
 
         let p2 = [&h2[..], &tail].concat();
-        let (got2, r2) = gm.prefill_cached(&p2, h2.len()).unwrap();
+        let (got2, r2) = gm.prefill_cached(&p2, 0, h2.len()).unwrap();
         assert_eq!(r2, h1.len());
         // A prompt that does not extend the saved history (now h2) starts over.
-        let (got3, r3) = gm.prefill_cached(&p1, h1.len()).unwrap();
+        let (got3, r3) = gm.prefill_cached(&p1, 0, h1.len()).unwrap();
         assert_eq!((r3, &got3), (0, &want1));
+        let want3 = want1.clone();
         let want2 = fresh(&mut gm, &[&h1, &h2[h1.len()..], &tail]);
         assert_eq!(got2, want2, "reused prefix");
+
+        // With a system prompt: a request whose history rewrites the earlier one (a compacted conversation) restarts
+        // from the state after the system prompt, also after decode steps and a history hit in between.
+        let sys = enc("<|im_start|>system\nYou are a geography tutor. Answer in two sentences.<|im_end|>\n");
+        let s1 = [&sys[..], &h1].concat();
+        let s2 = [&sys[..], &enc("<|im_start|>user\nSummary: we talked about rivers.<|im_end|>\n<|im_start|>user\nAnd lakes?<|im_end|>\n")].concat();
+        let q1 = [&s1[..], &tail].concat();
+        let q2 = [&s2[..], &tail].concat();
+        let want1 = fresh(&mut gm, &[&sys, &h1, &tail]);
+        let want2 = fresh(&mut gm, &[&sys, &s2[sys.len()..], &tail]);
+        let (got, r) = gm.prefill_cached(&q1, sys.len(), s1.len()).unwrap();
+        assert_eq!((r, &got), (0, &want1));
+        for t in [11u32, 22, 33] { gm.step(t).unwrap(); }
+        let (got, r) = gm.prefill_cached(&q2, sys.len(), s2.len()).unwrap();
+        assert_eq!((r, &got), (sys.len(), &want2), "restart after the system prompt");
+        let (got, r) = gm.prefill_cached(&q2, sys.len(), s2.len()).unwrap();
+        assert_eq!((r, &got), (s2.len(), &want2), "history hit");
+        let (got, r) = gm.prefill_cached(&q1, sys.len(), s1.len()).unwrap();
+        assert_eq!((r, &got), (sys.len(), &want1), "back to the first history");
+        // Another system prompt starts over and replaces the stash.
+        let (got, r) = gm.prefill_cached(&p1, 0, h1.len()).unwrap();
+        assert_eq!((r, &got), (0, &want3));
+        let (_, r) = gm.prefill_cached(&q2, sys.len(), s2.len()).unwrap();
+        assert_eq!(r, 0, "stash dropped once its KV was rewritten");
     }
 }
 
