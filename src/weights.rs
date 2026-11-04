@@ -1,4 +1,4 @@
-//! Named tensor views over the mmapped GGUF and a reference parallel matvec.
+//! Named tensor views over the mmapped GGUF, page cache advice for them, and a reference parallel matvec.
 
 use crate::config::ModelConfig;
 use crate::gguf::Gguf;
@@ -105,5 +105,52 @@ impl<'a> Weights<'a> {
             GgmlType::from_u32(t.ty).with_context(|| format!("tensor {}", t.name))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn madvise(p: usize, n: usize, advice: i32) {
+    unsafe extern "C" { fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32; }
+    unsafe { madvise(p as *mut _, n, advice) };
+}
+#[cfg(not(target_os = "linux"))]
+fn madvise(_: usize, _: usize, _: i32) {}
+
+/// Starts reading mapped bytes p..p + n into the page cache without waiting (MADV_WILLNEED).
+pub fn will_need(p: usize, n: usize) {
+    // One call reads at most one readahead window (read_ahead_kb, 128-256 KB on NVMe).
+    let (mut a, end) = (p & !4095, p + n);
+    while a < end {
+        let l = (end - a).min(256 << 10);
+        madvise(a, l, 3);
+        a += l;
+    }
+}
+
+/// Marks the whole pages of `b` first to reclaim (MADV_COLD): bytes now on the GPU. Expert files exceed the page
+/// cache, and pages read once at load would otherwise outlive the experts a prompt reads from it.
+pub fn cold(b: &[u8]) {
+    let (a, e) = ((b.as_ptr() as usize + 4095) & !4095, (b.as_ptr() as usize + b.len()) & !4095);
+    if e > a { madvise(a, e - a, 20); }
+}
+
+/// Reads ranges of mapped weights into the page cache from a background thread (`will_need`), in the order sent, so
+/// a cold read keeps many drive reads in flight instead of one page fault at a time. Dropping it joins the thread.
+pub struct Prefetch { tx: Option<std::sync::mpsc::Sender<Vec<(usize, usize)>>>, th: Option<std::thread::JoinHandle<()>> }
+
+impl Prefetch {
+    pub fn start() -> Prefetch {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<(usize, usize)>>();
+        let th = std::thread::spawn(move || for rs in rx { for (p, n) in rs { will_need(p, n); } });
+        Prefetch { tx: Some(tx), th: Some(th) }
+    }
+    /// (address, bytes) ranges of mapped weights.
+    pub fn send(&self, rs: Vec<(usize, usize)>) { let _ = self.tx.as_ref().unwrap().send(rs); }
+}
+
+impl Drop for Prefetch {
+    fn drop(&mut self) {
+        self.tx = None;
+        if let Some(t) = self.th.take() { let _ = t.join(); }
     }
 }

@@ -105,11 +105,18 @@ impl ExpertCache {
         // Initial fill: hottest first by profile; ties (and no profile) keep layer order.
         let mut order: Vec<usize> = (0..n_layers * n).filter(|&i| cache.layers[i / n].is_some()).collect();
         order.sort_by(|&a, &b| cache.counts[b].total_cmp(&cache.counts[a]).then(a.cmp(&b)));
+        // The experts that fit, read ahead in upload order.
+        let mut room: Vec<usize> = cache.pools.iter().map(|p| p.buf.len() / p.slot_bytes).collect();
+        let order: Vec<usize> = order.into_iter().filter(|&i| { let r = &mut room[cache.layers[i / n].as_ref().unwrap().pool]; *r > 0 && { *r -= 1; true } }).collect();
+        let pre = crate::weights::Prefetch::start();
+        let mut rs = Vec::new();
+        for &i in &order {
+            for name in MATS { let t = m.w.layer(i / n, name)?.expert(i % n, n); rs.push((t.data.as_ptr() as usize, t.data.len())); }
+        }
+        pre.send(rs);
         for i in order {
             let p = cache.layers[i / n].as_ref().unwrap().pool;
-            let pool = &cache.pools[p];
-            if pool.owner.len() * pool.slot_bytes + pool.slot_bytes > pool.buf.len() { continue; }
-            let slot = pool.owner.len();
+            let slot = cache.pools[p].owner.len();
             cache.pools[p].owner.push((i / n, i % n));
             cache.place(m, gpu, i / n, i % n, slot, false)?;
         }
@@ -126,6 +133,7 @@ impl ExpertCache {
             let o = slot * pool.slot_bytes + mat.off;
             debug_assert_eq!(t.data.len(), mat.bytes);
             gpu.htod(t.data, &pool.buf, o)?;
+            crate::weights::cold(t.data);
         }
         lx.table[e] = slot as i32;
         if sync { self.sync_table(gpu, il)?; }

@@ -6,6 +6,7 @@ use super::{Ffn, GpuModel, HcAt, Mixer};
 use crate::backend::{Backend, Buf, GEMM_BM, SAME_X};
 use crate::expert_cache::MATS;
 use crate::model::Model;
+use crate::weights::Prefetch;
 
 /// Experts staged per group when a layer routes to experts outside the cache. Staging holds two groups.
 const STAGE: usize = 16;
@@ -130,6 +131,8 @@ impl GpuModel<'_> {
     }
 
     fn prefill_chunk(&mut self, toks: &[u32]) -> anyhow::Result<()> {
+        // Missed experts are read from the mapped weights in the order the staging copies take them.
+        let pre = self.cache.is_some().then(Prefetch::start);
         let pe: Vec<f32> = if self.ple_ring.is_some() { toks.iter().flat_map(|&tk| self.m.ple_embed(&mut self.ple_prev, tk)).collect() } else { vec![] };
         let c = &self.m.cfg;
         let pf = self.pf.as_ref().unwrap();
@@ -265,6 +268,11 @@ impl GpuModel<'_> {
                     let (pool, stride) = cache.base(lx);
                     let used = |e: &usize| off[e + 1] > off[*e];
                     let missed: Vec<usize> = (0..c.n_expert).filter(used).filter(|&e| cache.slot(il, e) < 0).collect();
+                    if let Some(pre) = &pre {
+                        let w: Vec<_> = MATS.iter().map(|name| self.m.w.layer(il, name)).collect::<anyhow::Result<_>>()?;
+                        pre.send(missed.chunks(STAGE).flat_map(|grp| w.iter().zip(&lx.mats).flat_map(move |(w, mat)| grp.chunk_by(|a, b| *b == a + 1)
+                            .map(move |run| (w.data.as_ptr() as usize + run[0] * mat.bytes, run.len() * mat.bytes)))).collect());
+                    }
                     // Group 0: resident experts; then staged groups of at most STAGE missed experts. Staging holds
                     // each matrix in its own section (all gates, then ups, then downs), so experts with consecutive
                     // ids are contiguous there as in the weights and copy in one call.
