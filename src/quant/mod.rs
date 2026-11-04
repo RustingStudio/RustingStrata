@@ -33,7 +33,7 @@ impl GgmlType {
         }
     }
     /// Backend `backend` ("cuda" or "vulkan") has kernels for this type (F16 is CPU-only, Q2_0 CUDA-only so far).
-    pub fn gpu(self, backend: &str) -> bool { !matches!(self, F16) && (self != Q2_0 || backend == "cuda") }
+    pub fn gpu(self, _backend: &str) -> bool { !matches!(self, F16) }
     pub fn row_bytes(self, n: u64) -> usize { n as usize / self.block_elems() * self.block_bytes() }
     pub fn name(self) -> &'static str {
         match self {

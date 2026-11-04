@@ -14,7 +14,7 @@ layout(local_size_x = 256) in;
 #include "deq.glsl"
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64 { uint64_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer V4 { vec4 v[]; };
-layout(push_constant) uniform P { U64 tiles; uint64_t wd; V4 x; I32 xrow; F32 y; uint nd; uint xs; uint ys; uint rows; uint nsb; uint act; } p;
+layout(push_constant) uniform P { U64 tiles; uint64_t wd; V4 x; I32 xrow; F32 y; uint nd; uint xs; uint ys; uint rows; uint nk; uint act; } p;  // nk: K steps of 64 (cols / 64)
 const uint BM = 128, BK = 64, PW = (BK + 8) / 2;  // smem pitch in words (2 halves each)
 #if COOP
 #define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
@@ -56,12 +56,12 @@ void main() {
         uint r = (tid >> 4) + 16 * q;
         xb[q] = r < cnt ? ((uint64_t(p.xrow) != 0 ? uint(p.xrow.v[m0 + r]) : m0 + r) * p.xs + xc) / 4 : ~0u;
     }
-    for (uint kb = 0; kb < p.nsb * 4; kb++) {
+    for (uint kb = 0; kb < p.nk; kb++) {
         uint sb = kb / 4, part = kb % 4;
         [[unroll]] for (uint q = 0; q < 2; q++) {
             uint r = tid / 8 + 32 * q, j = tid % 8;
             float v[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-            if (n0 + r < p.rows) deq8(wt, ((n0 + r) * p.nsb + sb) * SBB, part * 8 + j, v);
+            if (n0 + r < p.rows) deq8(wt, (n0 + r) * rowb(p.nk * 64) + sb * SBB, part * 8 + j, v);
             [[unroll]] for (uint e = 0; e < 4; e++) ws[r * PW + j * 4 + e] = h2(v[2 * e], v[2 * e + 1]);
         }
         [[unroll]] for (uint q = 0; q < 8; q++) {

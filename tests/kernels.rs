@@ -995,7 +995,7 @@ fn random_tensor(ty: GgmlType, rows: usize, cols: usize, seed: u32) -> Vec<u8> {
 
 #[test]
 fn gemv_partial_superblocks_and_q2_0() {
-    for (bk, gpu) in common::backends_except(&["vulkan"]) {
+    for (bk, gpu) in common::backends_except(&[]) {
         let gpu = &*gpu;
         for ty in [GgmlType::Q2_0, GgmlType::Q8_0, GgmlType::IQ4NL, GgmlType::BF16, GgmlType::F32] {
             for cols in [640, 320, 2560] {

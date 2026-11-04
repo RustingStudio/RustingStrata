@@ -11,6 +11,8 @@ uint ld16(U8 w, uint o) { return uint(U16(uint64_t(w)).v[o >> 1]); }  // 2-align
 uint ld32(U8 w, uint o) { return ld16(w, o) | ld16(w, o + 2) << 16; }
 float h2f(uint h) { return float(uint16BitsToFloat16(uint16_t(h))); }
 float ldh(U8 w, uint o) { return h2f(ld16(w, o)); }
+// Bytes of a row of `cols` values (a multiple of the type's block).
+uint rowb(uint cols) { return cols * SBB / 256; }
 int sb(uint x) { return int(x << 24) >> 24; }  // the low byte, signed
 
 // IQ1_M (T 29) or IQ1_S (19) sub-block l of block ib: grid index, scale and the sign of the 1/8 offset.
@@ -163,6 +165,10 @@ void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
         uint g0, g1, sg;
         iq_grid(w, b, ib, l, g0, g1, sg, d);
         [[unroll]] for (uint j = 0; j < 8; j++) q[j] = sgn(j < 4 ? g0 : g1, sg, j);
+    } else if (T == 42) {  // Q2_0, 4 blocks of 18: f16 d, then 2-bit codes (value j at bits 2 (j % 4) of byte j / 4), (code - 1) d
+        uint p = b + 18 * (sub >> 3), c = ld16(w, p + 2 + 2 * (sub & 7));
+        d = ldh(w, p);
+        [[unroll]] for (uint i = 0; i < 8; i++) q[i] = int((c >> (2 * i)) & 3) - 1;
     } else {  // IQ4_XS (23), IQ4_NL (20, 8 blocks of 18)
         uint r = l * 8, o;
         if (T == 23) {

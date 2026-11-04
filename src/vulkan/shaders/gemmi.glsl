@@ -18,10 +18,10 @@ layout(local_size_x = 256) in;
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64 { uint64_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer UV4 { uvec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer UV2 { uvec2 v[]; };
-layout(push_constant) uniform P { U64 tiles; uint64_t wd; U32 x; I32 xrow; F32 y; uint nd; uint ys; uint rows; uint nsb; uint act; } p;
+layout(push_constant) uniform P { U64 tiles; uint64_t wd; U32 x; I32 xrow; F32 y; uint nd; uint ys; uint rows; uint nk; uint act; } p;  // nk: K steps of 64 (cols / 64)
 const uint BM = 128;
 const bool MIN = T == 10 || T == 12 || T == 13;
-const uint KS = T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23 ? 32 : 16;
+const uint KS = T == 42 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23 ? 32 : 16;
 // Rows in words. The int8 products are 32 deep: for KS = 16, w row holds each 16 values followed by 16 zeros (so
 // the 16 x values after each 16 add nothing).
 const uint PX = 20, PW = KS == 32 ? 20 : 36;
@@ -45,7 +45,7 @@ void ldw(U8 wt, uint wr, uint wi, bool wok, uint n0, uint kb, out uvec4 wv, out 
     float d1, m1;
     d = 0.0; m = 0.0; wv = uvec4(0);
     if (wok) {
-        uint b = ((n0 + wr) * p.nsb + kb / 4) * SBB, sub = (kb & 3) * 8 + 2 * wi;
+        uint b = (n0 + wr) * rowb(p.nk * 64) + kb / 4 * SBB, sub = (kb & 3) * 8 + 2 * wi;
         qw(wt, b, sub, wv.x, wv.y, d, m);
         qw(wt, b, sub + 1, wv.z, wv.w, d1, m1);
     }
@@ -72,7 +72,7 @@ void ldx(uint xr, uint xh, bool xok, uint xo, uint cols, uint kb, uint b) {
 #endif
 
 void main() {
-    uint tid = gl_LocalInvocationID.x, w = gl_SubgroupID, n0 = gl_WorkGroupID.x * 64, cols = p.nsb * 256;
+    uint tid = gl_LocalInvocationID.x, w = gl_SubgroupID, n0 = gl_WorkGroupID.x * 64, cols = p.nk * 64;
     uint wm = (w >> 1) * 32, wn = (w & 1) * 32, m0, cnt;
     U8 wt;
     if (uint64_t(p.tiles) != 0) {
@@ -116,11 +116,11 @@ void main() {
     ldx(xr, xh, xok, xo, cols, 0, 0);
     [[unroll]] for (uint j = 0; j < 4; j++) wq[wr * PW + wi * 128 / KS + j] = wv[j];
     wsc[0][wr][wi] = d; wmn[0][wr][wi] = m;
-    for (uint kb = 0; kb < p.nsb * 4; kb++) {
+    for (uint kb = 0; kb < p.nk; kb++) {
         uint xb = kb & 1;
         barrier();
-        if (kb + 1 < p.nsb * 4) ldx(xr, xh, xok, xo, cols, kb + 1, xb ^ 1);
-        if (kb + 1 < p.nsb * 4) ldw(wt, wr, wi, wok, n0, kb + 1, wv, d, m);
+        if (kb + 1 < p.nk) ldx(xr, xh, xok, xo, cols, kb + 1, xb ^ 1);
+        if (kb + 1 < p.nk) ldw(wt, wr, wi, wok, n0, kb + 1, wv, d, m);
         // Expert tiles are often part full; a subgroup whose 32 positions are all past cnt has nothing to multiply.
         if (wm < cnt)
         [[unroll]] for (uint h = 0; h < 64 / KS; h++) {
@@ -180,7 +180,7 @@ void main() {
 #endif
                 }
         }
-        if (kb + 1 < p.nsb * 4) {
+        if (kb + 1 < p.nk) {
             [[unroll]] for (uint j = 0; j < 4; j++) wq[((xb ^ 1) * 64 + wr) * PW + wi * 128 / KS + j] = wv[j];
             wsc[xb ^ 1][wr][wi] = d; wmn[xb ^ 1][wr][wi] = m;
         }
