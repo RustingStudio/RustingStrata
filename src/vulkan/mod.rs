@@ -34,8 +34,10 @@ const SPV: &[(&str, &[u8])] = &[
     ("dequant", include_bytes!("spv/dequant.spv")),
     ("gemm_f", include_bytes!("spv/gemm_f.spv")),
     ("gemm_f_dp", include_bytes!("spv/gemm_f_dp.spv")),
+    ("gemm_fs", include_bytes!("spv/gemm_fs.spv")),
     ("gemmi", include_bytes!("spv/gemmi.spv")),
     ("gemmi_dp", include_bytes!("spv/gemmi_dp.spv")),
+    ("gemmi_s", include_bytes!("spv/gemmi_s.spv")),
     ("gemv_f", include_bytes!("spv/gemv_f.spv")),
     ("gemv_q", include_bytes!("spv/gemv_q.spv")),
     ("hc_mix", include_bytes!("spv/hc_mix.spv")),
@@ -588,7 +590,11 @@ impl Vk {
         // gemmi loads q8 rows 16 bytes at a time: their stride (cols * 11 / 8) is aligned only for cols % 128 == 0.
         if !crate::cuda::Gpu::mmq(ty) || cols % 128 != 0 {
             if !same { q8.1 = None; }
-            return self.run(if self.0.coop { "gemm_f" } else { "gemm_f_dp" }, &spec, grid, &[&tiles, &wd, &x, &xrow, &y, &(nd as u32), &(x_stride as u32), &(y_stride as u32), tail[0], tail[1], tail[2]]);
+            let args: [&dyn Arg; 11] = [&tiles, &wd, &x, &xrow, &y, &(nd as u32), &(x_stride as u32), &(y_stride as u32), tail[0], tail[1], tail[2]];
+            self.run(if self.0.coop { "gemm_f" } else { "gemm_f_dp" }, &spec, grid, &args)?;
+            // Tile lists: gemm_f skips the tiles of at most 32 positions, which gemm_fs takes (as gemms_* on CUDA).
+            if self.0.coop && tiles != 0 { self.run("gemm_fs", &spec, grid, &args)?; }
+            return Ok(());
         }
         let need = n_x * (cols + cols / 8 + cols / 4);
         if q8.0.len() < need { q8.0 = self.alloc(need)?; }  // dropping the old buffer waits for work that uses it
@@ -599,7 +605,10 @@ impl Vk {
             self.run("quant_q8", &[self.0.llama], [n_x, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
             q8.1 = key;
         }
-        self.run(if self.0.coop_i8 { "gemmi" } else { "gemmi_dp" }, &spec, grid, &[&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2]])
+        let args: [&dyn Arg; 10] = [&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2]];
+        self.run(if self.0.coop_i8 { "gemmi" } else { "gemmi_dp" }, &spec, grid, &args)?;
+        if self.0.coop_i8 && tiles != 0 { self.run("gemmi_s", &spec, grid, &args)?; }
+        Ok(())
     }
 }
 

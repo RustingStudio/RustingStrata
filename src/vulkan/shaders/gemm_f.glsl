@@ -16,7 +16,12 @@ layout(local_size_x = 256) in;
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64 { uint64_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer V4 { vec4 v[]; };
 layout(push_constant) uniform P { U64 tiles; uint64_t wd; V4 x; I32 xrow; F32 y; uint nd; uint xs; uint ys; uint rows; uint nk; uint act; } p;  // nk: K steps of 64 (cols / 64)
-const uint BM = 128, BK = 64, PW = (BK + 8) / 2;  // smem pitch in words (2 halves each)
+#ifndef SM
+#define SM 0
+#endif
+// SM 1 (gemm_fs): only the tiles of at most 32 positions (most expert tiles), which SM 0 skips (tile lists, COOP);
+// X holds XM positions.
+const uint BM = 128, BK = 64, PW = (BK + 8) / 2, XM = SM != 0 ? 32 : BM;  // smem pitch in words (2 halves each)
 #if COOP
 #define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 #define NE ri.length()
@@ -27,7 +32,7 @@ const uint BM = 128, BK = 64, PW = (BK + 8) / 2;  // smem pitch in words (2 halv
 #define RI(i) (g + 8 * ((i) >> 2))
 #define CI(i) (2 * t + ((i) & 1) + 8 * (((i) >> 1) & 1))
 #endif
-shared uint xs[BM * PW], ws[64 * PW];
+shared uint xs[XM * PW], ws[64 * PW];
 uint h2(float a, float b) { return packFloat2x16(f16vec2(a, b)); }
 shared float ix[512];  // the row and column index matrices
 
@@ -55,17 +60,15 @@ void main() {
     } else {
         wt = U8(p.wd); m0 = gl_WorkGroupID.y * BM; cnt = min(BM, p.nd - m0);
     }
+#if COOP
+    if (uint64_t(p.tiles) != 0 && (cnt <= 32) != (SM != 0)) return;
+#endif
     for (uint i = tid; i < 256; i += 256) { ix[i] = float(i / 16); ix[256 + i] = float(i % 16); }
     load_tables();
     uint g = gl_SubgroupInvocationID >> 2, t = gl_SubgroupInvocationID & 3;
-    // sm: at most 32 positions (most expert tiles), whose 2 x 4 output tiles of 16 x 16 go one per subgroup (rows
-    // tm, columns tn, in acc[0][0]) instead of four each to subgroups 0 and 1. Each output sums the same products in
-    // the same order either way. (Masking the four-tile loop for sm instead is slower.)
-#if COOP
-    bool sm = cnt <= 32;
-#else
-    const bool sm = false;
-#endif
+    // sm (SM 1): the 2 x 4 output tiles of 16 x 16 go one per subgroup (rows tm, columns tn, in acc[0][0]) instead of
+    // four each to subgroups 0 and 1. Each output sums the same products in the same order either way.
+    const bool sm = SM != 0;
     uint tm = 16 * (w & 1), tn = 16 * (w >> 1);
 #if COOP
     ACC acc[2][2];
@@ -76,8 +79,8 @@ void main() {
 #endif
     // X: invocation converts 4 floats at column xc of rows tid / 16 + 16 q per step (16-byte loads: strides are
     // multiples of 4). xb: their offsets in vec4, ~0 past cnt.
-    uint xc = (tid & 15) * 4, xb[8];
-    [[unroll]] for (uint q = 0; q < 8; q++) {
+    uint xc = (tid & 15) * 4, xb[XM / 16];
+    [[unroll]] for (uint q = 0; q < XM / 16; q++) {
         uint r = (tid >> 4) + 16 * q;
         xb[q] = r < cnt ? ((uint64_t(p.xrow) != 0 ? uint(p.xrow.v[m0 + r]) : m0 + r) * p.xs + xc) / 4 : ~0u;
     }
@@ -86,7 +89,7 @@ void main() {
     ldw(wt, n0, 0, tid, wv);
     stw(tid, wv);
     for (uint kb = 0; kb < p.nk; kb++) {
-        [[unroll]] for (uint q = 0; q < 8; q++) {
+        [[unroll]] for (uint q = 0; q < XM / 16; q++) {
             uint r = (tid >> 4) + 16 * q;
             vec4 v = xb[q] != ~0u ? p.x.v[xb[q] + kb * BK / 4] : vec4(0.0);
             xs[r * PW + xc / 2] = h2(v.x, v.y); xs[r * PW + xc / 2 + 1] = h2(v.z, v.w);

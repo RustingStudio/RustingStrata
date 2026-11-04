@@ -20,15 +20,19 @@ layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64 { uint64
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer UV4 { uvec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer UV2 { uvec2 v[]; };
 layout(push_constant) uniform P { U64 tiles; uint64_t wd; U32 x; I32 xrow; F32 y; uint nd; uint ys; uint rows; uint nk; uint act; } p;  // nk: K steps of 64 (cols / 64)
-const uint BM = 128;
+#ifndef SM
+#define SM 0
+#endif
+// SM 1 (gemmi_s): only the tiles of at most 32 positions, as gemm_fs; X holds XM positions.
+const uint BM = 128, XM = SM != 0 ? 32 : BM;
 const bool MIN = T == 10 || T == 12 || T == 13;
 const uint KS = T == 42 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23 ? 32 : 16;
 // Rows in words. The int8 products are 32 deep: for KS = 16, w row holds each 16 values followed by 16 zeros (so
 // the 16 x values after each 16 add nothing).
 const uint PX = 20, PW = KS == 32 ? 20 : 36;
 // X and W are double buffered: step kb + 1 is stored while step kb's products run, so one barrier per step.
-shared uint xq[2 * BM * PX], wq[2 * 64 * PW];
-shared float xd[2][BM][2], xsum[2][BM][4], wsc[2][64][4], wmn[2][64][4];
+shared uint xq[2 * XM * PX], wq[2 * 64 * PW];
+shared float xd[2][XM][2], xsum[2][XM][4], wsc[2][64][4], wmn[2][64][4];
 // int to float for |c| < 2^22 without the quarter-rate I2F, as i2f_small in kernels.cu.
 float i2f_small(int c) { return intBitsToFloat(0x4B400000 + c) - 12582912.0; }
 // acc += dx dw c - sx mw, rounded as in kernels.cu.
@@ -56,7 +60,7 @@ void ldw(U8 wt, uint wr, uint wi, bool wok, uint n0, uint kb, out uvec4 wv, out 
 void ldx(uint xr, uint xh, bool xok, uint xo, uint cols, uint kb, uint b) {
     uvec4 xv[2];
     [[unroll]] for (uint j = 0; j < 2; j++) xv[j] = xok ? UV4(uint64_t(p.x)).v[(xo + kb * 16 + xh * 8) / 4 + j] : uvec4(0);
-    uint o = (b * BM + xr) * PX;
+    uint o = (b * XM + xr) * PX;
     [[unroll]] for (uint j = 0; j < 8; j++) xq[o + xh * 8 + j] = xv[j / 4][j % 4];
     if (xh == 0) { vec2 d = xok ? uintBitsToFloat(UV2(uint64_t(p.x)).v[(xo + cols / 4) / 2 + kb]) : vec2(0.0); xd[b][xr][0] = d.x; xd[b][xr][1] = d.y; }
     else { vec4 sm = xok ? uintBitsToFloat(UV4(uint64_t(p.x)).v[(xo + cols / 4 + cols / 32) / 4 + kb]) : vec4(0.0); for (uint j = 0; j < 4; j++) xsum[b][xr][j] = sm[j]; }
@@ -82,9 +86,12 @@ void main() {
     } else {
         wt = U8(p.wd); m0 = gl_WorkGroupID.y * BM; cnt = min(BM, p.nd - m0);
     }
+#if COOP
+    if (uint64_t(p.tiles) != 0 && (cnt <= 32) != (SM != 0)) return;
+#endif
     // The row and column index matrices, in X buffer 1 (first stored after the loop's first barrier).
 #if COOP
-    const uint IX = BM * PX;
+    const uint IX = XM * PX;
     for (uint i = tid; i < 256; i += 256) { xq[IX + i] = i / 16; xq[IX + 256 + i] = i % 16; }
 #endif
     if (KS == 16) for (uint i = tid; i < 2 * 64 * PW; i += 256) wq[i] = 0;
@@ -93,11 +100,7 @@ void main() {
     // Subgroup w multiplies rows bm .. bm + 31 by columns bn .. bn + 31 of the tile, or with sm (at most 32 positions,
     // most expert tiles) only the 16 x 16 at bm, bn, in acc[0][0], so the 8 output tiles are spread over all 8
     // subgroups. Each output sums the same products in the same order either way.
-#if COOP
-    bool sm = cnt <= 32;
-#else
-    const bool sm = false;
-#endif
+    const bool sm = SM != 0;
     uint bm = sm ? 16 * (w & 1) : (w >> 1) * 32, bn = sm ? 16 * (w >> 1) : (w & 1) * 32;
     // nv: the layout of mma.sync (element i at row g + 8 (i >> 2), column 2 t + (i & 1) + 8 ((i >> 1) & 1)), as on NVIDIA.
     uint g = gl_SubgroupInvocationID >> 2, t = gl_SubgroupInvocationID & 3;
@@ -124,13 +127,13 @@ void main() {
     // W step kb is decoded into registers during step kb - 1's products and stored after them, as kernels.cu.
     uvec4 wv; float d, m;
     ldw(wt, wr, wi, wok, n0, 0, wv, d, m);
-    ldx(xr, xh, xok, xo, cols, 0, 0);
+    if (xr < XM) ldx(xr, xh, xok, xo, cols, 0, 0);
     [[unroll]] for (uint j = 0; j < 4; j++) wq[wr * PW + wi * 128 / KS + j] = wv[j];
     wsc[0][wr][wi] = d; wmn[0][wr][wi] = m;
     for (uint kb = 0; kb < p.nk; kb++) {
         uint xb = kb & 1;
         barrier();
-        if (kb + 1 < p.nk) ldx(xr, xh, xok, xo, cols, kb + 1, xb ^ 1);
+        if (kb + 1 < p.nk && xr < XM) ldx(xr, xh, xok, xo, cols, kb + 1, xb ^ 1);
         if (kb + 1 < p.nk) ldw(wt, wr, wi, wok, n0, kb + 1, wv, d, m);
         // Expert tiles are often part full; a subgroup whose 32 positions are all past cnt has nothing to multiply.
         if (bm < cnt)
@@ -139,7 +142,7 @@ void main() {
             coopmat<int8_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> a[2];
             coopmat<int8_t, gl_ScopeSubgroup, 32, 16, gl_MatrixUseB> b[2];
             [[unroll]] for (uint i = 0; i < 2; i++) if (!sm || i == 0) {
-                coopMatLoad(a[i], xq, (xb * BM + bm + 16 * i) * PX + h * KS / 4, PX, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(a[i], xq, (xb * XM + bm + 16 * i) * PX + h * KS / 4, PX, gl_CooperativeMatrixLayoutRowMajor);
                 coopMatLoad(b[i], wq, (xb * 64 + bn + 16 * i) * PW + h * 8, PW, gl_CooperativeMatrixLayoutColumnMajor);
             }
 #endif
@@ -168,7 +171,7 @@ void main() {
                     uint xw[2][KS / 4], ww[4][KS / 4];
                     int c[8];
                     [[unroll]] for (uint j = 0; j < KS / 4; j++) {
-                        [[unroll]] for (uint e = 0; e < 2; e++) xw[e][j] = xq[(xb * BM + bm + 16 * mt + RI(4 * e)) * PX + h * KS / 4 + j];
+                        [[unroll]] for (uint e = 0; e < 2; e++) xw[e][j] = xq[(xb * XM + bm + 16 * mt + RI(4 * e)) * PX + h * KS / 4 + j];
                         [[unroll]] for (uint e = 0; e < 4; e++) ww[e][j] = wq[(xb * 64 + bn + 16 * nt + CI(e)) * PW + h * 8 + j];
                     }
                     [[unroll]] for (uint i = 0; i < 8; i++) {
