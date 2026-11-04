@@ -45,7 +45,9 @@ template <> __device__ __forceinline__ void deq8<0>(const u8* b, int sub, float*
     o[0] = a.x; o[1] = a.y; o[2] = a.z; o[3] = a.w; o[4] = c.x; o[5] = c.y; o[6] = c.z; o[7] = c.w;
 }
 template <> __device__ __forceinline__ void deq8<30>(const u8* b, int sub, float* o) {  // BF16
-    for (int i = 0; i < 8; i++) o[i] = __uint_as_float(ld16(b + 16 * sub + 2 * i) << 16);
+    uint4 q = *(const uint4*)(b + 16 * sub);  // one 16-byte load: rows are 16-byte multiples (cols % 8 == 0)
+    u32 w[4] = {q.x, q.y, q.z, q.w};
+    for (int i = 0; i < 4; i++) { o[2 * i] = __uint_as_float(w[i] << 16); o[2 * i + 1] = __uint_as_float(w[i] & 0xFFFF0000u); }
 }
 template <> __device__ __forceinline__ void deq8<8>(const u8* b, int sub, float* o) {  // Q8_0, 8 blocks of 34
     const u8* p = b + 34 * (sub >> 2);
@@ -548,6 +550,31 @@ template <> struct QS<18> : QI<18> {
     }
 };
 
+__shared__ u32 s_iq3s_grid[512];
+template <> struct QS<21> : QI<21> {
+    static constexpr bool SH = true;
+    __device__ static void load() { for (int i = threadIdx.x; i < 512; i += blockDim.x) s_iq3s_grid[i] = iq3s_grid[i]; }
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        int ib = sub >> 2, l = sub & 3;
+        u32 hb = b[66 + ib], sg = b[74 + 4 * ib + l], qq = ld16(b + 2 + 8 * ib + 2 * l);
+        d = ldh(b) * (float)(1 + 2 * ((b[106 + ib / 2] >> (4 * (ib & 1))) & 0xF));
+        lo = apply_signs(s_iq3s_grid[(qq & 255) | ((hb << (8 - 2 * l)) & 256)], sg & 15);
+        hi = apply_signs(s_iq3s_grid[(qq >> 8) | ((hb << (7 - 2 * l)) & 256)], sg >> 4);
+    }
+};
+__shared__ u64 s_iq2s_grid[1024];
+template <> struct QS<22> : QI<22> {
+    static constexpr bool SH = true;
+    __device__ static void load() { for (int i = threadIdx.x; i < 1024; i += blockDim.x) s_iq2s_grid[i] = iq2s_grid[i]; }
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        int ib = sub >> 2, l = sub & 3;
+        u64 g = s_iq2s_grid[b[2 + 4 * ib + l] | ((b[66 + ib] << (8 - 2 * l)) & 0x300)];
+        u32 sg = b[34 + 4 * ib + l], sc = b[74 + ib];
+        d = ldh(b) * (0.5f + (float)(l < 2 ? sc & 0xF : sc >> 4)) * 0.25f;
+        lo = apply_signs((u32)g, sg & 15); hi = apply_signs((u32)(g >> 32), sg >> 4);
+    }
+};
+
 template <int T, int SBB, bool P, class Q = QI<T>>
 __device__ __forceinline__ void gemv_row_q(const u8* __restrict__ w, const signed char* qs, const float* xd, float* y, int row, int cols) {
     int lane = threadIdx.x & 31;
@@ -649,10 +676,12 @@ FTYPES(DEF_FGEMV)
         extern __shared__ __align__(16) signed char sx[];                                                       \
         const signed char* xs = xq ? xq : sx;                                                                   \
         const float* xd = (const float*)(xs + cols);                                                       \
+        QS<T>::load();                                                                                          \
         if (!xq) quant_x<P>(x, cols, sx, (float*)(sx + cols));                                           \
+        else if (QS<T>::SH) __syncthreads();                                                                    \
         w += blockIdx.z * w2; y = (float*)((char*)y + blockIdx.z * y2); if (blockIdx.z) rows = rows2;           \
         int r0 = blockIdx.x * 8 * rpw + (threadIdx.x >> 5), r1 = min(rows, r0 - (threadIdx.x >> 5) + 8 * rpw);  \
-        for (int row = r0; row < r1; row += 8) gemv_row_q<T, SBB, P>(w + row * ROWB(cols, SBB), xs, xd, y, row, cols); \
+        for (int row = r0; row < r1; row += 8) gemv_row_q<T, SBB, P, QS<T>>(w + row * ROWB(cols, SBB), xs, xd, y, row, cols); \
     }                                                                                                           \
     extern "C" __global__ void moe_gemv_##NAME(const u8* w, const int* ids, long long stride, const float* x,  \
                                                int x_stride, int xg, float* y, int rows, int cols, int rpw,      \
