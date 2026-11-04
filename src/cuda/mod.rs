@@ -274,8 +274,12 @@ impl Gpu {
 
     /// Launch config and rows-per-warp argument for a GEMV with `rows` x `cols` per matrix and `k` matrices.
     fn gemv_cfg(ty: GgmlType, rows: usize, cols: usize, k: usize) -> (LaunchConfig, i32) {
-        // Float types: one warp per row and block, so small matrices (32 rows) still spread over many SMs.
-        if Self::float_ty(ty) { return (cfg((rows as u32, k as u32), 32, 0), 1); }
+        // Float types: one warp per row. Small matrices (32 rows) take one row per block to spread over many SMs;
+        // from 4096 rows 8 per block, as an SM holds only 16 blocks (hc_attn_up 10240 x 320: 28.7 -> 24.8 us).
+        if Self::float_ty(ty) {
+            let wpb = if rows >= 4096 { 8 } else { 1 };
+            return (cfg((rows.div_ceil(wpb) as u32, k as u32), 32 * wpb as u32, 0), 1);
+        }
         let rpw = Self::rpw(rows, cols, k);
         (cfg((rows.div_ceil(8 * rpw) as u32, k as u32), 256, Self::xq_smem(ty, cols)), rpw as i32)
     }
