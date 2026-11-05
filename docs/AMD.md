@@ -35,6 +35,11 @@ each layer separately to stay under that. If it still happens, try a smaller `--
 `STRATA_NAN_TRACE=1`, which prints per-layer magnitudes and the first layer with a non-finite value, and attach the
 output.
 
+**A model split over two cards (`--device 0,1`) is slower than expected.** Each card waits while the other works, and
+amdgpu clocks it down in those gaps. `echo high > /sys/class/drm/cardN/device/power_dpm_force_performance_level` (as
+root, for each card; `auto` restores the default) keeps the clocks up: 44 to 57 tok/s decode in one two-card report.
+The per-device times that `generate` prints on a split show whether a card is slow.
+
 **Load fails for lack of VRAM.** The desktop on the same card takes memory, and the driver's free-memory estimate can
 be more than it will allocate. Lower `--ctx`, use `--kv q8`, or a smaller `--chunk`.
 

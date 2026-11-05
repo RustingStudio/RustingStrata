@@ -117,6 +117,16 @@ GPU that drives no display, `--vram-margin 256` keeps more experts resident (+1-
 memory. `--kv q8` halves the KV cache (345 instead of 650 MB at 32K) at about 6% slower 32K decode and 14% slower
 32K prefill. Without `--gpu` everything runs on the CPU reference, which is slow and meant for checking.
 
+Several GPUs: `--device 0,1` splits the layers over the cards in proportion to their free VRAM, so more experts stay
+resident. The cards run one after the other, so one request gets more memory, not twice the speed of one card. MTP
+drafting is off on a split model. AMD cards clock down in the gaps while the other card works; `echo high >
+/sys/class/drm/cardN/device/power_dpm_force_performance_level` (as root, per card) took a two-card split from 44 to 57
+tok/s in one report.
+
+The experts that do not fit in VRAM are read from the GGUF through the page cache. A file system that keeps file data
+out of the page cache (ZFS with `primarycache=metadata`) makes every run read them from disk again; load the model
+from a file system that caches data, or from a tmpfs copy.
+
 ## Tests
 
 ```sh
