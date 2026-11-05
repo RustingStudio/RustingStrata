@@ -75,7 +75,7 @@ struct Layer { attn_norm: Option<GpuTensor>, post_norm: Option<GpuTensor>, hc: O
 /// MTP draft head: the `nextn` block (layer n_layer) with its own KV cache and CPU worker.
 /// A saved conversation state in host memory: its tokens, the PLE tokens before it, the `slot` buffers and the KV
 /// rows of its positions in each attention layer.
-struct Parked { ids: Vec<u32>, ple_prev: [i64; 2], slot: Vec<Vec<u8>>, kv: Vec<Vec<u8>> }
+struct Parked { ids: Vec<u32>, owner: u64, ple_prev: [i64; 2], slot: Vec<Vec<u8>>, kv: Vec<Vec<u8>> }
 
 impl Parked {
     fn bytes(&self) -> usize { self.slot.iter().chain(&self.kv).map(Vec::len).sum() }
@@ -128,6 +128,12 @@ pub struct GpuModel<'a> {
     sys: Option<(Vec<Vec<u8>>, usize, [i64; 2], Vec<u32>)>,
     /// Saved states that a request with another history replaced, most recent first (`park`).
     parked: Vec<Parked>,
+    /// Whose request `prefill_cached` serves (an API key's number): it reuses only states of the same owner, so one
+    /// key cannot learn from the cached-token count or the response time what another key sent.
+    pub owner: u64,
+    /// The owners of the saved and the stashed state.
+    saved_owner: u64,
+    sys_owner: u64,
     /// Host memory for `parked`, in bytes (0 = keep none).
     pub cache_ram: usize,
     ctx: usize,
@@ -344,7 +350,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None })
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None })
     }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
@@ -508,6 +514,7 @@ impl<'a> GpuModel<'a> {
             let data = q.slot().iter().map(|b| q.gpu.get::<u8>(b, 0, b.len())).collect::<anyhow::Result<_>>()?;
             q.saved_ids = ids.to_vec();
             q.sys = Some((data, q.saved_pos, q.saved_ple_prev, q.saved_ids.clone()));
+            (q.saved_owner, q.sys_owner) = (q.owner, q.owner);
             p = q.next.as_deref_mut();
         }
         Ok(())
@@ -533,7 +540,7 @@ impl<'a> GpuModel<'a> {
         let g = &self.gpu;
         let slot = self.slot().iter().map(|b| g.get::<u8>(b, 0, b.len())).collect::<anyhow::Result<_>>()?;
         let kv = self.kv_bufs().iter().map(|b| g.get::<u8>(b, 0, b.len() / self.ctx * n)).collect::<anyhow::Result<_>>()?;
-        self.parked.insert(0, Parked { ids: self.saved_ids.clone(), ple_prev: self.saved_ple_prev, slot, kv });
+        self.parked.insert(0, Parked { ids: self.saved_ids.clone(), owner: self.saved_owner, ple_prev: self.saved_ple_prev, slot, kv });
         while self.parked.iter().map(Parked::bytes).sum::<usize>() > self.cache_ram { self.parked.pop(); }
         Ok(())
     }
@@ -544,7 +551,7 @@ impl<'a> GpuModel<'a> {
         self.park()?;
         for (b, d) in self.slot().iter().zip(&p.slot) { self.gpu.put(d, b, 0)?; }
         for (b, d) in self.kv_bufs().iter().zip(&p.kv) { self.gpu.put(d, b, 0)?; }
-        (self.saved_pos, self.saved_ple_prev, self.saved_ids) = (p.ids.len(), p.ple_prev, p.ids);
+        (self.saved_pos, self.saved_ple_prev, self.saved_ids, self.saved_owner) = (p.ids.len(), p.ple_prev, p.ids, p.owner);
         self.restore_state()
     }
 
@@ -554,7 +561,7 @@ impl<'a> GpuModel<'a> {
         while let Some(q) = p {
             let s = q.sys.as_ref().ok_or_else(|| anyhow::anyhow!("unstash without stash"))?;
             for (b, d) in q.slot().iter().zip(&s.0) { q.gpu.put(d, b, 0)?; }
-            (q.saved_pos, q.saved_ple_prev, q.saved_ids) = (s.1, s.2, s.3.clone());
+            (q.saved_pos, q.saved_ple_prev, q.saved_ids, q.saved_owner) = (s.1, s.2, s.3.clone(), q.sys_owner);
             p = q.next.as_deref_mut();
         }
         self.restore_state()

@@ -312,6 +312,16 @@ fn prefill_cached_reuses_history() {
         for t in [11u32, 22, 33] { gm.step(t).unwrap(); }
         let (got, r) = gm.prefill_cached(&p2, 0, h2.len()).unwrap();
         assert_eq!((r, &got), (h2.len(), &want_h2), "parked side request");
+
+        // Another owner (API key) reuses nothing of owner 0, not even the system prompt; owner 0 still finds its own.
+        gm.owner = 7;
+        let (got, r) = gm.prefill_cached(&q1, sys.len(), s1.len()).unwrap();
+        assert_eq!((r, &got), (0, &want1), "other owner");
+        let (_, r) = gm.prefill_cached(&q1, sys.len(), s1.len()).unwrap();
+        assert_eq!(r, s1.len(), "other owner, its own history");
+        gm.owner = 0;
+        let (got, r) = gm.prefill_cached(&p2, 0, h2.len()).unwrap();
+        assert_eq!((r, &got), (h2.len(), &want_h2), "owner 0 parked");
     }
 }
 

@@ -54,11 +54,59 @@ pub fn host_ok(host: &str, bound: &str) -> bool {
     matches!(n.as_str(), "localhost" | "127.0.0.1" | "[::1]") || n == name(bound)
 }
 
+/// Whether the client closed the connection (it sends nothing more after its request).
+pub fn gone(c: &std::net::TcpStream) -> bool {
+    if c.set_nonblocking(true).is_err() { return false; }
+    let r = c.peek(&mut [0]);
+    let _ = c.set_nonblocking(false);
+    match r { Ok(n) => n == 0, Err(e) => e.kind() != std::io::ErrorKind::WouldBlock }
+}
+
 /// `Authorization` header check for `--api-key`, without an early exit on the first differing byte.
 pub fn key_ok(auth: &str, key: &str) -> bool {
     if key.is_empty() { return false; }
     let a = auth.strip_prefix("Bearer ").unwrap_or("").as_bytes();
     a.len() == key.len() && a.iter().zip(key.as_bytes()).fold(0, |x, (p, q)| x | (p ^ q)) == 0
+}
+
+/// The API keys: `--api-key` (all routes) and the `--api-keys` file (chat and model list only). No key at all
+/// leaves the server open, as for local use.
+#[derive(Clone, Default)]
+pub struct Keys {
+    pub admin: Option<String>,
+    /// (name, key), the name as the file gives it.
+    pub users: Vec<(String, String)>,
+}
+
+/// Who sent a request: the key's name for the usage log, a number that keeps each key's cached conversations
+/// apart (0 for the admin key or an open server), and whether it may use the admin routes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Who { pub name: String, pub id: u64, pub admin: bool }
+
+impl Keys {
+    /// Reads a key file: one `name key` pair a line, `#` starts a comment.
+    pub fn parse(text: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let mut v: Vec<(String, String)> = vec![];
+        for (n, line) in text.lines().enumerate() {
+            let l = line.split('#').next().unwrap_or("").trim();
+            if l.is_empty() { continue; }
+            let mut it = l.split_whitespace();
+            let (Some(name), Some(key), None) = (it.next(), it.next(), it.next()) else { bail!("line {}: want `name key`", n + 1) };
+            if key.len() < 16 { bail!("line {}: key of {name} is shorter than 16 characters", n + 1); }
+            if v.iter().any(|(a, k)| a == name || k == key) { bail!("line {}: name or key of {name} repeats", n + 1); }
+            v.push((name.into(), key.into()));
+        }
+        Ok(v)
+    }
+
+    pub fn any(&self) -> bool { self.admin.is_some() || !self.users.is_empty() }
+
+    /// The sender of `auth` (an `Authorization` header), or None for a missing or wrong key.
+    pub fn who(&self, auth: &str) -> Option<Who> {
+        if !self.any() { return Some(Who { name: String::new(), id: 0, admin: true }); }
+        if self.admin.as_deref().is_some_and(|k| key_ok(auth, k)) { return Some(Who { name: "admin".into(), id: 0, admin: true }); }
+        self.users.iter().position(|(_, k)| key_ok(auth, k)).map(|i| Who { name: self.users[i].0.clone(), id: i as u64 + 1, admin: false })
+    }
 }
 
 /// GGUF models under `dir` and two folder levels below it, as (name relative to `dir` with `/` separators, path,

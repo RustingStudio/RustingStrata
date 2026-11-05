@@ -87,6 +87,26 @@ struct Engine {
     cpu_fallback: bool,
 }
 
+/// `serve` options for a server that other people use (docs/HOSTING.md).
+#[derive(clap::Args, Clone, Debug)]
+struct Hosting {
+    /// File of customer keys, one `name key` pair a line (`#` comments). These keys reach only the chat APIs and
+    /// the model list, and each key's cached conversations are kept apart from the others'. `--api-key` stays
+    /// the admin key for every route.
+    #[arg(long)]
+    api_keys: Option<PathBuf>,
+    /// Append one JSON line per answered chat request (time, key name, token counts, timings) to this file.
+    #[arg(long)]
+    usage_log: Option<PathBuf>,
+    /// Requests read or waiting at once; more get `503` with `Retry-After`.
+    #[arg(long, default_value_t = 16)]
+    max_waiting: usize,
+    /// Most reply tokens a request may ask for (and the default when it asks for none) [default: what the context
+    /// leaves].
+    #[arg(long)]
+    max_tokens: Option<usize>,
+}
+
 enum Runner<'a> { Cpu(&'a Model<'a>, State), Gpu(Box<GpuModel<'a>>) }
 
 impl Runner<'_> {
@@ -265,6 +285,8 @@ enum Cmd {
         #[arg(long)]
         api_key: Option<String>,
         #[command(flatten)]
+        host: Hosting,
+        #[command(flatten)]
         engine: Engine,
     },
     /// Measure prefill chunk, MTP drafts per step and the short-prompt threshold on this machine (GPU) and write
@@ -339,9 +361,9 @@ enum Cmd {
 fn main() -> anyhow::Result<()> {
     let Some(cmd) = Cli::parse().cmd else {
         // Started without arguments, as by a double click: keep the window open on an error so it can be read.
-        let Some(Cmd::Serve { model, models_dir, addr, api_key, open, mut engine }) = Cli::parse_from(["strata", "serve", "--gpu", "--open"]).cmd else { unreachable!() };
+        let Some(Cmd::Serve { model, models_dir, addr, api_key, open, host, mut engine }) = Cli::parse_from(["strata", "serve", "--gpu", "--open"]).cmd else { unreachable!() };
         engine.cpu_fallback = true;
-        let r = run(Cmd::Serve { model, models_dir, addr, api_key, open, engine });
+        let r = run(Cmd::Serve { model, models_dir, addr, api_key, open, host, engine });
         if let Err(e) = &r {
             eprintln!("error: {e:#}\npress Enter to close");
             let _ = std::io::stdin().read_line(&mut String::new());
@@ -514,9 +536,22 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             r.finish()?;
         }
-        Cmd::Serve { model, models_dir, addr, api_key, open, engine } => {
+        Cmd::Serve { model, models_dir, addr, api_key, open, host, engine } => {
             let api_key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
             anyhow::ensure!(api_key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
+            let users = match &host.api_keys {
+                Some(f) => serve::Keys::parse(&std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?)
+                    .with_context(|| format!("in {}", f.display()))?,
+                None => vec![],
+            };
+            anyhow::ensure!(!users.iter().any(|u| api_key.as_ref() == Some(&u.1)), "the admin key is also a customer key");
+            let keys = serve::Keys { admin: api_key, users };
+            let usage = match &host.usage_log {
+                Some(f) => Some(std::sync::Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(f)
+                    .with_context(|| format!("opening {}", f.display()))?)),
+                None => None,
+            };
+            let max_waiting = host.max_waiting.max(1);
             let url = format!("http://{addr}/");
             let listener = match TcpListener::bind(&addr) {
                 Err(e) if open && e.kind() == std::io::ErrorKind::AddrInUse => { open_browser(&url); return Ok(()); }
@@ -528,34 +563,47 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let open_conns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let waiting = open_conns.clone();
             let stats = std::sync::Arc::new(std::sync::Mutex::new(serve::Stats::default()));
-            let (st, a, k, t0) = (stats.clone(), addr.clone(), api_key.clone(), Instant::now());
+            let (st, a, k, t0) = (stats.clone(), addr.clone(), keys.clone(), Instant::now());
             std::thread::spawn(move || for (i, conn) in listener.incoming().enumerate() {
-                let c = match conn { Ok(c) => c, Err(e) => { eprintln!("request {i}: {e:#}"); continue } };
-                // ponytail: a fixed cap on connections read or queued (each may hold an 8 MB body).
-                if open_conns.fetch_add(1, Relaxed) >= 16 {
+                let mut c = match conn { Ok(c) => c, Err(e) => { eprintln!("request {i}: {e:#}"); continue } };
+                // ponytail: one cap on connections read or queued (each may hold an 8 MB body), not one per key.
+                if open_conns.fetch_add(1, Relaxed) >= max_waiting {
                     open_conns.fetch_sub(1, Relaxed);
-                    eprintln!("request {i}: 16 requests already waiting, closed");
+                    eprintln!("request {i}: {max_waiting} requests already waiting, answered 503");
+                    let b = json!({"error": {"message": "server busy, retry later", "type": "overloaded_error"}}).to_string();
+                    let _ = c.set_write_timeout(Some(Duration::from_secs(5)));
+                    let _ = write!(c, "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+                    let _ = c.shutdown(std::net::Shutdown::Write);
                     continue;
                 }
                 let (tx, oc, st, a, k) = (tx.clone(), open_conns.clone(), st.clone(), a.clone(), k.clone());
                 std::thread::spawn(move || {
                     let q = c.set_read_timeout(Some(Duration::from_secs(30))).and_then(|_| c.set_write_timeout(Some(Duration::from_secs(30))))
                         .map_err(Into::into).and_then(|_| serve::read_request(&mut BufReader::new(&c)));
+                    let reply = |v: serde_json::Value, status: &str| {
+                        let b = v.to_string();
+                        let _ = write!(&c, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+                        oc.fetch_sub(1, Relaxed);
+                    };
+                    // For load balancers: no key, no Host check, and an answer while a reply is generated.
+                    if let Ok(r) = &q && r.method == "GET" && r.path == "/health" {
+                        let (model, loading) = { let g = st.lock().unwrap(); (g.model.is_some() && !g.loading, g.loading) };
+                        let waiting = oc.load(Relaxed) - 1;
+                        return if model { reply(json!({"status": "ok", "waiting": waiting}), "200 OK") }
+                            else { reply(json!({"status": if loading { "loading" } else { "no model" }}), "503 Service Unavailable") };
+                    }
                     // The page's side panel is answered here, so it stays current while a reply is generated or a
                     // model loads. A bad Host or key falls through to `handle`, which refuses it.
-                    if let Ok(r) = &q && r.method == "GET" && r.path == "/api/stats" && serve::host_ok(&r.host, &a)
-                        && k.as_deref().is_none_or(|k| serve::key_ok(&r.auth, k)) {
+                    if let Ok(r) = &q && r.method == "GET" && r.path == "/api/stats" && (k.any() || serve::host_ok(&r.host, &a))
+                        && k.who(&r.auth).is_some_and(|w| w.admin) {
                         let mut v = json!(*st.lock().unwrap());
                         (v["system"], v["uptime_s"]) = (serve::system(), t0.elapsed().as_secs().into());
-                        let b = v.to_string();
-                        let _ = write!(&c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
-                        oc.fetch_sub(1, Relaxed);
-                        return;
+                        return reply(v, "200 OK");
                     }
                     let _ = tx.send((c, q, i));
                 });
             });
-            let s = Serving { rx, waiting, addr, key: api_key, dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(),
+            let s = Serving { rx, waiting, addr, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(),
                 dl: Default::default(), stats };
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
@@ -726,7 +774,9 @@ struct Serving {
     rx: std::sync::mpsc::Receiver<(TcpStream, anyhow::Result<serve::Request>, usize)>,
     waiting: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     addr: String,
-    key: Option<String>,
+    keys: serve::Keys,
+    usage: Option<std::sync::Mutex<std::fs::File>>,
+    max_tokens: usize,
     dir: PathBuf,
     /// The --model, offered beside the models folder.
     model: Option<PathBuf>,
@@ -839,16 +889,22 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
     let created = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
     // Browsers can reach a loopback server: the Host check stops DNS rebinding, and requiring a JSON content type
     // makes a cross-site POST need a CORS preflight, which is never answered.
-    if !serve::host_ok(&host, &s.addr) { return send(&mut w, "403 Forbidden", json!({"error": {"message": "bad Host header", "type": "forbidden"}})); }
+    // With a key the check is not needed (a rebinding page has no key) and would refuse a reverse proxy's Host.
+    if !s.keys.any() && !serve::host_ok(&host, &s.addr) { return send(&mut w, "403 Forbidden", json!({"error": {"message": "bad Host header", "type": "forbidden"}})); }
     // The chat page holds no secret, so it loads without the key (the page asks for it).
     if method == "GET" && path == "/" {
         const PAGE: &str = include_str!("web/index.html");
         return Ok(write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PAGE}", PAGE.len())?);
     }
-    if s.key.as_deref().is_some_and(|k| !serve::key_ok(&auth, k)) { return send(&mut w, "401 Unauthorized", json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}})); }
+    let Some(who) = s.keys.who(&auth) else { return send(&mut w, "401 Unauthorized", json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}})) };
     if method == "POST" && !json { return send(&mut w, "415 Unsupported Media Type", json!({"error": {"message": "Content-Type must be application/json", "type": "invalid_request_error"}})); }
     // Claude Code adds `?beta=true`.
-    match (method.as_str(), path.split('?').next().unwrap_or_default()) {
+    let route = path.split('?').next().unwrap_or_default();
+    // Customer keys may not load models, download files or read the server's stats.
+    if !who.admin && !matches!(route, "/v1/chat/completions" | "/v1/messages" | "/v1/models") {
+        return send(&mut w, "403 Forbidden", json!({"error": {"message": "this key may use only /v1/chat/completions, /v1/messages and /v1/models", "type": "permission_error"}}));
+    }
+    match (method.as_str(), route) {
         ("GET", "/v1/models") => send(&mut w, "200 OK", json!({"object": "list", "data": l.map(|l| json!([{"id": l.name, "object": "model", "created": created, "owned_by": "strata"}])).unwrap_or(json!([]))})),
         ("GET", "/api/models") => {
             let models: Vec<_> = s.models().into_iter().map(|(id, p, n)| json!({"id": id, "bytes": n, "loaded": l.as_ref().is_some_and(|l| l.path == p)})).collect();
@@ -893,6 +949,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let anth = p == "/v1/messages";
             let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
             let (r, tok, tpl, name) = (&mut l.r, &l.tok, l.tpl, l.name.as_str());
+            if let Runner::Gpu(g) = r { g.owner = who.id; }
             let req = match if anth { serve::messages_body(&body) } else { Ok(body.clone()) }.and_then(|b| serve::chat_request(&b)) {
                 Ok(q) => q,
                 Err(err) => return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
@@ -909,7 +966,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             smp.top_k = req.top_k.unwrap_or(smp.top_k);
             smp.top_p = req.top_p.unwrap_or(smp.top_p);
             if req.seed.is_some() { smp.rng = seed(req.seed); }
-            let n = room(e, ids.len(), req.max_tokens.unwrap_or(usize::MAX));
+            let n = room(e, ids.len(), req.max_tokens.unwrap_or(usize::MAX).min(s.max_tokens));
             if n == 0 { return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("prompt of {} tokens fills the context", ids.len()), "type": "invalid_request_error"}})); }
             let id = format!("chatcmpl-{i}");
             let chunk = |delta: serde_json::Value, finish: Option<&str>| json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": name,
@@ -939,8 +996,12 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                         write!(w, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), None))?;
                     }
                 }
+                let mut k = 0;
                 decode(r, tok, e.mtp() > 0, &mut smp, logits, n, &mut |t| {
                     s.stats.lock().unwrap().live_tokens += 1;
+                    // A client that left stops the reply (a stream notices on the next write; held text writes nothing).
+                    k += 1;
+                    if k % 16 == 0 && serve::gone(&w) { anyhow::bail!("client closed the connection"); }
                     let t = hold.push(t);
                     if req.stream && !t.is_empty() {
                         if !anth { write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?; } else { text_delta(&mut w, &mut opened, &t)?; }
@@ -957,15 +1018,22 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             // The next request starts from the saved history state or from scratch. A stream that already started is just cut off.
             let (out, stop) = match res {
                 Ok(x) => x,
-                Err(err) if !req.stream => return send(&mut w, "500 Internal Server Error", json!({"error": {"message": format!("{err:#}"), "type": "server_error"}})),
+                Err(err) if !req.stream && !serve::gone(&w) => return send(&mut w, "500 Internal Server Error", json!({"error": {"message": format!("{err:#}"), "type": "server_error"}})),
                 Err(err) => return Err(err),
             };
             // A malformed call goes out as plain text.
             let calls = if tools { tpl.parse_calls(&hold.text, &req.tools) } else { None };
             let ms = |d: Duration| d.as_secs_f64() * 1e3;
-            s.stats.lock().unwrap().record(serve::Last { at: created, model: name.into(), system_tokens: n_system, cached_tokens: cached,
+            let last = serve::Last { at: created, model: name.into(), system_tokens: n_system, cached_tokens: cached,
                 prompt_tokens: ids.len(), completion_tokens: out.len(), prefill_ms: ms(t1 - t0), decode_ms: ms(decoded),
-                finish: if calls.is_some() { "tool_calls" } else if stop { "stop" } else { "length" }.into() });
+                finish: if calls.is_some() { "tool_calls" } else if stop { "stop" } else { "length" }.into() };
+            if let Some(f) = &s.usage {
+                let mut v = json!(last);
+                v["key"] = who.name.clone().into();
+                // A failed write must not fail the reply; it is reported.
+                if let Err(err) = writeln!(f.lock().unwrap(), "{v}") { eprintln!("usage log: {err}"); }
+            }
+            s.stats.lock().unwrap().record(last);
             let calls_json = |(content, calls): &(String, Vec<(String, String)>), stream: bool| {
                 let c: Vec<_> = calls.iter().enumerate().map(|(k, (f, a))| {
                     let mut c = json!({"id": format!("call_{i}_{k}"), "type": "function", "function": {"name": f, "arguments": a}});
