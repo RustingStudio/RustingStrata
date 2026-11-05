@@ -1528,9 +1528,10 @@ template <int N, int S = N / 2> __device__ __forceinline__ float warp_sum_scatte
 __device__ __forceinline__ float rh(float x) { return h2f(f2h(x)); }
 template <int HD, int G>
 __device__ void attn_decode_llama(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
-                                  int nh, int nkv, float scale, int bx) {
+                                  const int* sel, int nh, int nkv, float scale, int bx) {
     constexpr int R = (HD + 255) / 256;
-    int n_pos = step[0] + 1, ns = gridDim.y, n_kv = (n_pos + 255) / 256 * 256;
+    if (sel && sel[0] < 0) sel = nullptr;
+    int n_pos = sel ? sel[0] : step[0] + 1, ns = gridDim.y, n_kv = (n_pos + 255) / 256 * 256;
     int nc = n_kv >= 512 ? LLAMA_NTH : 1, cs = (n_kv + nc - 1) / nc;
     int p0 = blockIdx.y * cs, p1 = blockIdx.y < nc ? min(n_pos, p0 + cs) : 0;
     int h0 = bx * G, g = h0 / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
@@ -1543,7 +1544,7 @@ __device__ void attn_decode_llama(const float* q, const u16* kc, const u16* vc, 
     for (int t0 = p0; t0 < p1; t0 += 32) {
         int n = min(32, p1 - t0);
         for (int j = w; j < n; j += nw) {
-            const u16* kr = kc + ((size_t)(t0 + j) * nkv + g) * HD;
+            const u16* kr = kc + ((size_t)(sel ? sel[1 + t0 + j] : t0 + j) * nkv + g) * HD;
             for (int i = 0; i < G; i++) {
                 float s = 0.0f;
                 for (int d = lane; d < HD; d += 32) s += sqh[i * HD + d] * h2f(kr[d]);
@@ -1553,7 +1554,7 @@ __device__ void attn_decode_llama(const float* q, const u16* kc, const u16* vc, 
         }
         __syncthreads();
         for (int j = 0; j < n; j++) {
-            const u16* vr = vc + ((size_t)(t0 + j) * nkv + g) * HD;
+            const u16* vr = vc + ((size_t)(sel ? sel[1 + t0 + j] : t0 + j) * nkv + g) * HD;
             for (int i = 0; i < G; i++) {
                 float s = ss[i][j], ms = 1.0f, vs = 1.0f;
                 if (s > m[i]) { ms = expf(m[i] - s); m[i] = s; for (int r = 0; r < R; r++) acc[i][r] = rh(acc[i][r] * ms); }
@@ -1583,15 +1584,18 @@ __device__ void attn_decode_llama(const float* q, const u16* kc, const u16* vc, 
 // CP (f16 cache, the GQA entry point, head_dim 128 or 256): each lane cp.asyncs its own slice of the next two chunks
 // into shared memory while the block works on this one. Only the lane that copies a slice reads it, so the copies need
 // no barriers of their own.
+// sel (QSA): when not null and sel[0] >= 0, the block attends to the sel[0] cells sel[1 ..] instead of 0 ..= step[0].
 template <int PER, int G, bool CP = false>
 __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
-                              int nh, int nkv, float scale, int bx) {
+                              const int* sel, int nh, int nkv, float scale, int bx) {
     constexpr int hd = PER * 32, C = 32, J = C / 8;  // positions per chunk, per warp
 #if LLAMA_Q8
-    return attn_decode_llama<hd, G>(q, kc, vc, part, step, nh, nkv, scale, bx);
+    return attn_decode_llama<hd, G>(q, kc, vc, part, step, sel, nh, nkv, scale, bx);
 #endif
     // At least 16 positions per split: short contexts use few blocks instead of many near-empty ones.
-    int n_pos = step[0] + 1, ns = gridDim.y, per_s = max((n_pos + ns - 1) / ns, 16);
+    if (sel && sel[0] < 0) sel = nullptr;
+    auto cell = [&](int i) { return sel ? sel[1 + i] : i; };
+    int n_pos = sel ? sel[0] : step[0] + 1, ns = gridDim.y, per_s = max((n_pos + ns - 1) / ns, 16);
     int p0 = blockIdx.y * per_s, p1 = min(n_pos, p0 + per_s);
     if (p0 >= n_pos) {  // empty split
         for (int i = 0; i < G; i++)
@@ -1614,7 +1618,7 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
         if (c0 < p1)
 #pragma unroll
             for (int j = 0; j < J; j++) {
-                size_t r = ((size_t)min(c0 + w * J + j, p1 - 1) * nkv + g) * hd + lane * PER;
+                size_t r = ((size_t)cell(min(c0 + w * J + j, p1 - 1)) * nkv + g) * hd + lane * PER;
                 u16 *dk = kb + ((b * 2) * C + w * J + j) * hd + lane * PER, *dv = dk + C * hd;
                 if constexpr (PER == 8) { cp_async16(dk, kc + r, true); cp_async16(dv, vc + r, true); }
                 else { cp_async8(dk, kc + r, true); cp_async8(dv, vc + r, true); }
@@ -1639,7 +1643,7 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
                 const u16* sk = kb + (((it % ST) * 2) * C + w * J + j) * hd + lane * PER;
                 ldh_raw<PER>(sk, kr[j]); ldh_raw<PER>(sk + C * hd, vr[j]);
             } else {
-                size_t r = ((size_t)min(t, p1 - 1) * nkv + g) * hd + lane * PER;
+                size_t r = ((size_t)cell(min(t, p1 - 1)) * nkv + g) * hd + lane * PER;
                 ldkv<PER>(kc, r, hd, kr[j]); ldkv<PER>(vc, r, hd, vr[j]);
             }
             for (int d = 0; d < PER / 2; d++) if (t >= p1) kr[j][d] = vr[j][d] = 0;
@@ -1713,10 +1717,10 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
 // so it is a separate entry point to keep attn_decode's occupancy. Both have one entry point per head size
 // (attn_decode_128, ...): a switch over hd would give every size the registers of the largest.
 #define ATT_ARGS const float* q, const u16* kc, const u16* vc, float* part, const int* step, int nh, int nkv, int hd, \
-                 float scale, int gq_min, int pz, int nt
-#define ATT_TOK int t = blockIdx.x % nt; q += (size_t)t * nh * hd; part += (size_t)t * pz; step += 2 * t;
-#define ATT_RUN(G) attn_decode_t<PER, G>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt)
-#define ATT_RUN_CP(G) attn_decode_t<PER, G, !KV_Q8 && (PER == 4 || PER == 8)>(q, kc, vc, part, step, nh, nkv, scale, blockIdx.x / nt)
+                 float scale, int gq_min, int pz, int nt, const int* sel, int sst
+#define ATT_TOK int t = blockIdx.x % nt; q += (size_t)t * nh * hd; part += (size_t)t * pz; step += 2 * t; if (sel) sel += (size_t)t * sst;
+#define ATT_RUN(G) attn_decode_t<PER, G>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt)
+#define ATT_RUN_CP(G) attn_decode_t<PER, G, !KV_Q8 && (PER == 4 || PER == 8)>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt)
 #define DEF_ATT(HD)                                                                                          \
     extern "C" __global__ void attn_decode_##HD(ATT_ARGS) {                                                  \
         constexpr int PER = HD / 32; ATT_TOK                                                                 \
@@ -1901,9 +1905,14 @@ extern "C" __global__ void moe_combine_seq(float* x, const float* ye, const floa
 // row-major; mma fragments come from ldmatrix (.trans for V).
 #define FA_BQ 64
 #define FA_BK 32
+// QSA mask (see qsa_select): whether query row t (mw words a row) sees key position `key`. The mask has rows for the
+// tile padding past T too (their output is dropped).
+__device__ __forceinline__ bool qsa_bit(const unsigned* qm, int mw, int t, int key) {
+    return (qm[(size_t)t * mw + (key >> 7)] >> ((key >> 2) & 31)) & 1;
+}
 template <int HD>
 __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, const u16* vc, const float* qg, float* out,
-                                               const int* step, int T, int nh, int nkv, float scale) {
+                                               const int* step, int T, int nh, int nkv, float scale, const unsigned* qm, int mw) {
     constexpr int PQ = HD + 8;
     extern __shared__ __align__(16) u16 fa_sm[];
     u16 *qs = fa_sm, *ks = qs + FA_BQ * PQ, *vs = ks + FA_BK * PQ;
@@ -1957,7 +1966,14 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
         cp_async_wait<1>();  // this K tile; its V tile may still be in flight
 #endif
         __syncthreads();
+        // QSA: the tile's 8 blocks are bits (k0 >> 2) & 31 .. + 7 of one mask word per row. A warp whose 16 rows see
+        // none of them skips the tile (its keys would add exactly nothing).
+        unsigned vis[2] = {0xff, 0xff};
+        if (qm)
+            for (int r = 0; r < 2; r++) vis[r] = (qm[(size_t)(qp[r] - pos0) * mw + (k0 >> 7)] >> ((k0 >> 2) & 31)) & 0xff;
+        bool skip = qm && !__any_sync(0xffffffff, (vis[0] | vis[1]) != 0);
         float s[FA_BK / 8][4] = {};
+        if (!skip)
 #pragma unroll
         for (int kk = 0; kk < HD; kk += 16) {
             u32 a[4], b[4];
@@ -1974,29 +1990,34 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
         if (k0 + FA_BK <= last) ld(k0 + FA_BK, ks, kc);
         else cp_async_commit();  // keep one group per tile for the waits
 #endif
+        if (!skip) {
         float mx[2] = {m[0], m[1]};
         for (int nt = 0; nt < FA_BK / 8; nt++)
             for (int e = 0; e < 4; e++) {
                 int key = k0 + nt * 8 + 2 * t4 + (e & 1), r = e >> 1;
-                if (key > qp[r]) s[nt][e] = -INFINITY;
+                if (key > qp[r] || !((vis[r] >> ((key >> 2) & 7)) & 1)) s[nt][e] = -INFINITY;
                 mx[r] = fmaxf(mx[r], s[nt][e]);
             }
-        float c[2];
+        float c[2], ms[2];
         for (int r = 0; r < 2; r++) {
             mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 1));
             mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 2));
-            c[r] = expf(m[r] - mx[r]);  // key 0 is in the first block, so mx is finite from then on
+            // mx is -inf while a QSA mask has hidden every key so far (key 0 is visible without one).
+            ms[r] = mx[r] == -INFINITY ? 0.0f : mx[r];
+            c[r] = expf(m[r] - ms[r]);
             m[r] = mx[r];
             l[r] *= c[r];
         }
         for (int nt = 0; nt < FA_BK / 8; nt++)
-            for (int e = 0; e < 4; e++) { float p = expf(s[nt][e] - m[e >> 1]); s[nt][e] = p; l[e >> 1] += p; }
+            for (int e = 0; e < 4; e++) { float p = expf(s[nt][e] - ms[e >> 1]); s[nt][e] = p; l[e >> 1] += p; }
 #pragma unroll
         for (int d = 0; d < HD / 8; d++) { o[d][0] *= c[0]; o[d][1] *= c[0]; o[d][2] *= c[1]; o[d][3] *= c[1]; }
+        }
 #if !KV_Q8
         cp_async_wait<1>();  // this V tile; the next K tile may still be in flight
         __syncthreads();
 #endif
+        if (!skip)
 #pragma unroll
         for (int kb = 0; kb < FA_BK / 16; kb++) {
             u32 a0 = h2pack(s[2 * kb][0], s[2 * kb][1]), a1 = h2pack(s[2 * kb][2], s[2 * kb][3]);
@@ -2037,7 +2058,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
 // rounds q and the softmax weights to f16). One query at a time per block; slow, for parity runs only.
 template <int HD>
 __device__ void attn_prefill_llama(const float* q, const u16* kc, const u16* vc, const float* qg, float* out,
-                                   const int* step, int T, int nh, int nkv, float scale) {
+                                   const int* step, int T, int nh, int nkv, float scale, const unsigned* qm, int mw) {
     constexpr int R = (HD + 127) / 128;
     extern __shared__ __align__(16) u16 fa_sm[];
     float *sq = (float*)fa_sm, *sc = sq + HD;
@@ -2055,11 +2076,12 @@ __device__ void attn_prefill_llama(const float* q, const u16* kc, const u16* vc,
                 float s = 0.0f;
                 for (int d = lane; d < HD; d += 32) s += sq[d] * h2f(kr[d]);
                 s = warp_sum(s);
-                if (lane == 0) sc[j] = s * scale;
+                if (lane == 0) sc[j] = qm && !qsa_bit(qm, mw, t, k0 + j) ? -INFINITY : s * scale;
             }
             __syncthreads();
             float mn = m;
             for (int j = 0; j < n; j++) mn = fmaxf(mn, sc[j]);
+            if (mn == -INFINITY) continue;  // every key so far hidden by the QSA mask
             float cs = expf(m - mn);
             l *= cs;
             for (int r = 0; r < R; r++) acc[r] *= cs;
@@ -2080,8 +2102,147 @@ __device__ void attn_prefill_llama(const float* q, const u16* kc, const u16* vc,
 }
 #define DEF_FA(HD) \
     extern "C" __global__ void __launch_bounds__(128) attn_prefill_##HD(const float* q, const u16* kc, const u16* vc, \
-            const float* qg, float* out, const int* step, int T, int nh, int nkv, float scale) {                      \
-        if (LLAMA_Q8) attn_prefill_llama<HD>(q, kc, vc, qg, out, step, T, nh, nkv, scale);                           \
-        else attn_prefill_t<HD>(q, kc, vc, qg, out, step, T, nh, nkv, scale);                                       \
+            const float* qg, float* out, const int* step, int T, int nh, int nkv, float scale, const unsigned* qm, int mw) { \
+        if (LLAMA_Q8) attn_prefill_llama<HD>(q, kc, vc, qg, out, step, T, nh, nkv, scale, qm, mw);                   \
+        else attn_prefill_t<HD>(q, kc, vc, qg, out, step, T, nh, nkv, scale, qm, mw);                               \
     }
 DEF_FA(64) DEF_FA(128) DEF_FA(256)
+
+// ---- QSA sparse attention indexer (qwen4exp, see Model::qsa) ----
+// Raw indexer keys (128 dims) are pooled per block of 4 positions: mean, rms norm, NEOX rope at the block's first
+// position. A query row scores each complete block by sum over its 4 heads of relu(q . k) / sqrt(128) and attends to
+// the top `top` blocks plus the tail of its incomplete block; rows with at most `top` complete blocks stay dense.
+#define QSA_D 128
+#define QSA_H 4
+
+// grid = t / 4 + 1, block = 128 (thread d owns dim d). t raw keys at positions p0 = step[0] ..; CTA i pools block
+// p0 / 4 + i if this call completes it. Members before p0 come from `ring` (the raw keys of the last incomplete block,
+// slot = position % 4); CTA 0, the only one reading the ring, then stores the keys of this call's incomplete block.
+extern "C" __global__ void qsa_pool(const float* ik, float* ring, float* pool, const float* w, const int* step, int t,
+                                    int n_rot, float base, float eps) {
+    int d = threadIdx.x, p0 = step[0], b = p0 / 4 + blockIdx.x;
+    __shared__ float sx[QSA_D];
+    if (4 * b + 4 <= p0 + t) {
+        float x = 0.0f;
+        for (int m = 0; m < 4; m++) {
+            int p = 4 * b + m;
+            x += (p >= p0 ? ik[(size_t)(p - p0) * QSA_D + d] : ring[(p & 3) * QSA_D + d]) / 4.0f;
+        }
+        float ss = block_sum(x * x);
+        sx[d] = x * (1.0f / sqrtf(ss / QSA_D + eps)) * w[d];
+        __syncthreads();
+        int half = n_rot / 2, i = d < half ? d : d - half;
+        float y = sx[d];
+        if (d < n_rot) {
+            double theta = (double)(4 * b) * pow((double)base, -2.0 * i / n_rot);
+            float s = (float)sin(theta), c = (float)cos(theta);
+            y = d < half ? sx[d] * c - sx[d + half] * s : sx[d - half] * s + sx[d] * c;
+        }
+        pool[(size_t)b * QSA_D + d] = y;
+    }
+    if (blockIdx.x == 0)
+        for (int p = max(p0, (p0 + t) / 4 * 4); p < p0 + t; p++) ring[(p & 3) * QSA_D + d] = ik[(size_t)(p - p0) * QSA_D + d];
+}
+
+// grid = (64, ceil(rows / 8)), block = 256: warp w of CTA (x, y) scores blocks x * 8 + w, + 512, ... for query rows
+// 8y .. 8y + 7 (row r at position step[0] + r0 + r, QSA_H normed and roped heads of QSA_D at q + r * QSA_H * QSA_D)
+// into score[r * nbs + b]; the 8 rows share each pool read.
+extern "C" __global__ void qsa_score(const float* q, const float* pool, float* score, const int* step, int r0, int rows,
+                                     int nbs, int top) {
+    __shared__ float4 sq[8 * QSA_H * QSA_D / 4];
+    int r1 = blockIdx.y * 8, n = min(8, rows - r1), p0 = step[0] + r0 + r1, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int nbm = (p0 + n) / 4;  // blocks of the tile's last row
+    if (nbm <= top) return;
+    for (int i = threadIdx.x; i < n * QSA_H * QSA_D / 4; i += blockDim.x) sq[i] = ((const float4*)(q + (size_t)r1 * QSA_H * QSA_D))[i];
+    __syncthreads();
+    for (int b = blockIdx.x * 8 + w; b < nbm; b += gridDim.x * 8) {
+        float4 k = *(const float4*)(pool + (size_t)b * QSA_D + 4 * lane);
+        for (int j = 0; j < n; j++) {
+            int nb = (p0 + j + 1) / 4;
+            if (nb <= top || b >= nb) continue;
+            float s = 0.0f;
+            for (int h = 0; h < QSA_H; h++) {
+                float4 qv = sq[(j * QSA_H + h) * (QSA_D / 4) + lane];
+                s += fmaxf(warp_sum(qv.x * k.x + qv.y * k.y + qv.z * k.z + qv.w * k.w), 0.0f);
+            }
+            if (lane == 0) score[(size_t)(r1 + j) * nbs + b] = s / sqrtf((float)QSA_D);
+        }
+    }
+}
+
+// Exclusive prefix sum over the block (1024 threads); `tot` gets the total.
+__device__ int block_scan(int v, int* tot) {
+    __shared__ int ws[32];
+    int lane = threadIdx.x & 31, w = threadIdx.x >> 5, x = v;
+    for (int o = 1; o < 32; o <<= 1) { int y = __shfl_up_sync(0xffffffff, x, o); if (lane >= o) x += y; }
+    __syncthreads();
+    if (lane == 31) ws[w] = x;
+    __syncthreads();
+    if (w == 0) {
+        int s = ws[lane];
+        for (int o = 1; o < 32; o <<= 1) { int y = __shfl_up_sync(0xffffffff, s, o); if (lane >= o) s += y; }
+        ws[lane] = s;
+    }
+    __syncthreads();
+    *tot = ws[31];
+    return x - v + (w ? ws[w - 1] : 0);
+}
+
+// grid = rows, block = 1024: the top `top` blocks of row r by score (ties to the lower block), in block order.
+// mw = 0: sel row r (sst ints) = [cell count, cells...] with the 4 cells of each block, then the tail, or count -1
+// for a dense row. mw > 0: bit b of mask row r (mw words) set for each selected block and the tail block (all bits
+// for a dense row); the caller's causal check hides the cells past the row's position.
+extern "C" __global__ void __launch_bounds__(1024) qsa_select(const float* score, int* sel, unsigned* mask, const int* step,
+                                                              int r0, int nbs, int top, int sst, int mw) {
+    int r = blockIdx.x, pos = step[0] + r0 + r, nb = (pos + 1) / 4, tid = threadIdx.x;
+    const unsigned* u = (const unsigned*)score + (size_t)r * nbs;  // scores are >= +0: their bits order as the values
+    sel += (size_t)r * sst; mask += (size_t)r * mw;
+    if (nb <= top) {
+        if (mw) for (int i = tid; i < mw; i += blockDim.x) mask[i] = ~0u;
+        else if (tid == 0) sel[0] = -1;
+        return;
+    }
+    // Radix select, 8 bits a pass from the top: thr = the top-th largest bits, kk = how many equal to thr to take.
+    __shared__ int hist[256];
+    __shared__ unsigned sthr;
+    __shared__ int skk;
+    unsigned thr = 0, hi = 0;
+    int kk = top;
+    for (int sh = 24; sh >= 0; sh -= 8) {
+        for (int i = tid; i < 256; i += blockDim.x) hist[i] = 0;
+        __syncthreads();
+        for (int i = tid; i < nb; i += blockDim.x) if ((u[i] & hi) == thr) atomicAdd(&hist[(u[i] >> sh) & 255], 1);
+        __syncthreads();
+        if (tid == 0) {
+            int bin = 255;
+            for (; bin > 0 && kk > hist[bin]; bin--) kk -= hist[bin];
+            sthr = thr | (unsigned)bin << sh; skk = kk;
+        }
+        __syncthreads();
+        thr = sthr; kk = skk; hi |= 255u << sh;
+        __syncthreads();
+    }
+    if (mw) {
+        for (int i = tid; i < mw; i += blockDim.x) mask[i] = 0;
+        __syncthreads();
+    }
+    // Ordered compaction: thread tid walks blocks [tid * cs, ...) knowing the selections before its chunk.
+    int cs = (nb + blockDim.x - 1) / blockDim.x, i0 = min(nb, tid * cs), i1 = min(nb, i0 + cs), gt = 0, eq = 0, tg, te;
+    for (int i = i0; i < i1; i++) { gt += u[i] > thr; eq += u[i] == thr; }
+    gt = block_scan(gt, &tg);
+    eq = block_scan(eq, &te);
+    for (int i = i0; i < i1; i++) {
+        bool take = u[i] > thr || (u[i] == thr && eq < kk);
+        if (take) {
+            int o = gt + min(eq, kk);
+            if (mw) atomicOr(&mask[i >> 5], 1u << (i & 31));
+            else for (int m = 0; m < 4; m++) sel[1 + 4 * o + m] = 4 * i + m;
+        }
+        gt += u[i] > thr; eq += u[i] == thr;
+    }
+    if (mw) { if (tid == 0) atomicOr(&mask[nb >> 5], 1u << (nb & 31)); }
+    else {
+        for (int p = 4 * nb + tid; p <= pos; p += blockDim.x) sel[1 + 4 * top + p - 4 * nb] = p;
+        if (tid == 0) sel[0] = 4 * top + pos + 1 - 4 * nb;
+    }
+}

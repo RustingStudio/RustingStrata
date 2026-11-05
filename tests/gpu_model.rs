@@ -348,3 +348,46 @@ fn qwen4exp_gpu_matches_cpu() {
         }
     }
 }
+
+/// QSA sparse attention on the GPU (top_k lowered to 8 cells so a short prompt runs sparse) against the CPU reference:
+/// token by token, a prefill in chunks of 4 (the incomplete block crosses chunks) and in one chunk, each followed by
+/// a 4-row verify. Near-tied block scores can pick differently, so the bound is on the mean error: 0.037 of the logit
+/// range on CUDA, against 0.039 for dense attention (top_k 0) on the same prompt.
+#[test]
+fn qwen4exp_qsa_gpu_matches_cpu() {
+    let _gpu = common::gpu_lock();
+    let p = std::path::Path::new("/mnt/ollama/qwen4exp/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf");
+    if !p.exists() { return }
+    let g = Gguf::open(p).unwrap();
+    let mut m = Model::load(&g).unwrap();
+    m.cfg.idx_top_k = 8;
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let ids = tok.encode("The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. \
+        Once upon a time, in a small village").unwrap();
+    let mut st = State::new(&m.cfg);
+    let want: Vec<Vec<f32>> = ids.iter().map(|&t| m.step(&mut st, t)).collect();
+    let (k, n) = (ids.len() - 4, ids.len());
+    for chunk in [4, 64] {
+        for (bk, gpu) in common::backends() {
+            let mut gm = GpuModel::load(&m, gpu, 256, chunk, 512 << 20, 0).unwrap();
+            let mut got: Vec<Vec<f32>> = ids.iter().map(|&t| gm.step(t).unwrap()).collect();
+            let mut rows: Vec<usize> = (0..n).collect();
+            gm.reset().unwrap();
+            gm.short = 0;
+            got.push(gm.prefill(&ids[..k]).unwrap());
+            got.extend(gm.verify(&ids[k..]).unwrap());
+            rows.extend(k - 1..n);
+            let mut err = 0f32;
+            for (i, (g, &r)) in got.iter().zip(&rows).enumerate() {
+                let w = &want[r];
+                let range = w.iter().fold(f32::MIN, |a, &b| a.max(b)) - w.iter().fold(f32::MAX, |a, &b| a.min(b));
+                let diff = g.iter().zip(w).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+                eprintln!("{bk} chunk {chunk} row {i} (pos {r}): argmax {} vs {}, max |dlogit| {diff:.4} (range {range:.2})",
+                          ops::argmax(g), ops::argmax(w));
+                assert!(diff <= 0.2 * range, "row {i}: {diff} vs range {range}");
+                err += diff / range / got.len() as f32;
+            }
+            assert!(err < 0.05, "{bk} chunk {chunk}: mean relative error {err}");
+        }
+    }
+}
