@@ -1,12 +1,29 @@
 # Write dequant fixtures from a real GGUF using gguf-py's numpy reference (independent of our Rust port).
 # Usage: python -I tools/gen_fixtures.py <model.gguf> <out_dir>
-import sys, pathlib, numpy as np
-sys.path.insert(0, str(pathlib.Path.home() / "llama.cpp/gguf-py"))
-from gguf import GGUFReader, GGMLQuantizationType as Q
-from gguf.quants import dequantize
-from gguf.constants import GGML_QUANT_SIZES
+import pathlib
+import sys
 
-WANT = {Q.F32, Q.BF16, Q.Q8_0, Q.Q2_K, Q.Q3_K, Q.Q4_K, Q.Q5_K, Q.Q6_K, Q.IQ2_XS, Q.IQ3_XXS, Q.IQ4_XS}
+import numpy as np
+
+sys.path.insert(0, str(pathlib.Path.home() / "llama.cpp/gguf-py"))
+from gguf import GGMLQuantizationType as Q
+from gguf import GGUFReader
+from gguf.constants import GGML_QUANT_SIZES
+from gguf.quants import dequantize
+
+WANT = {
+    Q.F32,
+    Q.BF16,
+    Q.Q8_0,
+    Q.Q2_K,
+    Q.Q3_K,
+    Q.Q4_K,
+    Q.Q5_K,
+    Q.Q6_K,
+    Q.IQ2_XS,
+    Q.IQ3_XXS,
+    Q.IQ4_XS,
+}
 r = GGUFReader(sys.argv[1])
 out = pathlib.Path(sys.argv[2])
 out.mkdir(parents=True, exist_ok=True)
