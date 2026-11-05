@@ -421,6 +421,14 @@ impl Vk {
             eprintln!("note: Vulkan conditional rendering failed its self-test; a CPU expert worker that is slow on \
                 a layer will be an error");
         }
+        // One line with what the device has, so a pasted bug report shows it.
+        let mut drv = vk::PhysicalDeviceDriverProperties::default();
+        unsafe { v.0.instance.get_physical_device_properties2(v.0.pd, &mut vk::PhysicalDeviceProperties2::default().push_next(&mut drv)) };
+        let s = |c: &[std::ffi::c_char]| unsafe { std::ffi::CStr::from_ptr(c.as_ptr()) }.to_string_lossy().into_owned();
+        let yn = |b: bool| if b { "yes" } else { "no" };
+        let amd = if v.0.amd_plain || v.0.amd_coherent { format!(", device-coherent memory {}", yn(v.0.amd_coherent)) } else { String::new() };
+        eprintln!("vulkan: {name} ({} {}){amd}, cooperative matrix f16 {} int8 {}, conditional rendering {}", s(&drv.driver_name),
+            s(&drv.driver_info), yn(v.0.coop), yn(v.0.coop_i8), yn(v.0.cr.is_some() && !v.0.st().no_cond));
         Ok(v)
     }
 
