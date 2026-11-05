@@ -105,6 +105,13 @@ impl Runner<'_> {
     }
     /// Seconds spent waiting on CPU experts so far (GPU only).
     fn cpu_secs(&self) -> f64 { if let Runner::Gpu(g) = self { g.parts().map(|p| p.cpu_time.as_secs_f64()).sum() } else { 0.0 } }
+    /// Split model: seconds per part but the last (forward until its GPU is done, copy to the next part).
+    fn split_secs(&self) -> Vec<(f64, f64)> {
+        let Runner::Gpu(g) = self else { return vec![] };
+        let mut v: Vec<_> = g.parts().map(|p| (p.split_time.0.as_secs_f64(), p.split_time.1.as_secs_f64())).collect();
+        v.pop();
+        v
+    }
     fn finish(&self) -> anyhow::Result<()> {
         if let Runner::Gpu(g) = self {
             let sum = |f: &dyn Fn(&GpuModel) -> usize| g.parts().map(f).sum::<usize>();
@@ -356,13 +363,18 @@ fn main() -> anyhow::Result<()> {
             let t0 = Instant::now();
             let logits = r.prefill(&ids)?;
             let t1 = Instant::now();
-            let cpu0 = r.cpu_secs();
+            let (cpu0, split0) = (r.cpu_secs(), r.split_secs());
             let cap = room(&engine, ids.len(), n);
             let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut engine.sampler(), logits, cap, &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
             let (pp, tg) = ((t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
             if out.len() == cap && cap < n { eprint!("\n(stopped: the context is full at {} tokens; raise --ctx)", engine.ctx); }
             eprintln!("\nprompt {} tok {:.2} tok/s | gen {} tok {:.2} tok/s", ids.len(), ids.len() as f64 / pp, out.len(), out.len() as f64 / tg);
             if engine.gpu { eprintln!("CPU expert compute, share of gen time: {:.1}%", 100.0 * (r.cpu_secs() - cpu0) / tg); }
+            let ms = |s: f64| 1e3 * s / out.len().max(1) as f64;
+            for (i, ((a, b), (a0, b0))) in r.split_secs().into_iter().zip(split0).enumerate() {
+                eprintln!("device {i}: {:.2} ms/token forward, {:.2} ms/token copy to the next device", ms(a - a0), ms(b - b0));
+            }
+            if !r.split_secs().is_empty() { eprintln!("gen total {:.2} ms/token", ms(tg)); }
             r.finish()?;
         }
         Cmd::Perplexity { model, file, ctx_len: n, chunks, kld_base, mut engine } => {
