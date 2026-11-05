@@ -41,8 +41,19 @@ What changes with `--parallel N`:
   35B model kept 7008 of its 10240 experts resident.
 - **More than 4 slots** do not raise the total, because one pass decodes at most 4 requests. They let more users
   stream at the same time instead of waiting in the queue, each at a lower speed.
-- **Prefill.** A new request's prompt is prefilled in one piece while the other requests wait, so a long prompt
-  pauses everyone's stream for its prefill time.
+- **Prefill.** Prompts are prefilled one at a time, in chunks (`--chunk`, from `strata calibrate`). After each
+  chunk the requests that are decoding run for as long as the chunk took, so a long prompt and the streams share
+  the GPU evenly: the prompt takes about twice as long to its first token, and each stream pauses for one chunk at a
+  time. A smaller `--chunk` gives shorter pauses but a slower prefill. A 10K-token prompt that arrives while 3
+  requests stream, on the 3060 with `--parallel 4`:
+
+  | `--chunk` | Longest pause of a stream | First token of the long prompt |
+  |---|---|---|
+  | 4096 (calibrated) | 2.2 s | 10.2 s |
+  | 1024 | 0.7 s | 13.9 s |
+  | 512 | 0.4 s | 16.4 s |
+
+  Prefilled in one piece, the same prompt took 6.5 s to its first token, and the three streams stopped for all of it.
 - **MTP drafting is off** (`--mtp` is ignored), and the server uses one GPU (`--device` with one card). For several
   GPUs, run one server per card (see [Several GPUs](#several-gpus)).
 - **Conversation cache.** Each slot keeps the state of its last conversation, and a request that continues a

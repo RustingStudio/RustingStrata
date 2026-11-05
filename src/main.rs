@@ -109,8 +109,8 @@ struct Hosting {
     #[arg(long)]
     max_tokens: Option<usize>,
     /// Requests answered at once (GPU, one device): each gets its own slot of `--ctx` tokens of KV cache, and the
-    /// slots that decode share each forward, up to 4 at a time. A prompt's prefill holds up the others' decoding
-    /// while it runs. MTP drafting is off.
+    /// slots that decode share each forward, up to 4 at a time. Between the chunks of a prompt's prefill the others
+    /// decode for as long as the chunk took (a smaller `--chunk` gives shorter pauses). MTP drafting is off.
     #[arg(long, default_value_t = 1)]
     parallel: usize,
 }
@@ -864,13 +864,68 @@ impl Drop for Client {
     fn drop(&mut self) { if let Some(s) = self.slot { let _ = self.tx.send(Job::Done(s)); } }
 }
 
+/// The model thread's view of the slots under `--parallel` (`Serving::serve_slots`).
+#[derive(Default)]
+struct Sched {
+    /// Slots held by a request, and when each was last freed (the least recently used goes first).
+    held: Vec<bool>,
+    freed: Vec<u64>,
+    tick: u64,
+    /// Chat jobs waiting for a free slot, and decode steps waiting for a forward (since the first came).
+    chats: std::collections::VecDeque<Job>,
+    steps: Vec<(usize, u32, std::sync::mpsc::Sender<anyhow::Result<Vec<f32>>>)>,
+    since: Option<Instant>,
+}
+
+impl Sched {
+    /// How long a decode step waits for the other decoding slots' steps to share its forward.
+    const GATHER: Duration = Duration::from_millis(2);
+
+    fn decoding(&self) -> usize { self.held.iter().filter(|&&h| h).count() }
+
+    /// How long to wait for jobs: until the steps of all decoding slots are in, at most `GATHER` after the first.
+    fn wait(&self) -> Duration {
+        match self.since {
+            Some(t) if self.steps.len() < self.decoding() => Self::GATHER.saturating_sub(t.elapsed()),
+            Some(_) => Duration::ZERO,
+            None => Duration::from_millis(5),
+        }
+    }
+
+    /// Take the jobs that come within `wait`.
+    fn take(&mut self, jobs: &std::sync::mpsc::Receiver<Job>, wait: Duration) {
+        let mut got: Vec<Job> = jobs.recv_timeout(wait).into_iter().collect();
+        got.extend(jobs.try_iter());
+        for j in got {
+            match j {
+                Job::Done(s) => { self.held[s] = false; self.tick += 1; self.freed[s] = self.tick; }
+                Job::Step { slot, token, back } => { self.since.get_or_insert_with(Instant::now); self.steps.push((slot, token, back)); }
+                c => self.chats.push_back(c),
+            }
+        }
+    }
+
+    fn ready(&self) -> bool { self.since.is_some_and(|t| self.steps.len() >= self.decoding() || t.elapsed() >= Self::GATHER) }
+
+    /// One forward over the oldest steps (with more than `TMAX` slots decoding, each waits its turn), in slot order
+    /// (fewer graphs to capture).
+    fn run(&mut self, g: &mut GpuModel) {
+        let mut batch: Vec<_> = self.steps.drain(..self.steps.len().min(rusting_strata::cpu_worker::TMAX)).collect();
+        batch.sort_by_key(|s| s.0);
+        self.since = if self.steps.is_empty() { None } else { Some(Instant::now() - Self::GATHER) };
+        match g.step_rows(&batch.iter().map(|b| (b.0, b.1)).collect::<Vec<_>>()) {
+            Ok(rows) => for (b, l) in batch.into_iter().zip(rows) { let _ = b.2.send(Ok(l)); },
+            Err(err) => for b in batch { let _ = b.2.send(Err(anyhow::anyhow!("{err:#}"))); },
+        }
+    }
+}
+
 impl Serving {
     /// `serve` with several slots (`--parallel`): each request runs `handle` on its own thread and sends its model
-    /// work here, where prefills run one at a time and the decode steps of up to `TMAX` slots share a forward.
+    /// work here, where prefills run one at a time (the decoding slots run between its chunks) and the decode steps of
+    /// up to `TMAX` slots share a forward.
     fn serve_slots(&self, l: &mut Loaded, e: &Engine) -> Option<(PathBuf, TcpStream)> {
         use std::sync::mpsc::{TryRecvError, channel};
-        // How long a decode step waits for the other decoding slots' steps to share its forward.
-        const GATHER: Duration = Duration::from_millis(2);
         let Loaded { r, tok, tpl, name, path } = l;
         let Runner::Gpu(g) = r else { unreachable!() };
         let (tx, jobs) = channel::<Job>();
@@ -880,12 +935,8 @@ impl Serving {
         std::thread::scope(|sc| {
             // Owned here, so that a panic drops the queued jobs' reply channels and the request threads end (the
             // scope then joins them and the panic goes on).
-            let jobs = jobs;
-            // Slots held by a request, and when each was last freed (the least recently used goes first).
-            let (mut held, mut freed, mut tick) = (vec![false; n], vec![0u64; n], 0u64);
-            let mut chats = std::collections::VecDeque::new();
-            let mut steps: Vec<(usize, u32, std::sync::mpsc::Sender<anyhow::Result<Vec<f32>>>)> = vec![];
-            let (mut open, mut since) = (true, None::<Instant>);
+            let (jobs, mut s) = (jobs, Sched { held: vec![false; n], freed: vec![0; n], ..Default::default() });
+            let mut open = true;
             loop {
                 while open && next.lock().unwrap().is_none() {
                     match rx.try_recv() {
@@ -908,51 +959,36 @@ impl Serving {
                     }
                 }
                 if (!open || next.lock().unwrap().is_some()) && live.load(Relaxed) == 0 { break; }
-                let decoding = held.iter().filter(|&&h| h).count();
-                let wait = match since {
-                    Some(t) if steps.len() < decoding => GATHER.saturating_sub(t.elapsed()),
-                    Some(_) => Duration::ZERO,
-                    None => Duration::from_millis(5),
-                };
-                let mut got: Vec<Job> = jobs.recv_timeout(wait).into_iter().collect();
-                got.extend(jobs.try_iter());
-                for j in got {
-                    match j {
-                        Job::Done(s) => { held[s] = false; tick += 1; freed[s] = tick; }
-                        Job::Step { slot, token, back } => { since.get_or_insert_with(Instant::now); steps.push((slot, token, back)); }
-                        c => chats.push_back(c),
-                    }
-                }
+                s.take(&jobs, s.wait());
                 // One prefill between decode steps, in the free slot whose saved state this prompt extends the
                 // furthest, else the least recently used one.
-                // ponytail: a prefill runs whole, so a long prompt stalls the decoding slots; chunk it between
-                // decode steps if that matters.
-                if let Some(s) = (0..n).filter(|&s| !held[s]).max_by_key(|&s| {
-                    let reuse = match chats.front() {
-                        Some(Job::Chat { ids, keep, owner, .. }) => { let (sv, o) = g.slot_saved(s); if o == *owner && ids[..*keep].starts_with(sv) { sv.len() } else { 0 } }
+                if let Some(sl) = (0..n).filter(|&i| !s.held[i]).max_by_key(|&i| {
+                    let reuse = match s.chats.front() {
+                        Some(Job::Chat { ids, keep, owner, .. }) => { let (sv, o) = g.slot_saved(i); if o == *owner && ids[..*keep].starts_with(sv) { sv.len() } else { 0 } }
                         _ => 0,
                     };
-                    (reuse, std::cmp::Reverse(freed[s]))
-                }) && let Some(Job::Chat { ids, sys, keep, owner, back }) = chats.pop_front() {
-                    g.use_slot(s);
+                    (reuse, std::cmp::Reverse(s.freed[i]))
+                }) && let Some(Job::Chat { ids, sys, keep, owner, back }) = s.chats.pop_front() {
+                    g.use_slot(sl);
                     g.owner = owner;
-                    let r = g.prefill_cached(&ids, sys, keep);
-                    held[s] = r.is_ok();
-                    let _ = back.send(r.map(|(l, u)| (l, u, s)));
+                    // Between two prefill chunks the decoding slots run for as long as the chunk before took, so a long
+                    // prompt shares the GPU with them evenly instead of stalling them.
+                    // ponytail: an even share; weigh it (or cap the prompt's chunk) if first-token time matters more.
+                    let mut t0 = Instant::now();
+                    let r = g.prefill_cached_with(&ids, sys, keep, &mut |g| {
+                        let end = Instant::now() + t0.elapsed();
+                        while s.decoding() > 0 && Instant::now() < end {
+                            s.take(&jobs, s.wait().min(end.saturating_duration_since(Instant::now())));
+                            if s.ready() { s.run(g); }
+                        }
+                        t0 = Instant::now();
+                        Ok(())
+                    });
+                    s.held[sl] = r.is_ok();
+                    let _ = back.send(r.map(|(l, u)| (l, u, sl)));
                     gpu_model_stats(g, &mut self.stats.lock().unwrap());
                 }
-                let ready = since.is_some_and(|t| steps.len() >= held.iter().filter(|&&h| h).count() || t.elapsed() >= GATHER);
-                if ready {
-                    // The oldest steps first (with more than `TMAX` slots decoding, each waits its turn), in slot order
-                    // (fewer graphs to capture).
-                    let mut batch: Vec<_> = steps.drain(..steps.len().min(rusting_strata::cpu_worker::TMAX)).collect();
-                    batch.sort_by_key(|s| s.0);
-                    since = if steps.is_empty() { None } else { Some(Instant::now() - GATHER) };
-                    match g.step_rows(&batch.iter().map(|b| (b.0, b.1)).collect::<Vec<_>>()) {
-                        Ok(rows) => for (b, l) in batch.into_iter().zip(rows) { let _ = b.2.send(Ok(l)); },
-                        Err(err) => for b in batch { let _ = b.2.send(Err(anyhow::anyhow!("{err:#}"))); },
-                    }
-                }
+                if s.ready() { s.run(g); }
             }
         });
         next.into_inner().unwrap()
