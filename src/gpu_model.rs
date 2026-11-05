@@ -113,6 +113,9 @@ pub struct GpuModel<'a> {
     pub resumed: std::cell::Cell<usize>,
     /// MTP drafts (made, accepted).
     pub drafts: (usize, usize),
+    /// Split model, all parts but the last: seconds from the start of this part's forward until its GPU is done, and
+    /// for the copy of its hidden rows to the next part.
+    pub split_time: (Duration, Duration),
     /// MTP drafts per speculative step (0 = no draft head). May be lowered after `load`, never raised.
     pub k: usize,
     /// Prompts shorter than this go through `step` instead of the batched prefill.
@@ -291,7 +294,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], sys: None, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), k, short: 32, pf, mtp, first: range.start, next: None })
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], sys: None, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None })
     }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
@@ -320,9 +323,11 @@ impl<'a> GpuModel<'a> {
     /// Run the forward of `nt` tokens (input in `x`, per-token values in `step_buf`) through this part and the
     /// parts after it. The last part's forward is left running, as `run` leaves it.
     fn pass(&mut self, nt: usize) -> anyhow::Result<()> {
+        let t0 = std::time::Instant::now();
         self.run(nt)?;
         if self.next.is_none() { return Ok(()); }
         self.gpu.sync()?;
+        let t1 = std::time::Instant::now();
         self.finish(nt, gq_min(self.pos, nt), None)?;
         let c = &self.m.cfg;
         let xs = self.gpu.get::<f32>(&self.x, 0, nt * c.hc_n.max(1) * c.n_embd)?;
@@ -333,6 +338,8 @@ impl<'a> GpuModel<'a> {
         let seq = nx.worker.as_mut().map_or(0, |w| w.begin());
         let steps: Vec<i32> = (0..nt).flat_map(|t| [(nx.pos + t) as i32, seq as i32]).collect();
         nx.gpu.put(&steps, &nx.step_buf, 0)?;
+        self.split_time.0 += t1 - t0;
+        self.split_time.1 += t1.elapsed();
         nx.pass(nt)
     }
 
