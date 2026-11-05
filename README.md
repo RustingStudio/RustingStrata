@@ -107,9 +107,9 @@ prefilled again. Strata keeps those blocks by default, so a long agent session p
 A request with another history (an agent's side request for a title or a summary) parks the conversation's state in
 host memory (`--cache-ram`, 4096 MB by default), and the next request that continues it takes it back instead of
 prefilling it again.
-The server has one key and treats all clients as one user: the cached-token count and the response time show
-whether the previous request started with the same messages, so do not share one server between people who must
-not learn each other's prompts.
+For a server that other people use (customer keys in a file, a usage log for billing, `/health`, TLS through a
+reverse proxy, systemd), see [docs/HOSTING.md](docs/HOSTING.md). Each customer key reuses only its own cached
+conversations; all requests under one key count as one user.
 
 Useful flags: `--ctx` (KV cache size, default 4096), `--mtp [N]` (speculative decoding with the model's draft
 head; greedy tokens stay the same, sampling keeps its distribution), `--chunk`, `--threads`, `--vram-margin`. On a

@@ -109,11 +109,11 @@ impl GpuModel<'_> {
     /// prompt does not cost the main conversation its cache. Returns the logits and the tokens reused.
     pub fn prefill_cached(&mut self, tokens: &[u32], sys: usize, keep: usize) -> anyhow::Result<(Vec<f32>, usize)> {
         anyhow::ensure!(sys <= keep && keep < tokens.len(), "prefill_cached: sys {sys}, keep {keep} of {} tokens", tokens.len());
-        let hit = self.saved_ids.len();
-        let stashed = self.sys.as_ref().map_or(0, |s| if tokens[..keep].starts_with(&s.3) { s.3.len() } else { 0 });
-        let extends = hit > 0 && hit >= stashed && tokens[..keep].starts_with(&self.saved_ids);
+        let (hit, own) = (self.saved_ids.len(), self.owner);
+        let stashed = self.sys.as_ref().filter(|_| self.sys_owner == own).map_or(0, |s| if tokens[..keep].starts_with(&s.3) { s.3.len() } else { 0 });
+        let extends = hit > 0 && hit >= stashed && self.saved_owner == own && tokens[..keep].starts_with(&self.saved_ids);
         // The longest parked state this prompt continues, if it beats the saved one and the stash.
-        let best = self.parked.iter().enumerate().filter(|(_, p)| tokens[..keep].starts_with(&p.ids))
+        let best = self.parked.iter().enumerate().filter(|(_, p)| p.owner == own && tokens[..keep].starts_with(&p.ids))
             .max_by_key(|(_, p)| p.ids.len()).map(|(i, p)| (i, p.ids.len()))
             .filter(|&(_, n)| n > stashed && !(extends && n <= hit));
         let reused = if let Some((i, n)) = best {
@@ -142,7 +142,7 @@ impl GpuModel<'_> {
         if keep > from {
             self.prefill(&tokens[from..keep])?;
             self.save_state()?;
-            self.saved_ids = tokens[..keep].to_vec();
+            (self.saved_ids, self.saved_owner) = (tokens[..keep].to_vec(), own);
         }
         Ok((self.prefill(&tokens[keep..])?, reused))
     }

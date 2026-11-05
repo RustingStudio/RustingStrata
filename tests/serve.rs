@@ -1,5 +1,5 @@
 use rusting_strata::chat::{Hold, Json, Msg, Template};
-use rusting_strata::serve::{chat_request, host_ok, key_ok, list_models, messages_body, read_request};
+use rusting_strata::serve::{Keys, Who, chat_request, host_ok, key_ok, list_models, messages_body, read_request};
 
 /// Every request in tests/fixtures/chat renders byte-identical to llama.cpp's Jinja rendering of the model's own
 /// template (tools/gen_chat_fixtures.py); a request llama.cpp rejects must be rejected too.
@@ -260,4 +260,22 @@ fn stats_keep_totals_across_loads() {
     assert!(s.loading && s.vram.is_none() && s.model.as_deref() == Some("b"));
     s.unload(None);
     assert!(!s.loading && s.model.is_none() && s.requests == 45);
+}
+
+#[test]
+fn keys_file_and_access() {
+    let users = Keys::parse("# customers\nacme  acme-0123456789abcdef  # first\n\nbeta beta-0123456789abcdef\n").unwrap();
+    assert_eq!(users, [("acme".to_string(), "acme-0123456789abcdef".to_string()), ("beta".into(), "beta-0123456789abcdef".into())]);
+    assert!(Keys::parse("acme short").is_err() && Keys::parse("acme").is_err() && Keys::parse("a b c").is_err());
+    assert!(Keys::parse("a acme-0123456789abcdef\na beta-0123456789abcdef").is_err(), "repeated name");
+    assert!(Keys::parse("a acme-0123456789abcdef\nb acme-0123456789abcdef").is_err(), "repeated key");
+    let open = Keys::default();
+    assert_eq!(open.who(""), Some(Who { name: "".into(), id: 0, admin: true }));
+    let k = Keys { admin: Some("root-key".into()), users };
+    assert_eq!(k.who("Bearer root-key").map(|w| (w.id, w.admin)), Some((0, true)));
+    assert_eq!(k.who("Bearer beta-0123456789abcdef"), Some(Who { name: "beta".into(), id: 2, admin: false }));
+    assert_eq!(k.who("Bearer nope"), None);
+    assert_eq!(k.who(""), None);
+    let only_users = Keys { admin: None, users: k.users.clone() };
+    assert_eq!(only_users.who(""), None, "customer keys alone close the server to keyless requests");
 }
