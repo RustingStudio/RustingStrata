@@ -511,6 +511,32 @@ fn slots_match_single() {
                 for (&s, l) in rows.iter().zip(gm.step_rows(&rt).unwrap()) { got[s].push(l); }
             }
         }
+        // Decode steps of slot 0 between the prefill chunks of slot 1 (`serve --parallel`) change neither.
+        gm.short = 1;
+        let mut run = |gm: &mut GpuModel, inter: bool| {
+            gm.use_slot(0);
+            gm.reset().unwrap();
+            let mut t = ops::argmax(&gm.prefill(&prompts[0]).unwrap()) as u32;
+            gm.use_slot(1);
+            gm.reset().unwrap();
+            let mut l0 = vec![];
+            let mut dec = |g: &mut GpuModel| -> anyhow::Result<()> {
+                let l = g.step_rows(&[(0, t)])?.pop().unwrap();
+                t = ops::argmax(&l) as u32;
+                l0.push(l);
+                Ok(())
+            };
+            let l1 = if inter { gm.prefill_with(&prompts[2], &mut dec).unwrap() } else {
+                for _ in 0..prompts[2].len().div_ceil(4) - 1 { dec(gm).unwrap(); }
+                gm.prefill(&prompts[2]).unwrap()
+            };
+            (l0, l1)
+        };
+        let (want0, want1) = run(&mut gm, false);
+        let (got0, got1) = run(&mut gm, true);
+        assert!(want0.len() >= 2, "{bk}: prompt fits one chunk");
+        assert!(got0 == want0 && got1 == want1, "{bk} cpu experts {cpu}: decode between prefill chunks");
+        gm.short = 32;
         // A conversation parked in slot 0 continues in slot 2, which never saved a state.
         gm.cache_ram = 1 << 30;
         gm.use_slot(0);

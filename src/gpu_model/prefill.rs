@@ -75,11 +75,18 @@ impl Scratch {
 impl GpuModel<'_> {
     /// Run `tokens` from the current position; returns the logits after the last one. Short prompts (and models
     /// loaded without a prefill chunk) go through the decode step.
-    pub fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+    pub fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> { self.prefill_with(tokens, &mut |_| Ok(())) }
+
+    /// `prefill`, calling `between` between two chunks (`serve --parallel` decodes the other slots there; it must
+    /// leave the current slot's state alone).
+    pub fn prefill_with(&mut self, tokens: &[u32], between: &mut dyn FnMut(&mut Self) -> anyhow::Result<()>) -> anyhow::Result<Vec<f32>> {
         let Some(chunk) = self.pf.as_ref().map(|p| p.chunk) else { return self.step_all(tokens) };
         if tokens.len() < self.short { return self.step_all(tokens); }
         anyhow::ensure!(self.pos + tokens.len() <= self.ctx, "context full ({} tokens; raise --ctx)", self.ctx);
-        for ch in tokens.chunks(chunk) { self.prefill_chunk(ch, None)?; }
+        for (i, ch) in tokens.chunks(chunk).enumerate() {
+            if i > 0 { between(self)?; }
+            self.prefill_chunk(ch, None)?;
+        }
         // The prompt's routing predicts the reply's: place its hot experts now instead of 64 per adapt during decode.
         let adapt = self.adapt_every > 0;
         let mut p = Some(&mut *self);
@@ -108,6 +115,12 @@ impl GpuModel<'_> {
     /// memory (up to `cache_ram`), and a later call that continues it takes it back, so a side request with another
     /// prompt does not cost the main conversation its cache. Returns the logits and the tokens reused.
     pub fn prefill_cached(&mut self, tokens: &[u32], sys: usize, keep: usize) -> anyhow::Result<(Vec<f32>, usize)> {
+        self.prefill_cached_with(tokens, sys, keep, &mut |_| Ok(()))
+    }
+
+    /// `prefill_cached` with `prefill_with`'s `between`.
+    pub fn prefill_cached_with(&mut self, tokens: &[u32], sys: usize, keep: usize, between: &mut dyn FnMut(&mut Self) -> anyhow::Result<()>)
+        -> anyhow::Result<(Vec<f32>, usize)> {
         anyhow::ensure!(sys <= keep && keep < tokens.len(), "prefill_cached: sys {sys}, keep {keep} of {} tokens", tokens.len());
         let (hit, own) = (self.saved_ids.len(), self.owner);
         let stashed = self.sys.as_ref().filter(|_| self.sys_owner == own).map_or(0, |s| if tokens[..keep].starts_with(&s.3) { s.3.len() } else { 0 });
@@ -135,16 +148,16 @@ impl GpuModel<'_> {
         // brings its own KV, which may have been computed in other chunks.
         if best.is_some() || stashed == 0 && self.sys.as_ref().is_some_and(|s| reused < s.3.len()) { self.sys = None; }
         if sys > reused {
-            self.prefill(&tokens[reused..sys])?;
+            self.prefill_with(&tokens[reused..sys], between)?;
             self.stash(&tokens[..sys])?;
         }
         let from = reused.max(sys);
         if keep > from {
-            self.prefill(&tokens[from..keep])?;
+            self.prefill_with(&tokens[from..keep], between)?;
             self.save_state()?;
             (self.saved_ids, self.saved_owner) = (tokens[..keep].to_vec(), own);
         }
-        Ok((self.prefill(&tokens[keep..])?, reused))
+        Ok((self.prefill_with(&tokens[keep..], between)?, reused))
     }
 
     fn step_all(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
