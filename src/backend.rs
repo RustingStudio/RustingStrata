@@ -78,6 +78,8 @@ pub const SAME_X: i32 = 4;
 pub trait Backend: Send {
     /// "cuda" or "vulkan".
     fn name(&self) -> &'static str;
+    /// The GPU's name as the driver reports it.
+    fn device(&self) -> String;
     /// Zeroed buffer of `bytes` (at least 1).
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf>;
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()>;
@@ -121,6 +123,12 @@ pub trait Backend: Send {
             let b = self.alloc(4 * f.len())?;
             self.htod(&f.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), &b, 0)?;
             return Ok(GpuTensor::new(GgmlType::F32, t.rows, t.cols, b));
+        }
+        if matches!(t.ty, GgmlType::Q4_0 | GgmlType::Q5_0) {  // no kernels: Q8_0 holds their values exactly
+            let q = crate::quant::to_q8_0(t.ty, t.data);
+            let b = self.alloc(q.len())?;
+            self.htod(&q, &b, 0)?;
+            return Ok(GpuTensor::new(GgmlType::Q8_0, t.rows, t.cols, b));
         }
         let b = self.alloc(t.data.len())?;
         self.htod(t.data, &b, 0)?;
@@ -210,7 +218,24 @@ pub trait Backend: Send {
     /// Causal conv + SiLU over `t` tokens of `ch` channels, then roll the conv state forward (snapshots as in `deltanet`).
     fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize, snap: u64, nsnap: usize) -> anyhow::Result<()>;
     /// `qg` 0: no output gate.
-    fn attn_prefill(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()>;
+    fn attn_prefill(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
+        self.attn_prefill_m(q, kc, vc, qg, out, step, t, nh, nkv, hd, scale, 0, 0)
+    }
+    /// `attn_prefill` where query row i sees only the keys whose 4-cell block has its bit set in row i of `qm` (`mw`
+    /// words a row, rows up to `t` rounded up to 64; see `qsa_select`). `qm` 0: no mask.
+    fn attn_prefill_m(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32, qm: u64, mw: usize) -> anyhow::Result<()>;
+    /// QSA indexer keys (see `Model::qsa`): pool the blocks of 4 positions that the `t` raw keys (rows of 128) at
+    /// positions step[0] .. complete into `pool` (rows of 128 per block: mean, rms norm with `w`, NEOX rope at the
+    /// block's first position). `ring`: 4 rows of 128, the raw keys of the incomplete block (row = position % 4).
+    fn qsa_pool(&self, _ik: u64, _ring: u64, _pool: u64, _w: u64, _step: u64, _t: usize, _n_rot: usize, _base: f32, _eps: f32) -> anyhow::Result<()> {
+        anyhow::bail!("{}: QSA sparse attention not implemented", self.name())
+    }
+    /// QSA block selection for `rows` query rows at positions step[0] + r0 + i (rows of 4 normed, roped heads of 128 in
+    /// `q`): scores into `score` (rows of `nbs`), then either cell lists into `sel` (rows of `sst` ints, `mw` 0) for
+    /// `attn_decode_q`, or block masks into `mask` (rows of `mw` words) for `attn_prefill_m`. `top`: blocks kept.
+    fn qsa_select(&self, _q: u64, _pool: u64, _score: u64, _sel: u64, _mask: u64, _step: u64, _r0: usize, _rows: usize, _nbs: usize, _top: usize, _sst: usize, _mw: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: QSA sparse attention not implemented", self.name())
+    }
     fn moe_combine_seq(&self, x: u64, ye: u64, wts: u64, inv: u64, k: usize, sh: u64, sg: u64, n: usize, t: usize) -> anyhow::Result<()>;
     fn norm_gate(&self, o: u64, w: u64, z: u64, n: usize, heads: usize, eps: f32) -> anyhow::Result<()>;
     /// `norm_gate`, then either returns 0, or also writes o (all heads of a token as one row) quantized as `quant_xq`
@@ -242,7 +267,9 @@ pub trait Backend: Send {
         self.attn_decode_gq(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, ATT_GQA_MIN, nt)
     }
     /// `attn_decode_gq`, also writing `out` quantized for `gemvq` into `xq` where supported; returns the xq to use (0: none).
-    fn attn_decode_q(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, _xq: u64) -> anyhow::Result<u64> {
+    /// `sel` not 0: QSA cell lists from `qsa_select` (rows of `sst` ints per token).
+    fn attn_decode_q(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, _xq: u64, sel: u64, _sst: usize) -> anyhow::Result<u64> {
+        anyhow::ensure!(sel == 0, "{}: QSA sparse attention not implemented", self.name());
         self.attn_decode_gq(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt)?;
         Ok(0)
     }

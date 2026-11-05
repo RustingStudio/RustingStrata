@@ -79,6 +79,9 @@ float block_sum(float v) {
     return warp_sum(gl_SubgroupInvocationID < gl_NumSubgroups ? block_sum_s[gl_SubgroupInvocationID] : 0.0);
 }
 
+// QSA mask (see qsa_select): whether query row t (mw words a row) sees key position `key`.
+bool qsa_bit(U32 qm, uint mw, uint t, uint key) { return ((qm.v[t * mw + (key >> 7)] >> ((key >> 2) & 31)) & 1) != 0; }
+
 // f32 to f16 bits, rounded to nearest even (cvt.rn.f16.f32).
 uint f2h(float x) {
     uint b = floatBitsToUint(x), s = b >> 16 & 0x8000u, a = b & 0x7fffffffu;

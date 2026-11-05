@@ -36,8 +36,25 @@ enum Mixer {
         /// Conv and DeltaNet states after each of the first `k` verify tokens (MTP only), for `rollback`.
         snap: Option<(Buf, Buf)>,
     },
-    Attn { q: GpuTensor, k: GpuTensor, v: GpuTensor, qn: GpuTensor, kn: GpuTensor, o: GpuTensor, kc: Buf, vc: Buf },
+    Attn { q: GpuTensor, k: GpuTensor, v: GpuTensor, qn: GpuTensor, kn: GpuTensor, o: GpuTensor, kc: Buf, vc: Buf, qsa: Option<Qsa> },
 }
+
+/// QSA indexer of an attention layer (qwen4exp, see `Model::qsa`): projections and norms, the pooled keys (128 floats
+/// per block of 4 positions) and this layer's 4 rows of `QsaBufs::ring`.
+struct Qsa { kp: GpuTensor, qp: GpuTensor, kn: GpuTensor, qn: GpuTensor, pool: Buf, ring: u64 }
+
+/// QSA scratch shared by the layers: raw indexer keys of each layer's incomplete block (`QSA_RING` floats a layer)
+/// and their copy at `save_state`, block scores (rows of `nbs`), decode cell lists (rows of `sst`), prefill masks
+/// (rows of `mw` words).
+struct QsaBufs { ring: Buf, saved: Buf, score: Buf, sel: Buf, mask: Buf, top: usize, nbs: usize, sst: usize, mw: usize }
+
+/// Positions a QSA pool block covers, the indexer head size and heads (the kernels' QSA_D and QSA_H).
+const QSA_POOL: usize = 4;
+const QSA_D: usize = 128;
+const QSA_H: usize = 4;
+const QSA_RING: usize = QSA_POOL * QSA_D;
+/// Query rows per `qsa_select` launch in prefill (score rows).
+const QSA_ROWS: usize = 64;
 
 struct Shared { gate_inp: GpuTensor, gate: GpuTensor, up: GpuTensor, down: GpuTensor }
 
@@ -56,6 +73,14 @@ struct Ple { key: GpuTensor, value: GpuTensor, norm_key: GpuTensor, norm_query: 
 struct Layer { attn_norm: Option<GpuTensor>, post_norm: Option<GpuTensor>, hc: Option<[HcRead; 2]>, ple: Option<Ple>, mixer: Mixer, ffn: Ffn }
 
 /// MTP draft head: the `nextn` block (layer n_layer) with its own KV cache and CPU worker.
+/// A saved conversation state in host memory: its tokens, the PLE tokens before it, the `slot` buffers and the KV
+/// rows of its positions in each attention layer.
+struct Parked { ids: Vec<u32>, ple_prev: [i64; 2], slot: Vec<Vec<u8>>, kv: Vec<Vec<u8>> }
+
+impl Parked {
+    fn bytes(&self) -> usize { self.slot.iter().chain(&self.kv).map(Vec::len).sum() }
+}
+
 struct MtpHead {
     layer: Layer, eh_proj: GpuTensor, enorm: GpuTensor, hnorm: GpuTensor, head_norm: GpuTensor,
     worker: CpuWorker, step_buf: Buf, emb: Buf, eh: Buf, x: Buf, pos: usize,
@@ -78,6 +103,7 @@ pub struct GpuModel<'a> {
     /// qwen4exp PLE: the normalized rows of the last 16 positions (see `ple_conv`), its copy at `save_state`, the two
     /// previous tokens for the n-gram hash and their copy.
     ple_ring: Option<(Buf, Buf)>,
+    qsa: Option<QsaBufs>,
     ple_prev: [i64; 2],
     saved_ple_prev: [i64; 2],
     /// Scratch activations by name.
@@ -100,6 +126,10 @@ pub struct GpuModel<'a> {
     /// tokens behind it. A request whose history no longer extends the saved one (a rewritten or compacted
     /// conversation) restarts from it.
     sys: Option<(Vec<Vec<u8>>, usize, [i64; 2], Vec<u32>)>,
+    /// Saved states that a request with another history replaced, most recent first (`park`).
+    parked: Vec<Parked>,
+    /// Host memory for `parked`, in bytes (0 = keep none).
+    pub cache_ram: usize,
     ctx: usize,
     pub pos: usize,
     pub cache: Option<ExpertCache>,
@@ -165,9 +195,10 @@ impl<'a> GpuModel<'a> {
 
     fn load_part(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, k: usize, range: std::ops::Range<usize>) -> anyhow::Result<GpuModel<'a>> {
         let last = range.end == m.cfg.n_layer;
-        // The PLE table stays on the CPU; other F16 tensors but experts are uploaded as F32 (`Backend::upload`).
+        // The PLE table stays on the CPU; other F16, Q4_0 and Q5_0 tensors but experts are converted on upload
+        // (`Backend::upload`).
         let cpu_only = |n: &str| n == "per_layer_token_embd.weight";
-        let f32_up = |n: &str, ty| ty == GgmlType::F16 && !n.contains("_exps.");
+        let f32_up = |n: &str, ty| matches!(ty, GgmlType::F16 | GgmlType::Q4_0 | GgmlType::Q5_0) && !n.contains("_exps.");
         if let Some(t) = m.w.g.tensors.values().find(|t| !cpu_only(&t.name)
             && GgmlType::from_u32(t.ty).is_ok_and(|ty| !ty.gpu(gpu.name()) && !f32_up(&t.name, ty))) {
             anyhow::bail!("tensor {} has type {}, which the {} backend does not support yet", t.name, GgmlType::from_u32(t.ty)?.name(), gpu.name());
@@ -185,6 +216,9 @@ impl<'a> GpuModel<'a> {
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
         let channels = c.ssm_d_inner + 2 * nk * dk;
         let kv = c.n_head_kv * c.head_dim;
+        let qsa_on = c.idx_top_k > 0 && (0..c.n_layer).any(|il| m.w.layer(il, "indexer.k_proj.weight").is_ok());
+        if qsa_on { ensure!(c.idx_head_dim == QSA_D && c.idx_n_head == QSA_H, "QSA indexer: {} heads of {} (the GPU kernels take {QSA_H} of {QSA_D})", c.idx_n_head, c.idx_head_dim); }
+        let ring = gpu.zeros::<f32>(if qsa_on { c.n_layer * QSA_RING } else { 1 })?;
 
         // ponytail: no MTP or batched prefill with hyper-connections yet (their state and row layouts assume one stream).
         let k = if c.n_nextn > 0 && c.hc_n == 0 { k.min(TMAX - 1) } else { 0 };
@@ -203,6 +237,14 @@ impl<'a> GpuModel<'a> {
                     q: lt(il, "attn_q.weight")?, k: lt(il, "attn_k.weight")?, v: lt(il, "attn_v.weight")?,
                     qn: lt(il, "attn_q_norm.weight")?, kn: lt(il, "attn_k_norm.weight")?, o: lt(il, "attn_output.weight")?,
                     kc: gpu.zeros::<u16>(gpu.kv_words(ctx * kv))?, vc: gpu.zeros::<u16>(gpu.kv_words(ctx * kv))?,
+                    qsa: if qsa_on && il < c.n_layer && m.w.layer(il, "indexer.k_proj.weight").is_ok() {
+                        Some(Qsa {
+                            kp: lt(il, "indexer.k_proj.weight")?, qp: lt(il, "indexer.q_proj.weight")?,
+                            kn: lt(il, "indexer.k_norm.weight")?, qn: lt(il, "indexer.q_norm.weight")?,
+                            // Rows of 128 floats per position, as the KV rows (`kv_bufs`): ctx / 4 blocks of 512.
+                            pool: gpu.zeros::<f32>(ctx * QSA_D / QSA_POOL)?, ring: ring.addr() + (4 * il * QSA_RING) as u64,
+                        })
+                    } else { None },
                 }
             };
             let ffn = if c.is_moe() {
@@ -252,6 +294,7 @@ impl<'a> GpuModel<'a> {
             ("ffq", ff * 9 / 32), ("shq", c.n_ff_shexp * 9 / 32), ("attq", c.n_head * c.head_dim * 9 / 32),
             ("oq", c.ssm_d_inner * 9 / 32),
         ];
+        if qsa_on { sizes.extend([("ik", QSA_D), ("iq", QSA_H * QSA_D), ("iqn", QSA_H * QSA_D)]); }
         if c.hc_n > 0 {
             let d = c.hc_n * c.n_embd;
             sizes.extend([("xn", d), ("lo", c.hc_rank), ("hg", d), ("inj", c.hc_n), ("mo", c.n_embd),
@@ -265,6 +308,13 @@ impl<'a> GpuModel<'a> {
         // 1024, 347 with 4096 (fewer expert slots).
         let chunk = if c.hc_n > 0 { chunk.min(1024) } else { chunk };
         let pf = if chunk > 0 { Some(prefill::Scratch::new(m, &*gpu, chunk.min(ctx))?) } else { None };
+        let qsa = if qsa_on {
+            let (top, nbs) = (c.idx_top_k / QSA_POOL, ctx / QSA_POOL);
+            let (sst, mw) = (1 + c.idx_top_k + QSA_POOL, (nbs + 1).div_ceil(32));
+            let rows = pf.as_ref().map_or(0, |p| p.chunk.next_multiple_of(64));
+            Some(QsaBufs { saved: gpu.zeros::<f32>(ring.len() / 4)?, ring, score: gpu.zeros::<f32>(QSA_ROWS.max(TMAX) * nbs)?,
+                           sel: gpu.zeros::<i32>(TMAX * sst)?, mask: gpu.zeros::<u32>((rows * mw).max(1))?, top, nbs, sst, mw })
+        } else { None };
         let (free1, _) = gpu.mem_info()?;
         // Past the budget the driver spills buffers to system memory: RADV then runs a long prefill slowly enough to
         // hit amdgpu's job timeout and lose the device. A margin above 512 MB only leaves fewer expert slots.
@@ -294,7 +344,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], sys: None, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None })
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None })
     }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
@@ -433,6 +483,7 @@ impl<'a> GpuModel<'a> {
         }
         if let Some(h) = &self.mtp { g.dtod(&self.x, 0, &h.saved_x, 0, 4 * self.m.cfg.n_embd)?; }
         if let Some((r, sr)) = &self.ple_ring { g.dtod(r, 0, sr, 0, r.len())?; }
+        if let Some(q) = &self.qsa { g.dtod(&q.ring, 0, &q.saved, 0, q.ring.len())?; }
         self.saved_ple_prev = self.ple_prev;
         self.saved_pos = self.pos;
         self.saved_ids.clear();
@@ -445,6 +496,7 @@ impl<'a> GpuModel<'a> {
         let mut v: Vec<&Buf> = self.saved.iter().flat_map(|(c, s)| [c, s]).collect();
         v.extend(self.mtp.as_ref().map(|h| &h.saved_x));
         v.extend(self.ple_ring.as_ref().map(|(_, sr)| sr));
+        v.extend(self.qsa.as_ref().map(|q| &q.saved));
         v
     }
 
@@ -459,6 +511,41 @@ impl<'a> GpuModel<'a> {
             p = q.next.as_deref_mut();
         }
         Ok(())
+    }
+
+    /// The KV caches of the attention layers (and of the draft head) and their QSA pooled keys, whose rows are positions.
+    fn kv_bufs(&self) -> Vec<&Buf> {
+        self.layers.iter().chain(self.mtp.as_ref().map(|h| &h.layer))
+            .flat_map(|l| match &l.mixer {
+                Mixer::Attn { kc, vc, qsa, .. } => [kc, vc].into_iter().chain(qsa.as_ref().map(|a| &a.pool)).collect(),
+                _ => vec![],
+            }).collect()
+    }
+
+    /// Copy the saved state to host memory, so a later request that continues it can take it back (`unpark`); the
+    /// least recently parked states go when they exceed `cache_ram`.
+    fn park(&mut self) -> anyhow::Result<()> {
+        let n = self.saved_ids.len();
+        // ponytail: a split model parks nothing (each part would need its own copy, in step with the others).
+        if n == 0 || self.next.is_some() { return Ok(()) }
+        let kv = self.kv_bufs().iter().map(|b| b.len() / self.ctx * n).sum::<usize>();
+        if kv + self.slot().iter().map(|b| b.len()).sum::<usize>() > self.cache_ram { return Ok(()) }
+        let g = &self.gpu;
+        let slot = self.slot().iter().map(|b| g.get::<u8>(b, 0, b.len())).collect::<anyhow::Result<_>>()?;
+        let kv = self.kv_bufs().iter().map(|b| g.get::<u8>(b, 0, b.len() / self.ctx * n)).collect::<anyhow::Result<_>>()?;
+        self.parked.insert(0, Parked { ids: self.saved_ids.clone(), ple_prev: self.saved_ple_prev, slot, kv });
+        while self.parked.iter().map(Parked::bytes).sum::<usize>() > self.cache_ram { self.parked.pop(); }
+        Ok(())
+    }
+
+    /// Make parked state `i` the saved state and return to it; the saved state is parked in its place.
+    fn unpark(&mut self, i: usize) -> anyhow::Result<()> {
+        let p = self.parked.remove(i);
+        self.park()?;
+        for (b, d) in self.slot().iter().zip(&p.slot) { self.gpu.put(d, b, 0)?; }
+        for (b, d) in self.kv_bufs().iter().zip(&p.kv) { self.gpu.put(d, b, 0)?; }
+        (self.saved_pos, self.saved_ple_prev, self.saved_ids) = (p.ids.len(), p.ple_prev, p.ids);
+        self.restore_state()
     }
 
     /// Return to the state of the last `stash`, which also becomes the saved state.
@@ -503,6 +590,7 @@ impl<'a> GpuModel<'a> {
         }
         self.pos = self.saved_pos;
         if let Some((r, sr)) = &self.ple_ring { g.dtod(sr, 0, r, 0, r.len())?; }
+        if let Some(q) = &self.qsa { g.dtod(&q.saved, 0, &q.ring, 0, q.ring.len())?; }
         self.ple_prev = self.saved_ple_prev;
         // The draft head's entries before the saved position are still the ones its prompt fill wrote (see `mtp_synced`).
         if let Some(h) = self.mtp.as_mut() {
@@ -780,13 +868,24 @@ impl<'a> GpuModel<'a> {
                              else { g.norm_gate_q(p("o"), norm.ptr, p("z"), dv, nt * nv, eps, p("oq"))? };
                     if oq != 0 { g.gemvq(out, p("o"), c.ssm_d_inner, oq, p("mix"), ne, nt)?; } else { mv(out, "o", c.ssm_d_inner, "mix", ne)?; }
                 }
-                Mixer::Attn { q, k, v, qn, kn, o, kc, vc } => {
+                Mixer::Attn { q, k, v, qn, kn, o, kc, vc, qsa } => {
                     let qs = if c.q_gate { 2 * hd } else { hd };
                     g.batch(&mut || { mv2(q, k, "qg", "kraw")?; mv(v, "h", ne, "v", kv) })?;
                     g.batch(&mut || g.rms_norm_rope_qk(p("qg"), qs, qn.ptr, p("q"), nt * nh, nh, p("kraw"), kn.ptr, p("k"), nt * nkv, nkv,
                                                        hd, eps, c.n_rot, step, c.rope_base, p("v"), kc.addr(), vc.addr()))?;
+                    let (sel, sst) = match (qsa, &self.qsa) {
+                        (Some(a), Some(b)) => {
+                            mv2(&a.qp, &a.kp, "iq", "ik")?;
+                            g.qsa_pool(p("ik"), a.ring, a.pool.addr(), a.kn.ptr, step, nt, c.n_rot, c.rope_base, eps)?;
+                            g.rms_norm(p("iq"), QSA_D, a.qn.ptr, p("iqn"), QSA_D, QSA_D, nt * QSA_H, eps)?;
+                            g.rope_neox(p("iqn"), QSA_D, nt * QSA_H, QSA_H, c.n_rot, step, c.rope_base)?;
+                            g.qsa_select(p("iqn"), a.pool.addr(), b.score.addr(), b.sel.addr(), 0, step, 0, nt, b.nbs, b.top, b.sst, 0)?;
+                            (b.sel.addr(), b.sst)
+                        }
+                        _ => (0, 0),
+                    };
                     let aq = g.attn_decode_q(p("q"), kc.addr(), vc.addr(), if c.q_gate { p("qg") } else { 0 }, p("att"), p("attp"), step, nh, nkv, hd,
-                                             1.0 / (hd as f32).sqrt(), gq, nt, p("attq"))?;
+                                             1.0 / (hd as f32).sqrt(), gq, nt, p("attq"), sel, sst)?;
                     if aq != 0 { g.gemvq(o, p("att"), nh * hd, aq, p("mix"), ne, nt)?; } else { mv(o, "att", nh * hd, "mix", ne)?; }
                 }
             }

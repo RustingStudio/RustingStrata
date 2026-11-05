@@ -62,6 +62,11 @@ pub struct ModelConfig {
     pub hc_rank: usize,
     /// Per-layer (n-gram) embedding width (qwen4exp; 0 = none).
     pub n_embd_ple: usize,
+    /// QSA sparse attention indexer (qwen4exp): heads, head size, and the number of cells kept per row
+    /// (0 = dense attention).
+    pub idx_n_head: usize,
+    pub idx_head_dim: usize,
+    pub idx_top_k: usize,
     /// Mixer of each main layer (MTP layers are attention).
     pub layers: Vec<LayerKind>,
     pub q_gate: bool,
@@ -121,6 +126,9 @@ impl ModelConfig {
             hc_n: opt("hyper_connection.count"),
             hc_rank: opt("hyper_connection.low_rank"),
             n_embd_ple: opt("embedding_length_per_layer_input"),
+            idx_n_head: opt("attention.indexer.head_count"),
+            idx_head_dim: opt("attention.indexer.key_length"),
+            idx_top_k: opt("attention.indexer.top_k"),
             layers,
             q_gate: a.q_gate,
             k_interleave: a.k_interleave,

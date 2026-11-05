@@ -12,7 +12,7 @@ layout(local_size_x = 128) in;
 #include "common.glsl"
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer UV4 { uvec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer FV4 { vec4 v[]; };
-layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 qg; F32 o; I32 step; uint t; uint nh; uint nkv; float scale; } p;
+layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 qg; F32 o; I32 step; uint t; uint nh; uint nkv; float scale; U32 qm; uint mw; } p;
 // PQ: tile rows in uvec4 (8 halves).
 const uint BQ = 64, BK = 32, PQ = HD / 8 + 1, PP = BK + 8;
 #define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
@@ -65,7 +65,7 @@ void main() {
     [[unroll]] for (uint d = 0; d < HD / 16; d++) acc[d] = ACC(0.0);
     uint last = pos0 + min(q0 + BQ, p.t) - 1;  // last key any query of the tile sees
     uint qp[2] = {pos0 + q0 + w * 16 + g, pos0 + q0 + w * 16 + g + 8};
-    float m[2] = {ninf, ninf};
+    float m[2] = {ninf, ninf}, ms[2];
     precise float l[2] = {0.0, 0.0};
     uint sb = w * 16 * BK, pb = w * 16 * PP, rb = w * 16;
     for (uint k0 = 0; k0 <= last; k0 += BK) {
@@ -114,20 +114,22 @@ void main() {
             [[unroll]] for (uint e = 0; e < 4; e++) {
                 uint col = nt * 8 + 2 * t4 + (e & 1), r = e >> 1;
                 float x = s[nt][e];
-                if (k0 + col > qp[r]) x = ninf;
+                if (k0 + col > qp[r] || (uint64_t(p.qm) != 0 && !qsa_bit(p.qm, p.mw, qp[r] - pos0, k0 + col))) x = ninf;
                 s[nt][e] = x;
                 mx[r] = max(mx[r], x);
             }
         [[unroll]] for (uint r = 0; r < 2; r++) {
             mx[r] = max(mx[r], subgroupShuffleXor(mx[r], 1));
             mx[r] = max(mx[r], subgroupShuffleXor(mx[r], 2));
-            c[r] = expf_(m[r] - mx[r]);  // key 0 is in the first block, so mx is finite from then on
+            // A row's keys so far can all be masked (QSA): then subtract 0 so the weights are 0, not NaN.
+            ms[r] = mx[r] == ninf ? 0.0 : mx[r];
+            c[r] = expf_(m[r] - ms[r]);
             m[r] = mx[r];
         }
         [[unroll]] for (uint nt = 0; nt < 4; nt++)
             [[unroll]] for (uint e = 0; e < 4; e++) {
                 uint r = e >> 1;
-                float pe = expf_(s[nt][e] - m[r]);
+                float pe = expf_(s[nt][e] - ms[r]);
                 // l *= c fuses into the first add, as nvcc compiles it.
                 l[r] = nt == 0 && (e & 1) == 0 ? fma(l[r], c[r], pe) : l[r] + pe;
                 s[nt][e] = pe;
