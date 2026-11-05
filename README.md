@@ -6,7 +6,7 @@ cudarc (cached as a cubin), and the same kernels also run on Vulkan (`--backend 
 committed): no C++ build step, no ggml. Experts that do not fit in VRAM run on the CPU at the same time as the GPU
 work, and the expert placement adapts to the routing it sees.
 
-Status: v1.1.0. Milestones M0-M6 are done (M6: server, chat, calibration, bench); the v1 gate run is in
+Status: v1.2.0. Milestones M0-M6 are done (M6: server, chat, calibration, bench); the v1 gate run is in
 `docs/m6-results.md`.
 
 ## Numbers
