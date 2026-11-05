@@ -304,9 +304,9 @@ impl<'a> GpuModel<'a> {
         let (x, logits, ids) = (gpu.zeros::<f32>(TMAX * hcn * c.n_embd)?, gpu.zeros::<f32>(TMAX * c.n_vocab)?, gpu.zeros::<i32>(TMAX * ke)?);
         let amax = gpu.zeros::<i32>(TMAX)?;
         let (slots, step_buf) = (gpu.zeros::<i32>(TMAX * ke)?, gpu.zeros::<i32>(2 * TMAX)?);
-        // Hyper-connection prefill scratch is ~4x larger a token; qwen4exp at 943 tokens (warm) prefills 447 tok/s with
-        // 1024, 347 with 4096 (fewer expert slots).
-        let chunk = if c.hc_n > 0 { chunk.min(1024) } else { chunk };
+        // Hyper-connection prefill scratch is ~4x larger a token, so a large chunk leaves fewer expert slots: qwen4exp at
+        // 943 tokens (warm) prefills 447 tok/s with 1024, 347 with 4096. Long prompts gain (each chunk restages the experts
+        // not resident: Flash-Next at 4764 tokens 132 -> 158 tok/s on a 3060), so `calibrate` picks per machine.
         let pf = if chunk > 0 { Some(prefill::Scratch::new(m, &*gpu, chunk.min(ctx))?) } else { None };
         let qsa = if qsa_on {
             let (top, nbs) = (c.idx_top_k / QSA_POOL, ctx / QSA_POOL);
