@@ -136,9 +136,10 @@ pub struct GpuModel<'a> {
 impl<'a> GpuModel<'a> {
     /// `chunk`: prefill batch in tokens (0 = no batched prefill). `mtp`: load the MTP draft head (needs `nextn`).
     pub fn load(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, k: usize) -> anyhow::Result<GpuModel<'a>> {
-        // The PLE table stays on the CPU; other F16 tensors but experts are uploaded as F32 (`Backend::upload`).
+        // The PLE table stays on the CPU; other F16, Q4_0 and Q5_0 tensors but experts are converted on upload
+        // (`Backend::upload`).
         let cpu_only = |n: &str| n == "per_layer_token_embd.weight";
-        let f32_up = |n: &str, ty| ty == GgmlType::F16 && !n.contains("_exps.");
+        let f32_up = |n: &str, ty| matches!(ty, GgmlType::F16 | GgmlType::Q4_0 | GgmlType::Q5_0) && !n.contains("_exps.");
         if let Some(t) = m.w.g.tensors.values().find(|t| !cpu_only(&t.name)
             && GgmlType::from_u32(t.ty).is_ok_and(|ty| !ty.gpu(gpu.name()) && !f32_up(&t.name, ty))) {
             anyhow::bail!("tensor {} has type {}, which the {} backend does not support yet", t.name, GgmlType::from_u32(t.ty)?.name(), gpu.name());

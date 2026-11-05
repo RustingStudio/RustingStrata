@@ -50,7 +50,7 @@ Other models, greedy "The capital of France is" with `--gpu` (CUDA / Vulkan, sec
 | Qwen3.8-Flash-Next GSQ-RCO IQ2_XS (64 GB in two files, pass the `-00001-of-00002` one; 18% of experts fit in VRAM, and with 32 GB RAM the rest are partly read from disk) | Q2_0, IQ1_M to IQ4_XS, Q6_K, Q8_0, F16, BF16 | 22 / 20 tok/s |
 
 Supported GGUF types: F32, F16, BF16, Q8_0, Q2_0, Q2_K-Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
-IQ4_NL.
+IQ4_NL, and Q4_0 and Q5_0 outside the experts (converted to Q8_0 on the GPU).
 
 ## Build
 
