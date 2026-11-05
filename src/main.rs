@@ -60,8 +60,9 @@ struct Engine {
     /// Keep the think block of earlier replies in the prompt (Qwen3.5/3.6 templates' `preserve_thinking`; a request
     /// can set it in `chat_template_kwargs`). The template drops it from replies before the last user message, so
     /// each new user message changes the earlier text and the whole conversation is prefilled again; with this, a
-    /// coding agent's long history stays cached across user messages.
-    #[arg(long)]
+    /// coding agent's long history stays cached across user messages. `--preserve-thinking false` follows the
+    /// template's default.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     preserve_thinking: bool,
     /// KV cache format (GPU): f16, or q8 (q8_0 blocks, half the KV memory; numerics differ slightly from
     /// llama.cpp's default f16 cache).
