@@ -119,7 +119,7 @@ enum Runner<'a> { Cpu(&'a Model<'a>, State), Gpu(Box<GpuModel<'a>>), Slot(Client
 
 impl Runner<'_> {
     fn step(&mut self, t: u32) -> anyhow::Result<Vec<f32>> {
-        match self { Runner::Cpu(m, st) => Ok(m.step(st, t)), Runner::Gpu(g) => g.step(t), Runner::Slot(c) => c.step(t) }
+        match self { Runner::Cpu(m, st) => Ok(m.step(st, t)), Runner::Gpu(g) => g.step(t), Runner::Slot(c) => Ok(c.step(t, true)?.1) }
     }
     /// Feed a prompt; returns the logits after its last token.
     fn prefill(&mut self, ts: &[u32]) -> anyhow::Result<Vec<f32>> {
@@ -758,6 +758,7 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
             }
             // Greedy without MTP: the argmax on the GPU, so only the token id is copied back, not the logits.
             Runner::Gpu(g) if smp.temp <= 0.0 => { ahead = Some(g.step_greedy(next)?); vec![next] }
+            Runner::Slot(c) if smp.temp <= 0.0 => { ahead = Some(c.step(next, false)?.0); vec![next] }
             _ => { logits = r.step(next)?; vec![next] }
         };
         for t in toks {
@@ -834,8 +835,8 @@ impl Serving {
 enum Job {
     /// `prefill_cached` in a free slot; answers the logits, the tokens reused and the slot.
     Chat { ids: Vec<u32>, sys: usize, keep: usize, owner: u64, back: std::sync::mpsc::Sender<anyhow::Result<(Vec<f32>, usize, usize)>> },
-    /// One decode step in a slot the request holds.
-    Step { slot: usize, token: u32, back: std::sync::mpsc::Sender<anyhow::Result<Vec<f32>>> },
+    /// One decode step in a slot the request holds; answers the greedy next token and the logits if `logits`.
+    Step { slot: usize, token: u32, logits: bool, back: std::sync::mpsc::Sender<anyhow::Result<(u32, Vec<f32>)>> },
     /// The request is done with its slot.
     Done(usize),
 }
@@ -852,10 +853,10 @@ impl Client {
         self.slot = Some(s);
         Ok((logits, reused))
     }
-    fn step(&mut self, token: u32) -> anyhow::Result<Vec<f32>> {
+    fn step(&mut self, token: u32, logits: bool) -> anyhow::Result<(u32, Vec<f32>)> {
         let slot = self.slot.context("step before chat")?;
         let (back, r) = std::sync::mpsc::channel();
-        self.tx.send(Job::Step { slot, token, back }).map_err(|_| anyhow::anyhow!("model gone"))?;
+        self.tx.send(Job::Step { slot, token, logits, back }).map_err(|_| anyhow::anyhow!("model gone"))?;
         r.recv()?
     }
 }
@@ -873,7 +874,7 @@ struct Sched {
     tick: u64,
     /// Chat jobs waiting for a free slot, and decode steps waiting for a forward (since the first came).
     chats: std::collections::VecDeque<Job>,
-    steps: Vec<(usize, u32, std::sync::mpsc::Sender<anyhow::Result<Vec<f32>>>)>,
+    steps: Vec<(usize, u32, bool, std::sync::mpsc::Sender<anyhow::Result<(u32, Vec<f32>)>>)>,
     since: Option<Instant>,
 }
 
@@ -899,7 +900,7 @@ impl Sched {
         for j in got {
             match j {
                 Job::Done(s) => { self.held[s] = false; self.tick += 1; self.freed[s] = self.tick; }
-                Job::Step { slot, token, back } => { self.since.get_or_insert_with(Instant::now); self.steps.push((slot, token, back)); }
+                Job::Step { slot, token, logits, back } => { self.since.get_or_insert_with(Instant::now); self.steps.push((slot, token, logits, back)); }
                 c => self.chats.push_back(c),
             }
         }
@@ -913,9 +914,9 @@ impl Sched {
         let mut batch: Vec<_> = self.steps.drain(..self.steps.len().min(rusting_strata::cpu_worker::TMAX)).collect();
         batch.sort_by_key(|s| s.0);
         self.since = if self.steps.is_empty() { None } else { Some(Instant::now() - Self::GATHER) };
-        match g.step_rows(&batch.iter().map(|b| (b.0, b.1)).collect::<Vec<_>>()) {
-            Ok(rows) => for (b, l) in batch.into_iter().zip(rows) { let _ = b.2.send(Ok(l)); },
-            Err(err) => for b in batch { let _ = b.2.send(Err(anyhow::anyhow!("{err:#}"))); },
+        match g.step_rows(&batch.iter().map(|b| (b.0, b.1, b.2)).collect::<Vec<_>>()) {
+            Ok(rows) => for (b, l) in batch.into_iter().zip(rows) { let _ = b.3.send(Ok(l)); },
+            Err(err) => for b in batch { let _ = b.3.send(Err(anyhow::anyhow!("{err:#}"))); },
         }
     }
 }

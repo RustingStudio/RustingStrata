@@ -32,7 +32,7 @@ requests sent at once:
 | 4 | 8 | 163 tok/s | 41 tok/s, 4 wait |
 | 8 | 8 | 149 tok/s | 19 tok/s |
 
-A request alone on a `--parallel 4` server decodes at 101 tok/s (106 with `--parallel 1`).
+A request alone on a `--parallel 4` server decodes at 105 tok/s (106 with `--parallel 1`).
 
 What changes with `--parallel N`:
 

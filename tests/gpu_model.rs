@@ -508,12 +508,19 @@ fn slots_match_single() {
                 gm.use_slot(rows[0]);
                 got[rows[0]].push(gm.step(rt[0].1).unwrap());
             } else {
-                for (&s, l) in rows.iter().zip(gm.step_rows(&rt).unwrap()) { got[s].push(l); }
+                // Every other row asks for its logits; all rows return their argmax.
+                let rl: Vec<(usize, u32, bool)> = rt.iter().enumerate().map(|(i, &(s, t))| (s, t, i % 2 == 0)).collect();
+                let out = gm.step_rows(&rl).unwrap();
+                for (&(s, _, wl), (t, l)) in rl.iter().zip(out) {
+                    let w = &want[s][got[s].len()];
+                    assert_eq!(t, ops::argmax(w) as u32, "{bk} cpu experts {cpu} slot {s}: greedy token");
+                    got[s].push(if wl { l } else { assert!(l.is_empty()); w.clone() });
+                }
             }
         }
         // Decode steps of slot 0 between the prefill chunks of slot 1 (`serve --parallel`) change neither.
         gm.short = 1;
-        let mut run = |gm: &mut GpuModel, inter: bool| {
+        let run = |gm: &mut GpuModel, inter: bool| {
             gm.use_slot(0);
             gm.reset().unwrap();
             let mut t = ops::argmax(&gm.prefill(&prompts[0]).unwrap()) as u32;
@@ -521,7 +528,7 @@ fn slots_match_single() {
             gm.reset().unwrap();
             let mut l0 = vec![];
             let mut dec = |g: &mut GpuModel| -> anyhow::Result<()> {
-                let l = g.step_rows(&[(0, t)])?.pop().unwrap();
+                let l = g.step_rows(&[(0, t, true)])?.pop().unwrap().1;
                 t = ops::argmax(&l) as u32;
                 l0.push(l);
                 Ok(())
