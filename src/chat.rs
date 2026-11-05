@@ -208,8 +208,10 @@ impl Template {
     }
 
     /// The prompt for `msgs` and `tools` (from `tool_def`). `generate` adds the assistant header the reply follows;
-    /// `think` false closes the think block at once where the template has one.
-    pub fn render(&self, msgs: &[Msg], tools: &[Json], think: bool, generate: bool) -> String {
+    /// `think` false closes the think block at once where the template has one. `preserve` prints the think block of
+    /// every earlier reply, not only of those after the last user turn (Qwen3.6's `preserve_thinking`), so a new user
+    /// turn leaves the text of the earlier ones as it was and their cached state can be reused.
+    pub fn render(&self, msgs: &[Msg], tools: &[Json], think: bool, preserve: bool, generate: bool) -> String {
         let mut s = String::new();
         let tool_end = |s: &mut String, i: usize| {
             if i + 1 == msgs.len() || msgs[i + 1].role != "tool" { *s += "<|im_end|>\n"; }
@@ -238,7 +240,7 @@ impl Template {
                         "user" => s += &format!("<|im_start|>user\n{c}<|im_end|>\n"),
                         "assistant" => {
                             let (r, c) = split_think(m, c);
-                            if i > lq { s += &format!("<|im_start|>assistant\n<think>\n{}\n</think>\n\n{c}", r.trim()); }
+                            if preserve || i > lq { s += &format!("<|im_start|>assistant\n<think>\n{}\n</think>\n\n{c}", r.trim()); }
                             else { s += &format!("<|im_start|>assistant\n{c}"); }
                             for (k, call) in m.calls.iter().enumerate() {
                                 s += if k > 0 { "\n" } else if c.trim().is_empty() { "" } else { "\n\n" };
@@ -353,7 +355,9 @@ fn xml_call(inner: &str, tools: &[Json]) -> Option<(String, String)> {
         let v = v.strip_prefix('\n').unwrap_or(v);
         let v = v.strip_suffix('\n').unwrap_or(v);
         let string = props.get(k).get("type").as_str() == Some("string");
-        args.push((k.to_string(), if string { Json::Str(v.into()) } else { serde_json::from_str(v).unwrap_or_else(|_| Json::Str(v.into())) }));
+        // The template prints earlier calls' booleans and null in Python spelling, and the model copies it.
+        let py = |v: &str| match v.trim() { "True" => Some(Json::Bool(true)), "False" => Some(Json::Bool(false)), "None" => Some(Json::Null), _ => None };
+        args.push((k.to_string(), if string { Json::Str(v.into()) } else { serde_json::from_str(v).ok().or_else(|| py(v)).unwrap_or_else(|| Json::Str(v.into())) }));
     }
     Some((name.to_string(), Json::Obj(args).dump()))
 }

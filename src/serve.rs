@@ -35,6 +35,8 @@ pub fn read_request(r: &mut impl BufRead) -> anyhow::Result<Request> {
             "content-length" => len = v.parse().context("bad Content-Length")?,
             "host" => host = v.to_string(),
             "authorization" => auth = v.to_string(),
+            // The Anthropic API's key header (Claude Code with ANTHROPIC_API_KEY).
+            "x-api-key" if auth.is_empty() => auth = format!("Bearer {v}"),
             "content-type" => json = v.starts_with("application/json"),
             _ => {}
         }
@@ -109,6 +111,8 @@ pub struct ChatRequest {
     pub max_tokens: Option<usize>,
     pub stream: bool,
     pub think: bool,
+    /// `chat_template_kwargs.preserve_thinking`; the server's `--preserve-thinking` when absent.
+    pub preserve_thinking: Option<bool>,
     pub temperature: Option<f32>,
     pub top_k: Option<usize>,
     pub top_p: Option<f32>,
@@ -156,6 +160,7 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
     if stop.len() > 16 || stop.iter().any(|s| s.len() > 256) { bail!("stop takes at most 16 strings of at most 256 bytes"); }
     let think = v["chat_template_kwargs"]["enable_thinking"].as_bool().unwrap_or(false);
     Ok(ChatRequest { messages, tools, tool_calls, max_tokens, stream: v["stream"].as_bool().unwrap_or(false), think,
+        preserve_thinking: v["chat_template_kwargs"]["preserve_thinking"].as_bool(),
         temperature: num("temperature", |f| f >= 0.0, "a number >= 0")?, top_k: int("top_k", 0)?.map(|n| n as usize),
         top_p: num("top_p", |f| f > 0.0 && f <= 1.0, "a number in (0, 1]")?, seed: int("seed", 0)?, stop })
 }
@@ -273,4 +278,68 @@ pub fn system() -> Value {
     #[cfg(not(any(target_os = "linux", windows)))]
     let _ = cpu_pct;
     v
+}
+
+/// An Anthropic Messages API request (`POST /v1/messages`, what Claude Code sends) as the OpenAI chat request
+/// `chat_request` reads: the system blocks become a system message, `tool_use` blocks tool calls, `tool_result`
+/// blocks tool messages, and `thinking: {"type": "enabled"}` turns thinking on. Images and server tools are dropped.
+pub fn messages_body(body: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let j: Json = serde_json::from_slice(body)?;
+    let s = |x: &str| Json::Str(x.into());
+    let obj = |v: Vec<(&str, Json)>| Json::Obj(v.into_iter().map(|(k, v)| (k.to_string(), v)).collect());
+    // A string, or the text of an array of blocks.
+    let text = |c: &Json| match c {
+        Json::Str(t) => t.clone(),
+        Json::Arr(a) => a.iter().filter(|b| b.get("type").as_str() == Some("text")).filter_map(|b| b.get("text").as_str()).collect::<Vec<_>>().join("\n"),
+        _ => String::new(),
+    };
+    let mut msgs = vec![];
+    let sys = text(j.get("system"));
+    if !sys.is_empty() { msgs.push(obj(vec![("role", s("system")), ("content", Json::Str(sys))])); }
+    let Json::Arr(ms) = j.get("messages") else { bail!("missing messages") };
+    for m in ms {
+        let role = m.get("role").as_str().context("message without role")?;
+        let blocks = match m.get("content") { Json::Str(t) => vec![obj(vec![("type", s("text")), ("text", s(t))])], Json::Arr(a) => a.clone(), _ => bail!("bad content") };
+        let (mut texts, mut calls, mut reasoning) = (vec![], vec![], String::new());
+        for b in &blocks {
+            match (role, b.get("type").as_str().unwrap_or("")) {
+                (_, "text") => texts.push(b.get("text").as_str().unwrap_or("").to_string()),
+                ("assistant", "thinking") => reasoning += b.get("thinking").as_str().unwrap_or(""),
+                ("assistant", "tool_use") => calls.push(obj(vec![("id", b.get("id").clone()), ("type", s("function")),
+                    ("function", obj(vec![("name", b.get("name").clone()), ("arguments", b.get("input").clone())]))])),
+                ("user", "tool_result") => {
+                    let mut c = text(b.get("content"));
+                    if matches!(b.get("is_error"), Json::Bool(true)) { c = format!("Error: {c}"); }
+                    msgs.push(obj(vec![("role", s("tool")), ("tool_call_id", b.get("tool_use_id").clone()), ("content", Json::Str(c))]));
+                }
+                _ => {}
+            }
+        }
+        if role == "assistant" {
+            let mut a = vec![("role", s("assistant")), ("content", Json::Str(texts.join("\n")))];
+            if !reasoning.is_empty() { a.push(("reasoning_content", Json::Str(reasoning))); }
+            if !calls.is_empty() { a.push(("tool_calls", Json::Arr(calls))); }
+            msgs.push(obj(a));
+        } else if !texts.is_empty() {
+            msgs.push(obj(vec![("role", s(role)), ("content", Json::Str(texts.join("\n")))]));
+        }
+    }
+    let mut out = vec![("messages", Json::Arr(msgs))];
+    if let Json::Arr(ts) = j.get("tools") {
+        // Server tools (web search and the like) have a type other than "custom" and no input_schema.
+        let ts = ts.iter().filter(|t| !matches!(t.get("input_schema"), Json::Null)).map(|t| obj(vec![("type", s("function")),
+            ("function", obj(vec![("name", t.get("name").clone()), ("description", t.get("description").clone()), ("parameters", t.get("input_schema").clone())]))]));
+        out.push(("tools", Json::Arr(ts.collect())));
+    }
+    match j.get("tool_choice").get("type").as_str() {
+        Some("any") => out.push(("tool_choice", s("required"))),
+        Some("none") => out.push(("tool_choice", s("none"))),
+        Some("tool") => out.push(("tool_choice", obj(vec![("type", s("function")), ("function", obj(vec![("name", j.get("tool_choice").get("name").clone())]))]))),
+        _ => {}
+    }
+    for (from, to) in [("max_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k"), ("stop_sequences", "stop"), ("stream", "stream")] {
+        if !matches!(j.get(from), Json::Null) { out.push((to, j.get(from).clone())); }
+    }
+    if j.get("thinking").get("type").as_str() == Some("enabled") { out.push(("chat_template_kwargs", obj(vec![("enable_thinking", Json::Bool(true))]))); }
+    Ok(obj(out).dump().into_bytes())
 }

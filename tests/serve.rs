@@ -1,5 +1,5 @@
 use rusting_strata::chat::{Hold, Json, Msg, Template};
-use rusting_strata::serve::{chat_request, host_ok, key_ok, list_models, read_request};
+use rusting_strata::serve::{chat_request, host_ok, key_ok, list_models, messages_body, read_request};
 
 /// Every request in tests/fixtures/chat renders byte-identical to llama.cpp's Jinja rendering of the model's own
 /// template (tools/gen_chat_fixtures.py); a request llama.cpp rejects must be rejected too.
@@ -15,7 +15,7 @@ fn prompts_match_llama_cpp() {
         for (case, body) in &reqs {
             let q = chat_request(body.dump().as_bytes());
             match want[case].as_str() {
-                Some(w) => { let q = q.unwrap(); assert_eq!(tpl.render(&q.messages, &q.tools, q.think, true), w, "{name} {case}") }
+                Some(w) => { let q = q.unwrap(); assert_eq!(tpl.render(&q.messages, &q.tools, q.think, false, true), w, "{name} {case}") }
                 None => assert!(q.is_err(), "{name} {case} should be rejected"),
             }
         }
@@ -49,10 +49,10 @@ fn parses_tool_calls() {
         {"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"},"code":{"type":"string"}}}}}]"#).unwrap();
     let xml = "Checking.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n\
         <parameter=code>\n12\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=other>\n<parameter=x>\n[1, \"a\"]\n</parameter>\n\
-        <parameter=y>\nnot json\n</parameter>\n</function>\n</tool_call>";
+        <parameter=y>\nnot json\n</parameter>\n<parameter=z>\nFalse\n</parameter>\n</function>\n</tool_call>";
     assert_eq!(Template::Xml.parse_calls(xml, &tools), Some(("Checking.".into(), vec![
         ("get_weather".into(), r#"{"city": "Paris", "days": 3, "code": "12"}"#.into()),
-        ("other".into(), r#"{"x": [1, "a"], "y": "not json"}"#.into())])));
+        ("other".into(), r#"{"x": [1, "a"], "y": "not json", "z": false}"#.into())])));
     let js = Template::Json { reasoning: true };
     assert_eq!(js.parse_calls("<tool_call>\n{\"name\": \"f\", \"arguments\": {\"b\": 1, \"a\": \"é\"}}\n</tool_call>", &[]),
         Some((String::new(), vec![("f".into(), r#"{"b": 1, "a": "é"}"#.into())])));
@@ -88,9 +88,42 @@ fn hold_never_streams_a_call() {
 #[test]
 fn old_chat_prompt_unchanged() {
     let m = vec![Msg::new("system", "Be brief."), Msg::new("user", "Hi")];
-    assert_eq!(Template::Xml.render(&m, &[], false, true),
+    assert_eq!(Template::Xml.render(&m, &[], false, false, true),
         "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
-    assert!(Template::Xml.render(&m, &[], true, true).ends_with("<|im_start|>assistant\n<think>\n"));
+    assert!(Template::Xml.render(&m, &[], true, false, true).ends_with("<|im_start|>assistant\n<think>\n"));
+}
+
+#[test]
+fn preserve_thinking_keeps_history_text() {
+    let mut m = vec![Msg::new("user", "Find X"), Msg::new("assistant", "Looking."), Msg::new("user", "<tool_response>\nr\n</tool_response>"),
+        Msg::new("assistant", "Found.")];
+    let before = Template::Xml.render(&m, &[], false, true, false);
+    m.push(Msg::new("user", "Now Y"));
+    let after = Template::Xml.render(&m, &[], false, true, false);
+    assert!(after.starts_with(&before), "{before:?}\n{after:?}");
+    assert!(before.contains("<|im_start|>assistant\n<think>\n\n</think>\n\nLooking."));
+    // Without it, the template drops the think block once a new user turn follows, as Qwen3.6's template does.
+    assert!(!Template::Xml.render(&m, &[], false, false, false).contains("<think>"));
+    let r = chat_request(br#"{"messages":[{"role":"user","content":"a"}],"chat_template_kwargs":{"preserve_thinking":true}}"#).unwrap();
+    assert_eq!(r.preserve_thinking, Some(true));
+}
+
+#[test]
+fn messages_api_request() {
+    let body = br#"{"model":"m","max_tokens":50,"stream":true,"system":[{"type":"text","text":"Be brief.","cache_control":{"type":"ephemeral"}}],
+        "tools":[{"name":"read","description":"Read a file","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}},{"type":"web_search_20250305","name":"web_search"}],
+        "messages":[{"role":"user","content":"Fix it"},
+            {"role":"assistant","content":[{"type":"text","text":"Reading."},{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.rs"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"fn a() {}"}]},{"type":"text","text":"go on"}]}]}"#;
+    let r = chat_request(&messages_body(body).unwrap()).unwrap();
+    let m: Vec<_> = r.messages.iter().map(|m| (m.role.as_str(), m.content.as_str(), m.calls.len())).collect();
+    assert_eq!(m, [("system", "Be brief.", 0), ("user", "Fix it", 0), ("assistant", "Reading.", 1), ("tool", "fn a() {}", 0), ("user", "go on", 0)]);
+    assert_eq!(r.messages[2].calls[0].args.dump(), r#"{"path": "a.rs"}"#);
+    assert_eq!(r.tools.len(), 1);
+    assert_eq!((r.max_tokens, r.stream), (Some(50), true));
+    // The Anthropic key header counts as the bearer key.
+    let raw = "POST /v1/messages?beta=true HTTP/1.1\r\nx-api-key: k\r\ncontent-length: 0\r\n\r\n";
+    assert!(key_ok(&read_request(&mut raw.as_bytes()).unwrap().auth, "k"));
 }
 
 #[test]
