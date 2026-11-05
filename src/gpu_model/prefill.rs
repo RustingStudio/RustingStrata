@@ -43,7 +43,7 @@ impl Scratch {
         let (h, base) = (hd * chunk, (hd + ne) * chunk); // x (hc_n streams a token) at 0, then h
         let mut at = base;
         let mut take = |n: usize| { let o = at; at += n * chunk; o };
-        let (a, b, c2, d, e) = (take((2 * q).max(channels).max(2 * ne)), take(q.max(c.ssm_d_inner)), take(channels.max(3 * kv)), take(q.max(c.ssm_d_inner)), take(2 * nv));
+        let (a, b, c2, d, e) = (take((2 * q).max(channels).max(2 * ne)), take(q.max(c.ssm_d_inner)), take(channels.max(3 * kv).max(if c.idx_top_k > 0 { (1 + 2 * super::QSA_H) * super::QSA_D } else { 0 })), take(q.max(c.ssm_d_inner)), take(2 * nv));
         let mix_end = at;
         at = base;
         let mut take = |n: usize| { let o = at; at += n * chunk; o };
@@ -104,23 +104,36 @@ impl GpuModel<'_> {
     /// saved; when the saved tokens are a prefix of the next call's `tokens[..keep]`, that call starts from them
     /// (KV past them is rewritten, the recurrent state is copied back). The state after `tokens[..sys]` (the system
     /// prompt, `sys <= keep`) is stashed in host memory: a call whose history does not extend the saved one but
-    /// starts with the same system prompt starts from there. Returns the logits and the tokens reused.
+    /// starts with the same system prompt starts from there. A saved state that a call replaces is parked in host
+    /// memory (up to `cache_ram`), and a later call that continues it takes it back, so a side request with another
+    /// prompt does not cost the main conversation its cache. Returns the logits and the tokens reused.
     pub fn prefill_cached(&mut self, tokens: &[u32], sys: usize, keep: usize) -> anyhow::Result<(Vec<f32>, usize)> {
         anyhow::ensure!(sys <= keep && keep < tokens.len(), "prefill_cached: sys {sys}, keep {keep} of {} tokens", tokens.len());
         let hit = self.saved_ids.len();
         let stashed = self.sys.as_ref().map_or(0, |s| if tokens[..keep].starts_with(&s.3) { s.3.len() } else { 0 });
-        let reused = if hit > 0 && hit >= stashed && tokens[..keep].starts_with(&self.saved_ids) {
+        let extends = hit > 0 && hit >= stashed && tokens[..keep].starts_with(&self.saved_ids);
+        // The longest parked state this prompt continues, if it beats the saved one and the stash.
+        let best = self.parked.iter().enumerate().filter(|(_, p)| tokens[..keep].starts_with(&p.ids))
+            .max_by_key(|(_, p)| p.ids.len()).map(|(i, p)| (i, p.ids.len()))
+            .filter(|&(_, n)| n > stashed && !(extends && n <= hit));
+        let reused = if let Some((i, n)) = best {
+            self.unpark(i)?;
+            n
+        } else if extends {
             self.restore_state()?;
             hit
         } else if stashed > 0 {
+            self.park()?;
             self.unstash()?;
             stashed
         } else {
+            self.park()?;
             self.reset()?;
             0
         };
-        // The stash stays valid while its KV entries do: this prompt rewrites them only past `reused`.
-        if stashed == 0 && self.sys.as_ref().is_some_and(|s| reused < s.3.len()) { self.sys = None; }
+        // The stash stays valid while its KV entries do: this prompt rewrites them only past `reused`. A parked state
+        // brings its own KV, which may have been computed in other chunks.
+        if best.is_some() || stashed == 0 && self.sys.as_ref().is_some_and(|s| reused < s.3.len()) { self.sys = None; }
         if sys > reused {
             self.prefill(&tokens[reused..sys])?;
             self.stash(&tokens[..sys])?;
@@ -248,7 +261,7 @@ impl GpuModel<'_> {
                     if ly.hc.is_some() { g.norm_gate_sig(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps, 0)?; } else { g.norm_gate(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps)?; }
                     g.gemm_dense(out, t, at(l.d), c.ssm_d_inner, mx, ne, mact)?;
                 }
-                Mixer::Attn { q, k, v, qn, kn, o, kc, vc } => {
+                Mixer::Attn { q, k, v, qn, kn, o, kc, vc, qsa } => {
                     let (kraw, kk, vv) = (at(l.c), at(l.c + n * kv), at(l.c + 2 * n * kv));
                     let qs = if c.q_gate { 2 * hd } else { hd };
                     g.gemm_dense(q, t, h, ne, at(l.a), nh * qs, 0)?;
@@ -259,7 +272,28 @@ impl GpuModel<'_> {
                     g.rms_norm(kraw, hd, kn.ptr, kk, hd, hd, t * nkv, eps)?;
                     g.rope_neox(kk, hd, t * nkv, nkv, c.n_rot, step, c.rope_base)?;
                     g.kv_store(kk, vv, kc.addr(), vc.addr(), kv, t, step, hd)?;
-                    g.attn_prefill(at(l.b), kc.addr(), vc.addr(), if c.q_gate { at(l.a) } else { 0 }, at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt())?;
+                    // QSA: region c (free after kv_store) holds the raw indexer keys, raw queries and normed queries.
+                    let (qm, mw) = match (qsa, &self.qsa) {
+                        (Some(a), Some(b)) => {
+                            let (ik, iq, iqn) = (at(l.c), at(l.c + n * super::QSA_D), at(l.c + n * (1 + super::QSA_H) * super::QSA_D));
+                            let (dq, nq) = (super::QSA_D, super::QSA_H * super::QSA_D);
+                            g.gemm_dense(&a.kp, t, h, ne, ik, dq, 0)?;
+                            g.gemm_dense(&a.qp, t, h, ne, iq, nq, SAME_X)?;
+                            g.qsa_pool(ik, a.ring, a.pool.addr(), a.kn.ptr, step, t, c.n_rot, c.rope_base, eps)?;
+                            // Rows with at most `top` complete blocks attend densely: no mask while all of them do.
+                            if self.pos + t >= super::QSA_POOL * (b.top + 1) {
+                                g.rms_norm(iq, dq, a.qn.ptr, iqn, dq, dq, t * super::QSA_H, eps)?;
+                                g.rope_neox(iqn, dq, t * super::QSA_H, super::QSA_H, c.n_rot, step, c.rope_base)?;
+                                for r0 in (0..t).step_by(super::QSA_ROWS) {
+                                    g.qsa_select(iqn + (4 * r0 * nq) as u64, a.pool.addr(), b.score.addr(), 0, b.mask.addr() + (4 * r0 * b.mw) as u64,
+                                                 step, r0, super::QSA_ROWS.min(t - r0), b.nbs, b.top, 0, b.mw)?;
+                                }
+                                (b.mask.addr(), b.mw)
+                            } else { (0, 0) }
+                        }
+                        _ => (0, 0),
+                    };
+                    g.attn_prefill_m(at(l.b), kc.addr(), vc.addr(), if c.q_gate { at(l.a) } else { 0 }, at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), qm, mw)?;
                     probe(&mut tr, "q", &pf.slab, at(l.a), nh * qs, t)?;
                     probe(&mut tr, "k", &pf.slab, kk, kv, t)?;
                     probe(&mut tr, "v", &pf.slab, vv, kv, t)?;

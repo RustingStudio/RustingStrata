@@ -247,6 +247,7 @@ fn prefill_cached_reuses_history() {
         eprintln!("backend {bk}");
         let mut gm = GpuModel::load(&m, gpu, 512, 128, 512 << 20, 0).unwrap();
         gm.adapt_every = 0;
+        gm.cache_ram = 0;
         let enc = |s: &str| tok.encode(s).unwrap();
         let h1 = enc("<|im_start|>user\nTell me about rivers, the ways they carve valleys over thousands of years, and why towns grow on their banks.<|im_end|>\n");
         let h2 = [h1.clone(), enc("<|im_start|>assistant\nRivers move water and sediment downhill.<|im_end|>\n<|im_start|>user\nAnd lakes?<|im_end|>\n")].concat();
@@ -271,6 +272,7 @@ fn prefill_cached_reuses_history() {
         let want3 = want1.clone();
         let want2 = fresh(&mut gm, &[&h1, &h2[h1.len()..], &tail]);
         assert_eq!(got2, want2, "reused prefix");
+        let want_h2 = want2;
 
         // With a system prompt: a request whose history rewrites the earlier one (a compacted conversation) restarts
         // from the state after the system prompt, also after decode steps and a history hit in between.
@@ -295,6 +297,21 @@ fn prefill_cached_reuses_history() {
         assert_eq!((r, &got), (0, &want3));
         let (_, r) = gm.prefill_cached(&q2, sys.len(), s2.len()).unwrap();
         assert_eq!(r, 0, "stash dropped once its KV was rewritten");
+
+        // With host memory for replaced states, a side request with another prompt in between costs nothing.
+        gm.cache_ram = 64 << 20;
+        let (got, r) = gm.prefill_cached(&q1, sys.len(), s1.len()).unwrap();
+        assert_eq!((r, &got), (sys.len(), &want1));
+        for t in [11u32, 22, 33] { gm.step(t).unwrap(); }
+        let (got, r) = gm.prefill_cached(&p1, 0, h1.len()).unwrap();
+        assert_eq!((r, &got), (0, &want3), "side request");
+        let (got, r) = gm.prefill_cached(&p2, 0, h2.len()).unwrap();
+        assert_eq!((r, &got), (h1.len(), &want_h2), "side request continued");
+        let (got, r) = gm.prefill_cached(&q1, sys.len(), s1.len()).unwrap();
+        assert_eq!((r, &got), (s1.len(), &want1), "parked conversation");
+        for t in [11u32, 22, 33] { gm.step(t).unwrap(); }
+        let (got, r) = gm.prefill_cached(&p2, 0, h2.len()).unwrap();
+        assert_eq!((r, &got), (h2.len(), &want_h2), "parked side request");
     }
 }
 
@@ -385,4 +402,47 @@ fn split_matches_single() {
         }
     }
     unsafe { std::env::remove_var("STRATA_EXPERT_MB") };
+}
+
+/// QSA sparse attention on the GPU (top_k lowered to 8 cells so a short prompt runs sparse) against the CPU reference:
+/// token by token, a prefill in chunks of 4 (the incomplete block crosses chunks) and in one chunk, each followed by
+/// a 4-row verify. Near-tied block scores can pick differently, so the bound is on the mean error: 0.037 of the logit
+/// range on CUDA, against 0.039 for dense attention (top_k 0) on the same prompt.
+#[test]
+fn qwen4exp_qsa_gpu_matches_cpu() {
+    let _gpu = common::gpu_lock();
+    let p = std::path::Path::new("/mnt/ollama/qwen4exp/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf");
+    if !p.exists() { return }
+    let g = Gguf::open(p).unwrap();
+    let mut m = Model::load(&g).unwrap();
+    m.cfg.idx_top_k = 8;
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let ids = tok.encode("The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. \
+        Once upon a time, in a small village").unwrap();
+    let mut st = State::new(&m.cfg);
+    let want: Vec<Vec<f32>> = ids.iter().map(|&t| m.step(&mut st, t)).collect();
+    let (k, n) = (ids.len() - 4, ids.len());
+    for chunk in [4, 64] {
+        for (bk, gpu) in common::backends() {
+            let mut gm = GpuModel::load(&m, gpu, 256, chunk, 512 << 20, 0).unwrap();
+            let mut got: Vec<Vec<f32>> = ids.iter().map(|&t| gm.step(t).unwrap()).collect();
+            let mut rows: Vec<usize> = (0..n).collect();
+            gm.reset().unwrap();
+            gm.short = 0;
+            got.push(gm.prefill(&ids[..k]).unwrap());
+            got.extend(gm.verify(&ids[k..]).unwrap());
+            rows.extend(k - 1..n);
+            let mut err = 0f32;
+            for (i, (g, &r)) in got.iter().zip(&rows).enumerate() {
+                let w = &want[r];
+                let range = w.iter().fold(f32::MIN, |a, &b| a.max(b)) - w.iter().fold(f32::MAX, |a, &b| a.min(b));
+                let diff = g.iter().zip(w).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+                eprintln!("{bk} chunk {chunk} row {i} (pos {r}): argmax {} vs {}, max |dlogit| {diff:.4} (range {range:.2})",
+                          ops::argmax(g), ops::argmax(w));
+                assert!(diff <= 0.2 * range, "row {i}: {diff} vs range {range}");
+                err += diff / range / got.len() as f32;
+            }
+            assert!(err < 0.05, "{bk} chunk {chunk}: mean relative error {err}");
+        }
+    }
 }
