@@ -21,4 +21,4 @@ told us what they need. Thank you all.
 
 ## Reddit
 
-- [gcavalcante8808](https://gist.github.com/gcavalcante8808): First helper ever, did multiple benchmarks and rapports on AMD GPU, very big contribute!
+- [gcavalcante8808](https://github.com/gcavalcante8808): First helper ever, did multiple benchmarks and rapports on AMD GPU, very big contribute!
