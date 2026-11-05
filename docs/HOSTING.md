@@ -223,8 +223,9 @@ Run `calibrate` as the service user, because the calibration file and the CUDA k
 
 `GET /health` needs no key and is answered at once, also while a reply is generated or a model loads:
 
-- `200 {"status": "ok", "waiting": N}` once a model is loaded. `waiting` counts the requests read or queued besides
-  this one.
+- `200 {"status": "ok", "waiting": N, "slots": S}` once a model is loaded. `waiting` counts the requests being read,
+  generated or queued besides this one; `slots` is how many are generated at once (`--parallel`). A load balancer
+  can send the next request to the server with the lowest `waiting / slots`.
 - `503 {"status": "loading"}` or `503 {"status": "no model"}` otherwise.
 
 Point the load balancer or your monitoring at it.
