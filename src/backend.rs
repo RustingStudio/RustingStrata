@@ -124,7 +124,7 @@ pub trait Backend: Send {
             self.htod(&f.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), &b, 0)?;
             return Ok(GpuTensor::new(GgmlType::F32, t.rows, t.cols, b));
         }
-        if matches!(t.ty, GgmlType::Q4_0 | GgmlType::Q5_0) {  // no kernels: Q8_0 holds their values exactly
+        if matches!(t.ty, GgmlType::Q4_0 | GgmlType::Q5_0) {  // as Q8_0, which holds their values exactly (experts keep theirs)
             let q = crate::quant::to_q8_0(t.ty, t.data);
             let b = self.alloc(q.len())?;
             self.htod(&q, &b, 0)?;

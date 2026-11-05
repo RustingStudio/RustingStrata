@@ -25,7 +25,7 @@ layout(push_constant) uniform P { U64 tiles; uint64_t wd; U32 x; I32 xrow; F32 y
 #endif
 // SM 1 (gemmi_s): only the tiles of at most 32 positions, as gemm_fs; X holds XM positions.
 const uint BM = 128, XM = SM != 0 ? 32 : BM;
-const uint KS = T == 42 || T == 3 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23 ? 32 : 16;
+const uint KS = T == 42 || T == 2 || T == 3 || T == 6 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23 ? 32 : 16;
 // Rows in words. The int8 products are 32 deep: for KS = 16, w row holds each 16 values followed by 16 zeros (so
 // the 16 x values after each 16 add nothing).
 const uint PX = 20, PW = KS == 32 ? 20 : 36;

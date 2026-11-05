@@ -472,6 +472,33 @@ template <int T> struct QI41 {  // Q4_1 (T = 3, 20 bytes) and Q5_1 (T = 7, 24 by
 };
 template <> struct QI<3> : QI41<3> {};
 template <> struct QI<7> : QI41<7> {};
+// Q4_0 (T = 2, 18 bytes) and Q5_0 (T = 6, 22: f16 d, u32 qh, nibbles): blocks 2-byte aligned (ld16 only); the unsigned
+// codes as in Q4_1 / Q5_1, minus 8 (16) per byte.
+template <int T> struct QI40 {
+    static constexpr bool MIN = false;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        const u8* p = b + (T == 2 ? 18 : 22) * (sub >> 2);
+        int r = (sub & 3) * 8, sh = r < 16 ? 0 : 4;
+        d = ldh(p);
+        const u8* q = p + (T == 2 ? 2 : 6) + (r & 15);
+        u32 a = ((ld16(q) | (ld16(q + 2) << 16)) >> sh) & 0x0F0F0F0Fu, c = ((ld16(q + 4) | (ld16(q + 6) << 16)) >> sh) & 0x0F0F0F0Fu;
+        if (T == 6) {
+            u32 qh = (ld16(p + 2) | (ld16(p + 4) << 16)) >> r;
+            a |= (((qh & 15) * 0x00204081u) & 0x01010101u) << 4; c |= ((((qh >> 4) & 15) * 0x00204081u) & 0x01010101u) << 4;
+        }
+        u32 off = T == 2 ? 0x08080808u : 0x10101010u;
+        lo = (int)__vsub4(a, off); hi = (int)__vsub4(c, off);
+    }
+};
+template <> struct QI<2> : QI40<2> {};
+template <> struct QI<6> : QI40<6> {};
+template <int T> __device__ __forceinline__ void deq8_q40(const u8* b, int sub, float* o) {
+    int lo, hi; float d, m;
+    QI40<T>::get(b, sub, lo, hi, d, m);
+    for (int i = 0; i < 8; i++) o[i] = d * (float)(signed char)((i < 4 ? lo : hi) >> (8 * (i & 3)));
+}
+template <> __device__ __forceinline__ void deq8<2>(const u8* b, int sub, float* o) { deq8_q40<2>(b, sub, o); }  // Q4_0
+template <> __device__ __forceinline__ void deq8<6>(const u8* b, int sub, float* o) { deq8_q40<6>(b, sub, o); }  // Q5_0
 template <> struct QI<20> {  // IQ4_NL, 8 blocks of 18 (2-byte aligned: ld16 only)
     static constexpr bool MIN = false;
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
@@ -656,7 +683,7 @@ __device__ __forceinline__ void gemv_row_qn(const u8* __restrict__ w, const sign
 
 #define FTYPES(X) X(0, f32, 1024) X(30, bf16, 512)
 #define ITYPES(X) X(8, q8_0, 272) X(10, q2_k, 84) X(11, q3_k, 110) X(12, q4_k, 144) X(13, q5_k, 176) X(14, q6_k, 210) \
-    X(19, iq1_s, 50) X(29, iq1_m, 56) X(16, iq2_xxs, 66) X(17, iq2_xs, 74) X(22, iq2_s, 82) X(18, iq3_xxs, 98) X(21, iq3_s, 110) X(23, iq4_xs, 136) X(20, iq4_nl, 144) X(42, q2_0, 72) \
+    X(19, iq1_s, 50) X(29, iq1_m, 56) X(16, iq2_xxs, 66) X(17, iq2_xs, 74) X(22, iq2_s, 82) X(18, iq3_xxs, 98) X(21, iq3_s, 110) X(23, iq4_xs, 136) X(20, iq4_nl, 144) X(42, q2_0, 72) X(2, q4_0, 144) X(6, q5_0, 176) \
     X(3, q4_1, 160) X(7, q5_1, 192)
 #define QTYPES(X) FTYPES(X) ITYPES(X)
 
@@ -957,7 +984,7 @@ __device__ __forceinline__ void mma_s8_16832(int* c, u32 a0, u32 a1, u32 a2, u32
 // int -> float for |c| < 2^22 without the quarter-rate I2F: 2^23 + 2^22 + c has c in its low mantissa bits.
 __device__ __forceinline__ float i2f_small(int c) { return __int_as_float(0x4B400000 + c) - 12582912.0f; }
 // Weight types whose scale (and min) is constant over 32 weights: one 32-deep mma per scale.
-template <int T> __host__ __device__ constexpr bool scale32() { return T == 42 || T == 3 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23; }
+template <int T> __host__ __device__ constexpr bool scale32() { return T == 42 || T == 2 || T == 3 || T == 6 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23; }
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok) {
     unsigned d = (unsigned)__cvta_generic_to_shared(dst);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(ok ? 16 : 0));
