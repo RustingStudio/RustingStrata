@@ -4,7 +4,9 @@
 // submission is skipped, and the host waits for the worker and runs the forward again from this combine
 // (GpuModel::finish). The combines of one submission share SPINS polls (about 0.1 s on an RTX 3060; err[1] counts them,
 // the host zeroes it at each wait), so a submission cannot outlast the driver's job timeout (amdgpu resets the GPU
-// after 10 s) however long the worker reads experts from a cold drive.
+// after 10 s) however long the worker reads experts from a cold drive. A poll can take far longer on other GPUs (RADV),
+// so the host also sets err[2] once it has waited too long for a submission (Vk::submit), and a waiting combine gives
+// up on it within 256 polls.
 const uint SPINS = 1u << 19;
 bool mb_wait(MB mb, uint seq, U32 err) {
     uint base = atomicLoad(err.v[1], gl_ScopeDevice, 0, 0), spins = base, v;
@@ -16,7 +18,8 @@ bool mb_wait(MB mb, uint seq, U32 err) {
             break;
         }
         // Without conditional rendering a later layer of a submission whose wait gave up stops within 256 polls.
-        if (++spins >= SPINS || ((spins & 0xffu) == 0 && (atomicLoad(mb.v[8], gl_ScopeDevice, 0, 0) == 2u || atomicLoad(err.v[0], gl_ScopeDevice, 0, 0) != 0))) {
+        if (++spins >= SPINS || ((spins & 0xffu) == 0 && (atomicLoad(mb.v[8], gl_ScopeDevice, 0, 0) == 2u || atomicLoad(err.v[0], gl_ScopeDevice, 0, 0) != 0
+                || atomicLoad(err.v[2], gl_ScopeDevice, 0, 0) != 0))) {
             v = atomicCompSwap(mb.v[8], 0u, 2u);
             if (v == 0u) v = 2u;
             break;

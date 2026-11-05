@@ -284,6 +284,9 @@ enum Cmd {
         /// KV cache format to calibrate with (q8 leaves more VRAM for experts), as `--kv` of the runs that use it.
         #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
         kv: String,
+        /// Accepted for symmetry with the other commands: calibration always runs on the GPU.
+        #[arg(long, hide = true)]
+        gpu: bool,
     },
     /// Speed test: for each prompt length, prefill that many tokens of prose, then greedily decode `tg` more at that
     /// depth. Prints prefill and decode tok/s as mean (min-max) over `reps` runs. `--ctx` grows to fit.
@@ -484,7 +487,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             r.finish()?;
         }
-        Cmd::Calibrate { model, ctx, vram_margin, backend, device, kv } => {
+        Cmd::Calibrate { model, ctx, vram_margin, backend, device, kv, gpu: _ } => {
             if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
             calibrate(&model, ctx, vram_margin << 20, backend.as_deref(), device)?
         }
