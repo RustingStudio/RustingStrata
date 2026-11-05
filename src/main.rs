@@ -608,9 +608,9 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     };
                     // For load balancers: no key, no Host check, and an answer while a reply is generated.
                     if let Ok(r) = &q && r.method == "GET" && r.path == "/health" {
-                        let (model, loading) = { let g = st.lock().unwrap(); (g.model.is_some() && !g.loading, g.loading) };
+                        let (model, loading, slots) = { let g = st.lock().unwrap(); (g.model.is_some() && !g.loading, g.loading, g.slots) };
                         let waiting = oc.load(Relaxed) - 1;
-                        return if model { reply(json!({"status": "ok", "waiting": waiting}), "200 OK") }
+                        return if model { reply(json!({"status": "ok", "waiting": waiting, "slots": slots}), "200 OK") }
                             else { reply(json!({"status": if loading { "loading" } else { "no model" }}), "503 Service Unavailable") };
                     }
                     // The page's side panel is answered here, so it stays current while a reply is generated or a
@@ -1009,7 +1009,7 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
     {
         let mut st = s.stats.lock().unwrap();
         st.loading = false;
-        (st.backend, st.device, st.ctx) = match &r { Runner::Gpu(g) => (g.gpu.name().into(), g.gpu.device(), engine.ctx), _ => ("cpu".into(), String::new(), engine.ctx) };
+        (st.backend, st.device, st.ctx, st.slots) = match &r { Runner::Gpu(g) => (g.gpu.name().into(), g.gpu.device(), engine.ctx, g.slots()), _ => ("cpu".into(), String::new(), engine.ctx, 1) };
         gpu_stats(&r, &mut st);
     }
     let mut l = Loaded { r, tok: &tok, tpl: template(&g), name, path: model.to_path_buf() };
