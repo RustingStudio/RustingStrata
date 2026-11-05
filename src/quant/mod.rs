@@ -32,9 +32,9 @@ impl GgmlType {
             IQ1S => 50, IQ1M => 56, IQ2XXS => 66, IQ2XS => 74, IQ2S => 82, IQ3XXS => 98, IQ3S => 110, IQ4XS => 136, IQ4NL => 18,
         }
     }
-    /// Backend `backend` ("cuda" or "vulkan") has kernels for this type. F16, Q4_0 and Q5_0 have none: `Backend::upload`
-    /// converts them to a type that holds their values exactly.
-    pub fn gpu(self, _backend: &str) -> bool { !matches!(self, F16 | Q4_0 | Q5_0) }
+    /// Backend `backend` ("cuda" or "vulkan") has kernels for this type. F16 has none: `Backend::upload` converts it to
+    /// F32, which holds its values exactly.
+    pub fn gpu(self, _backend: &str) -> bool { self != F16 }
     pub fn row_bytes(self, n: u64) -> usize { n as usize / self.block_elems() * self.block_bytes() }
     pub fn name(self) -> &'static str {
         match self {

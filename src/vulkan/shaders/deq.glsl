@@ -74,8 +74,8 @@ void load_tables() {
 #endif
 // Bytewise a - c (each byte of a below 128; CUDA __vsub4).
 uint vsub4(uint a, uint c) { return ((a | 0x80808080u) - c) ^ 0x80808080u; }
-// The types QI<T> in kernels.cu reads with word loads: Q4_1, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K.
-const bool WORDS = T == 3 || T == 7 || T == 8 || (T >= 10 && T <= 14);
+// The types QI<T> in kernels.cu reads with word loads: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K.
+const bool WORDS = T == 2 || T == 3 || T == 6 || T == 7 || T == 8 || (T >= 10 && T <= 14);
 // Types with a min (QI<T>::MIN): value d q - m.
 const bool MIN = T == 3 || T == 7 || T == 10 || T == 12 || T == 13;
 
@@ -126,6 +126,16 @@ void qw_k(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out flo
             uint qh = U32(uint64_t(w) + p + 4).v[0] >> r;
             lo |= (((qh & 15) * 0x00204081u) & 0x01010101u) << 4; hi |= ((((qh >> 4) & 15) * 0x00204081u) & 0x01010101u) << 4;
         }
+    } else if (T == 2 || T == 6) {  // Q4_0, Q5_0 (QI40 in kernels.cu): 2-aligned blocks of 18 / 22, codes minus 8 / 16
+        uint r = (sub & 3) * 8, p = b + (T == 2 ? 18 : 22) * (sub >> 2), sh = r < 16 ? 0 : 4, off = T == 2 ? 0x08080808u : 0x10101010u;
+        d = ldh(w, p);
+        v = ld8(w, p + (T == 2 ? 2 : 6) + (r & 15));
+        lo = (v.x >> sh) & 0x0F0F0F0Fu; hi = (v.y >> sh) & 0x0F0F0F0Fu;
+        if (T == 6) {
+            uint qh = ld32(w, p + 2) >> r;
+            lo |= (((qh & 15) * 0x00204081u) & 0x01010101u) << 4; hi |= ((((qh >> 4) & 15) * 0x00204081u) & 0x01010101u) << 4;
+        }
+        lo = vsub4(lo, off); hi = vsub4(hi, off);
     } else {  // Q6_K
         uint e = sub * 8, n = e >> 7, r = e & 127, qt = r >> 5, k = r & 31, ns = 4 * (qt >> 1), hs = 2 * qt;
         d = ldh(w, b + 208) * float(sb(u8_(w, b + 192 + 8 * n + (k >> 4) + 2 * qt)));

@@ -254,16 +254,24 @@ fn dot_q2_0(row: &[u8], xq: &[Q8K]) -> f32 {
     }).sum()
 }
 
-/// Q4_1 (`Q5 = false`, 20 bytes) and Q5_1 (24): 32 values d * q + m per block, eight blocks per Q8_K block.
-fn dot_q41<const Q5: bool>(row: &[u8], xq: &[Q8K]) -> f32 {
-    row.chunks_exact(if Q5 { 24 } else { 20 }).enumerate().map(|(i, b)| {
+/// Q4_0 (`T` = 2, 18 bytes), Q4_1 (3, 20), Q5_0 (6, 22), Q5_1 (7, 24): block bytes, offset of the 32 high bits
+/// (0 = none) and of the 16 bytes of nibbles.
+const fn q4_layout(t: u8) -> (usize, usize, usize) { match t { 2 => (18, 0, 2), 3 => (20, 0, 4), 6 => (22, 2, 6), _ => (24, 4, 8) } }
+/// The block's m in value = d * q + m (q the unsigned 4- or 5-bit code): its own for Q4_1 / Q5_1, -8 d or -16 d for
+/// Q4_0 / Q5_0.
+fn q4_min(t: u8, b: &[u8]) -> f32 { match t { 3 | 7 => d16(&b[2..]), 2 => -8.0 * d16(b), _ => -16.0 * d16(b) } }
+
+/// Q4_0, Q4_1, Q5_0, Q5_1 (`q4_layout`): 32 values d * q + m per block, eight blocks per Q8_K block.
+fn dot_q4<const T: u8>(row: &[u8], xq: &[Q8K]) -> f32 {
+    let (bb, oh, oq) = q4_layout(T);
+    row.chunks_exact(bb).enumerate().map(|(i, b)| {
         let (y, o) = (&xq[i / 8], i % 8 * 32);
-        let (qh, qs) = if Q5 { (u32::from_le_bytes(b[4..8].try_into().unwrap()), &b[8..24]) } else { (0, &b[4..20]) };
+        let (qh, qs) = if oh > 0 { (u32::from_le_bytes(b[oh..oh + 4].try_into().unwrap()), &b[oq..oq + 16]) } else { (0, &b[oq..oq + 16]) };
         let s: i32 = (0..16).map(|j| {
             let (l, h) = ((qs[j] & 0xF) as i32 | ((qh >> j) & 1) as i32 * 16, (qs[j] >> 4) as i32 | ((qh >> (j + 16)) & 1) as i32 * 16);
             l * y.qs[o + j] as i32 + h * y.qs[o + j + 16] as i32
         }).sum();
-        y.d * (d16(b) * s as f32 + d16(&b[2..]) * (y.bs[o / 16] as i32 + y.bs[o / 16 + 1] as i32) as f32)
+        y.d * (d16(b) * s as f32 + q4_min(T, b) * (y.bs[o / 16] as i32 + y.bs[o / 16 + 1] as i32) as f32)
     }).sum()
 }
 
@@ -655,23 +663,24 @@ mod avx2 {
         }
     }
 
-    /// Q4_1 / Q5_1 (scalar `dot_q41`).
-    pub fn dot_q41<const Q5: bool>(row: &[u8], xq: &[Q8K]) -> f32 {
+    /// Q4_0, Q4_1, Q5_0, Q5_1 (scalar `dot_q4`).
+    pub fn dot_q4<const T: u8>(row: &[u8], xq: &[Q8K]) -> f32 {
+        let (bb, oh, oq) = super::q4_layout(T);
         unsafe {
             let (m4, ones, mut acc, mut sumf) = (_mm_set1_epi8(0xF), _mm256_set1_epi16(1), _mm256_setzero_ps(), 0f32);
-            for (i, b) in row.chunks_exact(if Q5 { 24 } else { 20 }).enumerate() {
+            for (i, b) in row.chunks_exact(bb).enumerate() {
                 let (y, o) = (&xq[i / 8], i % 8 * 32);
-                let q = _mm_loadu_si128(b[if Q5 { 8 } else { 4 }..].as_ptr() as *const __m128i);
+                let q = _mm_loadu_si128(b[oq..oq + 16].as_ptr() as *const __m128i);
                 let mut w = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q, 4), m4), _mm_and_si128(q, m4));
-                if Q5 {  // bit j of qh as 16 in byte j (llama.cpp bytes_from_bits_32)
-                    let qh = i32::from_le_bytes(b[4..8].try_into().unwrap());
+                if oh > 0 {  // bit j of qh as 16 in byte j (llama.cpp bytes_from_bits_32)
+                    let qh = i32::from_le_bytes(b[oh..oh + 4].try_into().unwrap());
                     let sh = _mm256_shuffle_epi8(_mm256_set1_epi32(qh), _mm256_set_epi64x(0x0303030303030303, 0x0202020202020202, 0x0101010101010101, 0));
                     let set = _mm256_cmpeq_epi8(_mm256_or_si256(sh, _mm256_set1_epi64x(0x7fbfdfeff7fbfdfe)), _mm256_set1_epi64x(-1));
                     w = _mm256_or_si256(w, _mm256_and_si256(set, _mm256_set1_epi8(16)));
                 }
                 let s = _mm256_madd_epi16(_mm256_maddubs_epi16(w, q8(y, o)), ones);
                 acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(s), acc);
-                sumf += d16(&b[2..]) * y.d * (y.bs[o / 16] as i32 + y.bs[o / 16 + 1] as i32) as f32;
+                sumf += super::q4_min(T, b) * y.d * (y.bs[o / 16] as i32 + y.bs[o / 16 + 1] as i32) as f32;
             }
             hsum(acc) + sumf
         }
@@ -703,9 +712,9 @@ mod avx2 {
 fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
     #[cfg(target_feature = "avx2")]
     if std::env::var_os("STRATA_SCALAR").is_none() {
-        return match ty { GgmlType::IQ2XS => Some(avx2::dot_iq2xs), GgmlType::IQ3XXS => Some(avx2::dot_iq3xxs), GgmlType::IQ4XS => Some(avx2::dot_iq4xs), GgmlType::IQ3S => Some(avx2::dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::IQ2XXS => Some(avx2::dot_iq2xxs), GgmlType::IQ2S => Some(avx2::dot_iq2s), GgmlType::IQ1S => Some(avx2::dot_iq1s), GgmlType::IQ1M => Some(avx2::dot_iq1m), GgmlType::Q2K => Some(avx2::dot_q2k), GgmlType::Q3K => Some(avx2::dot_q3k), GgmlType::Q4K => Some(avx2::dot_q4k), GgmlType::Q2_0 => Some(avx2::dot_q2_0), GgmlType::Q4_1 => Some(avx2::dot_q41::<false>), GgmlType::Q5_1 => Some(avx2::dot_q41::<true>), _ => None };
+        return match ty { GgmlType::IQ2XS => Some(avx2::dot_iq2xs), GgmlType::IQ3XXS => Some(avx2::dot_iq3xxs), GgmlType::IQ4XS => Some(avx2::dot_iq4xs), GgmlType::IQ3S => Some(avx2::dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::IQ2XXS => Some(avx2::dot_iq2xxs), GgmlType::IQ2S => Some(avx2::dot_iq2s), GgmlType::IQ1S => Some(avx2::dot_iq1s), GgmlType::IQ1M => Some(avx2::dot_iq1m), GgmlType::Q2K => Some(avx2::dot_q2k), GgmlType::Q3K => Some(avx2::dot_q3k), GgmlType::Q4K => Some(avx2::dot_q4k), GgmlType::Q2_0 => Some(avx2::dot_q2_0), GgmlType::Q4_0 => Some(avx2::dot_q4::<2>), GgmlType::Q4_1 => Some(avx2::dot_q4::<3>), GgmlType::Q5_0 => Some(avx2::dot_q4::<6>), GgmlType::Q5_1 => Some(avx2::dot_q4::<7>), _ => None };
     }
-    match ty { GgmlType::IQ2XS => Some(dot_iq2xs), GgmlType::IQ3XXS => Some(dot_iq3xxs), GgmlType::IQ4XS => Some(dot_iq4xs), GgmlType::IQ3S => Some(dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::IQ2XXS => Some(dot_iq2xxs), GgmlType::IQ2S => Some(dot_iq2s), GgmlType::IQ1S => Some(dot_iq1s), GgmlType::IQ1M => Some(dot_iq1m), GgmlType::Q2K => Some(dot_q2k), GgmlType::Q3K => Some(dot_q3k), GgmlType::Q4K => Some(dot_q4k), GgmlType::Q2_0 => Some(dot_q2_0), GgmlType::Q4_1 => Some(dot_q41::<false>), GgmlType::Q5_1 => Some(dot_q41::<true>), _ => None }
+    match ty { GgmlType::IQ2XS => Some(dot_iq2xs), GgmlType::IQ3XXS => Some(dot_iq3xxs), GgmlType::IQ4XS => Some(dot_iq4xs), GgmlType::IQ3S => Some(dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::IQ2XXS => Some(dot_iq2xxs), GgmlType::IQ2S => Some(dot_iq2s), GgmlType::IQ1S => Some(dot_iq1s), GgmlType::IQ1M => Some(dot_iq1m), GgmlType::Q2K => Some(dot_q2k), GgmlType::Q3K => Some(dot_q3k), GgmlType::Q4K => Some(dot_q4k), GgmlType::Q2_0 => Some(dot_q2_0), GgmlType::Q4_0 => Some(dot_q4::<2>), GgmlType::Q4_1 => Some(dot_q4::<3>), GgmlType::Q5_0 => Some(dot_q4::<6>), GgmlType::Q5_1 => Some(dot_q4::<7>), _ => None }
 }
 
 /// y = t · x for every row, using the integer kernel when the type has one.
@@ -776,7 +785,7 @@ mod tests {
         let mut r = 0x9E3779B97F4A7C15u64;
         let mut rnd = || { r ^= r << 13; r ^= r >> 7; r ^= r << 17; r as u8 };
         let x: Vec<f32> = (0..1024).map(|i| ((i as f32 * 0.7548777).fract() - 0.5) * 2.0).collect();
-        for ty in [GgmlType::Q2_0, GgmlType::Q4_1, GgmlType::Q5_1, GgmlType::IQ2XS, GgmlType::IQ3XXS, GgmlType::IQ3S, GgmlType::IQ4XS, GgmlType::Q6K, GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K, GgmlType::IQ2XXS, GgmlType::IQ2S, GgmlType::IQ1S, GgmlType::IQ1M] {
+        for ty in [GgmlType::Q2_0, GgmlType::Q4_0, GgmlType::Q4_1, GgmlType::Q5_0, GgmlType::Q5_1, GgmlType::IQ2XS, GgmlType::IQ3XXS, GgmlType::IQ3S, GgmlType::IQ4XS, GgmlType::Q6K, GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K, GgmlType::IQ2XXS, GgmlType::IQ2S, GgmlType::IQ1S, GgmlType::IQ1M] {
             // Q2_0 at 640 values exercises the zero-padded last Q8_K block.
             let n = if ty == GgmlType::Q2_0 { 640 } else { 1024 };
             let xq = quantize_q8k(&x[..n]);
@@ -792,7 +801,7 @@ mod tests {
             let mut w = vec![0f32; n];
             crate::quant::dequant_row(ty, &row, &mut w);
             let want: f64 = w.iter().enumerate().map(|(i, &v)| v as f64 * (xq[i / 256].d * xq[i / 256].qs[i % 256] as f32) as f64).sum();
-            let scalar = match ty { GgmlType::IQ2XS => dot_iq2xs, GgmlType::IQ3XXS => dot_iq3xxs, GgmlType::IQ3S => dot_iq3s, GgmlType::Q6K => dot_q6k, GgmlType::Q2K => dot_q2k, GgmlType::Q3K => dot_q3k, GgmlType::Q4K => dot_q4k, GgmlType::IQ2XXS => dot_iq2xxs, GgmlType::IQ2S => dot_iq2s, GgmlType::IQ1S => dot_iq1s, GgmlType::IQ1M => dot_iq1m, GgmlType::Q2_0 => dot_q2_0, GgmlType::Q4_1 => dot_q41::<false>, GgmlType::Q5_1 => dot_q41::<true>, _ => dot_iq4xs };
+            let scalar = match ty { GgmlType::IQ2XS => dot_iq2xs, GgmlType::IQ3XXS => dot_iq3xxs, GgmlType::IQ3S => dot_iq3s, GgmlType::Q6K => dot_q6k, GgmlType::Q2K => dot_q2k, GgmlType::Q3K => dot_q3k, GgmlType::Q4K => dot_q4k, GgmlType::IQ2XXS => dot_iq2xxs, GgmlType::IQ2S => dot_iq2s, GgmlType::IQ1S => dot_iq1s, GgmlType::IQ1M => dot_iq1m, GgmlType::Q2_0 => dot_q2_0, GgmlType::Q4_0 => dot_q4::<2>, GgmlType::Q4_1 => dot_q4::<3>, GgmlType::Q5_0 => dot_q4::<6>, GgmlType::Q5_1 => dot_q4::<7>, _ => dot_iq4xs };
             for got in [scalar(&row, &xq), int_dot(ty).unwrap()(&row, &xq)] {
                 assert!(((got as f64 - want) / want.abs().max(1e-3)).abs() < 1e-5, "{}: {got} vs {want}", ty.name());
             }

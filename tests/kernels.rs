@@ -1,7 +1,7 @@
 //! Kernel tests, run on every backend that opens (`common::backends`).
 mod common;
 use common::{down, up};
-use rusting_strata::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM};
+use rusting_strata::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
 use rusting_strata::{cuda::Gpu, gguf::Gguf, quant::GgmlType, weights::{Tensor, Weights}};
 
 fn xs(n: usize) -> Vec<f32> {
@@ -1026,7 +1026,7 @@ fn attn_decode_bandwidth() {
 }
 
 
-/// Random rows of `ty` with sane block scales: f16 d in [0.01, 0.02) at each block's start (Q2_0, Q8_0, IQ4_NL; Q4_1 and Q5_1 also a small m), or
+/// Random rows of `ty` with sane block scales: f16 d in [0.01, 0.02) at each block's start (Q2_0, Q8_0, IQ4_NL, Q4_0, Q5_0; Q4_1 and Q5_1 also a small m), or
 /// float values (F32, BF16).
 fn random_tensor(ty: GgmlType, rows: usize, cols: usize, seed: u32) -> Vec<u8> {
     let mut s = seed.wrapping_mul(2654435761) | 1;
@@ -1052,14 +1052,16 @@ fn random_tensor(ty: GgmlType, rows: usize, cols: usize, seed: u32) -> Vec<u8> {
 fn gemv_partial_superblocks_and_q2_0() {
     for (bk, gpu) in common::backends_except(&[]) {
         let gpu = &*gpu;
-        for ty in [GgmlType::Q2_0, GgmlType::Q8_0, GgmlType::IQ4NL, GgmlType::Q4_1, GgmlType::Q5_1, GgmlType::BF16, GgmlType::F32] {
+        for ty in [GgmlType::Q2_0, GgmlType::Q8_0, GgmlType::IQ4NL, GgmlType::Q4_0, GgmlType::Q5_0, GgmlType::Q4_1, GgmlType::Q5_1, GgmlType::BF16, GgmlType::F32] {
             for cols in [640, 320, 2560] {
                 if cols % ty.block_elems() != 0 { continue; }
                 let (rows, nt, ne) = (40, 3, 4);  // ne experts of `rows` rows for moe_gemv
                 let data = random_tensor(ty, ne * rows, cols, cols as u32 + ty as u32);
                 let all = Tensor { ty, cols, rows: ne * rows, data: &data };
                 let t = Tensor { rows, data: &data[..ty.row_bytes(cols as u64) * rows], ..all };
-                let (dt, dall) = (gpu.upload(&t).unwrap(), gpu.upload(&all).unwrap());
+                // Raw bytes, as experts are uploaded (`Backend::upload` turns Q4_0 / Q5_0 into Q8_0).
+                let raw = |t: &Tensor| { let b = gpu.alloc(t.data.len()).unwrap(); gpu.htod(t.data, &b, 0).unwrap(); GpuTensor::new(t.ty, t.rows, t.cols, b) };
+                let (dt, dall) = (raw(&t), raw(&all));
                 let what = format!("{bk} {} cols {cols}", ty.name());
                 // dequant
                 let dq = gpu.zeros::<f32>(rows * cols).unwrap();
