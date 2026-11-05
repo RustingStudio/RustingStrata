@@ -436,12 +436,13 @@ impl<'a> GpuModel<'a> {
     fn slot_pos(&mut self, s: usize) -> &mut usize { if s == self.cur { &mut self.pos } else { &mut self.seqs[s].pos } }
 
     /// One decode step for each of up to `TMAX` distinct slots in one forward (each weight read once): `rows` holds
-    /// (slot, token). Returns the logits per row. Each forward is graphed by its slots and attention regimes, so
-    /// keep the rows in slot order.
-    pub fn step_rows(&mut self, rows: &[(usize, u32)]) -> anyhow::Result<Vec<Vec<f32>>> {
+    /// (slot, token, whether to return its logits). Returns per row the greedy next token (argmax, first on ties) and
+    /// the logits if asked (else empty: greedy rows copy back only the token). Each forward is graphed by its slots
+    /// and attention regimes, so keep the rows in slot order.
+    pub fn step_rows(&mut self, rows: &[(usize, u32, bool)]) -> anyhow::Result<Vec<(u32, Vec<f32>)>> {
         let (nt, nvoc) = (rows.len(), self.m.cfg.n_vocab);
         ensure!((1..=TMAX).contains(&nt) && self.next.is_none() && self.mtp.is_none(), "step_rows: {nt} rows");
-        let pos: Vec<usize> = rows.iter().map(|&(s, _)| *self.slot_pos(s)).collect();
+        let pos: Vec<usize> = rows.iter().map(|&(s, ..)| *self.slot_pos(s)).collect();
         if pos.iter().any(|&p| p >= self.ctx) { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
         let seq = self.worker.as_mut().map_or(0, |w| w.begin());
         self.put_embed(&rows.iter().map(|r| r.1).collect::<Vec<_>>())?;
@@ -450,18 +451,24 @@ impl<'a> GpuModel<'a> {
         const _: () = assert!(TMAX <= 4, "step_rows graph key");
         let mut key = 1 << 63 | nt as u64;
         for (r, &(sl, p)) in self.rows.iter().enumerate() { key |= (sl as u64) << (8 + 8 * r) | ((gq_min(p, 1) == 0) as u64) << (48 + r); }
-        let res = (|| -> anyhow::Result<Vec<f32>> {
+        let res = (|| -> anyhow::Result<Vec<(u32, Vec<f32>)>> {
             self.gpu.graph(key, &mut || self.forward(nt, 0, None))?;
-            let mut logits = self.gpu.get::<f32>(&self.logits, 0, nt * nvoc)?;
-            if self.finish(nt, 0, None)? { logits = self.gpu.get::<f32>(&self.logits, 0, nt * nvoc)?; }
-            Ok(logits)
+            let g = &self.gpu;
+            g.argmax_rows(self.logits.addr(), nvoc, nt, self.amax.addr())?;
+            let mut am = g.get::<i32>(&self.amax, 0, nt)?;
+            if self.finish(nt, 0, None)? {
+                g.argmax_rows(self.logits.addr(), nvoc, nt, self.amax.addr())?;
+                am = g.get::<i32>(&self.amax, 0, nt)?;
+            }
+            rows.iter().zip(am).enumerate()
+                .map(|(r, (&(.., want), t))| Ok((t as u32, if want { g.get::<f32>(&self.logits, r * nvoc, nvoc)? } else { vec![] }))).collect()
         })();
         self.rows.clear();
-        let logits = res?;
-        for &(s, _) in rows { *self.slot_pos(s) += 1; }
+        let out = res?;
+        for &(s, ..) in rows { *self.slot_pos(s) += 1; }
         self.row_tokens += nt;
         self.after_experts(nt, self.row_tokens)?;
-        Ok(logits.chunks(nvoc).map(|c| c.to_vec()).collect())
+        Ok(out)
     }
 
     /// This part and the parts after it.
