@@ -460,7 +460,7 @@ fn attn_prefill_matches_decode() {
                 if gq_min == ATT_GQA_MIN {  // attn_decode_q's xq (where written) is quant_xq of its output
                     let (dxq, wxq) = (gpu.zeros::<u8>(t * nh * hd * 9 / 8).unwrap(), gpu.zeros::<u8>(t * nh * hd * 9 / 8).unwrap());
                     let aq = gpu.attn_decode_q(dq.addr(), dk.addr(), dv.addr(), dg.addr(), dbat.addr(), pbat.addr(), ds.addr(),
-                                               nh, nkv, hd, scale, gq_min, t, dxq.addr()).unwrap();
+                                               nh, nkv, hd, scale, gq_min, t, dxq.addr(), 0, 0).unwrap();
                     assert_eq!(down::<f32>(gpu, &dbat), want, "attn_decode_q nh {nh} nkv {nkv} hd {hd}");
                     if aq != 0 {
                         gpu.quant_xq(dbat.addr(), nh * hd, nh * hd, t, wxq.addr()).unwrap();

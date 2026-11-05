@@ -56,6 +56,9 @@ const SPV: &[(&str, &[u8])] = &[
     ("ple_gate", include_bytes!("spv/ple_gate.spv")),
     ("quant_q8", include_bytes!("spv/quant_q8.spv")),
     ("quant_xq", include_bytes!("spv/quant_xq.spv")),
+    ("qsa_pool", include_bytes!("spv/qsa_pool.spv")),
+    ("qsa_score", include_bytes!("spv/qsa_score.spv")),
+    ("qsa_select", include_bytes!("spv/qsa_select.spv")),
     ("rms_norm", include_bytes!("spv/rms_norm.spv")),
     ("rope_neox", include_bytes!("spv/rope_neox.spv")),
     ("router_topk", include_bytes!("spv/router_topk.spv")),
@@ -689,15 +692,15 @@ impl Arg for f32 { fn put(&self, v: &mut Vec<u8>) { v.extend(self.to_le_bytes())
 impl Vk {
     /// As the CUDA one: both kernels run, the step decides which one works, then attn_merge combines the splits (and
     /// writes out quantized into xq when not null).
-    fn attn(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64) -> anyhow::Result<()> {
+    fn attn(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64, sel: u64, sst: usize) -> anyhow::Result<()> {
         ensure!([64, 128, 256, 512].contains(&hd), "attention head_dim {hd} unsupported (64, 128, 256 or 512)");
         let (per, pz) = ((hd / 32) as u32, (nh * ATT_SPLITS * (hd + 2)) as u32);
         if self.0.llama != 0 {  // one head per workgroup, merged as the attn_decode splits (empty ones weigh 0)
-            self.run("attn_decode_llama", &[0, hd as u32], [nh * nt, ATT_SPLITS_1, 1], &[&q, &kc, &vc, &part, &step, &(nh as u32), &(nkv as u32), &scale, &pz, &(nt as u32)])?;
+            self.run("attn_decode_llama", &[0, hd as u32], [nh * nt, ATT_SPLITS_1, 1], &[&q, &kc, &vc, &part, &step, &sel, &(sst as u32), &(nh as u32), &(nkv as u32), &scale, &pz, &(nt as u32)])?;
             return self.run("attn_merge", &[], [nh, 1, nt], &[&part, &qg, &out, &step, &(hd as u32), &(ATT_SPLITS as u32), &(ATT_SPLITS_1 as u32), &i32::MAX, &0u64]);
         }
         let g = [8, 4, 2, 1].into_iter().find(|&g| (nh / nkv) % g == 0 && g * hd <= 2048).unwrap();
-        let args: [&dyn Arg; 11] = [&q, &kc, &vc, &part, &step, &(nh as u32), &(nkv as u32), &scale, &gq_min, &pz, &(nt as u32)];
+        let args: [&dyn Arg; 13] = [&q, &kc, &vc, &part, &step, &sel, &(sst as u32), &(nh as u32), &(nkv as u32), &scale, &gq_min, &pz, &(nt as u32)];
         // gq_min i32::MAX or 0 fixes the regime, so the dispatch that would exit at once is skipped.
         let wide = (nt >= 2) as u32;
         if gq_min != 0 { self.run("attn_decode", &[0, per, 1, 0, wide], [nh * nt, ATT_SPLITS_1, 1], &args)?; }
@@ -1116,16 +1119,16 @@ impl Backend for Vk {
         self.run("conv_seq", &[], [(t * ch).div_ceil(256), 1, 1], &[&qkv, &state, &w, &y, &(ch as u32), &(kw as u32), &(t as u32)])?;
         self.run("conv_state", &[], [ch.div_ceil(256), 1, 1], &[&qkv, &state, &snap, &(ch as u32), &(kw as u32), &(t as u32), &(nsnap as u32)])
     }
-    fn attn_prefill(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
+    fn attn_prefill_m(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32, qm: u64, mw: usize) -> anyhow::Result<()> {
         let name = match hd { 64 => "attn_prefill_64", 128 => "attn_prefill_128", 256 => "attn_prefill_256",
             _ => anyhow::bail!("attention prefill: head_dim {hd} unsupported (64, 128 or 256)") };
         if self.0.llama != 0 {
-            return self.run("attn_prefill_llama", &[0, hd as u32], [t, nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale]);
+            return self.run("attn_prefill_llama", &[0, hd as u32], [t, nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32)]);
         }
         if !self.0.coop {
-            return self.run("attn_prefill_dp", &[0, (hd / 32) as u32], [t.div_ceil(4), nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale]);
+            return self.run("attn_prefill_dp", &[0, (hd / 32) as u32], [t.div_ceil(4), nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32)]);
         }
-        self.run(name, &[], [t.div_ceil(64), nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale])
+        self.run(name, &[], [t.div_ceil(64), nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32)])
     }
     fn moe_combine_seq(&self, x: u64, ye: u64, wts: u64, inv: u64, k: usize, sh: u64, sg: u64, n: usize, t: usize) -> anyhow::Result<()> {
         self.run("moe_combine_seq", &[], [(t * n).div_ceil(256), 1, 1], &[&x, &ye, &wts, &inv, &sh, &sg, &(k as u32), &(n as u32), &(t as u32)])
@@ -1163,12 +1166,20 @@ impl Backend for Vk {
         self.run("kv_store", &[], [(n * t).div_ceil(256), 1, 1], &[&k, &v, &kc, &vc, &step, &(n as u32), &((n * t) as u32), &(hd as u32)])
     }
     fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize) -> anyhow::Result<()> {
-        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, 0)
+        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, 0, 0, 0)
     }
-    fn attn_decode_q(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64) -> anyhow::Result<u64> {
+    fn attn_decode_q(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64, sel: u64, sst: usize) -> anyhow::Result<u64> {
         let xq = if self.0.llama != 0 { 0 } else { xq };
-        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, xq)?;
+        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, xq, sel, sst)?;
         Ok(xq)
+    }
+    fn qsa_pool(&self, ik: u64, ring: u64, pool: u64, w: u64, step: u64, t: usize, n_rot: usize, base: f32, eps: f32) -> anyhow::Result<()> {
+        let ts = (base as f64).powf(-2.0 / n_rot as f64);
+        self.run("qsa_pool", &[], [t / 4 + 1, 1, 1], &[&ik, &ring, &pool, &w, &step, &ts, &(t as u32), &(n_rot as u32), &eps])
+    }
+    fn qsa_select(&self, q: u64, pool: u64, score: u64, sel: u64, mask: u64, step: u64, r0: usize, rows: usize, nbs: usize, top: usize, sst: usize, mw: usize) -> anyhow::Result<()> {
+        self.run("qsa_score", &[], [64, rows.div_ceil(8), 1], &[&q, &pool, &score, &step, &(r0 as i32), &(rows as u32), &(nbs as u32), &(top as u32)])?;
+        self.run("qsa_select", &[], [rows, 1, 1], &[&score, &sel, &mask, &step, &(r0 as i32), &(nbs as u32), &(top as u32), &(sst as u32), &(mw as u32)])
     }
     fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()> {
         ensure!(n <= 512 && k <= 32, "router_topk: {n} experts, top {k}");
