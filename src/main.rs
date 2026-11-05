@@ -57,6 +57,12 @@ struct Engine {
     /// repeat exactly.
     #[arg(long)]
     fixed_experts: bool,
+    /// Keep the think block of earlier replies in the prompt (Qwen3.5/3.6 templates' `preserve_thinking`; a request
+    /// can set it in `chat_template_kwargs`). The template drops it from replies before the last user message, so
+    /// each new user message changes the earlier text and the whole conversation is prefilled again; with this, a
+    /// coding agent's long history stays cached across user messages.
+    #[arg(long)]
+    preserve_thinking: bool,
     /// KV cache format (GPU): f16, or q8 (q8_0 blocks, half the KV memory; numerics differ slightly from
     /// llama.cpp's default f16 cache).
     #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
@@ -476,7 +482,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 if stdin.lock().read_line(&mut line)? == 0 { break; }
                 if line.trim().is_empty() { continue; }
                 msgs.push(Msg::new("user", line.trim_end()));
-                let (ids, logits, _) = r.chat(&tok, &tpl.render(&msgs, &[], think, true), &tpl.render(&msgs, &[], think, false), "")?;
+                let (ids, logits, _) = r.chat(&tok, &tpl.render(&msgs, &[], think, engine.preserve_thinking, true), &tpl.render(&msgs, &[], think, engine.preserve_thinking, false), "")?;
                 let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut smp, logits, room(&engine, ids.len(), n), &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
                 println!();
                 msgs.push(Msg::new("assistant", &answer(&tok.decode(&out)?)));
@@ -782,6 +788,15 @@ fn open_browser(url: &str) {
     if let Err(e) = r { eprintln!("could not open a browser ({e}); open {url}"); }
 }
 
+/// One Messages API stream event.
+fn sse(w: &mut impl Write, v: serde_json::Value) -> anyhow::Result<()> { Ok(write!(w, "event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap_or_default())?) }
+
+/// Streamed reply text as a Messages API text block (index 0), started by the first piece.
+fn text_delta(w: &mut impl Write, opened: &mut bool, t: &str) -> anyhow::Result<()> {
+    if !std::mem::replace(opened, true) { sse(w, json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}))?; }
+    sse(w, json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": t}}))
+}
+
 fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Loaded>, e: &Engine, s: &Serving, i: usize,
     next: &mut Option<(PathBuf, TcpStream)>) -> anyhow::Result<()> {
     let send = |w: &mut TcpStream, status: &str, v: serde_json::Value| -> anyhow::Result<()> {
@@ -807,7 +822,8 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
     }
     if s.key.as_deref().is_some_and(|k| !serve::key_ok(&auth, k)) { return send(&mut w, "401 Unauthorized", json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}})); }
     if method == "POST" && !json { return send(&mut w, "415 Unsupported Media Type", json!({"error": {"message": "Content-Type must be application/json", "type": "invalid_request_error"}})); }
-    match (method.as_str(), path.as_str()) {
+    // Claude Code adds `?beta=true`.
+    match (method.as_str(), path.split('?').next().unwrap_or_default()) {
         ("GET", "/v1/models") => send(&mut w, "200 OK", json!({"object": "list", "data": l.map(|l| json!([{"id": l.name, "object": "model", "created": created, "owned_by": "strata"}])).unwrap_or(json!([]))})),
         ("GET", "/api/models") => {
             let models: Vec<_> = s.models().into_iter().map(|(id, p, n)| json!({"id": id, "bytes": n, "loaded": l.as_ref().is_some_and(|l| l.path == p)})).collect();
@@ -847,18 +863,21 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             });
             send(&mut w, "202 Accepted", json!(*s.dl.lock().unwrap()))
         }
-        ("POST", "/v1/chat/completions") => {
+        // The Anthropic Messages API (Claude Code) is translated to a chat request, and the reply back.
+        ("POST", p @ ("/v1/chat/completions" | "/v1/messages")) => {
+            let anth = p == "/v1/messages";
             let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
             let (r, tok, tpl, name) = (&mut l.r, &l.tok, l.tpl, l.name.as_str());
-            let req = match serve::chat_request(&body) {
+            let req = match if anth { serve::messages_body(&body) } else { Ok(body.clone()) }.and_then(|b| serve::chat_request(&b)) {
                 Ok(q) => q,
                 Err(err) => return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
             };
             // Room is checked on the full prompt before any state changes.
-            let prompt = tpl.render(&req.messages, &req.tools, req.think, true);
+            let preserve = req.preserve_thinking.unwrap_or(e.preserve_thinking);
+            let prompt = tpl.render(&req.messages, &req.tools, req.think, preserve, true);
             // The system and tools block, which compacted or rewritten conversations keep.
             let n_sys = req.messages.iter().take_while(|m| m.role == "system").count();
-            let system = tpl.render(&req.messages[..n_sys], &req.tools, req.think, false);
+            let system = tpl.render(&req.messages[..n_sys], &req.tools, req.think, preserve, false);
             let ids = tok.encode(&prompt)?;
             let mut smp = e.sampler();
             smp.temp = req.temperature.unwrap_or(smp.temp);
@@ -873,6 +892,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             // With tools, a stream holds back the text from a `<tool_call>` tag on until the reply is parsed.
             let tools = req.tool_calls && !req.tools.is_empty();
             let mut cached = 0;
+            let mut opened = false;  // Messages API stream: the text block has started
             let mut hold = Hold::new(tools, req.stop);
             let n_system = tok.encode(&system)?.len();
             let (t0, mut t1) = (Instant::now(), Instant::now());
@@ -882,16 +902,24 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             }
             let res = (|| -> anyhow::Result<(Vec<u32>, bool)> {
                 let logits;
-                (_, logits, cached) = r.chat(tok, &prompt, &tpl.render(&req.messages, &req.tools, req.think, false), &system)?;
+                (_, logits, cached) = r.chat(tok, &prompt, &tpl.render(&req.messages, &req.tools, req.think, preserve, false), &system)?;
                 t1 = Instant::now();
                 if req.stream {
                     write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
-                    write!(w, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), None))?;
+                    if anth {
+                        sse(&mut w, json!({"type": "message_start", "message": {"id": format!("msg_{i}"), "type": "message", "role": "assistant", "model": name,
+                            "content": [], "stop_reason": null, "stop_sequence": null,
+                            "usage": {"input_tokens": ids.len() - cached, "cache_read_input_tokens": cached, "output_tokens": 0}}}))?;
+                    } else {
+                        write!(w, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), None))?;
+                    }
                 }
                 decode(r, tok, e.mtp() > 0, &mut smp, logits, n, &mut |t| {
                     s.stats.lock().unwrap().live_tokens += 1;
                     let t = hold.push(t);
-                    if req.stream && !t.is_empty() { write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?; }
+                    if req.stream && !t.is_empty() {
+                        if !anth { write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?; } else { text_delta(&mut w, &mut opened, &t)?; }
+                    }
                     Ok(hold.stopped)
                 })
             })();
@@ -899,13 +927,8 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 let mut st = s.stats.lock().unwrap();
                 st.busy = false;
                 gpu_stats(r, &mut st);
-                if let Ok((out, stop)) = &res {
-                    let ms = |d: Duration| d.as_secs_f64() * 1e3;
-                    st.record(serve::Last { at: created, model: name.into(), system_tokens: n_system, cached_tokens: cached, prompt_tokens: ids.len(),
-                        completion_tokens: out.len(), prefill_ms: ms(t1 - t0), decode_ms: ms(t1.elapsed()),
-                        finish: if *stop { "stop" } else { "length" }.into() });
-                }
             }
+            let decoded = t1.elapsed();
             // The next request starts from the saved history state or from scratch. A stream that already started is just cut off.
             let (out, stop) = match res {
                 Ok(x) => x,
@@ -914,6 +937,10 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             };
             // A malformed call goes out as plain text.
             let calls = if tools { tpl.parse_calls(&hold.text, &req.tools) } else { None };
+            let ms = |d: Duration| d.as_secs_f64() * 1e3;
+            s.stats.lock().unwrap().record(serve::Last { at: created, model: name.into(), system_tokens: n_system, cached_tokens: cached,
+                prompt_tokens: ids.len(), completion_tokens: out.len(), prefill_ms: ms(t1 - t0), decode_ms: ms(decoded),
+                finish: if calls.is_some() { "tool_calls" } else if stop { "stop" } else { "length" }.into() });
             let calls_json = |(content, calls): &(String, Vec<(String, String)>), stream: bool| {
                 let c: Vec<_> = calls.iter().enumerate().map(|(k, (f, a))| {
                     let mut c = json!({"id": format!("call_{i}_{k}"), "type": "function", "function": {"name": f, "arguments": a}});
@@ -923,6 +950,30 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 if stream { json!({"tool_calls": c}) }
                 else { json!({"role": "assistant", "content": if content.is_empty() { None } else { Some(content) }, "tool_calls": c}) }
             };
+            if anth {
+                let reason = if calls.is_some() { "tool_use" } else if stop { "end_turn" } else { "max_tokens" };
+                let usage = json!({"input_tokens": ids.len() - cached, "cache_read_input_tokens": cached, "cache_creation_input_tokens": 0, "output_tokens": out.len()});
+                let uses: Vec<_> = calls.iter().flat_map(|c| &c.1).enumerate().map(|(k, (f, a))| json!({"type": "tool_use", "id": format!("toolu_{i}_{k}"),
+                    "name": f, "input": serde_json::from_str::<serde_json::Value>(a).unwrap_or(json!({}))})).collect();
+                if !req.stream {
+                    let text = calls.as_ref().map_or(&hold.text, |c| &c.0);
+                    let content: Vec<_> = (!text.is_empty()).then(|| json!({"type": "text", "text": text})).into_iter().chain(uses).collect();
+                    return send(&mut w, "200 OK", json!({"id": format!("msg_{i}"), "type": "message", "role": "assistant", "model": name, "content": content,
+                        "stop_reason": reason, "stop_sequence": null, "usage": usage}));
+                }
+                if calls.is_none() && !hold.rest().is_empty() { text_delta(&mut w, &mut opened, hold.rest())?; }
+                if opened { sse(&mut w, json!({"type": "content_block_stop", "index": 0}))?; }
+                for (k, u) in uses.iter().enumerate() {
+                    let (index, input) = (k + opened as usize, u["input"].to_string());
+                    let mut start = u.clone();
+                    start["input"] = json!({});
+                    sse(&mut w, json!({"type": "content_block_start", "index": index, "content_block": start}))?;
+                    sse(&mut w, json!({"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": input}}))?;
+                    sse(&mut w, json!({"type": "content_block_stop", "index": index}))?;
+                }
+                sse(&mut w, json!({"type": "message_delta", "delta": {"stop_reason": reason, "stop_sequence": null}, "usage": {"output_tokens": out.len()}}))?;
+                return sse(&mut w, json!({"type": "message_stop"}));
+            }
             let finish = if calls.is_some() { "tool_calls" } else if stop { "stop" } else { "length" };
             let usage = json!({"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len(),
                 "prompt_tokens_details": {"cached_tokens": cached}});

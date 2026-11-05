@@ -96,6 +96,13 @@ they are left out. When a request repeats the previous request's messages and ad
 prefilled (`usage.prompt_tokens_details.cached_tokens`). `tools` and `tool_choice` work as in the OpenAI API (calls
 come back as `tool_calls` with `finish_reason: "tool_calls"`). The prompt follows the model's own chat template,
 rendered like llama.cpp's `--jinja`. `tool_choice: "required"` does not force a call.
+`POST /v1/messages` speaks the Anthropic Messages API (text, `tool_use` and `tool_result` blocks, streamed or not,
+the key in `x-api-key`), so Claude Code can use the server:
+`ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=secret ANTHROPIC_MODEL=local ANTHROPIC_SMALL_FAST_MODEL=local claude`.
+OpenCode and other agents use the OpenAI address. Qwen3.6's template leaves the think block out of replies before the
+last user message, so each new user message changes the text of the earlier turns and the whole conversation is
+prefilled again; `--preserve-thinking` (or `chat_template_kwargs.preserve_thinking` in a request) keeps those blocks,
+and a long agent session then prefills only what was added.
 The server has one key and treats all clients as one user: the cached-token count and the response time show
 whether the previous request started with the same messages, so do not share one server between people who must
 not learn each other's prompts.
