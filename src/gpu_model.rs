@@ -56,6 +56,14 @@ struct Ple { key: GpuTensor, value: GpuTensor, norm_key: GpuTensor, norm_query: 
 struct Layer { attn_norm: Option<GpuTensor>, post_norm: Option<GpuTensor>, hc: Option<[HcRead; 2]>, ple: Option<Ple>, mixer: Mixer, ffn: Ffn }
 
 /// MTP draft head: the `nextn` block (layer n_layer) with its own KV cache and CPU worker.
+/// A saved conversation state in host memory: its tokens, the PLE tokens before it, the `slot` buffers and the KV
+/// rows of its positions in each attention layer.
+struct Parked { ids: Vec<u32>, ple_prev: [i64; 2], slot: Vec<Vec<u8>>, kv: Vec<Vec<u8>> }
+
+impl Parked {
+    fn bytes(&self) -> usize { self.slot.iter().chain(&self.kv).map(Vec::len).sum() }
+}
+
 struct MtpHead {
     layer: Layer, eh_proj: GpuTensor, enorm: GpuTensor, hnorm: GpuTensor, head_norm: GpuTensor,
     worker: CpuWorker, step_buf: Buf, emb: Buf, eh: Buf, x: Buf, pos: usize,
@@ -99,6 +107,10 @@ pub struct GpuModel<'a> {
     /// tokens behind it. A request whose history no longer extends the saved one (a rewritten or compacted
     /// conversation) restarts from it.
     sys: Option<(Vec<Vec<u8>>, usize, [i64; 2], Vec<u32>)>,
+    /// Saved states that a request with another history replaced, most recent first (`park`).
+    parked: Vec<Parked>,
+    /// Host memory for `parked`, in bytes (0 = keep none).
+    pub cache_ram: usize,
     ctx: usize,
     pub pos: usize,
     pub cache: Option<ExpertCache>,
@@ -253,7 +265,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], sys: None, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), k, short: 32, pf, mtp })
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), k, short: 32, pf, mtp })
     }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
@@ -380,6 +392,37 @@ impl<'a> GpuModel<'a> {
         self.saved_ids = ids.to_vec();
         self.sys = Some((data, self.saved_pos, self.saved_ple_prev, self.saved_ids.clone()));
         Ok(())
+    }
+
+    /// The KV caches of the attention layers (and of the draft head), whose rows are positions.
+    fn kv_bufs(&self) -> Vec<&Buf> {
+        self.layers.iter().chain(self.mtp.as_ref().map(|h| &h.layer))
+            .flat_map(|l| match &l.mixer { Mixer::Attn { kc, vc, .. } => vec![kc, vc], _ => vec![] }).collect()
+    }
+
+    /// Copy the saved state to host memory, so a later request that continues it can take it back (`unpark`); the
+    /// least recently parked states go when they exceed `cache_ram`.
+    fn park(&mut self) -> anyhow::Result<()> {
+        let n = self.saved_ids.len();
+        if n == 0 { return Ok(()) }
+        let kv = self.kv_bufs().iter().map(|b| b.len() / self.ctx * n).sum::<usize>();
+        if kv + self.slot().iter().map(|b| b.len()).sum::<usize>() > self.cache_ram { return Ok(()) }
+        let g = &self.gpu;
+        let slot = self.slot().iter().map(|b| g.get::<u8>(b, 0, b.len())).collect::<anyhow::Result<_>>()?;
+        let kv = self.kv_bufs().iter().map(|b| g.get::<u8>(b, 0, b.len() / self.ctx * n)).collect::<anyhow::Result<_>>()?;
+        self.parked.insert(0, Parked { ids: self.saved_ids.clone(), ple_prev: self.saved_ple_prev, slot, kv });
+        while self.parked.iter().map(Parked::bytes).sum::<usize>() > self.cache_ram { self.parked.pop(); }
+        Ok(())
+    }
+
+    /// Make parked state `i` the saved state and return to it; the saved state is parked in its place.
+    fn unpark(&mut self, i: usize) -> anyhow::Result<()> {
+        let p = self.parked.remove(i);
+        self.park()?;
+        for (b, d) in self.slot().iter().zip(&p.slot) { self.gpu.put(d, b, 0)?; }
+        for (b, d) in self.kv_bufs().iter().zip(&p.kv) { self.gpu.put(d, b, 0)?; }
+        (self.saved_pos, self.saved_ple_prev, self.saved_ids) = (p.ids.len(), p.ple_prev, p.ids);
+        self.restore_state()
     }
 
     /// Return to the state of the last `stash`, which also becomes the saved state.

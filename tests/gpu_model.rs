@@ -247,6 +247,7 @@ fn prefill_cached_reuses_history() {
         eprintln!("backend {bk}");
         let mut gm = GpuModel::load(&m, gpu, 512, 128, 512 << 20, 0).unwrap();
         gm.adapt_every = 0;
+        gm.cache_ram = 0;
         let enc = |s: &str| tok.encode(s).unwrap();
         let h1 = enc("<|im_start|>user\nTell me about rivers, the ways they carve valleys over thousands of years, and why towns grow on their banks.<|im_end|>\n");
         let h2 = [h1.clone(), enc("<|im_start|>assistant\nRivers move water and sediment downhill.<|im_end|>\n<|im_start|>user\nAnd lakes?<|im_end|>\n")].concat();
@@ -271,6 +272,7 @@ fn prefill_cached_reuses_history() {
         let want3 = want1.clone();
         let want2 = fresh(&mut gm, &[&h1, &h2[h1.len()..], &tail]);
         assert_eq!(got2, want2, "reused prefix");
+        let want_h2 = want2;
 
         // With a system prompt: a request whose history rewrites the earlier one (a compacted conversation) restarts
         // from the state after the system prompt, also after decode steps and a history hit in between.
@@ -295,6 +297,21 @@ fn prefill_cached_reuses_history() {
         assert_eq!((r, &got), (0, &want3));
         let (_, r) = gm.prefill_cached(&q2, sys.len(), s2.len()).unwrap();
         assert_eq!(r, 0, "stash dropped once its KV was rewritten");
+
+        // With host memory for replaced states, a side request with another prompt in between costs nothing.
+        gm.cache_ram = 64 << 20;
+        let (got, r) = gm.prefill_cached(&q1, sys.len(), s1.len()).unwrap();
+        assert_eq!((r, &got), (sys.len(), &want1));
+        for t in [11u32, 22, 33] { gm.step(t).unwrap(); }
+        let (got, r) = gm.prefill_cached(&p1, 0, h1.len()).unwrap();
+        assert_eq!((r, &got), (0, &want3), "side request");
+        let (got, r) = gm.prefill_cached(&p2, 0, h2.len()).unwrap();
+        assert_eq!((r, &got), (h1.len(), &want_h2), "side request continued");
+        let (got, r) = gm.prefill_cached(&q1, sys.len(), s1.len()).unwrap();
+        assert_eq!((r, &got), (s1.len(), &want1), "parked conversation");
+        for t in [11u32, 22, 33] { gm.step(t).unwrap(); }
+        let (got, r) = gm.prefill_cached(&p2, 0, h2.len()).unwrap();
+        assert_eq!((r, &got), (h2.len(), &want_h2), "parked side request");
     }
 }
 

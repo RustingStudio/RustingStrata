@@ -104,6 +104,9 @@ OpenCode and other agents use the OpenAI address. Qwen3.6's template leaves the 
 last user message, so each new user message changes the text of the earlier turns and the whole conversation is
 prefilled again. Strata keeps those blocks by default, so a long agent session prefills only what was added;
 `--preserve-thinking false` (or `chat_template_kwargs.preserve_thinking` in a request) follows the template.
+A request with another history (an agent's side request for a title or a summary) parks the conversation's state in
+host memory (`--cache-ram`, 4096 MB by default), and the next request that continues it takes it back instead of
+prefilling it again.
 The server has one key and treats all clients as one user: the cached-token count and the response time show
 whether the previous request started with the same messages, so do not share one server between people who must
 not learn each other's prompts.

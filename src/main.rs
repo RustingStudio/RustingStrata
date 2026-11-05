@@ -57,6 +57,10 @@ struct Engine {
     /// repeat exactly.
     #[arg(long)]
     fixed_experts: bool,
+    /// Host memory in MB for conversation states that a request with another history replaced (GPU): a later request
+    /// that continues one of them takes it back instead of prefilling it again. 0 keeps none.
+    #[arg(long, default_value_t = 4096)]
+    cache_ram: usize,
     /// Keep the think block of earlier replies in the prompt (Qwen3.5/3.6 templates' `preserve_thinking`; a request
     /// can set it in `chat_template_kwargs`). The template drops it from replies before the last user message, so
     /// each new user message changes the earlier text and the whole conversation is prefilled again; with this, a
@@ -151,6 +155,7 @@ impl Engine {
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
         let mut g = GpuModel::load(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp()).context(LOAD_HINT)?;
         g.short = self.short;
+        g.cache_ram = self.cache_ram << 20;
         if self.mtp() > 0 && g.k == 0 {
             eprintln!("--mtp: this model has no MTP draft head, decoding without it");
             self.mtp = Some(0);

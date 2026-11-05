@@ -98,23 +98,36 @@ impl GpuModel<'_> {
     /// saved; when the saved tokens are a prefix of the next call's `tokens[..keep]`, that call starts from them
     /// (KV past them is rewritten, the recurrent state is copied back). The state after `tokens[..sys]` (the system
     /// prompt, `sys <= keep`) is stashed in host memory: a call whose history does not extend the saved one but
-    /// starts with the same system prompt starts from there. Returns the logits and the tokens reused.
+    /// starts with the same system prompt starts from there. A saved state that a call replaces is parked in host
+    /// memory (up to `cache_ram`), and a later call that continues it takes it back, so a side request with another
+    /// prompt does not cost the main conversation its cache. Returns the logits and the tokens reused.
     pub fn prefill_cached(&mut self, tokens: &[u32], sys: usize, keep: usize) -> anyhow::Result<(Vec<f32>, usize)> {
         anyhow::ensure!(sys <= keep && keep < tokens.len(), "prefill_cached: sys {sys}, keep {keep} of {} tokens", tokens.len());
         let hit = self.saved_ids.len();
         let stashed = self.sys.as_ref().map_or(0, |s| if tokens[..keep].starts_with(&s.3) { s.3.len() } else { 0 });
-        let reused = if hit > 0 && hit >= stashed && tokens[..keep].starts_with(&self.saved_ids) {
+        let extends = hit > 0 && hit >= stashed && tokens[..keep].starts_with(&self.saved_ids);
+        // The longest parked state this prompt continues, if it beats the saved one and the stash.
+        let best = self.parked.iter().enumerate().filter(|(_, p)| tokens[..keep].starts_with(&p.ids))
+            .max_by_key(|(_, p)| p.ids.len()).map(|(i, p)| (i, p.ids.len()))
+            .filter(|&(_, n)| n > stashed && !(extends && n <= hit));
+        let reused = if let Some((i, n)) = best {
+            self.unpark(i)?;
+            n
+        } else if extends {
             self.restore_state()?;
             hit
         } else if stashed > 0 {
+            self.park()?;
             self.unstash()?;
             stashed
         } else {
+            self.park()?;
             self.reset()?;
             0
         };
-        // The stash stays valid while its KV entries do: this prompt rewrites them only past `reused`.
-        if stashed == 0 && self.sys.as_ref().is_some_and(|s| reused < s.3.len()) { self.sys = None; }
+        // The stash stays valid while its KV entries do: this prompt rewrites them only past `reused`. A parked state
+        // brings its own KV, which may have been computed in other chunks.
+        if best.is_some() || stashed == 0 && self.sys.as_ref().is_some_and(|s| reused < s.3.len()) { self.sys = None; }
         if sys > reused {
             self.prefill(&tokens[reused..sys])?;
             self.stash(&tokens[..sys])?;
