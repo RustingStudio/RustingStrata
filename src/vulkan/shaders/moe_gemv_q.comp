@@ -20,7 +20,7 @@ void sb_step(U8 w, F32 xd, uint row, uint lane, uint t, uint s, inout precise fl
     int sx = dotPacked4x8EXT(0x01010101, int(a)) + dotPacked4x8EXT(0x01010101, int(c));
     float dx = xd.v[(t * p.cols + s * 256) / 32 + (lane >> 2)];
     acc = fma(d * dx, float(dot), acc);
-    if (T == 10 || T == 12 || T == 13) acc = fma(-(m * dx), float(sx), acc);  // types with a min
+    if (MIN) acc = fma(-(m * dx), float(sx), acc);  // types with a min
 }
 
 void main() {

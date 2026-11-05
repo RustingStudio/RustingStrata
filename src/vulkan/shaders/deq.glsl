@@ -54,7 +54,7 @@ layout(buffer_reference, std430, buffer_reference_align = 8) buffer U32x2 { uvec
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer U32x4 { uvec4 v[]; };
 // Q4_K, Q5_K and IQ4_XS blocks (144, 176, 136 bytes) and every field ld8 reads in them are 8-aligned; Q2_K's (84) 4-aligned.
 const bool A8 = T == 12 || T == 13 || T == 23;
-const bool A4 = T == 10;
+const bool A4 = T == 10 || T == 3 || T == 7;  // and Q4_1, Q5_1 (20, 24)
 // 8 bytes at 2-aligned w + o: one load for the A8 types, two word loads for A4, else the three words around them
 // shifted (ld8a2 in kernels.cu) without a branch: in Q8_0 the lanes of a subgroup differ in alignment.
 uvec2 ld8(U8 w, uint o) {
@@ -74,8 +74,10 @@ void load_tables() {
 #endif
 // Bytewise a - c (each byte of a below 128; CUDA __vsub4).
 uint vsub4(uint a, uint c) { return ((a | 0x80808080u) - c) ^ 0x80808080u; }
-// The types QI<T> in kernels.cu reads with word loads: Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K.
-const bool WORDS = T == 8 || (T >= 10 && T <= 14);
+// The types QI<T> in kernels.cu reads with word loads: Q4_1, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K.
+const bool WORDS = T == 3 || T == 7 || T == 8 || (T >= 10 && T <= 14);
+// Types with a min (QI<T>::MIN): value d q - m.
+const bool MIN = T == 3 || T == 7 || T == 10 || T == 12 || T == 13;
 
 // qi8 for the WORDS types, the 8 int8 values packed in lo, hi (QI<T>::get).
 void qw_k(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out float m) {
@@ -114,6 +116,15 @@ void qw_k(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out flo
         if (T == 13) {
             uvec2 qh = ld8(w, b + 16 + r);
             lo |= ((qh.x >> bit) & 0x01010101u) << 4; hi |= ((qh.y >> bit) & 0x01010101u) << 4;
+        }
+    } else if (T == 3 || T == 7) {  // Q4_1, Q5_1 (QI41 in kernels.cu): value d q + m, so m here is minus the block's m
+        uint r = (sub & 3) * 8, p = b + (T == 3 ? 20 : 24) * (sub >> 2), dm = U32(uint64_t(w) + p).v[0], sh = r < 16 ? 0 : 4;
+        d = h2f(dm & 0xFFFF); m = -h2f(dm >> 16);
+        v = ld8(w, p + (T == 3 ? 4 : 8) + (r & 15));
+        lo = (v.x >> sh) & 0x0F0F0F0Fu; hi = (v.y >> sh) & 0x0F0F0F0Fu;
+        if (T == 7) {
+            uint qh = U32(uint64_t(w) + p + 4).v[0] >> r;
+            lo |= (((qh & 15) * 0x00204081u) & 0x01010101u) << 4; hi |= ((((qh >> 4) & 15) * 0x00204081u) & 0x01010101u) << 4;
         }
     } else {  // Q6_K
         uint e = sub * 8, n = e >> 7, r = e & 127, qt = r >> 5, k = r & 31, ns = 4 * (qt >> 1), hs = 2 * qt;

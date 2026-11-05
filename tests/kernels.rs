@@ -1026,7 +1026,7 @@ fn attn_decode_bandwidth() {
 }
 
 
-/// Random rows of `ty` with sane block scales: f16 d in [0.01, 0.02) at each block's start (Q2_0, Q8_0, IQ4_NL), or
+/// Random rows of `ty` with sane block scales: f16 d in [0.01, 0.02) at each block's start (Q2_0, Q8_0, IQ4_NL; Q4_1 and Q5_1 also a small m), or
 /// float values (F32, BF16).
 fn random_tensor(ty: GgmlType, rows: usize, cols: usize, seed: u32) -> Vec<u8> {
     let mut s = seed.wrapping_mul(2654435761) | 1;
@@ -1039,6 +1039,9 @@ fn random_tensor(ty: GgmlType, rows: usize, cols: usize, seed: u32) -> Vec<u8> {
             (0..n).flat_map(|_| {
                 let mut b: Vec<u8> = (0..bb).map(|_| rnd() as u8).collect();
                 b[..2].copy_from_slice(&half::f16::from_f32(0.01 + (rnd() % 100) as f32 * 1e-4).to_le_bytes());
+                if matches!(ty, GgmlType::Q4_1 | GgmlType::Q5_1) {  // m in [-0.15, 0.05)
+                    b[2..4].copy_from_slice(&half::f16::from_f32(-0.15 + (rnd() % 100) as f32 * 2e-3).to_le_bytes());
+                }
                 b
             }).collect()
         }
@@ -1049,7 +1052,7 @@ fn random_tensor(ty: GgmlType, rows: usize, cols: usize, seed: u32) -> Vec<u8> {
 fn gemv_partial_superblocks_and_q2_0() {
     for (bk, gpu) in common::backends_except(&[]) {
         let gpu = &*gpu;
-        for ty in [GgmlType::Q2_0, GgmlType::Q8_0, GgmlType::IQ4NL, GgmlType::BF16, GgmlType::F32] {
+        for ty in [GgmlType::Q2_0, GgmlType::Q8_0, GgmlType::IQ4NL, GgmlType::Q4_1, GgmlType::Q5_1, GgmlType::BF16, GgmlType::F32] {
             for cols in [640, 320, 2560] {
                 if cols % ty.block_elems() != 0 { continue; }
                 let (rows, nt, ne) = (40, 3, 4);  // ne experts of `rows` rows for moe_gemv

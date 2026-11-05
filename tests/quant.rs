@@ -22,7 +22,7 @@ fn check(name: &str, ty: GgmlType) {
 #[test] fn q4_k() { check("Q4_K", GgmlType::Q4K) }
 #[test] fn q5_k() { check("Q5_K", GgmlType::Q5K) }
 #[test] fn q6_k() { check("Q6_K", GgmlType::Q6K) }
-#[test] fn rejects_unknown() { assert!(GgmlType::from_u32(3).is_err()); } // Q4_1 is not supported
+#[test] fn rejects_unknown() { assert!(GgmlType::from_u32(34).is_err()); } // TQ1_0 is not supported
 
 /// One Q4_0 block (value = (q - 8) d) and one Q5_0 block (32 high bits after d; value = (q - 16) d): element j is
 /// the low nibble of byte j, j + 16 the high nibble. Converted to Q8_0 they give the same values.
@@ -43,6 +43,24 @@ fn q4_0_and_q5_0_blocks() {
         dequant_row(ty, &b, &mut y);
         dequant_row(GgmlType::Q8_0, &rusting_strata::quant::to_q8_0(ty, &b), &mut y8);
         for j in 0..32 { assert_eq!((y[j], y8[j]), (0.25 * want[j], 0.25 * want[j]), "{} element {j}", ty.name()); }
+    }
+}
+
+/// One Q4_1 block (f16 d, f16 m; value = q d + m) and one Q5_1 block (32 high bits after d and m).
+#[test]
+fn q4_1_and_q5_1_blocks() {
+    let dm = [half::f16::from_f32(0.25).to_le_bytes(), half::f16::from_f32(-1.5).to_le_bytes()].concat();
+    let nib: Vec<u8> = (0..16u8).map(|j| j | (15 - j) << 4).collect();
+    let qh: u32 = 0xA5A5_0F0F;
+    for (id, b, n) in [(3, [&dm[..], &nib].concat(), 20), (7, [&dm[..], &qh.to_le_bytes(), &nib].concat(), 24)] {
+        let ty = GgmlType::from_u32(id).unwrap();
+        assert_eq!(ty.row_bytes(32), n);
+        let mut y = [0f32; 32];
+        dequant_row(ty, &b, &mut y);
+        for j in 0..32u32 {
+            let q = (if j < 16 { j } else { 31 - j }) | if id == 7 { ((qh >> j) & 1) << 4 } else { 0 };
+            assert_eq!(y[j as usize], 0.25 * q as f32 - 1.5, "{} element {j}", ty.name());
+        }
     }
 }
 

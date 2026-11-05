@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-const QTYPES: [GgmlType; 18] = {
+const QTYPES: [GgmlType; 20] = {
     use GgmlType::*;
-    [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0]
+    [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, Q4_1, Q5_1]
 };
 const KERNELS: [&str; 34] = [
     "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
