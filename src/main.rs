@@ -85,6 +85,9 @@ struct Engine {
     /// Run on the CPU when no GPU backend opens (the bare `strata` launch).
     #[arg(skip)]
     cpu_fallback: bool,
+    /// Sequences in GPU memory at once (`serve --parallel`).
+    #[arg(skip)]
+    parallel: usize,
 }
 
 /// `serve` options for a server that other people use (docs/HOSTING.md).
@@ -105,19 +108,25 @@ struct Hosting {
     /// leaves].
     #[arg(long)]
     max_tokens: Option<usize>,
+    /// Requests answered at once (GPU, one device): each gets its own slot of `--ctx` tokens of KV cache, and the
+    /// slots that decode share each forward, up to 4 at a time. A prompt's prefill holds up the others' decoding
+    /// while it runs. MTP drafting is off.
+    #[arg(long, default_value_t = 1)]
+    parallel: usize,
 }
 
-enum Runner<'a> { Cpu(&'a Model<'a>, State), Gpu(Box<GpuModel<'a>>) }
+enum Runner<'a> { Cpu(&'a Model<'a>, State), Gpu(Box<GpuModel<'a>>), Slot(Client) }
 
 impl Runner<'_> {
     fn step(&mut self, t: u32) -> anyhow::Result<Vec<f32>> {
-        match self { Runner::Cpu(m, st) => Ok(m.step(st, t)), Runner::Gpu(g) => g.step(t) }
+        match self { Runner::Cpu(m, st) => Ok(m.step(st, t)), Runner::Gpu(g) => g.step(t), Runner::Slot(c) => c.step(t) }
     }
     /// Feed a prompt; returns the logits after its last token.
     fn prefill(&mut self, ts: &[u32]) -> anyhow::Result<Vec<f32>> {
         match self {
             Runner::Cpu(m, st) => Ok(ts.iter().map(|&t| m.step(st, t)).last().unwrap_or_default()),
             Runner::Gpu(g) => g.prefill(ts),
+            Runner::Slot(_) => anyhow::bail!("prefill on a slot"),
         }
     }
     /// Feed a chat prompt as a fresh sequence, reusing the earlier request's state for the shared message history
@@ -131,13 +140,14 @@ impl Runner<'_> {
         let sys = if ids.starts_with(&s) && s.len() <= keep { s.len() } else { 0 };
         let (logits, reused) = match self {
             Runner::Gpu(g) => g.prefill_cached(&ids, sys, keep)?,
+            Runner::Slot(c) => c.chat(&ids, sys, keep)?,
             _ => { self.reset()?; (self.prefill(&ids)?, 0) }
         };
         Ok((ids, logits, reused))
     }
     /// Forget the sequence so far.
     fn reset(&mut self) -> anyhow::Result<()> {
-        match self { Runner::Cpu(m, st) => { *st = State::new(&m.cfg); Ok(()) } Runner::Gpu(g) => g.reset() }
+        match self { Runner::Cpu(m, st) => { *st = State::new(&m.cfg); Ok(()) } Runner::Gpu(g) => g.reset(), Runner::Slot(_) => Ok(()) }
     }
     /// Seconds spent waiting on CPU experts so far (GPU only).
     fn cpu_secs(&self) -> f64 { if let Runner::Gpu(g) = self { g.parts().map(|p| p.cpu_time.as_secs_f64()).sum() } else { 0.0 } }
@@ -182,9 +192,19 @@ impl Engine {
         self.short = get("short").unwrap_or(32);
         // The global pool can be built once; a model loaded later by `serve` keeps the first one's threads.
         if let Some(n) = self.threads.or(get("threads")) { let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global(); }
-        let Some(bk) = bk else { return Ok(Runner::Cpu(m, State::new(&m.cfg))) };
+        let Some(bk) = bk else {
+            if self.parallel > 1 { eprintln!("--parallel: the CPU runs one request at a time"); }
+            return Ok(Runner::Cpu(m, State::new(&m.cfg)));
+        };
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
-        let mut g = GpuModel::load_split(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp()).context(LOAD_HINT)?;
+        let mut g = if self.parallel > 1 {
+            anyhow::ensure!(bk.len() == 1, "--parallel: one GPU only (run one server per GPU)");
+            if self.mtp() > 0 { eprintln!("--parallel: decoding without MTP drafts"); }
+            self.mtp = Some(0);
+            GpuModel::load_slots(m, bk.into_iter().next().unwrap(), self.ctx, self.chunk(), self.vram_margin << 20, self.parallel).context(LOAD_HINT)?
+        } else {
+            GpuModel::load_split(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp()).context(LOAD_HINT)?
+        };
         g.short = self.short;
         g.cache_ram = self.cache_ram << 20;
         if self.mtp() > 0 && g.k == 0 {
@@ -536,7 +556,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             r.finish()?;
         }
-        Cmd::Serve { model, models_dir, addr, api_key, open, host, engine } => {
+        Cmd::Serve { model, models_dir, addr, api_key, open, host, mut engine } => {
+            engine.parallel = host.parallel;
             let api_key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
             anyhow::ensure!(api_key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
             let users = match &host.api_keys {
@@ -603,7 +624,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     let _ = tx.send((c, q, i));
                 });
             });
-            let s = Serving { rx, waiting, addr, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(),
+            let s = Serving { rx: rx.into(), waiting, addr, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(),
                 dl: Default::default(), stats };
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
@@ -767,11 +788,11 @@ fn template(g: &Gguf) -> Template {
 fn answer(s: &str) -> String { s.rsplit_once("</think>").map_or(s, |x| x.1).trim().to_string() }
 
 /// A model `serve` has loaded.
-struct Loaded<'a> { r: Runner<'a>, tok: Tokenizer, tpl: Template, name: String, path: PathBuf }
+struct Loaded<'a> { r: Runner<'a>, tok: &'a Tokenizer, tpl: Template, name: String, path: PathBuf }
 
 /// What `serve` keeps across model loads.
 struct Serving {
-    rx: std::sync::mpsc::Receiver<(TcpStream, anyhow::Result<serve::Request>, usize)>,
+    rx: std::sync::Mutex<std::sync::mpsc::Receiver<(TcpStream, anyhow::Result<serve::Request>, usize)>>,
     waiting: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     addr: String,
     keys: serve::Keys,
@@ -789,7 +810,8 @@ impl Serving {
     /// Answers requests until one asks for a model to be loaded; returns its path and connection (None once the
     /// listener is gone).
     fn serve(&self, mut l: Option<&mut Loaded>, e: &Engine) -> Option<(PathBuf, TcpStream)> {
-        for (c, q, i) in &self.rx {
+        if let Some(l) = l.as_deref_mut() && matches!(&l.r, Runner::Gpu(g) if g.slots() > 1) { return self.serve_slots(l, e); }
+        for (c, q, i) in self.rx.lock().unwrap().iter() {
             let mut next = None;
             let res = handle(c, q, l.as_deref_mut(), e, self, i, &mut next);
             self.waiting.fetch_sub(1, Relaxed);
@@ -805,6 +827,135 @@ impl Serving {
             v.push((p.display().to_string(), p.clone(), std::fs::metadata(p).map_or(0, |m| m.len())));
         }
         v
+    }
+}
+
+/// What a request thread asks of the model's thread under `--parallel` (`Serving::serve_slots`).
+enum Job {
+    /// `prefill_cached` in a free slot; answers the logits, the tokens reused and the slot.
+    Chat { ids: Vec<u32>, sys: usize, keep: usize, owner: u64, back: std::sync::mpsc::Sender<anyhow::Result<(Vec<f32>, usize, usize)>> },
+    /// One decode step in a slot the request holds.
+    Step { slot: usize, token: u32, back: std::sync::mpsc::Sender<anyhow::Result<Vec<f32>>> },
+    /// The request is done with its slot.
+    Done(usize),
+}
+
+/// A request's handle on the model under `--parallel`; dropping it frees the slot.
+struct Client { tx: std::sync::mpsc::Sender<Job>, slot: Option<usize>, owner: u64 }
+
+impl Client {
+    fn chat(&mut self, ids: &[u32], sys: usize, keep: usize) -> anyhow::Result<(Vec<f32>, usize)> {
+        if let Some(s) = self.slot.take() { let _ = self.tx.send(Job::Done(s)); }
+        let (back, r) = std::sync::mpsc::channel();
+        self.tx.send(Job::Chat { ids: ids.to_vec(), sys, keep, owner: self.owner, back }).map_err(|_| anyhow::anyhow!("model gone"))?;
+        let (logits, reused, s) = r.recv()??;
+        self.slot = Some(s);
+        Ok((logits, reused))
+    }
+    fn step(&mut self, token: u32) -> anyhow::Result<Vec<f32>> {
+        let slot = self.slot.context("step before chat")?;
+        let (back, r) = std::sync::mpsc::channel();
+        self.tx.send(Job::Step { slot, token, back }).map_err(|_| anyhow::anyhow!("model gone"))?;
+        r.recv()?
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) { if let Some(s) = self.slot { let _ = self.tx.send(Job::Done(s)); } }
+}
+
+impl Serving {
+    /// `serve` with several slots (`--parallel`): each request runs `handle` on its own thread and sends its model
+    /// work here, where prefills run one at a time and the decode steps of up to `TMAX` slots share a forward.
+    fn serve_slots(&self, l: &mut Loaded, e: &Engine) -> Option<(PathBuf, TcpStream)> {
+        use std::sync::mpsc::{TryRecvError, channel};
+        // How long a decode step waits for the other decoding slots' steps to share its forward.
+        const GATHER: Duration = Duration::from_millis(2);
+        let Loaded { r, tok, tpl, name, path } = l;
+        let Runner::Gpu(g) = r else { unreachable!() };
+        let (tx, jobs) = channel::<Job>();
+        let (next, live) = (std::sync::Mutex::new(None), std::sync::atomic::AtomicUsize::new(0));
+        let rx = self.rx.lock().unwrap();
+        let n = g.slots();
+        std::thread::scope(|sc| {
+            // Owned here, so that a panic drops the queued jobs' reply channels and the request threads end (the
+            // scope then joins them and the panic goes on).
+            let jobs = jobs;
+            // Slots held by a request, and when each was last freed (the least recently used goes first).
+            let (mut held, mut freed, mut tick) = (vec![false; n], vec![0u64; n], 0u64);
+            let mut chats = std::collections::VecDeque::new();
+            let mut steps: Vec<(usize, u32, std::sync::mpsc::Sender<anyhow::Result<Vec<f32>>>)> = vec![];
+            let (mut open, mut since) = (true, None::<Instant>);
+            loop {
+                while open && next.lock().unwrap().is_none() {
+                    match rx.try_recv() {
+                        Ok((c, q, i)) => {
+                            live.fetch_add(1, Relaxed);
+                            let (tx, tok, tpl, name, path, next, live) = (tx.clone(), &**tok, *tpl, name.clone(), path.clone(), &next, &live);
+                            sc.spawn(move || {
+                                let mut l = Loaded { r: Runner::Slot(Client { tx, slot: None, owner: 0 }), tok, tpl, name, path };
+                                let mut nx = None;
+                                let res = handle(c, q, Some(&mut l), e, self, i, &mut nx);
+                                drop(l);
+                                self.waiting.fetch_sub(1, Relaxed);
+                                if let Err(e) = res { eprintln!("request {i}: {e:#}"); }
+                                if nx.is_some() { *next.lock().unwrap() = nx; }
+                                live.fetch_sub(1, Relaxed);
+                            });
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => open = false,
+                    }
+                }
+                if (!open || next.lock().unwrap().is_some()) && live.load(Relaxed) == 0 { break; }
+                let decoding = held.iter().filter(|&&h| h).count();
+                let wait = match since {
+                    Some(t) if steps.len() < decoding => GATHER.saturating_sub(t.elapsed()),
+                    Some(_) => Duration::ZERO,
+                    None => Duration::from_millis(5),
+                };
+                let mut got: Vec<Job> = jobs.recv_timeout(wait).into_iter().collect();
+                got.extend(jobs.try_iter());
+                for j in got {
+                    match j {
+                        Job::Done(s) => { held[s] = false; tick += 1; freed[s] = tick; }
+                        Job::Step { slot, token, back } => { since.get_or_insert_with(Instant::now); steps.push((slot, token, back)); }
+                        c => chats.push_back(c),
+                    }
+                }
+                // One prefill between decode steps, in the free slot whose saved state this prompt extends the
+                // furthest, else the least recently used one.
+                // ponytail: a prefill runs whole, so a long prompt stalls the decoding slots; chunk it between
+                // decode steps if that matters.
+                if let Some(s) = (0..n).filter(|&s| !held[s]).max_by_key(|&s| {
+                    let reuse = match chats.front() {
+                        Some(Job::Chat { ids, keep, owner, .. }) => { let (sv, o) = g.slot_saved(s); if o == *owner && ids[..*keep].starts_with(sv) { sv.len() } else { 0 } }
+                        _ => 0,
+                    };
+                    (reuse, std::cmp::Reverse(freed[s]))
+                }) && let Some(Job::Chat { ids, sys, keep, owner, back }) = chats.pop_front() {
+                    g.use_slot(s);
+                    g.owner = owner;
+                    let r = g.prefill_cached(&ids, sys, keep);
+                    held[s] = r.is_ok();
+                    let _ = back.send(r.map(|(l, u)| (l, u, s)));
+                    gpu_model_stats(g, &mut self.stats.lock().unwrap());
+                }
+                let ready = since.is_some_and(|t| steps.len() >= held.iter().filter(|&&h| h).count() || t.elapsed() >= GATHER);
+                if ready {
+                    // The oldest steps first (with more than `TMAX` slots decoding, each waits its turn), in slot order
+                    // (fewer graphs to capture).
+                    let mut batch: Vec<_> = steps.drain(..steps.len().min(rusting_strata::cpu_worker::TMAX)).collect();
+                    batch.sort_by_key(|s| s.0);
+                    since = if steps.is_empty() { None } else { Some(Instant::now() - GATHER) };
+                    match g.step_rows(&batch.iter().map(|b| (b.0, b.1)).collect::<Vec<_>>()) {
+                        Ok(rows) => for (b, l) in batch.into_iter().zip(rows) { let _ = b.2.send(Ok(l)); },
+                        Err(err) => for b in batch { let _ = b.2.send(Err(anyhow::anyhow!("{err:#}"))); },
+                    }
+                }
+            }
+        });
+        next.into_inner().unwrap()
     }
 }
 
@@ -824,7 +975,7 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
         (st.backend, st.device, st.ctx) = match &r { Runner::Gpu(g) => (g.gpu.name().into(), g.gpu.device(), engine.ctx), _ => ("cpu".into(), String::new(), engine.ctx) };
         gpu_stats(&r, &mut st);
     }
-    let mut l = Loaded { r, tok, tpl: template(&g), name, path: model.to_path_buf() };
+    let mut l = Loaded { r, tok: &tok, tpl: template(&g), name, path: model.to_path_buf() };
     eprintln!("loaded {}", l.name);
     if let Some(mut w) = w.take() {
         let b = json!({"loaded": l.name}).to_string();
@@ -839,11 +990,13 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
 
 /// The side panel's device memory, expert cache and MTP counts.
 fn gpu_stats(r: &Runner, s: &mut serve::Stats) {
-    if let Runner::Gpu(g) = r {
-        s.vram = g.gpu.mem_info().ok().map(|(f, t)| ((t - f) as u64, t as u64));
-        s.experts = g.cache.as_ref().map(|_| (g.hits as u64, g.misses as u64));
-        s.drafts = (g.drafts.0 > 0).then_some((g.drafts.0 as u64, g.drafts.1 as u64));
-    }
+    if let Runner::Gpu(g) = r { gpu_model_stats(g, s) }
+}
+
+fn gpu_model_stats(g: &GpuModel, s: &mut serve::Stats) {
+    s.vram = g.gpu.mem_info().ok().map(|(f, t)| ((t - f) as u64, t as u64));
+    s.experts = g.cache.as_ref().map(|_| (g.hits as u64, g.misses as u64));
+    s.drafts = (g.drafts.0 > 0).then_some((g.drafts.0 as u64, g.drafts.1 as u64));
 }
 
 /// Default models folder: `$XDG_DATA_HOME`, `%LOCALAPPDATA%` on Windows, else `~/.local/share`.
@@ -949,7 +1102,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let anth = p == "/v1/messages";
             let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
             let (r, tok, tpl, name) = (&mut l.r, &l.tok, l.tpl, l.name.as_str());
-            if let Runner::Gpu(g) = r { g.owner = who.id; }
+            match r { Runner::Gpu(g) => g.owner = who.id, Runner::Slot(c) => c.owner = who.id, _ => {} }
             let req = match if anth { serve::messages_body(&body) } else { Ok(body.clone()) }.and_then(|b| serve::chat_request(&b)) {
                 Ok(q) => q,
                 Err(err) => return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),

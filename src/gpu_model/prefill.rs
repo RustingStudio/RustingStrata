@@ -238,7 +238,7 @@ impl GpuModel<'_> {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, .. } => {
                     let (eb, eg) = (at(l.e), at(l.e + n * nv));
                     g.gemm_dense(qkv, t, h, ne, at(l.a), channels, 0)?;
-                    g.conv_seq(at(l.a), conv.addr(), conv_w.ptr, at(l.c), channels, c.ssm_conv, t, 0, 0)?;
+                    g.conv_seq(at(l.a), conv[self.cur].addr(), conv_w.ptr, at(l.c), channels, c.ssm_conv, t, 0, 0)?;
                     // The beta and alpha GEMMs (16 blocks each) run beside the norm: batch launches alternate streams.
                     g.batch(&mut || {
                         g.gemm_dense(beta, t, h, ne, eb, nv, SAME_X)?;
@@ -252,11 +252,11 @@ impl GpuModel<'_> {
                     probe(&mut tr, "alpha", &pf.slab, eg, nv, t)?;
                     // The z GEMM runs beside the scan, on the SMs its last wave of blocks leaves idle.
                     g.batch(&mut || {
-                        g.deltanet(at(l.c), s.addr(), eb, eg, 0, 0, at(l.d), nk, nv, c.k_interleave, dk, dv, 1.0 / (dk as f32).sqrt(), t, channels, 0, 0)?;
+                        g.deltanet(at(l.c), s[self.cur].addr(), eb, eg, 0, 0, at(l.d), nk, nv, c.k_interleave, dk, dv, 1.0 / (dk as f32).sqrt(), t, channels, 0, 0)?;
                         g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, SAME_X)
                     })?;
                     probe(&mut tr, "deltanet", &pf.slab, at(l.d), c.ssm_d_inner, t)?;
-                    probe(&mut tr, "state", s, s.addr(), s.len() / 4, 1)?;
+                    probe(&mut tr, "state", &s[self.cur], s[self.cur].addr(), s[self.cur].len() / 4, 1)?;
                     probe(&mut tr, "z", &pf.slab, at(l.b), c.ssm_d_inner, t)?;
                     if ly.hc.is_some() { g.norm_gate_sig(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps, 0)?; } else { g.norm_gate(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps)?; }
                     g.gemm_dense(out, t, at(l.d), c.ssm_d_inner, mx, ne, mact)?;
@@ -271,7 +271,7 @@ impl GpuModel<'_> {
                     g.gemm_dense(v, t, h, ne, vv, kv, SAME_X)?;
                     g.rms_norm(kraw, hd, kn.ptr, kk, hd, hd, t * nkv, eps)?;
                     g.rope_neox(kk, hd, t * nkv, nkv, c.n_rot, step, c.rope_base)?;
-                    g.kv_store(kk, vv, kc.addr(), vc.addr(), kv, t, step, hd)?;
+                    g.kv_store(kk, vv, kc[self.cur].addr(), vc[self.cur].addr(), kv, t, step, hd)?;
                     // QSA: region c (free after kv_store) holds the raw indexer keys, raw queries and normed queries.
                     let (qm, mw) = match (qsa, &self.qsa) {
                         (Some(a), Some(b)) => {
@@ -293,7 +293,7 @@ impl GpuModel<'_> {
                         }
                         _ => (0, 0),
                     };
-                    g.attn_prefill_m(at(l.b), kc.addr(), vc.addr(), if c.q_gate { at(l.a) } else { 0 }, at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), qm, mw)?;
+                    g.attn_prefill_m(at(l.b), kc[self.cur].addr(), vc[self.cur].addr(), if c.q_gate { at(l.a) } else { 0 }, at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), qm, mw)?;
                     probe(&mut tr, "q", &pf.slab, at(l.a), nh * qs, t)?;
                     probe(&mut tr, "k", &pf.slab, kk, kv, t)?;
                     probe(&mut tr, "v", &pf.slab, vv, kv, t)?;
