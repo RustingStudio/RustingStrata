@@ -115,6 +115,10 @@ const BAR: &[vk::MemoryPropertyFlags] = &[vk::MemoryPropertyFlags::from_raw(7), 
 const BAR_AMD: &[vk::MemoryPropertyFlags] = &[vk::MemoryPropertyFlags::from_raw(0xc7), vk::MemoryPropertyFlags::from_raw(0xc6),
     vk::MemoryPropertyFlags::from_raw(7), vk::MemoryPropertyFlags::from_raw(0xe), vk::MemoryPropertyFlags::from_raw(6)];
 
+/// How long the host waits for a submission before it tells MoE combines still waiting for the CPU worker to give up
+/// (err[2], see `Inner::submit`).
+const GIVE_UP: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Bytes of the quantized-x scratch buffer.
 const XQ: usize = 4 << 20;
 
@@ -410,9 +414,10 @@ impl Vk {
         let mut st = inner.st();
         st.staging = staging;
         st.map = map? as usize;
-        let (b, m) = inner.buffer(8, HOST)?;
+        // In mailbox memory: the GPU must see the host's give-up word (err[2]) at once, as it sees the worker's answers.
+        let (b, m) = inner.buffer(12, if inner.amd_coherent { BAR_AMD } else { BAR })?;
         let p = unsafe { inner.dev.map_memory(m, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }?;
-        unsafe { (p as *mut [u32; 2]).write_volatile([0, 0]) };
+        unsafe { (p as *mut [u32; 3]).write_volatile([0, 0, 0]) };
         st.err = (b, m, p as usize, unsafe { inner.dev.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(b)) });
         drop(st);
         let mut v = Vk(Arc::new(inner), Buf::new(0, 0, ()), Buf::new(0, 0, ()), Mutex::new((Buf::new(0, 0, ()), None)));
@@ -565,8 +570,21 @@ impl Inner {
         st.busy = true;
         if wait {
             // A fence also covers every earlier submission on the queue; the transfer queue's copies are waited too.
+            // A MoE combine waiting for the CPU worker gives up after SPINS polls, but a poll can be slow enough (RADV)
+            // for that to outlast the driver's job timeout (amdgpu: 10 s, then the device is lost). So after GIVE_UP
+            // the host raises err[2] and a waiting combine gives up within 256 polls. Without conditional rendering
+            // giving up is an error, so only near the timeout.
+            let e = st.err.2 as *mut u32;
+            let give_up = if self.cr.is_some() && !st.no_cond { GIVE_UP } else { 8 * GIVE_UP };
+            let t0 = std::time::Instant::now();
+            loop {
+                match unsafe { self.dev.wait_for_fences(&[st.fence], true, 20_000_000) } {
+                    Err(vk::Result::TIMEOUT) => if t0.elapsed() >= give_up && !e.is_null() { unsafe { e.add(2).write_volatile(1) } },
+                    r => break r?,
+                }
+            }
+            if !e.is_null() { unsafe { e.add(2).write_volatile(0) } }
             unsafe {
-                self.dev.wait_for_fences(&[st.fence], true, u64::MAX)?;
                 self.dev.reset_fences(&[st.fence])?;
                 self.dev.reset_command_pool(st.pool, vk::CommandPoolResetFlags::empty())?;
                 if st.tval > 0 {
@@ -587,7 +605,6 @@ impl Inner {
             st.spare.extend(used);
             st.busy = false;
             st.staged = 0;
-            let e = st.err.2 as *mut u32;
             if !e.is_null() { unsafe { e.add(1).write_volatile(0) }; }
             if !e.is_null() && unsafe { e.read_volatile() } != 0 {
                 unsafe { e.write_volatile(0) };
