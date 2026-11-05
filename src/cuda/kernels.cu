@@ -195,6 +195,21 @@ template <> __device__ __forceinline__ void deq8<20>(const u8* b, int sub, float
     const u8* q = p + 2 + (r & 15);
     for (int i = 0; i < 8; i++) o[i] = d * (float)kvalues_iq4nl[r < 16 ? q[i] & 0xF : q[i] >> 4];
 }
+// Q4_1 / Q5_1, 8 blocks of 20 / 24 per 256: f16 d, f16 m, (Q5_1: u32 qh,) 16 bytes of nibbles; element j of a block is the
+// low nibble of byte j (j < 16) or the high nibble of byte j - 16, plus 16 for bit j of qh; value d q + m.
+template <int T> __device__ __forceinline__ const u8* q41_blk(const u8* b, int sub, int& r) {
+    r = (sub & 3) * 8;
+    return b + (T == 3 ? 20 : 24) * (sub >> 2);
+}
+template <int T> __device__ __forceinline__ void deq8_q41(const u8* b, int sub, float* o) {
+    int r; const u8* p = q41_blk<T>(b, sub, r);
+    float d = ldh(p), m = ldh(p + 2);
+    u32 qh = T == 7 ? ld32(p + 4) >> r : 0;
+    const u8* q = p + (T == 3 ? 4 : 8) + (r & 15);
+    for (int i = 0; i < 8; i++) o[i] = d * (float)((r < 16 ? q[i] & 0xF : q[i] >> 4) | (((qh >> i) & 1) << 4)) + m;
+}
+template <> __device__ __forceinline__ void deq8<3>(const u8* b, int sub, float* o) { deq8_q41<3>(b, sub, o); }  // Q4_1
+template <> __device__ __forceinline__ void deq8<7>(const u8* b, int sub, float* o) { deq8_q41<7>(b, sub, o); }  // Q5_1
 // Q2_0, 4 blocks of 18 per 256: f16 d, then 2-bit codes (value j at bits 2 (j % 4) of byte j / 4), value (code - 1) d.
 __device__ __forceinline__ u32 q2_0_codes(const u8* b, int sub, float& d) {
     const u8* p = b + 18 * (sub >> 3);
@@ -439,6 +454,24 @@ template <> struct QI<42> {  // Q2_0
         lo = (int)__vsub4(a, 0x01010101u); hi = (int)__vsub4(c, 0x01010101u);
     }
 };
+template <int T> struct QI41 {  // Q4_1 (T = 3, 20 bytes) and Q5_1 (T = 7, 24 bytes): rows 4-aligned
+    static constexpr bool MIN = true;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        int r; const u8* p = q41_blk<T>(b, sub, r);
+        u32 dm = ldu32(p);
+        d = h2f((u16)dm); m = -h2f((u16)(dm >> 16));  // the kernels subtract m times the activation sum
+        const u8* q = p + (T == 3 ? 4 : 8) + (r & 15);
+        int sh = r < 16 ? 0 : 4;
+        lo = (int)((ldu32(q) >> sh) & 0x0F0F0F0Fu); hi = (int)((ldu32(q + 4) >> sh) & 0x0F0F0F0Fu);
+        if (T == 7) {
+            u32 qh = ldu32(p + 4) >> r;
+            lo |= (int)((((qh & 15) * 0x00204081u) & 0x01010101u) << 4);
+            hi |= (int)(((((qh >> 4) & 15) * 0x00204081u) & 0x01010101u) << 4);
+        }
+    }
+};
+template <> struct QI<3> : QI41<3> {};
+template <> struct QI<7> : QI41<7> {};
 template <> struct QI<20> {  // IQ4_NL, 8 blocks of 18 (2-byte aligned: ld16 only)
     static constexpr bool MIN = false;
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
@@ -623,7 +656,8 @@ __device__ __forceinline__ void gemv_row_qn(const u8* __restrict__ w, const sign
 
 #define FTYPES(X) X(0, f32, 1024) X(30, bf16, 512)
 #define ITYPES(X) X(8, q8_0, 272) X(10, q2_k, 84) X(11, q3_k, 110) X(12, q4_k, 144) X(13, q5_k, 176) X(14, q6_k, 210) \
-    X(19, iq1_s, 50) X(29, iq1_m, 56) X(16, iq2_xxs, 66) X(17, iq2_xs, 74) X(22, iq2_s, 82) X(18, iq3_xxs, 98) X(21, iq3_s, 110) X(23, iq4_xs, 136) X(20, iq4_nl, 144) X(42, q2_0, 72)
+    X(19, iq1_s, 50) X(29, iq1_m, 56) X(16, iq2_xxs, 66) X(17, iq2_xs, 74) X(22, iq2_s, 82) X(18, iq3_xxs, 98) X(21, iq3_s, 110) X(23, iq4_xs, 136) X(20, iq4_nl, 144) X(42, q2_0, 72) \
+    X(3, q4_1, 160) X(7, q5_1, 192)
 #define QTYPES(X) FTYPES(X) ITYPES(X)
 
 #define DEF_DEQUANT(T, NAME, SBB)                                                                                 \
@@ -923,7 +957,7 @@ __device__ __forceinline__ void mma_s8_16832(int* c, u32 a0, u32 a1, u32 a2, u32
 // int -> float for |c| < 2^22 without the quarter-rate I2F: 2^23 + 2^22 + c has c in its low mantissa bits.
 __device__ __forceinline__ float i2f_small(int c) { return __int_as_float(0x4B400000 + c) - 12582912.0f; }
 // Weight types whose scale (and min) is constant over 32 weights: one 32-deep mma per scale.
-template <int T> __host__ __device__ constexpr bool scale32() { return T == 42 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23; }
+template <int T> __host__ __device__ constexpr bool scale32() { return T == 42 || T == 3 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23; }
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok) {
     unsigned d = (unsigned)__cvta_generic_to_shared(dst);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(ok ? 16 : 0));
