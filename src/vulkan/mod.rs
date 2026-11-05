@@ -304,6 +304,10 @@ impl Vk {
     /// The `device`-th usable GPU. Fails with "Vulkan init" (and the reasons) when there is none.
     pub fn new(device: usize) -> anyhow::Result<Vk> {
         ensure!(!(crate::cuda::kv_q8() && crate::cuda::llama_numerics()), "--kv q8 does not combine with --llama-numerics (its attention reads f16 KV)");
+        // RADV hides VK_AMD_device_coherent_memory on RDNA4 (RX 9000) unless this driconf option is set, and without
+        // it the GPU caches the CPU expert mailbox: MoE combines miss the worker's answer and wait until they give up.
+        // Mesa reads the option from the environment when the device is created; other drivers ignore it.
+        if std::env::var_os("radv_device_coherent_memory").is_none() { unsafe { std::env::set_var("radv_device_coherent_memory", "true") } }
         let entry = unsafe { ash::Entry::load() }.context("Vulkan init")?;
         let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
         let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None) }
@@ -345,6 +349,8 @@ impl Vk {
         };
         if amd_coherent { exts.push(ash::amd::device_coherent_memory::NAME.as_ptr()) }
         let amd_plain = !amd_coherent && unsafe { instance.get_physical_device_properties(pd) }.vendor_id == 0x1002;
+        if amd_plain { eprintln!("warning: this AMD GPU has no VK_AMD_device_coherent_memory; experts on the CPU will make decode slow (the GPU \
+            does not see the CPU worker's answers in time)"); }
         let mut fcr = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
         let cond = has(ash::ext::conditional_rendering::NAME) && std::env::var_os("STRATA_VK_NO_COND").is_none() && {
             unsafe { instance.get_physical_device_features2(pd, &mut vk::PhysicalDeviceFeatures2::default().push_next(&mut fcr)) };
