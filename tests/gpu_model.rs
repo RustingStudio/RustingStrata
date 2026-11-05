@@ -456,3 +456,81 @@ fn qwen4exp_qsa_gpu_matches_cpu() {
         }
     }
 }
+
+/// `step_rows` over several slots matches each sequence run alone in one slot: prefill per slot, then decode steps with
+/// all slots in one forward, with a subset of the slots, and with one slot through `step`. Each row of the batched
+/// forward does the same arithmetic as a single token, so the logits match bit for bit.
+#[test]
+fn slots_match_single() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let prompts: Vec<Vec<u32>> = ["The capital of France is", "def fib(n):\n    return", "Once upon a time, in a small village by the sea, there"]
+        .iter().map(|s| tok.encode(s).unwrap()).collect();
+    // Which slots decode at each step; the last one decodes slot 1 alone through `step`.
+    let plan: [&[usize]; 6] = [&[0, 1, 2], &[0, 1, 2], &[0, 2], &[1, 2], &[0, 1, 2], &[1]];
+    // All experts on the CPU, then the default placement.
+    for (cpu, bk) in [true, false].into_iter().flat_map(|c| ["cuda", "vulkan"].map(move |b| (c, b))) {
+        // SAFETY: the GPU lock serializes every test that loads a model, the only readers of this variable.
+        if cpu { unsafe { std::env::set_var("STRATA_EXPERT_MB", "0") } } else { unsafe { std::env::remove_var("STRATA_EXPERT_MB") } }
+        let gpu: Box<dyn rusting_strata::backend::Backend> = match bk {
+            "cuda" => match rusting_strata::cuda::Gpu::new(0) { Ok(g) => Box::new(g), Err(_) => continue },
+            _ => match rusting_strata::vulkan::Vk::new(0) { Ok(g) => Box::new(g), Err(_) => continue },
+        };
+        let mut gm = GpuModel::load_slots(&m, gpu, 256, 4, 512 << 20, 3).unwrap();
+        gm.adapt_every = 0;
+        // Reference: each prompt alone in slot 0, greedy, as many steps as the plan gives its slot. The placement is
+        // fixed (no adaptation), so only the batching differs.
+        let mut want: Vec<Vec<Vec<f32>>> = vec![];
+        let mut toks: Vec<Vec<u32>> = vec![];
+        for (s, ids) in prompts.iter().enumerate() {
+            gm.reset().unwrap();
+            let mut l = vec![gm.prefill(ids).unwrap()];
+            let mut t = vec![];
+            for _ in plan.iter().filter(|r| r.contains(&s)) {
+                t.push(ops::argmax(l.last().unwrap()) as u32);
+                l.push(gm.step(*t.last().unwrap()).unwrap());
+            }
+            want.push(l);
+            toks.push(t);
+        }
+        let mut got: Vec<Vec<Vec<f32>>> = vec![vec![]; 3];
+        for (s, ids) in prompts.iter().enumerate() {
+            gm.use_slot(s);
+            gm.reset().unwrap();
+            got[s].push(gm.prefill(ids).unwrap());
+        }
+        for (i, rows) in plan.iter().enumerate() {
+            let rt: Vec<(usize, u32)> = rows.iter().map(|&s| (s, toks[s][got[s].len() - 1])).collect();
+            if i == plan.len() - 1 {
+                gm.use_slot(rows[0]);
+                got[rows[0]].push(gm.step(rt[0].1).unwrap());
+            } else {
+                for (&s, l) in rows.iter().zip(gm.step_rows(&rt).unwrap()) { got[s].push(l); }
+            }
+        }
+        // A conversation parked in slot 0 continues in slot 2, which never saved a state.
+        gm.cache_ram = 1 << 30;
+        gm.use_slot(0);
+        let (a, b) = (&prompts[2], &prompts[1]);
+        let long: Vec<u32> = a.iter().chain(b).copied().collect();
+        gm.prefill_cached(a, 0, a.len() - 1).unwrap();
+        gm.prefill_cached(b, 0, b.len() - 1).unwrap();
+        gm.use_slot(2);
+        let (l, reused) = gm.prefill_cached(&long, 0, long.len() - 1).unwrap();
+        assert_eq!(reused, a.len() - 1, "{bk}: parked state not taken back");
+        gm.reset().unwrap();
+        assert_eq!(l, gm.prefill(&long).unwrap(), "{bk}: unparked state");
+        for s in 0..3 {
+            assert_eq!(got[s].len(), want[s].len());
+            for (i, (g, w)) in got[s].iter().zip(&want[s]).enumerate() {
+                let diff = g.iter().zip(w).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+                eprintln!("{bk} cpu experts {cpu} slot {s} row {i}: argmax {} vs {}, max |dlogit| {diff}", ops::argmax(g), ops::argmax(w));
+                assert_eq!(g, w, "{bk} cpu experts {cpu} slot {s} row {i}");
+            }
+        }
+    }
+    unsafe { std::env::remove_var("STRATA_EXPERT_MB") };
+}

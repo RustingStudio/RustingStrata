@@ -2,7 +2,7 @@
 
 This page is for running `strata serve` as a service that other people or programs use over the network, for
 example to sell API access to a model. It covers keys, TLS through a reverse proxy, a systemd unit, health checks,
-the usage log for billing, and how far one server goes.
+the usage log for billing, and how many requests one server answers at once.
 
 The [license](../LICENSE.md) allows commercial services built on Strata: you can charge for access to a model that
 Strata serves. Keep the license and the credit to the original author. You may not sell Strata itself. The model has
@@ -10,10 +10,51 @@ its own license (most Qwen models are Apache 2.0; check the model card).
 
 ## How much one server does
 
-`strata serve` answers one chat request at a time. Others wait in a queue (`--max-waiting`, 16 by default) and run in
-arrival order; more than that get `503 Service Unavailable` with `Retry-After: 2`. One request decodes at the speed in
-the README (about 113 tok/s for Qwen3.6-35B-A3B Q2_K_XL on an RTX 3060), so that is also the total for all users of
-one server. Long prompts block the queue for their prefill time (about 2 s for 4K tokens on the 3060).
+By default `strata serve` answers one chat request at a time. Others wait in a queue (`--max-waiting`, 16 by default)
+and run in arrival order; more than that get `503 Service Unavailable` with `Retry-After: 2`. One request decodes at
+the speed in the README (about 113 tok/s for Qwen3.6-35B-A3B Q2_K_XL on an RTX 3060), so that is also the total for
+all users of one server. Long prompts block the queue for their prefill time (about 2 s for 4K tokens on the 3060).
+
+### Several requests at once: `--parallel`
+
+`--parallel N` keeps N conversations in GPU memory and decodes them together: the requests that are decoding share
+each forward pass, up to 4 at a time. A forward pass reads the same expert weights for every request in it, so 4
+requests cost little more than one.
+
+Measured on the RTX 3060 with Qwen3.6-35B-A3B Q2_K_XL, `--ctx 4096`, short prompts and 200-token replies, all
+requests sent at once:
+
+| `--parallel` | Requests | Total | Each request |
+|---|---|---|---|
+| 1 | 4 | 90 tok/s | one after the other |
+| 2 | 2 | 139 tok/s | 69 tok/s |
+| 4 | 4 | 164 tok/s | 41 tok/s |
+| 4 | 8 | 163 tok/s | 41 tok/s, 4 wait |
+| 8 | 8 | 149 tok/s | 19 tok/s |
+
+A request alone on a `--parallel 4` server decodes at 101 tok/s (106 with `--parallel 1`).
+
+What changes with `--parallel N`:
+
+- **Memory.** `--ctx` is the context of each slot, so the KV cache and the recurrent state take N times the memory
+  of one, and fewer experts fit in VRAM. The `plan:` line at start shows the split. With 8 slots of 4096 tokens the
+  35B model kept 7008 of its 10240 experts resident.
+- **More than 4 slots** do not raise the total, because one pass decodes at most 4 requests. They let more users
+  stream at the same time instead of waiting in the queue, each at a lower speed.
+- **Prefill.** A new request's prompt is prefilled in one piece while the other requests wait, so a long prompt
+  pauses everyone's stream for its prefill time.
+- **MTP drafting is off** (`--mtp` is ignored), and the server uses one GPU (`--device` with one card). For several
+  GPUs, run one server per card (see [Several GPUs](#several-gpus)).
+- **Conversation cache.** Each slot keeps the state of its last conversation, and a request that continues a
+  conversation goes to the slot that holds it. Other conversations are parked in host memory (`--cache-ram`) as
+  without `--parallel`. Keys still only reuse their own conversations.
+- **Same answers.** A request decodes the same tokens as it would alone on the same server. Greedy output can still
+  change at near-ties from one run to the next, because the expert placement adapts to the routing it sees (as
+  with `--parallel 1`).
+- Without `--gpu` the option is ignored: the CPU reference runs one request at a time.
+
+For a server with a few users at a time, `--parallel 4` gives the most total speed. Measure your own mix with your
+prompts: long prompts and long contexts change the picture.
 
 For more users, run one server per GPU and put a load balancer in front (see [Several GPUs](#several-gpus)).
 
@@ -42,7 +83,7 @@ sudo chmod 600 /etc/strata/keys.txt
 
 # 4. Run it on the loopback address; the reverse proxy below is the only thing that faces the network.
 STRATA_API_KEY=<admin key> strata serve --model $M --gpu --ctx 32768 --addr 127.0.0.1:8080 \
-    --api-keys /etc/strata/keys.txt --usage-log /var/lib/strata/usage.jsonl --max-tokens 4096
+    --api-keys /etc/strata/keys.txt --usage-log /var/lib/strata/usage.jsonl --max-tokens 4096 --parallel 4
 ```
 
 Clients then use the OpenAI address `https://api.example.com/v1` with their key, or the Anthropic address
@@ -144,7 +185,8 @@ Wants=network-online.target
 User=strata
 EnvironmentFile=/etc/strata/env
 ExecStart=/usr/local/bin/strata serve --model /srv/models/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf --gpu --ctx 32768 \
-    --addr 127.0.0.1:8080 --api-keys /etc/strata/keys.txt --usage-log /var/lib/strata/usage.jsonl --max-tokens 4096
+    --addr 127.0.0.1:8080 --api-keys /etc/strata/keys.txt --usage-log /var/lib/strata/usage.jsonl --max-tokens 4096 \
+    --parallel 4
 StateDirectory=strata
 Restart=on-failure
 RestartSec=5
@@ -207,6 +249,7 @@ The file only grows; rotate it with logrotate (`copytruncate`, since Strata keep
   request may decode until the context is full, which holds the server for minutes.
 - Bodies over 8 MiB are refused, and a client has 30 s to send its request.
 - A client that disconnects stops its reply within a few tokens, so the next request in the queue starts.
+- With `--parallel N`, `--ctx` is per slot: N slots of 32K need N times the KV memory of one.
 
 ## Several GPUs
 
@@ -227,14 +270,15 @@ again; hashing on the key (`hash $http_authorization consistent;` instead of `le
 server.
 
 **One server over several GPUs, a bigger model.** `--device 0,1` splits the layers over the cards, so more experts
-fit in VRAM. It does not serve two requests at once.
+fit in VRAM. It does not serve two requests at once, and `--parallel` needs one GPU.
 
 ## Checklist
 
 - [ ] Strata listens on `127.0.0.1` only; the firewall opens 443 (and 80 for the certificate), not 8080.
 - [ ] An admin key, and customer keys in a file with mode 600.
 - [ ] The proxy streams without buffering and has a long read timeout.
-- [ ] `--max-tokens` and `--ctx` fit your price list and your GPU memory.
+- [ ] `--max-tokens` and `--ctx` fit your price list and your GPU memory (times `--parallel`).
+- [ ] `--parallel` set for the number of users you expect at once (4 for the most total speed).
 - [ ] `--usage-log` is on and rotated.
 - [ ] `/health` is monitored, and systemd restarts the server on failure.
 - [ ] `strata calibrate` ran on this machine as the service user.
