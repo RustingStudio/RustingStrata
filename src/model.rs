@@ -22,12 +22,14 @@ const PLE_NGRAM: usize = 3;
 const PLE_HEADS: usize = 8;
 const PLE_KERNEL: usize = 4;
 const PLE_HIST: usize = (PLE_KERNEL - 1) * PLE_NGRAM;
+/// QSA: cells per pooled indexer key.
+const QSA_POOL: usize = 4;
 
 pub enum LayerState {
     /// conv: last (ssm_conv - 1) inputs per channel, oldest first; s: dt_rank x head_v x head_k.
     Recurrent { conv: Vec<f32>, s: Vec<f32> },
-    /// k, v: pos x n_head_kv x head_dim.
-    Attn { k: Vec<f32>, v: Vec<f32> },
+    /// k, v: pos x n_head_kv x head_dim; ik: pos x idx_head_dim raw QSA indexer keys (empty without an indexer).
+    Attn { k: Vec<f32>, v: Vec<f32>, ik: Vec<f32> },
 }
 
 pub struct State {
@@ -48,7 +50,7 @@ impl State {
                     conv: vec![0.0; (c.ssm_conv - 1) * channels],
                     s: vec![0.0; c.ssm_dt_rank * c.ssm_dv() * c.ssm_d_state],
                 },
-                LayerKind::Attn => LayerState::Attn { k: Vec::new(), v: Vec::new() },
+                LayerKind::Attn => LayerState::Attn { k: Vec::new(), v: Vec::new(), ik: Vec::new() },
             })
             .collect();
         let ple = if c.n_embd_ple > 0 { PLE_HIST * c.hc_n * c.n_embd } else { 0 };
@@ -60,7 +62,7 @@ impl State {
 pub struct Mtp { pub kv: LayerState, pub pos: usize }
 
 impl Default for Mtp {
-    fn default() -> Mtp { Mtp { kv: LayerState::Attn { k: Vec::new(), v: Vec::new() }, pos: 0 } }
+    fn default() -> Mtp { Mtp { kv: LayerState::Attn { k: Vec::new(), v: Vec::new(), ik: Vec::new() }, pos: 0 } }
 }
 
 fn mv(t: &Tensor, x: &[f32]) -> Vec<f32> {
@@ -135,7 +137,7 @@ impl<'a> Model<'a> {
             let (h, inj) = self.hc_read(&r, &format!("blk.{il}.hc_attn_"));
             let mix = match &mut st.layers[il] {
                 LayerState::Recurrent { conv, s } => self.deltanet(il, &h, conv, s),
-                LayerState::Attn { k, v } => self.attention(il, &h, k, v, st.pos),
+                LayerState::Attn { k, v, ik } => self.attention(il, &h, k, v, ik, st.pos),
             };
             Self::hc_write(&mut r, &mix, &inj);
             let (h, inj) = self.hc_read(&r, &format!("blk.{il}.hc_ffn_"));
@@ -245,7 +247,7 @@ impl<'a> Model<'a> {
         ops::rms_norm(x, &self.f(il, "attn_norm.weight"), c.eps, &mut h);
         let mix = match ls {
             LayerState::Recurrent { conv, s } => self.deltanet(il, &h, conv, s),
-            LayerState::Attn { k, v } => self.attention(il, &h, k, v, pos),
+            LayerState::Attn { k, v, ik } => self.attention(il, &h, k, v, ik, pos),
         };
         for (a, b) in x.iter_mut().zip(&mix) { *a += b; }
         ops::rms_norm(x, &self.f(il, "post_attention_norm.weight"), c.eps, &mut h);
@@ -331,8 +333,46 @@ impl<'a> Model<'a> {
         mv(&self.t(il, "ssm_out.weight"), &out)
     }
 
-    fn attention(&self, il: usize, h: &[f32], kc: &mut Vec<f32>, vc: &mut Vec<f32>, pos: usize) -> Vec<f32> {
+    /// QSA (qwen4exp sparse attention): the cells row `pos` attends to, or None for all of them. Keys are pooled
+    /// in blocks of QSA_POOL cells: mean of the raw indexer keys, RMS-normed and rotated to the block's first
+    /// position. Each complete block scores sum over heads of relu(q_h . k) / sqrt(head_dim); the top
+    /// idx_top_k / QSA_POOL blocks (ties to the lower block) and the incomplete tail block are kept. Dense while
+    /// there are no more complete blocks than that. Mirrors llama.cpp qwen4exp.cpp `build_qsa_sel`.
+    fn qsa(&self, il: usize, h: &[f32], ik: &mut Vec<f32>, pos: usize) -> Option<Vec<usize>> {
         let c = &self.cfg;
+        let (nh, d) = (c.idx_n_head, c.idx_head_dim);
+        if c.idx_top_k == 0 || self.w.layer(il, "indexer.k_proj.weight").is_err() { return None; }
+        ik.extend_from_slice(&mv(&self.t(il, "indexer.k_proj.weight"), h));
+        let (nb, top) = ((pos + 1) / QSA_POOL, c.idx_top_k / QSA_POOL);
+        if nb <= top { return None; }
+        let (qn, kn) = (self.f(il, "indexer.q_norm.weight"), self.f(il, "indexer.k_norm.weight"));
+        let qr = mv(&self.t(il, "indexer.q_proj.weight"), h);
+        let mut q = vec![0f32; nh * d];
+        for i in 0..nh {
+            ops::rms_norm(&qr[i * d..(i + 1) * d], &qn, c.eps, &mut q[i * d..(i + 1) * d]);
+            ops::rope_neox(&mut q[i * d..(i + 1) * d], c.n_rot, pos, c.rope_base);
+        }
+        let mut score = vec![0f32; nb];
+        let (mut mean, mut k) = (vec![0f32; d], vec![0f32; d]);
+        for (b, s) in score.iter_mut().enumerate() {
+            mean.fill(0.0);
+            for t in b * QSA_POOL..(b + 1) * QSA_POOL {
+                for (m, x) in mean.iter_mut().zip(&ik[t * d..(t + 1) * d]) { *m += x / QSA_POOL as f32; }
+            }
+            ops::rms_norm(&mean, &kn, c.eps, &mut k);
+            ops::rope_neox(&mut k, c.n_rot, b * QSA_POOL, c.rope_base);
+            *s = q.chunks(d).map(|qh| qh.iter().zip(&k).map(|(a, b)| a * b).sum::<f32>().max(0.0)).sum::<f32>()
+                / (d as f32).sqrt();
+        }
+        let mut blocks = ops::top_k(&score, top);
+        blocks.sort_unstable();
+        Some(blocks.iter().flat_map(|b| b * QSA_POOL..(b + 1) * QSA_POOL).chain(nb * QSA_POOL..pos + 1).collect())
+    }
+
+    fn attention(&self, il: usize, h: &[f32], kc: &mut Vec<f32>, vc: &mut Vec<f32>, ik: &mut Vec<f32>, pos: usize)
+        -> Vec<f32> {
+        let c = &self.cfg;
+        let cells = self.qsa(il, h, ik, pos).unwrap_or_else(|| (0..pos + 1).collect());
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
         let qs = if c.q_gate { 2 * hd } else { hd };  // per-head row of attn_q: query, then the gate if any
         let qg = mv(&self.t(il, "attn_q.weight"), h);
@@ -353,20 +393,19 @@ impl<'a> Model<'a> {
         }
         kc.extend_from_slice(&k);
         vc.extend_from_slice(&v);
-        let n = pos + 1;
         let scale = 1.0 / (hd as f32).sqrt();
         let mut out = vec![0f32; nh * hd];
-        let mut sc = vec![0f32; n];
+        let mut sc = vec![0f32; cells.len()];
         for i in 0..nh {
             let g = i / (nh / nkv);
             let qh = &q[i * hd..(i + 1) * hd];
-            for (t, s) in sc.iter_mut().enumerate() {
+            for (&t, s) in cells.iter().zip(sc.iter_mut()) {
                 let kt = &kc[(t * nkv + g) * hd..(t * nkv + g + 1) * hd];
                 *s = qh.iter().zip(kt).map(|(a, b)| a * b).sum::<f32>() * scale;
             }
             ops::softmax(&mut sc);
             let oh = &mut out[i * hd..(i + 1) * hd];
-            for (t, p) in sc.iter().enumerate() {
+            for (&t, p) in cells.iter().zip(&sc) {
                 let vt = &vc[(t * nkv + g) * hd..(t * nkv + g + 1) * hd];
                 for (o, vv) in oh.iter_mut().zip(vt) { *o += p * vv; }
             }
