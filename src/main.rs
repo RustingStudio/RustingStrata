@@ -906,7 +906,8 @@ impl Serving {
 /// What a request thread asks of the model's thread under `--parallel` (`Serving::serve_slots`).
 enum Job {
     /// `prefill_cached` in a free slot; answers the logits, the tokens reused and the slot.
-    Chat { ids: Vec<u32>, sys: usize, keep: usize, owner: u64, back: std::sync::mpsc::Sender<anyhow::Result<(Vec<f32>, usize, usize)>> },
+    /// `gone` is set when the client leaves while the chat waits for a slot; the chat is then dropped.
+    Chat { ids: Vec<u32>, sys: usize, keep: usize, owner: u64, gone: std::sync::Arc<std::sync::atomic::AtomicBool>, back: std::sync::mpsc::Sender<anyhow::Result<(Vec<f32>, usize, usize)>> },
     /// One decode step in a slot the request holds; answers the greedy next token and the logits if `logits`.
     Step { slot: usize, token: u32, logits: bool, back: std::sync::mpsc::Sender<anyhow::Result<(u32, Vec<f32>)>> },
     /// The request is done with its slot.
@@ -914,14 +915,25 @@ enum Job {
 }
 
 /// A request's handle on the model under `--parallel`; dropping it frees the slot.
-struct Client { tx: std::sync::mpsc::Sender<Job>, slot: Option<usize>, owner: u64 }
+/// `conn` is the request's connection, watched while the chat waits for a slot.
+struct Client { tx: std::sync::mpsc::Sender<Job>, slot: Option<usize>, owner: u64, conn: Option<TcpStream> }
 
 impl Client {
     fn chat(&mut self, ids: &[u32], sys: usize, keep: usize) -> anyhow::Result<(Vec<f32>, usize)> {
         if let Some(s) = self.slot.take() { let _ = self.tx.send(Job::Done(s)); }
         let (back, r) = std::sync::mpsc::channel();
-        self.tx.send(Job::Chat { ids: ids.to_vec(), sys, keep, owner: self.owner, back }).map_err(|_| anyhow::anyhow!("model gone"))?;
-        let (logits, reused, s) = r.recv()??;
+        let gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.tx.send(Job::Chat { ids: ids.to_vec(), sys, keep, owner: self.owner, gone: gone.clone(), back }).map_err(|_| anyhow::anyhow!("model gone"))?;
+        let (logits, reused, s) = loop {
+            match r.recv_timeout(Duration::from_millis(250)) {
+                Ok(x) => break x?,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => if self.conn.as_ref().is_some_and(serve::gone) {
+                    gone.store(true, Relaxed);
+                    anyhow::bail!("client closed the connection");
+                },
+                Err(_) => anyhow::bail!("model gone"),
+            }
+        };
         self.slot = Some(s);
         Ok((logits, reused))
     }
@@ -1026,7 +1038,7 @@ impl Serving {
                             live.fetch_add(1, Relaxed);
                             let (tx, tok, tpl, name, path, next, live) = (tx.clone(), &**tok, *tpl, name.clone(), path.clone(), &next, &live);
                             sc.spawn(move || {
-                                let mut l = Loaded { r: Runner::Slot(Client { tx, slot: None, owner: 0 }), tok, tpl, name, path };
+                                let mut l = Loaded { r: Runner::Slot(Client { tx, slot: None, owner: 0, conn: None }), tok, tpl, name, path };
                                 let mut nx = None;
                                 let res = handle(c, q, Some(&mut l), e, self, i, &mut nx);
                                 drop((l, hold));
@@ -1044,6 +1056,7 @@ impl Serving {
                 s.take(&jobs, s.wait());
                 // One prefill between decode steps, in the free slot whose saved state this prompt extends the
                 // furthest, else the least recently used one.
+                s.chats.retain(|j| !matches!(j, Job::Chat { gone, .. } if gone.load(Relaxed)));
                 let first = s.next_chat();
                 if let Some(sl) = (0..n).filter(|&i| !s.held[i]).max_by_key(|&i| {
                     let reuse = match first.and_then(|j| s.chats.get(j)) {
@@ -1051,7 +1064,7 @@ impl Serving {
                         _ => 0,
                     };
                     (reuse, std::cmp::Reverse(s.freed[i]))
-                }) && let Some(Job::Chat { ids, sys, keep, owner, back }) = first.and_then(|j| s.chats.remove(j)) {
+                }) && let Some(Job::Chat { ids, sys, keep, owner, back, .. }) = first.and_then(|j| s.chats.remove(j)) {
                     g.use_slot(sl);
                     g.owner = owner;
                     // Between two prefill chunks the decoding slots run for as long as the chunk before took, so a long
@@ -1068,7 +1081,12 @@ impl Serving {
                         Ok(())
                     });
                     (s.held[sl], s.who[sl]) = (r.is_ok(), owner);
-                    let _ = back.send(r.map(|(l, u)| (l, u, sl)));
+                    // A client that left during the prefill takes no slot.
+                    if back.send(r.map(|(l, u)| (l, u, sl))).is_err() && s.held[sl] {
+                        s.held[sl] = false;
+                        s.tick += 1;
+                        s.freed[sl] = s.tick;
+                    }
                     gpu_model_stats(g, &mut self.stats.lock().unwrap());
                 }
                 if s.ready() { s.run(g); }
@@ -1233,7 +1251,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let anth = p == "/v1/messages";
             let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
             let (r, tok, tpl, name) = (&mut l.r, &l.tok, l.tpl, l.name.as_str());
-            match r { Runner::Gpu(g) => g.owner = who.id, Runner::Slot(c) => c.owner = who.id, _ => {} }
+            match r { Runner::Gpu(g) => g.owner = who.id, Runner::Slot(c) => (c.owner, c.conn) = (who.id, w.try_clone().ok()), _ => {} }
             let req = match if anth { serve::messages_body(&body) } else { Ok(body.clone()) }.and_then(|b| serve::chat_request(&b)) {
                 Ok(q) => q,
                 Err(err) => return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
@@ -1268,9 +1286,13 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 if st.busy == 0 { st.live_tokens = 0; }
                 st.busy += 1;
             }
+            // Whether the prompt reached the model: a client that left while it waited in the queue is not logged.
+            let mut prefilled = false;
             let res = (|| -> anyhow::Result<(Vec<u32>, bool)> {
                 let logits;
+                if serve::gone(&w) { anyhow::bail!("client closed the connection"); }
                 (_, logits, cached) = r.chat(tok, &prompt, &tpl.render(&req.messages, &req.tools, req.think, preserve, false), &system)?;
+                prefilled = true;
                 t1 = Instant::now();
                 if req.stream {
                     write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
@@ -1316,7 +1338,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     // Logged with the tokens decoded so far, which a client that left may have received.
                     let gone = serve::gone(&w);
                     last.finish = if gone { "cut" } else { "error" }.into();
-                    log(&last);
+                    if prefilled || !gone { log(&last); }
                     if !req.stream && !gone { return send(&mut w, "500 Internal Server Error", json!({"error": {"message": format!("{err:#}"), "type": "server_error"}})); }
                     return Err(err);
                 }

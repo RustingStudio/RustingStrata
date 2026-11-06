@@ -316,7 +316,8 @@ With `--usage-log FILE`, every chat request that reaches the model adds one JSON
   tokens decoded so far: a stream has sent nearly all of them, a reply without `stream` has sent none. `error` is a
   request that failed on the server; it got a `500` or a stream that stopped.
 
-Requests refused before the model (bad key, bad JSON, a prompt that fills the context, `503`) are not logged. Tokens
+Requests refused before the model (bad key, bad JSON, a prompt that fills the context, `503`, `429`) and requests
+whose client left while they waited in the queue are not logged. Tokens
 per key and day, without failed requests:
 
 ```sh
@@ -333,7 +334,9 @@ The file only grows; rotate it with logrotate (`copytruncate`, since Strata keep
 - `--max-tokens` caps the reply length a request may ask for, and is the length when it asks for none. Without it a
   request may decode until the context is full, which holds the server for minutes.
 - Bodies over 8 MiB are refused, and a client has 30 s to send its request.
-- A client that disconnects stops its reply within a few tokens, so the next request in the queue starts.
+- A client that disconnects stops its reply within a few tokens, so the next request in the queue starts. One that
+  leaves while its request waits in the queue costs no prefill: the request is dropped when its turn comes (with
+  `--parallel`, within a quarter second).
 - With `--parallel N`, `--ctx` is per slot: N slots of 32K need N times the KV memory of one.
 - `--max-per-key N` caps the requests one customer key may have open at once (read, generated or queued); more get
   `429 Too Many Requests` with `Retry-After: 1` and the OpenAI error type `rate_limit_error`, which the OpenAI and
