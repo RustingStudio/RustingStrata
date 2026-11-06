@@ -99,7 +99,7 @@ prefilled (`usage.prompt_tokens_details.cached_tokens`). `tools` and `tool_choic
 come back as `tool_calls` with `finish_reason: "tool_calls"`). The prompt follows the model's own chat template,
 rendered like llama.cpp's `--jinja`. `tool_choice: "required"` does not force a call.
 `POST /v1/messages` speaks the Anthropic Messages API (text, `tool_use` and `tool_result` blocks, streamed or not,
-the key in `x-api-key`), so Claude Code can use the server:
+the key in `x-api-key`, and `POST /v1/messages/count_tokens`), so Claude Code can use the server:
 `ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=secret ANTHROPIC_MODEL=local ANTHROPIC_SMALL_FAST_MODEL=local claude`.
 OpenCode and other agents use the OpenAI address. Qwen3.6's template leaves the think block out of replies before the
 last user message, so each new user message changes the text of the earlier turns and the whole conversation is

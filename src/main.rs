@@ -1104,8 +1104,8 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
     // Claude Code adds `?beta=true`.
     let route = path.split('?').next().unwrap_or_default();
     // Customer keys may not load models, download files or read the server's stats.
-    if !who.admin && !matches!(route, "/v1/chat/completions" | "/v1/messages" | "/v1/models") {
-        return send(&mut w, "403 Forbidden", json!({"error": {"message": "this key may use only /v1/chat/completions, /v1/messages and /v1/models", "type": "permission_error"}}));
+    if !who.admin && !matches!(route, "/v1/chat/completions" | "/v1/messages" | "/v1/messages/count_tokens" | "/v1/models") {
+        return send(&mut w, "403 Forbidden", json!({"error": {"message": "this key may use only /v1/chat/completions, /v1/messages (and count_tokens) and /v1/models", "type": "permission_error"}}));
     }
     match (method.as_str(), route) {
         ("GET", "/v1/models") => send(&mut w, "200 OK", json!({"object": "list", "data": l.map(|l| json!([{"id": l.name, "object": "model", "created": created, "owned_by": "strata"}])).unwrap_or(json!([]))})),
@@ -1146,6 +1146,17 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 (g.running, g.error) = (false, r.err().map(|e| format!("{e:#}")));
             });
             send(&mut w, "202 Accepted", json!(*s.dl.lock().unwrap()))
+        }
+        // The prompt's tokens as the model would see them, template and tools included.
+        ("POST", "/v1/messages/count_tokens") => {
+            let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
+            match serve::messages_body(&body).and_then(|b| serve::chat_request(&b)) {
+                Ok(req) => {
+                    let prompt = l.tpl.render(&req.messages, &req.tools, req.think, req.preserve_thinking.unwrap_or(e.preserve_thinking), true);
+                    send(&mut w, "200 OK", json!({"input_tokens": l.tok.encode(&prompt)?.len()}))
+                }
+                Err(err) => send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
+            }
         }
         // The Anthropic Messages API (Claude Code) is translated to a chat request, and the reply back.
         ("POST", p @ ("/v1/chat/completions" | "/v1/messages")) => {
