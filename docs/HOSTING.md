@@ -11,7 +11,8 @@ its own license (most Qwen models are Apache 2.0; check the model card).
 ## How much one server does
 
 By default `strata serve` answers one chat request at a time. Others wait in a queue (`--max-waiting`, 16 by default)
-and run in arrival order; more than that get `503 Service Unavailable` with `Retry-After: 2`. One request decodes at
+and run in arrival order; more than that get `503 Service Unavailable` with `Retry-After: 2` (`--max-per-key` keeps one
+customer from taking all the places). One request decodes at
 the speed in the README (about 113 tok/s for Qwen3.6-35B-A3B Q2_K_XL on an RTX 3060), so that is also the total for
 all users of one server. Long prompts block the queue for their prefill time (about 2 s for 4K tokens on the 3060).
 
@@ -113,7 +114,8 @@ sudo chmod 600 /etc/strata/keys.txt
 
 # 4. Run it on the loopback address; the reverse proxy below is the only thing that faces the network.
 STRATA_API_KEY=<admin key> strata serve --model $M --gpu --ctx 32768 --addr 127.0.0.1:8080 \
-    --api-keys /etc/strata/keys.txt --usage-log /var/lib/strata/usage.jsonl --max-tokens 4096 --parallel 4 --kv q8
+    --api-keys /etc/strata/keys.txt --usage-log /var/lib/strata/usage.jsonl --max-tokens 4096 --parallel 4 --kv q8 \
+    --max-per-key 4
 ```
 
 Clients then use the OpenAI address `https://api.example.com/v1` with their key, or the Anthropic address
@@ -128,7 +130,8 @@ chunk.
   Keep it for yourself.
 - **Customer keys** (`--api-keys FILE`). One `name key` pair a line, `#` starts a comment. Keys must be at least 16
   characters, and names and keys must not repeat. A customer key reaches only `POST /v1/chat/completions`,
-  `POST /v1/messages`, `POST /v1/messages/count_tokens` and `GET /v1/models`; other routes answer `403`. The name goes into the usage log.
+  `POST /v1/messages`, `POST /v1/messages/count_tokens` and `GET /v1/models`; other routes answer `403`. The name
+  goes into the usage log.
 - **Changing the key file.** The server reads the file again when it changes, and the next request uses the new
   keys; replies being generated go on. A file that does not parse, or one with no keys, keeps the old keys (the
   server log says why). Write a new file and rename it over the old one, so that the server never reads it half
@@ -139,7 +142,8 @@ chunk.
       && chmod 600 /etc/strata/keys.new && mv /etc/strata/keys.new /etc/strata/keys.txt'
   ```
 
-  A removed key gets `401` from its next request on. A key that stays keeps its cached conversations, even when its line moves.
+  A removed key gets `401` from its next request on. A key that stays keeps its cached conversations, even when its
+  line moves. To cut off a customer who used up a prepaid budget, sum the usage log per key and remove the key.
 - With customer keys and no admin key, nobody can use the admin routes.
 - With no key at all the server is open to anyone who reaches it. That is meant for a local machine only.
 
@@ -204,22 +208,19 @@ To keep the chat page and the admin routes off the public address, serve only `/
 Then reach the chat page through an SSH tunnel: `ssh -L 8080:127.0.0.1:8080 server`, and open
 http://127.0.0.1:8080 with the admin key.
 
-Limits per customer belong in the proxy too. Strata answers requests in arrival order, so one customer that sends
-many at once makes the others wait behind them; cap the requests each key has open, and the requests per minute:
+Strata caps the requests each key has open itself (`--max-per-key`, see [Limits per request](#limits-per-request)).
+A cap on requests per minute belongs in the proxy:
 
 ```nginx
 # in http { }
-limit_conn_zone $http_authorization zone=perkey:10m;
 limit_req_zone  $http_authorization zone=perkey_rate:10m rate=60r/m;
 
 # in the location that passes /v1/ to Strata
-limit_conn perkey 2;                          # at most 2 open requests per key; more get 429
 limit_req  zone=perkey_rate burst=20 nodelay;
-limit_conn_status 429;
 limit_req_status  429;
 ```
 
-Anthropic clients send the key as `x-api-key`, so key those zones on `$http_x_api_key` too if you serve them.
+Anthropic clients send the key as `x-api-key`, so key the zone on `$http_x_api_key` too if you serve them.
 
 ## systemd
 
@@ -242,7 +243,7 @@ User=strata
 EnvironmentFile=/etc/strata/env
 ExecStart=/usr/local/bin/strata serve --model /srv/models/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf --gpu --ctx 32768 \
     --addr 127.0.0.1:8080 --api-keys /etc/strata/keys.txt --usage-log /var/lib/strata/usage.jsonl --max-tokens 4096 \
-    --parallel 4 --kv q8
+    --parallel 4 --kv q8 --max-per-key 4
 StateDirectory=strata
 Restart=on-failure
 RestartSec=5
