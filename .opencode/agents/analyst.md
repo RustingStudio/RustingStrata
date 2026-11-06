@@ -2,7 +2,7 @@
 description: Analyses a task and opens the GitHub issue with the full contract. Code read-only.
 mode: subagent
 color: "#0ea5e9"
-steps: 80
+steps: 120
 permissions:
   - action: "*"
     resource: "*"
