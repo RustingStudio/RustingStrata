@@ -101,7 +101,7 @@ struct Hosting {
     /// Append one JSON line per chat request (time, key name, token counts, timings, how it finished) to this file.
     #[arg(long)]
     usage_log: Option<PathBuf>,
-    /// Requests read or waiting at once; more get `503` with `Retry-After`.
+    /// Open connections (being read, generated or queued, health checks included); more get `503` with `Retry-After`.
     #[arg(long, default_value_t = 16)]
     max_waiting: usize,
     /// Requests one customer key may have read, generated or queued at once; more get `429` with `Retry-After`
@@ -570,6 +570,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 None => vec![],
             };
             anyhow::ensure!(!users.iter().any(|u| api_key.as_ref() == Some(&u.1)), "the admin key is also a customer key");
+            // An empty key file would leave the server open to anyone.
+            anyhow::ensure!(host.api_keys.is_none() || !users.is_empty() || api_key.is_some(), "the key file has no keys");
             let keys = std::sync::Arc::new(std::sync::RwLock::new(serve::Keys { admin: api_key, users }));
             let keys_file = host.api_keys.clone();
             let usage = match &host.usage_log {
@@ -593,14 +595,16 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let (st, a, k, t0) = (stats.clone(), addr.clone(), keys.clone(), Instant::now());
             let (per_key, held) = (host.max_per_key, serve::Open::default());
             let stop = on_sigterm();
-            // SIGTERM (systemctl stop or restart): new requests get 503, the replies being generated finish, then
-            // the server exits. Two looks 0.2 s apart cover a connection counted just before the signal.
+            // SIGTERM (systemctl stop or restart): new requests get 503, the requests accepted before it finish, then
+            // the server exits. The model thread does that itself, after saving the expert profile (`Serving::stopped`);
+            // this thread covers a server with no model or one loading. Two looks 0.2 s apart cover a connection counted
+            // just before the signal, and the model thread gets 3 s to save first.
             let oc = open_conns.clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(Duration::from_millis(200));
                 if !stop.load(Relaxed) { continue; }
                 let n = oc.load(Relaxed);
-                if n == 0 { std::thread::sleep(Duration::from_millis(200)); if oc.load(Relaxed) == 0 { eprintln!("stopped"); std::process::exit(0); } }
+                if n == 0 { std::thread::sleep(Duration::from_millis(200)); if oc.load(Relaxed) == 0 { std::thread::sleep(Duration::from_secs(3)); eprintln!("stopped"); std::process::exit(0); } }
                 else { eprintln!("stopping: {n} requests to finish"); std::thread::sleep(Duration::from_secs(5)); }
             });
             std::thread::spawn(move || for (i, conn) in listener.incoming().enumerate() {
@@ -682,7 +686,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     let _ = tx.send((c, q, i, hold));
                 });
             });
-            let s = Serving { rx: rx.into(), waiting, addr, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(),
+            let s = Serving { rx: rx.into(), waiting, stop, addr, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(),
                 dl: Default::default(), stats };
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
@@ -854,6 +858,8 @@ struct Serving {
     /// Complete requests, with their key's place when `--max-per-key` counts it (freed once answered).
     rx: std::sync::Mutex<std::sync::mpsc::Receiver<(TcpStream, anyhow::Result<serve::Request>, usize, Option<serve::Hold>)>>,
     waiting: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Set by SIGTERM.
+    stop: &'static std::sync::atomic::AtomicBool,
     addr: String,
     keys: std::sync::Arc<std::sync::RwLock<serve::Keys>>,
     usage: Option<std::sync::Mutex<std::fs::File>>,
@@ -884,15 +890,24 @@ impl Serving {
     /// listener is gone).
     fn serve(&self, mut l: Option<&mut Loaded>, e: &Engine) -> Option<(PathBuf, TcpStream)> {
         if let Some(l) = l.as_deref_mut() && matches!(&l.r, Runner::Gpu(g) if g.slots() > 1) { return self.serve_slots(l, e); }
-        for (c, q, i, _hold) in self.rx.lock().unwrap().iter() {
+        let rx = self.rx.lock().unwrap();
+        loop {
+            let (c, q, i, _hold) = match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(x) => x,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if self.stopped() => { eprintln!("stopped"); return None }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+            };
             let mut next = None;
             let res = handle(c, q, l.as_deref_mut(), e, self, i, &mut next);
             self.waiting.fetch_sub(1, Relaxed);
             if let Err(e) = res { eprintln!("request {i}: {e:#}"); }
             if next.is_some() { return next; }
         }
-        None
     }
+    /// SIGTERM came and the requests accepted before it are answered: `serve` returns None, so the expert profile
+    /// is saved and the server exits.
+    fn stopped(&self) -> bool { self.stop.load(Relaxed) && self.waiting.load(Relaxed) == 0 }
     /// The models the page offers: the models folder, then --model if it is elsewhere.
     fn models(&self) -> Vec<(String, PathBuf, u64)> {
         let mut v = serve::list_models(&self.dir);
@@ -1056,6 +1071,7 @@ impl Serving {
                         Err(TryRecvError::Disconnected) => open = false,
                     }
                 }
+                if open && self.stopped() { eprintln!("stopped"); open = false; }
                 if (!open || next.lock().unwrap().is_some()) && live.load(Relaxed) == 0 { break; }
                 s.take(&jobs, s.wait());
                 // One prefill between decode steps, in the free slot whose saved state this prompt extends the
