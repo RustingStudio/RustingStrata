@@ -736,9 +736,13 @@ fn batch_rows(mats: &[Tensor], xs: &[&[f32]], out: &mut [f32]) {
     let rows = out.len() / mats.len();
     let dot = int_dot(mats[0].ty);
     let xq: Vec<Vec<Q8K>> = if dot.is_some() { xs.iter().map(|x| quantize_q8k(x)).collect() } else { vec![] };
-    out.par_chunks_mut(16).enumerate().for_each_init(|| vec![0f32; mats[0].cols], |buf, (c, ys)| {
+    // Q2_0 experts benefit from fewer Rayon tasks on AVX2. Keep enough chunks to occupy the pool,
+    // including when only one expert misses; other formats keep their existing granularity.
+    let batch = if mats[0].ty == GgmlType::Q2_0 && cfg!(target_feature = "avx2")
+        && out.len() / 64 >= rayon::current_num_threads() { 64 } else { 16 };
+    out.par_chunks_mut(batch).enumerate().for_each_init(|| if dot.is_none() { vec![0f32; mats[0].cols] } else { Vec::new() }, |buf, (c, ys)| {
         for (k, v) in ys.iter_mut().enumerate() {
-            let i = c * 16 + k;
+            let i = c * batch + k;
             let (t, r, x) = (&mats[i / rows], i % rows, i / rows * xs.len() / mats.len());
             let rb = t.data.len() / t.rows;
             *v = match dot {
@@ -778,6 +782,43 @@ pub fn experts(m: &Model, il: usize, h: &[f32], sel: &[(usize, f32)]) -> Vec<f32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Batch boundaries can cross matrices; both Q2_0 and the f32 fallback must use the right input row.
+    #[test]
+    fn batch_rows_match_individual_matvecs() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let (cols, rows, count) = (640, 257, 3);
+        let inputs: Vec<Vec<f32>> = (0..count).map(|m| (0..cols).map(|i| ((i * 13 + m * 7) % 101) as f32 / 50.0 - 1.0).collect()).collect();
+        for ty in [GgmlType::Q2_0, GgmlType::F32] {
+            let rb = ty.row_bytes(cols as u64);
+            let data: Vec<Vec<u8>> = (0..count).map(|m| {
+                let mut v = vec![0u8; rows * rb];
+                if ty == GgmlType::Q2_0 {
+                    for (i, b) in v.chunks_exact_mut(18).enumerate() {
+                        b[..2].copy_from_slice(&f16::from_f32(0.01).to_le_bytes());
+                        for (j, q) in b[2..].iter_mut().enumerate() { *q = ((i * 17 + j * 11 + m) % 256) as u8; }
+                    }
+                } else {
+                    for (i, b) in v.chunks_exact_mut(4).enumerate() { b.copy_from_slice(&(((i + m * 3) % 113) as f32 / 57.0 - 1.0).to_le_bytes()); }
+                }
+                v
+            }).collect();
+            let mats: Vec<Tensor> = data.iter().map(|d| Tensor { ty, cols, rows, data: d }).collect();
+            let xs: Vec<&[f32]> = inputs.iter().map(Vec::as_slice).collect();
+            let mut got = vec![0.0; rows * count];
+            pool.install(|| batch_rows(&mats, &xs, &mut got));
+            for (i, t) in mats.iter().enumerate() {
+                let xq = quantize_q8k(xs[i]);
+                let dot = int_dot(ty);
+                let mut decoded = vec![0.0; cols];
+                for r in 0..rows {
+                    let want = if let Some(d) = dot { d(&t.data[r * rb..(r + 1) * rb], &xq) }
+                        else { t.row(r, &mut decoded); decoded.iter().zip(xs[i]).map(|(a, b)| a * b).sum() };
+                    assert_eq!(got[i * rows + r], want, "{} matrix {i} row {r}", ty.name());
+                }
+            }
+        }
+    }
 
     /// Every integer kernel (scalar and, when built, AVX2) equals the f32 dequantized dot on random blocks.
     #[test]
