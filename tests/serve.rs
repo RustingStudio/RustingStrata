@@ -273,7 +273,11 @@ fn keys_file_and_access() {
     assert_eq!(open.who(""), Some(Who { name: "".into(), id: 0, admin: true }));
     let k = Keys { admin: Some("root-key".into()), users };
     assert_eq!(k.who("Bearer root-key").map(|w| (w.id, w.admin)), Some((0, true)));
-    assert_eq!(k.who("Bearer beta-0123456789abcdef"), Some(Who { name: "beta".into(), id: 2, admin: false }));
+    let beta = k.who("Bearer beta-0123456789abcdef").unwrap();
+    assert!(beta.name == "beta" && beta.id != 0 && !beta.admin && beta.id != k.who("Bearer acme-0123456789abcdef").unwrap().id);
+    // A reloaded file with the lines in another order keeps each key's id (its cached conversations).
+    let swapped = Keys { admin: None, users: k.users.iter().rev().cloned().collect() };
+    assert_eq!(swapped.who("Bearer beta-0123456789abcdef"), Some(beta));
     assert_eq!(k.who("Bearer nope"), None);
     assert_eq!(k.who(""), None);
     let only_users = Keys { admin: None, users: k.users.clone() };

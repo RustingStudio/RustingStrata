@@ -95,7 +95,7 @@ struct Engine {
 struct Hosting {
     /// File of customer keys, one `name key` pair a line (`#` comments). These keys reach only the chat APIs and
     /// the model list, and each key's cached conversations are kept apart from the others'. `--api-key` stays
-    /// the admin key for every route.
+    /// the admin key for every route. A changed file is read again before the next request.
     #[arg(long)]
     api_keys: Option<PathBuf>,
     /// Append one JSON line per chat request (time, key name, token counts, timings, how it finished) to this file.
@@ -565,7 +565,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 None => vec![],
             };
             anyhow::ensure!(!users.iter().any(|u| api_key.as_ref() == Some(&u.1)), "the admin key is also a customer key");
-            let keys = serve::Keys { admin: api_key, users };
+            let keys = std::sync::Arc::new(std::sync::RwLock::new(serve::Keys { admin: api_key, users }));
+            let (keys_file, mut keys_time) = (host.api_keys.clone(), host.api_keys.as_ref().and_then(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok()));
             let usage = match &host.usage_log {
                 Some(f) => Some(std::sync::Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(f)
                     .with_context(|| format!("opening {}", f.display()))?)),
@@ -586,6 +587,18 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let (st, a, k, t0) = (stats.clone(), addr.clone(), keys.clone(), Instant::now());
             std::thread::spawn(move || for (i, conn) in listener.incoming().enumerate() {
                 let mut c = match conn { Ok(c) => c, Err(e) => { eprintln!("request {i}: {e:#}"); continue } };
+                // A changed key file takes effect from the next request; one that does not parse keeps the old keys.
+                if let Some(f) = &keys_file && let Ok(t) = std::fs::metadata(f).and_then(|m| m.modified()) && Some(t) != keys_time {
+                    keys_time = Some(t);
+                    let mut kw = k.write().unwrap();
+                    match std::fs::read_to_string(f).map_err(Into::into).and_then(|t| serve::Keys::parse(&t)) {
+                        Ok(u) if u.iter().any(|u| kw.admin.as_ref() == Some(&u.1)) => eprintln!("{}: the admin key is also a customer key, keeping the old keys", f.display()),
+                        // An empty file (or one caught mid-write) would leave the server open.
+                        Ok(u) if u.is_empty() && kw.admin.is_none() => eprintln!("{}: no keys, keeping the old keys", f.display()),
+                        Ok(u) => { eprintln!("{}: {} keys", f.display(), u.len()); kw.users = u; }
+                        Err(e) => eprintln!("{}: {e:#}, keeping the old keys", f.display()),
+                    }
+                }
                 // ponytail: one cap on connections read or queued (each may hold an 8 MB body), not one per key.
                 if open_conns.fetch_add(1, Relaxed) >= max_waiting {
                     open_conns.fetch_sub(1, Relaxed);
@@ -614,8 +627,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     }
                     // The page's side panel is answered here, so it stays current while a reply is generated or a
                     // model loads. A bad Host or key falls through to `handle`, which refuses it.
-                    if let Ok(r) = &q && r.method == "GET" && r.path == "/api/stats" && (k.any() || serve::host_ok(&r.host, &a))
-                        && k.who(&r.auth).is_some_and(|w| w.admin) {
+                    if let Ok(r) = &q && r.method == "GET" && r.path == "/api/stats" && let k = k.read().unwrap().clone()
+                        && (k.any() || serve::host_ok(&r.host, &a)) && k.who(&r.auth).is_some_and(|w| w.admin) {
                         let mut v = json!(*st.lock().unwrap());
                         (v["system"], v["uptime_s"]) = (serve::system(), t0.elapsed().as_secs().into());
                         return reply(v, "200 OK");
@@ -795,7 +808,7 @@ struct Serving {
     rx: std::sync::Mutex<std::sync::mpsc::Receiver<(TcpStream, anyhow::Result<serve::Request>, usize)>>,
     waiting: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     addr: String,
-    keys: serve::Keys,
+    keys: std::sync::Arc<std::sync::RwLock<serve::Keys>>,
     usage: Option<std::sync::Mutex<std::fs::File>>,
     max_tokens: usize,
     dir: PathBuf,
@@ -1079,13 +1092,14 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
     // Browsers can reach a loopback server: the Host check stops DNS rebinding, and requiring a JSON content type
     // makes a cross-site POST need a CORS preflight, which is never answered.
     // With a key the check is not needed (a rebinding page has no key) and would refuse a reverse proxy's Host.
-    if !s.keys.any() && !serve::host_ok(&host, &s.addr) { return send(&mut w, "403 Forbidden", json!({"error": {"message": "bad Host header", "type": "forbidden"}})); }
+    let keys = s.keys.read().unwrap().clone();
+    if !keys.any() && !serve::host_ok(&host, &s.addr) { return send(&mut w, "403 Forbidden", json!({"error": {"message": "bad Host header", "type": "forbidden"}})); }
     // The chat page holds no secret, so it loads without the key (the page asks for it).
     if method == "GET" && path == "/" {
         const PAGE: &str = include_str!("web/index.html");
         return Ok(write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PAGE}", PAGE.len())?);
     }
-    let Some(who) = s.keys.who(&auth) else { return send(&mut w, "401 Unauthorized", json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}})) };
+    let Some(who) = keys.who(&auth) else { return send(&mut w, "401 Unauthorized", json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}})) };
     if method == "POST" && !json { return send(&mut w, "415 Unsupported Media Type", json!({"error": {"message": "Content-Type must be application/json", "type": "invalid_request_error"}})); }
     // Claude Code adds `?beta=true`.
     let route = path.split('?').next().unwrap_or_default();
