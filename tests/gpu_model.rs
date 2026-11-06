@@ -401,7 +401,7 @@ fn split_matches_single() {
                 out
             };
             let want = run(&mut GpuModel::load(&m, one, 256, 4, 512 << 20, 0).unwrap());
-            let mut gm = GpuModel::load_split(&m, vec![open().unwrap(), open().unwrap()], 256, 4, 512 << 20, 0).unwrap();
+            let mut gm = GpuModel::load_split(&m, vec![open().unwrap(), open().unwrap()], 256, 4, 512 << 20, 0, 1).unwrap();
             assert_eq!(gm.parts().count(), 2);
             let got = run(&mut gm);
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
@@ -471,15 +471,22 @@ fn slots_match_single() {
         .iter().map(|s| tok.encode(s).unwrap()).collect();
     // Which slots decode at each step; the last one decodes slot 1 alone through `step`.
     let plan: [&[usize]; 6] = [&[0, 1, 2], &[0, 1, 2], &[0, 2], &[1, 2], &[0, 1, 2], &[1]];
-    // All experts on the CPU, then the default placement.
-    for (cpu, bk) in [true, false].into_iter().flat_map(|c| ["cuda", "vulkan"].map(move |b| (c, b))) {
+    let open = |bk: &str| -> Option<Box<dyn rusting_strata::backend::Backend>> {
+        match bk {
+            "cuda" => rusting_strata::cuda::Gpu::new(0).ok().map(|g| Box::new(g) as _),
+            _ => rusting_strata::vulkan::Vk::new(0).ok().map(|g| Box::new(g) as _),
+        }
+    };
+    // All experts on the CPU, then the default placement, then the layers split in two parts (on the same GPU).
+    for (cpu, bk, split) in [(true, false), (false, false), (false, true)].into_iter().flat_map(|(c, sp)| ["cuda", "vulkan"].map(move |b| (c, b, sp))) {
         // SAFETY: the GPU lock serializes every test that loads a model, the only readers of this variable.
         if cpu { unsafe { std::env::set_var("STRATA_EXPERT_MB", "0") } } else { unsafe { std::env::remove_var("STRATA_EXPERT_MB") } }
-        let gpu: Box<dyn rusting_strata::backend::Backend> = match bk {
-            "cuda" => match rusting_strata::cuda::Gpu::new(0) { Ok(g) => Box::new(g), Err(_) => continue },
-            _ => match rusting_strata::vulkan::Vk::new(0) { Ok(g) => Box::new(g), Err(_) => continue },
+        let Some(gpu) = open(bk) else { continue };
+        let mut gm = if split {
+            GpuModel::load_split(&m, vec![gpu, open(bk).unwrap()], 256, 4, 512 << 20, 0, 3).unwrap()
+        } else {
+            GpuModel::load_slots(&m, gpu, 256, 4, 512 << 20, 3).unwrap()
         };
-        let mut gm = GpuModel::load_slots(&m, gpu, 256, 4, 512 << 20, 3).unwrap();
         gm.adapt_every = 0;
         // Reference: each prompt alone in slot 0, greedy, as many steps as the plan gives its slot. The placement is
         // fixed (no adaptation), so only the batching differs.
@@ -513,7 +520,7 @@ fn slots_match_single() {
                 let out = gm.step_rows(&rl).unwrap();
                 for (&(s, _, wl), (t, l)) in rl.iter().zip(out) {
                     let w = &want[s][got[s].len()];
-                    assert_eq!(t, ops::argmax(w) as u32, "{bk} cpu experts {cpu} slot {s}: greedy token");
+                    assert_eq!(t, ops::argmax(w) as u32, "{bk} cpu experts {cpu} split {split} slot {s}: greedy token");
                     got[s].push(if wl { l } else { assert!(l.is_empty()); w.clone() });
                 }
             }
@@ -542,26 +549,28 @@ fn slots_match_single() {
         let (want0, want1) = run(&mut gm, false);
         let (got0, got1) = run(&mut gm, true);
         assert!(want0.len() >= 2, "{bk}: prompt fits one chunk");
-        assert!(got0 == want0 && got1 == want1, "{bk} cpu experts {cpu}: decode between prefill chunks");
+        assert!(got0 == want0 && got1 == want1, "{bk} cpu experts {cpu} split {split}: decode between prefill chunks");
         gm.short = 32;
-        // A conversation parked in slot 0 continues in slot 2, which never saved a state.
-        gm.cache_ram = 1 << 30;
-        gm.use_slot(0);
-        let (a, b) = (&prompts[2], &prompts[1]);
-        let long: Vec<u32> = a.iter().chain(b).copied().collect();
-        gm.prefill_cached(a, 0, a.len() - 1).unwrap();
-        gm.prefill_cached(b, 0, b.len() - 1).unwrap();
-        gm.use_slot(2);
-        let (l, reused) = gm.prefill_cached(&long, 0, long.len() - 1).unwrap();
-        assert_eq!(reused, a.len() - 1, "{bk}: parked state not taken back");
-        gm.reset().unwrap();
-        assert_eq!(l, gm.prefill(&long).unwrap(), "{bk}: unparked state");
+        // A conversation parked in slot 0 continues in slot 2, which never saved a state (split models do not park).
+        if !split {
+            gm.cache_ram = 1 << 30;
+            gm.use_slot(0);
+            let (a, b) = (&prompts[2], &prompts[1]);
+            let long: Vec<u32> = a.iter().chain(b).copied().collect();
+            gm.prefill_cached(a, 0, a.len() - 1).unwrap();
+            gm.prefill_cached(b, 0, b.len() - 1).unwrap();
+            gm.use_slot(2);
+            let (l, reused) = gm.prefill_cached(&long, 0, long.len() - 1).unwrap();
+            assert_eq!(reused, a.len() - 1, "{bk}: parked state not taken back");
+            gm.reset().unwrap();
+            assert_eq!(l, gm.prefill(&long).unwrap(), "{bk}: unparked state");
+        }
         for s in 0..3 {
             assert_eq!(got[s].len(), want[s].len());
             for (i, (g, w)) in got[s].iter().zip(&want[s]).enumerate() {
                 let diff = g.iter().zip(w).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
-                eprintln!("{bk} cpu experts {cpu} slot {s} row {i}: argmax {} vs {}, max |dlogit| {diff}", ops::argmax(g), ops::argmax(w));
-                assert_eq!(g, w, "{bk} cpu experts {cpu} slot {s} row {i}");
+                eprintln!("{bk} cpu experts {cpu} split {split} slot {s} row {i}: argmax {} vs {}, max |dlogit| {diff}", ops::argmax(g), ops::argmax(w));
+                assert_eq!(g, w, "{bk} cpu experts {cpu} split {split} slot {s} row {i}");
             }
         }
     }
