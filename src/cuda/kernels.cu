@@ -1523,9 +1523,16 @@ extern "C" __global__ void kv_store(const float* k, const float* v, u16* kc, u16
 // grid = rows (heads of n), block 256: rms_norm (out rows of n) then rope_neox of the head, in one launch with the same
 // bits. Head r belongs to token r / per. With kc, then kv_store of the head and its v (v rows of n, like out).
 // Blocks below qrows do the q heads (from qx etc., no cache store); the rest do x etc.
+__device__ __forceinline__ double rope_f(float base, int i, int n_rot) { return pow((double)base, -2.0 * i / n_rot); }
+// fr[i] = rope_f(base, i, n_rot) for i < n_rot / 2, made once so rms_norm_rope skips the f64 pow.
+extern "C" __global__ void rope_freq(double* fr, float base, int n_rot) {
+    for (int i = threadIdx.x; i < n_rot / 2; i += blockDim.x) fr[i] = rope_f(base, i, n_rot);
+}
+// fr: the rope_freq table of base and n_rot, or null to compute it here.
 extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const float* w, float* out, int n, float eps, int per,
                                          int n_rot, const int* step, float base, const float* v, u16* kc, u16* vc,
-                                         int qrows, const float* qx, int q_stride, const float* qw, float* qo, int qper) {
+                                         int qrows, const float* qx, int q_stride, const float* qw, float* qo, int qper,
+                                         const double* fr) {
     int b = (int)blockIdx.x - qrows;
     if (b < 0) { b = blockIdx.x; x = qx; x_stride = q_stride; w = qw; out = qo; per = qper; kc = 0; }
     const float* xr = x + (size_t)b * x_stride;
@@ -1537,7 +1544,7 @@ extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const flo
     __syncthreads();
     int i = threadIdx.x, half = n_rot / 2;
     if (i < half) {
-        double theta = (double)(step[0] + b / per) * pow((double)base, -2.0 * i / n_rot);
+        double theta = (double)(step[0] + b / per) * (fr ? fr[i] : rope_f(base, i, n_rot));
         double ds, dc;
         sincos(theta, &ds, &dc);
         float sn = (float)ds, c = (float)dc;

@@ -15,8 +15,8 @@ const QTYPES: [GgmlType; 22] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, Q4_1, Q5_1, Q4_0, Q5_0]
 };
-const KERNELS: [&str; 34] = [
-    "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
+const KERNELS: [&str; 35] = [
+    "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv",
@@ -49,6 +49,8 @@ pub struct Gpu {
     done: CudaEvent,
     /// The side stream after the last `beside`'s copies; the next `beside` makes the stream wait for it.
     lag: std::sync::Mutex<Option<CudaEvent>>,
+    /// rope_freq tables by (base bits, n_rot), and the ones a graph capture asked for (see `rope_fr`).
+    fr: std::sync::Mutex<(HashMap<(u32, usize), CudaSlice<f64>>, Vec<(f32, usize)>)>,
 }
 
 const RING: usize = 64 << 20;
@@ -200,10 +202,31 @@ impl Gpu {
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = ctx.new_event(None)?;
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_q8, am, graphs: Default::default(), ring, done, lag: Default::default() })
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_q8, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
+
+    /// The rope frequencies base^(-2i / n_rot) as rms_norm_rope computes them in f64 (slow on consumer cards), made
+    /// once by the rope_freq kernel. While a graph is captured, a missing table gives 0 (the kernel computes them
+    /// itself) and is made after the capture, which `graph` then repeats.
+    fn rope_fr(&self, base: f32, n_rot: usize) -> anyhow::Result<u64> {
+        let mut fr = self.fr.lock().unwrap();
+        if let Some(t) = fr.0.get(&(base.to_bits(), n_rot)) { return Ok(self.ptr(t)); }
+        if self.stream.capture_status()? != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE {
+            fr.1.push((base, n_rot));
+            return Ok(0);
+        }
+        let t = self.stream.alloc_zeros::<f64>((n_rot / 2).max(1))?;
+        let p = self.ptr(&t);
+        let mut b = self.stream.launch_builder(self.f("rope_freq"));
+        let (bs, nr) = (base, n_rot as i32);
+        b.arg(&p); b.arg(&bs); b.arg(&nr);
+        unsafe { b.launch(cfg((1, 1), 256, 0)) }.context("launch rope_freq")?;
+        self.stream.synchronize()?;
+        fr.0.insert((base.to_bits(), n_rot), t);
+        Ok(p)
+    }
 
     /// The stream for the next launch: inside `batch`, odd launches go to `side`.
     fn st(&self) -> &Arc<CudaStream> {
@@ -453,6 +476,12 @@ impl Backend for Gpu {
         r?;
         let g = g.ok_or_else(|| anyhow::anyhow!("empty CUDA graph"))?;
         g.launch()?;
+        // A rope table the capture lacked: make it, and capture again next time (this graph computes it per call).
+        let want = std::mem::take(&mut self.fr.lock().unwrap().1);
+        if !want.is_empty() {
+            for (base, n_rot) in want { self.rope_fr(base, n_rot)?; }
+            return Ok(());
+        }
         self.graphs.lock().unwrap().insert(key, Graph(g));
         Ok(())
     }
@@ -566,8 +595,9 @@ impl Backend for Gpu {
 
     fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
         anyhow::ensure!(n_rot <= n.min(512) && n % 32 == 0, "rms_norm_rope: head of {n}, n_rot {n_rot}");
+        let fr = self.rope_fr(base, n_rot)?;
         launch!(self, "rms_norm_rope", cfg((rows as u32, 1), 256, 0), x, x_stride as i32, w, out, n as i32, eps, per as i32, n_rot as i32, step, base, v, kc, vc,
-                0i32, 0u64, 0i32, 0u64, 0u64, 0i32);
+                0i32, 0u64, 0i32, 0u64, 0u64, 0i32, fr);
         Ok(())
     }
 
@@ -575,8 +605,9 @@ impl Backend for Gpu {
     fn rms_norm_rope_qk(&self, q: u64, q_stride: usize, qw: u64, qo: u64, qrows: usize, qper: usize, k: u64, kw: u64, ko: u64, krows: usize, kper: usize,
                         n: usize, eps: f32, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
         anyhow::ensure!(n_rot <= n.min(512) && n % 32 == 0, "rms_norm_rope: head of {n}, n_rot {n_rot}");
+        let fr = self.rope_fr(base, n_rot)?;
         launch!(self, "rms_norm_rope", cfg(((qrows + krows) as u32, 1), 256, 0), k, n as i32, kw, ko, n as i32, eps, kper as i32, n_rot as i32, step, base, v, kc, vc,
-                qrows as i32, q, q_stride as i32, qw, qo, qper as i32);
+                qrows as i32, q, q_stride as i32, qw, qo, qper as i32, fr);
         Ok(())
     }
 
