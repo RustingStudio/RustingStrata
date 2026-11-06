@@ -927,10 +927,12 @@ impl Client {
         let (logits, reused, s) = loop {
             match r.recv_timeout(Duration::from_millis(250)) {
                 Ok(x) => break x?,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => if self.conn.as_ref().is_some_and(serve::gone) {
+                // A client that left is flagged, and the wait goes on: the model drops the chat if it is still queued
+                // (the channel closes), or sends its slot if the prefill already started, which `handle` then frees.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => if !gone.load(Relaxed) && self.conn.as_ref().is_some_and(serve::gone) {
                     gone.store(true, Relaxed);
-                    anyhow::bail!("client closed the connection");
                 },
+                Err(_) if gone.load(Relaxed) => anyhow::bail!("client closed the connection"),
                 Err(_) => anyhow::bail!("model gone"),
             }
         };
@@ -1294,6 +1296,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 (_, logits, cached) = r.chat(tok, &prompt, &tpl.render(&req.messages, &req.tools, req.think, preserve, false), &system)?;
                 prefilled = true;
                 t1 = Instant::now();
+                if serve::gone(&w) { anyhow::bail!("client closed the connection"); }
                 if req.stream {
                     write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
                     if anth {
