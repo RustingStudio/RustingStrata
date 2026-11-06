@@ -334,6 +334,10 @@ The file only grows; rotate it with logrotate (`copytruncate`, since Strata keep
 - Bodies over 8 MiB are refused, and a client has 30 s to send its request.
 - A client that disconnects stops its reply within a few tokens, so the next request in the queue starts.
 - With `--parallel N`, `--ctx` is per slot: N slots of 32K need N times the KV memory of one.
+- `--max-per-key N` caps the requests one customer key may have open at once (read, generated or queued); more get
+  `429 Too Many Requests` with `Retry-After: 1` and the OpenAI error type `rate_limit_error`, which the OpenAI and
+  Anthropic SDKs retry. The admin key is not counted. Set it below `--max-waiting`, so that one customer cannot fill
+  the whole queue and leave the others with `503`.
 
 ## Several GPUs
 
@@ -368,6 +372,7 @@ keeps its last conversation. For many users on cards that each fit the model, on
 - [ ] The proxy streams without buffering and has a long read timeout.
 - [ ] `--max-tokens` and `--ctx` fit your price list and your GPU memory (times `--parallel`).
 - [ ] `--parallel` set for the number of users you expect at once (4 for the most total speed).
+- [ ] `--max-per-key` below `--max-waiting`, so one customer cannot fill the queue.
 - [ ] `--usage-log` is on and rotated.
-- [ ] `/health` is monitored, and systemd restarts the server on failure.
+- [ ] `/health` (or `/metrics`) is monitored, and systemd restarts the server on failure.
 - [ ] `strata calibrate` ran on this machine as the service user.

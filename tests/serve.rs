@@ -288,3 +288,17 @@ fn keys_file_and_access() {
     let only_users = Keys { admin: None, users: k.users.clone() };
     assert_eq!(only_users.who(""), None, "customer keys alone close the server to keyless requests");
 }
+
+#[test]
+fn per_key_holds() {
+    use rusting_strata::serve::{Hold, Open};
+    let open = Open::default();
+    let (a, b) = (Hold::take(&open, 7, 2), Hold::take(&open, 7, 2));
+    assert!(a.is_some() && b.is_some() && Hold::take(&open, 7, 2).is_none());
+    assert!(Hold::take(&open, 8, 2).is_some(), "another key has its own count");
+    drop(a);
+    let c = Hold::take(&open, 7, 2);
+    assert!(c.is_some());
+    drop((b, c));
+    assert!(open.lock().unwrap().is_empty());
+}
