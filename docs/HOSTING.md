@@ -325,6 +325,8 @@ With `--usage-log FILE`, every chat request that reaches the model adds one JSON
 - `key`: the key's name from the key file (`admin` for the admin key, empty on a server without keys).
 - `prompt_tokens`: all prompt tokens. `cached_tokens` of them came from the conversation cache and were not prefilled
   again; many providers bill them at a lower price.
+- `prefill_ms`: from when the model takes the request until its prompt is read (the wait in the queue, or for a
+  slot under `--parallel`, is not included); `decode_ms`: the reply after that.
 - `completion_tokens`: reply tokens. `finish` is `stop`, `length` (hit `max_tokens` or the context) or `tool_calls`.
 - `finish` is `cut` when the client closed the connection before the end. `completion_tokens` then counts the
   tokens decoded so far: a stream has sent nearly all of them, a reply without `stream` has sent none. `error` is a
