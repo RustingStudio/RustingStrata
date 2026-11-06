@@ -317,8 +317,8 @@ With `--usage-log FILE`, every chat request that reaches the model adds one JSON
   request that failed on the server; it got a `500` or a stream that stopped.
 
 Requests refused before the model (bad key, bad JSON, a prompt that fills the context, `503`, `429`) and requests
-whose client left while they waited in the queue are not logged. Tokens
-per key and day, without failed requests:
+whose client left while they waited in the queue are not logged. A client that leaves once its prefill has started
+is logged as `cut`, with all its prompt tokens. Tokens per key and day, without failed requests:
 
 ```sh
 jq -r 'select(.finish != "error") | [(.at | strftime("%Y-%m-%d")), .key, .prompt_tokens - .cached_tokens, .cached_tokens, .completion_tokens] | @tsv' usage.jsonl \
