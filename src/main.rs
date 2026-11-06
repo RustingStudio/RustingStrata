@@ -668,8 +668,19 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         (v["system"], v["uptime_s"]) = (serve::system(), t0.elapsed().as_secs().into());
                         return reply(v, "200 OK");
                     }
+                    // A malformed request or a wrong key is refused here, not in the queue, where without `--parallel` it
+                    // would wait for the reply being generated (`handle` checks again: the keys may change meanwhile).
+                    let who = q.as_ref().ok().and_then(|r| k.read().unwrap().who(&r.auth));
+                    match &q {
+                        Err(e) => {
+                            eprintln!("request {i}: {e:#}");
+                            return reply(json!({"error": {"message": format!("{e:#}"), "type": "invalid_request_error"}}), "400 Bad Request");
+                        }
+                        Ok(r) if who.is_none() && !(r.method == "GET" && r.path == "/") =>
+                            return reply(json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}}), "401 Unauthorized"),
+                        _ => {}
+                    }
                     // A customer key over `--max-per-key` is refused here, before it takes a place in the queue.
-                    let who = q.as_ref().ok().filter(|_| per_key.is_some()).and_then(|r| k.read().unwrap().who(&r.auth));
                     let hold = match (who, per_key) {
                         (Some(w), Some(cap)) if !w.admin => match serve::Hold::take(&held, w.id, cap) {
                             Some(h) => Some(h),
