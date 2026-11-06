@@ -86,3 +86,31 @@ fn glsl_tables_are_fresh() {
     if std::env::var_os("STRATA_WRITE_TABLES").is_some() { std::fs::write(path, &want).unwrap(); }
     assert!(std::fs::read_to_string(path).unwrap_or_default() == want, "{path} is stale: rerun with STRATA_WRITE_TABLES=1");
 }
+
+#[test]
+fn batched_quantized_gemm_uses_prepared_x() {
+    use rusting_strata::backend::SAME_X;
+    use rusting_strata::quant::GgmlType;
+    use rusting_strata::weights::Tensor;
+
+    let data = include_bytes!("fixtures/Q4_K.raw").repeat(8);
+    let weight = Tensor { ty: GgmlType::Q4K, cols: 256, rows: 64, data: &data };
+    assert_eq!(data.len(), weight.ty.row_bytes(256) * 64);
+    let n = 128;
+    let input: Vec<f32> = (0..n * 256).map(|i| (i % 127) as f32 / 63.0 - 1.0).collect();
+    for (backend, gpu) in common::backends() {
+        let weight = gpu.upload(&weight).unwrap();
+        let x = common::up(&*gpu, &input);
+        let y = gpu.zeros::<f32>(n * 64).unwrap();
+        gpu.prequant_gemm_x(&weight, n, x.addr(), 256).unwrap();
+        gpu.batch(&mut || gpu.gemm_dense(&weight, n, x.addr(), 256, y.addr(), 64, SAME_X)).unwrap();
+        let got = common::down::<f32>(&*gpu, &y);
+
+        let expected = gpu.zeros::<f32>(n * 64).unwrap();
+        gpu.gemm_dense(&weight, n, x.addr(), 256, expected.addr(), 64, 0).unwrap();
+        let expected = common::down::<f32>(&*gpu, &expected);
+        assert!(got.iter().any(|v| v.abs() > 1e-5), "{backend}: empty GEMM result");
+        assert!(got.iter().zip(&expected).all(|(a, b)| a.is_finite() && (a - b).abs() < 1e-4),
+            "{backend}: batched result differs from non-batched GEMM");
+    }
+}

@@ -251,6 +251,7 @@ impl GpuModel<'_> {
                     probe(&mut tr, "beta", &pf.slab, eb, nv, t)?;
                     probe(&mut tr, "alpha", &pf.slab, eg, nv, t)?;
                     // The z GEMM runs beside the scan, on the SMs its last wave of blocks leaves idle.
+                    g.prequant_gemm_x(gate, t, h, ne)?;
                     g.batch(&mut || {
                         g.deltanet(at(l.c), s.addr(), eb, eg, 0, 0, at(l.d), nk, nv, c.k_interleave, dk, dv, 1.0 / (dk as f32).sqrt(), t, channels, 0, 0)?;
                         g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, SAME_X)
