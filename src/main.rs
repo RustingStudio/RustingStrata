@@ -1170,7 +1170,8 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let (t0, mut t1) = (Instant::now(), Instant::now());
             {
                 let mut st = s.stats.lock().unwrap();
-                (st.busy, st.live_tokens) = (true, 0);
+                if st.busy == 0 { st.live_tokens = 0; }
+                st.busy += 1;
             }
             let res = (|| -> anyhow::Result<(Vec<u32>, bool)> {
                 let logits;
@@ -1201,7 +1202,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             })();
             {
                 let mut st = s.stats.lock().unwrap();
-                st.busy = false;
+                st.busy -= 1;
                 gpu_stats(r, &mut st);
             }
             let decoded = t1.elapsed();
