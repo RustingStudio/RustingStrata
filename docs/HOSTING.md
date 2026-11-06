@@ -34,6 +34,11 @@ requests sent at once:
 
 A request alone on a `--parallel 4` server decodes at 105 tok/s (106 with `--parallel 1`).
 
+The gain is smaller for a model whose experts mostly do not fit in VRAM, because the requests in a pass route to
+different experts and the CPU computes the missing ones for each. Qwen3-Next-80B-A3B IQ1_S on the same 3060 (9199
+of 24576 experts resident with 4 slots), 4 requests: 56.5 tok/s with `--parallel 1`, 77.5 tok/s with
+`--parallel 4`.
+
 What changes with `--parallel N`:
 
 - **Memory.** `--ctx` is the context of each slot, so the KV cache and the recurrent state take N times the memory
