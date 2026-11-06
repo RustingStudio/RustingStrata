@@ -124,8 +124,18 @@ chunk.
   Keep it for yourself.
 - **Customer keys** (`--api-keys FILE`). One `name key` pair a line, `#` starts a comment. Keys must be at least 16
   characters, and names and keys must not repeat. A customer key reaches only `POST /v1/chat/completions`,
-  `POST /v1/messages` and `GET /v1/models`; other routes answer `403`. The name goes into the usage log. The file is
-  read at start, so restart the server after you change it.
+  `POST /v1/messages` and `GET /v1/models`; other routes answer `403`. The name goes into the usage log.
+- **Changing the key file.** The server reads the file again when it changes, and the next request uses the new
+  keys; replies being generated go on. A file that does not parse, or one with no keys, keeps the old keys (the
+  server log says why). Write a new file and rename it over the old one, so that the server never reads it half
+  written:
+
+  ```sh
+  sudo sh -c 'cp /etc/strata/keys.txt /etc/strata/keys.new && echo "gamma $(openssl rand -hex 24)" >> /etc/strata/keys.new \
+      && chmod 600 /etc/strata/keys.new && mv /etc/strata/keys.new /etc/strata/keys.txt'
+  ```
+
+  A removed key gets `401` from its next request on. A key that stays keeps its cached conversations, even when its line moves.
 - With customer keys and no admin key, nobody can use the admin routes.
 - With no key at all the server is open to anyone who reaches it. That is meant for a local machine only.
 

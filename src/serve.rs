@@ -105,7 +105,13 @@ impl Keys {
     pub fn who(&self, auth: &str) -> Option<Who> {
         if !self.any() { return Some(Who { name: String::new(), id: 0, admin: true }); }
         if self.admin.as_deref().is_some_and(|k| key_ok(auth, k)) { return Some(Who { name: "admin".into(), id: 0, admin: true }); }
-        self.users.iter().position(|(_, k)| key_ok(auth, k)).map(|i| Who { name: self.users[i].0.clone(), id: i as u64 + 1, admin: false })
+        // The id comes from the key, not its line, so a reloaded file with other lines gives no key another's id.
+        self.users.iter().find(|(_, k)| key_ok(auth, k)).map(|(n, k)| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::hash::DefaultHasher::new();
+            k.hash(&mut h);
+            Who { name: n.clone(), id: h.finish().max(1), admin: false }
+        })
     }
 }
 
