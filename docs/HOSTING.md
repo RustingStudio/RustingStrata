@@ -124,7 +124,7 @@ chunk.
   Keep it for yourself.
 - **Customer keys** (`--api-keys FILE`). One `name key` pair a line, `#` starts a comment. Keys must be at least 16
   characters, and names and keys must not repeat. A customer key reaches only `POST /v1/chat/completions`,
-  `POST /v1/messages` and `GET /v1/models`; other routes answer `403`. The name goes into the usage log.
+  `POST /v1/messages`, `POST /v1/messages/count_tokens` and `GET /v1/models`; other routes answer `403`. The name goes into the usage log.
 - **Changing the key file.** The server reads the file again when it changes, and the next request uses the new
   keys; replies being generated go on. A file that does not parse, or one with no keys, keeps the old keys (the
   server log says why). Write a new file and rename it over the old one, so that the server never reads it half
