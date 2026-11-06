@@ -18,8 +18,9 @@ all users of one server. Long prompts block the queue for their prefill time (ab
 ### Several requests at once: `--parallel`
 
 `--parallel N` keeps N conversations in GPU memory and decodes them together: the requests that are decoding share
-each forward pass, up to 4 at a time. A forward pass reads the same expert weights for every request in it, so 4
-requests cost little more than one.
+each forward pass, up to 4 at a time. A pass reads the attention, recurrent and shared-expert weights once for all
+its requests; only the routed experts each request picks are read per request. On the RTX 3060 below, a pass takes
+10.6 ms for one request, 15.3 ms for 2 and 25 ms for 4.
 
 Measured on the RTX 3060 with Qwen3.6-35B-A3B Q2_K_XL, `--ctx 4096`, short prompts and 200-token replies, all
 requests sent at once:
@@ -277,6 +278,22 @@ sends `SIGKILL` after `TimeoutStopSec`; Ctrl+C still stops at once. On Windows t
 - `503 {"status": "loading"}` or `503 {"status": "no model"}` otherwise.
 
 Point the load balancer or your monitoring at it.
+
+`GET /metrics` gives the same numbers and more in Prometheus text format: `strata_up`, `strata_slots`,
+`strata_busy`, `strata_waiting`, `strata_requests_total`, `strata_prompt_tokens_total`,
+`strata_cached_prompt_tokens_total`, `strata_completion_tokens_total`, `strata_vram_used_bytes` /
+`strata_vram_total_bytes` and, for MoE models, `strata_expert_hits_total` / `strata_expert_misses_total`
+(these two restart at each model load). Like `/api/stats` it needs the admin key, and it is answered while a
+reply is generated:
+
+```yaml
+scrape_configs:
+  - job_name: strata
+    authorization:
+      credentials: sk-admin-...   # the --api-key value
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+```
 
 ## Usage log and billing
 
