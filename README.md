@@ -92,7 +92,8 @@ STRATA_API_KEY=secret target/release/strata serve --model $M --gpu --addr 127.0.
 ```
 
 `serve` speaks the OpenAI chat completions API (`POST /v1/chat/completions`, streamed or not, `GET /v1/models`).
-It runs one request at a time. `temperature`, `top_k`, `top_p` and `seed` are honored, and decoding is greedy when
+It runs one request at a time; `--parallel N` (one unsplit GPU) lets N replies take turns, each at about 1/N the
+speed of a single one, with MTP off. `temperature`, `top_k`, `top_p` and `seed` are honored, and decoding is greedy when
 they are left out. When a request repeats the previous request's messages and adds new ones, only the new part is
 prefilled (`usage.prompt_tokens_details.cached_tokens`). `tools` and `tool_choice` work as in the OpenAI API (calls
 come back as `tool_calls` with `finish_reason: "tool_calls"`). The prompt follows the model's own chat template,

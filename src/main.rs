@@ -6,7 +6,7 @@ use rusting_strata::{config::ModelConfig, gguf::Gguf, hf, ops, ops::Sampler, qua
 use rusting_strata::chat::{Hold, Msg, Template};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::{collections::BTreeMap, net::{TcpListener, TcpStream}, sync::atomic::Ordering::Relaxed, path::{Path, PathBuf}, time::{Duration, Instant, SystemTime}};
+use std::{collections::{BTreeMap, VecDeque}, net::{TcpListener, TcpStream}, sync::atomic::Ordering::Relaxed, path::{Path, PathBuf}, time::{Duration, Instant, SystemTime}};
 
 #[derive(Parser)]
 #[command(name = "strata", version, about = "Rust inference engine for Qwen3.5/3.6-family GGUF models")]
@@ -82,9 +82,13 @@ struct Engine {
     /// Prompts shorter than this skip the batched prefill (from `strata calibrate`, else 32).
     #[arg(skip)]
     short: usize,
-    /// Run on the CPU when no GPU backend opens (the bare `strata` launch).
+    /// Run on the GPU when no GPU backend opens (the bare `strata` launch).
     #[arg(skip)]
     cpu_fallback: bool,
+    /// Generate up to N replies at the same time on one GPU (sequences take turns every 8 tokens, each at roughly
+    /// 1/N the speed of a single reply; MTP is off and a split model falls back to one at a time).
+    #[arg(long, default_value_t = 1)]
+    parallel: usize,
 }
 
 enum Runner<'a> { Cpu(&'a Model<'a>, State), Gpu(Box<GpuModel<'a>>) }
@@ -164,7 +168,11 @@ impl Engine {
         if let Some(n) = self.threads.or(get("threads")) { let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global(); }
         let Some(bk) = bk else { return Ok(Runner::Cpu(m, State::new(&m.cfg))) };
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
-        let mut g = GpuModel::load_split(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp()).context(LOAD_HINT)?;
+        // A parked sequence does not carry the MTP draft state, so concurrent replies decode without it.
+        if self.parallel > 1 {
+            if self.mtp() > 0 { eprintln!("--parallel > 1: MTP is off while replies take turns"); }
+            self.mtp = Some(0);
+        }        let mut g = GpuModel::load_split(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp()).context(LOAD_HINT)?;
         g.short = self.short;
         g.cache_ram = self.cache_ram << 20;
         if self.mtp() > 0 && g.k == 0 {
@@ -739,6 +747,13 @@ impl Serving {
     /// Answers requests until one asks for a model to be loaded; returns its path and connection (None once the
     /// listener is gone).
     fn serve(&self, mut l: Option<&mut Loaded>, e: &Engine) -> Option<(PathBuf, TcpStream)> {
+        // Concurrent replies need one unsplit GPU model: its sequences take turns and park their state between turns.
+        if e.parallel > 1
+            && let Some(ld) = l.as_deref_mut()
+            && matches!(&ld.r, Runner::Gpu(g) if g.parts().count() == 1)
+        {
+            return self.serve_parallel(ld, e);
+        }
         for (c, q, i) in &self.rx {
             let mut next = None;
             let res = handle(c, q, l.as_deref_mut(), e, self, i, &mut next);
@@ -748,9 +763,70 @@ impl Serving {
         }
         None
     }
+
+    /// `serve` for `--parallel N`: chat replies keep a parked state and take turns, so N streams progress at once.
+    /// Everything else is answered as in the serial loop; a model load waits for the running replies (409).
+    fn serve_parallel(&self, l: &mut Loaded, e: &Engine) -> Option<(PathBuf, TcpStream)> {
+        let mut jobs: Vec<ChatJob> = Vec::new();
+        let mut pending: VecDeque<(TcpStream, anyhow::Result<serve::Request>, usize)> = VecDeque::new();
+        loop {
+            // Fill free slots from the queue first.
+            while jobs.len() < e.parallel {
+                let Some((c, q, i)) = pending.pop_front() else { break };
+                match ChatJob::start(c, q, &mut *l, e, self, i) {
+                    Ok(Some(j)) => jobs.push(j),
+                    Ok(None) => {}
+                    Err(err) => eprintln!("request {i}: {err:#}"),
+                }
+            }
+            let msg = if jobs.is_empty() && pending.is_empty() {
+                match self.rx.recv() { Ok(m) => Some(m), Err(_) => return None }
+            } else {
+                self.rx.try_recv().ok()
+            };
+            if let Some((c, q, i)) = msg {
+                let is_chat = match &q {
+                    Ok(r) => r.method == "POST" && matches!(r.path.split('?').next(), Some("/v1/chat/completions" | "/v1/messages")),
+                    Err(_) => true,
+                };
+                if is_chat {
+                    if jobs.len() < e.parallel {
+                        match ChatJob::start(c, q, &mut *l, e, self, i) {
+                            Ok(Some(j)) => jobs.push(j),
+                            Ok(None) => {}
+                            Err(err) => eprintln!("request {i}: {err:#}"),
+                        }
+                    } else {
+                        pending.push_back((c, q, i));
+                    }
+                } else {
+                    let load = q.as_ref().ok().is_some_and(|r| r.method == "POST" && r.path.split('?').next() == Some("/api/load"));
+                    if load && !jobs.is_empty() {
+                        let mut c = c;
+                        let _ = reply(&mut c, "409 Conflict", json!({"error": {"message": "replies are running; load the model when they finish", "type": "conflict"}}));
+                    } else {
+                        let mut next = None;
+                        if let Err(err) = handle(c, q, Some(&mut *l), e, self, i, &mut next) { eprintln!("request {i}: {err:#}"); }
+                        if let Some(n) = next { return Some(n); }
+                    }
+                }
+                self.waiting.fetch_sub(1, Relaxed);
+            }
+            if jobs.is_empty() { continue; }
+            for j in jobs.iter_mut() {
+                if let Err(err) = j.quantum(&mut *l, self, PAR_QUANTUM) { eprintln!("request {}: {err:#}", j.i); j.done = true; }
+            }
+            jobs.retain(|j| !j.done);
+            {
+                let mut st = self.stats.lock().unwrap();
+                st.busy = !jobs.is_empty();
+                gpu_stats(&l.r, &mut st);
+            }
+        }
+    }
+
     /// The models the page offers: the models folder, then --model if it is elsewhere.
-    fn models(&self) -> Vec<(String, PathBuf, u64)> {
-        let mut v = serve::list_models(&self.dir);
+    fn models(&self) -> Vec<(String, PathBuf, u64)> {        let mut v = serve::list_models(&self.dir);
         if let Some(p) = self.model.as_ref().filter(|p| !v.iter().any(|x| &x.1 == *p)) {
             v.push((p.display().to_string(), p.clone(), std::fs::metadata(p).map_or(0, |m| m.len())));
         }
@@ -1020,3 +1096,238 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
         _ => send(&mut w, "404 Not Found", json!({"error": {"message": format!("no route {method} {path}"), "type": "not_found"}})),
     }
 }
+
+// ---- concurrent replies: up to --parallel sequences take turns on the one model ----
+// A parked sequence keeps its KV and recurrent state in host memory (`GpuModel::park_current`); the loop lets each
+// one generate PAR_QUANTUM tokens, then hands the model to the next. Measured on a 2060 with 4 sequences: quantum 1
+// loses half the aggregate throughput to the state copies, quantum 8 is within a few percent of generating one reply
+// at a time, so every stream runs at about 1/4 speed instead of 1/8.
+
+/// Tokens a concurrent reply generates before the next one takes the model.
+const PAR_QUANTUM: usize = 8;
+
+fn reply(w: &mut TcpStream, status: &str, v: serde_json::Value) -> anyhow::Result<()> {
+    let b = v.to_string();
+    Ok(write!(w, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len())?)
+}
+
+fn chunk_json(id: &str, created: u64, name: &str, delta: serde_json::Value, finish: Option<&str>) -> serde_json::Value {
+    json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": name,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+}
+
+/// One reply driven a quantum at a time by `Serving::serve_parallel`: the prompt is prefilled and parked when the
+/// request arrives, then each quantum adopts the state, generates a few tokens and parks it again.
+struct ChatJob {
+    w: TcpStream,
+    i: usize,
+    anth: bool,
+    req: serve::ChatRequest,
+    tools: bool,
+    /// Model history: the prompt, then every generated token fed back.
+    ids: Vec<u32>,
+    out: Vec<u32>,
+    /// `out[..start]` is already decoded and pushed through `hold`.
+    start: usize,
+    /// Greedy: the next token `step_greedy` already picked; sampling: the logits of the current state.
+    ahead: Option<u32>,
+    logits: Vec<f32>,
+    smp: Sampler,
+    eos: Vec<u32>,
+    n: usize,
+    hold: Hold,
+    opened: bool,
+    text: String,
+    id: String,
+    created: u64,
+    name: String,
+    prompt_tokens: usize,
+    cached: usize,
+    n_system: usize,
+    t0: Instant,
+    t1: Instant,
+    stop: bool,
+    done: bool,
+}
+
+impl ChatJob {
+    fn start(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: &mut Loaded, e: &Engine, s: &Serving, i: usize) -> anyhow::Result<Option<ChatJob>> {
+        let serve::Request { method, path, host, auth, json, body } = match q {
+            Ok(r) => r,
+            Err(err) => {
+                let _ = reply(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}}));
+                return Err(err);
+            }
+        };
+        if !serve::host_ok(&host, &s.addr) { let _ = reply(&mut w, "403 Forbidden", json!({"error": {"message": "bad Host header", "type": "forbidden"}})); return Ok(None); }
+        if s.key.as_deref().is_some_and(|k| !serve::key_ok(&auth, k)) { let _ = reply(&mut w, "401 Unauthorized", json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}})); return Ok(None); }
+        if method != "POST" || !json { let _ = reply(&mut w, "415 Unsupported Media Type", json!({"error": {"message": "Content-Type must be application/json", "type": "invalid_request_error"}})); return Ok(None); }
+        let anth = path.split('?').next() == Some("/v1/messages");
+        let req = match (if anth { serve::messages_body(&body) } else { Ok(body) }).and_then(|b| serve::chat_request(&b)) {
+            Ok(q) => q,
+            Err(err) => { let _ = reply(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})); return Ok(None); }
+        };
+        let created = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+        let preserve = req.preserve_thinking.unwrap_or(e.preserve_thinking);
+        let prompt = l.tpl.render(&req.messages, &req.tools, req.think, preserve, true);
+        let n_sys = req.messages.iter().take_while(|m| m.role == "system").count();
+        let system = l.tpl.render(&req.messages[..n_sys], &req.tools, req.think, preserve, false);
+        let n_system = l.tok.encode(&system)?.len();
+        let ids = l.tok.encode(&prompt)?;
+        let mut smp = e.sampler();
+        smp.temp = req.temperature.unwrap_or(smp.temp);
+        smp.top_k = req.top_k.unwrap_or(smp.top_k);
+        smp.top_p = req.top_p.unwrap_or(smp.top_p);
+        if req.seed.is_some() { smp.rng = seed(req.seed); }
+        let n = room(e, ids.len(), req.max_tokens.unwrap_or(usize::MAX));
+        if n == 0 {
+            let _ = reply(&mut w, "400 Bad Request", json!({"error": {"message": format!("prompt of {} tokens fills the context", ids.len()), "type": "invalid_request_error"}}));
+            return Ok(None);
+        }
+        let name = l.name.clone();
+        let id = format!("chatcmpl-{i}");
+        let tools = req.tool_calls && !req.tools.is_empty();
+        let prompt_tokens = ids.len();
+        let req_stop = req.stop.clone();
+        let t0 = Instant::now();
+        // Prefill before the first byte goes out, as the serial path does; the state is parked so another sequence
+        // can run before this one's first quantum.
+        let (logits, cached, t1) = {
+            let Loaded { r, tok, tpl, .. } = l;
+            let history = tpl.render(&req.messages, &req.tools, req.think, preserve, false);
+            let (_, logits, reused) = r.chat(tok, &prompt, &history, &system)?;
+            let t1 = Instant::now();
+            if req.stream {
+                write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
+                if anth {
+                    sse(&mut w, json!({"type": "message_start", "message": {"id": format!("msg_{i}"), "type": "message", "role": "assistant", "model": name,
+                        "content": [], "stop_reason": null, "stop_sequence": null,
+                        "usage": {"input_tokens": ids.len() - reused, "cache_read_input_tokens": reused, "output_tokens": 0}}}))?;
+                } else {
+                    write!(w, "data: {}\n\n", chunk_json(&id, created, &name, json!({"role": "assistant", "content": ""}), None))?;
+                }
+            }
+            if let Runner::Gpu(g) = r {
+                g.clear_stash();
+                g.park_current(&ids)?;
+            }
+            (logits, reused, t1)
+        };
+        Ok(Some(ChatJob { w, i, anth, req, tools, ids, out: Vec::new(), start: 0, ahead: None, logits, smp,
+            eos: l.tok.eos_ids(), n, hold: Hold::new(tools, req_stop), opened: false, text: String::new(), id, created,
+            name, prompt_tokens, cached, n_system, t0, t1, stop: false, done: false }))
+    }
+
+    /// Generate up to `q` tokens for this reply, then park its state for the next one.
+    fn quantum(&mut self, l: &mut Loaded, s: &Serving, q: usize) -> anyhow::Result<()> {
+        if self.done { return Ok(()); }
+        let Loaded { r, tok, tpl, name, .. } = l;
+        let Runner::Gpu(g) = r else { anyhow::bail!("parallel replies need one unsplit GPU model") };
+        g.adopt(&self.ids)?;
+        let mut emitted = 0;
+        for _ in 0..q {
+            if self.out.len() >= self.n { self.done = true; break; }
+            let next = match self.ahead.take() {
+                Some(t) => t,
+                None if self.smp.temp <= 0.0 => ops::argmax(&self.logits) as u32,
+                None => self.smp.pick(&self.logits)? as u32,
+            };
+            if self.eos.contains(&next) { self.stop = true; self.done = true; break; }
+            if self.smp.temp <= 0.0 {
+                self.ahead = Some(g.step_greedy(next)?);
+            } else {
+                self.logits = g.step(next)?;
+            }
+            self.out.push(next);
+            self.ids.push(next);
+            emitted += 1;
+            let piece = tok.decode(&self.out[self.start..])?;
+            // A partial UTF-8 sequence at the end waits for the next token.
+            if !piece.ends_with('\u{fffd}') {
+                let text = self.hold.push(&piece).to_string();
+                self.text.push_str(&text);
+                self.start = self.out.len();
+                if self.hold.stopped { self.stop = true; self.done = true; break; }
+            }
+        }
+        g.park_current(&self.ids)?;
+        if emitted > 0 { s.stats.lock().unwrap().live_tokens += emitted; }
+        if self.req.stream && !self.text.is_empty() {
+            let text = std::mem::take(&mut self.text);
+            if self.anth {
+                text_delta(&mut self.w, &mut self.opened, &text)?;
+            } else {
+                let c = chunk_json(&self.id, self.created, &self.name, json!({"content": text}), None);
+                write!(self.w, "data: {c}\n\n")?;
+            }
+        }
+        if self.done { self.finish(tpl, name, s)?; }
+        Ok(())
+    }
+
+    fn finish(&mut self, tpl: &Template, name: &str, s: &Serving) -> anyhow::Result<()> {
+        let t2 = Instant::now();
+        let calls = if self.tools { tpl.parse_calls(&self.hold.text, &self.req.tools) } else { None };
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        s.stats.lock().unwrap().record(serve::Last { at: self.created, model: name.into(), system_tokens: self.n_system,
+            cached_tokens: self.cached, prompt_tokens: self.prompt_tokens, completion_tokens: self.out.len(),
+            prefill_ms: ms(self.t1 - self.t0), decode_ms: ms(t2 - self.t1),
+            finish: if calls.is_some() { "tool_calls" } else if self.stop { "stop" } else { "length" }.into() });
+        let i = self.i;
+        let calls_json = |(content, calls): &(String, Vec<(String, String)>), stream: bool| {
+            let c: Vec<_> = calls.iter().enumerate().map(|(k, (f, a))| {
+                let mut c = json!({"id": format!("call_{i}_{k}"), "type": "function", "function": {"name": f, "arguments": a}});
+                if stream { c["index"] = k.into(); }
+                c
+            }).collect();
+            if stream { json!({"tool_calls": c}) }
+            else { json!({"role": "assistant", "content": if content.is_empty() { None } else { Some(content) }, "tool_calls": c}) }
+        };
+        if self.anth {
+            let reason = if calls.is_some() { "tool_use" } else if self.stop { "end_turn" } else { "max_tokens" };
+            let usage = json!({"input_tokens": self.prompt_tokens - self.cached, "cache_read_input_tokens": self.cached, "cache_creation_input_tokens": 0, "output_tokens": self.out.len()});
+            let uses: Vec<_> = calls.iter().flat_map(|c| &c.1).enumerate().map(|(k, (f, a))| json!({"type": "tool_use", "id": format!("toolu_{i}_{k}"),
+                "name": f, "input": serde_json::from_str::<serde_json::Value>(a).unwrap_or(json!({}))})).collect();
+            if !self.req.stream {
+                let text = calls.as_ref().map_or(&self.hold.text, |c| &c.0);
+                let content: Vec<_> = (!text.is_empty()).then(|| json!({"type": "text", "text": text})).into_iter().chain(uses).collect();
+                return reply(&mut self.w, "200 OK", json!({"id": format!("msg_{i}"), "type": "message", "role": "assistant", "model": name, "content": content,
+                    "stop_reason": reason, "stop_sequence": null, "usage": usage}));
+            }
+            if calls.is_none() && !self.hold.rest().is_empty() { text_delta(&mut self.w, &mut self.opened, self.hold.rest())?; }
+            if self.opened { sse(&mut self.w, json!({"type": "content_block_stop", "index": 0}))?; }
+            for (k, u) in uses.iter().enumerate() {
+                let (index, input) = (k + self.opened as usize, u["input"].to_string());
+                let mut start = u.clone();
+                start["input"] = json!({});
+                sse(&mut self.w, json!({"type": "content_block_start", "index": index, "content_block": start}))?;
+                sse(&mut self.w, json!({"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": input}}))?;
+                sse(&mut self.w, json!({"type": "content_block_stop", "index": index}))?;
+            }
+            sse(&mut self.w, json!({"type": "message_delta", "delta": {"stop_reason": reason, "stop_sequence": null}, "usage": {"output_tokens": self.out.len()}}))?;
+            return sse(&mut self.w, json!({"type": "message_stop"}));
+        }
+        let finish = if calls.is_some() { "tool_calls" } else if self.stop { "stop" } else { "length" };
+        let usage = json!({"prompt_tokens": self.prompt_tokens, "completion_tokens": self.out.len(), "total_tokens": self.prompt_tokens + self.out.len(),
+            "prompt_tokens_details": {"cached_tokens": self.cached}});
+        if self.req.stream {
+            match &calls {
+                Some(c) => { let v = calls_json(c, true); write!(self.w, "data: {v}\n\n")?; }
+                None if !self.hold.rest().is_empty() => {
+                    let v = chunk_json(&self.id, self.created, &self.name, json!({"content": self.hold.rest()}), None);
+                    write!(self.w, "data: {v}\n\n")?;
+                }
+                None => {}
+            }
+            let mut last = chunk_json(&self.id, self.created, &self.name, json!({}), Some(finish));
+            last["usage"] = usage;
+            write!(self.w, "data: {last}\n\ndata: [DONE]\n\n")?;
+        } else {
+            let message = match &calls { Some(c) => calls_json(c, false), None => json!({"role": "assistant", "content": &self.hold.text}) };
+            reply(&mut self.w, "200 OK", json!({"id": self.id, "object": "chat.completion", "created": self.created, "model": self.name,
+                "choices": [{"index": 0, "message": message, "finish_reason": finish}], "usage": usage}))?;
+        }
+        Ok(())
+    }
+}
+

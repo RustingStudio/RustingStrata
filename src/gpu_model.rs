@@ -548,9 +548,31 @@ impl<'a> GpuModel<'a> {
         self.restore_state()
     }
 
+    /// Park the sequence whose state the model holds now (`ids`: the tokens it has seen), so another one can run.
+    /// `adopt` takes it back; the model is left at no sequence (a later `park` is a no-op).
+    pub fn park_current(&mut self, ids: &[u32]) -> anyhow::Result<()> {
+        anyhow::ensure!(self.next.is_none(), "park_current: split model");
+        self.save_state()?;
+        self.saved_ids = ids.to_vec();
+        self.park()?;
+        let ok = self.parked.first().is_some_and(|p| p.ids == ids);
+        self.saved_ids.clear();
+        anyhow::ensure!(ok, "park_current: state of {} tokens not parked (cache_ram?)", ids.len());
+        Ok(())
+    }
+
+    /// Make the parked state of `ids` the current one again.
+    pub fn adopt(&mut self, ids: &[u32]) -> anyhow::Result<()> {
+        let i = self.parked.iter().position(|p| p.ids == ids)
+            .ok_or_else(|| anyhow::anyhow!("adopt: no parked state of {} tokens", ids.len()))?;
+        self.unpark(i)
+    }
+
+    /// Forget the system-prompt stash: its KV rows are not guaranteed while several sequences share the cache.
+    pub fn clear_stash(&mut self) { self.sys = None; }
+
     /// Return to the state of the last `stash`, which also becomes the saved state.
-    pub fn unstash(&mut self) -> anyhow::Result<()> {
-        let mut p = Some(&mut *self);
+    pub fn unstash(&mut self) -> anyhow::Result<()> {        let mut p = Some(&mut *self);
         while let Some(q) = p {
             let s = q.sys.as_ref().ok_or_else(|| anyhow::anyhow!("unstash without stash"))?;
             for (b, d) in q.slot().iter().zip(&s.0) { q.gpu.put(d, b, 0)?; }
