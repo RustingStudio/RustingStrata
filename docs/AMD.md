@@ -4,7 +4,7 @@ All benchmarks in the README were run on an NVIDIA RTX 3060. AMD GPUs run the Vu
 (`--backend vulkan`), and everything known about them comes from user reports (RX 9070 XT on Linux with RADV, and on
 Windows with AMD's driver). Expect problems; this page lists the known ones and what to send when you hit a new one.
 
-Needs RDNA or newer (older AMD GPUs lack subgroup size 32) and a Vulkan 1.3 driver.
+Needs a Vulkan 1.3 driver and subgroup size 32 or a fixed subgroup size 64. The wave64 path has also been tested on Radeon VII (Vega 20) with RADV Mesa 26.0.8. Qwen3 dense decode on wave64 uses unquantized activations for accuracy and can be slower than the int8 path. Batched prefill still uses quantized activations; `--chunk 0` uses token-by-token prefill when closer agreement with the CPU reference matters more than prompt processing speed.
 
 ## First line of the output
 

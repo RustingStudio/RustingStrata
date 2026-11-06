@@ -1046,6 +1046,14 @@ impl Backend for Vk {
     fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
         self.gemm_raw(w.ty, w.rows, w.cols, 0, n.div_ceil(128), w.ptr, n, x, x_stride, n, 0, y, y_stride, act)
     }
+    fn accurate_dense_layer(&self) -> bool { self.0.wave64 }
+    fn gemv_unquantized(&self, w: &GpuTensor, x: u64, xs: usize, y: u64, ys: usize, nt: usize) -> anyhow::Result<()> {
+        ensure!((1..=4).contains(&nt), "gemvn: {nt} inputs (1 to 4)");
+        let nc = gemv_cols(self.0.llama, w.ty, w.cols)?;
+        let wpb = if w.rows >= 4096 { 8 } else { 1 };
+        let spec = [&self.wspec(w.ty)[..], &[nt as u32, 32 * wpb as u32]].concat();
+        self.run("gemv_f", &spec, [w.rows.div_ceil(wpb), 1, 1], &[&w.ptr, &x, &y, &(xs as u32), &(ys as u32), &nc, &(w.rows as u32)])
+    }
     fn gemv(&self, w: &GpuTensor, x: u64, y: u64) -> anyhow::Result<()> { self.gemvq(w, x, 0, 0, y, 0, 1) }
     fn gemvn(&self, w: &GpuTensor, x: u64, x_stride: usize, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
         self.gemvq(w, x, x_stride, 0, y, y_stride, nt)
