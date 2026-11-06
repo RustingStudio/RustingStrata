@@ -211,6 +211,9 @@ Il coordinatore può sempre: leggere file/issue/PR, `git log/diff/status`,
 `gh issue/pr view`, e fermare/riavviare la GPU di produzione **solo** per i
 test previsti dal piano della issue.
 
+Tutti i comandi GitHub usano `--repo TheBrutalX/RustingStrata` (il fork ha un
+tracker separato da upstream; `gh repo set-default` è già impostato).
+
 ### Prompt di lancio (riferimento)
 
 - Analyst: *"Analizza il task `<titolo>`. Contesto: `<...>`. Apri la issue
