@@ -69,8 +69,8 @@ What changes with `--parallel N`:
   | 512 | 0.4 s | 16.4 s |
 
   Prefilled in one piece, the same prompt took 6.5 s to its first token, and the three streams stopped for all of it.
-- **MTP drafting is off** (`--mtp` is ignored), and the server uses one GPU (`--device` with one card). For several
-  GPUs, run one server per card (see [Several GPUs](#several-gpus)).
+- **MTP drafting is off** (`--mtp` is ignored). With several cards (`--device 0,1`), the slots work over the split
+  layers too (see [Several GPUs](#several-gpus)).
 - **Conversation cache.** Each slot keeps the state of its last conversation, and a request that continues a
   conversation goes to the slot that holds it. Other conversations are parked in host memory (`--cache-ram`) as
   without `--parallel`. Keys still only reuse their own conversations.
@@ -313,7 +313,10 @@ again; hashing on the key (`hash $http_authorization consistent;` instead of `le
 server.
 
 **One server over several GPUs, a bigger model.** `--device 0,1` splits the layers over the cards, so more experts
-fit in VRAM. It does not serve two requests at once, and `--parallel` needs one GPU.
+fit in VRAM. `--parallel` works here too: each card holds the KV cache of its own layers for every slot. The cards
+take their layers in turn for each step, so they do not compute at the same time, and the gain over `--parallel 1`
+comes from the batching, as on one card. A split server does not park conversations in host memory: each slot only
+keeps its last conversation. For many users on cards that each fit the model, one server per card is faster.
 
 ## Checklist
 

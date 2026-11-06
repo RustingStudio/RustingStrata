@@ -108,7 +108,7 @@ struct Hosting {
     /// leaves].
     #[arg(long)]
     max_tokens: Option<usize>,
-    /// Requests answered at once (GPU, one device): each gets its own slot of `--ctx` tokens of KV cache, and the
+    /// Requests answered at once (GPU): each gets its own slot of `--ctx` tokens of KV cache, and the
     /// slots that decode share each forward, up to 4 at a time. Between the chunks of a prompt's prefill the others
     /// decode for as long as the chunk took (a smaller `--chunk` gives shorter pauses). MTP drafting is off.
     #[arg(long, default_value_t = 1)]
@@ -198,12 +198,11 @@ impl Engine {
         };
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
         let mut g = if self.parallel > 1 {
-            anyhow::ensure!(bk.len() == 1, "--parallel: one GPU only (run one server per GPU)");
             if self.mtp() > 0 { eprintln!("--parallel: decoding without MTP drafts"); }
             self.mtp = Some(0);
-            GpuModel::load_slots(m, bk.into_iter().next().unwrap(), self.ctx, self.chunk(), self.vram_margin << 20, self.parallel).context(LOAD_HINT)?
+            GpuModel::load_split(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, 0, self.parallel).context(LOAD_HINT)?
         } else {
-            GpuModel::load_split(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp()).context(LOAD_HINT)?
+            GpuModel::load_split(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp(), 1).context(LOAD_HINT)?
         };
         g.short = self.short;
         g.cache_ram = self.cache_ram << 20;

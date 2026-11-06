@@ -197,17 +197,17 @@ impl<'a> GpuModel<'a> {
     /// `load` with `n` slots: sequences with their own KV cache and recurrent state each (`ctx` tokens a slot), which
     /// `step_rows` decodes together. No MTP draft head; not for hyper-connection, PLE or QSA models.
     pub fn load_slots(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, n: usize) -> anyhow::Result<GpuModel<'a>> {
-        let c = &m.cfg;
-        ensure!(n == 1 || c.hc_n == 0 && c.n_embd_ple == 0 && c.idx_top_k == 0, "--parallel: not supported for this model (hyper-connections, PLE or QSA)");
-        ensure!((1..=255).contains(&n), "--parallel {n}: 1 to 255 slots");
-        Self::load_part(m, gpu, ctx, chunk, vram_margin, 0, 0..c.n_layer, n)
+        Self::load_part(m, gpu, ctx, chunk, vram_margin, 0, 0..m.cfg.n_layer, n)
     }
 
     /// `load` with the layers split over `gpus` in proportion to their free VRAM (each device then fills the rest
-    /// of its VRAM with expert slots). One device: `load`.
-    pub fn load_split(m: &'a Model<'a>, gpus: Vec<Box<dyn Backend>>, ctx: usize, chunk: usize, vram_margin: usize, k: usize) -> anyhow::Result<GpuModel<'a>> {
+    /// of its VRAM with expert slots), and `ns` slots as in `load_slots`. One device: `load` or `load_slots`.
+    pub fn load_split(m: &'a Model<'a>, gpus: Vec<Box<dyn Backend>>, ctx: usize, chunk: usize, vram_margin: usize, k: usize, ns: usize) -> anyhow::Result<GpuModel<'a>> {
         let n = m.cfg.n_layer;
-        if gpus.len() == 1 { return Self::load(m, gpus.into_iter().next().unwrap(), ctx, chunk, vram_margin, k); }
+        if gpus.len() == 1 {
+            let g = gpus.into_iter().next().unwrap();
+            return if ns > 1 { Self::load_slots(m, g, ctx, chunk, vram_margin, ns) } else { Self::load(m, g, ctx, chunk, vram_margin, k) };
+        }
         let free = gpus.iter().map(|g| Ok(g.mem_info()?.0 as f64)).collect::<anyhow::Result<Vec<_>>>()?;
         let total: f64 = free.iter().sum();
         let mut ends = vec![0];
@@ -222,7 +222,7 @@ impl<'a> GpuModel<'a> {
             ensure!(ple.iter().all(|il| r.contains(il)) || !ple.iter().any(|il| r.contains(il)), "the PLE layers would be split across devices");
             eprintln!("device {i} ({}): layers {}..{}", gpu.name(), r.start, r.end);
             // ponytail: no MTP draft head on a split model (it reads the last part's hidden rows from the first).
-            parts.push(Self::load_part(m, gpu, ctx, chunk, vram_margin, 0, r, 1)?);
+            parts.push(Self::load_part(m, gpu, ctx, chunk, vram_margin, 0, r, ns)?);
         }
         let mut it = parts.into_iter().rev();
         let mut acc = it.next().unwrap();
@@ -231,6 +231,9 @@ impl<'a> GpuModel<'a> {
     }
 
     fn load_part(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, k: usize, range: std::ops::Range<usize>, ns: usize) -> anyhow::Result<GpuModel<'a>> {
+        let c = &m.cfg;
+        ensure!(ns == 1 || c.hc_n == 0 && c.n_embd_ple == 0 && c.idx_top_k == 0, "--parallel: not supported for this model (hyper-connections, PLE or QSA)");
+        ensure!((1..=255).contains(&ns), "--parallel {ns}: 1 to 255 slots");
         let last = range.end == m.cfg.n_layer;
         // The PLE table stays on the CPU; other F16, Q4_0 and Q5_0 tensors but experts are converted on upload
         // (`Backend::upload`).
@@ -415,6 +418,7 @@ impl<'a> GpuModel<'a> {
 
     /// Make slot `s` current: `prefill`, `prefill_cached`, `step`, `reset` and the rest then use its state.
     pub fn use_slot(&mut self, s: usize) {
+        if let Some(n) = self.next.as_mut() { n.use_slot(s); }
         if s == self.cur { return; }
         let mut q = std::mem::take(&mut self.seqs[s]);
         std::mem::swap(&mut self.pos, &mut q.pos);
@@ -441,34 +445,55 @@ impl<'a> GpuModel<'a> {
     /// and attention regimes, so keep the rows in slot order.
     pub fn step_rows(&mut self, rows: &[(usize, u32, bool)]) -> anyhow::Result<Vec<(u32, Vec<f32>)>> {
         let (nt, nvoc) = (rows.len(), self.m.cfg.n_vocab);
-        ensure!((1..=TMAX).contains(&nt) && self.next.is_none() && self.mtp.is_none(), "step_rows: {nt} rows");
+        ensure!((1..=TMAX).contains(&nt) && self.mtp.is_none(), "step_rows: {nt} rows");
         let pos: Vec<usize> = rows.iter().map(|&(s, ..)| *self.slot_pos(s)).collect();
         if pos.iter().any(|&p| p >= self.ctx) { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
-        let seq = self.worker.as_mut().map_or(0, |w| w.begin());
         self.put_embed(&rows.iter().map(|r| r.1).collect::<Vec<_>>())?;
+        let res = self.rows_pass(rows, &pos).and_then(|_| {
+            let t = self.tail();
+            let g = &t.gpu;
+            g.argmax_rows(t.logits.addr(), nvoc, nt, t.amax.addr())?;
+            let mut am = g.get::<i32>(&t.amax, 0, nt)?;
+            if t.finish(nt, 0, None)? {
+                g.argmax_rows(t.logits.addr(), nvoc, nt, t.amax.addr())?;
+                am = g.get::<i32>(&t.amax, 0, nt)?;
+            }
+            rows.iter().zip(am).enumerate()
+                .map(|(r, (&(.., want), t_))| Ok((t_ as u32, if want { g.get::<f32>(&t.logits, r * nvoc, nvoc)? } else { vec![] }))).collect()
+        });
+        let every = self.adapt_every;
+        let mut p = Some(&mut *self);
+        while let Some(q) = p {
+            q.rows.clear();
+            if res.is_ok() {
+                for &(s, ..) in rows { *q.slot_pos(s) += 1; }
+                q.row_tokens += nt;
+                q.adapt_every = every;
+                q.after_experts(nt, q.row_tokens)?;
+            }
+            p = q.next.as_deref_mut();
+        }
+        res
+    }
+
+    /// The forward of `step_rows` (input in `x`) through this part and the parts after it, as `pass`. Each forward
+    /// is graphed by its slots and attention regimes; the last part's is left running.
+    fn rows_pass(&mut self, rows: &[(usize, u32, bool)], pos: &[usize]) -> anyhow::Result<()> {
+        let nt = rows.len();
+        let seq = self.worker.as_mut().map_or(0, |w| w.begin());
         self.gpu.put(&pos.iter().flat_map(|&p| [p as i32, seq as i32]).collect::<Vec<_>>(), &self.step_buf, 0)?;
-        self.rows = rows.iter().zip(&pos).map(|(r, &p)| (r.0, p)).collect();
+        self.rows = rows.iter().zip(pos).map(|(r, &p)| (r.0, p)).collect();
         const _: () = assert!(TMAX <= 4, "step_rows graph key");
         let mut key = 1 << 63 | nt as u64;
         for (r, &(sl, p)) in self.rows.iter().enumerate() { key |= (sl as u64) << (8 + 8 * r) | ((gq_min(p, 1) == 0) as u64) << (48 + r); }
-        let res = (|| -> anyhow::Result<Vec<(u32, Vec<f32>)>> {
-            self.gpu.graph(key, &mut || self.forward(nt, 0, None))?;
-            let g = &self.gpu;
-            g.argmax_rows(self.logits.addr(), nvoc, nt, self.amax.addr())?;
-            let mut am = g.get::<i32>(&self.amax, 0, nt)?;
-            if self.finish(nt, 0, None)? {
-                g.argmax_rows(self.logits.addr(), nvoc, nt, self.amax.addr())?;
-                am = g.get::<i32>(&self.amax, 0, nt)?;
-            }
-            rows.iter().zip(am).enumerate()
-                .map(|(r, (&(.., want), t))| Ok((t as u32, if want { g.get::<f32>(&self.logits, r * nvoc, nvoc)? } else { vec![] }))).collect()
-        })();
-        self.rows.clear();
-        let out = res?;
-        for &(s, ..) in rows { *self.slot_pos(s) += 1; }
-        self.row_tokens += nt;
-        self.after_experts(nt, self.row_tokens)?;
-        Ok(out)
+        self.gpu.graph(key, &mut || self.forward(nt, 0, None))?;
+        if self.next.is_none() { return Ok(()); }
+        self.gpu.sync()?;
+        self.finish(nt, 0, None)?;
+        let xs = self.gpu.get::<f32>(&self.x, 0, nt * self.m.cfg.n_embd)?;
+        let nx = self.next.as_deref_mut().unwrap();
+        nx.gpu.put(&xs, &nx.x, 0)?;
+        nx.rows_pass(rows, pos)
     }
 
     /// This part and the parts after it.
