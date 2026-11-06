@@ -14,7 +14,12 @@
 #extension GL_EXT_control_flow_attributes : require
 layout(local_size_x = 256) in;
 #include "common.glsl"
+// Volta has 48 KB of shared memory and the driver does not drop the spec-constant-sized table arrays in the
+// non-cooperative-matrix path: the KS = 16 pipelines ask for 49168 bytes, 16 over. Read the IQ tables from the
+// buffer there (V100, sm_70; fixes the Xid 13 "L1_CONFIG_TOO_SMALL" on the first chunked prefill).
+#if COOP
 #define SHARED_TABLES
+#endif
 #include "deq.glsl"
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64 { uint64_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer UV4 { uvec4 v[]; };
