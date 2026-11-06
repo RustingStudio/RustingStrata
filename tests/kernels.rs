@@ -1,7 +1,7 @@
 //! Kernel tests, run on every backend that opens (`common::backends`).
 mod common;
 use common::{down, up};
-use rusting_strata::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
+use rusting_strata::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor, SAME_X};
 use rusting_strata::{cuda::Gpu, gguf::Gguf, quant::GgmlType, weights::{Tensor, Weights}};
 
 fn xs(n: usize) -> Vec<f32> {
@@ -296,6 +296,43 @@ fn gemm_matches_reference_for_every_type() {
             let bits = got.iter().zip(f.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
             assert_eq!(bits, 0, "{} gemm ({name}) on {bk}: {bits} values differ from the first backend", ty.name());
         }
+    }
+}
+
+/// A `SAME_X` GEMM inside `batch` whose x was not quantized by the previous GEMM (that one's type is off the int8
+/// path, e.g. IQ2_XS) falls back to the f16 kernel instead of failing. Mixed-quant models hit this in prefill.
+#[test]
+fn same_x_inside_batch_falls_back_when_x_is_not_quantized() {
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let w = Weights::new(&g).unwrap();
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        // A tensor off the int8 path (IQ2_XS or a float type) and an int8 one with the same row length.
+        let (mut slow, mut fast) = (std::collections::HashMap::new(), std::collections::HashMap::new());
+        for (name, info) in &g.tensors {
+            if info.dims.len() != 2 { continue }
+            let cols = info.dims[0] as usize;
+            if !cols.is_multiple_of(128) { continue }
+            let Ok(ty) = GgmlType::from_u32(info.ty) else { continue };
+            if Gpu::mmq(ty) { fast.entry(cols).or_insert((name, ty)); } else { slow.entry(cols).or_insert((name, ty)); }
+        }
+        let Some((&cols, &(slow_name, _))) = slow.iter().find(|(c, _)| fast.contains_key(c)) else {
+            eprintln!("{bk}: SKIP, no mixed-type pair with equal columns");
+            continue;
+        };
+        let (fast_name, _) = fast[&cols];
+        let (ts, tf) = (w.get(slow_name).unwrap(), w.get(fast_name).unwrap());
+        let (ds, df) = (gpu.upload(&ts).unwrap(), gpu.upload(&tf).unwrap());
+        let n_x = 8;
+        let x = xs(n_x * cols);
+        let dx = up(gpu, &x);
+        let (dy1, dy2) = (gpu.zeros::<f32>(n_x * ts.rows).unwrap(), gpu.zeros::<f32>(n_x * tf.rows).unwrap());
+        // The first GEMM takes the f16 path and leaves no int8 copy of x.
+        gpu.gemm_dense(&ds, n_x, dx.addr(), cols, dy1.addr(), ts.rows, 0).unwrap();
+        // Inside a batch this GEMM cannot quantize x: it must use its f16 kernel rather than fail.
+        gpu.batch(&mut || gpu.gemm_dense(&df, n_x, dx.addr(), cols, dy2.addr(), tf.rows, SAME_X)).unwrap();
+        assert!(down::<f32>(gpu, &dy2).iter().all(|v| v.is_finite()), "{bk}: {fast_name} after SAME_X fallback");
     }
 }
 
