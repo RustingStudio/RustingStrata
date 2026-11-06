@@ -242,6 +242,8 @@ ExecStart=/usr/local/bin/strata serve --model /srv/models/Qwen3.6-35B-A3B-UD-Q2_
 StateDirectory=strata
 Restart=on-failure
 RestartSec=5
+# Replies being generated finish before the server stops; long ones need more than the default 90 s.
+TimeoutStopSec=300
 
 [Install]
 WantedBy=multi-user.target
@@ -259,6 +261,11 @@ journalctl -u strata -f
 Run `calibrate` as the service user, because the calibration file and the CUDA kernel cache live in that user's
 `~/.cache/rusting_strata`. The first start after an update compiles the CUDA kernels (about 15 s); `/health` answers
 `503` until the model has loaded.
+
+**Stopping and restarting.** On `SIGTERM` (`systemctl stop` or `restart`) the server answers new requests, `/health`
+included, with `503` and `Retry-After: 5`, lets the replies being generated finish, and then exits. A load balancer
+sends the new requests to the other servers meanwhile, so restarting one server at a time cuts no reply. `systemd`
+sends `SIGKILL` after `TimeoutStopSec`; Ctrl+C still stops at once. On Windows there is no such drain.
 
 ## Health checks
 
@@ -319,6 +326,8 @@ strata serve --model $M --gpu --device 1 --addr 127.0.0.1:8082 --threads 6 ...
 
 ```nginx
 upstream strata { least_conn; server 127.0.0.1:8081; server 127.0.0.1:8082; }
+# In the location block: a 503 (busy or stopping) is sent before any work, so another server may take the request.
+proxy_next_upstream error http_503 non_idempotent;
 ```
 
 Give each server half of the CPU cores (`--threads`), because each one computes the experts that do not fit in its
