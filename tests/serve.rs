@@ -1,5 +1,5 @@
 use rusting_strata::chat::{Hold, Json, Msg, Template};
-use rusting_strata::serve::{chat_request, host_ok, key_ok, list_models, messages_body, models, read_request};
+use rusting_strata::serve::{Keys, Who, chat_request, host_ok, key_ok, list_models, messages_body, models, read_request};
 
 /// Every request in tests/fixtures/chat renders byte-identical to llama.cpp's Jinja rendering of the model's own
 /// template (tools/gen_chat_fixtures.py); a request llama.cpp rejects must be rejected too.
