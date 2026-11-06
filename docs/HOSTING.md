@@ -263,7 +263,7 @@ Point the load balancer or your monitoring at it.
 
 ## Usage log and billing
 
-With `--usage-log FILE`, every answered chat request adds one JSON line:
+With `--usage-log FILE`, every chat request that reaches the model adds one JSON line:
 
 ```json
 {"at":1793917331,"key":"acme","model":"Qwen3.6-35B-A3B-UD-Q2_K_XL","prompt_tokens":1200,"cached_tokens":1100,"system_tokens":300,"completion_tokens":250,"prefill_ms":95.1,"decode_ms":2210.4,"finish":"stop"}
@@ -274,11 +274,15 @@ With `--usage-log FILE`, every answered chat request adds one JSON line:
 - `prompt_tokens`: all prompt tokens. `cached_tokens` of them came from the conversation cache and were not prefilled
   again; many providers bill them at a lower price.
 - `completion_tokens`: reply tokens. `finish` is `stop`, `length` (hit `max_tokens` or the context) or `tool_calls`.
+- `finish` is `cut` when the client closed the connection before the end. `completion_tokens` then counts the
+  tokens decoded so far: a stream has sent nearly all of them, a reply without `stream` has sent none. `error` is a
+  request that failed on the server; it got a `500` or a stream that stopped.
 
-Requests that fail, and replies that stop because the client went away, are not logged. Tokens per key and day:
+Requests refused before the model (bad key, bad JSON, a prompt that fills the context, `503`) are not logged. Tokens
+per key and day, without failed requests:
 
 ```sh
-jq -r '[(.at | strftime("%Y-%m-%d")), .key, .prompt_tokens - .cached_tokens, .cached_tokens, .completion_tokens] | @tsv' usage.jsonl \
+jq -r 'select(.finish != "error") | [(.at | strftime("%Y-%m-%d")), .key, .prompt_tokens - .cached_tokens, .cached_tokens, .completion_tokens] | @tsv' usage.jsonl \
   | awk '{k=$1" "$2; p[k]+=$3; c[k]+=$4; o[k]+=$5} END {for (k in p) print k, p[k], c[k], o[k]}' | sort
 ```
 
