@@ -268,12 +268,12 @@ __device__ __forceinline__ int2 iq4nl_lut(u32 q) {
     u32 b = __byte_perm(lo, hi, hs >> 16);
     return make_int2((int)__byte_perm(a, b, 0x6420), (int)__byte_perm(a, b, 0x7531));
 }
-// 8 bytes at 2-aligned p with 4-byte loads: at p when 4-aligned, else at p - 2, p + 2, p + 6 and shifted (so the
-// 2 bytes either side must be readable). Superblock offsets keep p's alignment uniform across a warp.
+// 8 bytes at 2-aligned p from the three 4-byte words that cover them, shifted when p is not 4-aligned (so the 2
+// bytes after p + 8 must be readable). No branch, so the loads of unrolled superblocks can be issued together.
 __device__ __forceinline__ uint2 ld8a2(const u8* p) {
-    if (((size_t)p & 3) == 0) return make_uint2(ldu32(p), ldu32(p + 4));
-    u32 a0 = ldu32(p - 2), a1 = ldu32(p + 2), a2 = ldu32(p + 6);
-    return make_uint2(__funnelshift_r(a0, a1, 16), __funnelshift_r(a1, a2, 16));
+    const u8* a = (const u8*)((size_t)p & ~(size_t)3);
+    u32 sh = ((size_t)p & 2) * 8, a0 = ldu32(a), a1 = ldu32(a + 4), a2 = ldu32((const u8*)(((size_t)p + 7) & ~(size_t)3));
+    return make_uint2(__funnelshift_r(a0, a1, sh), __funnelshift_r(a1, a2, sh));
 }
 // Byte j of the result is 0xFF when bit j of s is set (j < 4).
 __device__ __forceinline__ u32 smask4(u32 s) { return ((s * 0x00204081u) & 0x01010101u) * 0xFFu; }
