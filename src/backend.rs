@@ -142,6 +142,9 @@ pub trait Backend: Send {
     /// y = silu(y) * result (SwiGLU with the gate already in y), 2 adds to y; `| SAME_X` as below. `n_x`: rows of x
     /// the tiles read.
     fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()>;
+    /// Whether `gemm` and `gemm_dense` run on int8 tensor cores for `ty` (the alternative is f16 products), so tests
+    /// and callers build their reference the way this backend will.
+    fn int8_gemm(&self, ty: GgmlType) -> bool;
     /// y[m] (op) W x[m] for positions m < n, x and y rows `x_stride` / `y_stride` floats apart.
     fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()>;
     /// y = W x (all rows of `w`).

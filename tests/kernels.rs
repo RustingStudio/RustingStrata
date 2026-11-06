@@ -2,7 +2,7 @@
 mod common;
 use common::{down, up};
 use rusting_strata::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
-use rusting_strata::{cuda::Gpu, gguf::Gguf, quant::GgmlType, weights::{Tensor, Weights}};
+use rusting_strata::{gguf::Gguf, quant::GgmlType, weights::{Tensor, Weights}};
 
 fn xs(n: usize) -> Vec<f32> {
     (0..n).map(|i| ((i as f32 * 0.7548777).fract() - 0.5) * 2.0).collect()
@@ -249,7 +249,7 @@ fn gemv_bandwidth() {
 fn f16r(v: f32) -> f32 { half::f16::from_f32(v).to_f32() }
 
 /// Tensor-core GEMM over a tile list matches per-row dot products, for every type, with a gathered X and partial
-/// tiles. Types on the int8 path (`Gpu::mmq`) see X as int8 per 32 (as the GEMV path does), the others fp16 inputs.
+/// tiles. Types on the int8 path (`Backend::int8_gemm`) see X as int8 per 32 (as the GEMV path does), the others fp16 inputs.
 #[test]
 fn gemm_matches_reference_for_every_type() {
     let Some(p) = common::model_path() else { return };
@@ -280,7 +280,7 @@ fn gemm_matches_reference_for_every_type() {
                 t.row(r, &mut wr);
                 for (i, &xr) in xrow.iter().enumerate() {
                     let xv = &x[xr as usize * t.cols..][..t.cols];
-                    want[i * rows + r] = if Gpu::mmq(t.ty) {
+                    want[i * rows + r] = if gpu.int8_gemm(t.ty) {
                         wr.iter().zip(as_seen(t.ty, xv)).map(|(a, b)| a * b).sum()
                     } else {
                         wr.iter().zip(xv).map(|(a, b)| f16r(*a) * f16r(*b)).sum()
@@ -291,7 +291,7 @@ fn gemm_matches_reference_for_every_type() {
             eprintln!("{:8} {name}: gemm rel err {e:.2e}", ty.name());
             assert!(e <= 1e-4, "{} gemm ({name}): rel err {e}", ty.name());
             // Vulkan without cooperative matrices sums the f16 products in another order than mma.sync.
-            if bk == "vulkan" && !Gpu::mmq(t.ty) && std::env::var_os("STRATA_VK_NO_COOP").is_some() { continue; }
+            if bk == "vulkan" && !gpu.int8_gemm(t.ty) && std::env::var_os("STRATA_VK_NO_COOP").is_some() { continue; }
             let f = first.entry(name.clone()).or_insert_with(|| got.clone());
             let bits = got.iter().zip(f.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
             assert_eq!(bits, 0, "{} gemm ({name}) on {bk}: {bits} values differ from the first backend", ty.name());
@@ -1112,7 +1112,7 @@ fn gemv_partial_superblocks_and_q2_0() {
                 for r in 0..rows {
                     t.row(r, &mut wr);
                     for (i, xv) in xm.chunks(cols).enumerate() {
-                        want[i * rows + r] = if Gpu::mmq(ty) && cols % 128 == 0 { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
+                        want[i * rows + r] = if gpu.int8_gemm(ty) && cols % 128 == 0 { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
                                              else { wr.iter().zip(xv).map(|(a, b)| f16r(*a) * f16r(*b)).sum() };
                     }
                 }

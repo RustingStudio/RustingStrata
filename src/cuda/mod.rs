@@ -38,6 +38,8 @@ pub struct Gpu {
     q8: std::sync::Mutex<(CudaSlice<u8>, Option<[u64; 4]>)>,
     /// The kernels were compiled for a q8 KV cache (`--kv q8`).
     pub kv_q8: bool,
+    /// The GPU has int8 tensor-core mma (sm_80+). Turing runs the prefill GEMM on the f16 path instead.
+    pub int8_mma: bool,
     /// `argmax_rows` partials, AMAX_PARTS per row.
     am: CudaSlice<[i32; 2]>,
     /// Recorded graphs by `Backend::graph` key.
@@ -179,19 +181,27 @@ impl Gpu {
         eprintln!("cuda device {device}: {}", ctx.name().unwrap_or_default());
         let stream = ctx.new_stream()?;
         let (maj, min) = ctx.compute_capability()?;
+        let int8_mma = maj >= 8;
+        let max_optin = ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
+            .unwrap_or(48 << 10).max(48 << 10) as u32;
         let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
         let module = ctx.load_module(ptx(&source(kv_q8), arch)?).context("load cubin")?;
         let mut fns = HashMap::new();
         let names = KERNELS.iter().map(|s| s.to_string())
             .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm", "gemms"].map(|p| kname(p, t))))
             .chain(QTYPES.iter().flat_map(|&t| ["gemv", "gemvn", "moe_gemv"].map(|p| kname(p, t) + "_p")))
-            .chain(QTYPES.iter().filter(|&&t| !Self::float_ty(t)).flat_map(|&t| [kname("gemmi", t), kname("gemmis", t)]))
+            .chain(QTYPES.iter().filter(|&&t| int8_mma && !Self::float_ty(t)).flat_map(|&t| [kname("gemmi", t), kname("gemmis", t)]))
             .chain([64, 128, 256, 512].iter().flat_map(|h| [format!("attn_decode_{h}"), format!("attn_decode_gqa_{h}")]));
         for n in names {
             let f = module.load_function(&n).with_context(|| format!("kernel {n}"))?;
             // gemvn caches nt quantized inputs: 4 x 17408 columns (Qwen3.8-27B ffn_down) need 77 KB.
             if n.starts_with("attn_prefill") || n.starts_with("attn_decode_gqa") || n.starts_with("gemvn") {
-                f.set_attribute(cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 96 << 10)?;
+                // Opt in to as much dynamic shared memory as the device has left after the kernel's statics (96 KB
+                // on Ampere and newer, 64 KB on Turing).
+                let static_smem = f.shared_size_bytes().unwrap_or(0).max(0) as u32;
+                let smem = max_optin.saturating_sub(static_smem).min(96 << 10) as i32;
+                f.set_attribute(cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem)
+                    .with_context(|| format!("shared memory attribute for {n}"))?;
             }
             fns.insert(n, f);
         }
@@ -199,7 +209,7 @@ impl Gpu {
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = ctx.new_event(None)?;
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_q8, am, graphs: Default::default(), ring, done, lag: Default::default() })
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_q8, int8_mma, am, graphs: Default::default(), ring, done, lag: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -245,7 +255,7 @@ impl Gpu {
         let (same, act) = (act & SAME_X != 0, act & !SAME_X);
         let mut q8 = self.q8.lock().unwrap();
         // The int8 path loads q8 rows 16 bytes at a time: their stride (cols * 11 / 8) is aligned only for cols % 128 == 0.
-        if !Self::mmq(ty) || cols % 128 != 0 {
+        if !self.int8_mma || !Self::mmq(ty) || cols % 128 != 0 {
             if !same { q8.1 = None; }
             launch!(self, &kname(if sm { "gemms" } else { "gemm" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
                 tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act);
@@ -332,7 +342,9 @@ impl Gpu {
         // gq_min i32::MAX or 0 fixes the regime, so the kernel that would exit at once is not launched.
         if gq_min != 0 { launch!(self, &format!("attn_decode_{hd}"), cfg(((nh * nt) as u32, ATT_SPLITS_1 as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32); }
         // attn_decode_gqa with the f16 cache at head_dim 128 or 256 also holds 2 chunks of K and V for its cp.async.
-        let cp = if !self.kv_q8 && (hd == 128 || hd == 256) { 2 * 2 * 32 * hd * 2 } else { 0 };
+        // Turing (sm_75) has 64 KB of shared memory a block: the head_dim 256 chunks do not fit, so it loads them
+        // through registers instead (kernels.cu ATT_RUN_CP).
+        let cp = if !self.kv_q8 && (hd == 128 || (hd == 256 && self.int8_mma)) { 2 * 2 * 32 * hd * 2 } else { 0 };
         if gq_min != i32::MAX { launch!(self, &format!("attn_decode_gqa_{hd}"), cfg(((nh / g * nt) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4 + cp) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32); }
         launch!(self, "attn_merge", LaunchConfig { grid_dim: (nh as u32, 1, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, part, qg, out, hd as i32, ATT_SPLITS as i32, step, ATT_SPLITS_1 as i32, gq_min, xq);
         Ok(())
@@ -474,6 +486,8 @@ impl Backend for Gpu {
     fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
         self.gemm_raw(w.ty, w.rows, w.cols, 0, n.div_ceil(GEMM_BM), w.ptr, n, x, x_stride, n, 0, y, y_stride, act)
     }
+
+    fn int8_gemm(&self, ty: GgmlType) -> bool { self.int8_mma && Self::mmq(ty) }
 
     fn gemv(&self, w: &GpuTensor, x: u64, y: u64) -> anyhow::Result<()> {
         let (ncols, kn) = Self::gemv_cols("gemv", w.ty, w.cols)?;
@@ -617,7 +631,9 @@ impl Backend for Gpu {
 
     fn attn_prefill_m(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32, qm: u64, mw: usize) -> anyhow::Result<()> {
         if !matches!(hd, 64 | 128 | 256) { bail!("attention prefill: head_dim {hd} unsupported (64, 128 or 256)"); }
-        let smem = (2 * (64 + 32 + 32) * (hd + 8)) as u32;
+        // Turing keeps 16 keys a tile for head_dim 256 (see FA_BK_FOR in kernels.cu).
+        let bk = if !self.int8_mma && hd == 256 { 16 } else { 32 };
+        let smem = (2 * (64 + bk + bk) * (hd + 8)) as u32;
         launch!(self, &format!("attn_prefill_{hd}"), cfg((t.div_ceil(64) as u32, nh as u32), 128, smem),
             q, kc, vc, qg, out, step, t as i32, nh as i32, nkv as i32, scale, qm, mw as i32);
         Ok(())
