@@ -151,6 +151,8 @@ pub trait Backend: Send {
     fn gemvn(&self, w: &GpuTensor, x: u64, x_stride: usize, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()>;
     /// Whether this backend can use unquantized activations for a numerically sensitive dense layer.
     fn accurate_dense_layer(&self) -> bool { false }
+    /// First layer to use unquantized activations; the output head stays unquantized.
+    fn accurate_dense_start(&self, _layers: usize) -> usize { 0 }
     /// Dense GEMV with unquantized activations, when supported by the backend.
     fn gemv_unquantized(&self, w: &GpuTensor, x: u64, xs: usize, y: u64, ys: usize, nt: usize) -> anyhow::Result<()> {
         self.gemvn(w, x, xs, y, ys, nt)

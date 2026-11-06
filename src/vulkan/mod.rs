@@ -139,6 +139,8 @@ struct Inner {
     budget: bool,
     /// The device runs fixed 64-lane subgroups, split into logical 32-lane warps.
     wave64: bool,
+    /// Optional limit on unquantized Qwen3 decode layers for the wave64 backend.
+    qwen3_f32_layers: Option<usize>,
     /// VK_KHR_cooperative_matrix with the 16 x 16 x 16 f16 / f32 shape is enabled (`gemm_f`, `attn_prefill`).
     coop: bool,
     /// The 16 x 16 x 32 int8 / int32 shape is there too (`gemmi`).
@@ -338,6 +340,11 @@ impl Vk {
         let mut sg = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
         unsafe { instance.get_physical_device_properties2(pd, &mut vk::PhysicalDeviceProperties2::default().push_next(&mut sg)) };
         let wave64 = sg.min_subgroup_size == 64;
+        let qwen3_f32_layers = match std::env::var("STRATA_VK_QWEN3_F32_LAYERS") {
+            Ok(v) => Some(v.parse::<usize>().context("STRATA_VK_QWEN3_F32_LAYERS must be a non-negative integer")?),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(e) => return Err(anyhow!(e).context("STRATA_VK_QWEN3_F32_LAYERS")),
+        };
         let qf = unsafe { instance.get_physical_device_queue_family_properties(pd) }.iter()
             .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE)).context("no compute queue")? as u32;
         let dexts = unsafe { instance.enumerate_device_extension_properties(pd) }?;
@@ -414,7 +421,7 @@ impl Vk {
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, wave64, coop, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, wave64, qwen3_f32_layers, coop, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -1047,6 +1054,7 @@ impl Backend for Vk {
         self.gemm_raw(w.ty, w.rows, w.cols, 0, n.div_ceil(128), w.ptr, n, x, x_stride, n, 0, y, y_stride, act)
     }
     fn accurate_dense_layer(&self) -> bool { self.0.wave64 }
+    fn accurate_dense_start(&self, layers: usize) -> usize { layers.saturating_sub(self.0.qwen3_f32_layers.unwrap_or(layers)) }
     fn gemv_unquantized(&self, w: &GpuTensor, x: u64, xs: usize, y: u64, ys: usize, nt: usize) -> anyhow::Result<()> {
         ensure!((1..=4).contains(&nt), "gemvn: {nt} inputs (1 to 4)");
         let nc = gemv_cols(self.0.llama, w.ty, w.cols)?;
