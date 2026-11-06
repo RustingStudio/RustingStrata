@@ -668,15 +668,22 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         (v["system"], v["uptime_s"]) = (serve::system(), t0.elapsed().as_secs().into());
                         return reply(v, "200 OK");
                     }
-                    // A malformed request or a wrong key is refused here, not in the queue, where without `--parallel` it
-                    // would wait for the reply being generated (`handle` checks again: the keys may change meanwhile).
+                    // A malformed request, a wrong key and the page are answered here, not in the queue, where without
+                    // `--parallel` they would wait for the reply being generated (`handle` checks the key again: the
+                    // keys may change meanwhile). The page holds no secret, so it loads without the key (it asks for it);
+                    // without keys the Host check stops DNS rebinding.
                     let who = q.as_ref().ok().and_then(|r| k.read().unwrap().who(&r.auth));
                     match &q {
                         Err(e) => {
                             eprintln!("request {i}: {e:#}");
                             return reply(json!({"error": {"message": format!("{e:#}"), "type": "invalid_request_error"}}), "400 Bad Request");
                         }
-                        Ok(r) if who.is_none() && !(r.method == "GET" && r.path == "/") =>
+                        Ok(r) if r.method == "GET" && r.path == "/" && (k.read().unwrap().any() || serve::host_ok(&r.host, &a)) => {
+                            let _ = write!(&c, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PAGE}", PAGE.len());
+                            oc.fetch_sub(1, Relaxed);
+                            return;
+                        }
+                        Ok(_) if who.is_none() =>
                             return reply(json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}}), "401 Unauthorized"),
                         _ => {}
                     }
@@ -1194,6 +1201,9 @@ fn text_delta(w: &mut impl Write, opened: &mut bool, t: &str) -> anyhow::Result<
     sse(w, json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": t}}))
 }
 
+/// The chat page, served by the connection threads of `strata serve`.
+const PAGE: &str = include_str!("web/index.html");
+
 fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Loaded>, e: &Engine, s: &Serving, i: usize,
     next: &mut Option<(PathBuf, TcpStream)>) -> anyhow::Result<()> {
     let send = |w: &mut TcpStream, status: &str, v: serde_json::Value| -> anyhow::Result<()> {
@@ -1214,11 +1224,6 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
     // With a key the check is not needed (a rebinding page has no key) and would refuse a reverse proxy's Host.
     let keys = s.keys.read().unwrap().clone();
     if !keys.any() && !serve::host_ok(&host, &s.addr) { return send(&mut w, "403 Forbidden", json!({"error": {"message": "bad Host header", "type": "forbidden"}})); }
-    // The chat page holds no secret, so it loads without the key (the page asks for it).
-    if method == "GET" && path == "/" {
-        const PAGE: &str = include_str!("web/index.html");
-        return Ok(write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PAGE}", PAGE.len())?);
-    }
     let Some(who) = keys.who(&auth) else { return send(&mut w, "401 Unauthorized", json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}})) };
     if method == "POST" && !json { return send(&mut w, "415 Unsupported Media Type", json!({"error": {"message": "Content-Type must be application/json", "type": "invalid_request_error"}})); }
     // Claude Code adds `?beta=true`.
