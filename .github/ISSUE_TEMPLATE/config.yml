@@ -1,8 +1,8 @@
 blank_issues_enabled: true
 contact_links:
-  - name: Roadmap V100
-    url: https://github.com/TheBrutalX/RustingStrata/blob/v100/docs/V100.md
-    about: Piano per fasi, stato e prossimi task
-  - name: Workflow agenti
+  - name: V100 roadmap
+    url: https://github.com/TheBrutalX/RustingStrata/blob/v100/docs/ROADMAP.md
+    about: Milestones, tasks and current status
+  - name: Agent workflow
     url: https://github.com/TheBrutalX/RustingStrata/blob/v100/docs/agents/WORKFLOW.md
-    about: Come funzionano analisi, sviluppo e review
+    about: How analysis, development and review work

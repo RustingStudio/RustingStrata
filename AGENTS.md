@@ -1,145 +1,144 @@
 # AGENTS.md — RustingStrata V100 fork
 
-Questo repository è il fork `TheBrutalX/RustingStrata`, dedicato a far girare
-RustingStrata su NVIDIA Tesla V100 (Volta, **sm_70**) e a ottimizzarlo.
+This repository is the `TheBrutalX/RustingStrata` fork, dedicated to running and
+optimizing RustingStrata on the NVIDIA Tesla V100 (Volta, **sm_70**).
 
-Origine: `RustingStudio/RustingStrata` (remote `upstream`), licenza
-**RustingStrata License 1.0** (vedi `LICENSE.md`): fork e modifiche sono
-consentiti, anche per servizi commerciali, con licenza e credito all'autore
-originale; è vietato vendere l'engine stesso. Ogni file derivato mantiene
-licenza e attribution.
+Upstream: `RustingStudio/RustingStrata` (remote `upstream`), license
+**RustingStrata License 1.0** (see `LICENSE.md`): forks and modifications are
+allowed, including commercial services, provided the license and credit to the
+original author are kept; selling the engine itself is not allowed. Every
+derived file keeps the license and attribution.
 
-## Rami
+## Branches
 
-- `main` = specchio di `upstream/main` (non si modifica a mano).
-- `v100` = ramo di integrazione e **default branch del fork**; qui vivono i
-  fix e la documentazione del fork.
-- `task/<issue>-<slug>` = un ramo per task, PR verso `v100`.
-- Sync: `git fetch upstream && git merge upstream/main` su `v100`.
+- `main` = mirror of `upstream/main` (never edited by hand).
+- `v100` = integration branch and **default branch of the fork**; the fork's
+  fixes and documentation live here.
+- `task/<issue>-<slug>` = one branch per task, PR towards `v100`.
+- Sync: `git fetch upstream && git merge upstream/main` on `v100`.
 
-## Regole non negoziabili
+## Non-negotiable rules
 
-1. **Il coordinatore non scrive codice.** Il suo unico compito è orchestrare
-   gli step, leggere issue/PR e decidere il prossimo passo. Le modifiche le
-   fanno solo gli agenti `analyst`, `developer`, `reviewer`.
-2. **Una issue = un task.** La issue è l'unica fonte di verità: analisi,
-   istruzioni, avanzamento e verdetto vivono lì (e nella PR collegata).
-3. **Nessun test che fermi la produzione senza via libera del coordinatore.**
-   La V100 ospita `llama.router.service`: va fermato solo per i test GPU che
-   lo richiedono, e riavviato subito dopo.
-4. **Compatibilità upstream.** I rami restano allineabili a `upstream/main`.
-   Le modifiche CUDA specifiche di Volta vanno dietro `#if __CUDA_ARCH__`
-   (o helper equivalenti) senza cambiare il comportamento su sm_80+.
-   I fix Vulkan rigenerano gli SPIR-V con `tools/gen_spirv.sh`.
-5. **Niente segreti, modelli o binari nel repo.** I modelli stanno in
-   `/mnt/models`, le build in `target/`.
-6. **La storia pubblicata non si riscrive.** Niente force-push su `main`,
-   `v100` o rami già in review.
+1. **The coordinator does not write code.** Its job is to orchestrate the
+   steps, read issues/PRs and decide the next action. Only the `planner`,
+   `analyst`, `developer` and `reviewer` agents modify the repository.
+2. **One issue = one task.** The issue is the single source of truth: analysis,
+   instructions, progress and verdict live there (and in the linked PR).
+3. **Everything is written in English**: issues, comments, documents, commits,
+   PRs, code comments. No exceptions.
+4. **No test may stop production without coordinator approval.** The V100 also
+   hosts `llama.router.service`: stop it only for the GPU tests that require
+   it, and restart it immediately afterwards.
+5. **Upstream compatibility.** Branches must stay rebasable onto
+   `upstream/main`. Volta-specific CUDA changes go behind
+   `#if __CUDA_ARCH__` (or equivalent helpers) without changing sm_80+
+   behaviour. Vulkan fixes regenerate the SPIR-V with `tools/gen_spirv.sh`.
+6. **No secrets, models or binaries in the repository.** Models live in
+   `/mnt/models`, builds in `target/`.
+7. **Published history is not rewritten.** No force-push to `main`, `v100` or
+   any branch already in review.
 
-## Workflow (obbligatorio)
+## Workflow (mandatory)
 
-Dettaglio completo: [`docs/agents/WORKFLOW.md`](docs/agents/WORKFLOW.md).
+Full protocol: [`docs/agents/WORKFLOW.md`](docs/agents/WORKFLOW.md).
+Living plan: [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ```
-        ┌──────────────┐   issue + label step:dev
-task ──▶│ 1. ANALYST   │──────────────────────────┐
-        └──────────────┘                          ▼
-                                          ┌──────────────┐
-                                          │ 2. DEVELOPER │ commit + PR, label step:review
-                                          └──────┬───────┘
-                                                 ▼
-                                          ┌──────────────┐
-                                          │ 3. REVIEWER  │
-                                          └──┬────────┬──┘
-                               CHANGES ──────┘        └────── APPROVE
-                                    │                        │
-                                    ▼                        ▼
-                        torna a STEP 1 (issue      merge + close issue
-                        aggiornata con i gap)      → prossimo task
+request ──▶ 0. PLANNER ──▶ docs/ROADMAP.md (milestones + tasks)
+                                │
+task ─────▶ 1. ANALYST ──▶ GitHub issue (step:dev)
+                                │
+          2. DEVELOPER ──▶ commit + PR (step:review)
+                                │
+          3. REVIEWER ──▶ APPROVE: merge + close
+                          CHANGES: back to step 1 (step:analysis)
 ```
 
-- **Step 1 — Analyst** (`analyst`): legge il task dal coordinatore, analizza il
-  codice, produce il report e **apre la issue** con il contratto completo
-  (contesto, requisiti, criteri di accettazione, file, fuori scope, test,
-  rischi, stima). Etichetta `step:dev`.
-- **Step 2 — Developer** (`developer`): lavora **solo** sulla issue assegnata,
-  crea il ramo `task/<issue>-<slug>`, committa, apre la PR verso `v100`,
-  commenta il report di sviluppo. Etichetta `step:review`.
-- **Step 3 — Reviewer** (`reviewer`): verifica il lavoro **contro la issue**,
-  non contro le intenzioni. Se è corretto e completo: merge squash, chiude la
-  issue. Altrimenti: commenta i gap puntuali (file:riga), etichetta
-  `step:analysis` e il task torna allo Step 1.
-- Dopo **2 giri di review falliti** il task va in `step:blocked` e il
-  coordinatore chiede istruzioni all'umano.
+- **Step 0 — Planner** (`planner`): decomposes the request into milestones and
+  tasks and writes `docs/ROADMAP.md`. It does not write code, commit or open
+  issues. The coordinator keeps the document updated.
+- **Step 1 — Analyst** (`analyst`): reads the task from the roadmap, analyses
+  the code, opens the **issue** with the full contract (context, requirements,
+  acceptance criteria, files, out of scope, test plan, risks, estimate) and
+  sets `step:dev`.
+- **Step 2 — Developer** (`developer`): works **only** on the assigned issue,
+  creates `task/<issue>-<slug>`, commits, opens the PR towards `v100`, posts
+  the dev report and sets `step:review`.
+- **Step 3 — Reviewer** (`reviewer`): verifies the work **against the issue**,
+  not against intentions. If complete and correct: squash merge and close the
+  issue. Otherwise: comments the gaps (`file:line`), sets `step:analysis` and
+  the task goes back to step 1.
+- After **2 failed review rounds** the task goes to `step:blocked` and the
+  coordinator asks the human.
 
-## Ruoli OpenCode
+## OpenCode roles
 
-Definiti in `.opencode/agents/`:
+Defined in `.opencode/agents/`:
 
-| Agente | Modalità | Può | Non può |
+| Agent | Mode | Can | Cannot |
 | --- | --- | --- | --- |
-| `coordinator` | primary | leggere, orchestrare, `gh`, `git` in lettura | editare file, fare commit |
-| `analyst` | subagent | leggere, cercare, `gh issue`, test in lettura | editare, committare |
-| `developer` | subagent | editare, committare, push, `gh pr`, build/test | lanciare subagent |
-| `reviewer` | subagent | leggere diff, build/test, `gh` (comment/merge/close) | editare codice |
+| `coordinator` | primary | read, orchestrate, `gh`, read-only `git` | edit files, commit |
+| `planner` | subagent | read, `gh` read, write `docs/**` | edit code, commit, open issues |
+| `analyst` | subagent | read, search, `gh issue`, read-only tests | edit code, commit |
+| `developer` | subagent | edit, commit, push, `gh pr`, build/test | spawn subagents |
+| `reviewer` | subagent | read diffs, build/test, `gh` (comment/merge/close) | edit code |
 
-Per usare il coordinatore come agente primario: selezionarlo nella sessione
-(`/agent` o selettore agent) oppure impostare `"default_agent": "coordinator"`
-in `.opencode/opencode.json`.
+The project sets `default_agent: coordinator` in `.opencode/opencode.json`.
+Select another agent from the session agent picker when needed.
 
-## Costruire e testare
+## Build and test
 
 ```sh
 cargo build --release
 
-# test CPU (sempre eseguibili)
+# CPU tests (always available)
 cargo test --release
 
-# GPU Vulkan (V100) — richiede la GPU libera
+# GPU Vulkan (V100) — requires the GPU to be free
 M=/mnt/models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
 target/release/strata bench --model "$M" --gpu --backend vulkan \
   --pp 512,4096,32768 --tg 128 --reps 3 --ctx 32896
 
-# bench ripetibile (scrive in docs/V100-results.md)
+# repeatable benchmark (appends to docs/V100-results.md)
 tools/bench_v100.sh "$M" vulkan
 
-# parità (dopo il port CUDA; richiede llama-server)
+# parity (after the CUDA port; requires llama-server)
 python3 -I tools/parity.py "$M" --extra "--gpu --backend cuda" --tag sm70
 ```
 
-## Ambiente di riferimento
+## Reference environment
 
-| Voce | Valore |
+| Item | Value |
 | --- | --- |
-| GPU | Tesla V100-SXM2-32GB, sm_70, driver 580.178.04 (ultimo per Volta) |
-| CUDA | toolkit/NVRTC 12.9 (`/usr/local/cuda`), CUDA 13 **non** supporta sm_70 |
-| Vulkan | 1.4.312, **senza** `VK_KHR_cooperative_matrix` |
+| GPU | Tesla V100-SXM2-32GB, sm_70, driver 580.178.04 (last branch for Volta) |
+| CUDA | toolkit/NVRTC 12.9 (`/usr/local/cuda`), CUDA 13 does **not** support sm_70 |
+| Vulkan | 1.4.312, **without** `VK_KHR_cooperative_matrix` |
 | Rust | stable (rustup), edition 2024 |
-| Modello di riferimento | `Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf` (12.3 GB) |
-| Produzione | `llama.router.service` sulla stessa GPU |
+| Reference model | `Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf` (12.3 GB) |
+| Production | `llama.router.service` on the same GPU |
 
-## Convenzioni git
+## Git conventions
 
-- Rami: `task/<numero-issue>-<slug>` (es. `task/12-cuda-sm70-warp-reduce`).
-- Commit: Conventional Commits — `feat(cuda): ...`, `fix(vulkan): ...`,
-  `test: ...`, `docs: ...`, `chore: ...`. Un commit = un passo logico.
-- PR: titolo `[#<issue>] <titolo task>`, body con `Closes #<issue>`, verso
+- Branches: `task/<issue-number>-<slug>` (e.g. `task/12-cuda-sm70-warp-reduce`).
+- Commits: Conventional Commits — `feat(cuda): ...`, `fix(vulkan): ...`,
+  `test: ...`, `docs: ...`, `chore: ...`. One commit per logical step.
+- PR: title `[#<issue>] <task title>`, body with `Closes #<issue>`, target
   `v100`, squash merge.
-- Prima della review: `git fetch upstream && git rebase upstream/main`
-  (o `v100`), build e test verdi.
+- Before review: `git fetch upstream && git rebase upstream/main` (or `v100`),
+  build and tests green.
 
 ## GitHub
 
-`gh` è già autenticato e il repository di default è
-`TheBrutalX/RustingStrata` (`gh repo set-default`). Nei comandi degli agenti
-passare comunque `--repo TheBrutalX/RustingStrata` per evitare ambiguità con
-il remote `upstream`. Le issue del fork sono separate da quelle di upstream.
+`gh` is authenticated and the default repository is `TheBrutalX/RustingStrata`
+(`gh repo set-default`). Agents still pass
+`--repo TheBrutalX/RustingStrata` explicitly to avoid ambiguity with the
+`upstream` remote. The fork's issues are separate from upstream's.
 
-## Mappa del progetto
+## Project map
 
-- `docs/V100.md` — piano per fasi.
-- `docs/V100-results.md` — numeri misurati (append-only).
-- `docs/agents/WORKFLOW.md` — protocollo operativo degli agenti.
-- `src/cuda/` — backend CUDA (`kernels.cu`, `mod.rs`).
-- `src/vulkan/` — backend Vulkan (`mod.rs`, `shaders/`, `spv/`).
-- `.github/ISSUE_TEMPLATE/task.yml` — contratto della issue.
+- `docs/ROADMAP.md` — living milestone and task plan (updated by the coordinator).
+- `docs/V100-results.md` — measured numbers (append-only).
+- `docs/agents/WORKFLOW.md` — agent protocol.
+- `src/cuda/` — CUDA backend (`kernels.cu`, `mod.rs`).
+- `src/vulkan/` — Vulkan backend (`mod.rs`, `shaders/`, `spv/`).
+- `.github/ISSUE_TEMPLATE/task.yml` — issue contract.
