@@ -98,7 +98,7 @@ struct Hosting {
     /// the admin key for every route.
     #[arg(long)]
     api_keys: Option<PathBuf>,
-    /// Append one JSON line per answered chat request (time, key name, token counts, timings) to this file.
+    /// Append one JSON line per chat request (time, key name, token counts, timings, how it finished) to this file.
     #[arg(long)]
     usage_log: Option<PathBuf>,
     /// Requests read or waiting at once; more get `503` with `Retry-After`.
@@ -1163,6 +1163,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             // With tools, a stream holds back the text from a `<tool_call>` tag on until the reply is parsed.
             let tools = req.tool_calls && !req.tools.is_empty();
             let mut cached = 0;
+            let mut k = 0;  // tokens decoded
             let mut opened = false;  // Messages API stream: the text block has started
             let mut hold = Hold::new(tools, req.stop);
             let n_system = tok.encode(&system)?.len();
@@ -1186,7 +1187,6 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                         write!(w, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), None))?;
                     }
                 }
-                let mut k = 0;
                 decode(r, tok, e.mtp() > 0, &mut smp, logits, n, &mut |t| {
                     s.stats.lock().unwrap().live_tokens += 1;
                     // A client that left stops the reply (a stream notices on the next write; held text writes nothing).
@@ -1205,24 +1205,32 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 gpu_stats(r, &mut st);
             }
             let decoded = t1.elapsed();
-            // The next request starts from the saved history state or from scratch. A stream that already started is just cut off.
-            let (out, stop) = match res {
-                Ok(x) => x,
-                Err(err) if !req.stream && !serve::gone(&w) => return send(&mut w, "500 Internal Server Error", json!({"error": {"message": format!("{err:#}"), "type": "server_error"}})),
-                Err(err) => return Err(err),
-            };
-            // A malformed call goes out as plain text.
-            let calls = if tools { tpl.parse_calls(&hold.text, &req.tools) } else { None };
             let ms = |d: Duration| d.as_secs_f64() * 1e3;
-            let last = serve::Last { at: created, model: name.into(), system_tokens: n_system, cached_tokens: cached,
-                prompt_tokens: ids.len(), completion_tokens: out.len(), prefill_ms: ms(t1 - t0), decode_ms: ms(decoded),
-                finish: if calls.is_some() { "tool_calls" } else if stop { "stop" } else { "length" }.into() };
-            if let Some(f) = &s.usage {
+            let mut last = serve::Last { at: created, model: name.into(), system_tokens: n_system, cached_tokens: cached,
+                prompt_tokens: ids.len(), completion_tokens: k, prefill_ms: ms(t1 - t0), decode_ms: ms(decoded), finish: String::new() };
+            let log = |last: &serve::Last| if let Some(f) = &s.usage {
                 let mut v = json!(last);
                 v["key"] = who.name.clone().into();
                 // A failed write must not fail the reply; it is reported.
                 if let Err(err) = writeln!(f.lock().unwrap(), "{v}") { eprintln!("usage log: {err}"); }
-            }
+            };
+            // The next request starts from the saved history state or from scratch. A stream that already started is just cut off.
+            let (out, stop) = match res {
+                Ok(x) => x,
+                Err(err) => {
+                    // Logged with the tokens decoded so far, which a client that left may have received.
+                    let gone = serve::gone(&w);
+                    last.finish = if gone { "cut" } else { "error" }.into();
+                    log(&last);
+                    if !req.stream && !gone { return send(&mut w, "500 Internal Server Error", json!({"error": {"message": format!("{err:#}"), "type": "server_error"}})); }
+                    return Err(err);
+                }
+            };
+            // A malformed call goes out as plain text.
+            let calls = if tools { tpl.parse_calls(&hold.text, &req.tools) } else { None };
+            last.completion_tokens = out.len();
+            last.finish = if calls.is_some() { "tool_calls" } else if stop { "stop" } else { "length" }.into();
+            log(&last);
             s.stats.lock().unwrap().record(last);
             let calls_json = |(content, calls): &(String, Vec<(String, String)>), stream: bool| {
                 let c: Vec<_> = calls.iter().enumerate().map(|(k, (f, a))| {
