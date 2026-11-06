@@ -51,7 +51,7 @@ void stw(uint tid, uint wv[8]) {
 }
 
 void main() {
-    uint tid = gl_LocalInvocationID.x, w = gl_SubgroupID, n0 = gl_WorkGroupID.x * 64;
+    uint tid = gl_LocalInvocationID.x, w = (gl_SubgroupID * (gl_SubgroupSize / 32u) + gl_SubgroupInvocationID / 32u), n0 = gl_WorkGroupID.x * 64;
     uint wm = (w >> 1) * 32, wn = (w & 1) * 32, m0, cnt;
     U8 wt;
     if (uint64_t(p.tiles) != 0) {
@@ -65,7 +65,7 @@ void main() {
 #endif
     for (uint i = tid; i < 256; i += 256) { ix[i] = float(i / 16); ix[256 + i] = float(i % 16); }
     load_tables();
-    uint g = gl_SubgroupInvocationID >> 2, t = gl_SubgroupInvocationID & 3;
+    uint g = (gl_SubgroupInvocationID & 31u) >> 2, t = (gl_SubgroupInvocationID & 31u) & 3;
     // sm (SM 1): the 2 x 4 output tiles of 16 x 16 go one per subgroup (rows tm, columns tn, in acc[0][0]) instead of
     // four each to subgroups 0 and 1. Each output sums the same products in the same order either way.
     const bool sm = SM != 0;

@@ -65,6 +65,15 @@ float log1p_(float a) {
 }
 float softplus(float x) { return x > 20.0 ? x : log1p_(expf_(x)); }
 
+// Reductions over each logical 32-lane warp, including either half of a 64-lane subgroup.
+uint warp_max_uint(uint v) { for (uint o = 16; o > 0; o >>= 1) v = max(v, subgroupShuffleXor(v, o)); return v; }
+uint warp_min_uint(uint v) { for (uint o = 16; o > 0; o >>= 1) v = min(v, subgroupShuffleXor(v, o)); return v; }
+uint warp_scan(uint v) {
+    uint lane = gl_SubgroupInvocationID & 31u, base = gl_SubgroupInvocationID & ~31u;
+    for (uint o = 1; o < 32; o <<= 1) { uint x = subgroupShuffle(v, base + (lane >= o ? lane - o : lane)); if (lane >= o) v += x; }
+    return v;
+}
+
 // Sums and maxima over a subgroup of 32 in the butterfly order of the CUDA warp_sum / warp_max.
 float warp_sum(float v) { for (uint o = 16; o > 0; o >>= 1) v += subgroupShuffleXor(v, o); return v; }
 float warp_max(float v) { for (uint o = 16; o > 0; o >>= 1) v = max(v, subgroupShuffleXor(v, o)); return v; }
@@ -74,9 +83,9 @@ shared float block_sum_s[32];
 float block_sum(float v) {
     v = warp_sum(v);
     barrier();
-    if (gl_SubgroupInvocationID == 0) block_sum_s[gl_SubgroupID] = v;
+    if ((gl_SubgroupInvocationID & 31u) == 0) block_sum_s[(gl_SubgroupID * (gl_SubgroupSize / 32u) + gl_SubgroupInvocationID / 32u)] = v;
     barrier();
-    return warp_sum(gl_SubgroupInvocationID < gl_NumSubgroups ? block_sum_s[gl_SubgroupInvocationID] : 0.0);
+    return warp_sum((gl_SubgroupInvocationID & 31u) < ((gl_WorkGroupSize.x + 31u) / 32u) ? block_sum_s[(gl_SubgroupInvocationID & 31u)] : 0.0);
 }
 
 // QSA mask (see qsa_select): whether query row t (mw words a row) sees key position `key`.
