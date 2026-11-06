@@ -98,7 +98,9 @@ STRATA_API_KEY=<admin key> strata serve --model $M --gpu --ctx 32768 --addr 127.
 ```
 
 Clients then use the OpenAI address `https://api.example.com/v1` with their key, or the Anthropic address
-`https://api.example.com` (`POST /v1/messages`).
+`https://api.example.com` (`POST /v1/messages`). The request fields Strata honors (sampling, `stop`, tools,
+thinking) are listed under [Use](../README.md#use) in the README; the usage of a streamed reply comes in its last
+chunk.
 
 ## Keys
 
