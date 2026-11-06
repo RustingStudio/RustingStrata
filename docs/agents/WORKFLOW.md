@@ -1,251 +1,282 @@
-# Workflow agenti — RustingStrata V100
+# Agent workflow — RustingStrata V100
 
-Protocollo operativo per lo sviluppo del fork. Tre agenti specializzati, un
-coordinatore che li orchestra. Ogni task attraversa gli step 1 → 2 → 3; la
-issue su GitHub è l'unica fonte di verità.
+Operating protocol for the fork. Three delivery steps (analysis, development,
+review) plus a planning step that produces the living roadmap. A coordinator
+orchestrates them. The GitHub issue is the single source of truth for every
+task.
 
-Vale per ogni task: fix, port, ottimizzazione, test, docs. Un task = una issue
-= un ramo = una PR.
+Applies to every task: fix, port, optimization, test, docs. One task = one
+issue = one branch = one PR. **Everything is written in English.**
 
 ---
 
-## 0. Stato e label
+## 0. State and labels
 
-La label `step:*` sulla issue dice dove si trova il task. Il coordinatore non
-lavora mai su una issue senza label o con più di una `step:*`.
+The `step:*` label on the issue says where the task is. The coordinator never
+works on an issue that has no `step:*` label or more than one.
 
-| Label | Significato |
+| Label | Meaning |
 | --- | --- |
-| `step:analysis` | in mano all'analyst (o in attesa di rianalisi dopo una review negativa) |
-| `step:dev` | analisi approvata, in sviluppo |
-| `step:review` | sviluppo pronto, in review |
-| `step:blocked` | serve una decisione umana |
+| `step:analysis` | with the analyst (or waiting for re-analysis after a failed review) |
+| `step:dev` | analysis accepted, in development |
+| `step:review` | development ready, in review |
+| `step:blocked` | a human decision is needed |
 
-Label di area: `area:cuda`, `area:vulkan`, `area:docs`, `area:ci`.
-Label di priorità: `priority:p0` (bloccante), `priority:p1`, `priority:p2`.
+Area labels: `area:cuda`, `area:vulkan`, `area:docs`, `area:ci`.
+Priority labels: `priority:p0` (blocking), `priority:p1`, `priority:p2`.
 
-Transizioni ammesse:
+Allowed transitions:
 
 ```
-(nuova) --analyst--> step:dev --developer--> step:review --reviewer--> chiusa
-                          ^                       |
-                          └──── step:analysis <───┘ (changes requested)
-qualsiasi step --coordinatore--> step:blocked --umano--> step:*
+(new) --analyst--> step:dev --developer--> step:review --reviewer--> closed
+                        ^                       |
+                        └──── step:analysis <───┘ (changes requested)
+any step --coordinator--> step:blocked --human--> step:*
 ```
+
+The **roadmap** (`docs/ROADMAP.md`) is a separate artifact: it lists
+milestones and tasks with their status and points to the issues. The
+coordinator keeps it updated; it is not driven by labels.
 
 ---
 
-## 1. Analyst — analisi e apertura issue
+## 0-bis. Planner — milestones and tasks
 
-**Input del coordinatore:** il task preso dalla roadmap (`docs/V100.md`,
-issue #1) o una richiesta dell'umano, con eventuali vincoli.
+**Input from the coordinator:** the request (or the next milestone to break
+down) and the constraints.
 
-**Cosa fa:**
+**What it does:**
 
-1. Legge il codice e i documenti rilevanti (`docs/V100.md`,
-   `docs/V100-results.md`, `AGENTS.md`, file toccati dal task).
-2. Verifica i presupposti sul campo: per CUDA/Vulkan, guarda le API usate, le
-   versioni, i limiti hardware (sm_70: niente `cp.async`, `ldmatrix`,
-   `mma.m16n8k16`, niente tensor core int8; Vulkan: 48 KB di shared, niente
-   cooperative matrix). Non inventa: se un dato non è verificabile, lo segna
-   come assunzione.
-3. Suddivide il lavoro in passi verificabili e stima lo sforzo.
-4. **Apre la issue** con il contratto qui sotto e label `step:dev`.
+1. Reads `AGENTS.md`, this protocol, `docs/V100-results.md`, the open issues
+   and the relevant code.
+2. Decomposes the request into milestones with verifiable exit criteria, and
+   each milestone into tasks small enough for one issue and one PR (S or M; L
+   must be split).
+3. Writes `docs/ROADMAP.md` with: goals/non-goals, hard constraints, status
+   legend, milestones (objective, exit criteria, dependencies, risks), task
+   tables (ID, title, scope, files, size, dependencies, acceptance, status,
+   issue, PR), critical path.
 
-**Non fa:** non modifica file, non committa, non implementa.
+**Does not:** modify code, commit, open issues, invent measurements.
 
-### Contratto della issue
+---
 
-Titolo: `[<area>] <verbo> <oggetto>` — es. `[cuda] Sostituire ldmatrix su sm_70`.
+## 1. Analyst — analysis and issue creation
+
+**Coordinator input:** the task taken from `docs/ROADMAP.md` (or a human
+request), with any constraints.
+
+**What it does:**
+
+1. Reads the code and the relevant documents (`docs/ROADMAP.md`,
+   `docs/V100-results.md`, `AGENTS.md`, files touched by the task).
+2. Checks assumptions against reality: for CUDA/Vulkan, look at the APIs used,
+   versions and hardware limits (sm_70: no `cp.async`, `ldmatrix`,
+   `mma.m16n8k16`, no int8 tensor cores; Vulkan: 48 KB shared memory, no
+   cooperative matrix). Never invent: mark unverifiable items as assumptions.
+3. Splits the work into verifiable steps and estimates effort.
+4. **Opens the issue** with the contract below and sets `step:dev`.
+
+**Does not:** modify files, commit, implement.
+
+### Issue contract
+
+Title: `[<area>] <verb> <object>` — e.g. `[cuda] Replace ldmatrix on sm_70`.
 
 ```md
-## Contesto
-Perché serve, stato attuale, cosa è già stato fatto (link a commit/PR/issue).
+## Context
+Why this is needed, current state, what has already been done (links).
 
-## Obiettivo
-Una frase verificabile.
+## Goal
+One verifiable sentence.
 
-## Requisiti
-- [ ] requisito puntuale 1
-- [ ] requisito puntuale 2
+## Requirements
+- [ ] specific requirement 1
+- [ ] specific requirement 2
 
-## Criteri di accettazione
-- [ ] comando esatto + output atteso (build, test, bench, parità)
-- [ ] nessuna regressione: <cosa misurare e con quale soglia>
+## Acceptance criteria
+- [ ] exact command + expected output (build, test, bench, parity)
+- [ ] no regression: <what to measure and the threshold>
 
-## File e aree
-Percorsi e funzioni toccate (es. `src/cuda/kernels.cu:ldsm4`).
+## Files and areas
+Paths and functions touched (e.g. `src/cuda/kernels.cu:ldsm4`).
 
-## Fuori scope
-Cosa NON va fatto in questo task (per evitare scope creep).
+## Out of scope
+What must NOT be done in this task (avoid scope creep).
 
-## Piano di test
-Comandi, modelli, backend, GPU libera sì/no, durata.
+## Test plan
+Commands, models, backend, GPU free yes/no, duration.
 
-## Rischi e assunzioni
-- rischio → mitigazione
-- assunzione → come verificarla
+## Risks and assumptions
+- risk -> mitigation
+- assumption -> how to verify it
 
-## Stima
-S / M / L (max 1 giorno / 1-3 giorni / >3 giorni). Se è L, proporre lo split.
+## Estimate
+S / M / L (max 1 day / 1-3 days / >3 days). If L, propose the split.
 
-## Riferimenti
-Link a codice, doc upstream, misure in `docs/V100-results.md`.
+## References
+Links to code, upstream docs, measurements in `docs/V100-results.md`.
 ```
 
-Se il task è troppo grande (L), l'analyst **non** apre una issue unica: apre
-la issue ombrello con lo split in sotto-task e il coordinatore li esegue uno
-alla volta.
+If the task is L, the analyst does **not** open a single issue: it opens an
+umbrella issue with the split into sub-tasks and the coordinator executes them
+one at a time.
 
 ---
 
-## 2. Developer — sviluppo
+## 2. Developer — implementation
 
-**Input del coordinatore:** numero della issue e ramo base (`v100`).
+**Coordinator input:** issue number and base branch (`v100`).
 
-**Cosa fa:**
+**What it does:**
 
-1. Legge la issue per intero (contratto + commenti) e il codice.
-2. Crea il ramo: `git switch -c task/<issue>-<slug> v100`.
-3. Implementa **solo** lo scope della issue. Se scopre che il contratto è
-   sbagliato, si ferma e commenta la issue chiedendo il ritorno allo Step 1:
-   non allarga il task di nascosto.
-4. Esegue i test del piano (build, test CPU, test GPU se previsti e se il
-   coordinatore ha liberato la GPU).
-5. Committa con Conventional Commits, apre la PR verso `v100`
-   (`gh pr create --draft`, body con `Closes #<issue>`), la segna ready e
-   commenta il report.
-6. Etichetta la issue `step:review` (togliendo `step:dev`).
+1. Reads the whole issue (contract + comments) and the code.
+2. Creates the branch: `git switch -c task/<issue>-<slug> v100`.
+3. Implements **only** the issue scope. If the contract turns out to be wrong,
+   it stops and comments on the issue asking to go back to step 1: it does not
+   silently widen the task.
+4. Runs the tests in the plan (build, CPU tests, GPU tests if planned and if
+   the coordinator has freed the GPU).
+5. Commits with Conventional Commits, opens the PR towards `v100`
+   (`gh pr create --draft`, body with `Closes #<issue>`), marks it ready and
+   posts the report.
+6. Sets the issue to `step:review` (removing `step:dev`).
 
-**Non fa:** non fa merge, non chiude issue, non tocca la GPU di produzione
-senza ok del coordinatore, non modifica file fuori scope.
+**Does not:** merge, close issues, touch the production GPU without the
+coordinator's approval, modify files outside scope.
 
-### Report di sviluppo (commento sulla issue)
+### Dev report (issue comment)
 
 ```md
 ## Dev report
-- Ramo: `task/...`
+- Branch: `task/...`
 - PR: #...
-- Commit: <sha> <messaggio> (uno per riga)
+- Commits: <sha> <message> (one per line)
 
-### Cosa è cambiato
-Punti concreti, con file:riga.
+### What changed
+Concrete points, with file:line.
 
-### Come è stato verificato
-Comandi eseguiti e output rilevante (build, test, bench, parità).
+### How it was verified
+Commands run and relevant output (build, test, bench, parity).
 
-### Scostamenti dal contratto
-Nessuno, oppure cosa e perché (richiede review esplicita).
+### Deviations from the contract
+None, or what and why (requires explicit review).
 
-### Dubbi aperti
-Domande per il reviewer/analyst.
+### Open questions
+Questions for the reviewer/analyst.
 ```
 
 ---
 
-## 3. Reviewer — verifica e chiusura
+## 3. Reviewer — verification and closure
 
-**Input del coordinatore:** numero della issue + PR.
+**Coordinator input:** issue number + PR.
 
-**Cosa fa:**
+**What it does:**
 
-1. Rilegge la issue (contratto) e la PR. Verifica **requisito per requisito**,
-   non "a sensazione".
-2. Ricostruisce e riesegue i test dichiarati (o li campiona se la GPU è
-   occupata; in quel caso lo dichiara).
-3. Controlla: scope rispettato, nessun file fuori scope, convenzioni
-   (`__CUDA_ARCH__` per il codice Volta, SPIR-V rigenerati, commit puliti),
-   licenza/attribution, niente segreti/binari.
-4. Verdetto.
+1. Re-reads the issue (contract) and the PR. Verifies **requirement by
+   requirement**, not by impression.
+2. Rebuilds and re-runs the declared tests (or samples them if the GPU is
+   busy; in that case it says so).
+3. Checks: scope respected, no out-of-scope files, conventions
+   (`__CUDA_ARCH__` for Volta code, regenerated SPIR-V, clean commits),
+   license/attribution, no secrets/binaries.
+4. Delivers a verdict.
 
-### Review (commento sulla issue)
+### Review (issue comment)
 
 ```md
 ## Review
-Verdetto: APPROVE | CHANGES REQUESTED
+Verdict: APPROVE | CHANGES REQUESTED
 
 ### Checklist
-- [ ] tutti i requisiti della issue
-- [ ] criteri di accettazione verificati (output allegato)
-- [ ] nessuna regressione misurata
-- [ ] scope rispettato, nessun file extra
-- [ ] build/test verdi
-- [ ] convenzioni del repo (AGENTS.md)
+- [ ] all issue requirements
+- [ ] acceptance criteria verified (output attached)
+- [ ] no measured regression
+- [ ] scope respected, no extra files
+- [ ] build/tests green
+- [ ] repository conventions (AGENTS.md)
 
-### Riscontri
-- [bloccante] file:riga — cosa non va e cosa serve
-- [minore] ...
-- [nota] ...
+### Findings
+- [blocking] file:line — what is wrong and what is needed
+- [minor] ...
+- [note] ...
 
-### Verifica eseguita
-Comandi + output.
+### Verification performed
+Commands + output.
 ```
 
-**APPROVE:** merge squash della PR su `v100`, chiude la issue, scrive nel
-commento finale il commit di merge. Il coordinatore passa al task successivo.
+**APPROVE:** squash-merge the PR into `v100`, close the issue, write the merge
+commit in the final comment. The coordinator updates the roadmap and moves to
+the next task.
 
-**CHANGES REQUESTED:** lascia la PR aperta, commenta i gap puntuali, mette
-`step:analysis` (toglie `step:review`). Il task torna allo Step 1: l'analyst
-aggiorna il contratto con quanto emerso e le nuove istruzioni, poi `step:dev`.
+**CHANGES REQUESTED:** leaves the PR open, comments the specific gaps, sets
+`step:analysis` (removing `step:review`). The task goes back to step 1: the
+analyst updates the contract with what emerged and the new instructions, then
+`step:dev`.
 
-Dopo **2** giri negativi: `step:blocked` e domanda all'umano.
+After **2** failed rounds: `step:blocked` and a question to the human.
 
 ---
 
-## 4. Coordinatore — orchèstra
+## 4. Coordinator — orchestration
 
-Non scrive codice. Per ogni task:
+Does not write code. For every task:
 
-1. Sceglie il task dalla roadmap (#1 / `docs/V100.md`) rispettando priorità e
-   dipendenze. Un task alla volta.
-2. Lancia `analyst` con: obiettivo, vincoli, link a roadmap e misure.
-3. Quando la issue è pronta con `step:dev`, lancia `developer` con il numero.
-4. Quando è `step:review`, lancia `reviewer` con issue + PR.
-5. Se APPROVE: verifica che la issue sia chiusa e la PR mergiata, aggiorna la
-   roadmap (checkbox in `docs/V100.md`), passa al task successivo.
-6. Se CHANGES REQUESTED: rilancia `analyst` con il commento di review; il
-   ciclo riparte. Conta i giri.
-7. Se `step:blocked` o dopo 2 giri: si ferma e chiede all'umano.
+1. Takes the next task from `docs/ROADMAP.md`, respecting priority and
+   dependencies. One task at a time.
+2. Launches `analyst` with: objective, constraints, links to the roadmap and
+   measurements.
+3. When the issue is ready with `step:dev`, launches `developer` with the
+   number.
+4. When it is `step:review`, launches `reviewer` with issue + PR.
+5. On APPROVE: verifies the issue is closed and the PR merged, updates
+   `docs/ROADMAP.md` (task status, issue/PR links), moves to the next task.
+6. On CHANGES REQUESTED: relaunches `analyst` with the review comment; the
+   cycle restarts. Counts the rounds.
+7. On `step:blocked` or after 2 rounds: stops and asks the human.
 
-Il coordinatore può sempre: leggere file/issue/PR, `git log/diff/status`,
-`gh issue/pr view`, e fermare/riavviare la GPU di produzione **solo** per i
-test previsti dal piano della issue.
+The coordinator may always: read files/issues/PRs, `git log/diff/status`,
+`gh issue/pr view`, and stop/restart the production GPU **only** for the tests
+planned in the issue.
 
-Tutti i comandi GitHub usano `--repo TheBrutalX/RustingStrata` (il fork ha un
-tracker separato da upstream; `gh repo set-default` è già impostato).
+All GitHub commands pass `--repo TheBrutalX/RustingStrata` (the fork has its own
+tracker, separate from upstream; `gh repo set-default` is already configured).
 
-### Prompt di lancio (riferimento)
+### Launch prompts (reference)
 
-- Analyst: *"Analizza il task `<titolo>`. Contesto: `<...>`. Apri la issue
-  secondo il contratto in AGENTS.md. Non modificare codice."*
-- Developer: *"Implementa la issue #`<n>`. Ramo da `v100`. Segui il contratto
-  alla lettera; se è sbagliato, fermati e commenta. Apri la PR e aggiorna le
-  label."*
-- Reviewer: *"Verifica la PR #`<p>` contro la issue #`<n>`. Approva e mergia
-  solo se tutti i criteri sono verificati; altrimenti elenca i gap e rimanda a
+- Planner: *"Decompose `<request>` into milestones and tasks and write
+  `docs/ROADMAP.md` per the contract in AGENTS.md. English only."*
+- Analyst: *"Analyse task `<title>`. Context: `<...>`. Open the issue per the
+  contract in AGENTS.md. Do not modify code."*
+- Developer: *"Implement issue #`<n>`. Branch from `v100`. Follow the contract
+  exactly; if it is wrong, stop and comment. Open the PR and update the
+  labels."*
+- Reviewer: *"Verify PR #`<p>` against issue #`<n>`. Approve and merge only if
+  every criterion is verified; otherwise list the gaps and send it back to
   `step:analysis`."*
 
 ---
 
 ## 5. Definition of ready / done
 
-**Ready (si può passare allo Step 2):** issue con contesto, requisiti
-verificabili, criteri di accettazione con comandi esatti, file toccati, fuori
-scope, piano di test, stima ≤ M.
+**Ready (can move to step 2):** issue with context, verifiable requirements,
+acceptance criteria with exact commands, files touched, out of scope, test
+plan, estimate <= M.
 
-**Done (si può chiudere):** tutti i requisiti e i criteri di accettazione
-verificati dal reviewer; build e test verdi; nessuna regressione misurata;
-scope rispettato; docs aggiornate se cambia il comportamento; nessun segreto o
-artefatto committato.
+**Done (can be closed):** all requirements and acceptance criteria verified by
+the reviewer; build and tests green; no measured regression; scope respected;
+docs updated when behaviour changes; no secrets or artifacts committed.
 
 ---
 
-## 6. Regole di sicurezza e ambiente
+## 6. Safety and environment rules
 
-- La V100 è condivisa con `llama.router.service` (produzione). I test GPU si
-  fanno solo dopo ok del coordinatore, che ferma e riavvia il servizio.
-- `CUDA 13` non supporta sm_70: usare NVRTC 12.x. `Cargo`/`rustup` sono in
+- The V100 is shared with `llama.router.service` (production). GPU tests run
+  only after the coordinator's approval; the coordinator stops and restarts
+  the service.
+- `CUDA 13` does not support sm_70: use NVRTC 12.x. `cargo`/`rustup` live in
   `~/.cargo`.
-- I modelli di test stanno in `/mnt/models` e non si committano.
-- Se un test produce `Xid`/`device lost`, annotare il comando e fermarsi: è un
-  bug, non un rumore.
+- Test models live in `/mnt/models` and are never committed.
+- If a test produces `Xid`/`device lost`, record the command and stop: that is
+  a bug, not noise.
