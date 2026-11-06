@@ -350,6 +350,8 @@ The file only grows; rotate it with logrotate (`copytruncate`, since Strata keep
 - Bodies over 8 MiB are refused, a connection that sends nothing for 30 s is closed, and a body needs a
   `Content-Length` (a chunked upload gets `400`). nginx buffers the request by default, which covers both: a slow
   client then holds nginx, not a Strata place.
+- A missing or wrong key (`401`) and a malformed request (`400`) are answered as soon as they are read, without
+  a place in the queue, so a scan for keys does not delay paying customers.
 - A client that disconnects stops its reply within a few tokens, so the next request in the queue starts. One that
   leaves while its request waits in the queue costs no prefill: the request is dropped when its turn comes (with
   `--parallel`, within a quarter second).
