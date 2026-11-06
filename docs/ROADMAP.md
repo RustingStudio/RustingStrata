@@ -459,6 +459,36 @@ same window: M0-T5, M0-T6, M0-T7, M1-T7, M1-T8, M2-T8, M3-T4. CPU-only tasks
   to `docs/V100-results.md` (append-only) and links the entry from its issue.
 - **Superseded artifacts.** Issue #1 remains for history (closed); this
   document is the plan of record and is maintained in English only.
+### 9.1 GitHub Project and milestones
+
+- **Project:** [RustingStrata V100](https://github.com/users/TheBrutalX/projects/5)
+  (project 5), linked to `TheBrutalX/RustingStrata`.
+- **Views:** `Roadmap` (table: Task ID, Milestone group, Status, Size, Depends
+  on) and `Board` (board by Status).
+- **Fields:** built-in Status (`Todo`, `In progress`, `In review`, `Blocked`,
+  `Done`), `Milestone group` (M0–M4), `Task ID`, `Size`, `Depends on`.
+- **Items:** one draft item per task (36). The three completed M0 tasks are
+  `Done`; the rest are `Todo`.
+- **Repository milestones:** `M0 — Baseline, process and Vulkan stability` (#1),
+  `M1 — CUDA sm_70 bring-up` (#2), `M2 — CUDA performance on the V100` (#3),
+  `M3 — Vulkan fallback hardening` (#4), `M4 — CI, parity, release and
+  upstreaming` (#5).
+
+**Sync protocol (coordinator).** When the analyst opens the issue for a task:
+
+1. add the issue to the project:
+   `gh project item-add 5 --owner TheBrutalX --url <issue-url>`;
+2. set the repository milestone that matches the task's `Milestone group`;
+3. copy `Task ID`, `Size` and `Depends on` to the issue item (the draft item
+   keeps the long scope/acceptance text);
+4. archive the draft item once the issue item carries the same fields
+   (`gh project item-archive`), so the board has one row per task;
+5. move `Status` as the workflow advances (`step:dev` → `In progress`,
+   `step:review` → `In review`, merged → `Done`, blocked → `Blocked`).
+
+The roadmap and the project must agree at all times: the document is the
+source of truth, the project is the board view of it.
+
 - **References.** `docs/V100-results.md` (numbers), `docs/baseline.md`,
   `docs/m2-results.md`, `docs/m4-results.md`, `docs/m6-results.md` (parity
   gate history), `docs/agents/WORKFLOW.md` (process),

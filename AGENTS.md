@@ -137,6 +137,7 @@ python3 -I tools/parity.py "$M" --extra "--gpu --backend cuda" --tag sm70
 ## Project map
 
 - `docs/ROADMAP.md` — living milestone and task plan (updated by the coordinator).
+- [GitHub Project 5](https://github.com/users/TheBrutalX/projects/5) — board view of the roadmap (draft items + repo milestones M0–M4); the coordinator keeps it in sync.
 - `docs/V100-results.md` — measured numbers (append-only).
 - `docs/agents/WORKFLOW.md` — agent protocol.
 - `src/cuda/` — CUDA backend (`kernels.cu`, `mod.rs`).
