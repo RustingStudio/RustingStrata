@@ -800,14 +800,19 @@ impl Vk {
         ensure!(cols % 64 == 0, "{} matrix with {cols} columns: GEMM needs a multiple of 64", ty.name());
         if n_tiles == 0 { return Ok(()); }
         let (spec, grid, nk) = (self.wspec(ty), [rows.div_ceil(64), n_tiles, 1], (cols / 64) as u32);
+        let (same, act) = (act & SAME_X != 0, act & !SAME_X);
+        let mut q8 = self.3.lock().unwrap();
+        let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);  // as on CUDA
+        let reuse = same && q8.1 == key;
+        // A SAME_X gemm inside a batch cannot quantize x (the quantize and the gemm would not be ordered): when the
+        // cached q8 rows are not x's, use the f16 kernel (as on CUDA).
+        let int8 = crate::cuda::Gpu::mmq(ty) && cols.is_multiple_of(128);
+        let f = !int8 || (same && !reuse && self.0.st().batch);
         // A dense GEMM of few workgroups runs as gemm_fs/gemmi_s (cooperative matrices only), 32 positions a
         // workgroup (as on CUDA).
-        let f = !crate::cuda::Gpu::mmq(ty) || cols % 128 != 0;
         let sm = tiles == 0 && grid[0] * grid[1] < 112 && if f { self.0.coop } else { self.0.coop_i8 };
         let grid = if sm { [grid[0], nd.div_ceil(32), 1] } else { grid };
-        let (same, act) = (act & SAME_X != 0, act & !SAME_X);
         let tail = [&(rows as u32) as &dyn Arg, &nk, &act];
-        let mut q8 = self.3.lock().unwrap();
         // gemmi loads q8 rows 16 bytes at a time: their stride (cols * 11 / 8) is aligned only for cols % 128 == 0.
         if f {
             if !same { q8.1 = None; }
@@ -820,8 +825,7 @@ impl Vk {
         let need = n_x * (cols + cols / 8 + cols / 4);
         if q8.0.len() < need { q8.0 = self.alloc(need)?; }  // dropping the old buffer waits for work that uses it
         let xq = q8.0.addr();
-        let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);  // as on CUDA
-        if !(same && q8.1 == key) {
+        if !reuse {
             ensure!(!self.0.st().batch, "gemm inside batch: x must be quantized already (SAME_X)");
             self.run("quant_q8", &[self.0.llama], [n_x, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
             q8.1 = key;

@@ -268,8 +268,13 @@ impl Gpu {
         let grid = if sm { (grid.0, nd.div_ceil(32) as u32) } else { grid };
         let (same, act) = (act & SAME_X != 0, act & !SAME_X);
         let mut q8 = self.q8.lock().unwrap();
+        let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
+        let reuse = same && q8.1 == key;
         // The int8 path loads q8 rows 16 bytes at a time: their stride (cols * 11 / 8) is aligned only for cols % 128 == 0.
-        if !Self::mmq(ty) || cols % 128 != 0 {
+        // A SAME_X gemm inside a batch cannot quantize x (the quantize and the gemm would land on different streams):
+        // when the cached q8 rows are not x's, use the f16 kernel.
+        let int8 = Self::mmq(ty) && cols.is_multiple_of(128);
+        if !int8 || (same && !reuse && self.nb.load(Relaxed) < BESIDE) {
             if !same { q8.1 = None; }
             launch!(self, &kname(if sm { "gemms" } else { "gemm" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
                 tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act);
@@ -283,8 +288,7 @@ impl Gpu {
         let need = n_x * (cols + cols / 8 + cols / 4);
         if q8.0.len() < need { q8.0 = self.stream.alloc_zeros::<u8>(need)?; }
         let xq = self.ptr(&q8.0);
-        let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
-        if !(same && q8.1 == key) {
+        if !reuse {
             anyhow::ensure!(self.nb.load(Relaxed) >= BESIDE, "gemm inside batch: x must be quantized already (SAME_X)");
             launch!(self, "quant_q8", cfg((n_x as u32, 1), 256, 0), x, x_stride as i32, xq, cols as i32);
             q8.1 = key;
