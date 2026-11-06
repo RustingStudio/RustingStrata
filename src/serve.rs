@@ -231,8 +231,8 @@ pub struct Stats {
     /// MoE expert cache hits and misses, and MTP drafts tried and accepted, since the model loaded.
     pub experts: Option<(u64, u64)>,
     pub drafts: Option<(u64, u64)>,
-    /// A reply is being generated, and its tokens so far.
-    pub busy: bool,
+    /// Replies being generated, and their tokens so far.
+    pub busy: usize,
     pub live_tokens: usize,
     pub requests: u64,
     pub prompt_tokens: u64,
