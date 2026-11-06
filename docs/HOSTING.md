@@ -11,8 +11,10 @@ its own license (most Qwen models are Apache 2.0; check the model card).
 ## How much one server does
 
 By default `strata serve` answers one chat request at a time. Others wait in a queue (`--max-waiting`, 16 by default)
-and run in arrival order; more than that get `503 Service Unavailable` with `Retry-After: 2` (`--max-per-key` keeps one
-customer from taking all the places). One request decodes at
+and run in arrival order. `--max-waiting` counts every open connection (being read, generated or queued, health
+checks included), so with one reply running 15 places are left for the queue. Beyond it a connection gets
+`503 Service Unavailable` with `Retry-After: 2` (`--max-per-key` keeps one customer from taking all the places). One
+request decodes at
 the speed in the README (about 113 tok/s for Qwen3.6-35B-A3B Q2_K_XL on an RTX 3060), so that is also the total for
 all users of one server. Long prompts block the queue for their prefill time (about 2 s for 4K tokens on the 3060).
 
@@ -98,9 +100,12 @@ On a Linux machine with an NVIDIA driver (or a Vulkan 1.3 driver):
 cargo build --release
 sudo install -m 755 target/release/strata /usr/local/bin/strata
 
-# 2. A model, and the calibration for this machine (once per model and machine).
+# 2. A service user, a model, and the calibration for this machine (once per model and machine). It runs as the
+#    service user, with the --ctx and --kv of the server, because it is kept in that user's ~/.cache/rusting_strata.
+sudo useradd --system --create-home --home-dir /var/lib/strata strata
+sudo usermod -aG video,render strata      # GPU device access on most distributions
 M=/srv/models/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
-strata calibrate --model $M
+sudo -u strata strata calibrate --model $M --ctx 32768 --kv q8
 
 # 3. Keys: one admin key, and a file of customer keys.
 openssl rand -hex 24                            # run once per key
@@ -110,10 +115,11 @@ sudo tee /etc/strata/keys.txt >/dev/null <<'EOF'
 acme       3f9c0d6e5b...
 beta-corp  a81e44f2c7...
 EOF
-sudo chmod 600 /etc/strata/keys.txt
+sudo chown strata /etc/strata/keys.txt && sudo chmod 600 /etc/strata/keys.txt
 
 # 4. Run it on the loopback address; the reverse proxy below is the only thing that faces the network.
-STRATA_API_KEY=<admin key> strata serve --model $M --gpu --ctx 32768 --addr 127.0.0.1:8080 \
+#    (systemd below runs the same command as a service.)
+sudo -u strata env STRATA_API_KEY=<admin key> strata serve --model $M --gpu --ctx 32768 --addr 127.0.0.1:8080 \
     --api-keys /etc/strata/keys.txt --usage-log /var/lib/strata/usage.jsonl --max-tokens 4096 --parallel 4 --kv q8 \
     --max-per-key 4
 ```
@@ -128,18 +134,20 @@ chunk.
 - **Admin key** (`--api-key`, or `STRATA_API_KEY` to keep it out of the process list). It can use every route: the
   chat APIs, the chat page's stats, loading another model (`/api/load`) and downloading models (`/api/download`).
   Keep it for yourself.
-- **Customer keys** (`--api-keys FILE`). One `name key` pair a line, `#` starts a comment. Keys must be at least 16
-  characters, and names and keys must not repeat. A customer key reaches only `POST /v1/chat/completions`,
+- **Customer keys** (`--api-keys FILE`). One `name key` pair a line, `#` starts a comment (so a key cannot contain
+  `#`). Keys must be at least 16 characters, names and keys must not repeat, and the admin key must not be among
+  them. A customer key reaches only `POST /v1/chat/completions`,
   `POST /v1/messages`, `POST /v1/messages/count_tokens` and `GET /v1/models`; other routes answer `403`. The name
   goes into the usage log.
 - **Changing the key file.** The server reads the file again when it changes, and the next request uses the new
-  keys; replies being generated go on. A file that does not parse, or one with no keys, keeps the old keys (the
-  server log says why). Write a new file and rename it over the old one, so that the server never reads it half
+  keys; replies being generated go on. A file that cannot be read or does not parse keeps the old keys (the server
+  log says why). A file with no keys removes all customer keys when there is an admin key; without one it is refused,
+  as it is at start, because the server would be open. Write a new file and rename it over the old one, so that the server never reads it half
   written:
 
   ```sh
   sudo sh -c 'cp /etc/strata/keys.txt /etc/strata/keys.new && echo "gamma $(openssl rand -hex 24)" >> /etc/strata/keys.new \
-      && chmod 600 /etc/strata/keys.new && mv /etc/strata/keys.new /etc/strata/keys.txt'
+      && chown strata /etc/strata/keys.new && chmod 600 /etc/strata/keys.new && mv /etc/strata/keys.new /etc/strata/keys.txt'
   ```
 
   A removed key gets `401` from its next request on. A key that stays keeps its cached conversations, even when its
@@ -147,7 +155,8 @@ chunk.
 - With customer keys and no admin key, nobody can use the admin routes.
 - With no key at all the server is open to anyone who reaches it. That is meant for a local machine only.
 
-Clients send the key as `Authorization: Bearer <key>` (OpenAI) or `x-api-key: <key>` (Anthropic).
+Clients send the key as `Authorization: Bearer <key>` (OpenAI; `Bearer` as written) or `x-api-key: <key>`
+(Anthropic).
 
 **Privacy between keys.** Strata keeps recent conversation states in GPU and host memory (`--cache-ram`) so that a
 request that continues a conversation prefills only the new part. Each key only reuses states that its own requests
@@ -250,18 +259,16 @@ ExecStart=/usr/local/bin/strata serve --model /srv/models/Qwen3.6-35B-A3B-UD-Q2_
 StateDirectory=strata
 Restart=on-failure
 RestartSec=5
-# Replies being generated finish before the server stops; long ones need more than the default 90 s.
+# Accepted requests (queued ones too) finish before the server stops; that needs more than the default 90 s.
 TimeoutStopSec=300
 
 [Install]
 WantedBy=multi-user.target
 ```
 
+With the user, keys and calibration of the quick start:
+
 ```sh
-sudo useradd --system --create-home --home-dir /var/lib/strata strata
-sudo chown strata /etc/strata/keys.txt
-sudo usermod -aG video,render strata      # GPU device access on most distributions
-sudo -u strata strata calibrate --model /srv/models/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
 sudo systemctl daemon-reload && sudo systemctl enable --now strata
 journalctl -u strata -f
 ```
@@ -271,7 +278,9 @@ Run `calibrate` as the service user, because the calibration file and the CUDA k
 `503` until the model has loaded.
 
 **Stopping and restarting.** On `SIGTERM` (`systemctl stop` or `restart`) the server answers new requests, `/health`
-included, with `503` and `Retry-After: 5`, lets the replies being generated finish, and then exits. A load balancer
+included, with `503` and `Retry-After: 5`, lets the requests it already accepted finish (the queued ones too), saves
+the routing profile it learned, so that the next start places the experts as well, and then exits.
+`TimeoutStopSec` must cover a full queue, or keep `--max-waiting` low. A load balancer
 sends the new requests to the other servers meanwhile, so restarting one server at a time cuts no reply. `systemd`
 sends `SIGKILL` after `TimeoutStopSec`; Ctrl+C still stops at once. On Windows there is no such drain.
 
@@ -283,10 +292,12 @@ sends `SIGKILL` after `TimeoutStopSec`; Ctrl+C still stops at once. On Windows t
   generated or queued besides this one; `slots` is how many are generated at once (`--parallel`). A load balancer
   can send the next request to the server with the lowest `waiting / slots`.
 - `503 {"status": "loading"}` or `503 {"status": "no model"}` otherwise.
+- `503` with an `error` body (no `status`) when `--max-waiting` connections are open, or while the server stops. A
+  load balancer then treats a full server as down, which sends the next requests elsewhere.
 
 Point the load balancer or your monitoring at it.
 
-`GET /metrics` gives the same numbers and more in Prometheus text format: `strata_up`, `strata_slots`,
+`GET /metrics` gives the same numbers and more in Prometheus text format: `strata_up`, `strata_uptime_seconds`, `strata_slots`,
 `strata_busy`, `strata_waiting`, `strata_requests_total`, `strata_prompt_tokens_total`,
 `strata_cached_prompt_tokens_total`, `strata_completion_tokens_total`, `strata_vram_used_bytes` /
 `strata_vram_total_bytes` and, for MoE models, `strata_expert_hits_total` / `strata_expert_misses_total`
@@ -336,12 +347,14 @@ The file only grows; rotate it with logrotate (`copytruncate`, since Strata keep
   KV memory grows with it: about 650 MB at 32K for the 35B model, half that with `--kv q8`.
 - `--max-tokens` caps the reply length a request may ask for, and is the length when it asks for none. Without it a
   request may decode until the context is full, which holds the server for minutes.
-- Bodies over 8 MiB are refused, and a client has 30 s to send its request.
+- Bodies over 8 MiB are refused, a connection that sends nothing for 30 s is closed, and a body needs a
+  `Content-Length` (a chunked upload gets `400`). nginx buffers the request by default, which covers both: a slow
+  client then holds nginx, not a Strata place.
 - A client that disconnects stops its reply within a few tokens, so the next request in the queue starts. One that
   leaves while its request waits in the queue costs no prefill: the request is dropped when its turn comes (with
   `--parallel`, within a quarter second).
 - With `--parallel N`, `--ctx` is per slot: N slots of 32K need N times the KV memory of one.
-- `--max-per-key N` caps the requests one customer key may have open at once (read, generated or queued); more get
+- `--max-per-key N` caps the requests one customer key may have open at once (generated or queued; a request counts once it is read); more get
   `429 Too Many Requests` with `Retry-After: 1` and the OpenAI error type `rate_limit_error`, which the OpenAI and
   Anthropic SDKs retry. The admin key is not counted. Set it below `--max-waiting`, so that one customer cannot fill
   the whole queue and leave the others with `503`.
@@ -356,7 +369,8 @@ strata serve --model $M --gpu --device 1 --addr 127.0.0.1:8082 --threads 6 ...
 ```
 
 ```nginx
-upstream strata { least_conn; server 127.0.0.1:8081; server 127.0.0.1:8082; }
+# max_fails=0: a busy 503 must not mark the server down for 10 s (with both busy, nginx would answer 502).
+upstream strata { least_conn; server 127.0.0.1:8081 max_fails=0; server 127.0.0.1:8082 max_fails=0; }
 # In the location block: a 503 (busy or stopping) is sent before any work, so another server may take the request.
 proxy_next_upstream error http_503 non_idempotent;
 ```
