@@ -77,7 +77,7 @@ edits old measurement entries: new runs append.
   decode).
 - **Upstreamable.** All Volta-specific code stays behind `#if __CUDA_ARCH__`
   or equivalent helpers; the sm_80+ path and its numerics stay unchanged.
-  Generic fixes are offered upstream.
+  Offering fixes upstream is explicitly out of scope for now (see non-goals).
 - **Repeatable.** CI (non-GPU) and a scheduled GPU suite on the V100 keep the
   state from rotting; releases carry both backends with sm_70 notes.
 
@@ -88,6 +88,8 @@ edits old measurement entries: new runs append.
   exists.
 - Beating llama.cpp on every model: the dense 27B gap is a known consequence
   of Vulkan lacking cooperative matrices; CUDA is the intended fix.
+- Offering fixes upstream to `RustingStudio/RustingStrata`: deferred, not
+  planned in this roadmap (the fork stays rebasable, nothing more).
 - Changing upstream numerics or refactoring the sm_80+ kernels for style.
 - Multimodal/other architectures beyond what upstream supports.
 - Selling the engine or re-licensing the fork (see §3.3).
@@ -347,11 +349,11 @@ goes through the preflight from M0-T4 and is measured.
 
 ---
 
-### M4 — CI, parity automation, release and upstreaming
+### M4 — CI, parity automation and release
 
 **Objective.** Make the V100 state reproducible (non-GPU CI + scheduled GPU
-suite), automate the parity gate, ship a release with both backends, and offer
-the generic fixes upstream.
+suite), automate the parity gate, and ship a release with both backends.
+Upstreaming is deferred and not part of this milestone (see non-goals).
 
 **Exit criteria.**
 
@@ -363,31 +365,23 @@ the generic fixes upstream.
   production outside the window.
 - Parity for both backends is automated with the 99% threshold and a
   regression comparison against the previous run.
-- At least one upstream PR is open for a fix that is not Volta-specific, with
-  a conflict-risk note; the weekly upstream-sync job is green or reports the
-  exact conflict.
 - A release tag carries Linux/Windows binaries with sm_70 notes and updated
   English documentation.
 
 **Dependencies.** M0-T7/M0-T8 (parity and JSON capture) for the automation;
-M2-T8 and M3-T4 for the release gate. CI tasks (M4-T1, M4-T4) can start
-immediately.
+M2-T8 and M3-T4 for the release gate. M4-T1 can start immediately.
 
 **Risks.** A self-hosted runner on the production host can compete with
 `llama.router.service`; the lock and the service stop/restart must be part of
-the workflow, not a human habit. Upstream PRs may be rejected or conflict;
-the fork keeps working either way.
+the workflow, not a human habit.
 
 | ID | Title | Scope | Files / areas | Size | Deps | Acceptance | Status | Issue | PR |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | M4-T1 | Non-GPU CI workflow | PR job: `cargo build --release`, `cargo test --release` (GPU tests skip), `spirv_is_fresh` with `glslc`, table freshness; fix the `STRATA_MODEL` default so a missing model skips cleanly and document it | `.github/workflows/`, `tests/common/mod.rs`, `docs/` | M | — | Workflow green on a PR without a GPU; a stale SPIR-V or table fails with an actionable message | todo | | |
 | M4-T2 | Self-hosted V100 GPU suite | Scheduled workflow on a V100 runner: exclusive lock, stop/restart `llama.router.service`, run bench + parity for CUDA and Vulkan, upload artifacts, never leave the service stopped | `.github/workflows/`, `tools/`, `docs/agents/WORKFLOW.md` | M | M4-T1 | One scheduled run completes and restarts production; a deliberately failed step still restarts it (tested with a dry-run job) | todo | | |
 | M4-T3 | Automated parity gate for both backends | Wrap `tools/parity.py` for CUDA and Vulkan, apply the 99% either-mode threshold, compare with the previous stored result, publish a summary | `tools/parity.py`, `tools/`, `.github/workflows/` | M | M0-T7, M0-T8 | Gate fails on a parity drop; results are archived per run and tagged by backend | todo | | |
-| M4-T4 | Upstream sync job and conflict notes | Scheduled `git fetch upstream && git merge upstream/main` on a scratch branch, build and CPU tests, report conflicts restricted to the documented Volta-guarded regions | `.github/workflows/`, `docs/agents/WORKFLOW.md` | S | — | Job green or lists the conflicting files/hunks; no force-push, no rewrite of `v100` | todo | | |
-| M4-T5 | Audit fixes worth upstreaming | Classify fork commits: Volta-only vs generic (e.g. the non-cooperative `gemmi` shared-memory fix and the benchmark tooling); produce a short list with risk and upstream benefit | `docs/`, `git log` | S | M3-T4 | List appended to the docs with a per-item decision and rationale | todo | | |
-| M4-T6 | Open upstream PR(s) for generic fixes | Prepare minimal, rebased commits for the audited generic fixes, open PR(s) against `RustingStudio/RustingStrata` from the fork, keep license/attribution | branch(es) from `main`, `docs/` | M | M4-T5 | Draft upstream PR(s) linked from the fork issue; fork remains functional if upstream declines | todo | | |
-| M4-T7 | Documentation consolidation | English V100 documentation covering verified state, flags, constraints and benchmarks; update `README`/`AGENTS.md` links and the production-GPU procedure | `docs/`, `README.md`, `AGENTS.md` | S | M2-T8, M3-T4 | All planning docs and commands are English and work verbatim; no stale links | todo | | |
-| M4-T8 | Release with both backends | Tag a fork release, verify binaries build and load both backends on the V100, publish notes covering sm_70 limits, driver/toolkit pins and license/credit | `.github/workflows/release.yml`, `docs/` | S | M4-T7, M4-T3 | Release artifacts exist; notes verified against this document; license and attribution present | todo | | |
+| M4-T4 | Documentation consolidation | English V100 documentation covering verified state, flags, constraints and benchmarks; update `README`/`AGENTS.md` links and the production-GPU procedure | `docs/`, `README.md`, `AGENTS.md` | S | M2-T8, M3-T4 | All planning docs and commands are English and work verbatim; no stale links | todo | | |
+| M4-T5 | Release with both backends | Tag a fork release, verify binaries build and load both backends on the V100, publish notes covering sm_70 limits, driver/toolkit pins and license/credit | `.github/workflows/release.yml`, `docs/` | S | M4-T4, M4-T3 | Release artifacts exist; notes verified against this document; license and attribution present | todo | | |
 
 ---
 
@@ -402,8 +396,8 @@ M1-T1 ──▶ M1-T2 ─┐
         ──▶ M1-T5 ─┤                              └──▶ M2-T3/M2-T4/M2-T5/M2-T6
         ──▶ M1-T6 ─┘
 M0-T4 ──▶ M0-T5/M0-T6/M0-T7 ──▶ M3-T1 ──▶ M3-T2/T3 ──▶ M3-T4
-M0-T7/M0-T8 ──▶ M4-T3;  M4-T1 ──▶ M4-T2;  M3-T4 ──▶ M4-T5 ──▶ M4-T6
-M2-T8 + M3-T4 ──▶ M4-T7 ──▶ M4-T8
+M0-T7/M0-T8 ──▶ M4-T3;  M4-T1 ──▶ M4-T2
+M2-T8 + M3-T4 ──▶ M4-T4 ──▶ M4-T5
 ```
 
 The longest chain is **M1-T1 → M1-T4 → M1-T7 → M1-T8 → M2-T1 → M2-T2 →
@@ -422,12 +416,12 @@ M2-T8**. M2-T2 (attention tensor cores) is the riskiest item on it.
    M2-T3..M2-T6 and the M2-T8 gate.
 4. **M0-T6/T8 and M3** in parallel with M2, since they use the same GPU
    windows and do not block the CUDA chain.
-5. **M4-T1/M4-T4** early (no GPU), **M4-T2/M4-T3** after M2-T8, **M4-T5/M4-T6**
-   and **M4-T7/M4-T8** at the end.
+5. **M4-T1** early (no GPU), **M4-T2/M4-T3** after M2-T8, **M4-T4/M4-T5** at the
+   end.
 
 **GPU-window batching.** Tasks that need the V100 should be scheduled in the
 same window: M0-T5, M0-T6, M0-T7, M1-T7, M1-T8, M2-T8, M3-T4. CPU-only tasks
-(S: M1-T1, M1-T2, M4-T1, M4-T4, M4-T5) can proceed without a window.
+(S: M1-T1, M1-T2, M4-T1, M4-T4) can proceed without a window.
 
 ---
 
@@ -437,7 +431,7 @@ same window: M0-T5, M0-T6, M0-T7, M1-T7, M1-T8, M2-T8, M3-T4. CPU-only tasks
 | --- | --- | --- | --- |
 | 1 | Volta tensor-core fragment mapping in `attn_prefill_t` is wrong but plausible | High (silent numerical corruption; weeks) | Keep the FMA fallback compiled and selectable; land `gemm_q` (M2-T1) first; per-op tests against CPU reference; M2-T7 cross-backend report; coordinator sign-off before tuning |
 | 2 | `cp.async` removal changes synchronization, not just instructions | High (races that appear only at long context) | Audit every wait site in M1-T6 (`:1044-1081`, `:1733-1798`, `:2094-2191`), add explicit `__syncthreads`, test with `STRATA_NO_GRAPH`, repeated runs at 32K, and compare prefill logits with Vulkan |
-| 3 | Upstream drift makes `v100` expensive to rebase | Medium (schedule) | All Volta code behind `__CUDA_ARCH__`; weekly sync job (M4-T4); one logical commit per task; no reformatting of sm_80 code |
+| 3 | Upstream drift makes `v100` expensive to rebase | Medium (schedule) | All Volta code behind `__CUDA_ARCH__`; one logical commit per task; no reformatting of sm_80 code; a manual rebase check before large changes |
 | 4 | 48 KB Vulkan limit re-triggered by a new type or tile | Medium (device reset on production GPU) | M0-T4 preflight plus M0-T5 type matrix; every shader change measured and regenerated |
 | 5 | GPU contention or turbo/noise makes numbers non-comparable | Medium (wrong conclusions) | Same harness (`tools/bench_v100.sh`, `reps 3`), same window policy, record min/mean/max, never compare across different `--ctx`/`--chunk` |
 | 6 | NVRTC/driver regression on the last Volta branch | Low but fatal | Pin driver 580.178.04 and toolkit 12.9 in docs; `sm_70` compile is a CI smoke test on the runner (M4-T2) |
@@ -471,8 +465,7 @@ same window: M0-T5, M0-T6, M0-T7, M1-T7, M1-T8, M2-T8, M3-T4. CPU-only tasks
   `Done`; the rest are `Todo`.
 - **Repository milestones:** `M0 — Baseline, process and Vulkan stability` (#1),
   `M1 — CUDA sm_70 bring-up` (#2), `M2 — CUDA performance on the V100` (#3),
-  `M3 — Vulkan fallback hardening` (#4), `M4 — CI, parity, release and
-  upstreaming` (#5).
+  `M3 — Vulkan fallback hardening` (#4), `M4 — CI, parity and release` (#5).
 
 **Sync protocol (coordinator).** When the analyst opens the issue for a task:
 
