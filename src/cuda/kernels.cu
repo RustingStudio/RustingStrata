@@ -282,13 +282,20 @@ __device__ __forceinline__ int apply_signs(u32 g, u32 s) { u32 n = (s * 0x002040
 
 // QI form of scale_min_k4: d and dmin from one 4-byte load at b; with WORDS the 12 scale bytes from three 4-byte
 // loads too (faster for the Q4_K output head in gemv_bandwidth, slower for the Q5_K shapes).
+// The WORDS form on the four words already loaded: dm, then the scale bytes 0-3, 4-7, 8-11.
+__device__ __forceinline__ void k4_dm_w(u32 dm, u32 w0, u32 w1, u32 w2, int j, float& d, float& m) {
+    u32 sh = 8 * (j & 3), a = (w0 >> sh) & 255, c = (w1 >> sh) & 255, e = (w2 >> sh) & 255;
+    int s, mi;
+    if (j < 4) { s = a & 63; mi = c & 63; }
+    else { s = (e & 0xF) | ((a >> 6) << 4); mi = (e >> 4) | ((c >> 6) << 4); }
+    d = h2f((u16)dm) * (float)s; m = h2f((u16)(dm >> 16)) * (float)mi;
+}
 template <bool WORDS>
 __device__ __forceinline__ void k4_dm(const u8* b, int j, float& d, float& m) {
     u32 dm = ldu32(b); int s, mi;
     if (WORDS) {
-        u32 sh = 8 * (j & 3), a = (ldu32(b + 4) >> sh) & 255, c = (ldu32(b + 8) >> sh) & 255, e = (ldu32(b + 12) >> sh) & 255;
-        if (j < 4) { s = a & 63; mi = c & 63; }
-        else { s = (e & 0xF) | ((a >> 6) << 4); mi = (e >> 4) | ((c >> 6) << 4); }
+        k4_dm_w(dm, ldu32(b + 4), ldu32(b + 8), ldu32(b + 12), j, d, m);
+        return;
     } else {
         scale_min_k4(j, b + 4, s, mi);
     }
@@ -337,6 +344,14 @@ template <> struct QI<12> {  // Q4_K (144 bytes)
         k4_dm<true>(b, 2 * j + h, d, m);
         const u8* q = b + 16 + 32 * j + l;
         lo = (int)((ldu32(q) >> (4 * h)) & 0x0F0F0F0Fu); hi = (int)((ldu32(q + 4) >> (4 * h)) & 0x0F0F0F0Fu);
+    }
+    // get(sub) and get(sub + 1) for an even sub with two 16-byte loads; b must be 16-byte aligned.
+    __device__ static void get2(const u8* b, int sub, int& lo0, int& hi0, int& lo1, int& hi1, float& d, float& m) {
+        int e = sub * 8, j = e >> 6, h = (e >> 5) & 1, l = e & 31;
+        uint4 s = *(const uint4*)b, q = *(const uint4*)(b + 16 + 32 * j + l);
+        k4_dm_w(s.x, s.y, s.z, s.w, 2 * j + h, d, m);
+        lo0 = (int)((q.x >> (4 * h)) & 0x0F0F0F0Fu); hi0 = (int)((q.y >> (4 * h)) & 0x0F0F0F0Fu);
+        lo1 = (int)((q.z >> (4 * h)) & 0x0F0F0F0Fu); hi1 = (int)((q.w >> (4 * h)) & 0x0F0F0F0Fu);
     }
 };
 template <> struct QI<13> {  // Q5_K (176 bytes)
@@ -983,6 +998,16 @@ __device__ __forceinline__ void mma_s8_16832(int* c, u32 a0, u32 a1, u32 a2, u32
 }
 // int -> float for |c| < 2^22 without the quarter-rate I2F: 2^23 + 2^22 + c has c in its low mantissa bits.
 __device__ __forceinline__ float i2f_small(int c) { return __int_as_float(0x4B400000 + c) - 12582912.0f; }
+// The mma with every accumulator starting at I2F_BIAS: d = I2F_BIAS + sum, so i2f_small's integer add comes free.
+#define I2F_BIAS 0x4B400000
+__device__ __forceinline__ void mma_s8_16816_b(int* d, u32 a0, u32 a1, u32 b0) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};"
+                 : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a0), "r"(a1), "r"(b0), "r"(I2F_BIAS));
+}
+__device__ __forceinline__ void mma_s8_16832_b(int* d, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};"
+                 : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(I2F_BIAS));
+}
 // Weight types whose scale (and min) is constant over 32 weights: one 32-deep mma per scale.
 template <int T> __host__ __device__ constexpr bool scale32() { return T == 42 || T == 2 || T == 3 || T == 6 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23; }
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok) {
@@ -1004,7 +1029,7 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
     static_assert(BM == 128, "one X row half per thread");
     __shared__ __align__(16) signed char xq[2][XM * P], wq[64 * P];
     __shared__ __align__(16) float xd[2][XM][2], xsum[2][XM][4];
-    __shared__ float wsc[64][4], wmn[64][4];
+    __shared__ __align__(16) float2 wdm[4][64];  // W scale and min per 16 weights: [16-group][row]
     GemmTile tl = tiles ? tiles[blockIdx.y] : GemmTile{wd, (int)blockIdx.y * XM, min(XM, nd - (int)blockIdx.y * XM)};
     if (tiles && (tl.cnt <= 32) != SM) return;
     int n0 = blockIdx.x * 64, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
@@ -1025,6 +1050,7 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
     // W: thread decodes the 16 weights (subs 2 wi, 2 wi + 1 of the step) of row wr_.
     int wr_ = tid >> 2, wi = tid & 3;
     const u8* wp = n0 + wr_ < rows ? tl.w + (size_t)(n0 + wr_) * ROWB(cols, SBB) : nullptr;
+    const bool v16 = ((size_t)tl.w & 15) == 0 && ROWB(cols, SBB) % 16 == 0;  // QI::get2's 16-byte loads
     float acc[2][4][4] = {};
     const int nk = n64;
     // W step kb is decoded into registers during step kb - 1's mma and stored after it.
@@ -1035,13 +1061,16 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
         if (wp) {
             const u8* sbp = wp + (size_t)(kb >> 2) * SBB;
             int sub = (kb & 3) * 8 + 2 * wi;
+            if constexpr (T == 12) {
+                if (v16) { QI<12>::get2(sbp, sub, lo0, hi0, lo1, hi1, wd0, wm0); return; }
+            }
             QI<T>::get(sbp, sub, lo0, hi0, wd0, wm0);
             QI<T>::get(sbp, sub + 1, lo1, hi1, d1, m1);
         }
     };
     auto stw = [&]() {
         *(int4*)(wq + wr_ * P + wi * 16) = make_int4(lo0, hi0, lo1, hi1);
-        wsc[wr_][wi] = wd0; wmn[wr_][wi] = wm0;
+        wdm[wi][wr_] = make_float2(wd0, wm0);
     };
     ldx(0);
     ldw(0);
@@ -1053,9 +1082,19 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
         if (kb + 1 < nk) ldw(kb + 1);
         const int b = kb & 1;
         constexpr int KS = scale32<T>() ? 32 : 16;  // depth of one mma (one weight scale)
+        constexpr int MT = SM ? 1 : 2, NT8 = SM ? 2 : 4;
+        // X scales and sums of the step for this thread's rows (g, g + 8 of each mt), one vector load each.
+        float2 xdv[2][2]; float4 xsv[2][2];
+        #pragma unroll
+        for (int mt = 0; mt < MT; mt++)
+            #pragma unroll
+            for (int i = 0; i < 2; i++) {
+                int r = wm + mt * 16 + g + 8 * i;
+                xdv[mt][i] = *(const float2*)xd[b][r];
+                if (QI<T>::MIN) xsv[mt][i] = *(const float4*)xsum[b][r];
+            }
         #pragma unroll
         for (int h = 0; h < 64 / KS; h++) if (wm < tl.cnt) {
-            constexpr int MT = SM ? 1 : 2, NT8 = SM ? 2 : 4;
             u32 a[2][4], bw[4][2];
             float da[2][2], sa[2][2], dbv[4][2], mb[4][2];
             #pragma unroll
@@ -1064,10 +1103,11 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
                 const signed char* p = &xq[b][r * P + h * KS + 4 * t];
                 a[mt][0] = *(const u32*)p; a[mt][1] = *(const u32*)(p + 8 * P);
                 if (KS == 32) { a[mt][2] = *(const u32*)(p + 16); a[mt][3] = *(const u32*)(p + 8 * P + 16); }
-                da[mt][0] = xd[b][r][h * KS / 32]; da[mt][1] = xd[b][r + 8][h * KS / 32];
-                if (QI<T>::MIN) {
-                    sa[mt][0] = KS == 32 ? xsum[b][r][2 * h] + xsum[b][r][2 * h + 1] : xsum[b][r][h];
-                    sa[mt][1] = KS == 32 ? xsum[b][r + 8][2 * h] + xsum[b][r + 8][2 * h + 1] : xsum[b][r + 8][h];
+                #pragma unroll
+                for (int i = 0; i < 2; i++) {
+                    const float* xs = (const float*)&xsv[mt][i];
+                    da[mt][i] = h * KS / 32 ? xdv[mt][i].y : xdv[mt][i].x;
+                    if (QI<T>::MIN) sa[mt][i] = KS == 32 ? xs[2 * h] + xs[2 * h + 1] : xs[h];
                 }
             }
             #pragma unroll
@@ -1076,22 +1116,19 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
                 const signed char* p = wq + (n + g) * P + h * KS + 4 * t;
                 bw[nt][0] = *(const u32*)p;
                 if (KS == 32) bw[nt][1] = *(const u32*)(p + 16);
-                #pragma unroll
-                for (int e = 0; e < 2; e++) {
-                    dbv[nt][e] = wsc[n + 2 * t + e][h * KS / 16];
-                    if (QI<T>::MIN) mb[nt][e] = wmn[n + 2 * t + e][h * KS / 16];
-                }
+                float4 q = *(const float4*)&wdm[h * KS / 16][n + 2 * t];
+                dbv[nt][0] = q.x; mb[nt][0] = q.y; dbv[nt][1] = q.z; mb[nt][1] = q.w;
             }
             #pragma unroll
             for (int mt = 0; mt < MT; mt++)
                 #pragma unroll
                 for (int nt = 0; nt < NT8; nt++) {
-                    int c[4] = {0, 0, 0, 0};
-                    if (KS == 32) mma_s8_16832(c, a[mt][0], a[mt][1], a[mt][2], a[mt][3], bw[nt][0], bw[nt][1]);
-                    else mma_s8_16816(c, a[mt][0], a[mt][1], bw[nt][0]);
+                    int c[4];
+                    if (KS == 32) mma_s8_16832_b(c, a[mt][0], a[mt][1], a[mt][2], a[mt][3], bw[nt][0], bw[nt][1]);
+                    else mma_s8_16816_b(c, a[mt][0], a[mt][1], bw[nt][0]);
                     #pragma unroll
                     for (int i = 0; i < 4; i++) {
-                        float f = i2f_small(c[i]) * (da[mt][i >> 1] * dbv[nt][i & 1]);
+                        float f = (__int_as_float(c[i]) - 12582912.0f) * (da[mt][i >> 1] * dbv[nt][i & 1]);  // i2f_small
                         if (QI<T>::MIN) f -= sa[mt][i >> 1] * mb[nt][i & 1];
                         acc[mt][nt][i] += f;
                     }
@@ -1119,7 +1156,7 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
 }
 
 #define DEF_GEMMI(T, NAME, SBB)                                                                                   \
-    extern "C" __global__ void __launch_bounds__(256) gemmi_##NAME(const GemmTile* tiles, const u8* wd, int nd,    \
+    extern "C" __global__ void __launch_bounds__(256, 2) gemmi_##NAME(const GemmTile* tiles, const u8* wd, int nd,    \
             const u8* x, const int* xrow, float* y, int y_stride, int rows, int n64, int act) {                    \
         gemmi_q<T, SBB, 128, false>(tiles, wd, nd, x, xrow, y, y_stride, rows, n64, act);                       \
     }                                                                                                             \
