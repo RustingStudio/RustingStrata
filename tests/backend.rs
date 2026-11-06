@@ -86,3 +86,30 @@ fn glsl_tables_are_fresh() {
     if std::env::var_os("STRATA_WRITE_TABLES").is_some() { std::fs::write(path, &want).unwrap(); }
     assert!(std::fs::read_to_string(path).unwrap_or_default() == want, "{path} is stale: rerun with STRATA_WRITE_TABLES=1");
 }
+
+/// Each Vulkan device reads the precision setting once; exercise boundaries in isolated processes.
+#[test]
+fn qwen3_precision_layers_configuration() {
+    const KEY: &str = "STRATA_VK_QWEN3_F32_LAYERS";
+    const CHILD: &str = "STRATA_PRECISION_TEST_CHILD";
+    if let Ok(case) = std::env::var(CHILD) {
+        use rusting_strata::backend::Backend;
+        let gpu = match rusting_strata::vulkan::Vk::new(0) {
+            Ok(gpu) => gpu,
+            Err(e) if format!("{e}") == "Vulkan init" => { eprintln!("SKIP: {e:#}"); return; }
+            Err(e) if case == "invalid" && format!("{e:#}").contains(KEY) => return,
+            Err(e) => panic!("{e:#}"),
+        };
+        assert_ne!(case, "invalid", "invalid layer count must fail");
+        let expected = match case.as_str() { "default" | "large" => 0, "zero" => 28, "eight" => 20, _ => unreachable!() };
+        assert_eq!(gpu.accurate_dense_start(28), expected, "{case}");
+        return;
+    }
+    for (case, value) in [("default", None), ("zero", Some("0")), ("eight", Some("8")), ("large", Some("99")), ("invalid", Some("bad"))] {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "qwen3_precision_layers_configuration", "--nocapture"]).env(CHILD, case).env_remove(KEY);
+        if let Some(v) = value { cmd.env(KEY, v); }
+        let output = cmd.output().unwrap();
+        assert!(output.status.success(), "{case}: {}", String::from_utf8_lossy(&output.stderr));
+    }
+}
