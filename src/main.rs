@@ -668,7 +668,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         (v["system"], v["uptime_s"]) = (serve::system(), t0.elapsed().as_secs().into());
                         return reply(v, "200 OK");
                     }
-                    // A malformed request, a wrong key and the page are answered here, not in the queue, where without
+                    // A malformed request, a wrong key, the page and the model list are answered here, not in the queue, where without
                     // `--parallel` they would wait for the reply being generated (`handle` checks the key again: the
                     // keys may change meanwhile). The page holds no secret, so it loads without the key (it asks for it);
                     // without keys the Host check stops DNS rebinding.
@@ -685,6 +685,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         }
                         Ok(_) if who.is_none() =>
                             return reply(json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}}), "401 Unauthorized"),
+                        // Clients list the models often; a model still loading is listed, as its chats wait for the load.
+                        Ok(r) if r.method == "GET" && r.path.split('?').next() == Some("/v1/models") && (k.read().unwrap().any() || serve::host_ok(&r.host, &a)) => {
+                            let created = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                            let m = st.lock().unwrap().model.clone();
+                            return reply(json!({"object": "list", "data": m.map(|id| json!([{"id": id, "object": "model", "created": created, "owned_by": "strata"}])).unwrap_or(json!([]))}), "200 OK");
+                        }
                         _ => {}
                     }
                     // A customer key over `--max-per-key` is refused here, before it takes a place in the queue.
@@ -1233,7 +1239,6 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
         return send(&mut w, "403 Forbidden", json!({"error": {"message": "this key may use only /v1/chat/completions, /v1/messages (and count_tokens) and /v1/models", "type": "permission_error"}}));
     }
     match (method.as_str(), route) {
-        ("GET", "/v1/models") => send(&mut w, "200 OK", json!({"object": "list", "data": l.map(|l| json!([{"id": l.name, "object": "model", "created": created, "owned_by": "strata"}])).unwrap_or(json!([]))})),
         ("GET", "/api/models") => {
             let models: Vec<_> = s.models().into_iter().map(|(id, p, n)| json!({"id": id, "bytes": n, "loaded": l.as_ref().is_some_and(|l| l.path == p)})).collect();
             send(&mut w, "200 OK", json!({"dir": s.dir, "models": models}))
