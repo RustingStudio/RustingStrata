@@ -162,7 +162,10 @@ Strata speaks plain HTTP. Put a reverse proxy in front of it for TLS, and bind S
 set, Strata accepts any `Host` header, so the proxy can pass the public name through.
 
 Streaming replies (`"stream": true`) must reach the client as they are written, so turn off response buffering, and
-give the proxy a read timeout that is longer than your longest reply.
+give the proxy a read timeout that is longer than your longest reply. Strata sends nothing, not even the headers of a
+stream, until the prompt is prefilled, so the timeout must also cover the wait in the queue plus the prefill of your
+longest prompt. A proxy whose timeout you cannot raise (Cloudflare gives up after 100 s without a response) needs a
+`--ctx` small enough that the longest prompt prefills in time, or a direct route that bypasses it.
 
 **Caddy** (gets and renews the certificate itself):
 
