@@ -26,7 +26,7 @@ void main() {
         float v = fdiv(o, L) * gate;
         p.out_.v[(z * nh + h) * hd + d] = v;
         if (uint64_t(p.xq) != 0) {
-            float mx = subgroupMax(abs(v)), id = mx > 0.0 ? fdiv(127.0, mx) : 0.0;
+            float mx = warp_max(abs(v)), id = mx > 0.0 ? fdiv(127.0, mx) : 0.0;
             uint n = nh * hd, i = z * n + h * hd + d;
             p.xq.v[i] = uint8_t(int(roundEven(v * id)) & 255);
             if ((tid & 31) == 0) F32(uint64_t(p.xq) + gl_NumWorkGroups.z * n).v[i / 32] = fdiv(mx, 127.0);

@@ -20,8 +20,8 @@ void topk(F32 p, uint b, uint n, uint k, float extra_scale, uint lane, out int i
             uint i = lane + 32 * r, key = floatBitsToUint(v[r]) + 1;
             if (i < n && (taken >> r & 1) == 0 && key > bk) { bk = key; bi = i; }
         }
-        uint mk = subgroupMax(bk);
-        bi = subgroupMin(bk == mk ? bi : 0xffffffffu);
+        uint mk = warp_max_uint(bk);
+        bi = warp_min_uint(bk == mk ? bi : 0xffffffffu);
         float bv = uintBitsToFloat(mk - 1);
         if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
         if (lane == j) { id = int(bi); mine = bv; }
