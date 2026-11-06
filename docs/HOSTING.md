@@ -175,8 +175,22 @@ To keep the chat page and the admin routes off the public address, serve only `/
 Then reach the chat page through an SSH tunnel: `ssh -L 8080:127.0.0.1:8080 server`, and open
 http://127.0.0.1:8080 with the admin key.
 
-Rate limits per customer (requests per minute) belong in the proxy too, for example nginx `limit_req` keyed on the
-`Authorization` header.
+Limits per customer belong in the proxy too. Strata answers requests in arrival order, so one customer that sends
+many at once makes the others wait behind them; cap the requests each key has open, and the requests per minute:
+
+```nginx
+# in http { }
+limit_conn_zone $http_authorization zone=perkey:10m;
+limit_req_zone  $http_authorization zone=perkey_rate:10m rate=60r/m;
+
+# in the location that passes /v1/ to Strata
+limit_conn perkey 2;                          # at most 2 open requests per key; more get 429
+limit_req  zone=perkey_rate burst=20 nodelay;
+limit_conn_status 429;
+limit_req_status  429;
+```
+
+Anthropic clients send the key as `x-api-key`, so key those zones on `$http_x_api_key` too if you serve them.
 
 ## systemd
 
