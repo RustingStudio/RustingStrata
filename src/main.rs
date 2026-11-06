@@ -585,8 +585,26 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let waiting = open_conns.clone();
             let stats = std::sync::Arc::new(std::sync::Mutex::new(serve::Stats::default()));
             let (st, a, k, t0) = (stats.clone(), addr.clone(), keys.clone(), Instant::now());
+            let stop = on_sigterm();
+            // SIGTERM (systemctl stop or restart): new requests get 503, the replies being generated finish, then
+            // the server exits. Two looks 0.2 s apart cover a connection counted just before the signal.
+            let oc = open_conns.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(200));
+                if !stop.load(Relaxed) { continue; }
+                let n = oc.load(Relaxed);
+                if n == 0 { std::thread::sleep(Duration::from_millis(200)); if oc.load(Relaxed) == 0 { eprintln!("stopped"); std::process::exit(0); } }
+                else { eprintln!("stopping: {n} requests to finish"); std::thread::sleep(Duration::from_secs(5)); }
+            });
             std::thread::spawn(move || for (i, conn) in listener.incoming().enumerate() {
                 let mut c = match conn { Ok(c) => c, Err(e) => { eprintln!("request {i}: {e:#}"); continue } };
+                if stop.load(Relaxed) {
+                    let b = json!({"error": {"message": "server is stopping, retry later", "type": "overloaded_error"}}).to_string();
+                    let _ = c.set_write_timeout(Some(Duration::from_secs(5)));
+                    let _ = write!(c, "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+                    let _ = c.shutdown(std::net::Shutdown::Write);
+                    continue;
+                }
                 // A changed key file takes effect from the next request; one that does not parse keeps the old keys.
                 if let Some(f) = &keys_file && let Ok(t) = std::fs::metadata(f).and_then(|m| m.modified()) && Some(t) != keys_time {
                     keys_time = Some(t);
@@ -817,6 +835,19 @@ struct Serving {
     /// The Hugging Face download running on its own thread, or the last one.
     dl: std::sync::Arc<std::sync::Mutex<hf::Progress>>,
     stats: std::sync::Arc<std::sync::Mutex<serve::Stats>>,
+}
+
+/// A flag that SIGTERM sets (instead of ending the process). Never set on Windows.
+fn on_sigterm() -> &'static std::sync::atomic::AtomicBool {
+    static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    #[cfg(unix)]
+    {
+        extern "C" fn h(_: i32) { STOP.store(true, Relaxed); }
+        unsafe extern "C" { fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize; }
+        // SAFETY: the handler only stores to an atomic, which is async-signal-safe. 15 is SIGTERM on Linux and macOS.
+        unsafe { signal(15, h); }
+    }
+    &STOP
 }
 
 impl Serving {
