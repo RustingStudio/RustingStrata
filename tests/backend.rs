@@ -62,6 +62,46 @@ fn host_mailbox_is_shared_with_kernels() {
     }
 }
 
+/// The Workgroup shared-memory accounting of the committed SPIR-V: no model, no GPU, no pipeline.
+/// `gemmi_dp`'s table arrays are sized by the weight type `T` and the super-block bytes `SBB`; its KS (16 or 32) is
+/// the difference between the two values, the measured sizes of the committed SPIR-V.
+#[test]
+fn shared_memory_matches_the_committed_spirv() {
+    let q2k = [0, 10, 84, 0, 0];  // T = Q2_K (10), SBB = 84: KS = 16
+    let iq3s = [0, 21, 110, 0, 0];  // T = IQ3_S (21), SBB = 110: KS = 32
+    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi_dp", &q2k, false).unwrap(), 49152, "gemmi_dp with Q2_K");
+    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi_dp", &iq3s, false).unwrap(), 40960, "gemmi_dp with IQ3_S");
+    // The COOP variant keeps the IQ lookup tables in shared memory: the 49168 bytes that lost the V100 (Xid 13).
+    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi", &q2k, false).unwrap(), 49168, "gemmi with Q2_K");
+}
+
+/// The refusal `Vk::pipeline` raises before it creates anything: kernel, specialization, bytes needed and limit.
+/// A smaller limit stands in for an oversized specialization, so no doctored shader is needed; no backend, model
+/// buffer or pipeline exists while this runs.
+#[test]
+fn shared_memory_refusal_names_kernel_spec_bytes_and_limit() {
+    use rusting_strata::vulkan::spv_smem::check_shared_memory;
+    let spec = [0u32, 10, 84, 0, 0];
+    let e = format!("{:#}", check_shared_memory("gemmi_dp", &spec, false, 40960).unwrap_err());
+    for want in ["gemmi_dp", "[0, 10, 84, 0, 0]", "49152", "40960", "maxComputeSharedMemorySize"] {
+        assert!(e.contains(want), "{e:?} does not contain {want:?}");
+    }
+    // Exactly at the limit is accepted: the V100 reports 49152 and `gemmi_dp` with Q2_K needs 49152.
+    assert_eq!(check_shared_memory("gemmi_dp", &spec, false, 49152).unwrap(), 49152);
+}
+
+/// The preflight over the reference model's weight types only (no weights uploaded): every pair must fit. Skips
+/// cleanly without the model or a Vulkan device; the V100 window runs it for real.
+#[test]
+fn preflight_of_the_reference_model() {
+    let Some(model) = common::model_path() else { return };
+    let Ok(g) = rusting_strata::vulkan::Vk::new(0) else { return eprintln!("SKIP: no Vulkan device"); };
+    let gg = rusting_strata::gguf::Gguf::open(&model).unwrap();
+    let types = rusting_strata::gpu_model::gpu_weight_types(&gg);
+    assert!(!types.is_empty(), "no GPU weight type in {}", model.display());
+    g.preflight(&types, true).unwrap();
+}
+
 /// The committed SPIR-V is what `tools/gen_spirv.sh` makes from the shaders now.
 #[test]
 fn spirv_is_fresh() {

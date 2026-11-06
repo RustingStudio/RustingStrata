@@ -75,6 +75,11 @@ pub fn open(kind: Option<&str>, device: usize) -> anyhow::Result<Box<dyn Backend
 /// `gemm` `act` flag: x is unchanged since the previous gemm call, which read the same x, so its int8 copy is reused.
 pub const SAME_X: i32 = 4;
 
+/// The weight type `Backend::upload` stores a tensor of type `ty` as: F16 as F32 (no F16 kernels; F32 holds every F16
+/// value exactly) and Q4_0/Q5_0 as Q8_0 (which holds their values exactly). Expert tensors are copied raw by
+/// `GpuModel::load_part`, not through `upload`, so they keep their type.
+pub fn upload_type(ty: GgmlType) -> GgmlType { match ty { GgmlType::F16 => GgmlType::F32, GgmlType::Q4_0 | GgmlType::Q5_0 => GgmlType::Q8_0, ty => ty } }
+
 pub trait Backend: Send {
     /// "cuda" or "vulkan".
     fn name(&self) -> &'static str;
@@ -116,23 +121,33 @@ pub trait Backend: Send {
     /// valid while the `Buf` lives.
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)>;
 
+    /// Refuse, before any weight is uploaded, if a pipeline these weight types (`GpuModel`'s upload types) need would
+    /// exceed the device's shared-memory limit; `verbose` also lists each checked (kernel, specialization) pair.
+    /// Vulkan computes it from the committed SPIR-V and the specialization constants; backends without a Workgroup
+    /// shared-memory limit have nothing to check.
+    fn preflight(&self, _types: &[GgmlType], _verbose: bool) -> anyhow::Result<()> { Ok(()) }
+
     fn upload(&self, t: &Tensor) -> anyhow::Result<GpuTensor> {
-        if t.ty == GgmlType::F16 {  // no F16 kernels: uploaded as F32, which holds every F16 value exactly
-            let mut f = vec![0f32; t.rows * t.cols];
-            crate::quant::dequant_row(GgmlType::F16, t.data, &mut f);
-            let b = self.alloc(4 * f.len())?;
-            self.htod(&f.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), &b, 0)?;
-            return Ok(GpuTensor::new(GgmlType::F32, t.rows, t.cols, b));
+        match upload_type(t.ty) {
+            GgmlType::F32 if t.ty == GgmlType::F16 => {
+                let mut f = vec![0f32; t.rows * t.cols];
+                crate::quant::dequant_row(GgmlType::F16, t.data, &mut f);
+                let b = self.alloc(4 * f.len())?;
+                self.htod(&f.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), &b, 0)?;
+                Ok(GpuTensor::new(GgmlType::F32, t.rows, t.cols, b))
+            }
+            GgmlType::Q8_0 if matches!(t.ty, GgmlType::Q4_0 | GgmlType::Q5_0) => {
+                let q = crate::quant::to_q8_0(t.ty, t.data);
+                let b = self.alloc(q.len())?;
+                self.htod(&q, &b, 0)?;
+                Ok(GpuTensor::new(GgmlType::Q8_0, t.rows, t.cols, b))
+            }
+            ty => {
+                let b = self.alloc(t.data.len())?;
+                self.htod(t.data, &b, 0)?;
+                Ok(GpuTensor::new(ty, t.rows, t.cols, b))
+            }
         }
-        if matches!(t.ty, GgmlType::Q4_0 | GgmlType::Q5_0) {  // as Q8_0, which holds their values exactly (experts keep theirs)
-            let q = crate::quant::to_q8_0(t.ty, t.data);
-            let b = self.alloc(q.len())?;
-            self.htod(&q, &b, 0)?;
-            return Ok(GpuTensor::new(GgmlType::Q8_0, t.rows, t.cols, b));
-        }
-        let b = self.alloc(t.data.len())?;
-        self.htod(t.data, &b, 0)?;
-        Ok(GpuTensor::new(t.ty, t.rows, t.cols, b))
     }
 
     /// u16 words of a KV cache for `n` values: f16, or q8 with one f16 scale per 32 values.

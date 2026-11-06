@@ -201,6 +201,10 @@ impl Engine {
             return Ok(Runner::Cpu(m, State::new(&m.cfg)));
         };
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
+        // Before the first weight is uploaded: fail if a pipeline these weight types need does not fit the device's
+        // shared memory (Vulkan; a no-op elsewhere). No pipeline or model buffer exists yet.
+        let types = rusting_strata::gpu_model::gpu_weight_types(&m.w.g);
+        for b in &bk { b.preflight(&types, false)?; }
         let mut g = if self.parallel > 1 {
             if self.mtp() > 0 { eprintln!("--parallel: decoding without MTP drafts"); }
             self.mtp = Some(0);
@@ -332,6 +336,17 @@ enum Cmd {
         /// Accepted for symmetry with the other commands: calibration always runs on the GPU.
         #[arg(long, hide = true)]
         gpu: bool,
+    },
+    /// Check that every Vulkan pipeline this model needs fits the device's `maxComputeSharedMemorySize`, naming the
+    /// kernel, specialization, bytes needed and limit when one does not; exits non-zero on overflow. No model is
+    /// loaded, no weight uploaded and no pipeline created: it is SPIR-V plus spec-constant arithmetic only.
+    Check {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        backend: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        device: usize,
     },
     /// Speed test: for each prompt length, prefill that many tokens of prose, then greedily decode `tg` more at that
     /// depth. Prints prefill and decode tok/s as mean (min-max) over `reps` runs. `--ctx` grows to fit.
@@ -535,6 +550,16 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Calibrate { model, ctx, vram_margin, backend, device, kv, gpu: _ } => {
             if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
             calibrate(&model, ctx, vram_margin << 20, backend.as_deref(), device)?
+        }
+        Cmd::Check { model, backend, device } => {
+            let g = Gguf::open(&model)?;
+            let types = rusting_strata::gpu_model::gpu_weight_types(&g);
+            let b = backend::open(backend.as_deref(), device)?;
+            if b.name() != "vulkan" {
+                eprintln!("check: the shared-memory preflight is Vulkan-only; nothing to check on {}", b.name());
+                return Ok(());
+            }
+            b.preflight(&types, true)?;
         }
         Cmd::Chat { model, system, n, think, mut engine } => {
             let g = Gguf::open(&model)?;

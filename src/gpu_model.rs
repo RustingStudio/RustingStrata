@@ -24,6 +24,27 @@ fn gq_min(pos: usize, nt: usize) -> i32 {
 
 mod prefill;
 
+/// A tensor `GpuModel::load_part` never uploads: the PLE table stays on the CPU.
+fn cpu_only(name: &str) -> bool { name == "per_layer_token_embd.weight" }
+
+/// A tensor `GpuModel::load_part` converts on upload (`Backend::upload`): F16 to F32, Q4_0/Q5_0 to Q8_0. Expert
+/// tensors (`*_exps.`) are copied raw and keep their type.
+fn f32_up(name: &str, ty: GgmlType) -> bool { matches!(ty, GgmlType::F16 | GgmlType::Q4_0 | GgmlType::Q5_0) && !name.contains("_exps.") }
+
+/// The weight types a GPU load of `g` leaves for the kernels, in the order first seen: `cpu_only` tensors skipped,
+/// `f32_up` tensors rewritten as `backend::upload_type` stores them, and tensors `load_part`'s gate rejects left out
+/// (the load itself then fails). Used by the Vulkan shared-memory preflight; no model is loaded.
+pub fn gpu_weight_types(g: &crate::gguf::Gguf) -> Vec<GgmlType> {
+    let mut v: Vec<GgmlType> = vec![];
+    for t in g.tensors.values() {
+        if cpu_only(&t.name) { continue; }
+        let Ok(ty) = GgmlType::from_u32(t.ty) else { continue };  // load_part rejects the tensor
+        let ty = if f32_up(&t.name, ty) { crate::backend::upload_type(ty) } else { ty };
+        if ty.gpu("vulkan") && !v.contains(&ty) { v.push(ty); }  // F16 has no kernels: load_part rejects it
+    }
+    v
+}
+
 /// Scratch rows for `hc_read` and `ple`: the decode buffers (`GpuModel::hc_at`) or the prefill slab, where `gemm`
 /// runs their matrices as dense GEMMs over the chunk. `hq` 0: no int8 copy of h.
 #[derive(Clone, Copy)]
@@ -235,10 +256,6 @@ impl<'a> GpuModel<'a> {
         ensure!(ns == 1 || c.hc_n == 0 && c.n_embd_ple == 0 && c.idx_top_k == 0, "--parallel: not supported for this model (hyper-connections, PLE or QSA)");
         ensure!((1..=255).contains(&ns), "--parallel {ns}: 1 to 255 slots");
         let last = range.end == m.cfg.n_layer;
-        // The PLE table stays on the CPU; other F16, Q4_0 and Q5_0 tensors but experts are converted on upload
-        // (`Backend::upload`).
-        let cpu_only = |n: &str| n == "per_layer_token_embd.weight";
-        let f32_up = |n: &str, ty| matches!(ty, GgmlType::F16 | GgmlType::Q4_0 | GgmlType::Q5_0) && !n.contains("_exps.");
         if let Some(t) = m.w.g.tensors.values().find(|t| !cpu_only(&t.name)
             && GgmlType::from_u32(t.ty).is_ok_and(|ty| !ty.gpu(gpu.name()) && !f32_up(&t.name, ty))) {
             anyhow::bail!("tensor {} has type {}, which the {} backend does not support yet", t.name, GgmlType::from_u32(t.ty)?.name(), gpu.name());
