@@ -645,8 +645,14 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     }
                     // The page's side panel is answered here, so it stays current while a reply is generated or a
                     // model loads. A bad Host or key falls through to `handle`, which refuses it.
-                    if let Ok(r) = &q && r.method == "GET" && r.path == "/api/stats" && let k = k.read().unwrap().clone()
+                    if let Ok(r) = &q && r.method == "GET" && matches!(r.path.as_str(), "/api/stats" | "/metrics") && let k = k.read().unwrap().clone()
                         && (k.any() || serve::host_ok(&r.host, &a)) && k.who(&r.auth).is_some_and(|w| w.admin) {
+                        if r.path == "/metrics" {
+                            let b = st.lock().unwrap().prometheus(oc.load(Relaxed) - 1, t0.elapsed().as_secs());
+                            let _ = write!(&c, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+                            oc.fetch_sub(1, Relaxed);
+                            return;
+                        }
                         let mut v = json!(*st.lock().unwrap());
                         (v["system"], v["uptime_s"]) = (serve::system(), t0.elapsed().as_secs().into());
                         return reply(v, "200 OK");

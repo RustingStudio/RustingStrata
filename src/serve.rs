@@ -276,6 +276,32 @@ impl Stats {
         self.recent.push_back(l);
     }
 
+    /// The stats in Prometheus text format, with `waiting` requests open besides the scrape.
+    pub fn prometheus(&self, waiting: usize, uptime_s: u64) -> String {
+        let mut s = String::new();
+        let mut m = |name: &str, kind: &str, help: &str, v: u64| {
+            s += &format!("# HELP strata_{name} {help}\n# TYPE strata_{name} {kind}\nstrata_{name} {v}\n");
+        };
+        m("up", "gauge", "1 when a model is loaded and not loading.", (self.model.is_some() && !self.loading) as u64);
+        m("slots", "gauge", "Requests generated at once (--parallel).", self.slots as u64);
+        m("busy", "gauge", "Replies being generated.", self.busy as u64);
+        m("waiting", "gauge", "Requests being read, generated or queued.", waiting as u64);
+        m("uptime_seconds", "counter", "Seconds since the server started.", uptime_s);
+        m("requests_total", "counter", "Chat requests answered since start.", self.requests);
+        m("prompt_tokens_total", "counter", "Prompt tokens of answered requests.", self.prompt_tokens);
+        m("cached_prompt_tokens_total", "counter", "Prompt tokens reused from earlier requests.", self.cached_tokens);
+        m("completion_tokens_total", "counter", "Reply tokens of answered requests.", self.completion_tokens);
+        if let Some((u, t)) = self.vram {
+            m("vram_used_bytes", "gauge", "Device memory in use.", u);
+            m("vram_total_bytes", "gauge", "Device memory in total.", t);
+        }
+        if let Some((h, x)) = self.experts {
+            m("expert_hits_total", "counter", "Routed experts found on the GPU since the model loaded.", h);
+            m("expert_misses_total", "counter", "Routed experts computed on the CPU since the model loaded.", x);
+        }
+        s
+    }
+
     /// The stats with no model loaded (`model` while it loads), keeping the totals and recent requests since start.
     pub fn unload(&mut self, model: Option<String>) {
         let recent = std::mem::take(&mut self.recent);

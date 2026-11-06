@@ -260,6 +260,11 @@ fn stats_keep_totals_across_loads() {
     assert!(s.loading && s.vram.is_none() && s.model.as_deref() == Some("b"));
     s.unload(None);
     assert!(!s.loading && s.model.is_none() && s.requests == 45);
+    let p = s.prometheus(3, 9);
+    for l in ["strata_up 0\n", "strata_waiting 3\n", "strata_uptime_seconds 9\n", "strata_prompt_tokens_total 450\n", "# TYPE strata_requests_total counter\n"] {
+        assert!(p.contains(l), "{l:?} missing from\n{p}");
+    }
+    assert!(!p.contains("vram") && !p.contains("expert"));
 }
 
 #[test]
