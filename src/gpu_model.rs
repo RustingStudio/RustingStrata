@@ -630,7 +630,9 @@ impl<'a> GpuModel<'a> {
             (None, Some(hr)) => self.hc_read(hr, x, nt, &self.hc_at())?,
             _ => unreachable!(),
         }
-        g.gemvq(self.output.as_ref().unwrap(), p("h"), ne, p("hq"), self.logits.addr(), c.n_vocab, nt)
+        if c.arch == "qwen3" && g.accurate_dense_layer() {
+            g.gemv_unquantized(self.output.as_ref().unwrap(), p("h"), ne, self.logits.addr(), c.n_vocab, nt)
+        } else { g.gemvq(self.output.as_ref().unwrap(), p("h"), ne, p("hq"), self.logits.addr(), c.n_vocab, nt) }
     }
 
     /// Per-stream RMSNorm of nt stacks (rows of hc * n_embd) at `x` with the hc * n_embd gamma `w` into `out`.
@@ -827,13 +829,19 @@ impl<'a> GpuModel<'a> {
         let c = &self.m.cfg;
         let (g, eps, ne) = (&self.gpu, c.eps, c.n_embd);
         let p = |n: &str| self.bufs[n].addr();
+        // Qwen3 can cancel large residuals in its final layer, amplifying quantization errors.
+        // Use unquantized activations for its dense decode on wave64 (or its final layers when configured).
+        let accurate = c.arch == "qwen3" && g.accurate_dense_layer() && il >= g.accurate_dense_start(c.n_layer);
         // Inputs from "h" are quantized once ("hq", after each norm) instead of once per GEMV block.
         let mv = |w: &GpuTensor, x: &str, xs: usize, y: &str, ys: usize|
-            if x == "h" { g.gemvq(w, p(x), xs, p("hq"), p(y), ys, nt) } else { self.mv(w, p(x), xs, p(y), ys, nt) };
-        let mv2 = |a: &GpuTensor, b: &GpuTensor, ya: &str, yb: &str| g.gemvq2(a, b, p("h"), ne, p("hq"), p(ya), p(yb), nt);
+            if accurate { g.gemv_unquantized(w, p(x), xs, p(y), ys, nt) } else if x == "h" { g.gemvq(w, p(x), xs, p("hq"), p(y), ys, nt) } else { self.mv(w, p(x), xs, p(y), ys, nt) };
+        let mv2 = |a: &GpuTensor, b: &GpuTensor, ya: &str, yb: &str| {
+            if accurate { g.gemv_unquantized(a, p("h"), ne, p(ya), a.rows, nt)?; g.gemv_unquantized(b, p("h"), ne, p(yb), b.rows, nt) }
+            else { g.gemvq2(a, b, p("h"), ne, p("hq"), p(ya), p(yb), nt) }
+        };
         // The SwiGLU for a down GEMV of type `ty` (float weights read g itself). Returns the xq for the GEMV.
         let sw = |ty: GgmlType, ga: &str, ua: &str, n: usize, rows: usize, q: &str| -> anyhow::Result<u64> {
-            if matches!(ty, GgmlType::F32 | GgmlType::BF16) { g.swiglu(p(ga), p(ua), rows * n)?; return Ok(0); }
+            if accurate || matches!(ty, GgmlType::F32 | GgmlType::BF16) { g.swiglu(p(ga), p(ua), rows * n)?; return Ok(0); }
             g.swiglu_q(p(ga), p(ua), n, rows, p(q))
         };
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
@@ -886,7 +894,7 @@ impl<'a> GpuModel<'a> {
                     };
                     let aq = g.attn_decode_q(p("q"), kc.addr(), vc.addr(), if c.q_gate { p("qg") } else { 0 }, p("att"), p("attp"), step, nh, nkv, hd,
                                              1.0 / (hd as f32).sqrt(), gq, nt, p("attq"), sel, sst)?;
-                    if aq != 0 { g.gemvq(o, p("att"), nh * hd, aq, p("mix"), ne, nt)?; } else { mv(o, "att", nh * hd, "mix", ne)?; }
+                    if aq != 0 && !accurate { g.gemvq(o, p("att"), nh * hd, aq, p("mix"), ne, nt)?; } else { mv(o, "att", nh * hd, "mix", ne)?; }
                 }
             }
             match (&l.post_norm, &l.hc) {
@@ -904,7 +912,8 @@ impl<'a> GpuModel<'a> {
                     debug_assert!(!resume);
                     g.batch(&mut || mv2(gate, up, "ge", "ue"))?;
                     let q = sw(down.ty, "ge", "ue", down.cols, nt, "ffq")?;
-                    g.gemvq(down, p("ge"), down.cols, q, p("ye"), ne, nt)?;
+                    if accurate { g.gemv_unquantized(down, p("ge"), down.cols, p("ye"), ne, nt)?; }
+                    else { g.gemvq(down, p("ge"), down.cols, q, p("ye"), ne, nt)?; }
                     return Ok(p("ye"));
                 }
                 Ffn::Moe { router, shared } => {

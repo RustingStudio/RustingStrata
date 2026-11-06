@@ -4,7 +4,26 @@ All benchmarks in the README were run on an NVIDIA RTX 3060. AMD GPUs run the Vu
 (`--backend vulkan`), and everything known about them comes from user reports (RX 9070 XT on Linux with RADV, and on
 Windows with AMD's driver). Expect problems; this page lists the known ones and what to send when you hit a new one.
 
-Needs RDNA or newer (older AMD GPUs lack subgroup size 32) and a Vulkan 1.3 driver.
+Needs a Vulkan 1.3 driver and subgroup size 32 or a fixed subgroup size 64. The wave64 path has also been tested on Radeon VII (Vega 20) with RADV Mesa 26.0.8. Qwen3 dense decode on wave64 uses unquantized activations for accuracy and can be slower than the int8 path. Batched prefill still uses quantized activations; `--chunk 0` uses token-by-token prefill when closer agreement with the CPU reference matters more than prompt processing speed.
+
+## Wave64 Qwen3 speed and accuracy
+
+On fixed wave64 GPUs, dense Qwen3 decode uses unquantized activations by default. Set
+`STRATA_VK_QWEN3_F32_LAYERS` before starting Strata to use unquantized activations only in the final N layers;
+earlier layers use int8 activations. The output head remains unquantized. For example:
+
+```sh
+STRATA_VK_QWEN3_F32_LAYERS=8 strata generate --model model.gguf --gpu --backend vulkan --chunk 0 --prompt "Hello" -n 128
+```
+
+This is an opt-in speed/accuracy tradeoff; results depend on the model and prompt. On one Radeon VII with
+Qwen3-0.6B Q8_0, N=8 raised short-context decode from 118.8 to 177.1 tokens/s (median of three runs), while
+teacher-forced CPU top-1 agreement on 14 prompts fell from 224/224 to 221/224 tokens. For Qwen3-4B
+Instruct Q4_K_M the same setting raised decode from 21.6 to 44.8 tokens/s (median of three), while agreement
+on five prompts fell from 40/40 to 39/40. These samples are not guarantees of accuracy or performance. The usual batched
+prefill introduces its own numerical differences; `--chunk 0` uses token-by-token prefill for closer CPU agreement.
+Unset the variable to retain the accuracy-oriented default. This switch has no effect on other model architectures
+or devices using 32-lane subgroups.
 
 ## First line of the output
 
