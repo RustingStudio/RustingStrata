@@ -69,6 +69,30 @@ pub fn key_ok(auth: &str, key: &str) -> bool {
     a.len() == key.len() && a.iter().zip(key.as_bytes()).fold(0, |x, (p, q)| x | (p ^ q)) == 0
 }
 
+/// The requests each customer key has open (`--max-per-key`), by key id.
+pub type Open = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, usize>>>;
+
+/// One request's place in its key's count of open requests; dropping it frees the place.
+pub struct Hold(Open, u64);
+
+impl Hold {
+    /// A place for key `id`, or None when it already has `cap` requests open.
+    pub fn take(open: &Open, id: u64, cap: usize) -> Option<Hold> {
+        let mut m = open.lock().unwrap();
+        let n = m.entry(id).or_default();
+        if *n >= cap { return None; }
+        *n += 1;
+        Some(Hold(open.clone(), id))
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let mut m = self.0.lock().unwrap();
+        if let Some(n) = m.get_mut(&self.1) { *n -= 1; if *n == 0 { m.remove(&self.1); } }
+    }
+}
+
 /// The API keys: `--api-key` (all routes) and the `--api-keys` file (chat and model list only). No key at all
 /// leaves the server open, as for local use.
 #[derive(Clone, Default)]

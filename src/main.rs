@@ -104,6 +104,10 @@ struct Hosting {
     /// Requests read or waiting at once; more get `503` with `Retry-After`.
     #[arg(long, default_value_t = 16)]
     max_waiting: usize,
+    /// Requests one customer key may have read, generated or queued at once; more get `429` with `Retry-After`
+    /// [default: no limit besides `--max-waiting`].
+    #[arg(long)]
+    max_per_key: Option<usize>,
     /// Most reply tokens a request may ask for (and the default when it asks for none) [default: what the context
     /// leaves].
     #[arg(long)]
@@ -585,6 +589,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let waiting = open_conns.clone();
             let stats = std::sync::Arc::new(std::sync::Mutex::new(serve::Stats::default()));
             let (st, a, k, t0) = (stats.clone(), addr.clone(), keys.clone(), Instant::now());
+            let (per_key, held) = (host.max_per_key, serve::Open::default());
             let stop = on_sigterm();
             // SIGTERM (systemctl stop or restart): new requests get 503, the replies being generated finish, then
             // the server exits. Two looks 0.2 s apart cover a connection counted just before the signal.
@@ -627,7 +632,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     let _ = c.shutdown(std::net::Shutdown::Write);
                     continue;
                 }
-                let (tx, oc, st, a, k) = (tx.clone(), open_conns.clone(), st.clone(), a.clone(), k.clone());
+                let (tx, oc, st, a, k, held) = (tx.clone(), open_conns.clone(), st.clone(), a.clone(), k.clone(), held.clone());
                 std::thread::spawn(move || {
                     let q = c.set_read_timeout(Some(Duration::from_secs(30))).and_then(|_| c.set_write_timeout(Some(Duration::from_secs(30))))
                         .map_err(Into::into).and_then(|_| serve::read_request(&mut BufReader::new(&c)));
@@ -657,7 +662,24 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         (v["system"], v["uptime_s"]) = (serve::system(), t0.elapsed().as_secs().into());
                         return reply(v, "200 OK");
                     }
-                    let _ = tx.send((c, q, i));
+                    // A customer key over `--max-per-key` is refused here, before it takes a place in the queue.
+                    let hold = match (&q, per_key) {
+                        (Ok(r), Some(cap)) => match k.read().unwrap().who(&r.auth) {
+                            Some(w) if !w.admin => match serve::Hold::take(&held, w.id, cap) {
+                                Some(h) => Some(h),
+                                None => {
+                                    eprintln!("request {i}: {} already has {cap} requests open, answered 429", w.name);
+                                    let b = json!({"error": {"message": format!("this key already has {cap} requests open, retry later"), "type": "rate_limit_error"}}).to_string();
+                                    let _ = write!(&c, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+                                    oc.fetch_sub(1, Relaxed);
+                                    return;
+                                }
+                            },
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let _ = tx.send((c, q, i, hold));
                 });
             });
             let s = Serving { rx: rx.into(), waiting, addr, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(),
@@ -829,7 +851,8 @@ struct Loaded<'a> { r: Runner<'a>, tok: &'a Tokenizer, tpl: Template, name: Stri
 
 /// What `serve` keeps across model loads.
 struct Serving {
-    rx: std::sync::Mutex<std::sync::mpsc::Receiver<(TcpStream, anyhow::Result<serve::Request>, usize)>>,
+    /// Complete requests, with their key's place when `--max-per-key` counts it (freed once answered).
+    rx: std::sync::Mutex<std::sync::mpsc::Receiver<(TcpStream, anyhow::Result<serve::Request>, usize, Option<serve::Hold>)>>,
     waiting: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     addr: String,
     keys: std::sync::Arc<std::sync::RwLock<serve::Keys>>,
@@ -861,7 +884,7 @@ impl Serving {
     /// listener is gone).
     fn serve(&self, mut l: Option<&mut Loaded>, e: &Engine) -> Option<(PathBuf, TcpStream)> {
         if let Some(l) = l.as_deref_mut() && matches!(&l.r, Runner::Gpu(g) if g.slots() > 1) { return self.serve_slots(l, e); }
-        for (c, q, i) in self.rx.lock().unwrap().iter() {
+        for (c, q, i, _hold) in self.rx.lock().unwrap().iter() {
             let mut next = None;
             let res = handle(c, q, l.as_deref_mut(), e, self, i, &mut next);
             self.waiting.fetch_sub(1, Relaxed);
@@ -999,14 +1022,14 @@ impl Serving {
             loop {
                 while open && next.lock().unwrap().is_none() {
                     match rx.try_recv() {
-                        Ok((c, q, i)) => {
+                        Ok((c, q, i, hold)) => {
                             live.fetch_add(1, Relaxed);
                             let (tx, tok, tpl, name, path, next, live) = (tx.clone(), &**tok, *tpl, name.clone(), path.clone(), &next, &live);
                             sc.spawn(move || {
                                 let mut l = Loaded { r: Runner::Slot(Client { tx, slot: None, owner: 0 }), tok, tpl, name, path };
                                 let mut nx = None;
                                 let res = handle(c, q, Some(&mut l), e, self, i, &mut nx);
-                                drop(l);
+                                drop((l, hold));
                                 self.waiting.fetch_sub(1, Relaxed);
                                 if let Err(e) = res { eprintln!("request {i}: {e:#}"); }
                                 if nx.is_some() { *next.lock().unwrap() = nx; }
