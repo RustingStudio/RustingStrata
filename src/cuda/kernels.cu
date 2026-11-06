@@ -326,7 +326,7 @@ template <> struct QI<11> {  // Q3_K (110 bytes: rows 2-aligned)
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
         int e = sub * 8, n = e >> 7, r = e & 127, j = r >> 5, i0 = r & 31, is = n * 8 + j * 2 + (i0 >> 4);
         const u8* sc = b + 96;
-        int low = is < 8 ? (sc[is] & 0xF) : (sc[is - 8] >> 4);
+        int low = (sc[is & 7] >> (4 * (is >> 3))) & 0xF;
         int hs = (sc[8 + (is & 3)] >> (2 * (is >> 2))) & 3;
         d = ldh(b + 108) * (float)((low | (hs << 4)) - 32);
         const u8 *q = b + 32 + 32 * n + i0, *h = b + i0;
