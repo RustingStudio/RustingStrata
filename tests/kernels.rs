@@ -513,6 +513,37 @@ fn attn_prefill_matches_decode() {
     }
 }
 
+/// A QSA mask with every block selected leaves `attn_prefill_m` equal to `attn_prefill` (the tiled no-coop fallback
+/// uses the same mask rows as the other prefill kernels).
+#[test]
+fn attn_prefill_qsa_mask_all_ones_matches_unmasked() {
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        eprintln!("backend {bk}");
+        let (pos0, t, nh, nkv, hd) = (37, 40, 8, 2, 128);
+        let n = (pos0 + t) * nkv * hd;
+        let (kf, vf) = (xs(n), xs(n + 5)[5..].to_vec());
+        let (dk, dv) = (gpu.zeros::<u16>(n).unwrap(), gpu.zeros::<u16>(n).unwrap());
+        let step = up(gpu, &[pos0 as i32]);
+        let zero = up(gpu, &[0i32]);
+        gpu.kv_store(up(gpu, &kf).addr(), up(gpu, &vf).addr(), dk.addr(), dv.addr(), nkv * hd, pos0 + t, zero.addr(), hd).unwrap();
+        let q: Vec<f32> = xs(t * nh * hd + 3)[3..].iter().map(|v| 4.0 * v).collect();
+        let dq = up(gpu, &q);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let want_buf = gpu.zeros::<f32>(t * nh * hd).unwrap();
+        gpu.attn_prefill(dq.addr(), dk.addr(), dv.addr(), 0, want_buf.addr(), step.addr(), t, nh, nkv, hd, scale).unwrap();
+        let want = down::<f32>(gpu, &want_buf);
+        let mw = (pos0 + t).div_ceil(128);
+        // The cooperative tile reads mask rows in 64-query blocks, including rows past `t`.
+        let dmask = up(gpu, &vec![u32::MAX; t.next_multiple_of(64) * mw]);
+        let got_buf = gpu.zeros::<f32>(t * nh * hd).unwrap();
+        gpu.attn_prefill_m(dq.addr(), dk.addr(), dv.addr(), 0, got_buf.addr(), step.addr(), t, nh, nkv, hd, scale,
+            dmask.addr(), mw).unwrap();
+        let e = rel_l2(&down::<f32>(gpu, &got_buf), &want);
+        assert!(e <= 1e-6, "{bk} attn_prefill all-ones mask: rel err {e}");
+    }
+}
+
 /// DeltaNet scan over a chunk of T tokens equals T single-token scans and a CPU scan (output and final state), and
 /// its snapshots equal the states after the first single-token scans.
 #[test]
