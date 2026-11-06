@@ -2,7 +2,7 @@
 description: Implements one fork issue, commits and opens the PR. One task at a time, closed scope.
 mode: subagent
 color: "#22c55e"
-steps: 80
+steps: 160
 permissions:
   - action: "*"
     resource: "*"
