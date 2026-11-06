@@ -921,6 +921,8 @@ struct Sched {
     held: Vec<bool>,
     freed: Vec<u64>,
     tick: u64,
+    /// The key that holds each slot (`Client::owner`).
+    who: Vec<u64>,
     /// Chat jobs waiting for a free slot, and decode steps waiting for a forward (since the first came).
     chats: std::collections::VecDeque<Job>,
     steps: Vec<(usize, u32, bool, std::sync::mpsc::Sender<anyhow::Result<(u32, Vec<f32>)>>)>,
@@ -932,6 +934,13 @@ impl Sched {
     const GATHER: Duration = Duration::from_millis(2);
 
     fn decoding(&self) -> usize { self.held.iter().filter(|&&h| h).count() }
+
+    /// The queued chat to start next: the one whose key holds the fewest slots, the oldest among those, so that one
+    /// customer's burst of requests does not hold back the others'. With one key (or none) it is the oldest.
+    fn next_chat(&self) -> Option<usize> {
+        let holds = |o: u64| self.held.iter().zip(&self.who).filter(|&(&h, &w)| h && w == o).count();
+        (0..self.chats.len()).min_by_key(|&j| (if let Job::Chat { owner, .. } = &self.chats[j] { holds(*owner) } else { usize::MAX }, j))
+    }
 
     /// How long to wait for jobs: until the steps of all decoding slots are in, at most `GATHER` after the first.
     fn wait(&self) -> Duration {
@@ -985,7 +994,7 @@ impl Serving {
         std::thread::scope(|sc| {
             // Owned here, so that a panic drops the queued jobs' reply channels and the request threads end (the
             // scope then joins them and the panic goes on).
-            let (jobs, mut s) = (jobs, Sched { held: vec![false; n], freed: vec![0; n], ..Default::default() });
+            let (jobs, mut s) = (jobs, Sched { held: vec![false; n], freed: vec![0; n], who: vec![0; n], ..Default::default() });
             let mut open = true;
             loop {
                 while open && next.lock().unwrap().is_none() {
@@ -1012,13 +1021,14 @@ impl Serving {
                 s.take(&jobs, s.wait());
                 // One prefill between decode steps, in the free slot whose saved state this prompt extends the
                 // furthest, else the least recently used one.
+                let first = s.next_chat();
                 if let Some(sl) = (0..n).filter(|&i| !s.held[i]).max_by_key(|&i| {
-                    let reuse = match s.chats.front() {
+                    let reuse = match first.and_then(|j| s.chats.get(j)) {
                         Some(Job::Chat { ids, keep, owner, .. }) => { let (sv, o) = g.slot_saved(i); if o == *owner && ids[..*keep].starts_with(sv) { sv.len() } else { 0 } }
                         _ => 0,
                     };
                     (reuse, std::cmp::Reverse(s.freed[i]))
-                }) && let Some(Job::Chat { ids, sys, keep, owner, back }) = s.chats.pop_front() {
+                }) && let Some(Job::Chat { ids, sys, keep, owner, back }) = first.and_then(|j| s.chats.remove(j)) {
                     g.use_slot(sl);
                     g.owner = owner;
                     // Between two prefill chunks the decoding slots run for as long as the chunk before took, so a long
@@ -1034,7 +1044,7 @@ impl Serving {
                         t0 = Instant::now();
                         Ok(())
                     });
-                    s.held[sl] = r.is_ok();
+                    (s.held[sl], s.who[sl]) = (r.is_ok(), owner);
                     let _ = back.send(r.map(|(l, u)| (l, u, sl)));
                     gpu_model_stats(g, &mut self.stats.lock().unwrap());
                 }

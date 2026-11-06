@@ -55,6 +55,9 @@ What changes with `--parallel N`:
 
   `--kv q8` is about 6% slower to decode and 14% slower to prefill at 32K of actual context, so it pays off when the
   memory it frees holds experts. Greedy output can differ from `--kv f16` at near-ties.
+- **Queue.** When every slot is busy, requests wait. A free slot goes to the waiting request whose key holds the
+  fewest slots, the oldest first among those, so one customer who sends 20 requests at once does not hold back
+  another customer's one. Without `--api-keys` the queue is first come, first served.
 - **More than 4 slots** do not raise the total, because one pass decodes at most 4 requests. They let more users
   stream at the same time instead of waiting in the queue, each at a lower speed.
 - **Prefill.** Prompts are prefilled one at a time, in chunks (`--chunk`, from `strata calibrate`). After each
