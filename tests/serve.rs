@@ -1,5 +1,5 @@
 use rusting_strata::chat::{Hold, Json, Msg, Template};
-use rusting_strata::serve::{chat_request, host_ok, key_ok, list_models, messages_body, read_request};
+use rusting_strata::serve::{Keys, Who, chat_request, host_ok, key_ok, list_models, messages_body, models, read_request};
 
 /// Every request in tests/fixtures/chat renders byte-identical to llama.cpp's Jinja rendering of the model's own
 /// template (tools/gen_chat_fixtures.py); a request llama.cpp rejects must be rejected too.
@@ -232,6 +232,26 @@ fn lists_models_once_per_split() {
     let l: Vec<_> = list_models(&d).into_iter().map(|(id, p, n)| (id, p.strip_prefix(&d).unwrap().to_path_buf(), n)).collect();
     std::fs::remove_dir_all(&d).unwrap();
     assert_eq!(l, [("a.gguf".into(), "a.gguf".into(), 3), ("org/repo/big-00001-of-00002.gguf".into(), "org/repo/big-00001-of-00002.gguf".into(), 12)]);
+}
+
+#[test]
+fn lists_only_complete_split_models() {
+    let files = vec![
+        ("model-00001-of-00003.gguf".into(), 10),
+        ("model-00002-of-00003.gguf".into(), 20),
+        ("model-00001-of-00002.gguf".into(), 100),
+        ("model-00002-of-00002.gguf".into(), 20),
+        ("plain.gguf".into(), 7),
+    ];
+    assert_eq!(models(&files), vec![("model-00001-of-00002.gguf".into(), 120), ("plain.gguf".into(), 7)]);
+
+    let mut complete = files;
+    complete.push(("model-00003-of-00003.gguf".into(), 30));
+    assert_eq!(models(&complete), vec![
+        ("model-00001-of-00003.gguf".into(), 60),
+        ("model-00001-of-00002.gguf".into(), 120),
+        ("plain.gguf".into(), 7),
+    ]);
 }
 
 #[test]
