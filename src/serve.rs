@@ -156,13 +156,18 @@ pub fn list_models(dir: &Path) -> Vec<(String, PathBuf, u64)> {
     out
 }
 
-/// The models among files given as (name, bytes): .gguf files, a split model once by its first shard with the
-/// bytes of all its shards, vision projectors (`mmproj*`) left out.
+/// The models among files given as (name, bytes): .gguf files, complete split models once by their first shard
+/// with the bytes of their shards, vision projectors (`mmproj*`) left out.
 pub fn models(files: &[(String, u64)]) -> Vec<(String, u64)> {
-    let parts = |stem: &str| files.iter().filter(|(m, _)| shard(m).is_some_and(|(s, _)| s == stem)).map(|x| x.1).sum();
+    let sizes: std::collections::HashMap<&str, u64> = files.iter().map(|(name, bytes)| (name.as_str(), *bytes)).collect();
     files.iter().filter(|(n, _)| n.ends_with(".gguf") && !n.rsplit('/').next().unwrap_or(n).starts_with("mmproj"))
-        .filter_map(|(n, b)| match shard(n) {
-            Some((stem, 1)) => Some((n.clone(), parts(stem))),
+        .filter_map(|(n, b)| match shard_parts(n) {
+            Some((stem, 1, total)) if total > 0 && total as usize <= files.len() => {
+                (1..=total).try_fold(0u64, |bytes, i| {
+                    sizes.get(format!("{stem}-{i:05}-of-{total:05}.gguf").as_str())
+                        .and_then(|part| bytes.checked_add(*part))
+                }).map(|bytes| (n.clone(), bytes))
+            }
             Some(_) => None,
             None => Some((n.clone(), *b)),
         }).collect()
@@ -170,11 +175,15 @@ pub fn models(files: &[(String, u64)]) -> Vec<(String, u64)> {
 
 /// "dir/name-00002-of-00003.gguf" gives ("dir/name", 2).
 pub fn shard(n: &str) -> Option<(&str, u32)> {
+    shard_parts(n).map(|(stem, i, _)| (stem, i))
+}
+
+fn shard_parts(n: &str) -> Option<(&str, u32, u32)> {
     let (head, total) = n.strip_suffix(".gguf")?.rsplit_once("-of-")?;
     let (stem, i) = head.rsplit_once('-')?;
     let digits = |s: &str| s.len() == 5 && s.bytes().all(|b| b.is_ascii_digit());
     if !digits(total) || !digits(i) { return None; }
-    Some((stem, i.parse().ok()?))
+    Some((stem, i.parse().ok()?, total.parse().ok()?))
 }
 
 /// The parts of an OpenAI chat completion request that strata uses. Sampling fields left out fall back to the
