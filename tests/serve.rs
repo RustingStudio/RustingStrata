@@ -302,3 +302,53 @@ fn per_key_holds() {
     drop((b, c));
     assert!(open.lock().unwrap().is_empty());
 }
+
+/// `strata serve` without a model, over HTTP: what the connection threads answer before the queue, a customer key
+/// refused an admin route by `handle`, and a SIGTERM that exits.
+#[test]
+fn serve_without_a_model() {
+    use std::io::{Read, Write};
+    let dir = std::env::temp_dir().join(format!("strata-serve-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("keys.txt"), "acme acme-0123456789abcdef\n").unwrap();
+    let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_strata"))
+        .args(["serve", "--addr", &addr, "--api-key", "root-0123456789abcdef", "--api-keys"]).arg(dir.join("keys.txt"))
+        .arg("--models-dir").arg(&dir).stderr(std::process::Stdio::null()).spawn().unwrap();
+    // The status line and body of one request.
+    let get = |raw: &str| -> (String, String) {
+        let mut c = (0..100).find_map(|_| std::net::TcpStream::connect(&addr).ok().or_else(|| { std::thread::sleep(std::time::Duration::from_millis(50)); None }))
+            .expect("server up");
+        c.write_all(raw.as_bytes()).unwrap();
+        let mut s = String::new();
+        c.read_to_string(&mut s).unwrap();
+        let (head, body) = s.split_once("\r\n\r\n").unwrap();
+        (head.lines().next().unwrap().to_string(), body.to_string())
+    };
+    let req = |method: &str, path: &str, key: &str| {
+        get(&format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {key}\r\nContent-Length: 0\r\n\r\n"))
+    };
+    let (s, b) = req("GET", "/health", "");
+    assert!(s.contains("503") && b.contains("no model"), "{s} {b}");
+    let (s, b) = req("POST", "/v1/chat/completions", "wrong");
+    assert!(s.contains("401") && b.contains("invalid_api_key"), "{s} {b}");
+    assert!(req("GET", "/", "").0.contains("200"), "the page loads without a key");
+    let (s, b) = req("GET", "/v1/models?x=1", "acme-0123456789abcdef");
+    assert!(s.contains("200") && b.contains(r#""data":[]"#), "{s} {b}");
+    let (s, b) = req("GET", "/api/stats", "acme-0123456789abcdef");
+    assert!(s.contains("403") && b.contains("permission_error"), "{s} {b}");
+    assert!(req("GET", "/metrics", "root-0123456789abcdef").1.contains("strata_up"));
+    assert!(get("GARBAGE\r\n\r\n").0.contains("400"));
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill").args(["-TERM", &p.id().to_string()]).status().unwrap();
+        let t = std::time::Instant::now();
+        while p.try_wait().unwrap().is_none() {
+            assert!(t.elapsed().as_secs() < 15, "no exit after SIGTERM");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(p.wait().unwrap().success());
+    }
+    let _ = p.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
