@@ -42,3 +42,25 @@ Measured with `llama-server` (`/completion`, `cache_prompt: false`, temp 0):
   `Xid 13 SKEDCHECK18_L1_CONFIG_TOO_SMALL` and a lost device.
 - sm_80 `mma` and `cp.async` do not exist on sm_70: the CUDA backend requires
   the port described in `docs/ROADMAP.md`.
+
+## 2026-11-07 — M0-T4 shared-memory preflight validation (Vulkan, V100)
+
+```
+strata check --backend vulkan: maxComputeSharedMemorySize 49152
+  60 (kernel, spec) pairs checked, largest gemmi_dp = 49152 (at the limit, accepted)
+  no cooperative-matrix kernels (gemmi, gemmi_s, gemm_f, gemm_fs) on this device
+  cost 1.1-4.8 ms
+
+STRATA_VK_SMEM_LIMIT=40000: exit 1
+  vulkan: kernel gemmi_dp with specialization [[0, 13, 176, 176947200, 0]]
+  needs 40960 bytes of shared memory; this device allows 40000
+  (raised before any weight upload)
+
+bench --pp 512  --tg 128 --ctx 32768: prefill 761.6, decode 121.4 tok/s
+bench --pp 4096 --tg 128 --ctx 32896 (x3): prefill 1401-1404, decode 115.5-116.2 tok/s
+same-window v100 baseline: prefill 1398-1407, decode 113.9-115.5 tok/s -> no regression
+no new Xid; device usable after the forced-oversize run
+```
+
+Note: the 1423.9 / 108.6 figures earlier in this file come from a different
+session; compare within the same window.
