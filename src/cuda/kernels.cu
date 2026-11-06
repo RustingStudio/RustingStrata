@@ -1538,7 +1538,9 @@ extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const flo
     int i = threadIdx.x, half = n_rot / 2;
     if (i < half) {
         double theta = (double)(step[0] + b / per) * pow((double)base, -2.0 * i / n_rot);
-        float sn = (float)sin(theta), c = (float)cos(theta);
+        double ds, dc;
+        sincos(theta, &ds, &dc);
+        float sn = (float)ds, c = (float)dc;
         float a = o[i], b = o[i + half];
         o[i] = a * c - b * sn;
         o[i + half] = a * sn + b * c;
