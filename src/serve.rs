@@ -275,7 +275,7 @@ pub struct Stats {
 /// One answered chat request.
 #[derive(Clone, Default, serde::Serialize)]
 pub struct Last {
-    /// Unix time in seconds when it finished.
+    /// Unix time in seconds when it started.
     pub at: u64,
     pub model: String,
     /// Prompt tokens: the system part, reused from the previous request (cached, which includes the system part
