@@ -563,6 +563,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             engine.parallel = host.parallel;
             let api_key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
             anyhow::ensure!(api_key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
+            let mut keys_time = host.api_keys.as_ref().and_then(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok());
             let users = match &host.api_keys {
                 Some(f) => serve::Keys::parse(&std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?)
                     .with_context(|| format!("in {}", f.display()))?,
@@ -570,13 +571,14 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             };
             anyhow::ensure!(!users.iter().any(|u| api_key.as_ref() == Some(&u.1)), "the admin key is also a customer key");
             let keys = std::sync::Arc::new(std::sync::RwLock::new(serve::Keys { admin: api_key, users }));
-            let (keys_file, mut keys_time) = (host.api_keys.clone(), host.api_keys.as_ref().and_then(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok()));
+            let keys_file = host.api_keys.clone();
             let usage = match &host.usage_log {
                 Some(f) => Some(std::sync::Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(f)
                     .with_context(|| format!("opening {}", f.display()))?)),
                 None => None,
             };
             let max_waiting = host.max_waiting.max(1);
+            anyhow::ensure!(host.max_per_key != Some(0), "--max-per-key must be at least 1");
             let url = format!("http://{addr}/");
             let listener = match TcpListener::bind(&addr) {
                 Err(e) if open && e.kind() == std::io::ErrorKind::AddrInUse => { open_browser(&url); return Ok(()); }
@@ -610,6 +612,16 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     let _ = c.shutdown(std::net::Shutdown::Write);
                     continue;
                 }
+                // ponytail: one cap on connections read or queued (each may hold an 8 MB body), not one per key.
+                if open_conns.fetch_add(1, Relaxed) >= max_waiting {
+                    open_conns.fetch_sub(1, Relaxed);
+                    eprintln!("request {i}: {max_waiting} requests already waiting, answered 503");
+                    let b = json!({"error": {"message": "server busy, retry later", "type": "overloaded_error"}}).to_string();
+                    let _ = c.set_write_timeout(Some(Duration::from_secs(5)));
+                    let _ = write!(c, "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+                    let _ = c.shutdown(std::net::Shutdown::Write);
+                    continue;
+                }
                 // A changed key file takes effect from the next request; one that does not parse keeps the old keys.
                 if let Some(f) = &keys_file && let Ok(t) = std::fs::metadata(f).and_then(|m| m.modified()) && Some(t) != keys_time {
                     keys_time = Some(t);
@@ -621,16 +633,6 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         Ok(u) => { eprintln!("{}: {} keys", f.display(), u.len()); kw.users = u; }
                         Err(e) => eprintln!("{}: {e:#}, keeping the old keys", f.display()),
                     }
-                }
-                // ponytail: one cap on connections read or queued (each may hold an 8 MB body), not one per key.
-                if open_conns.fetch_add(1, Relaxed) >= max_waiting {
-                    open_conns.fetch_sub(1, Relaxed);
-                    eprintln!("request {i}: {max_waiting} requests already waiting, answered 503");
-                    let b = json!({"error": {"message": "server busy, retry later", "type": "overloaded_error"}}).to_string();
-                    let _ = c.set_write_timeout(Some(Duration::from_secs(5)));
-                    let _ = write!(c, "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
-                    let _ = c.shutdown(std::net::Shutdown::Write);
-                    continue;
                 }
                 let (tx, oc, st, a, k, held) = (tx.clone(), open_conns.clone(), st.clone(), a.clone(), k.clone(), held.clone());
                 std::thread::spawn(move || {
@@ -663,19 +665,17 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         return reply(v, "200 OK");
                     }
                     // A customer key over `--max-per-key` is refused here, before it takes a place in the queue.
-                    let hold = match (&q, per_key) {
-                        (Ok(r), Some(cap)) => match k.read().unwrap().who(&r.auth) {
-                            Some(w) if !w.admin => match serve::Hold::take(&held, w.id, cap) {
-                                Some(h) => Some(h),
-                                None => {
-                                    eprintln!("request {i}: {} already has {cap} requests open, answered 429", w.name);
-                                    let b = json!({"error": {"message": format!("this key already has {cap} requests open, retry later"), "type": "rate_limit_error"}}).to_string();
-                                    let _ = write!(&c, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
-                                    oc.fetch_sub(1, Relaxed);
-                                    return;
-                                }
-                            },
-                            _ => None,
+                    let who = q.as_ref().ok().filter(|_| per_key.is_some()).and_then(|r| k.read().unwrap().who(&r.auth));
+                    let hold = match (who, per_key) {
+                        (Some(w), Some(cap)) if !w.admin => match serve::Hold::take(&held, w.id, cap) {
+                            Some(h) => Some(h),
+                            None => {
+                                eprintln!("request {i}: {} already has {cap} requests open, answered 429", w.name);
+                                let b = json!({"error": {"message": format!("this key already has {cap} requests open, retry later"), "type": "rate_limit_error"}}).to_string();
+                                let _ = write!(&c, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+                                oc.fetch_sub(1, Relaxed);
+                                return;
+                            }
                         },
                         _ => None,
                     };
@@ -1042,7 +1042,9 @@ impl Serving {
                             sc.spawn(move || {
                                 let mut l = Loaded { r: Runner::Slot(Client { tx, slot: None, owner: 0, conn: None }), tok, tpl, name, path };
                                 let mut nx = None;
-                                let res = handle(c, q, Some(&mut l), e, self, i, &mut nx);
+                                // A panic still gives back the counts below, so the model thread can switch models.
+                                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(c, q, Some(&mut l), e, self, i, &mut nx)))
+                                    .unwrap_or_else(|_| Err(anyhow::anyhow!("panicked")));
                                 drop((l, hold));
                                 self.waiting.fetch_sub(1, Relaxed);
                                 if let Err(e) = res { eprintln!("request {i}: {e:#}"); }
