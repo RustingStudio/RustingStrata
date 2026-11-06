@@ -128,6 +128,13 @@ python3 -I tools/parity.py "$M" --extra "--gpu --backend cuda" --tag sm70
 - Prima della review: `git fetch upstream && git rebase upstream/main`
   (o `v100`), build e test verdi.
 
+## GitHub
+
+`gh` è già autenticato e il repository di default è
+`TheBrutalX/RustingStrata` (`gh repo set-default`). Nei comandi degli agenti
+passare comunque `--repo TheBrutalX/RustingStrata` per evitare ambiguità con
+il remote `upstream`. Le issue del fork sono separate da quelle di upstream.
+
 ## Mappa del progetto
 
 - `docs/V100.md` — piano per fasi.
