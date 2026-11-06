@@ -668,10 +668,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         (v["system"], v["uptime_s"]) = (serve::system(), t0.elapsed().as_secs().into());
                         return reply(v, "200 OK");
                     }
-                    // A malformed request, a wrong key, the page and the model list are answered here, not in the queue, where without
-                    // `--parallel` they would wait for the reply being generated (`handle` checks the key again: the
-                    // keys may change meanwhile). The page holds no secret, so it loads without the key (it asks for it);
-                    // without keys the Host check stops DNS rebinding.
+                    // A malformed request, a wrong key, the page and the model list are answered here, not in the queue,
+                    // where without `--parallel` they would wait for the reply being generated (`handle` checks the key
+                    // again: the keys may change meanwhile). The page holds no secret, so it loads without the key (it
+                    // asks for it); without keys the Host check stops DNS rebinding.
                     let who = q.as_ref().ok().and_then(|r| k.read().unwrap().who(&r.auth));
                     match &q {
                         Err(e) => {
@@ -715,7 +715,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
             eprintln!("listening on {url} (models folder: {})", s.dir.display());
-            // Requests wait while a model loads, so the page may take that long to show.
+            // Chats wait while a model loads; the page shows at once.
             if open { open_browser(&url); }
             loop {
                 let (p, mut w) = match next.take() {
