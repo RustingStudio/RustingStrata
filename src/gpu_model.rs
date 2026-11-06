@@ -830,8 +830,8 @@ impl<'a> GpuModel<'a> {
         let (g, eps, ne) = (&self.gpu, c.eps, c.n_embd);
         let p = |n: &str| self.bufs[n].addr();
         // Qwen3 can cancel large residuals in its final layer, amplifying quantization errors.
-        // Use unquantized activations for its dense decode on wave64.
-        let accurate = c.arch == "qwen3" && g.accurate_dense_layer();
+        // Use unquantized activations for its dense decode on wave64 (or its final layers when configured).
+        let accurate = c.arch == "qwen3" && g.accurate_dense_layer() && il >= g.accurate_dense_start(c.n_layer);
         // Inputs from "h" are quantized once ("hq", after each norm) instead of once per GEMV block.
         let mv = |w: &GpuTensor, x: &str, xs: usize, y: &str, ys: usize|
             if accurate { g.gemv_unquantized(w, p(x), xs, p(y), ys, nt) } else if x == "h" { g.gemvq(w, p(x), xs, p("hq"), p(y), ys, nt) } else { self.mv(w, p(x), xs, p(y), ys, nt) };
