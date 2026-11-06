@@ -186,7 +186,8 @@ impl Gpu {
             .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm", "gemms"].map(|p| kname(p, t))))
             .chain(QTYPES.iter().flat_map(|&t| ["gemv", "gemvn", "moe_gemv"].map(|p| kname(p, t) + "_p")))
             .chain(QTYPES.iter().filter(|&&t| !Self::float_ty(t)).flat_map(|&t| [kname("gemmi", t), kname("gemmis", t)]))
-            .chain([64, 128, 256, 512].iter().flat_map(|h| [format!("attn_decode_{h}"), format!("attn_decode_gqa_{h}")]));
+            .chain([64, 128, 256, 512].iter().flat_map(|h| [format!("attn_decode_{h}"), format!("attn_decode_gqa_{h}")]))
+            .chain(["attn_decode_gqa4_128".to_string()]);
         for n in names {
             let f = module.load_function(&n).with_context(|| format!("kernel {n}"))?;
             // gemvn caches nt quantized inputs: 4 x 17408 columns (Qwen3.8-27B ffn_down) need 77 KB.
@@ -331,9 +332,12 @@ impl Gpu {
         let pz = (nh * ATT_SPLITS * (hd + 2)) as i32;
         // gq_min i32::MAX or 0 fixes the regime, so the kernel that would exit at once is not launched.
         if gq_min != 0 { launch!(self, &format!("attn_decode_{hd}"), cfg(((nh * nt) as u32, ATT_SPLITS_1 as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32); }
-        // attn_decode_gqa with the f16 cache at head_dim 128 or 256 also holds 2 chunks of K and V for its cp.async.
-        let cp = if !self.kv_q8 && (hd == 128 || hd == 256) { 2 * 2 * 32 * hd * 2 } else { 0 };
-        if gq_min != i32::MAX { launch!(self, &format!("attn_decode_gqa_{hd}"), cfg(((nh / g * nt) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4 + cp) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32); }
+        // attn_decode_gqa with the f16 cache at head_dim 128 or 256 also holds 2 chunks of K and V for its cp.async,
+        // attn_decode_gqa4_128 one.
+        let cp = !self.kv_q8 && (hd == 128 || hd == 256);
+        let g4 = cp && g == 4 && hd == 128;
+        let (name, cp) = if g4 { ("attn_decode_gqa4_128".to_string(), 2 * 32 * hd * 2) } else { (format!("attn_decode_gqa_{hd}"), if cp { 2 * 2 * 32 * hd * 2 } else { 0 }) };
+        if gq_min != i32::MAX { launch!(self, &name, cfg(((nh / g * nt) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4 + cp) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32); }
         launch!(self, "attn_merge", LaunchConfig { grid_dim: (nh as u32, 1, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, part, qg, out, hd as i32, ATT_SPLITS as i32, step, ATT_SPLITS_1 as i32, gq_min, xq);
         Ok(())
     }

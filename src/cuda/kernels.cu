@@ -1681,9 +1681,10 @@ __device__ void attn_decode_llama(const float* q, const u16* kc, const u16* vc, 
 // [acc (hd) | max | sum] to part; attn_merge combines the splits.
 // CP (f16 cache, the GQA entry point, head_dim 128 or 256): each lane cp.asyncs its own slice of the next two chunks
 // into shared memory while the block works on this one. Only the lane that copies a slice reads it, so the copies need
-// no barriers of their own.
+// no barriers of their own. KV1: one chunk buffer, whose K and V halves each lane refills with the next chunk as soon
+// as it has read them into registers.
 // sel (QSA): when not null and sel[0] >= 0, the block attends to the sel[0] cells sel[1 ..] instead of 0 ..= step[0].
-template <int PER, int G, bool CP = false>
+template <int PER, int G, bool CP = false, bool KV1 = false>
 __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
                               const int* sel, int nh, int nkv, float scale, int bx) {
     constexpr int hd = PER * 32, C = 32, J = C / 8;  // positions per chunk, per warp
@@ -1702,7 +1703,7 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
         return;
     }
     extern __shared__ float sq[];  // G * hd query values, then nw * hd warp partials; with CP the K/V chunks at 8 * hd
-    constexpr int ST = 2;
+    constexpr int ST = KV1 ? 1 : 2;
     u16* kb = (u16*)(sq + 8 * hd);  // [ST][K, V][C][hd]
     __shared__ float ss[G][C], sc[G], sm[G], sl[G];
     int h0 = bx * G, g = h0 / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
@@ -1712,26 +1713,27 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
     for (int i = 0; i < G; i++)
         for (int d = 0; d < PER; d++) acc[i][d] = 0.0f;
     // Positions past p1 copy or load the row p1 - 1 and keep zeros: a select, not a branch around the loads.
-    auto cp = [&](int c0, int b) {
+    // cp(c0, b, kv): copy this lane's K (kv bit 0) and V (bit 1) slices of the chunk at c0 into buffer b, as one group.
+    auto cp = [&](int c0, int b, int kv) {
         if (c0 < p1)
 #pragma unroll
             for (int j = 0; j < J; j++) {
                 size_t r = ((size_t)cell(min(c0 + w * J + j, p1 - 1)) * nkv + g) * hd + lane * PER;
                 u16 *dk = kb + ((b * 2) * C + w * J + j) * hd + lane * PER, *dv = dk + C * hd;
-                if constexpr (PER == 8) { cp_async16(dk, kc + r, true); cp_async16(dv, vc + r, true); }
-                else { cp_async8(dk, kc + r, true); cp_async8(dv, vc + r, true); }
+                if constexpr (PER == 8) { if (kv & 1) cp_async16(dk, kc + r, true); if (kv & 2) cp_async16(dv, vc + r, true); }
+                else { if (kv & 1) cp_async8(dk, kc + r, true); if (kv & 2) cp_async8(dv, vc + r, true); }
             }
         cp_async_commit();
     };
-    if constexpr (CP) {
-        cp(p0, 0);
-        cp(p0 + C, 1);
-    }
+    if constexpr (KV1) { cp(p0, 0, 1); cp(p0, 0, 2); }
+    else if constexpr (CP) { cp(p0, 0, 3); cp(p0 + C, 1, 3); }
     __syncthreads();
     for (int c0 = p0, it = 0; c0 < p1; c0 += C, it++) {
         unsigned kr[J][PER / 2], vr[J][PER / 2];
+        // Two stages: groups commit as chunks 0 1 2 ..., so all but the newest gives this chunk. KV1 (one stage):
+        // groups commit as K0 V0 K1 V1 ..., so all but the newest gives this chunk's K here and its V further down.
         if constexpr (CP) {
-            cp_async_wait<ST - 1>();
+            cp_async_wait<1>();
             asm volatile("" ::: "memory");  // the reads below stay after the wait
         }
 #pragma unroll
@@ -1739,12 +1741,17 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
             int t = c0 + w * J + j;
             if constexpr (CP) {
                 const u16* sk = kb + (((it % ST) * 2) * C + w * J + j) * hd + lane * PER;
-                ldh_raw<PER>(sk, kr[j]); ldh_raw<PER>(sk + C * hd, vr[j]);
+                ldh_raw<PER>(sk, kr[j]);
+                if constexpr (!KV1) ldh_raw<PER>(sk + C * hd, vr[j]);
             } else {
                 size_t r = ((size_t)cell(min(t, p1 - 1)) * nkv + g) * hd + lane * PER;
                 ldkv<PER>(kc, r, hd, kr[j]); ldkv<PER>(vc, r, hd, vr[j]);
             }
             for (int d = 0; d < PER / 2; d++) if (t >= p1) kr[j][d] = vr[j][d] = 0;
+        }
+        if constexpr (KV1) {
+            asm volatile("" ::: "memory");
+            cp(c0 + C, 0, 1);
         }
         float kf[J][PER], p[J * G];
 #pragma unroll
@@ -1775,6 +1782,19 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
             if (lane == 0) sc[w] = cs;
         }
         __syncthreads();
+        // V here, not between the rescale and the adds below: the refill's branch would split them, and they would
+        // contract into other FMAs than in the two-stage path.
+        if constexpr (KV1) {
+            cp_async_wait<1>();
+            asm volatile("" ::: "memory");
+#pragma unroll
+            for (int j = 0; j < J; j++) {
+                ldh_raw<PER>(kb + (C + w * J + j) * hd + lane * PER, vr[j]);
+                for (int d = 0; d < PER / 2; d++) if (c0 + w * J + j >= p1) vr[j][d] = 0;
+            }
+            asm volatile("" ::: "memory");
+            cp(c0 + C, 0, 2);
+        }
 #pragma unroll
         for (int i = 0; i < G; i++) {
             float cs = sc[i];
@@ -1788,10 +1808,28 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
                 for (int d = 0; d < PER; d++) acc[i][d] += e * hraw(vr[j], d);
             }
         __syncthreads();
-        if constexpr (CP) cp(c0 + ST * C, it % ST);
+        if constexpr (CP && !KV1) cp(c0 + 2 * C, it % 2, 3);
     }
     if (w < G && lane == 0) { sm[w] = m; sl[w] = l; }
     float* sacc = sq;  // the queries are no longer needed (the loop ends on a barrier)
+    // With CP the K/V buffers are free too (no copy is pending), so the partials of all G heads fit at once.
+    if constexpr (CP && G * 8 <= 8 + 32 * ST) {
+#pragma unroll
+        for (int i = 0; i < G; i++)
+            for (int d = 0; d < PER; d++) sacc[(i * nw + w) * hd + lane * PER + d] = acc[i][d];
+        __syncthreads();
+        for (int x = threadIdx.x; x < G * hd; x += blockDim.x) {
+            int i = x / hd, d = x % hd;
+            float o = 0.0f;
+            for (int k = 0; k < nw; k++) o += sacc[(i * nw + k) * hd + d];
+            part[((size_t)(h0 + i) * ns + blockIdx.y) * (hd + 2) + d] = o;
+        }
+        if (threadIdx.x < G) {
+            float* pp = part + ((size_t)(h0 + threadIdx.x) * ns + blockIdx.y) * (hd + 2);
+            pp[hd] = sm[threadIdx.x]; pp[hd + 1] = sl[threadIdx.x];
+        }
+        return;
+    }
 #pragma unroll
     for (int i = 0; i < G; i++) {
         for (int d = 0; d < PER; d++) sacc[w * hd + lane * PER + d] = acc[i][d];
@@ -1835,6 +1873,15 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
         }                                                                                                    \
     }
 DEF_ATT(64) DEF_ATT(128) DEF_ATT(256) DEF_ATT(512)
+// attn_decode_gqa for G = 4 at head_dim 128 with the f16 cache (Qwen3-4B and 8B, Llama 3 8B): one K/V stage
+// refilled as soon as a lane has read it, and 80 registers, so 3 blocks share an SM (72 to 61 us per layer for
+// Qwen3-4B at 4K on a 3060).
+// Other group sizes lose with it: G = 8 spills its 32 accumulators, G = 2 gains nothing from the third block.
+extern "C" __global__ void __launch_bounds__(256, 3) attn_decode_gqa4_128(ATT_ARGS) {
+    constexpr int PER = 4; ATT_TOK
+    if (step[0] + 1 < gq_min) return;
+    if constexpr (!KV_Q8) attn_decode_t<PER, 4, true, true>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt);
+}
 
 // grid = query heads: out = (sum of split partials) / (sum of split sums) * sigmoid(gate), gate skipped when qg is null. Split 0 is never empty.
 // xq not null: out is also quantized there as quant_xq does (not under LLAMA_Q8, whose scales span 256 values).
