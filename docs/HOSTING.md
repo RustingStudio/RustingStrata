@@ -43,7 +43,17 @@ What changes with `--parallel N`:
 
 - **Memory.** `--ctx` is the context of each slot, so the KV cache and the recurrent state take N times the memory
   of one, and fewer experts fit in VRAM. The `plan:` line at start shows the split. With 8 slots of 4096 tokens the
-  35B model kept 7008 of its 10240 experts resident.
+  35B model kept 7008 of its 10240 experts resident. A long `--ctx` costs the most here, and `--kv q8` gets much of
+  it back. `--parallel 4`, 4 short requests at once on the 3060:
+
+  | `--ctx` | `--kv` | KV for 4 slots | Resident experts | Total |
+  |---|---|---|---|---|
+  | 16384 | f16 | 1280 MB | 6876 of 10240 | 160 tok/s |
+  | 32768 | f16 | 2560 MB | 5567 | 114 tok/s |
+  | 32768 | q8 | 1360 MB | 6779 | 154 tok/s |
+
+  `--kv q8` is about 6% slower to decode and 14% slower to prefill at 32K of actual context, so it pays off when the
+  memory it frees holds experts. Greedy output can differ from `--kv f16` at near-ties.
 - **More than 4 slots** do not raise the total, because one pass decodes at most 4 requests. They let more users
   stream at the same time instead of waiting in the queue, each at a lower speed.
 - **Prefill.** Prompts are prefilled one at a time, in chunks (`--chunk`, from `strata calibrate`). After each
@@ -99,7 +109,7 @@ sudo chmod 600 /etc/strata/keys.txt
 
 # 4. Run it on the loopback address; the reverse proxy below is the only thing that faces the network.
 STRATA_API_KEY=<admin key> strata serve --model $M --gpu --ctx 32768 --addr 127.0.0.1:8080 \
-    --api-keys /etc/strata/keys.txt --usage-log /var/lib/strata/usage.jsonl --max-tokens 4096 --parallel 4
+    --api-keys /etc/strata/keys.txt --usage-log /var/lib/strata/usage.jsonl --max-tokens 4096 --parallel 4 --kv q8
 ```
 
 Clients then use the OpenAI address `https://api.example.com/v1` with their key, or the Anthropic address
@@ -218,7 +228,7 @@ User=strata
 EnvironmentFile=/etc/strata/env
 ExecStart=/usr/local/bin/strata serve --model /srv/models/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf --gpu --ctx 32768 \
     --addr 127.0.0.1:8080 --api-keys /etc/strata/keys.txt --usage-log /var/lib/strata/usage.jsonl --max-tokens 4096 \
-    --parallel 4
+    --parallel 4 --kv q8
 StateDirectory=strata
 Restart=on-failure
 RestartSec=5
