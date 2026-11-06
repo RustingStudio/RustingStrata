@@ -1,0 +1,104 @@
+name: Task
+description: Contratto di un task del fork V100 (aperto dall'analyst o dall'umano)
+title: "[area] <verbo> <oggetto>"
+labels: ["step:analysis"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Compila il contratto completo. La issue è l'unica fonte di verità per
+        analisi, sviluppo e review (vedi `docs/agents/WORKFLOW.md`).
+
+  - type: textarea
+    id: contesto
+    attributes:
+      label: Contesto
+      description: Perché serve, stato attuale, cosa è già stato fatto (link a commit/PR/issue).
+    validations:
+      required: true
+
+  - type: textarea
+    id: obiettivo
+    attributes:
+      label: Obiettivo
+      description: Una frase verificabile.
+    validations:
+      required: true
+
+  - type: textarea
+    id: requisiti
+    attributes:
+      label: Requisiti
+      description: Elenco puntuale, uno per riga.
+      placeholder: |
+        - [ ] requisito 1
+        - [ ] requisito 2
+    validations:
+      required: true
+
+  - type: textarea
+    id: accettazione
+    attributes:
+      label: Criteri di accettazione
+      description: Comandi esatti, output atteso, soglie di non-regressione.
+      placeholder: |
+        - [ ] `cargo build --release` verde
+        - [ ] `strata bench ...` >= <soglia>
+    validations:
+      required: true
+
+  - type: textarea
+    id: file
+    attributes:
+      label: File e aree
+      description: Percorsi e funzioni toccate (file:riga).
+    validations:
+      required: true
+
+  - type: textarea
+    id: fuori-scope
+    attributes:
+      label: Fuori scope
+      description: Cosa NON va fatto in questo task.
+    validations:
+      required: true
+
+  - type: textarea
+    id: test
+    attributes:
+      label: Piano di test
+      description: Comandi, modelli, backend, GPU libera sì/no, durata.
+    validations:
+      required: true
+
+  - type: textarea
+    id: rischi
+    attributes:
+      label: Rischi e assunzioni
+      description: rischio → mitigazione; assunzione → come verificarla.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: stima
+    attributes:
+      label: Stima
+      options:
+        - "S (max 1 giorno)"
+        - "M (1-3 giorni)"
+        - "L (>3 giorni, da splittare)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - cuda
+        - vulkan
+        - docs
+        - ci
+    validations:
+      required: true
