@@ -99,15 +99,60 @@ fn source(kv_q8: bool) -> String {
     )
 }
 
-/// Compile `src` to a cubin for `arch`, reusing `$XDG_CACHE_HOME/rusting_strata/<hash>.cubin` when present. A cubin,
-/// unlike PTX, needs no driver JIT at load (~6 s per start whenever the driver's own JIT cache missed).
-fn ptx(src: &str, arch: &'static str) -> anyhow::Result<Ptx> {
+/// The NVRTC version `libloading` actually resolves, or `None` when the library is absent or `nvrtcVersion` fails.
+/// Device-free: no `libcuda` call, so it also works in a CPU-only test.
+fn nvrtc_version() -> Option<(i32, i32)> {
+    if !unsafe { cudarc::nvrtc::sys::is_culib_present() } { return None; }
+    // A library without `nvrtcVersion` makes cudarc's loader panic: turn that into `None` rather than crash.
+    std::panic::catch_unwind(|| {
+        let (mut major, mut minor) = (0, 0);
+        let r = unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor) };
+        (r == cudarc::nvrtc::sys::nvrtcResult::NVRTC_SUCCESS).then_some((major, minor))
+    }).ok().flatten()
+}
+
+/// The user-facing error for a device `cc` with an NVRTC that cannot target it, `None` when the pair is fine.
+/// CUDA 13 dropped Volta, so an sm_70 device must be compiled by NVRTC 12.x; saying it here keeps NVRTC's own
+/// `invalid value for --gpu-architecture` from being the first thing the user sees.
+fn arch_support_error(cc: (i32, i32), nvrtc: (i32, i32)) -> Option<String> {
+    (cc.0 < 8 && nvrtc.0 >= 13).then(|| format!(
+        "NVRTC {}.{} cannot compile for sm_{}{}: 13.x removed Volta (sm_70) support; install toolkit/NVRTC 12.x",
+        nvrtc.0, nvrtc.1, cc.0, cc.1))
+}
+
+/// The startup line for the device: arch always, plus the Volta marker when the kernel path is the sm_70 fallback.
+fn device_log(device: usize, name: &str, arch: &str, cc: (i32, i32)) -> String {
+    format!("cuda device {device}: {name}, {arch}{}", if cc.0 < 8 { " (Volta fallback)" } else { "" })
+}
+
+/// Cubin cache key: the compiled source, the target arch and the NVRTC version that produced it. The version is part
+/// of it so a cubin written by another toolkit is never loaded (a 13.x sm_70 cubin must not hide the unsupported
+/// toolkit, and machine code from an older compiler must not survive an upgrade). Detected NVRTC absent -> tag
+/// `"unverified"`: any cached entry is then only reused without a version check, never in place of the missing-
+/// library error below.
+fn cache_key(src: &str, arch: &str, nvrtc: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (src, arch).hash(&mut h);
+    (src, arch, nvrtc).hash(&mut h);
+    h.finish()
+}
+
+/// Compile `src` to a cubin for `arch`, reusing `$XDG_CACHE_HOME/rusting_strata/<hash>.cubin` when present. A cubin,
+/// unlike PTX, needs no driver JIT at load (~6 s per start whenever the driver's own JIT cache missed). The hash
+/// covers `(src, arch, NVRTC version)`; when NVRTC cannot be loaded the tag is `"unverified"`, so a cache entry is
+/// no longer reusable and the run reports the missing library instead of silently reusing a cubin.
+fn ptx(src: &str, arch: &'static str, cc: (i32, i32)) -> anyhow::Result<Ptx> {
+    let nvrtc = nvrtc_version();
+    // A device/NVRTC mismatch is fatal: no "CUDA init" context, or `backend::open` and the tests swallow it as a skip.
+    if let Some(nv) = nvrtc {
+        if let Some(msg) = arch_support_error(cc, nv) {
+            return Err(anyhow::anyhow!("{msg}"));
+        }
+    }
+    let tag = nvrtc.map(|(maj, min)| format!("{maj}.{min}")).unwrap_or_else(|| "unverified".to_string());
     let dir = std::env::var_os("XDG_CACHE_HOME").map(Into::into)
         .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"))
         .join("rusting_strata");
-    let path = dir.join(format!("{:016x}.cubin", h.finish()));
+    let path = dir.join(format!("{:016x}.cubin", cache_key(src, arch, &tag)));
     if let Ok(b) = std::fs::read(&path) {
         // Refresh mtime so pruning below keeps a cubin that is still in use.
         let _ = std::fs::File::options().append(true).open(&path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
@@ -115,10 +160,12 @@ fn ptx(src: &str, arch: &'static str) -> anyhow::Result<Ptx> {
     }
     // cudarc panics on a missing library; "CUDA init" lets `backend::open` fall back to Vulkan.
     if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
-        return Err(anyhow::anyhow!("the CUDA 13 NVRTC library (libnvrtc.so) is not installed")).context("CUDA init");
+        return Err(anyhow::anyhow!(
+            "the NVRTC library (libnvrtc.so) is not installed; sm_70 needs the CUDA 12.x toolkit/NVRTC (13.x dropped Volta support)"
+        )).context("CUDA init");
     }
     prune_ptx(&dir, std::time::Duration::from_secs(7 * 86400));
-    eprintln!("compiling CUDA kernels for {arch} (first run only, ~15 s)");
+    eprintln!("compiling CUDA kernels for {arch} with NVRTC {tag} (first run only, ~15 s)");
     let b = cubin(src, arch)?;
     let _ = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &b));
     Ok(Ptx::from_binary(b))
@@ -178,11 +225,11 @@ impl Gpu {
         }
         let ctx = CudaContext::new(device).context("CUDA init")?;
         unsafe { ctx.disable_event_tracking() };
-        eprintln!("cuda device {device}: {}", ctx.name().unwrap_or_default());
-        let stream = ctx.new_stream()?;
         let (maj, min) = ctx.compute_capability()?;
         let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
-        let module = ctx.load_module(ptx(&source(kv_q8), arch)?).context("load cubin")?;
+        eprintln!("{}", device_log(device, &ctx.name().unwrap_or_default(), arch, (maj, min)));
+        let stream = ctx.new_stream()?;
+        let module = ctx.load_module(ptx(&source(kv_q8), arch, (maj, min))?).context("load cubin")?;
         let mut fns = HashMap::new();
         let names = KERNELS.iter().map(|s| s.to_string())
             .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm", "gemms"].map(|p| kname(p, t))))
@@ -774,5 +821,64 @@ mod tests {
         left.sort();
         std::fs::remove_dir_all(&d).unwrap();
         assert_eq!(left, ["new.ptx", "old.txt"]);
+    }
+
+    const SRC: &str = "extern \"C\" __global__ void k(float* x){x[0]=1.0f;}";
+
+    /// The resolved NVRTC is the host's 12.9; a machine without NVRTC skips (documented, not ignored).
+    #[test]
+    fn nvrtc_version_is_detected() {
+        if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
+            eprintln!("skipping: NVRTC library not present");
+            return;
+        }
+        assert_eq!(super::nvrtc_version(), Some((12, 9)));
+    }
+
+    /// R2/R4 with no device and no model: 12.9 accepts a trivial kernel for sm_70.
+    #[test]
+    fn nvrtc_compiles_trivial_kernel_for_sm70() {
+        if !unsafe { cudarc::nvrtc::sys::is_culib_present() } { return; }
+        super::cubin(SRC, "sm_70").expect("NVRTC 12.x must compile for sm_70 without a GPU");
+    }
+
+    #[test]
+    fn arch_support_error_rejects_cuda13_on_sm70() {
+        let msg = super::arch_support_error((7, 0), (13, 0)).expect("13.x cannot target sm_70");
+        assert!(msg.contains("12.x"), "message must name the required toolkit: {msg}");
+        assert!(msg.contains("sm_70"), "message must name the arch: {msg}");
+    }
+
+    #[test]
+    fn arch_support_error_allows_cuda12_on_sm70() {
+        assert_eq!(super::arch_support_error((7, 0), (12, 9)), None);
+    }
+
+    #[test]
+    fn arch_support_error_allows_sm80_on_cuda13() {
+        assert_eq!(super::arch_support_error((8, 0), (13, 0)), None);
+    }
+
+    #[test]
+    fn cache_key_depends_on_nvrtc_tag() {
+        let (a, b, c) = (
+            super::cache_key(SRC, "sm_70", "12.9"),
+            super::cache_key(SRC, "sm_70", "13.0"),
+            super::cache_key(SRC, "sm_70", "unverified"),
+        );
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+        assert_eq!(a, super::cache_key(SRC, "sm_70", "12.9"));
+        assert_ne!(a, super::cache_key(SRC, "sm_80", "12.9"));
+    }
+
+    #[test]
+    fn arch_log_marks_volta() {
+        assert_eq!(
+            super::device_log(0, "Tesla V100-SXM2-32GB", "sm_70", (7, 0)),
+            "cuda device 0: Tesla V100-SXM2-32GB, sm_70 (Volta fallback)");
+        assert_eq!(super::device_log(0, "NVIDIA GeForce RTX 3060", "sm_86", (8, 6)),
+            "cuda device 0: NVIDIA GeForce RTX 3060, sm_86");
     }
 }
