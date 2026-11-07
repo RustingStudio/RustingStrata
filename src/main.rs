@@ -688,8 +688,14 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         // Clients list the models often; a model still loading is listed, as its chats wait for the load.
                         Ok(r) if r.method == "GET" && r.path.split('?').next() == Some("/v1/models") && (k.read().unwrap().any() || serve::host_ok(&r.host, &a)) => {
                             let created = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                            let m = st.lock().unwrap().model.clone();
-                            return reply(json!({"object": "list", "data": m.map(|id| json!([{"id": id, "object": "model", "created": created, "owned_by": "strata"}])).unwrap_or(json!([]))}), "200 OK");
+                            let (m, n_ctx, n_ctx_train) = {
+                                let state = st.lock().unwrap();
+                                (state.model.clone(), state.ctx, state.ctx_train)
+                            };
+                            return reply(json!({"object": "list", "data": m.map(|id| json!([{
+                                "id": id, "object": "model", "created": created, "owned_by": "strata",
+                                "meta": {"n_ctx": n_ctx, "n_ctx_train": n_ctx_train}
+                            }])).unwrap_or(json!([]))}), "200 OK");
                         }
                         _ => {}
                     }
@@ -1146,8 +1152,14 @@ impl Serving {
 fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<TcpStream>) -> anyhow::Result<Option<(PathBuf, TcpStream)>> {
     eprintln!("loading {}", model.display());
     let name = model.file_stem().and_then(|s| s.to_str()).unwrap_or("strata").to_string();
-    s.stats.lock().unwrap().unload(Some(name.clone()));
+    {
+        let mut st = s.stats.lock().unwrap();
+        st.unload(Some(name.clone()));
+        st.ctx = engine.ctx;
+    }
     let g = Gguf::open(model)?;
+    let arch = g.get("general.architecture")?.as_str().context("general.architecture")?;
+    s.stats.lock().unwrap().ctx_train = g.meta.get(&format!("{arch}.context_length")).and_then(|v| v.as_u64());
     let m = Model::load(&g)?;
     let tok = Tokenizer::from_gguf(&g)?;
     let r = engine.runner(&m, model)?;
