@@ -1369,14 +1369,21 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                         write!(w, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), None))?;
                     }
                 }
+                let mut last_stream_activity = Instant::now();
                 decode(r, tok, e.mtp() > 0, &mut smp, logits, n, &mut |t| {
                     s.stats.lock().unwrap().live_tokens += 1;
                     // A client that left stops the reply (a stream notices on the next write; held text writes nothing).
                     k += 1;
                     if k % 16 == 0 && serve::gone(&w) { anyhow::bail!("client closed the connection"); }
                     let t = hold.push(t);
-                    if req.stream && !t.is_empty() {
-                        if !anth { write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?; } else { text_delta(&mut w, &mut opened, &t)?; }
+                    if req.stream {
+                        if !t.is_empty() {
+                            if !anth { write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?; } else { text_delta(&mut w, &mut opened, &t)?; }
+                            last_stream_activity = Instant::now();
+                        } else if last_stream_activity.elapsed() >= Duration::from_secs(15) {
+                            w.write_all(b": keep-alive\n\n")?;
+                            last_stream_activity = Instant::now();
+                        }
                     }
                     Ok(hold.stopped)
                 })
