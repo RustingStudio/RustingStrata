@@ -818,15 +818,62 @@ struct GemmTile { const u8* w; int m0, cnt; };
 
 __device__ __forceinline__ u32 ld_s32(const u16* p) { return *(const u32*)p; }
 // Four 8x8 f16 matrices from shared memory; lane l gives the row address for matrix l / 8 (.trans transposes each).
+//
+// sm_75+ uses ldmatrix.x4. On sm_70 (Volta) ldmatrix does not exist, so the same fragments are loaded per lane with
+// plain shared loads. `p` is the lane's own matrix origin (lane l addresses matrix l / 8, row l & 7); its position
+// relative to the four matrices depends on the matrix order `RM` used by the call site. `my = l >> 3`, `mr = l & 7`,
+// and relative to the lane's own matrix origin:
+//
+//   RM = true : own_row = (my & 1) * 8, own_col = (my >> 1) * 8;  m_row = (m & 1) * 8, m_col = (m >> 1) * 8
+//   RM = false: own_row = (my >> 1) * 8, own_col = (my & 1) * 8;  m_row = (m >> 1) * 8, m_col = (m & 1) * 8
+//
+// ldmatrix register m of lane l holds matrix m, row l >> 2, columns 2*(l & 3), 2*(l & 3) + 1 (low half first):
+//   plain:  addr(m) = p + (m_row + (l >> 2) - own_row - mr) * PQ + (m_col + 2*(l & 3) - own_col)
+//   trans:  the matrix is transposed, so register m of lane l holds matrix m rows 2*(l & 3), 2*(l & 3) + 1 at
+//           column l >> 2. Those two halves are one row apart, so two 16-bit loads:
+//   trans:  addr(m) = p + (m_row + 2*(l & 3) - own_row - mr) * PQ + (m_col + (l >> 2) - own_col), high at +PQ
+//
+// The loads are warp-synchronous plain loads (no __syncwarp()): every lane reads only elements it will own, and the
+// tile is published by the __syncthreads() before the loop. The plain case is a 4-byte load because the two halves
+// are adjacent and the address is even; the transposed halves are not contiguous and use 16-bit loads.
+template <int PQ, bool RM>
 __device__ __forceinline__ void ldsm4(u32* r, const u16* p) {
+#if __CUDA_ARCH__ < 750
+    int l = threadIdx.x & 31, my = l >> 3, mr = l & 7;
+    int own_row = (RM ? (my & 1) : (my >> 1)) * 8, own_col = (RM ? (my >> 1) : (my & 1)) * 8;
+    int row = (l >> 2) - own_row - mr, col = 2 * (l & 3) - own_col;
+#pragma unroll
+    for (int m = 0; m < 4; m++) {
+        int m_row = (RM ? (m & 1) : (m >> 1)) * 8, m_col = (RM ? (m >> 1) : (m & 1)) * 8;
+        unsigned a = (unsigned)__cvta_generic_to_shared(p + (m_row + row) * PQ + m_col + col);
+        asm("ld.shared.b32 %0, [%1];" : "=r"(r[m]) : "r"(a));
+    }
+#else
     unsigned a = (unsigned)__cvta_generic_to_shared(p);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+#endif
 }
+template <int PQ, bool RM>
 __device__ __forceinline__ void ldsm4t(u32* r, const u16* p) {
+#if __CUDA_ARCH__ < 750
+    int l = threadIdx.x & 31, my = l >> 3, mr = l & 7;
+    int own_row = (RM ? (my & 1) : (my >> 1)) * 8, own_col = (RM ? (my >> 1) : (my & 1)) * 8;
+    int row = 2 * (l & 3) - own_row - mr, col = (l >> 2) - own_col;
+#pragma unroll
+    for (int m = 0; m < 4; m++) {
+        int m_row = (RM ? (m & 1) : (m >> 1)) * 8, m_col = (RM ? (m >> 1) : (m & 1)) * 8;
+        unsigned a = (unsigned)__cvta_generic_to_shared(p + (m_row + row) * PQ + m_col + col);
+        unsigned short lo, hi;
+        asm("ld.shared.u16 %0, [%1];" : "=h"(lo) : "r"(a));
+        asm("ld.shared.u16 %0, [%1];" : "=h"(hi) : "r"(a + 2 * PQ));
+        r[m] = (u32)lo | ((u32)hi << 16);
+    }
+#else
     unsigned a = (unsigned)__cvta_generic_to_shared(p);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+#endif
 }
 __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -2142,10 +2189,10 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
 #pragma unroll
         for (int kk = 0; kk < HD; kk += 16) {
             u32 a[4], b[4];
-            ldsm4(a, qs + (warp * 16 + lr) * PQ + kk + lc);
+            ldsm4<PQ, true>(a, qs + (warp * 16 + lr) * PQ + kk + lc);
             for (int nt = 0; nt < FA_BK / 8; nt += 2) {
                 // matrices: keys nt*8 / dims kk, keys nt*8 / dims kk+8, keys nt*8+8 / dims kk, keys nt*8+8 / dims kk+8
-                ldsm4(b, ks + (nt * 8 + (lane & 7) + (lane >> 4) * 8) * PQ + kk + ((lane >> 3) & 1) * 8);
+                ldsm4<PQ, false>(b, ks + (nt * 8 + (lane & 7) + (lane >> 4) * 8) * PQ + kk + ((lane >> 3) & 1) * 8);
                 mma16816(s[nt], a[0], a[1], a[2], a[3], b[0], b[1]);
                 mma16816(s[nt + 1], a[0], a[1], a[2], a[3], b[2], b[3]);
             }
@@ -2190,7 +2237,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
 #pragma unroll
             for (int d = 0; d < HD / 8; d += 2) {
                 u32 b[4];  // transposed: keys kb*16 / dims d*8, keys +8 / dims d*8, keys / dims d*8+8, keys +8 / dims d*8+8
-                ldsm4t(b, vs + (kb * 16 + lr) * PQ + d * 8 + lc);
+                ldsm4t<PQ, true>(b, vs + (kb * 16 + lr) * PQ + d * 8 + lc);
                 mma16816(o[d], a0, a1, a2, a3, b[0], b[1]);
                 mma16816(o[d + 1], a0, a1, a2, a3, b[2], b[3]);
             }
