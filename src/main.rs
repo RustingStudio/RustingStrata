@@ -1305,6 +1305,10 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let n_sys = req.messages.iter().take_while(|m| m.role == "system").count();
             let system = tpl.render(&req.messages[..n_sys], &req.tools, req.think, preserve, false);
             let ids = tok.encode(&prompt)?;
+            // One line per chat request, and one when it finishes (see `log` below).
+            let key_name = if who.name.is_empty() { "open" } else { who.name.as_str() };
+            eprintln!("request: {method} {p} key={key_name} model={name} prompt={} tok stream={} tools={}",
+                ids.len(), req.stream, req.tools.len());
             let mut smp = e.sampler();
             smp.temp = req.temperature.unwrap_or(smp.temp);
             smp.top_k = req.top_k.unwrap_or(smp.top_k);
@@ -1374,11 +1378,22 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let ms = |d: Duration| d.as_secs_f64() * 1e3;
             let mut last = serve::Last { at: created, model: name.into(), system_tokens: n_system, cached_tokens: cached,
                 prompt_tokens: ids.len(), completion_tokens: k, prefill_ms: ms(t1 - t0), decode_ms: ms(decoded), finish: String::new() };
-            let log = |last: &serve::Last| if let Some(f) = &s.usage {
-                let mut v = json!(last);
-                v["key"] = who.name.clone().into();
-                // A failed write must not fail the reply; it is reported.
-                if let Err(err) = writeln!(f.lock().unwrap(), "{v}") { eprintln!("usage log: {err}"); }
+            let log = |last: &serve::Last| {
+                let decode_s = last.decode_ms / 1e3;
+                let prefill_s = last.prefill_ms / 1e3;
+                // Cached prompt tokens were not prefilled again, so they do not count toward the prefill speed.
+                let new_prompt = last.prompt_tokens.saturating_sub(last.cached_tokens);
+                let decode_tps = if decode_s > 0.0 { last.completion_tokens as f64 / decode_s } else { 0.0 };
+                let prefill_tps = if prefill_s > 0.0 { new_prompt as f64 / prefill_s } else { 0.0 };
+                eprintln!("done: key={key_name} model={} prompt={} tok ({} cached) -> {} tok in {decode_s:.2} s, \
+                    decode {decode_tps:.1} tok/s, prefill {prefill_tps:.1} tok/s, finish={}",
+                    last.model, last.prompt_tokens, last.cached_tokens, last.completion_tokens, last.finish);
+                if let Some(f) = &s.usage {
+                    let mut v = json!(last);
+                    v["key"] = who.name.clone().into();
+                    // A failed write must not fail the reply; it is reported.
+                    if let Err(err) = writeln!(f.lock().unwrap(), "{v}") { eprintln!("usage log: {err}"); }
+                }
             };
             // The next request starts from the saved history state or from scratch. A stream that already started is just cut off.
             let (out, stop) = match res {

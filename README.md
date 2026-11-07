@@ -56,9 +56,10 @@ IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL.
 
 Needs Rust (2024 edition) and either an NVIDIA driver with the CUDA 13 NVRTC library (loaded at run time) or a
 Vulkan 1.3 driver with shaderFloat64, int8/16/64 and subgroup size 32 (tested only on an RTX 3060; Intel Arc lacks
-shaderFloat64, pre-RDNA AMD lacks subgroup size 32). `--gpu` picks CUDA when it loads, else Vulkan; `--backend`
-chooses. The first CUDA run compiles the kernels (~15 s) and caches them. AMD GPUs: see [docs/AMD.md](docs/AMD.md)
-for known issues and what to send in a report.
+shaderFloat64, pre-RDNA AMD lacks subgroup size 32). The CUDA kernels need Ampere or newer (compute capability 8.0,
+for `cp.async` and int8 tensor cores); on Pascal, Turing or Volta use `--backend vulkan`. `--gpu` picks CUDA when it
+loads, else Vulkan; `--backend` chooses. The first CUDA run compiles the kernels (~15 s) and caches them. AMD GPUs:
+see [docs/AMD.md](docs/AMD.md) for known issues and what to send in a report.
 
 ```sh
 cargo build --release
