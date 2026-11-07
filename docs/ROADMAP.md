@@ -245,6 +245,7 @@ model's tensor types need, exposed as an explicit check command too.
 
 **Objective.** Make `--gpu --backend cuda` run on sm_70 with no sm_80-only
 instruction, no int8 tensor cores, and correct numerics, before any tuning.
+**Status: complete (2026-11-07).**
 
 **Exit criteria.**
 
@@ -277,7 +278,7 @@ CPU reference paths.
 | M1-T5 | Quarantine the int8 tensor-core path | Guard `mma_s8_*` and `gemmi_q`/`gemmis_*` behind `#if __CUDA_ARCH__ >= 800`; make `Gpu::mmq` false on sm_70 and stop loading `gemmi*` function names there, so NVRTC and `load_function` never see them | `src/cuda/kernels.cu:993-1009`, `:1027-1170`; `src/cuda/mod.rs:186-200`, `:255-258`, `:260-298` | M | M1-T1 | NVRTC sm_70 compile succeeds without the int8 kernels; prefill uses `gemm_*`/`gemms_*` and matches the reference; sm_80 still uses int8 | done (`ea39c4a`) | #14 | #15 |
 | M1-T6 | Replace `cp.async` with synchronous double buffering | Provide `cp_async16/8/commit/wait` fallbacks using `ld.global` → registers → `st.shared` with zero-fill on the out-of-range flag; audit every wait site for the barrier it needs and add `__syncthreads` where the async version relied on the wait | `src/cuda/kernels.cu:1014-1023`, uses at `:1044-1081`, `:1733-1798`, `:2094-2191` | M | M1-T1 | `gemmi_q` (later unused), `attn_decode_t` and `attn_prefill_t` outputs match the reference on sm_70; no missing-barrier race under repeated runs; `STRATA_NO_GRAPH` runs also pass | done (`bd5a930`) | #16 | #17 |
 | M1-T7 | First green sm_70 build and kernel-load gate | Drive the full NVRTC compile/load and `cargo test --release` on CUDA; fix remaining compile fallout (function list, 96 KB attribute, launch bounds) and record which kernels execute | `src/cuda/mod.rs`, `src/cuda/kernels.cu`, `tests/kernels.rs`, `tests/backend.rs` | M | M1-T1..T6 | `cargo test --release` with `STRATA_MODEL` shows no `SKIP: cuda` and no failure; `strata generate` completes on the reference model without `Xid` | done (`a945aee`) | #20 | #21 |
-| M1-T8 | CUDA correctness baseline and parity | Run `tools/parity.py --tag cuda-sm70`, compare CUDA/Vulkan/CPU outputs per op, append first CUDA numbers and divergence notes | `tools/parity.py`, `docs/V100-results.md` | M | M1-T7 | Parity ≥ 99% either-mode or a coordinator-approved documented deviation; first prefill/decode numbers recorded with the same harness as M0-T3. Measured 636/640 either-mode (99.38%): bar passed | in review | #22 | #23 |
+| M1-T8 | CUDA correctness baseline and parity | Run `tools/parity.py --tag cuda-sm70`, compare CUDA/Vulkan/CPU outputs per op, append first CUDA numbers and divergence notes | `tools/parity.py`, `docs/V100-results.md` | M | M1-T7 | Parity ≥ 99% either-mode or a coordinator-approved documented deviation; first prefill/decode numbers recorded with the same harness as M0-T3. Measured 636/640 either-mode (99.38%): bar passed | done (`68f4f50`) | #22 | #23 |
 
 ---
 
