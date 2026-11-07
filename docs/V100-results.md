@@ -310,3 +310,85 @@ Cross-backend GEMM figures now recorded by `kernels::gemm_matches_reference_for_
 - CUDA vs CUDA-path references: 2.6e-7 - 8.2e-7 relative per backend.
 
 No new `Xid`/`NVRM` line in `dmesg` before or after any run; the GPU was left at 0 MiB.
+
+## 2026-11-07 — M1-T8 CUDA parity baseline (V100, sm_70)
+
+Commit `ae95739` (v100, branch `task/22-cuda-parity`, issue #22) | driver 580.178.04 |
+CUDA toolkit 12.9.2 (nvcc 12.9.86) | NVRTC 12.9.86
+Window: production (`llama.router.service`) stopped by the coordinator, V100 free (0 MiB,
+0 %); no other process on the card. Parity run 124 s, whole sequence (integrity check,
+20 `strata score` invocations, artifact) 2 min 04 s wall.
+
+```
+strata ae95739, --gpu --backend cuda --llama-numerics --fixed-experts, tag cuda-sm70
+reference: target/parity-ref.json (sha256 0c30267c…, llama.cpp 0.9.0-dev build 12110
+           cd959bae9, FA disabled by the build) reused as-is; llama-server not started
+           (0 cache misses, 0 "ref <n> prompt tokens" lines)
+20 prompts x 32 greedy tokens = 640 positions
+strict vs llama.cpp token-by-token: 630/640 = 98.44%
+either llama.cpp mode:              636/640 = 99.38%
+llama.cpp self-agreement:           630/640 = 98.44%
+verdict: PASS (636/640, above the 634/640 either-mode bar)
+Xid: none in the window (42 lines before and after, last Fri Nov 6 20:40:46 2026)
+```
+
+Reference integrity before the run: `sha256sum` matched both M0-T7 values
+(`0c30267cb673…` / `ba5e28ac2368…`), 20 × 32 rows, `prompt_tokens` equal to
+`docs/parity/vk-sm70.json` ([26,33,54,42,27,36,31,23,26,31,19,44,24,20,995,444,1367,281,
+553,541]), llama.cpp self-agreement 630/640. `tools/parity.py` printed no cache-miss line,
+so the engine was the only process that touched the model. First `strata score` paid the
+cold NVRTC/cubin compile (sm_70, ~10 s); the remaining 19 reuse the cache.
+
+Per-prompt results for `cuda-sm70` (parity mode, same reference as `vk-sm70`):
+
+| # | prompt | prompt tokens | agree/n | first_miss | top2_gap_at_miss |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Write a Rust function that returns the n-th Fibona | 26 | 32/32 | None | None |
+| 2 | In Python, how do I read a CSV file and compute th | 33 | 32/32 | None | None |
+| 3 | Explain what this C code does: int f(int *a, int n | 54 | 32/32 | None | None |
+| 4 | Write a SQL query that returns the top 5 customers | 42 | 32/32 | None | None |
+| 5 | Write a regular expression that matches an IPv4 ad | 27 | 32/32 | None | None |
+| 6 | Fix the bug: def avg(xs): return sum(xs) / len(xs) | 36 | 32/32 | None | None |
+| 7 | Give a bash one-liner that finds the 10 largest fi | 31 | 31/32 | 9 | 0.0329 |
+| 8 | Why is the sky blue? Answer in three sentences. | 23 | 32/32 | None | None |
+| 9 | Розкажи коротко про історію Києва. | 26 | 32/32 | None | None |
+| 10 | Объясни, что такое квантовая запутанность, простым | 31 | 28/32 | 3 | 0.5055 |
+| 11 | 请用简单的语言解释什么是机器学习。 | 19 | 30/32 | 23 | 0.0837 |
+| 12 | A train leaves at 9:15 and travels 180 km at 72 km | 44 | 31/32 | 5 | 0.0564 |
+| 13 | Define the word 'entropy' as used in information t | 24 | 32/32 | None | None |
+| 14 | Give me a simple recipe for pancakes. | 20 | 31/32 | 11 | 0.1449 |
+| 15 | Summarize this design document in five bullet poin | 995 | 32/32 | None | None |
+| 16 | What license terms apply here? Summarize: | 444 | 32/32 | None | None |
+| 17 | Find the error in this log: | 1367 | 31/32 | 13 | 0.2825 |
+| 18 | Which of these cities is the largest by population | 281 | 32/32 | None | None |
+| 19 | List the keys whose value is false: | 553 | 32/32 | None | None |
+| 20 | Which row has the highest score? | 541 | 32/32 | None | None |
+
+The 10 strict misses sit on 6 prompts (7, 10, 11, 12, 14, 17); six of them (prompt 10
+positions 3 and 12, prompt 11 position 23, prompt 12 position 5, prompt 14 position 11,
+prompt 17 position 13) are the position the second llama.cpp mode (context as one batch,
+`target/llama-batch-argmax.json`) also produces, which is what carries the either-mode
+count to 636/640. Prompt 10 (4 misses, 0.5055 top-2 gap at the first) is not a near-tie.
+
+Comparison with the M0-T7 Vulkan run (same reference, same flags; `d6c2beb`, strict
+625/640 = 97.66 %, either 629/640 = 98.28 %):
+
+- CUDA strict is 630/640, i.e. exactly llama.cpp's own self-agreement (630/640), 5
+  positions better than Vulkan; either-mode is +7 (636 vs 629).
+- Token-level CUDA-vs-Vulkan divergence: 9/640 positions, on 5 prompts.
+  - prompt 12 (pos 5): CUDA takes the second llama.cpp mode, Vulkan the reference.
+  - prompt 16 (pos 0, 23), prompt 18 (pos 30), prompt 19 (pos 0, 3): CUDA matches the
+    reference, Vulkan does not.
+  - prompt 17 (pos 8, 13, 16): CUDA matches the reference at 8 and 16, Vulkan at 13;
+    both miss one position of that 32-token continuation.
+  - Prompts 7, 10, 11, 14 are position-identical in both backends, so the Vulkan
+    deviation diagnosed by M3-T5 is not inherited by CUDA on this prompt set.
+- This is the first numerical measurement of the CUDA `--llama-numerics` path
+  (`attn_prefill_llama` / `attn_decode_llama` on sm_70); it completed with no NVRTC
+  error, no launch failure, no NaN and no `strata score` failure (20/20 invocations,
+  exit 0).
+
+No new `Xid`/`NVRM` line in `dmesg` (`grep -ic Xid` = 42 before and after the window, the
+tail still ends at `Fri Nov 6 20:40:46 2026`). No device lost, no engine crash; the GPU was
+left at 0 MiB. Artifact: `docs/parity/cuda-sm70.json` (`gate: pass`; the generated
+`target/parity-result-cuda-sm70.json` is not committed).
