@@ -26,9 +26,11 @@ derived file keeps the license and attribution.
    instructions, progress and verdict live there (and in the linked PR).
 3. **Everything is written in English**: issues, comments, documents, commits,
    PRs, code comments. No exceptions.
-4. **No test may stop production without coordinator approval.** The V100 also
-   hosts `llama.router.service`: stop it only for the GPU tests that require
-   it, and restart it immediately afterwards.
+4. **Production gets stopped only inside a scheduled window.** The V100 also
+   hosts `llama.router.service`. Before stopping it, drain in-flight and queued
+   requests; stop it only for the GPU tests that require it; restart it
+   immediately after **every** window (never leave it stopped between tests)
+   and verify it is active and serving the queue again.
 5. **Upstream compatibility.** Branches must stay rebasable onto
    `upstream/main`. Volta-specific CUDA changes go behind
    `#if __CUDA_ARCH__` (or equivalent helpers) without changing sm_80+
