@@ -64,3 +64,99 @@ no new Xid; device usable after the forced-oversize run
 
 Note: the 1423.9 / 108.6 figures earlier in this file come from a different
 session; compare within the same window.
+
+## 2026-11-07 — M0-T5 GGUF type matrix (Vulkan, V100, sm_70)
+
+Commit: `1b19139` | driver 580.178.04 | Vulkan 1.4.312 | maxComputeSharedMemorySize 49152
+Command: `STRATA_TEST_BACKENDS=vulkan cargo test --release --test kernels vulkan_type_matrix -- --nocapture --exact --test-threads=1`
+
+The test builds one synthetic, finite block per `GgmlType` with the scale fields at the
+offsets each dequantizer reads, uploads raw bytes (bypassing `Backend::upload`, so native
+kernels run) and compares dequant, GEMV, GEMV-N, GEMV-Q (bit-equal to GEMV-N on the same
+`quant_xq`), MoE GEMV (first expert, `-1` skipped slot, last expert), dense GEMM over 130
+positions and the tiled `gemm` with 3 tiles against the CPU reference over the same bytes.
+`strata check` and `Vk::max_shared_bytes` use the committed SPIR-V accounting.
+
+| Type | Block elems | Upload path (loader) | dequant | gemv | gemvn | gemvq | moe_gemv | gemm_dense | gemm (tiled) | max shared (B) | Result | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| F32 | 1 | native | pass | pass | pass | pass | pass | pass | pass | 27664 | pass | f16 GEMM inputs truncate (Volta `OpFConvert`); reference matches |
+| F16 | 1 | native F32 (`upload_type`) | unsupported | unsupported | unsupported | unsupported | unsupported | unsupported | unsupported | 49152 | unsupported | no F16 shader path; loader uploads it as F32 |
+| Q4_0 | 32 | native Q8_0 (`upload_type`) | pass | pass | pass | pass | pass | pass | pass | 40960 | pass | raw native kernels tested; loader uploads Q8_0 |
+| Q4_1 | 32 | native | pass | pass | pass | pass | pass | pass | pass | 40960 | pass | |
+| Q5_0 | 32 | native Q8_0 (`upload_type`) | pass | pass | pass | pass | pass | pass | pass | 40960 | pass | raw native kernels tested; loader uploads Q8_0 |
+| Q5_1 | 32 | native | pass | pass | pass | pass | pass | pass | pass | 40960 | pass | |
+| Q8_0 | 32 | native | pass | pass | pass | pass | pass | pass | pass | 40960 | pass | |
+| Q2_K | 256 | native | pass | pass | pass | pass | pass | pass | pass | 49152 | pass | |
+| Q3_K | 256 | native | pass | pass | pass | pass | pass | pass | pass | 49152 | pass | |
+| Q4_K | 256 | native | pass | pass | pass | pass | pass | pass | pass | 40960 | pass | |
+| Q5_K | 256 | native | pass | pass | pass | pass | pass | pass | pass | 40960 | pass | |
+| Q6_K | 256 | native | pass | pass | pass | pass | pass | pass | pass | 49152 | pass | |
+| IQ2_XXS | 256 | native | pass | pass | pass | pass | pass | pass | pass | 40960 | pass | |
+| IQ2_XS | 256 | native | pass | pass | pass | pass | pass | pass | pass | 49152 | pass | f16 GEMM inputs truncate (Volta `OpFConvert`); reference matches |
+| IQ3_XXS | 256 | native | pass | pass | pass | pass | pass | pass | pass | 40960 | pass | |
+| IQ1_S | 256 | native | pass | pass | pass | pass | pass | pass | pass | 40960 | pass | |
+| IQ4_NL | 32 | native | pass | pass | pass | pass | pass | pass | pass | 49152 | pass | |
+| IQ3_S | 256 | native | pass | pass | pass | pass | pass | pass | pass | 40960 | pass | |
+| IQ2_S | 256 | native | pass | pass | pass | pass | pass | pass | pass | 49152 | pass | f16 GEMM inputs truncate (Volta `OpFConvert`); reference matches |
+| IQ4_XS | 256 | native | pass | pass | pass | pass | pass | pass | pass | 40960 | pass | |
+| IQ1_M | 256 | native | pass | pass | pass | pass | pass | pass | pass | 49152 | pass | |
+| BF16 | 1 | native | pass | pass | pass | pass | pass | pass | pass | 27664 | pass | f16 GEMM inputs truncate (Volta `OpFConvert`); reference matches |
+| Q2_0 | 64 | native | pass | pass | pass | pass | pass | pass | pass | 40960 | pass | |
+
+Summary: 22/23 types pass, 1 documented unsupported (F16, no shader path; the loader
+uploads it as F32), 0 fail. Largest shared memory 49152 B (`gemmi_dp`, at the 49152 B
+limit and accepted) — the `COOP = 0` table path of `53f823e` still fits. No Xid.
+
+Note: on this driver the Vulkan f16 GEMM path (`packFloat2x16`, SPIR-V `OpFConvert`)
+truncates its f16 inputs toward zero, while CUDA's `__float2half` rounds to nearest
+even. The GEMM reference uses the conversion the backend performs, so the matrix measures
+the kernel. The two pre-existing Vulkan tests that assumed round-to-nearest
+(`gemv_partial_superblocks_and_q2_0`, `gemm_matches_reference_for_every_type`, plus
+`f16_weight_uploads_as_f32`) needed the same backend-aware reference; no shader or
+numerics changed. Residual risk: the Vulkan f16 GEMM differs from CUDA by up to ~6e-4
+relative on these synthetic inputs.
+
+Attention: type-independent (f32 after dequant). Covered by
+`attn_prefill_matches_decode` and `strata generate` on both models.
+
+### Checks
+
+```
+strata check --model Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf --backend vulkan
+  60 (kernel, specialization) pairs checked, largest 49152 bytes (gemmi_dp) of 49152 allowed
+  exit 0
+
+strata check --model Qwen3.8-27B-UD-Q4_K_XL.gguf --backend vulkan
+  66 (kernel, specialization) pairs checked, largest 49152 bytes (gemmi_dp) of 49152 allowed
+  exit 0
+```
+
+### End-to-end
+
+```
+strata generate --model Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf --gpu --backend vulkan \
+  --prompt "The river town woke before dawn." -n 32
+  prefill 94.48 tok/s | gen 125.86 tok/s, exit 0
+  "The first light of day was just beginning to touch the eastern horizon when the first
+   sounds of activity could be heard. The clatter of hooves on cobble"
+
+strata generate --model Qwen3.8-27B-UD-Q4_K_XL.gguf --gpu --backend vulkan \
+  --prompt "The river town woke before dawn." -n 32
+  prefill 27.10 tok/s | gen 27.97 tok/s, exit 0
+  "Not with birdsong or the creak of shutters, but with the low, insistent hum of the
+   *Königstein*—the old"
+```
+
+### Bench (informational, same window)
+
+```
+strata bench --pp 4096 --tg 128 --reps 1 --ctx 32896
+  prefill 1402.2 tok/s | decode 116.3 tok/s
+  adjacent M0-T4 window: prefill 1401-1404, decode 115.5-116.2 -> no regression
+```
+
+### Xid
+
+`dmesg -T | grep -i Xid` before the window ended at `Fri Nov 6 20:40:46 2026`
+(the M0-T4 forced-oversize run); after all M0-T5 runs the tail is unchanged.
+No new Xid in the window.
