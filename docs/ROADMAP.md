@@ -236,7 +236,7 @@ model's tensor types need, exposed as an explicit check command too.
 | M0-T4 | Vulkan shared-memory preflight | Query `maxComputeSharedMemorySize`, expose pipeline creation/shared-byte accounting, and check the specializations a model needs before uploading weights; clear error on overflow | `src/vulkan/mod.rs` (`Vk::new`, `pipeline`), `src/main.rs` (check command), `tests/backend.rs` | M | M0-T2 | On V100, an intentionally oversized specialization is refused with kernel/spec/bytes; a normal load emits no error and no `Xid` | done (`cf30f29`) | #2 | #3 |
 | M0-T5 | Vulkan GGUF type matrix on sm_70 | Exercise every supported type, especially the KS = 16 / `PW = 36` set (Q2_K, Q3_K, Q6_K, IQ1_M, IQ2_XS, IQ2_S, IQ4_NL) and the table-backed set (IQ3_S, IQ4_XS), plus Q4_K, Q5_K, Q8_0, BF16; record pass/fail | `tests/kernels.rs`, `tests/backend.rs`, `docs/V100-results.md`, `src/vulkan/shaders/` | M | M0-T4 | Matrix table appended to `docs/V100-results.md`; every type passes or is documented as unsupported; no `Xid` | done (`673f215`) | #4 | #5 |
 | M0-T6 | Vulkan flag/knob matrix | Run `--chunk` (512/4096/32768), `--kv q8`, `--parallel 2/4`, `--mtp`, `STRATA_VK_NO_COOP`, `STRATA_NO_GRAPH`; note interaction `--kv q8` × `--llama-numerics` (rejected by design) | `src/main.rs`, `src/vulkan/mod.rs`, `docs/V100-results.md` | M | M0-T4 | Table of combination → result/numbers in the docs; crashes or wrong output become follow-up tasks | todo | | |
-| M0-T7 | Vulkan parity baseline on V100 | Run `tools/parity.py` against llama-server with `--tag vk-sm70`; compare against the 99% either-mode bar and record the JSON/result | `tools/parity.py`, `docs/V100-results.md`, `docs/baseline.md` | M | M0-T4 | Parity ≥ 99% either-mode, or a documented, coordinator-approved deviation; result recorded | in progress | #6 | |
+| M0-T7 | Vulkan parity baseline on V100 | Run `tools/parity.py` against llama-server with `--tag vk-sm70`; compare against the 99% either-mode bar and record the JSON/result | `tools/parity.py`, `docs/V100-results.md`, `docs/baseline.md` | M | M0-T4 | Parity ≥ 99% either-mode, or a documented, coordinator-approved deviation; result recorded. Measured 629/640 either-mode (98.28%): deviation approved, diagnosis in M3-T5 | done (`7627641`) | #6 | #7 |
 | M0-T8 | Machine-readable benchmark capture | Add JSON output (or a JSONL sidecar) to `strata bench` and an aggregation step in `tools/bench_v100.sh`; keep the human-readable block | `src/main.rs` (`Cmd::Bench`), `tools/bench_v100.sh` | S | M0-T3 | One run produces both the existing text block and a parseable JSON record with backend, model, pp, tg, reps and per-run values | todo | | |
 
 ---
@@ -323,7 +323,8 @@ land `gemm_q` before attention.
 ### M3 — Vulkan fallback hardening and tuning
 
 **Objective.** Keep Vulkan as a trustworthy fallback: profile it, tune within
-the 48 KB ceiling, and guard the measured baseline.
+the 48 KB ceiling, guard the measured baseline, and diagnose the parity gap
+recorded by M0-T7 (629/640 either-mode vs the 99% bar).
 
 **Exit criteria.**
 
@@ -346,6 +347,7 @@ goes through the preflight from M0-T4 and is measured.
 | M3-T2 | Tune the non-cooperative GEMM shaders | Try local size, subgroup count, `BM`/`BK` and staged variants of `gemmi_dp`/`gemm_f_dp` within 48 KB; keep the bit-exact int32 path | `src/vulkan/shaders/gemmi.glsl`, `gemm_f.glsl`, `src/vulkan/spv/*` | M | M3-T1 | Measured change recorded; SPIR-V regenerated; preflight passes; no parity change | todo | | |
 | M3-T3 | Tune prefill attention on Volta | Examine `attn_prefill` shared usage and workgroup shape; test a variant only if M3-T1 shows it matters | `src/vulkan/shaders/attn_prefill.glsl`, `src/vulkan/spv/*` | M | M3-T1 | Gain measured or the conclusion documented; SPIR-V fresh; no regression | todo | | |
 | M3-T4 | Vulkan regression gate | Re-run the standard benchmark and parity after M1/M2/M3 changes; fail the milestone if below baseline | `tools/bench_v100.sh`, `tools/parity.py`, `docs/V100-results.md` | S | M3-T2, M3-T3 | Numbers ≥ baseline and parity unchanged; otherwise a follow-up task is opened before the milestone exits | todo | | |
+| M3-T5 | Diagnose the Vulkan parity gap | Explain the 629/640 either-mode baseline from M0-T7 (concentration on prompts 10/16/17/19, real top-2 gap on #10) and either close it or state the accepted ceiling with evidence | `src/vulkan/`, `src/gpu_model.rs`, `tools/parity.py`, `docs/parity/`, `docs/V100-results.md` | M | M0-T7 | Root cause identified; fix merged with a new parity run, or a documented, coordinator-approved ceiling with the evidence | todo | | |
 
 ---
 
