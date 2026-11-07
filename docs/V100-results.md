@@ -242,3 +242,71 @@ write verdict PASS"):
   a 0.5055 top-2 gap, so it is not a near-tie) is a follow-up task.
 - No new Xid, no device lost, no `strata score` failure; VRAM peak with server + score was
   ~29 GB of 32 GB and neither process was evicted.
+
+## 2026-11-07 — Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf, CUDA sm_70 (M1-T7 bring-up)
+
+First run of the CUDA backend on this card (issue #20, branch `task/20-cuda-sm70-bringup`).
+Bring-up numbers, **not** the M2 benchmark protocol: one repetition, one window, no tuning,
+`llama.router.service` stopped. Model, machine and driver as above; NVRTC 12.9.
+
+```
+cuda device 0: Tesla V100-SXM2-32GB, sm_70 (Volta fallback)
+cuda shared memory: opt-in 98304 B per block, attn_decode_gqa*: 2112 B static, dynamic max 73728 B
+cuda shared memory: opt-in 98304 B per block, attn_prefill_*: 0 B static, dynamic max 67584 B
+cuda shared memory: opt-in 98304 B per block, gemvn_*: 0 B static, dynamic max 98304 B
+plan: weights+state+scratch 1984 MB (KV 80 MB for 4096 tokens, prefill 512 MB),
+      expert slots 10040 MB, resident experts 10240/10240
+pp    512: prefill 836.5 (836.5-836.5) tok/s | tg 32: decode 116.2 (116.2-116.2) tok/s
+expert hit rate 100.0% (0 misses), cache swaps 0
+```
+
+`generate --prompt "The capital of France is"`: `-n 8` gen 122.78 tok/s, `-n 32`
+prompt 5 tok 84.03 tok/s | gen 32 tok 124.27 tok/s. Output coherent ("…Paris is the capital and
+most populous city of France…"). The Vulkan baseline of 2026-11-06 on the same model was
+`pp 512` 635.6 tok/s (steady state ~775) and `tg 128` 109.8 tok/s; the CUDA figures above are
+higher but come from a shorter protocol, so they are indicative only.
+
+Device facts measured here (they answer the M1-T7 open question): the driver reports a
+dynamic shared memory opt-in of **98304 B (96 KiB) with no reserve**, `attn_decode_gqa_*` uses
+**1920-2112 B of static shared memory** (1920 in `--llama-numerics`), `attn_prefill_*` and
+`gemvn_*` use 0 B. `optin - static` is therefore 96192 B for `attn_decode_gqa_*`, below the
+98304 B the sm_70 build used to request for every one of those functions.
+
+Kernels that actually executed (`nsys profile --trace=cuda --cuda-graph-trace=node`):
+
+- `generate -n 8`: `gemv_q4_k`, `gemv_q5_k`, `gemv_q6_k`, `gemv_q8_0`, `gemv_f32`,
+  `moe_gemv_iq2_xs`, `moe_gemv_iq3_xxs`, `moe_gemv_iq4_xs`, `moe_route`, `moe_combine`,
+  `rms_norm`, `rms_norm_rope`, `swiglu_q`, `deltanet_seq`, `conv_silu`, `norm_gate`,
+  `rope_freq`, `attn_decode_256`, `attn_merge`, `argmax_part`, `argmax_rows`.
+- `bench --pp 512 --tg 32` adds the prefill set: `attn_prefill_256` (10 launches, 2.04 s total,
+  i.e. the 67584 B dynamic shared memory launch), `gemm_q5_k`, `gemm_q6_k`, `gemm_q8_0`,
+  `gemm_iq2_xs`, `gemm_iq3_xxs`, `gemm_iq4_xs`, `gemms_q5_k`, `gemms_q6_k`, `gemms_iq2_xs`,
+  `gemms_iq3_xxs`, `gemms_iq4_xs`, `gemms_f32`, plus `l2_norm`, `rope_neox`, `conv_seq`,
+  `conv_state`, `router_topk`, `ssm_gates`, `moe_combine_seq`, `kv_store`.
+- No `gemmi_*`/`gemmis_*` and no `quant_q8`: as designed, the sm_70 build has no int8 prefill
+  GEMM (`Backend::mmq` is false there and `gemm_raw` takes the f16 `gemm_*` path).
+- `gemvn_*` was **not** launched by either command (the lm head ran as `gemv_q4_k`, one input),
+  so its 98304 B opt-in was set but the kernel itself is not yet exercised.
+
+### Test suite (same window)
+
+`STRATA_MODEL=$M cargo test --release --no-fail-fast`: 121 passed, 2 failed, 5 ignored,
+`grep -c "SKIP: cuda"` = 0 (the CUDA backend opens in every GPU test binary). Failures:
+
+- `backend::spirv_is_fresh` — the known pre-existing Vulkan/toolchain drift (40 of 47 committed
+  `.spv` byte-differ with shaderc 2025.2-1); untouched by this task.
+- `gpu_model::prefill_matches_reference` — fails on **Vulkan only**: at the step after a 73-token
+  prefill the Vulkan argmax is 15019 where CPU and CUDA give 4938 (`max |dlogit|` 1.4263 prefill
+  vs 1.4200 decode). Reproduced identically on the base commit `f295a6c` with
+  `STRATA_TEST_BACKENDS=vulkan`, so it predates M1-T7 and is outside its scope (Vulkan numerics).
+
+Cross-backend GEMM figures now recorded by `kernels::gemm_matches_reference_for_every_type`
+(each backend matches its own 1e-4 reference; the cross-backend figure is kept as data):
+
+- sm_70 CUDA f16 vs Vulkan int8, same tensor, different GEMM math: 3.17e-3 - 4.08e-3 relative
+  (the int8 quantization of X, not summation order).
+- f16 path with different input conversions (CUDA `__float2half` rounds, this driver's
+  `OpFConvert` truncates): 5.41e-4 (IQ2_XS), 4.79e-5 (F32).
+- CUDA vs CUDA-path references: 2.6e-7 - 8.2e-7 relative per backend.
+
+No new `Xid`/`NVRM` line in `dmesg` before or after any run; the GPU was left at 0 MiB.

@@ -2,7 +2,7 @@
 mod common;
 use common::{down, up};
 use rusting_strata::backend::{Backend, ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
-use rusting_strata::{cuda::Gpu, gguf::Gguf, quant::GgmlType, weights::{Tensor, Weights}};
+use rusting_strata::{gguf::Gguf, quant::GgmlType, weights::{Tensor, Weights}};
 
 fn xs(n: usize) -> Vec<f32> {
     (0..n).map(|i| ((i as f32 * 0.7548777).fract() - 0.5) * 2.0).collect()
@@ -263,11 +263,15 @@ fn f16tz(v: f32) -> f32 {
 fn f16_in(bk: &str, v: f32) -> f32 { if bk == "vulkan" { f16tz(v) } else { f16r(v) } }
 
 /// Tensor-core GEMM over a tile list matches per-row dot products, for every type, with a gathered X and partial
-/// tiles. Types on the int8 path (`Gpu::mmq`) see X as int8 per 32 (as the GEMV path does), the others fp16 inputs.
+/// tiles. Types on the int8 path (`Backend::mmq`, i.e. `Gpu::mmq` gated on the device) see X as int8 per 32 (as the
+/// GEMV path does), the others fp16 inputs.
 #[test]
 fn gemm_matches_reference_for_every_type() {
     let Some(p) = common::model_path() else { return };
-    let mut first = std::collections::HashMap::new();  // results of the first backend, which the others match bit for bit
+    // Results of the first backend per (tensor, GEMM path), the others of that path match it; and the last result of
+    // each backend for the per-tensor cross-path figure that this test only records.
+    let mut first = std::collections::HashMap::new();
+    let mut last: std::collections::HashMap<String, (&'static str, Vec<f32>)> = std::collections::HashMap::new();
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
@@ -290,11 +294,24 @@ fn gemm_matches_reference_for_every_type() {
             let got = down::<f32>(gpu, &dy);
             let mut wr = vec![0f32; t.cols];
             let mut want = vec![0f32; m * rows];
+            // The path this backend's launcher takes: int8 needs the type policy *and* the arch (sm_70 CUDA has no
+            // int8 tensor cores) *and* 16-byte aligned q8 rows (src/cuda/mod.rs:342).
+            let int8 = gpu.mmq(t.ty) && t.cols % 128 == 0;
+            // CUDA's `__float2half` rounds f16 operands, this Vulkan driver's `OpFConvert` truncates (f16tz/f16_in).
+            // Where the two disagree on this tensor's operands the two f16 GEMMs multiply different numbers.
+            let same_f16 = int8 || {
+                let mut all = x.iter().all(|&v| f16tz(v) == f16r(v));
+                for r in 0..rows {
+                    t.row(r, &mut wr);
+                    all &= wr.iter().all(|&v| f16tz(v) == f16r(v));
+                }
+                all
+            };
             for r in 0..rows {
                 t.row(r, &mut wr);
                 for (i, &xr) in xrow.iter().enumerate() {
                     let xv = &x[xr as usize * t.cols..][..t.cols];
-                    want[i * rows + r] = if Gpu::mmq(t.ty) {
+                    want[i * rows + r] = if int8 {
                         wr.iter().zip(as_seen(t.ty, xv)).map(|(a, b)| a * b).sum()
                     } else {
                         wr.iter().zip(xv).map(|(a, b)| f16_in(bk, *a) * f16_in(bk, *b)).sum()
@@ -305,10 +322,36 @@ fn gemm_matches_reference_for_every_type() {
             eprintln!("{:8} {name}: gemm rel err {e:.2e}", ty.name());
             assert!(e <= 1e-4, "{} gemm ({name}): rel err {e}", ty.name());
             // Vulkan without cooperative matrices sums the f16 products in another order than mma.sync.
-            if bk == "vulkan" && !Gpu::mmq(t.ty) && std::env::var_os("STRATA_VK_NO_COOP").is_some() { continue; }
-            let f = first.entry(name.clone()).or_insert_with(|| got.clone());
-            let bits = got.iter().zip(f.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-            assert_eq!(bits, 0, "{} gemm ({name}) on {bk}: {bits} values differ from the first backend", ty.name());
+            if bk == "vulkan" && !int8 && std::env::var_os("STRATA_VK_NO_COOP").is_some() { continue; }
+            // Cross-backend: bit for bit between backends on the same GEMM math and f16 operands, except by tolerance
+            // where an sm_70 CUDA backend is involved (its `mma16816` sums the same f16 products in another order).
+            // Backends whose math differs (sm_70 CUDA f16 vs Vulkan int8 for an int8 type, a truncating f16
+            // conversion, and Vulkan order without cooperative matrices) are recorded, not asserted: the per-backend
+            // reference above at 1e-4 is what catches a wrong kernel, and the measured figure goes in the PR.
+            let key = (name.clone(), int8);
+            match first.entry(key) {
+                std::collections::hash_map::Entry::Vacant(v) => { v.insert((bk, gpu.volta(), got.clone())); }
+                std::collections::hash_map::Entry::Occupied(o) => {
+                    let &(bk0, volta, ref f) = o.get();
+                    let bits = got.iter().zip(f.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                    if !same_f16 {
+                        eprintln!("{:8} {name}: {bk} vs {bk0} (different f16 input conversion, recorded): rel err {:.2e}",
+                            ty.name(), rel_l2(&got, f));
+                    } else if volta || gpu.volta() {
+                        let e = rel_l2(&got, f);
+                        eprintln!("{:8} {name}: gemm on {bk} vs {bk0} (same math): rel err {e:.2e}", ty.name());
+                        assert!(e <= 1e-4, "{} gemm ({name}) on {bk}: rel err {e} vs {bk0}", ty.name());
+                    } else {
+                        assert_eq!(bits, 0, "{} gemm ({name}) on {bk}: {bits} values differ from {bk0}", ty.name());
+                    }
+                }
+            }
+            if let Some((bk0, f0)) = last.insert(name.clone(), (bk, got.clone())) {
+                if bk0 != bk {
+                    eprintln!("{:8} {name}: {bk} vs {bk0} (different GEMM math, recorded): rel err {:.2e}",
+                        ty.name(), rel_l2(&got, &f0));
+                }
+            }
         }
     }
 }
@@ -416,12 +459,26 @@ fn attn_prefill_matches_decode() {
                 r => {
                     r.unwrap();
                     let got = down::<f32>(gpu, &dout);
-                    // Vulkan's cooperative matrices are the same f16 products summed in f32 as CUDA's mma.sync.
-                    let f = first_pf.entry((pos0, nh, nkv, hd)).or_insert_with(|| got.clone());
-                    let nd = got.iter().zip(f.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-                    // Without cooperative matrices Vulkan sums in another order.
-                    let nd = if bk == "vulkan" && std::env::var_os("STRATA_VK_NO_COOP").is_some() { 0 } else { nd };
-                    assert!(nd == 0, "{bk} attn_prefill pos {pos0} nh {nh} nkv {nkv} hd {hd}: {nd} of {} differ from the first backend", got.len());
+                    // Cross-backend: bit for bit where every backend sums the same f16 products in the same order
+                    // (Vulkan's cooperative matrices and CUDA's mma.sync), by tolerance from or against an sm_70 CUDA
+                    // backend, whose `mma16816` runs the same products on CUDA cores in another order, and where
+                    // Vulkan has no cooperative matrices.
+                    match first_pf.entry((pos0, nh, nkv, hd)) {
+                        std::collections::hash_map::Entry::Vacant(v) => { v.insert((bk, gpu.volta(), got.clone())); }
+                        std::collections::hash_map::Entry::Occupied(o) => {
+                            let &(bk0, volta, ref f) = o.get();
+                            if bk == "vulkan" && std::env::var_os("STRATA_VK_NO_COOP").is_some() {
+                                // Without cooperative matrices Vulkan sums in another order.
+                            } else if volta || gpu.volta() {
+                                let e = rel_l2(&got, f);
+                                eprintln!("attn_prefill {bk} vs {bk0} pos {pos0} nh {nh} nkv {nkv} hd {hd}: rel err {e:.2e}");
+                                assert!(e <= 5e-4, "{bk} attn_prefill pos {pos0} nh {nh} nkv {nkv} hd {hd}: rel err {e}");
+                            } else {
+                                let nd = got.iter().zip(f.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                                assert!(nd == 0, "{bk} attn_prefill pos {pos0} nh {nh} nkv {nkv} hd {hd}: {nd} of {} differ from {bk0}", got.len());
+                            }
+                        }
+                    }
                     gpu.attn_prefill(dq.addr(), dk.addr(), dv.addr(), 0, dout.addr(), step.addr(), t, nh, nkv, hd, scale).unwrap();
                     let e = rel_l2(&gated(&down::<f32>(gpu, &dout)), &got);
                     assert!(e <= 1e-6, "attn_prefill without gate nh {nh} hd {hd}: {e}");
@@ -1196,7 +1253,7 @@ fn gemv_partial_superblocks_and_q2_0() {
                 for r in 0..rows {
                     t.row(r, &mut wr);
                     for (i, xv) in xm.chunks(cols).enumerate() {
-                        want[i * rows + r] = if Gpu::mmq(ty) && cols % 128 == 0 { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
+                        want[i * rows + r] = if gpu.mmq(ty) && cols % 128 == 0 { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
                                              else { wr.iter().zip(xv).map(|(a, b)| f16_in(bk, *a) * f16_in(bk, *b)).sum() };
                     }
                 }
@@ -1346,7 +1403,7 @@ fn vulkan_type_matrix() {
                 for r in 0..rows {
                     t.row(r, &mut wr);
                     for (i, xv) in xm.chunks(cols).enumerate() {
-                        want[i * rows + r] = if Gpu::mmq(ty) && cols % 128 == 0 { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
+                        want[i * rows + r] = if gpu.mmq(ty) && cols % 128 == 0 { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
                                              else { wr.iter().zip(xv).map(|(a, b)| f16tz(*a) * f16tz(*b)).sum() };
                     }
                 }
@@ -1371,7 +1428,7 @@ fn vulkan_type_matrix() {
                     t.row(r, &mut wr);
                     for (i, &xri) in xrow.iter().enumerate() {
                         let xv = &xr[xri as usize * cols..][..cols];
-                        want[i * rows + r] = if Gpu::mmq(ty) { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
+                        want[i * rows + r] = if gpu.mmq(ty) && cols % 128 == 0 { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
                                              else { wr.iter().zip(xv).map(|(a, b)| f16tz(*a) * f16tz(*b)).sum() };
                     }
                 }
