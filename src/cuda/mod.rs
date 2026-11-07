@@ -33,6 +33,8 @@ pub struct Gpu {
     /// Launches so far in the current `batch` (usize::MAX outside one).
     nb: AtomicUsize,
     fns: HashMap<String, CudaFunction>,
+    /// The int8 prefill GEMM (`gemmi_*`/`gemmis_*`) is compiled in and loaded: sm_80+ only (see `int8_gemm_arch`).
+    i8_gemm: bool,
     /// q8 rows of the last integer GEMM's X (see quant_q8 in kernels.cu), grown on demand, and which x they hold
     /// (x, x_stride, n_x, cols) for a `SAME_X` call; None after a call without it that did not quantize.
     q8: std::sync::Mutex<(CudaSlice<u8>, Option<[u64; 4]>)>,
@@ -123,6 +125,26 @@ fn arch_support_error(cc: (i32, i32), nvrtc: (i32, i32)) -> Option<String> {
 /// The startup line for the device: arch always, plus the Volta marker when the kernel path is the sm_70 fallback.
 fn device_log(device: usize, name: &str, arch: &str, cc: (i32, i32)) -> String {
     format!("cuda device {device}: {name}, {arch}{}", if cc.0 < 8 { " (Volta fallback)" } else { "" })
+}
+
+/// Whether the device has int8 tensor cores, i.e. whether the `gemmi_*`/`gemmis_*` prefill GEMM exists in its cubin
+/// and may be launched. Volta (sm_70) does not: the s8 `mma` shapes need sm_80, so the kernels are compiled out of
+/// the sm_70 build (see the `#if __CUDA_ARCH__ >= 800` guards in kernels.cu) and dropped from the loaded name list.
+/// This is the CUDA launch gate only: `Gpu::mmq` stays the pure type policy shared with Vulkan and the tests.
+fn int8_gemm_arch(cc: (i32, i32)) -> bool { cc.0 >= 8 }
+
+/// The kernel names to load from the cubin: the full list on sm_80+, without the int8 prefill GEMM (`gemmi_*` and
+/// `gemmis_*`, 20 non-float types x 2) on a device where that code is not compiled in. Pure so a CPU test can pin
+/// both lists (282 / 242 names).
+fn kernel_names(sm80: bool) -> Vec<String> {
+    let int8 = move |&&t: &&GgmlType| sm80 && !matches!(t, GgmlType::F32 | GgmlType::BF16);
+    KERNELS.iter().map(|s| s.to_string())
+        .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm", "gemms"].map(|p| kname(p, t))))
+        .chain(QTYPES.iter().flat_map(|&t| ["gemv", "gemvn", "moe_gemv"].map(|p| kname(p, t) + "_p")))
+        .chain(QTYPES.iter().filter(int8).flat_map(|&t| [kname("gemmi", t), kname("gemmis", t)]))
+        .chain([64, 128, 256, 512].iter().flat_map(|h| [format!("attn_decode_{h}"), format!("attn_decode_gqa_{h}")]))
+        .chain(["attn_decode_gqa4_128".to_string()])
+        .collect()
 }
 
 /// Cubin cache key: the compiled source, the target arch and the NVRTC version that produced it. The version is part
@@ -230,14 +252,9 @@ impl Gpu {
         eprintln!("{}", device_log(device, &ctx.name().unwrap_or_default(), arch, (maj, min)));
         let stream = ctx.new_stream()?;
         let module = ctx.load_module(ptx(&source(kv_q8), arch, (maj, min))?).context("load cubin")?;
+        let i8_gemm = int8_gemm_arch((maj, min));
         let mut fns = HashMap::new();
-        let names = KERNELS.iter().map(|s| s.to_string())
-            .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm", "gemms"].map(|p| kname(p, t))))
-            .chain(QTYPES.iter().flat_map(|&t| ["gemv", "gemvn", "moe_gemv"].map(|p| kname(p, t) + "_p")))
-            .chain(QTYPES.iter().filter(|&&t| !Self::float_ty(t)).flat_map(|&t| [kname("gemmi", t), kname("gemmis", t)]))
-            .chain([64, 128, 256, 512].iter().flat_map(|h| [format!("attn_decode_{h}"), format!("attn_decode_gqa_{h}")]))
-            .chain(["attn_decode_gqa4_128".to_string()]);
-        for n in names {
+        for n in kernel_names(i8_gemm) {
             let f = module.load_function(&n).with_context(|| format!("kernel {n}"))?;
             // gemvn caches nt quantized inputs: 4 x 17408 columns (Qwen3.8-27B ffn_down) need 77 KB.
             if n.starts_with("attn_prefill") || n.starts_with("attn_decode_gqa") || n.starts_with("gemvn") {
@@ -249,7 +266,7 @@ impl Gpu {
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = ctx.new_event(None)?;
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_q8, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default() })
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, kv_q8, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -299,6 +316,9 @@ impl Gpu {
 
     /// Whether the prefill GEMM for `ty` runs on int8 tensor cores (X quantized to int8 per 32) rather than f16.
     /// `STRATA_MMQ=q5_k,q6_k,..` overrides the default list.
+    /// Type policy only: the CUDA launcher additionally requires the arch to have int8 tensor cores (`gemm_raw`), so
+    /// a CUDA-side consumer of this predicate must consult `int8_gemm_arch` too (tests/kernels.rs reference math:
+    /// M1-T7).
     pub fn mmq(ty: GgmlType) -> bool {
         // IQ2_XS (and IQ2_S) has a scale per 16: its int8 path spends as long scaling mma results as in the mma, and loses to f16 (#31).
         !Self::float_ty(ty) && std::env::var("STRATA_MMQ").map(|v| v.split(',').any(|t| t == ty.name())).unwrap_or(!matches!(ty, GgmlType::IQ2XS | GgmlType::IQ2S) || llama_numerics())
@@ -316,7 +336,10 @@ impl Gpu {
         let (same, act) = (act & SAME_X != 0, act & !SAME_X);
         let mut q8 = self.q8.lock().unwrap();
         // The int8 path loads q8 rows 16 bytes at a time: their stride (cols * 11 / 8) is aligned only for cols % 128 == 0.
-        if !Self::mmq(ty) || cols % 128 != 0 {
+        // Volta has no int8 tensor cores: there the kernels are not compiled (`#if __CUDA_ARCH__ >= 800`) and not
+        // loaded, so this gate must dominate `STRATA_MMQ` or the launch would panic on `self.fns[...]`; sm_70 takes
+        // the f16 `gemm_*`/`gemms_*` below instead.
+        if !self.i8_gemm || !Self::mmq(ty) || cols % 128 != 0 {
             if !same { q8.1 = None; }
             launch!(self, &kname(if sm { "gemms" } else { "gemm" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
                 tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act);
@@ -846,10 +869,10 @@ mod tests {
     /// This is a ratchet, not an allow-list: a blocker that stops firing must be removed here, and a line that
     /// matches none of these fails `nvrtc_compiles_full_source_for_sm70` with the line printed. The recorded
     /// substrings are for NVRTC 12.9 (the test skips on other versions).
-    /// Shrinking: M1-T3 removed `ldmatrix` and `Modifier '.m8n8'` (the `ldsm4`/`ldsm4t` sm_70 fallback); M1-T4
-    /// owns `.m16n8k16`, M1-T5 `.m16n8k32`, M1-T6 `cp.async` (which also covers `cp.async.commit_group` /
-    /// `cp.async.wait_group`).
-    const TRACKED_SM70_BLOCKERS: &[&str] = &[".m16n8k16", ".m16n8k32", "cp.async"];
+    /// Shrinking: M1-T3 removed `ldmatrix` and `Modifier '.m8n8'` (the `ldsm4`/`ldsm4t` sm_70 fallback); M1-T5
+    /// removed `.m16n8k32` (the int8 tensor-core GEMM, now guarded out of the sm_70 build); M1-T4 owns
+    /// `.m16n8k16`, M1-T6 `cp.async` (which also covers `cp.async.commit_group` / `cp.async.wait_group`).
+    const TRACKED_SM70_BLOCKERS: &[&str] = &[".m16n8k16", "cp.async"];
 
     /// M1-T2, CPU-only (no device, no model, no `STRATA_MODEL`): the full generated source must reach ptxas on
     /// sm_70 with **only** the tracked blockers left, so the `__reduce_*_sync` front-end errors are gone; and it must
@@ -878,6 +901,12 @@ mod tests {
         for b in TRACKED_SM70_BLOCKERS {
             eprintln!("tracked sm_70 blocker {b:?}: {} diagnostic(s)", log.matches(b).count());
         }
+        // Pinned counts (NVRTC 12.9.86, this machine): the int8 quarantine leaves only the f16 `.m16n8k16` (M1-T4)
+        // and `cp.async` (M1-T6). A different count means a construct entered or left the sm_70 build: re-measure,
+        // then update the owner here.
+        assert_eq!(log.matches(".m16n8k16").count(), 1104, "f16 mma diagnostics changed (M1-T4 owns them)");
+        assert_eq!(log.matches("cp.async").count(), 326, "cp.async diagnostics changed (M1-T6 owns them)");
+        assert_eq!(log.matches(".m16n8k32").count(), 0, "the int8 tensor-core path must not reach the sm_70 build");
         // Diagnostics are the lines mentioning `error`, minus the three bookkeeping ones: NVRTC's wrapper
         // (`... failed: NvrtcError(...)`), the `N errors detected in the compilation of ...` summary and ptxas's
         // `Ptx assembly aborted due to errors`. The other two are allowed because they carry no construct.
@@ -934,5 +963,30 @@ mod tests {
             "cuda device 0: Tesla V100-SXM2-32GB, sm_70 (Volta fallback)");
         assert_eq!(super::device_log(0, "NVIDIA GeForce RTX 3060", "sm_86", (8, 6)),
             "cuda device 0: NVIDIA GeForce RTX 3060, sm_86");
+    }
+
+    /// M1-T5, CPU-only: the int8 prefill GEMM needs int8 tensor cores, which Volta (7.x) lacks; every sm_80+ part
+    /// keeps it.
+    #[test]
+    fn int8_gemm_arch() {
+        assert!(!super::int8_gemm_arch((7, 0)));
+        assert!(!super::int8_gemm_arch((7, 5)));
+        assert!(super::int8_gemm_arch((8, 0)));
+        assert!(super::int8_gemm_arch((8, 6)));
+        assert!(super::int8_gemm_arch((9, 0)));
+    }
+
+    /// M1-T5, CPU-only: the loaded name list drops `gemmi_*`/`gemmis_*` only on a device where kernels.cu compiles
+    /// them out. 282 names today (sm_80, unchanged); 20 non-float types x 2 fewer names = 242 on sm_70.
+    #[test]
+    fn kernel_names() {
+        let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
+        assert_eq!(sm80.len(), 282);
+        assert_eq!(sm70.len(), 242);
+        assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmis")),
+            "sm_70 must not load the int8 prefill GEMM: {:?}",
+            sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());
+        assert!(sm80.contains(&"gemmi_q4_k".to_string()));
+        assert!(sm80.contains(&"gemmis_q2_k".to_string()));
     }
 }
