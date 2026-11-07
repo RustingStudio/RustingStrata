@@ -392,3 +392,21 @@ No new `Xid`/`NVRM` line in `dmesg` (`grep -ic Xid` = 42 before and after the wi
 tail still ends at `Fri Nov 6 20:40:46 2026`). No device lost, no engine crash; the GPU was
 left at 0 MiB. Artifact: `docs/parity/cuda-sm70.json` (`gate: pass`; the generated
 `target/parity-result-cuda-sm70.json` is not committed).
+
+## 2026-11-07 — Context scaling, CUDA, KV q8 (V100, sm_70)
+
+Model: `Qwen3.8-27B-UD-Q4_K_XL.gguf`. Build: `v100` at `b055eff` (M1 complete;
+CUDA uses the sm_70 FMA fallback, no tensor cores until M2).
+
+```
+strata bench --gpu --backend cuda --kv q8 --ctx 262272 \
+  --pp 32768,65536,131072,262144 --tg 128 --reps 1
+
+plan: weights+state+scratch 25280 MB (KV 8708 MB for 262272 tokens, prefill 706 MB)
+pp  32768: prefill 104.3 tok/s | tg 128: decode 25.0 tok/s
+pp  65536: prefill  79.5 tok/s | tg 128: decode 22.0 tok/s
+```
+
+128k and 256k were not completed: the run was stopped at the production
+window limit. Estimated on this build: 128k ~30-40 min, 256k ~80-100 min of
+prefill. KV q8 at 256k is 8708 MB; the plan fits in 32 GB.
