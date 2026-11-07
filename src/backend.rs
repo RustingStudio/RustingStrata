@@ -117,6 +117,13 @@ pub trait Backend: Send {
     /// added nothing and the rest of that submission was skipped: the caller waits for the worker and runs the
     /// forward again from that combine. Clears the flag. Backends whose combines never give up return false.
     fn stalled(&self) -> bool { false }
+    /// Whether the prefill GEMM for `ty` runs on int8 tensor cores on this backend: the type policy of `Gpu::mmq`,
+    /// gated on the device. Tests build their reference math from this, since the CUDA launcher takes the f16
+    /// `gemm_*` path where the arch has no int8 tensor cores (sm_70) even for an int8 type.
+    fn mmq(&self, ty: GgmlType) -> bool { crate::cuda::Gpu::mmq(ty) }
+    /// Whether this backend runs the Volta (sm_70) CUDA fallbacks, whose kernels sum the same f16 products in
+    /// another order than `mma.sync`. A cross-backend comparison against or from such a backend is by tolerance.
+    fn volta(&self) -> bool { false }
     /// Zeroed host memory of `words` u32 that kernels read and write at the `Buf` address. The host pointer is
     /// valid while the `Buf` lives.
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)>;

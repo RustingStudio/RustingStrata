@@ -6,7 +6,7 @@ use anyhow::{Context, bail};
 use crate::backend::{Backend, Buf, SAME_X};
 use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice, LaunchConfig, PushKernelArg, result, sys};
 use cudarc::nvrtc::Ptx;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -133,6 +133,50 @@ fn device_log(device: usize, name: &str, arch: &str, cc: (i32, i32)) -> String {
 /// This is the CUDA launch gate only: `Gpu::mmq` stays the pure type policy shared with Vulkan and the tests.
 fn int8_gemm_arch(cc: (i32, i32)) -> bool { cc.0 >= 8 }
 
+/// The dynamic shared memory a launch of kernel `name` can request, with its family for the startup log: the fixed
+/// maximum of the attention prefill (`2 * (64 + 32 + 32)` rows of `hd + 8` halves, `attn_prefill_m`) and of the
+/// decode GQA kernels (8 query slices per head group plus the cp.async K/V chunks at head_dim 128/256, `attn`),
+/// `usize::MAX` for `gemvn_*` whose request depends on the tensor shape (`xq_smem * nt`, `gemv_cfg`), and `None`
+/// for every kernel that never asks for more than the 48 KiB default (`attn_decode_*`, `attn_merge`, the rest).
+fn dyn_shmem_need(name: &str) -> Option<(&'static str, usize)> {
+    let family = if name.starts_with("attn_prefill") { "attn_prefill_*" }
+        else if name.starts_with("attn_decode_gqa") { "attn_decode_gqa*" }
+        else if name.starts_with("gemvn") { "gemvn_*" }
+        else { return None };
+    let need = match family {
+        "attn_prefill_*" => 2 * (64 + 32 + 32) * (name["attn_prefill_".len()..].parse::<usize>().ok()? + 8),
+        "attn_decode_gqa*" => {
+            let hd = name["attn_decode_gqa".len()..].trim_start_matches('4');
+            let hd = hd.strip_prefix('_')?.parse::<usize>().ok()?;
+            // attn_decode_gqa4_128 copies one K/V chunk, the generic kernel two: the larger value covers both, and
+            // both are below the 48 KiB default at head_dim 64 and 128.
+            let cp = if hd == 128 || hd == 256 { 2 * 2 * 32 * hd * 2 } else { 0 };
+            8 * hd * 4 + cp
+        }
+        // The only shape-dependent request: picking the device ceiling keeps every legal launch possible.
+        _ => usize::MAX,
+    };
+    Some((family, need))
+}
+
+/// The dynamic shared memory to opt in to for a function with `stat` bytes of static shared memory, or `None` to
+/// leave the attribute alone because the 48 KiB default already covers the launch. `need` is clamped to the device
+/// opt-in minus the static part: `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` cannot exceed what the
+/// device allows for the block, and on Volta the opt-in ceiling is shared with the static usage (up to 2112 B in
+/// `attn_decode_gqa_*`). A clamp below `need` makes the load succeed and a genuinely infeasible launch fail where
+/// it is attempted, instead of the whole module failing to load.
+fn dyn_shmem_optin(need: usize, stat: usize, optin: usize) -> Option<usize> {
+    const DEFAULT: usize = 48 << 10;
+    (need > DEFAULT).then(|| need.min(optin.saturating_sub(stat)))
+}
+
+/// One startup line per kernel family: the device's dynamic shared memory opt-in (not a table) and what the load set
+/// for the family's largest static usage. Quotable in an issue or PR as the numbers actually observed on the card.
+fn smem_log(family: &str, optin: usize, stat: usize, set: Option<usize>) -> String {
+    let dynamic = set.map_or_else(|| "default (48 KiB)".to_string(), |v| format!("{v} B"));
+    format!("cuda shared memory: opt-in {optin} B per block, {family}: {stat} B static, dynamic max {dynamic}")
+}
+
 /// The kernel names to load from the cubin: the full list on sm_80+, without the int8 prefill GEMM (`gemmi_*` and
 /// `gemmis_*`, 20 non-float types x 2) on a device where that code is not compiled in. Pure so a CPU test can pin
 /// both lists (282 / 242 names).
@@ -253,15 +297,28 @@ impl Gpu {
         let stream = ctx.new_stream()?;
         let module = ctx.load_module(ptx(&source(kv_q8), arch, (maj, min))?).context("load cubin")?;
         let i8_gemm = int8_gemm_arch((maj, min));
+        // The per-block dynamic shared memory ceiling the driver reports: 96 KiB on Volta per the roadmap, but
+        // possibly less (reserve), and shared with the function's static part. Never a constant.
+        let optin = ctx.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)? as usize;
         let mut fns = HashMap::new();
+        // Per family: the largest static usage seen and the largest value set, logged once after the load.
+        let mut smem: BTreeMap<&'static str, (usize, Option<usize>)> = BTreeMap::new();
         for n in kernel_names(i8_gemm) {
             let f = module.load_function(&n).with_context(|| format!("kernel {n}"))?;
-            // gemvn caches nt quantized inputs: 4 x 17408 columns (Qwen3.8-27B ffn_down) need 77 KB.
-            if n.starts_with("attn_prefill") || n.starts_with("attn_decode_gqa") || n.starts_with("gemvn") {
-                f.set_attribute(cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 96 << 10)?;
+            if let Some((family, need)) = dyn_shmem_need(&n) {
+                let stat = f.shared_size_bytes().with_context(|| format!("static shared memory of {n}"))?.max(0) as usize;
+                let set = dyn_shmem_optin(need, stat, optin);
+                if let Some(v) = set {
+                    f.set_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, v as i32)
+                        .with_context(|| format!("set dynamic shared memory on {n}: {stat} B static, {optin} B device opt-in"))?;
+                }
+                let e = smem.entry(family).or_insert((stat, None));
+                e.0 = e.0.max(stat);
+                e.1 = e.1.max(set);
             }
             fns.insert(n, f);
         }
+        for (family, (stat, set)) in &smem { eprintln!("{}", smem_log(family, optin, *stat, *set)); }
         let q8 = std::sync::Mutex::new((stream.alloc_zeros::<u8>(1)?, None));
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
@@ -317,8 +374,7 @@ impl Gpu {
     /// Whether the prefill GEMM for `ty` runs on int8 tensor cores (X quantized to int8 per 32) rather than f16.
     /// `STRATA_MMQ=q5_k,q6_k,..` overrides the default list.
     /// Type policy only: the CUDA launcher additionally requires the arch to have int8 tensor cores (`gemm_raw`), so
-    /// a CUDA-side consumer of this predicate must consult `int8_gemm_arch` too (tests/kernels.rs reference math:
-    /// M1-T7).
+    /// a consumer of the decision must use `Backend::mmq`, which the CUDA backend overrides with `int8_gemm_arch`.
     pub fn mmq(ty: GgmlType) -> bool {
         // IQ2_XS (and IQ2_S) has a scale per 16: its int8 path spends as long scaling mma results as in the mma, and loses to f16 (#31).
         !Self::float_ty(ty) && std::env::var("STRATA_MMQ").map(|v| v.split(',').any(|t| t == ty.name())).unwrap_or(!matches!(ty, GgmlType::IQ2XS | GgmlType::IQ2S) || llama_numerics())
@@ -451,6 +507,12 @@ impl Gpu {
 impl Backend for Gpu {
     fn name(&self) -> &'static str { "cuda" }
     fn device(&self) -> String { self.ctx.name().unwrap_or_default() }
+    /// The type policy gated on this device: `gemm_raw` takes the f16 `gemm_*` path where the arch has no int8
+    /// tensor cores (Volta), so a test comparing kernels must not expect `gemmi_*` there.
+    fn mmq(&self, ty: GgmlType) -> bool { self.i8_gemm && Gpu::mmq(ty) }
+    /// sm_70 runs `mma16816` on CUDA cores (the `__CUDA_ARCH__ < 800` branch in kernels.cu): the same f16 products
+    /// summed in another order than `mma.sync`, so a cross-backend comparison is by tolerance, not bit for bit.
+    fn volta(&self) -> bool { !self.i8_gemm }
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf> {
         let s = self.stream.alloc_zeros::<u8>(bytes.max(1))?;
         Ok(Buf::new(self.ptr(&s), s.len(), s))
@@ -950,5 +1012,58 @@ mod tests {
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());
         assert!(sm80.contains(&"gemmi_q4_k".to_string()));
         assert!(sm80.contains(&"gemmis_q2_k".to_string()));
+    }
+
+    /// M1-T7, CPU-only: the per-family dynamic shared memory a launch can ask for, from the launcher's tile shapes.
+    #[test]
+    fn dyn_shmem_need_per_family() {
+        // attn_prefill: 2 * (64 + 32 + 32) rows of hd + 8 halves, 2 bytes each.
+        assert_eq!(super::dyn_shmem_need("attn_prefill_64"), Some(("attn_prefill_*", 2 * 128 * 72)));
+        assert_eq!(super::dyn_shmem_need("attn_prefill_128"), Some(("attn_prefill_*", 2 * 128 * 136)));
+        assert_eq!(super::dyn_shmem_need("attn_prefill_256"), Some(("attn_prefill_*", 67584)));
+        // attn_decode_gqa: 8 query slices per head group, plus 2 chunks of 32 K and V positions at head_dim 128/256.
+        assert_eq!(super::dyn_shmem_need("attn_decode_gqa_64"), Some(("attn_decode_gqa*", 2048)));
+        assert_eq!(super::dyn_shmem_need("attn_decode_gqa_128"), Some(("attn_decode_gqa*", 36864)));
+        assert_eq!(super::dyn_shmem_need("attn_decode_gqa_256"), Some(("attn_decode_gqa*", 73728)));
+        assert_eq!(super::dyn_shmem_need("attn_decode_gqa_512"), Some(("attn_decode_gqa*", 16384)));
+        // gqa4_128 copies one K/V chunk; the generic figure covers it.
+        assert_eq!(super::dyn_shmem_need("attn_decode_gqa4_128"), Some(("attn_decode_gqa*", 36864)));
+        // gemvn caches nt quantized inputs of a runtime column count: the whole legal budget, not a guess.
+        assert_eq!(super::dyn_shmem_need("gemvn_q2_k"), Some(("gemvn_*", usize::MAX)));
+        assert_eq!(super::dyn_shmem_need("gemvn_f32"), Some(("gemvn_*", usize::MAX)));
+        // Every other kernel stays within the 48 KiB default (attn_decode_* maxes out at 16 KiB).
+        for n in ["attn_decode_256", "attn_merge", "gemv_q4_k", "gemm_q2_k", "gemms_q2_k", "quant_q8", "rope_freq"] {
+            assert_eq!(super::dyn_shmem_need(n), None, "{n}");
+        }
+    }
+
+    /// M1-T7, CPU-only: the opt-in value is clamped to the device ceiling minus the static shared memory, and the
+    /// attribute is only touched where the launch needs more than the 48 KiB default.
+    #[test]
+    fn dyn_shmem_optin_clamps_to_optin_and_static() {
+        const DEFAULT: usize = 48 << 10;
+        // At or below the 48 KiB default: no attribute, the default covers the launch.
+        assert_eq!(super::dyn_shmem_optin(16384, 0, 96 << 10), None);
+        assert_eq!(super::dyn_shmem_optin(DEFAULT, 0, 96 << 10), None);
+        assert_eq!(super::dyn_shmem_optin(DEFAULT + 1, 0, 96 << 10), Some(DEFAULT + 1));
+        // static == 0: the device ceiling is entirely available.
+        assert_eq!(super::dyn_shmem_optin(67584, 0, 96 << 10), Some(67584));
+        // Static comes out of the same ceiling (attn_decode_gqa_256: 2112 B static, 73728 B needed).
+        assert_eq!(super::dyn_shmem_optin(73728, 2112, 96 << 10), Some(73728));
+        // A shape-dependent request takes ceiling - static.
+        assert_eq!(super::dyn_shmem_optin(usize::MAX, 2112, 96 << 10), Some((96 << 10) - 2112));
+        // A need past the ceiling (attn_decode_gqa_256 plus a static part on a 96 KiB opt-in) is clamped, so the
+        // load succeeds and the launch fails where it is attempted.
+        assert_eq!(super::dyn_shmem_optin(100000, 4096, 96 << 10), Some((96 << 10) - 4096));
+        // Static alone above the opt-in: clamp at 0, never underflow.
+        assert_eq!(super::dyn_shmem_optin(usize::MAX, 100 << 10, 96 << 10), Some(0));
+    }
+
+    #[test]
+    fn smem_log_reports_device_numbers() {
+        assert_eq!(super::smem_log("attn_prefill_*", 98304, 0, Some(67584)),
+            "cuda shared memory: opt-in 98304 B per block, attn_prefill_*: 0 B static, dynamic max 67584 B");
+        assert_eq!(super::smem_log("attn_decode_*", 98304, 2112, None),
+            "cuda shared memory: opt-in 98304 B per block, attn_decode_*: 2112 B static, dynamic max default (48 KiB)");
     }
 }
