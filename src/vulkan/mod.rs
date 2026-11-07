@@ -1053,6 +1053,18 @@ impl Backend for Vk {
     fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
         self.gemm_raw(w.ty, w.rows, w.cols, 0, n.div_ceil(128), w.ptr, n, x, x_stride, n, 0, y, y_stride, act)
     }
+
+    fn prequant_gemm_x(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize) -> anyhow::Result<()> {
+        if !crate::cuda::Gpu::mmq(w.ty) || w.cols % 128 != 0 { return Ok(()); }
+        let cols = w.cols;
+        let need = n * (cols + cols / 8 + cols / 4);
+        let mut q8 = self.3.lock().unwrap();
+        if q8.0.len() < need { q8.0 = self.alloc(need)?; }
+        let xq = q8.0.addr();
+        self.run("quant_q8", &[self.0.llama], [n, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
+        q8.1 = Some([x, x_stride as u64, n as u64, cols as u64]);
+        Ok(())
+    }
     fn gemv(&self, w: &GpuTensor, x: u64, y: u64) -> anyhow::Result<()> { self.gemvq(w, x, 0, 0, y, 0, 1) }
     fn gemvn(&self, w: &GpuTensor, x: u64, x_stride: usize, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
         self.gemvq(w, x, x_stride, 0, y, y_stride, nt)
