@@ -54,7 +54,8 @@ IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL.
 
 ## Build
 
-Needs Rust (2024 edition) and either an NVIDIA driver with the CUDA 13 NVRTC library (loaded at run time) or a
+Needs Rust (2024 edition) and either an NVIDIA driver with the CUDA 12.x NVRTC library (loaded at run time;
+CUDA 13 dropped Volta/sm_70 support, so the V100 needs the 12.x toolkit) or a
 Vulkan 1.3 driver with shaderFloat64, int8/16/64 and subgroup size 32 (tested only on an RTX 3060; Intel Arc lacks
 shaderFloat64, pre-RDNA AMD lacks subgroup size 32). `--gpu` picks CUDA when it loads, else Vulkan; `--backend`
 chooses. The first CUDA run compiles the kernels (~15 s) and caches them. AMD GPUs: see [docs/AMD.md](docs/AMD.md)
