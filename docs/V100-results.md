@@ -160,3 +160,85 @@ strata bench --pp 4096 --tg 128 --reps 1 --ctx 32896
 `dmesg -T | grep -i Xid` before the window ended at `Fri Nov 6 20:40:46 2026`
 (the M0-T4 forced-oversize run); after all M0-T5 runs the tail is unchanged.
 No new Xid in the window.
+
+## 2026-11-07 — M0-T7 Vulkan parity baseline (V100, sm_70)
+
+Commit `d6c2beb` (v100) | driver 580.178.04 | Vulkan 1.4.312 | maxComputeSharedMemorySize 49152
+Window: production (`llama.router.service`) stopped by the coordinator, V100 free (0 MiB used);
+no other process on the card. Total window 13 min 43 s.
+
+```
+strata d6c2beb, --gpu --backend vulkan --llama-numerics --fixed-experts, tag vk-sm70
+llama-server 0.9.0-dev build 12110 (cd959bae9), -ngl 99 -fa auto -c 4096, CUDA on the V100
+20 prompts x 32 greedy tokens = 640 positions
+strict vs llama.cpp token-by-token: 625/640 = 97.66%
+either llama.cpp mode:              629/640 = 98.28%
+llama.cpp self-agreement:           630/640 = 98.44%
+verdict: FAIL (629/640, below 634/640 either-mode); documented deviation, see below
+Xid: none in the window (dmesg tail unchanged since Fri Nov 6 20:40:46 2026)
+```
+
+Environment and reference build:
+
+- `llama-server` `/srv/llama.cpp/build/bin/llama-server`, `version: 0.9.0-dev (build 12110,
+  commit cd959bae9)`, `/props` `build_info: b12110-cd959bae9`, on `127.0.0.1:8199`.
+- Flags: `-m Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf --host 127.0.0.1 --port 8199 -ngl 99 -fa auto
+  -c 4096 --seed 1234`; `n_ctx_slot = 4096`, `n_slots = 4`, `kv_unified = true`, model on CUDA0,
+  12185 MiB resident.
+- `-fa auto` resolved to **disabled**: the server logged
+  `resolve_fused_ops: Flash Attention over K/V rows not supported, set to disabled`
+  (the 3060 gate ran with `-fa 1`; recorded here because the reference differs).
+- Model load 4.4 s (page cache warm), ref cache + one-prompt smoke 32 s, `tools/selfparity.py`
+  300 s (640 requests, 0 refused), gated run 145 s.
+
+Per-prompt results for `vk-sm70` (parity mode):
+
+| # | prompt | prompt tokens | agree/n | first_miss | top2_gap_at_miss |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Write a Rust function that returns the n-th Fibona | 26 | 32/32 | None | None |
+| 2 | In Python, how do I read a CSV file and compute th | 33 | 32/32 | None | None |
+| 3 | Explain what this C code does: int f(int *a, int n | 54 | 32/32 | None | None |
+| 4 | Write a SQL query that returns the top 5 customers | 42 | 32/32 | None | None |
+| 5 | Write a regular expression that matches an IPv4 ad | 27 | 32/32 | None | None |
+| 6 | Fix the bug: def avg(xs): return sum(xs) / len(xs) | 36 | 32/32 | None | None |
+| 7 | Give a bash one-liner that finds the 10 largest fi | 31 | 31/32 | 9 | 0.0329 |
+| 8 | Why is the sky blue? Answer in three sentences. | 23 | 32/32 | None | None |
+| 9 | Розкажи коротко про історію Києва. | 26 | 32/32 | None | None |
+| 10 | Объясни, что такое квантовая запутанность, простым | 31 | 28/32 | 3 | 0.5055 |
+| 11 | 请用简单的语言解释什么是机器学习。 | 19 | 30/32 | 23 | 0.0837 |
+| 12 | A train leaves at 9:15 and travels 180 km at 72 km | 44 | 32/32 | None | None |
+| 13 | Define the word 'entropy' as used in information t | 24 | 32/32 | None | None |
+| 14 | Give me a simple recipe for pancakes. | 20 | 31/32 | 11 | 0.1449 |
+| 15 | Summarize this design document in five bullet poin | 995 | 32/32 | None | None |
+| 16 | What license terms apply here? Summarize: | 444 | 30/32 | 0 | 0.0319 |
+| 17 | Find the error in this log: | 1367 | 30/32 | 8 | 0.1615 |
+| 18 | Which of these cities is the largest by population | 281 | 31/32 | 30 | 0.1016 |
+| 19 | List the keys whose value is false: | 553 | 30/32 | 0 | 0.3904 |
+| 20 | Which row has the highest score? | 541 | 32/32 | None | None |
+
+Second block — same server, same window:
+
+```
+tag vk-sm70-r2 (repeat of parity mode): strict 625/640 = 97.66% | either 629/640 = 98.28%
+tag vk-sm70-default (--gpu --backend vulkan only): strict 626/640 = 97.81% | either 630/640 = 98.44%
+```
+
+The repeat is position-identical to the first run (625/629), so the gap to the bar is not
+sampling noise from expert placement (`--fixed-experts`) or scheduling.
+
+Deviation note (below the 99% either-mode bar; issue #6 requirement "if below the bar, do not
+write verdict PASS"):
+
+- 629/640 (98.28%) is 5 positions short of the 634/640 gate; the 3060 parity-mode runs scored
+  635-637/640 either-mode (99.32%), so this is 6-8 positions and ~1 point below that range.
+  The default path is *better* here (630/640), the opposite of the 3060 (98.85% default vs
+  99.32% parity mode).
+- The 3060 bar was measured against a **CPU** llama.cpp build; this run used the **CUDA** build
+  with flash attention disabled by the build itself (issue #34 already saw 97.34% strict against
+  a CUDA-build reference). llama.cpp's own two modes agree on only 630/640 (98.44%) here, so the
+  either-mode gate at 634/640 is stricter than llama.cpp's self-consistency on this card.
+- The engine was not changed: no shader, SPIR-V or numerics edit is part of M0-T7. Diagnosing
+  the 11 remaining positions (prompts 10, 16, 17, 19 concentrate 10 of them; prompt 10 misses at
+  a 0.5055 top-2 gap, so it is not a near-tie) is a follow-up task.
+- No new Xid, no device lost, no `strata score` failure; VRAM peak with server + score was
+  ~29 GB of 32 GB and neither process was evicted.
