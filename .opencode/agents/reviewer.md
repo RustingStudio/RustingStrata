@@ -12,7 +12,7 @@ permissions:
     effect: deny
   - action: shell
     resource: "*"
-    effect: ask
+    effect: allow
   - action: shell
     resource: "gh *"
     effect: allow
