@@ -870,9 +870,9 @@ mod tests {
     /// matches none of these fails `nvrtc_compiles_full_source_for_sm70` with the line printed. The recorded
     /// substrings are for NVRTC 12.9 (the test skips on other versions).
     /// Shrinking: M1-T3 removed `ldmatrix` and `Modifier '.m8n8'` (the `ldsm4`/`ldsm4t` sm_70 fallback); M1-T5
-    /// removed `.m16n8k32` (the int8 tensor-core GEMM, now guarded out of the sm_70 build); M1-T4 owns
-    /// `.m16n8k16`, M1-T6 `cp.async` (which also covers `cp.async.commit_group` / `cp.async.wait_group`).
-    const TRACKED_SM70_BLOCKERS: &[&str] = &[".m16n8k16", "cp.async"];
+    /// removed `.m16n8k32` (the int8 tensor-core GEMM, now guarded out of the sm_70 build); M1-T6 removed
+    /// `cp.async` (synchronous double buffering on sm_70). M1-T4 owns `.m16n8k16`.
+    const TRACKED_SM70_BLOCKERS: &[&str] = &[".m16n8k16"];
 
     /// M1-T2, CPU-only (no device, no model, no `STRATA_MODEL`): the full generated source must reach ptxas on
     /// sm_70 with **only** the tracked blockers left, so the `__reduce_*_sync` front-end errors are gone; and it must
@@ -901,11 +901,11 @@ mod tests {
         for b in TRACKED_SM70_BLOCKERS {
             eprintln!("tracked sm_70 blocker {b:?}: {} diagnostic(s)", log.matches(b).count());
         }
-        // Pinned counts (NVRTC 12.9.86, this machine): the int8 quarantine leaves only the f16 `.m16n8k16` (M1-T4)
-        // and `cp.async` (M1-T6). A different count means a construct entered or left the sm_70 build: re-measure,
-        // then update the owner here.
+        // Pinned counts (NVRTC 12.9.86, this machine): the int8 quarantine and the synchronous sm_70 copy leave
+        // only the f16 `.m16n8k16` (M1-T4). A different count means a construct entered or left the sm_70 build:
+        // re-measure, then update the owner here.
         assert_eq!(log.matches(".m16n8k16").count(), 1104, "f16 mma diagnostics changed (M1-T4 owns them)");
-        assert_eq!(log.matches("cp.async").count(), 326, "cp.async diagnostics changed (M1-T6 owns them)");
+        assert_eq!(log.matches("cp.async").count(), 0, "the sm_70 build must not contain cp.async");
         assert_eq!(log.matches(".m16n8k32").count(), 0, "the int8 tensor-core path must not reach the sm_70 build");
         // Diagnostics are the lines mentioning `error`, minus the three bookkeeping ones: NVRTC's wrapper
         // (`... failed: NvrtcError(...)`), the `N errors detected in the compilation of ...` summary and ptxas's

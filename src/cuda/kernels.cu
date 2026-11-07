@@ -1063,6 +1063,31 @@ __device__ __forceinline__ void mma_s8_16832_b(int* d, u32 a0, u32 a1, u32 a2, u
 #endif  // __CUDA_ARCH__ >= 800
 // Weight types whose scale (and min) is constant over 32 weights: one 32-deep mma per scale.
 template <int T> __host__ __device__ constexpr bool scale32() { return T == 42 || T == 2 || T == 3 || T == 6 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23; }
+// Volta (sm_70) has no cp.async (sm_80+). There the copy is a synchronous typed load/store by the same thread,
+// which is also why the "wait" sites need no thread barrier (see the audit at attn_decode_t / attn_prefill_t).
+// Zero fill: with `ok == false` the source is not read at all (cp.async's size operand 0 contract) and `dst`
+// receives zeros. The explicit `if (ok)` branch keeps ptxas from hoisting an unconditional ld.global; all current
+// sm_70 call sites pass a valid source anyway (prefill clamps the row to `last`, decode always passes true), so
+// the branch is a contract, not a hot path. The store is a typed C++ store through the same pointer type the
+// reader uses (uint4/uint2, like ldh_raw), so the compiler sees the alias; st.shared asm would hide it and let
+// the typed reads be reordered. The trailing empty asm is a compiler barrier only (not a thread barrier): no
+// reader can be hoisted above the store.
+#if __CUDA_ARCH__ < 800
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok) {
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (ok) v = *(const uint4*)src;
+    *(uint4*)dst = v;
+    asm volatile("" ::: "memory");
+}
+__device__ __forceinline__ void cp_async8(void* dst, const void* src, bool ok) {
+    uint2 v = make_uint2(0, 0);
+    if (ok) v = *(const uint2*)src;
+    *(uint2*)dst = v;
+    asm volatile("" ::: "memory");
+}
+__device__ __forceinline__ void cp_async_commit() {}
+template <int N> __device__ __forceinline__ void cp_async_wait() {}
+#else
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok) {
     unsigned d = (unsigned)__cvta_generic_to_shared(dst);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(ok ? 16 : 0));
@@ -1073,6 +1098,7 @@ __device__ __forceinline__ void cp_async8(void* dst, const void* src, bool ok) {
 }
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
 template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;" :: "n"(N)); }
+#endif
 
 // sm_80+ only: Volta has no int8 tensor cores (see the guard above); not compiled, not loaded and not launchable there.
 #if __CUDA_ARCH__ >= 800
@@ -1744,10 +1770,11 @@ __device__ void attn_decode_llama(const float* q, const u16* kc, const u16* vc, 
 // scores, warp h runs the online softmax of head h over the chunk, then warps add the weighted V rows. All warps
 // share one running max per head, so their partials just add up. The block writes per head its unnormalized partial
 // [acc (hd) | max | sum] to part; attn_merge combines the splits.
-// CP (f16 cache, the GQA entry point, head_dim 128 or 256): each lane cp.asyncs its own slice of the next two chunks
-// into shared memory while the block works on this one. Only the lane that copies a slice reads it, so the copies need
-// no barriers of their own. KV1: one chunk buffer, whose K and V halves each lane refills with the next chunk as soon
-// as it has read them into registers.
+// CP (f16 cache, the GQA entry point, head_dim 128 or 256): each lane copies its own slice of the next two chunks
+// into shared memory while the block works on this one (cp.async on sm_80+, a synchronous store on sm_70, at the
+// same program point). Only the lane that copies a slice reads it, so the copies need no barriers of their own.
+// KV1: one chunk buffer, whose K and V halves each lane refills with the next chunk as soon as it has read them
+// into registers.
 // sel (QSA): when not null and sel[0] >= 0, the block attends to the sel[0] cells sel[1 ..] instead of 0 ..= step[0].
 template <int PER, int G, bool CP = false, bool KV1 = false>
 __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
@@ -1778,7 +1805,8 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
     for (int i = 0; i < G; i++)
         for (int d = 0; d < PER; d++) acc[i][d] = 0.0f;
     // Positions past p1 copy or load the row p1 - 1 and keep zeros: a select, not a branch around the loads.
-    // cp(c0, b, kv): copy this lane's K (kv bit 0) and V (bit 1) slices of the chunk at c0 into buffer b, as one group.
+    // cp(c0, b, kv): copy this lane's K (kv bit 0) and V (bit 1) slices of the chunk at c0 into buffer b, as one
+    // cp.async group on sm_80+ (no group to commit on sm_70, where the copies are synchronous).
     auto cp = [&](int c0, int b, int kv) {
         if (c0 < p1)
 #pragma unroll
@@ -1797,8 +1825,9 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
         unsigned kr[J][PER / 2], vr[J][PER / 2];
         // Two stages: groups commit as chunks 0 1 2 ..., so all but the newest gives this chunk. KV1 (one stage):
         // groups commit as K0 V0 K1 V1 ..., so all but the newest gives this chunk's K here and its V further down.
+        // On sm_70 cp_async_wait is empty and each copy already happened in this lane's program order: no barrier.
         if constexpr (CP) {
-            cp_async_wait<1>();
+            cp_async_wait<1>();  // sm_80+: chunk it%2 landed; sm_70: same-lane copy, no barrier needed
             asm volatile("" ::: "memory");  // the reads below stay after the wait
         }
 #pragma unroll
@@ -1850,7 +1879,7 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
         // V here, not between the rescale and the adds below: the refill's branch would split them, and they would
         // contract into other FMAs than in the two-stage path.
         if constexpr (KV1) {
-            cp_async_wait<1>();
+            cp_async_wait<1>();  // sm_80+: this chunk's V landed; sm_70: same-lane copy, no barrier needed
             asm volatile("" ::: "memory");
 #pragma unroll
             for (int j = 0; j < J; j++) {
@@ -1872,7 +1901,7 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
                 float e = ss[i][w * J + j];
                 for (int d = 0; d < PER; d++) acc[i][d] += e * hraw(vr[j], d);
             }
-        __syncthreads();
+        __syncthreads();  // every lane has read buffer it%2 (lines above), so refilling it cannot clobber a live read
         if constexpr (CP && !KV1) cp(c0 + 2 * C, it % 2, 3);
     }
     if (w < G && lane == 0) { sm[w] = m; sl[w] = l; }
@@ -2150,8 +2179,9 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
     float o[HD / 8][4] = {}, m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
     constexpr int N = FA_BK * HD / 8 / 128;
 #if !KV_Q8
-    // f16: cp.async the V tile while the scores use K, and the next K tile while the sums use V (one block per SM,
-    // so nothing else hides the loads). Rows past `last` are zero-filled.
+    // f16: copy the V tile while the scores use K, and the next K tile while the sums use V (one block per SM,
+    // so nothing else hides the loads); cp.async on sm_80+, a blocking copy at the same program point on sm_70.
+    // Rows past `last` are zero-filled (synchronous path: the source is not read at all).
     auto ld = [&](int k0, u16* dst, const u16* src) {
 #pragma unroll
         for (int n = 0; n < N; n++) {
@@ -2183,7 +2213,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
             *(uint4*)(vs + r * PQ + c) = k0 + r <= last ? vv[n] : z;
         }
 #else
-        cp_async_wait<1>();  // this K tile; its V tile may still be in flight
+        cp_async_wait<1>();  // sm_80+: this K tile, its V tile may still be in flight; sm_70: already copied here
 #endif
         __syncthreads();
         // QSA: the tile's 8 blocks are bits (k0 >> 2) & 31 .. + 7 of one mask word per row. A warp whose 16 rows see
@@ -2208,7 +2238,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
 #if !KV_Q8
         __syncthreads();
         if (k0 + FA_BK <= last) ld(k0 + FA_BK, ks, kc);
-        else cp_async_commit();  // keep one group per tile for the waits
+        else cp_async_commit();  // keep one group per tile for the waits (sm_80+; nothing to commit on sm_70)
 #endif
         if (!skip) {
         float mx[2] = {m[0], m[1]};
@@ -2234,7 +2264,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
         for (int d = 0; d < HD / 8; d++) { o[d][0] *= c[0]; o[d][1] *= c[0]; o[d][2] *= c[1]; o[d][3] *= c[1]; }
         }
 #if !KV_Q8
-        cp_async_wait<1>();  // this V tile; the next K tile may still be in flight
+        cp_async_wait<1>();  // sm_80+: this V tile, the next K tile may still be in flight; sm_70: already copied here
         __syncthreads();
 #endif
         if (!skip)
@@ -2253,7 +2283,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
 #if !KV_Q8
         __syncthreads();
         if (k0 + FA_BK <= last) ld(k0 + FA_BK, vs, vc);
-        else cp_async_commit();
+        else cp_async_commit();  // keep one group per tile for the waits (sm_80+; nothing to commit on sm_70)
 #endif
     }
     for (int r = 0; r < 2; r++) {
