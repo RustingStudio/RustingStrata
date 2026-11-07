@@ -876,8 +876,44 @@ __device__ __forceinline__ void ldsm4t(u32* r, const u16* p) {
 #endif
 }
 __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
+#if __CUDA_ARCH__ < 800
+    // D[16,8] += A[16,16] * B[16,8] on CUDA cores. mma.sync.aligned.m16n8k16 is sm_80+ (unlike ldmatrix, which is
+    // sm_75+, hence the different guard). Lane l = 4*g + t (g = l >> 2, t = l & 3) owns A rows g / g+8 at the
+    // k-halves {2t, 2t+1, 2t+8, 2t+9}, and B column g at those same k. The four accumulators are sums over all 16
+    // k, so A of rows g / g+8 comes from lanes 4*g + tp and B of columns 2t / 2t+1 from lanes 4*n + tp
+    // (n = 2t, 2t+1), i.e. 8*t + tp and 8*t + 4 + tp. Accumulation order is k = 0,1,8,9, 2,3,10,11,
+    // 4,5,12,13, 6,7,14,15 (tp = 0..3): the only difference vs the tensor core is f32 summation order, the f16
+    // inputs are the same values. Every lane computes every accumulator, so this must stay in warp-uniform
+    // control flow: gemm_q's `wm < tl.cnt` (wm is per warp) and attn_prefill_t's `!skip` (`__any_sync`) are.
+    int l = threadIdx.x & 31, g = l >> 2, t = l & 3;
+#pragma unroll
+    for (int tp = 0; tp < 4; tp++) {
+        u32 sa0 = __shfl_sync(0xffffffff, a0, 4 * g + tp);      // A[g][2tp], A[g][2tp+1]
+        u32 sa2 = __shfl_sync(0xffffffff, a2, 4 * g + tp);      // A[g][2tp+8], A[g][2tp+9]
+        u32 sa1 = __shfl_sync(0xffffffff, a1, 4 * g + tp);      // A[g+8][2tp], A[g+8][2tp+1]
+        u32 sa3 = __shfl_sync(0xffffffff, a3, 4 * g + tp);      // A[g+8][2tp+8], A[g+8][2tp+9]
+        u32 sb0 = __shfl_sync(0xffffffff, b0, 8 * t + tp);      // B[2tp][2t], B[2tp+1][2t]
+        u32 sb1 = __shfl_sync(0xffffffff, b1, 8 * t + tp);      // B[2tp+8][2t], B[2tp+9][2t]
+        u32 sc0 = __shfl_sync(0xffffffff, b0, 8 * t + 4 + tp);  // B[2tp][2t+1], B[2tp+1][2t+1]
+        u32 sc1 = __shfl_sync(0xffffffff, b1, 8 * t + 4 + tp);  // B[2tp+8][2t+1], B[2tp+9][2t+1]
+        // The four k values 2tp, 2tp+1, 2tp+8, 2tp+9 of A (row g in ar, row g+8 in ar8) and of B (column 2t in
+        // bc, column 2t+1 in bc1), low half first.
+        float ar[4] = {h2f((u16)sa0), h2f((u16)(sa0 >> 16)), h2f((u16)sa2), h2f((u16)(sa2 >> 16))};
+        float ar8[4] = {h2f((u16)sa1), h2f((u16)(sa1 >> 16)), h2f((u16)sa3), h2f((u16)(sa3 >> 16))};
+        float bc[4] = {h2f((u16)sb0), h2f((u16)(sb0 >> 16)), h2f((u16)sb1), h2f((u16)(sb1 >> 16))};
+        float bc1[4] = {h2f((u16)sc0), h2f((u16)(sc0 >> 16)), h2f((u16)sc1), h2f((u16)(sc1 >> 16))};
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            c[0] = fmaf(ar[i], bc[i], c[0]);
+            c[1] = fmaf(ar[i], bc1[i], c[1]);
+            c[2] = fmaf(ar8[i], bc[i], c[2]);
+            c[3] = fmaf(ar8[i], bc1[i], c[3]);
+        }
+    }
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 __device__ __forceinline__ u32 h2pack(float a, float b) { return (u32)f2h(a) | ((u32)f2h(b) << 16); }
 

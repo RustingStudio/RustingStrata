@@ -865,18 +865,10 @@ mod tests {
         super::cubin(SRC, "sm_70").expect("NVRTC 12.x must compile for sm_70 without a GPU");
     }
 
-    /// The sm_70 diagnostics still expected from the full source, i.e. the constructs owned by the later M1 tasks.
-    /// This is a ratchet, not an allow-list: a blocker that stops firing must be removed here, and a line that
-    /// matches none of these fails `nvrtc_compiles_full_source_for_sm70` with the line printed. The recorded
-    /// substrings are for NVRTC 12.9 (the test skips on other versions).
-    /// Shrinking: M1-T3 removed `ldmatrix` and `Modifier '.m8n8'` (the `ldsm4`/`ldsm4t` sm_70 fallback); M1-T5
-    /// removed `.m16n8k32` (the int8 tensor-core GEMM, now guarded out of the sm_70 build); M1-T6 removed
-    /// `cp.async` (synchronous double buffering on sm_70). M1-T4 owns `.m16n8k16`.
-    const TRACKED_SM70_BLOCKERS: &[&str] = &[".m16n8k16"];
-
-    /// M1-T2, CPU-only (no device, no model, no `STRATA_MODEL`): the full generated source must reach ptxas on
-    /// sm_70 with **only** the tracked blockers left, so the `__reduce_*_sync` front-end errors are gone; and it must
-    /// still produce a cubin for sm_80, which is the compile-level proof that the `#else` path is unaffected.
+    /// M1-T2..M1-T6, CPU-only (no device, no model, no `STRATA_MODEL`): the full generated source must produce a
+    /// cubin for sm_70 **and** for sm_80. The last sm_70 blocker, `mma.m16n8k16`, is a CUDA-core fallback since
+    /// M1-T4 (`src/cuda/kernels.cu:mma16816`), so no blocker list remains: any sm_70 diagnostic is a regression.
+    /// The sm_80 cubin is the compile-level proof that the `#else` tensor-core path is unaffected.
     #[test]
     fn nvrtc_compiles_full_source_for_sm70() {
         if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
@@ -891,37 +883,7 @@ mod tests {
             }
         }
         let src = super::source(false);
-        let log = match super::cubin(&src, "sm_70") {
-            Ok(_) => panic!("sm_70 compiled: M1-T3..M1-T6 must have landed; shrink TRACKED_SM70_BLOCKERS"),
-            Err(e) => format!("{e:#}"),
-        };
-        for bad in ["__reduce_max_sync", "__reduce_min_sync"] {
-            assert!(!log.contains(bad), "sm_70 still rejects {bad} (M1-T2 regression):\n{log}");
-        }
-        for b in TRACKED_SM70_BLOCKERS {
-            eprintln!("tracked sm_70 blocker {b:?}: {} diagnostic(s)", log.matches(b).count());
-        }
-        // Pinned counts (NVRTC 12.9.86, this machine): the int8 quarantine and the synchronous sm_70 copy leave
-        // only the f16 `.m16n8k16` (M1-T4). A different count means a construct entered or left the sm_70 build:
-        // re-measure, then update the owner here.
-        assert_eq!(log.matches(".m16n8k16").count(), 1104, "f16 mma diagnostics changed (M1-T4 owns them)");
-        assert_eq!(log.matches("cp.async").count(), 0, "the sm_70 build must not contain cp.async");
-        assert_eq!(log.matches(".m16n8k32").count(), 0, "the int8 tensor-core path must not reach the sm_70 build");
-        // Diagnostics are the lines mentioning `error`, minus the three bookkeeping ones: NVRTC's wrapper
-        // (`... failed: NvrtcError(...)`), the `N errors detected in the compilation of ...` summary and ptxas's
-        // `Ptx assembly aborted due to errors`. The other two are allowed because they carry no construct.
-        const ALLOWED: [&str; 3] = ["failed: NvrtcError", "errors detected", "Ptx assembly aborted"];
-        let diags: Vec<&str> = log.lines()
-            .filter(|l| l.contains("error"))
-            .filter(|l| !ALLOWED.iter().any(|a| l.contains(a)))
-            .collect();
-        assert!(!diags.is_empty(), "expected ptxas diagnostics, got none: M1-T3..M1-T6 may have landed\n{log}");
-        let unmatched: Vec<&str> = diags.iter().copied()
-            .filter(|l| !TRACKED_SM70_BLOCKERS.iter().any(|b| l.contains(b)))
-            .collect();
-        assert!(unmatched.is_empty(),
-            "sm_70 compile errors outside the M1-T3..M1-T6 tracked set (add the owner to TRACKED_SM70_BLOCKERS \
-             or fix the construct): {unmatched:#?}\nfull log:\n{log}");
+        super::cubin(&src, "sm_70").unwrap_or_else(|e| panic!("sm_70 must compile: M1-T4 removed the last blocker: {e:#}"));
         super::cubin(&src, "sm_80").expect("the sm_80 path must keep compiling (cubin for sm_80)");
     }
 
