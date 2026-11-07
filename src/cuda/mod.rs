@@ -842,6 +842,65 @@ mod tests {
         super::cubin(SRC, "sm_70").expect("NVRTC 12.x must compile for sm_70 without a GPU");
     }
 
+    /// The sm_70 diagnostics still expected from the full source, i.e. the constructs owned by the later M1 tasks.
+    /// This is a ratchet, not an allow-list: a blocker that stops firing must be removed here, and a line that
+    /// matches none of these fails `nvrtc_compiles_full_source_for_sm70` with the line printed. The recorded
+    /// substrings are for NVRTC 12.9 (the test skips on other versions).
+    /// Shrinking: M1-T3 removes `ldmatrix` and `Modifier '.m8n8'`, M1-T4 `.m16n8k16`, M1-T5 `.m16n8k32`,
+    /// M1-T6 `cp.async` (which also covers `cp.async.commit_group` / `cp.async.wait_group`).
+    const TRACKED_SM70_BLOCKERS: &[&str] = &[
+        "ldmatrix",
+        "Modifier '.m8n8'",
+        ".m16n8k16",
+        ".m16n8k32",
+        "cp.async",
+    ];
+
+    /// M1-T2, CPU-only (no device, no model, no `STRATA_MODEL`): the full generated source must reach ptxas on
+    /// sm_70 with **only** the tracked blockers left, so the `__reduce_*_sync` front-end errors are gone; and it must
+    /// still produce a cubin for sm_80, which is the compile-level proof that the `#else` path is unaffected.
+    #[test]
+    fn nvrtc_compiles_full_source_for_sm70() {
+        if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
+            eprintln!("skipping: NVRTC library not present");
+            return;
+        }
+        match super::nvrtc_version() {
+            Some((12, _)) => {}
+            v => {
+                eprintln!("skipping: NVRTC {v:?} is not 12.x; CUDA 13.x cannot target sm_70 and its diagnostics differ");
+                return;
+            }
+        }
+        let src = super::source(false);
+        let log = match super::cubin(&src, "sm_70") {
+            Ok(_) => panic!("sm_70 compiled: M1-T3..M1-T6 must have landed; shrink TRACKED_SM70_BLOCKERS"),
+            Err(e) => format!("{e:#}"),
+        };
+        for bad in ["__reduce_max_sync", "__reduce_min_sync"] {
+            assert!(!log.contains(bad), "sm_70 still rejects {bad} (M1-T2 regression):\n{log}");
+        }
+        for b in TRACKED_SM70_BLOCKERS {
+            eprintln!("tracked sm_70 blocker {b:?}: {} diagnostic(s)", log.matches(b).count());
+        }
+        // Diagnostics are the lines mentioning `error`, minus the three bookkeeping ones: NVRTC's wrapper
+        // (`... failed: NvrtcError(...)`), the `N errors detected in the compilation of ...` summary and ptxas's
+        // `Ptx assembly aborted due to errors`. The other two are allowed because they carry no construct.
+        const ALLOWED: [&str; 3] = ["failed: NvrtcError", "errors detected", "Ptx assembly aborted"];
+        let diags: Vec<&str> = log.lines()
+            .filter(|l| l.contains("error"))
+            .filter(|l| !ALLOWED.iter().any(|a| l.contains(a)))
+            .collect();
+        assert!(!diags.is_empty(), "expected ptxas diagnostics, got none: M1-T3..M1-T6 may have landed\n{log}");
+        let unmatched: Vec<&str> = diags.iter().copied()
+            .filter(|l| !TRACKED_SM70_BLOCKERS.iter().any(|b| l.contains(b)))
+            .collect();
+        assert!(unmatched.is_empty(),
+            "sm_70 compile errors outside the M1-T3..M1-T6 tracked set (add the owner to TRACKED_SM70_BLOCKERS \
+             or fix the construct): {unmatched:#?}\nfull log:\n{log}");
+        super::cubin(&src, "sm_80").expect("the sm_80 path must keep compiling (cubin for sm_80)");
+    }
+
     #[test]
     fn arch_support_error_rejects_cuda13_on_sm70() {
         let msg = super::arch_support_error((7, 0), (13, 0)).expect("13.x cannot target sm_70");

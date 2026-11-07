@@ -1955,8 +1955,18 @@ __device__ void topk_warp(const float* p, int n, int k, float extra_scale, int l
             unsigned i = lane + 32 * r, key = __float_as_uint(v[r]) + 1;
             if (i < n && !(taken >> r & 1) && key > bk) { bk = key; bi = i; }
         }
+#if __CUDA_ARCH__ < 800
+        // Volta (sm_70) has no __reduce_*_sync: shuffle reduction over the 32 lanes. Ternary, not max/min: NVRTC
+        // guarantees neither overload for unsigned. The masked min runs after the max is complete, so the tie
+        // rule (lowest lane index among the max keys) is the same as __reduce_min_sync's.
+        unsigned mk = bk;
+        for (int o = 16; o > 0; o >>= 1) { unsigned m = __shfl_xor_sync(0xffffffff, mk, o); mk = m > mk ? m : mk; }
+        bi = bk == mk ? bi : 0xffffffffu;
+        for (int o = 16; o > 0; o >>= 1) { unsigned m = __shfl_xor_sync(0xffffffff, bi, o); bi = m < bi ? m : bi; }
+#else
         unsigned mk = __reduce_max_sync(0xffffffff, bk);
         bi = __reduce_min_sync(0xffffffff, bk == mk ? bi : 0xffffffffu);
+#endif
         float bv = __uint_as_float(mk - 1);
         if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
         if (lane == j) { id = bi; mine = bv; }
