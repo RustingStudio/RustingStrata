@@ -26,7 +26,35 @@ impl Vk {
     /// each is checked. No pipeline, buffer or dispatch is created here.
     pub fn preflight(&self, types: &[GgmlType], verbose: bool) -> Result<()> {
         let t0 = Instant::now();
-        // (kernel, spec) pairs: the same vectors `gemm_raw`, `gemvq`, `moe_gemv` and `dequant` pass to `pipeline`.
+        let mut checked = HashSet::new();
+        let (mut n, mut worst) = (0usize, (0u32, "", Vec::new()));
+        for (name, spec) in self.shared_memory_pairs(types) {
+            if !checked.insert((name, spec.clone())) { continue; }
+            let bytes = spv_smem::check_shared_memory(name, &spec, self.0.kv_q8, self.0.smem_limit)?;
+            n += 1;
+            if verbose { eprintln!("vulkan: preflight {name} {spec:?}: {bytes} bytes"); }
+            if bytes > worst.0 { worst = (bytes, name, spec); }
+        }
+        eprintln!("vulkan: shared-memory preflight: {n} (kernel, specialization) pairs checked, largest {} bytes \
+            ({}) of {} allowed, {:.1} ms", worst.0, worst.1, self.0.smem_limit, t0.elapsed().as_secs_f64() * 1e3);
+        Ok(())
+    }
+
+    /// The largest shared-memory request among the `(kernel, specialization)` pairs `types` reach, checked against
+    /// this device's limit (the same accounting as `preflight`, without the listing). Returns the byte count.
+    pub fn max_shared_bytes(&self, types: &[GgmlType]) -> Result<u32> {
+        let mut checked = HashSet::new();
+        let mut max = 0;
+        for (name, spec) in self.shared_memory_pairs(types) {
+            if !checked.insert((name, spec.clone())) { continue; }
+            max = max.max(spv_smem::check_shared_memory(name, &spec, self.0.kv_q8, self.0.smem_limit)?);
+        }
+        Ok(max)
+    }
+
+    /// `(kernel, specialization)` pairs: the same vectors `gemm_raw`, `gemvq`, `moe_gemv` and `dequant` pass to
+    /// `pipeline`.
+    fn shared_memory_pairs(&self, types: &[GgmlType]) -> Vec<(&'static str, Vec<u32>)> {
         let mut pairs: Vec<(&'static str, Vec<u32>)> = Vec::new();
         for &ty in types {
             let ws = self.wspec(ty).to_vec();
@@ -48,17 +76,6 @@ impl Vk {
                 push("moe_gemv_f", ws.clone());
             }
         }
-        let mut checked = HashSet::new();
-        let (mut n, mut worst) = (0usize, (0u32, "", Vec::new()));
-        for (name, spec) in pairs {
-            if !checked.insert((name, spec.clone())) { continue; }
-            let bytes = spv_smem::check_shared_memory(name, &spec, self.0.kv_q8, self.0.smem_limit)?;
-            n += 1;
-            if verbose { eprintln!("vulkan: preflight {name} {spec:?}: {bytes} bytes"); }
-            if bytes > worst.0 { worst = (bytes, name, spec); }
-        }
-        eprintln!("vulkan: shared-memory preflight: {n} (kernel, specialization) pairs checked, largest {} bytes \
-            ({}) of {} allowed, {:.1} ms", worst.0, worst.1, self.0.smem_limit, t0.elapsed().as_secs_f64() * 1e3);
-        Ok(())
+        pairs
     }
 }

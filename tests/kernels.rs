@@ -1,7 +1,7 @@
 //! Kernel tests, run on every backend that opens (`common::backends`).
 mod common;
 use common::{down, up};
-use rusting_strata::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
+use rusting_strata::backend::{Backend, ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
 use rusting_strata::{cuda::Gpu, gguf::Gguf, quant::GgmlType, weights::{Tensor, Weights}};
 
 fn xs(n: usize) -> Vec<f32> {
@@ -248,6 +248,20 @@ fn gemv_bandwidth() {
 
 fn f16r(v: f32) -> f32 { half::f16::from_f32(v).to_f32() }
 
+/// The f16 value the Vulkan f16 GEMM path (`packFloat2x16(f16vec2(..))`, SPIR-V `OpFConvert`) sees on this driver:
+/// the conversion truncates toward zero instead of rounding to nearest even. A reference built with it compares the
+/// kernel, not the driver's conversion; a 1-ulp input difference would otherwise read as a kernel error.
+fn f16tz(v: f32) -> f32 {
+    let h = half::f16::from_f32(v);
+    let b = h.to_bits();
+    let mag = b & 0x7fff;
+    if h.to_f32().abs() > v.abs() && mag > 1 { half::f16::from_bits((b & 0x8000) | (mag - 1)).to_f32() } else { h.to_f32() }
+}
+
+/// The f16 conversion the backend's f16 GEMM uses: CUDA `__float2half` rounds to nearest even; the Vulkan shader's
+/// `OpFConvert` truncates toward zero on the NVIDIA Volta driver.
+fn f16_in(bk: &str, v: f32) -> f32 { if bk == "vulkan" { f16tz(v) } else { f16r(v) } }
+
 /// Tensor-core GEMM over a tile list matches per-row dot products, for every type, with a gathered X and partial
 /// tiles. Types on the int8 path (`Gpu::mmq`) see X as int8 per 32 (as the GEMV path does), the others fp16 inputs.
 #[test]
@@ -283,7 +297,7 @@ fn gemm_matches_reference_for_every_type() {
                     want[i * rows + r] = if Gpu::mmq(t.ty) {
                         wr.iter().zip(as_seen(t.ty, xv)).map(|(a, b)| a * b).sum()
                     } else {
-                        wr.iter().zip(xv).map(|(a, b)| f16r(*a) * f16r(*b)).sum()
+                        wr.iter().zip(xv).map(|(a, b)| f16_in(bk, *a) * f16_in(bk, *b)).sum()
                     };
                 }
             }
@@ -1026,26 +1040,96 @@ fn attn_decode_bandwidth() {
 }
 
 
-/// Random rows of `ty` with sane block scales: f16 d in [0.01, 0.02) at each block's start (Q2_0, Q8_0, IQ4_NL, Q4_0, Q5_0; Q4_1 and Q5_1 also a small m), or
-/// float values (F32, BF16).
+/// Random rows of `ty` with finite, non-degenerate block fields. Payload/code bytes stay random; every scale field
+/// the CPU dequantizer reads is overwritten at its offset with a value in `[0.01, 0.02)` (`m` / `dmin` as noted):
+///
+/// | type | block | scale fields (byte offsets) |
+/// | --- | --- | --- |
+/// | F32 | 4 | one f32 value per element |
+/// | F16 | 2 | one f16 value per element |
+/// | BF16 | 2 | one bf16 value per element |
+/// | Q2_0 | 18 | `d` f16 @0 |
+/// | Q4_0 | 18 | `d` f16 @0 |
+/// | Q5_0 | 22 | `d` f16 @0 |
+/// | Q8_0 | 34 | `d` f16 @0 |
+/// | Q4_1 | 20 | `d` f16 @0, `m` f16 @2 (`[-0.15, 0.05)`) |
+/// | Q5_1 | 24 | `d` f16 @0, `m` f16 @2 (`[-0.15, 0.05)`) |
+/// | Q2_K | 84 | `d` f16 @80, `dmin` f16 @82 (16 4-bit scale pairs @0 random) |
+/// | Q3_K | 110 | `d` f16 @108 (6-bit scales @96 random) |
+/// | Q4_K | 144 | `d` f16 @0, `dmin` f16 @2 (6 4-bit scale pairs @4 random) |
+/// | Q5_K | 176 | `d` f16 @0, `dmin` f16 @2 (6 4-bit scale pairs @4 random) |
+/// | Q6_K | 210 | `d` f16 @208 (8-bit scales @192 random) |
+/// | IQ1_S | 50 | `d` f16 @0 |
+/// | IQ1_M | 56 | `d` bits split over the top nibbles of the four u16 scale words @48..56 |
+/// | IQ2_XXS | 66 | `d` f16 @0 |
+/// | IQ2_XS | 74 | `d` f16 @0 |
+/// | IQ2_S | 82 | `d` f16 @0 |
+/// | IQ3_XXS | 98 | `d` f16 @0 |
+/// | IQ3_S | 110 | `d` f16 @0 |
+/// | IQ4_XS | 136 | `d` f16 @0 |
+/// | IQ4_NL | 18 | `d` f16 @0 |
+///
+/// Every produced f32 is asserted finite, so a NaN/inf scale cannot mask a kernel bug later.
 fn random_tensor(ty: GgmlType, rows: usize, cols: usize, seed: u32) -> Vec<u8> {
     let mut s = seed.wrapping_mul(2654435761) | 1;
     let mut rnd = move || { s ^= s << 13; s ^= s >> 17; s ^= s << 5; s };
-    match ty {
+    let scale = |rnd: &mut dyn FnMut() -> u32| half::f16::from_f32(0.01 + (rnd() % 100) as f32 * 1e-4).to_le_bytes();
+    let data: Vec<u8> = match ty {
         GgmlType::F32 => (0..rows * cols).flat_map(|_| ((rnd() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()).collect(),
+        GgmlType::F16 => (0..rows * cols).flat_map(|_| half::f16::from_f32((rnd() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()).collect(),
         GgmlType::BF16 => (0..rows * cols).flat_map(|_| half::bf16::from_f32((rnd() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()).collect(),
         _ => {
-            let (bb, n) = (ty.block_bytes(), rows * cols / ty.block_elems());
+            let (bb, n) = (ty.block_bytes(), rows * (cols / ty.block_elems()));
             (0..n).flat_map(|_| {
                 let mut b: Vec<u8> = (0..bb).map(|_| rnd() as u8).collect();
-                b[..2].copy_from_slice(&half::f16::from_f32(0.01 + (rnd() % 100) as f32 * 1e-4).to_le_bytes());
-                if matches!(ty, GgmlType::Q4_1 | GgmlType::Q5_1) {  // m in [-0.15, 0.05)
-                    b[2..4].copy_from_slice(&half::f16::from_f32(-0.15 + (rnd() % 100) as f32 * 2e-3).to_le_bytes());
+                match ty {
+                    GgmlType::Q2K => { b[80..82].copy_from_slice(&scale(&mut rnd)); b[82..84].copy_from_slice(&scale(&mut rnd)); }
+                    GgmlType::Q3K => b[108..110].copy_from_slice(&scale(&mut rnd)),
+                    GgmlType::Q4K | GgmlType::Q5K => { b[0..2].copy_from_slice(&scale(&mut rnd)); b[2..4].copy_from_slice(&scale(&mut rnd)); }
+                    GgmlType::Q6K => b[208..210].copy_from_slice(&scale(&mut rnd)),
+                    GgmlType::Q4_1 | GgmlType::Q5_1 => {
+                        b[0..2].copy_from_slice(&scale(&mut rnd));
+                        b[2..4].copy_from_slice(&half::f16::from_f32(-0.15 + (rnd() % 100) as f32 * 2e-3).to_le_bytes());
+                    }
+                    GgmlType::IQ1M => {
+                        // d is composed from the top nibbles of the four u16 scale words at 48..56 (src/quant/mod.rs:201).
+                        let d = half::f16::from_f32(0.01 + (rnd() % 100) as f32 * 1e-4).to_bits();
+                        for i in 0..4 {
+                            let o = 48 + 2 * i;
+                            let w = (u16::from_le_bytes([b[o], b[o + 1]]) & 0x0FFF) | (((d >> (4 * i)) & 0xF) << 12);
+                            b[o..o + 2].copy_from_slice(&w.to_le_bytes());
+                        }
+                    }
+                    _ => b[0..2].copy_from_slice(&scale(&mut rnd)),
                 }
                 b
             }).collect()
         }
+    };
+    let mut values = vec![0f32; rows * cols];
+    rusting_strata::quant::dequant_row(ty, &data, &mut values);
+    assert!(values.iter().all(|v| v.is_finite()), "{}: random block produced a non-finite value", ty.name());
+    data
+}
+
+/// `random_tensor` gives every type a finite reference: no GPU needed, so the generator is checked on its own.
+#[test]
+fn random_tensor_scales_are_finite() {
+    for ty in all_types() {
+        for (rows, cols) in [(1, 256), (3, 512), (2, 2560)] {
+            let d = random_tensor(ty, rows, cols, cols as u32 + ty as u32);
+            assert_eq!(d.len(), ty.row_bytes(cols as u64) * rows, "{} bytes", ty.name());
+            let mut v = vec![0f32; rows * cols];
+            rusting_strata::quant::dequant_row(ty, &d, &mut v);
+            assert!(v.iter().all(|f| f.is_finite()), "{} {rows}x{cols}", ty.name());
+            assert!(v.iter().any(|&f| f != 0.0), "{} {rows}x{cols}: all-zero block", ty.name());
+        }
     }
+}
+
+/// Every supported `GgmlType`, in the order `from_u32` accepts them.
+fn all_types() -> Vec<GgmlType> {
+    (0..64).filter_map(|i| GgmlType::from_u32(i).ok()).collect()
 }
 
 #[test]
@@ -1113,7 +1197,7 @@ fn gemv_partial_superblocks_and_q2_0() {
                     t.row(r, &mut wr);
                     for (i, xv) in xm.chunks(cols).enumerate() {
                         want[i * rows + r] = if Gpu::mmq(ty) && cols % 128 == 0 { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
-                                             else { wr.iter().zip(xv).map(|(a, b)| f16r(*a) * f16r(*b)).sum() };
+                                             else { wr.iter().zip(xv).map(|(a, b)| f16_in(bk, *a) * f16_in(bk, *b)).sum() };
                     }
                 }
                 let e = rel_l2(&down::<f32>(gpu, &dym), &want);
@@ -1130,6 +1214,178 @@ fn gemv_partial_superblocks_and_q2_0() {
         gpu.quant_xq(dg2.addr(), n, n, rows, q2.addr()).unwrap();
         assert_eq!(down::<u8>(gpu, &q1), down::<u8>(gpu, &q2), "{bk}: swiglu_q of 640");
     }
+}
+
+/// Per-type Vulkan pass/fail matrix over all 23 `GgmlType` variants: dequant, GEMV/GEMV-N/GEMV-Q, MoE GEMV, dense
+/// and tiled GEMM, plus each type's largest shared-memory request. Synthetic raw blocks bypass `Backend::upload`, so
+/// native kernels run even for the types the loader converts (F16, Q4_0, Q5_0). Vulkan only: run it with
+/// `STRATA_TEST_BACKENDS=vulkan`. Prints one `MATRIX ty=...` line per type for `docs/V100-results.md`.
+#[test]
+fn vulkan_type_matrix() {
+    let Ok(g) = rusting_strata::vulkan::Vk::new(0) else { return eprintln!("SKIP: no Vulkan device"); };
+    let gpu: &dyn Backend = &g;
+    let not_impl = |e: &anyhow::Error| format!("{e:#}").contains("not implemented");
+    let types = all_types();
+    assert_eq!(types.len(), 23, "GgmlType variants");
+    let (rows, ne, cols, nt) = (40, 4, 256, 3);
+    let mut failures = 0;
+    for ty in types {
+        let smem = match g.max_shared_bytes(&[ty]) {
+            Ok(b) => b,
+            Err(e) => { eprintln!("MATRIX ty={} dequant=fail gemv=fail gemvn=fail gemvq=fail moe_gemv=fail gemm_dense=fail gemm=fail smem=? note=preflight: {e:#}", ty.name()); failures += 1; continue; }
+        };
+        if let Err(e) = g.preflight(&[ty], true) {
+            eprintln!("MATRIX ty={} dequant=fail gemv=fail gemvn=fail gemvq=fail moe_gemv=fail gemm_dense=fail gemm=fail smem={smem} note=preflight: {e:#}", ty.name());
+            failures += 1;
+            continue;
+        }
+        if ty == GgmlType::F16 {
+            eprintln!("MATRIX ty={} dequant=unsupported gemv=unsupported gemvn=unsupported gemvq=unsupported moe_gemv=unsupported gemm_dense=unsupported gemm=unsupported smem={smem} note=no F16 shader path; loader uploads it as F32", ty.name());
+            continue;
+        }
+        let (mut dequant, mut gemv, mut gemvn, mut gemvq, mut moe_gemv, mut gemm_dense, mut gemm) =
+            ("pass", "pass", "pass", "pass", "pass", "pass", "pass");
+        let mut note = if matches!(ty, GgmlType::Q4_0 | GgmlType::Q5_0) { "native bytes; loader uploads Q8_0".to_string() } else { String::new() };
+        // The f16 GEMM path converts its operands with packFloat2x16; on this Volta driver OpFConvert truncates.
+        if matches!(ty, GgmlType::F32 | GgmlType::BF16 | GgmlType::IQ2XS | GgmlType::IQ2S) {
+            note = format!("{note}{}f16 GEMM inputs truncate (Volta OpFConvert); reference matches", if note.is_empty() { "" } else { "; " });
+        }
+        let data = random_tensor(ty, ne * rows, cols, cols as u32 + ty as u32);
+        let all = Tensor { ty, cols, rows: ne * rows, data: &data };
+        let t = Tensor { rows, data: &data[..ty.row_bytes(cols as u64) * rows], ..all };
+        // Raw bytes, as experts are uploaded.
+        let raw = |t: &Tensor| {
+            let b = gpu.alloc(t.data.len()).unwrap();
+            gpu.htod(t.data, &b, 0).unwrap();
+            GpuTensor::new(t.ty, t.rows, t.cols, b)
+        };
+        let (dt, dall) = (raw(&t), raw(&all));
+        // dequant
+        let dq = gpu.zeros::<f32>(rows * cols).unwrap();
+        match gpu.dequant(&dt, rows, dq.addr()) {
+            Ok(()) => {
+                let got = down::<f32>(gpu, &dq);
+                let mut want = vec![0f32; rows * cols];
+                for (r, out) in want.chunks_exact_mut(cols).enumerate() { t.row(r, out); }
+                let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-30);
+                let diff = got.iter().zip(&want).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+                if diff > 1e-5 * scale { dequant = "fail"; note = format!("dequant max diff {diff} vs scale {scale}"); }
+            }
+            Err(e) if not_impl(&e) => { dequant = "unsupported"; note = format!("dequant: {e:#}"); }
+            Err(e) => panic!("{}: dequant: {e:#}", ty.name()),
+        }
+        // gemv, gemvn and gemvq on the same quant_xq input
+        let x = xs(nt * cols + 5)[5..].to_vec();
+        let dx = up(gpu, &x);
+        let want: Vec<Vec<f32>> = x.chunks(cols).map(|xt| { let mut y = vec![0f32; rows]; t.matvec(&as_seen(ty, xt), &mut y); y }).collect();
+        let dy = gpu.zeros::<f32>(nt * rows).unwrap();
+        match gpu.gemv(&dt, dx.addr(), dy.addr()) {
+            Ok(()) => {
+                let e = rel_l2(&down::<f32>(gpu, &dy)[..rows], &want[0]);
+                if e > 1e-4 { gemv = "fail"; note = format!("gemv rel err {e}"); }
+            }
+            Err(e) if not_impl(&e) => { gemv = "unsupported"; note = format!("gemv: {e:#}"); }
+            Err(e) => panic!("{}: gemv: {e:#}", ty.name()),
+        }
+        let mut gemvn_got: Option<Vec<f32>> = None;
+        match gpu.gemvn(&dt, dx.addr(), cols, dy.addr(), rows, nt) {
+            Ok(()) => {
+                let got = down::<f32>(gpu, &dy);
+                for k in 0..nt {
+                    let e = rel_l2(&got[k * rows..(k + 1) * rows], &want[k]);
+                    if e > 1e-4 { gemvn = "fail"; note = format!("gemvn token {k} rel err {e}"); }
+                }
+                gemvn_got = Some(got);
+            }
+            Err(e) if not_impl(&e) => { gemvn = "unsupported"; note = format!("gemvn: {e:#}"); }
+            Err(e) => panic!("{}: gemvn: {e:#}", ty.name()),
+        }
+        let xq = gpu.zeros::<u8>(nt * cols * 9 / 8).unwrap();
+        let dz = gpu.zeros::<f32>(nt * rows).unwrap();
+        match gpu.quant_xq(dx.addr(), cols, cols, nt, xq.addr()).and_then(|()| gpu.gemvq(&dt, dx.addr(), cols, xq.addr(), dz.addr(), rows, nt)) {
+            Ok(()) => {
+                let got = down::<f32>(gpu, &dz);
+                match &gemvn_got {
+                    Some(w) if got.iter().zip(w).any(|(a, b)| a.to_bits() != b.to_bits()) => { gemvq = "fail"; note = format!("gemvq differs from gemvn on quant_xq: {note}"); }
+                    _ => {}
+                }
+            }
+            Err(e) if not_impl(&e) => { gemvq = "unsupported"; note = format!("gemvq: {e:#}"); }
+            Err(e) => panic!("{}: gemvq: {e:#}", ty.name()),
+        }
+        // moe_gemv: the first expert, a skipped (-1) slot and the last expert.
+        let ids = [0i32, -1, ne as i32 - 1];
+        let di = up(gpu, &ids);
+        let dm = gpu.zeros::<f32>(3 * rows).unwrap();
+        match gpu.moe_gemv(ty, rows, cols, dall.ptr, dall.bytes() / ne, di.addr(), 3, dx.addr(), cols, 1, dm.addr(), None, 0) {
+            Ok(()) => {
+                let got = down::<f32>(gpu, &dm);
+                for (k, &e) in ids.iter().enumerate() {
+                    let g = &got[k * rows..(k + 1) * rows];
+                    if e < 0 {
+                        if g.iter().any(|&v| v != 0.0) { moe_gemv = "fail"; note = format!("moe_gemv wrote skipped slot {k}: {note}"); }
+                        continue;
+                    }
+                    let mut w = vec![0f32; rows];
+                    all.expert(e as usize, ne).matvec(&as_seen(ty, &x[k * cols..(k + 1) * cols]), &mut w);
+                    let err = rel_l2(g, &w);
+                    if err > 1e-4 { moe_gemv = "fail"; note = format!("moe_gemv expert {e} rel err {err}: {note}"); }
+                }
+            }
+            Err(e) if not_impl(&e) => { moe_gemv = "unsupported"; note = format!("moe_gemv: {e:#}"); }
+            Err(e) => panic!("{}: moe_gemv: {e:#}", ty.name()),
+        }
+        // Dense GEMM over 130 positions (a full and a partial tile) and the tiled `gemm` entry point with 3 tiles.
+        let m = 130;
+        let xm = xs(m * cols);
+        let (dxm, dym) = (up(gpu, &xm), gpu.zeros::<f32>(m * rows).unwrap());
+        match gpu.gemm_dense(&dt, m, dxm.addr(), cols, dym.addr(), rows, 0) {
+            Ok(()) => {
+                let mut wr = vec![0f32; cols];
+                let mut want = vec![0f32; m * rows];
+                for r in 0..rows {
+                    t.row(r, &mut wr);
+                    for (i, xv) in xm.chunks(cols).enumerate() {
+                        want[i * rows + r] = if Gpu::mmq(ty) && cols % 128 == 0 { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
+                                             else { wr.iter().zip(xv).map(|(a, b)| f16tz(*a) * f16tz(*b)).sum() };
+                    }
+                }
+                let e = rel_l2(&down::<f32>(gpu, &dym), &want);
+                if e > 1e-4 { gemm_dense = "fail"; note = format!("gemm_dense rel err {e}: {note}"); }
+            }
+            Err(e) if not_impl(&e) => { gemm_dense = "unsupported"; note = format!("gemm_dense: {e:#}"); }
+            Err(e) => panic!("{}: gemm_dense: {e:#}", ty.name()),
+        }
+        let (n_x, mt) = (50, 170);
+        let xr: Vec<f32> = xs(n_x * cols);
+        let xrow: Vec<i32> = (0..mt).map(|i| ((i * 7) % n_x) as i32).collect();
+        let tiles: Vec<u64> = [(0u64, 128u64), (128, 16), (144, 26)].iter().flat_map(|&(m0, c)| [dt.ptr, m0 | c << 32]).collect();
+        let (dtl, dxr, drow) = (up(gpu, &tiles), up(gpu, &xr), up(gpu, &xrow));
+        let dyt = gpu.zeros::<f32>(mt * rows).unwrap();
+        match gpu.gemm(ty, rows, cols, dtl.addr(), 3, dxr.addr(), cols, n_x, drow.addr(), dyt.addr(), rows, 0) {
+            Ok(()) => {
+                let got = down::<f32>(gpu, &dyt);
+                let mut wr = vec![0f32; cols];
+                let mut want = vec![0f32; mt * rows];
+                for r in 0..rows {
+                    t.row(r, &mut wr);
+                    for (i, &xri) in xrow.iter().enumerate() {
+                        let xv = &xr[xri as usize * cols..][..cols];
+                        want[i * rows + r] = if Gpu::mmq(ty) { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
+                                             else { wr.iter().zip(xv).map(|(a, b)| f16tz(*a) * f16tz(*b)).sum() };
+                    }
+                }
+                let e = rel_l2(&got, &want);
+                if e > 1e-4 { gemm = "fail"; note = format!("gemm rel err {e}: {note}"); }
+            }
+            Err(e) if not_impl(&e) => { gemm = "unsupported"; note = format!("gemm: {e:#}"); }
+            Err(e) => panic!("{}: gemm: {e:#}", ty.name()),
+        }
+        if [dequant, gemv, gemvn, gemvq, moe_gemv, gemm_dense, gemm].contains(&"fail") { failures += 1; }
+        eprintln!("MATRIX ty={} dequant={dequant} gemv={gemv} gemvn={gemvn} gemvq={gemvq} moe_gemv={moe_gemv} \
+            gemm_dense={gemm_dense} gemm={gemm} smem={smem} note={note}", ty.name());
+    }
+    assert_eq!(failures, 0, "type matrix failures");
 }
 
 /// qwen4exp hyper-connection and PLE kernels against loops over the same f32 inputs.
@@ -1234,7 +1490,12 @@ fn f16_weight_uploads_as_f32() {
         assert!(e <= 1e-5, "{bk} gemvn rel err {e}");
         let dy = gpu.zeros::<f32>(nt * rows).unwrap();
         gpu.gemm_dense(&dt, nt, dx.addr(), cols, dy.addr(), rows, 0).unwrap();
-        let e = rel_l2(&down::<f32>(gpu, &dy), &want);
+        // The prefill path converts x and w to f16; the decode paths above read them as f32.
+        let wantg: Vec<f32> = (0..nt * rows).map(|i| {
+            let (m, r) = (i / rows, i % rows);
+            (0..cols).map(|c| f16_in(bk, wf[r * cols + c]) as f64 * f16_in(bk, x[m * cols + c]) as f64).sum::<f64>() as f32
+        }).collect();
+        let e = rel_l2(&down::<f32>(gpu, &dy), &wantg);
         eprintln!("{bk}: gemm_dense rel err {e:.2e}");
         assert!(e <= 1e-5, "{bk} gemm_dense rel err {e}");
     }
