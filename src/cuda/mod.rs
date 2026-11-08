@@ -76,7 +76,11 @@ pub fn llama_numerics() -> bool { std::env::var_os("STRATA_LLAMA_NUMERICS").is_s
 /// `--kv q8`: KV cache rows in ggml q8_0 form (KV_Q8 in kernels.cu), read once by Gpu::new and Vk::new.
 pub fn kv_q8() -> bool { std::env::var_os("STRATA_KV_Q8").is_some() }
 
-fn source(kv_q8: bool) -> String {
+/// `STRATA_GEMM_FMA`: force the CUDA-core FMA fallback in the f16 prefill GEMM instead of the sm_70 tensor-core
+/// path (`GEMM_TC` in kernels.cu). Ignored on sm_80+, which always uses `mma.m16n8k16`.
+pub fn gemm_fma() -> bool { std::env::var_os("STRATA_GEMM_FMA").is_some() }
+
+fn source(kv_q8: bool, gemm_tc: bool) -> String {
     let join = |v: Vec<String>| v.join(",");
     format!(
         "__device__ const unsigned long long iq2xs_grid[512] = {{{}}};\n\
@@ -86,7 +90,7 @@ fn source(kv_q8: bool) -> String {
          __device__ const unsigned int iq3xxs_grid[256] = {{{}}};\n\
          __device__ const unsigned int iq3s_grid[512] = {{{}}};\n\
          __device__ const unsigned char ksigns_iq2xs[128] = {{{}}};\n\
-         __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n#define LLAMA_Q8 {}\n#define KV_Q8 {}\n{}",
+         __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n#define LLAMA_Q8 {}\n#define KV_Q8 {}\n#define GEMM_TC {}\n{}",
         join(IQ2XS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ2XXS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ2S_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
@@ -97,6 +101,7 @@ fn source(kv_q8: bool) -> String {
         join(KVALUES_IQ4NL.iter().map(|v| v.to_string()).collect()),
         llama_numerics() as u8,
         kv_q8 as u8,
+        gemm_tc as u8,
         include_str!("kernels.cu"),
     )
 }
@@ -122,9 +127,15 @@ fn arch_support_error(cc: (i32, i32), nvrtc: (i32, i32)) -> Option<String> {
         nvrtc.0, nvrtc.1, cc.0, cc.1))
 }
 
-/// The startup line for the device: arch always, plus the Volta marker when the kernel path is the sm_70 fallback.
-fn device_log(device: usize, name: &str, arch: &str, cc: (i32, i32)) -> String {
-    format!("cuda device {device}: {name}, {arch}{}", if cc.0 < 8 { " (Volta fallback)" } else { "" })
+/// The startup line for the device: arch always, plus the sm_70 prefill GEMM path (tensor cores vs FMA fallback).
+/// `gemm_fma` is passed explicitly so the log reflects the cubin actually compiled, not the env at print time.
+fn device_log(device: usize, name: &str, arch: &str, cc: (i32, i32), gemm_fma: bool) -> String {
+    let path = match (cc.0 < 8, gemm_fma) {
+        (true, false) => " (Volta, m8n8k4)",
+        (true, true) => " (Volta fallback)",
+        (false, _) => "",  // sm_80+ always uses mma.m16n8k16
+    };
+    format!("cuda device {device}: {name}, {arch}{path}")
 }
 
 /// Whether the device has int8 tensor cores, i.e. whether the `gemmi_*`/`gemmis_*` prefill GEMM exists in its cubin
@@ -293,9 +304,10 @@ impl Gpu {
         unsafe { ctx.disable_event_tracking() };
         let (maj, min) = ctx.compute_capability()?;
         let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
-        eprintln!("{}", device_log(device, &ctx.name().unwrap_or_default(), arch, (maj, min)));
+        let gemm_fma = gemm_fma();
+        eprintln!("{}", device_log(device, &ctx.name().unwrap_or_default(), arch, (maj, min), gemm_fma));
         let stream = ctx.new_stream()?;
-        let module = ctx.load_module(ptx(&source(kv_q8), arch, (maj, min))?).context("load cubin")?;
+        let module = ctx.load_module(ptx(&source(kv_q8, !gemm_fma), arch, (maj, min))?).context("load cubin")?;
         let i8_gemm = int8_gemm_arch((maj, min));
         // The per-block dynamic shared memory ceiling the driver reports: 96 KiB on Volta per the roadmap, but
         // possibly less (reserve), and shared with the function's static part. Never a constant.
@@ -944,9 +956,11 @@ mod tests {
                 return;
             }
         }
-        let src = super::source(false);
+        let src = super::source(false, true);
         super::cubin(&src, "sm_70").unwrap_or_else(|e| panic!("sm_70 must compile: M1-T4 removed the last blocker: {e:#}"));
         super::cubin(&src, "sm_80").expect("the sm_80 path must keep compiling (cubin for sm_80)");
+        // Same sm_70 source with the FMA fallback selected: both variants must produce a cubin (M2-T1).
+        super::cubin(&super::source(false, false), "sm_70").expect("the STRATA_GEMM_FMA sm_70 source must compile");
     }
 
     #[test]
@@ -983,9 +997,14 @@ mod tests {
     #[test]
     fn arch_log_marks_volta() {
         assert_eq!(
-            super::device_log(0, "Tesla V100-SXM2-32GB", "sm_70", (7, 0)),
+            super::device_log(0, "Tesla V100-SXM2-32GB", "sm_70", (7, 0), false),
+            "cuda device 0: Tesla V100-SXM2-32GB, sm_70 (Volta, m8n8k4)");
+        assert_eq!(
+            super::device_log(0, "Tesla V100-SXM2-32GB", "sm_70", (7, 0), true),
             "cuda device 0: Tesla V100-SXM2-32GB, sm_70 (Volta fallback)");
-        assert_eq!(super::device_log(0, "NVIDIA GeForce RTX 3060", "sm_86", (8, 6)),
+        assert_eq!(super::device_log(0, "NVIDIA GeForce RTX 3060", "sm_86", (8, 6), false),
+            "cuda device 0: NVIDIA GeForce RTX 3060, sm_86");
+        assert_eq!(super::device_log(0, "NVIDIA GeForce RTX 3060", "sm_86", (8, 6), true),
             "cuda device 0: NVIDIA GeForce RTX 3060, sm_86");
     }
 

@@ -915,6 +915,18 @@ __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 #endif
 }
+#if __CUDA_ARCH__ < 800
+// D[8,8] += A[8,4] * B[4,8] with the four independent computations of mma.m8n8k4 (Volta, SASS HMMA.884) selected
+// by g & 3. PTX ISA 8.5 §9.7.13.4.1: lane l = 4*g + t owns A row t + 4*(g >= 4) at k 0..3 and D elements by the
+// column/row formulas implemented in gemm_q's sm_70 path. mma.m16n8k16 is sm_80+, so this helper only exists for
+// the pre-Volta/Volta build: the guard keeps the sm_80+ preprocessed source byte-identical.
+__device__ __forceinline__ void mma884(float* d, u32 a0, u32 a1, u32 b0, u32 b1) {
+    asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+}
+#endif
 __device__ __forceinline__ u32 h2pack(float a, float b) { return (u32)f2h(a) | ((u32)f2h(b) << 16); }
 
 // act: 0 = store, 1 = y = silu(y) * result (SwiGLU over a gate already in y), 2 = y += result.
@@ -939,6 +951,10 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
         xr[q] = r < tl.cnt ? x + (size_t)(xrow ? xrow[tl.m0 + r] : tl.m0 + r) * x_stride : nullptr;
     }
     float acc[2][4][4] = {};
+#if __CUDA_ARCH__ < 800 && GEMM_TC
+    // Same 32 f32 storage as acc, seen as 4 m8 tiles x 8 D registers: accv[j][i] == &acc[0][0][0][j*8+i].
+    float (&accv)[4][8] = reinterpret_cast<float (&)[4][8]>(acc);
+#endif
     // W step kb is decoded into registers (as halves) during step kb - 1's mma and stored after it.
     constexpr int WQ = 64 * SUBS / NT;
     static_assert(64 * SUBS % NT == 0, "whole W groups per thread");
@@ -980,6 +996,25 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
         if (wm < tl.cnt)
 #pragma unroll
         for (int kk = 0; kk < BK; kk += 16) {
+#if __CUDA_ARCH__ < 800 && GEMM_TC
+            // Volta: eight m8n8k4 ops replace one m16n8k16 for the same 16-deep k step. The four computations of
+            // each instruction are selected by c = g & 3: SM == false maps them to the four n8 tiles (m8 = j, n8 =
+            // c, 32 f32 per lane in accv[0..3]); SM == true maps them to the four 8x8 quadrants of the 16x16 warp
+            // tile (m8 = c >> 1, n8 = c & 1, accv[0] only). A depends on m8 only (broadcast across c), B on n8.
+            const int c = g & 3, hi = g >> 2;
+            #pragma unroll
+            for (int j = 0; j < (SM ? 1 : 4); j++) {
+                int m8 = SM ? (c >> 1) : j, n8 = SM ? (c & 1) : c;
+                const u16* pa = xs + (wm + 8 * m8 + t + 4 * hi) * P + kk;
+                const u16* pb = ws + (wn + 8 * n8 + t + 4 * hi) * P + kk;
+                #pragma unroll
+                for (int ks = 0; ks < 4; ks++) {
+                    u32 a0 = ld_s32(pa + 4 * ks), a1 = ld_s32(pa + 4 * ks + 2);
+                    u32 b0 = ld_s32(pb + 4 * ks), b1 = ld_s32(pb + 4 * ks + 2);
+                    mma884(accv[j], a0, a1, b0, b1);
+                }
+            }
+#else
             constexpr int MT = SM ? 1 : 2, NT8 = SM ? 2 : 4;
             u32 a[2][4], b[4][2];
             #pragma unroll
@@ -996,10 +1031,34 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
             for (int mt = 0; mt < MT; mt++)
                 #pragma unroll
                 for (int nt = 0; nt < NT8; nt++) mma16816(acc[mt][nt], a[mt][0], a[mt][1], a[mt][2], a[mt][3], b[nt][0], b[nt][1]);
+#endif
         }
         __syncthreads();
         if (kb + 1 < nk) stw();
     }
+#if __CUDA_ARCH__ < 800 && GEMM_TC
+    // m8n8k4 D layout (PTX ISA 8.5 §9.7.13.4.1): register i = 4*p4 + 2*p2 + e sits at row (t & 1) + 2*p2 + 4*hi
+    // and column (t & 2) + 4*p4 + e of the 8x8 tile. For each fixed c, lanes {4c..4c+3} and {16+4c..19+4c} cover
+    // that tile exactly once; the tile itself is picked by c (n8 = c) and j (m8 = j), or by c alone for SM.
+    const int c = g & 3, hi = g >> 2;
+    #pragma unroll
+    for (int j = 0; j < (SM ? 1 : 4); j++)
+        #pragma unroll
+        for (int p4 = 0; p4 < 2; p4++)
+            #pragma unroll
+            for (int p2 = 0; p2 < 2; p2++) {
+                int r = wm + 8 * (SM ? (c >> 1) : j) + (t & 1) + 2 * p2 + 4 * hi;
+                int n = n0 + wn + 8 * (SM ? (c & 1) : c) + (t & 2) + 4 * p4;
+                if (r >= tl.cnt) continue;
+                float* yr = y + (size_t)(tl.m0 + r) * y_stride;
+                #pragma unroll
+                for (int e = 0; e < 2; e++) {
+                    if (n + e >= rows) break;
+                    float v = accv[j][4 * p4 + 2 * p2 + e];
+                    yr[n + e] = act == 0 ? v : act == 1 ? silu(yr[n + e]) * v : yr[n + e] + v;
+                }
+            }
+#else
     #pragma unroll
     for (int mt = 0; mt < (SM ? 1 : 2); mt++)
         #pragma unroll
@@ -1016,6 +1075,7 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
                     yr[n + e] = act == 0 ? v : act == 1 ? silu(yr[n + e]) * v : yr[n + e] + v;
                 }
             }
+#endif
 }
 
 #ifndef GEMM_BM

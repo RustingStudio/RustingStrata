@@ -423,3 +423,74 @@ pp 131072: prefill 53.9 tok/s | tg 128: decode 17.8 tok/s
 256k did not complete: the prefill was still running when the production
 window closed and the run was stopped. At this rate it needs roughly 100-120
 minutes of prefill on this build (sm_70 FMA fallback).
+
+## 2026-11-08 — Volta tensor cores in the prefill GEMM (M2-T1, V100, sm_70)
+
+Model: `Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf`. Build: `task/24-cuda-tensor-core-gemm`
+(PR #25), based on `v100` at `58fc084`. The f16 prefill GEMM (`gemm_q`,
+`gemm_*`/`gemms_*`) now uses `mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32`
+on sm_70; the `m16n8k16` path is unchanged for sm_80+ and `STRATA_GEMM_FMA=1`
+selects the old CUDA-core fallback.
+
+### Fragment mapping
+
+The per-lane mapping is the PTX ISA 8.5 §9.7.16.5.1 one (four computations
+selected by `g = lane >> 2 & 3`): A row `t + 4*(g >= 4)` (row-major, k 0..3),
+B column `t + 4*(g >= 4)` (column-major, k 0..3), and D register
+`i = 4*p4 + 2*p2 + e` at row `(t & 1) + 2*p2 + 4*(g >= 4)`, column
+`(t & 2) + 4*p4 + e`, with `t = lane & 3`. `SM == false` maps the four
+computations to the four n8 tiles (`m8 = j`, `n8 = c = g & 3`, 16 ops per
+16-deep k step); `SM == true` maps them to the four 8x8 quadrants of the 16x16
+warp tile (`m8 = c >> 1`, `n8 = c & 1`, 4 ops). The standalone asm compiled by
+NVRTC 12.9 for sm_70 lowers to `HMMA.884.F32.F32.STEP0..3` (`cuobjdump -sass`),
+and the sm_80+ preprocessed source is byte-identical to `v100` (1861 lines).
+
+### Correctness (device-free + V100)
+
+```sh
+STRATA_MODEL=$M STRATA_TEST_BACKENDS=cuda cargo test --release --test kernels \
+  gemm_matches_reference_for_every_type -- --nocapture --test-threads=1
+
+cuda device 0: Tesla V100-SXM2-32GB, sm_70 (Volta, m8n8k4)
+Q5_K     blk.0.attn_gate.weight: gemm rel err 9.58e-7
+IQ3_XXS  blk.0.ffn_down_exps.weight: gemm rel err 6.31e-7
+Q6_K     blk.0.ffn_down_shexp.weight: gemm rel err 6.47e-7
+IQ2_XS   blk.0.ffn_gate_exps.weight: gemm rel err 8.95e-7
+F32      blk.0.ffn_gate_inp.weight: gemm rel err 4.87e-7
+IQ4_XS   blk.1.ffn_down_exps.weight: gemm rel err 6.42e-7
+Q8_0     blk.1.ffn_down_shexp.weight: gemm rel err 6.01e-7
+Q4_K     output.weight: gemm rel err 9.13e-7
+ok
+```
+
+All relative errors are `<= 1e-6`, against the 1e-4 assertion; both `gemm_*`
+and `gemms_*` (including partial tiles) are covered. `strata generate
+--prompt "The capital of France is" -n 32` produced coherent text (" Paris. ...
+That is correct.") with no NaN. CPU side, `cargo test --release --lib cuda::`
+compiles sm_70 with `GEMM_TC=1`, sm_70 with `GEMM_TC=0` and sm_80 with NVRTC
+12.9 (14/14 tests green).
+
+### Benchmarks (same window, median of 3 reps)
+
+```sh
+M=/mnt/models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
+target/release/strata bench --model "$M" --gpu --backend cuda \
+  --pp 512,4096 --tg 128 --reps 3 --ctx 32896            # GEMM_TC = 1
+STRATA_GEMM_FMA=1 target/release/strata bench ...        # FMA fallback
+```
+
+| run | pp 512 (tok/s) | pp 4096 (tok/s) | tg 128 @512 (tok/s) | tg 128 @4096 (tok/s) |
+| --- | ---: | ---: | ---: | ---: |
+| `GEMM_TC = 1` (m8n8k4) | 1880.4 (1767.1-1948.2) | 1976.0 (1974.1-1977.6) | 123.0 (121.8-123.7) | 119.6 (118.6-120.1) |
+| `STRATA_GEMM_FMA=1` | 840.9 (839.5-842.2) | 1036.1 (1034.9-1037.3) | 123.3 (122.3-123.9) | 119.3 (119.0-119.6) |
+| delta | **+123.6 %** | **+90.7 %** | -0.2 % | +0.3 % |
+
+Prefill is 2.24x faster at 512 and 1.91x at 4096; decode is unchanged within
+noise (99.8 % and 100.3 % of the FMA run, as expected: decode does not use
+`gemm_q`). The absolute 512 value is also 2.25x the M1-T7 record of 836.5 tok/s
+(`docs/V100-results.md`, M1-T7; same model, same protocol) because that record
+was taken on the FMA fallback.
+
+No new `Xid`/`NVRM` line in `dmesg` (`grep -ic Xid` = 42 before and after the
+window), no device lost, no engine crash; the GPU was left at 0 MiB and
+`llama.router.service` was restarted by the coordinator after the window.
