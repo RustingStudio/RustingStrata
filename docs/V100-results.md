@@ -1668,3 +1668,25 @@ Net M2 effect, as recorded by the individual tasks: prefill @512 +123.6 % and
 GEMV rework (T5) and +1.0-1.2 % from residency (T4), with numerical parity held
 at 634/640 either-mode (T7). Both arms in this window were single-process, model
 fully resident, 0.0 µs/token of CPU worker cost on CUDA.
+
+## 2026-11-08 — repeatable A/B on Model R (dense, anonymised)
+
+The model is anonymised at the owner's request: a dense 27B-class GGUF with an
+MTP head. Prompt: `tools/prompts/bench-natural.txt` (~423 tokens of natural
+text), identical for both engines. Greedy (`temperature 0`), `n_predict 128`,
+`ctx 4096`. V100-SXM2-32GB, driver 580.178.04; value pairs are two consecutive
+runs of the same binary.
+
+| engine | config | prefill tok/s | decode tok/s | drafts accepted |
+| --- | --- | ---: | ---: | ---: |
+| strata | MTP off | 408.6–409.4 | 30.50–30.53 | — |
+| strata | MTP 2 | 402.5–403.4 | 37.74–37.75 | 68/122 (55.7 %) |
+| strata | MTP 3 | 394.7–400.6 | 33.76–33.81 | 77/162 (47.5 %) |
+| llama.cpp | no speculative | 481.3 | 37.26 | — |
+| llama.cpp | draft-mtp + ngram | 411.9 | 52.64 | 67/120 (55.8 %) |
+
+Reading: on this dense model llama.cpp leads on prefill (+18 %) and decode
+(+22 % without speculative decoding, +39 % with both speculative modes at the
+same acceptance rate), even though the prompt is natural text and not a
+repetitive pattern. The fork's MTP closes part of the decode gap (30.5 → 37.7)
+but not all of it. No `Xid` during the run; production was restarted afterwards.
