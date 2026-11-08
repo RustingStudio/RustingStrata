@@ -634,7 +634,7 @@ async function stats() {
   statsTimer = setTimeout(stats, document.hidden ? 10000 : s?.busy || s?.loading ? 700 : 2500);
   const st = $('state');
   if (!s) { [st.textContent, st.className] = ['Offline', 'state']; return; }
-  [st.textContent, st.className] = s.loading ? ['Loading', 'state busy'] : s.busy ? [`Writing, ${s.live_tokens} tokens`, 'state busy'] : s.model ? ['Ready', 'state ready'] : ['No model', 'state'];
+  [st.textContent, st.className] = s.loading ? ['Loading', 'state busy'] : s.busy ? [`Writing${s.busy > 1 ? ' ' + s.busy + ' replies' : ''}, ${s.live_tokens} tokens`, 'state busy'] : s.model ? ['Ready', 'state ready'] : ['No model', 'state'];
   $('mname').textContent = s.model || 'No model loaded';
   $('minfo').innerHTML = s.model && !s.loading ? dl([
     ['Runs on', { cpu: 'Processor', cuda: 'CUDA', vulkan: 'Vulkan' }[s.backend]],
