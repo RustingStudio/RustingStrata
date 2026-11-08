@@ -1080,16 +1080,29 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
 
 #ifndef GEMM_BM
 #define GEMM_BM 128
+#endif
+#ifndef GEMM_BK
 #define GEMM_BK 64
 #endif
+#ifndef GEMM_MIN_BLOCKS
+#define GEMM_MIN_BLOCKS 1
+#endif
+static_assert(GEMM_BM % 32 == 0, "GEMM_BM must be a multiple of 32 (warp rows)");
+static_assert(GEMM_BK % 8 == 0, "GEMM_BK must be a multiple of 8 (one super-block sub-tile)");
+static_assert((64 * (GEMM_BK / 8)) % (2 * GEMM_BM) == 0, "whole W groups per thread");
+#if GEMM_MIN_BLOCKS > 1
+#define GEMM_LAUNCH_BOUNDS __launch_bounds__(GEMM_BM * 2, GEMM_MIN_BLOCKS)
+#else
+#define GEMM_LAUNCH_BOUNDS __launch_bounds__(GEMM_BM * 2)
+#endif
 #define DEF_GEMM(T, NAME, SBB)                                                                                    \
-    extern "C" __global__ void __launch_bounds__(GEMM_BM * 2) gemm_##NAME(const GemmTile* tiles, const u8* wd, int nd, \
+    extern "C" __global__ void GEMM_LAUNCH_BOUNDS gemm_##NAME(const GemmTile* tiles, const u8* wd, int nd,         \
             const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act) {  \
         gemm_q<T, SBB, GEMM_BM, GEMM_BK, false>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act); \
     }                                                                                                             \
-    extern "C" __global__ void __launch_bounds__(GEMM_BM * 2) gemms_##NAME(const GemmTile* tiles, const u8* wd, int nd, \
+    extern "C" __global__ void GEMM_LAUNCH_BOUNDS gemms_##NAME(const GemmTile* tiles, const u8* wd, int nd,        \
             const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act) {  \
-        gemm_q<T, SBB, GEMM_BM, GEMM_BK, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act); \
+        gemm_q<T, SBB, GEMM_BM, GEMM_BK, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act);  \
     }
 QTYPES(DEF_GEMM)
 
@@ -2248,8 +2261,14 @@ extern "C" __global__ void moe_combine_seq(float* x, const float* ye, const floa
 // step[0] + t) attends to cached keys 0 .. step[0] + t. q is [T, nh * HD] after rope, qg [T, nh * 2 * HD] holds the
 // gate at +HD per head; out [T, nh * HD] = softmax(q K^T * scale) V * sigmoid(gate). Shared: Q, K and V tiles, all
 // row-major; mma fragments come from ldmatrix (.trans for V).
+#ifndef FA_BQ
 #define FA_BQ 64
+#endif
+#ifndef FA_BK
 #define FA_BK 32
+#endif
+static_assert(FA_BK % 32 == 0, "FA_BK must be a multiple of 32 (m8n8k4 / m16n8k16 K loops)");
+static_assert(FA_BQ == 16 * (128 / 32), "FA_BQ must be 16 query rows per warp of the 128-thread block");
 // QSA mask (see qsa_select): whether query row t (mw words a row) sees key position `key`. The mask has rows for the
 // tile padding past T too (their output is dropped).
 __device__ __forceinline__ bool qsa_bit(const unsigned* qm, int mw, int t, int key) {
