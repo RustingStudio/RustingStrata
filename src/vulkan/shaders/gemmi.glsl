@@ -78,7 +78,7 @@ void ldx(uint xr, uint xh, bool xok, uint xo, uint cols, uint kb, uint b) {
 #endif
 
 void main() {
-    uint tid = gl_LocalInvocationID.x, w = gl_SubgroupID, n0 = gl_WorkGroupID.x * 64, cols = p.nk * 64;
+    uint tid = gl_LocalInvocationID.x, w = WARP, n0 = gl_WorkGroupID.x * 64, cols = p.nk * 64;
     uint m0, cnt;
     U8 wt;
     if (uint64_t(p.tiles) != 0) {
@@ -104,7 +104,7 @@ void main() {
     const bool sm = SM != 0;
     uint bm = sm ? 16 * (w & 1) : (w >> 1) * 32, bn = sm ? 16 * (w >> 1) : (w & 1) * 32;
     // nv: the layout of mma.sync (element i at row g + 8 (i >> 2), column 2 t + (i & 1) + 8 ((i >> 1) & 1)), as on NVIDIA.
-    uint g = gl_SubgroupInvocationID >> 2, t = gl_SubgroupInvocationID & 3;
+    uint g = LANE >> 2, t = LANE & 3;
 #if COOP
     // Accumulator element i of this invocation is at row ri[i], column ci[i] (the layout is the implementation's).
     IACC ri, ci;

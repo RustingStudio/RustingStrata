@@ -138,6 +138,8 @@ struct Inner {
     tsem: vk::Semaphore,
     mem: vk::PhysicalDeviceMemoryProperties,
     budget: bool,
+    /// The device runs fixed 64-lane subgroups, split into logical 32-lane warps.
+    wave64: bool,
     /// VK_KHR_cooperative_matrix with the 16 x 16 x 16 f16 / f32 shape is enabled (`gemm_f`, `attn_prefill`).
     coop: bool,
     /// Without cooperative matrices: run the tiled `attn_prefill_tile` (one KV-head tile shared by 32 query/head tasks)
@@ -283,8 +285,9 @@ fn unusable(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<String> 
     let p = p2.properties;
     if p.device_type == vk::PhysicalDeviceType::CPU { return Some("a CPU device".into()); }
     if p.api_version < vk::API_VERSION_1_3 { return Some("Vulkan 1.3 is needed".into()); }
-    if !(sg.min_subgroup_size..=sg.max_subgroup_size).contains(&32) || !sg.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE) {
-        return Some(format!("subgroup size 32 is needed (it has {}-{})", sg.min_subgroup_size, sg.max_subgroup_size));
+    if !((sg.min_subgroup_size..=sg.max_subgroup_size).contains(&32) && sg.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE))
+        && !(sg.min_subgroup_size == 64 && sg.max_subgroup_size == 64 && p11.subgroup_size == 64) {
+        return Some(format!("subgroup size 32 or fixed size 64 is needed (it has {}-{})", sg.min_subgroup_size, sg.max_subgroup_size));
     }
     let ops = vk::SubgroupFeatureFlags::ARITHMETIC | vk::SubgroupFeatureFlags::SHUFFLE;
     if !p11.subgroup_supported_operations.contains(ops) || !p11.subgroup_supported_stages.contains(vk::ShaderStageFlags::COMPUTE) {
@@ -336,6 +339,9 @@ impl Vk {
         };
         eprintln!("vulkan device {device}: {name}");
         // ponytail: the instance leaks if device setup below fails; it is a one-time startup error.
+        let mut sg = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+        unsafe { instance.get_physical_device_properties2(pd, &mut vk::PhysicalDeviceProperties2::default().push_next(&mut sg)) };
+        let wave64 = sg.min_subgroup_size == 64;
         let qf = unsafe { instance.get_physical_device_queue_family_properties(pd) }.iter()
             .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE)).context("no compute queue")? as u32;
         let dexts = unsafe { instance.enumerate_device_extension_properties(pd) }?;
@@ -350,7 +356,7 @@ impl Vk {
             .unwrap_or_default() } else { vec![] };
         let shape = |k, ab, cr| props.iter().any(|c| (c.m_size, c.n_size, c.k_size) == (16, 16, k) && c.scope == vk::ScopeKHR::SUBGROUP
             && c.a_type == ab && c.b_type == ab && c.c_type == cr && c.result_type == cr);
-        let coop = shape(16, vk::ComponentTypeKHR::FLOAT16, vk::ComponentTypeKHR::FLOAT32)
+        let coop = !wave64 && shape(16, vk::ComponentTypeKHR::FLOAT16, vk::ComponentTypeKHR::FLOAT32)
             && std::env::var_os("STRATA_VK_NO_COOP").is_none();  // STRATA_VK_NO_COOP: run the kernels for devices without them
         let coop_i8 = coop && shape(32, vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32);
         // The tiled fallback needs a 1024-thread workgroup and 32 KB of shared memory (see attn_prefill_tile.comp).
@@ -416,7 +422,7 @@ impl Vk {
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, wave64, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -684,12 +690,13 @@ impl Inner {
         let m = unsafe { self.dev.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None) }?;
         let n = spec.len() as u32;
         let entries: Vec<_> = (0..n).map(|i| vk::SpecializationMapEntry::default().constant_id(i).offset(4 * i).size(4))
-            .chain([vk::SpecializationMapEntry::default().constant_id(15).offset(4 * n).size(4)]).collect();
-        let data: Vec<u8> = spec.iter().chain([&(self.kv_q8 as u32)]).flat_map(|v| v.to_le_bytes()).collect();
+            .chain([vk::SpecializationMapEntry::default().constant_id(15).offset(4 * n).size(4),
+                    vk::SpecializationMapEntry::default().constant_id(14).offset(4 * n + 4).size(4)]).collect();
+        let data: Vec<u8> = spec.iter().chain([&(self.kv_q8 as u32), &(self.wave64 as u32)]).flat_map(|v| v.to_le_bytes()).collect();
         let si = vk::SpecializationInfo::default().map_entries(&entries).data(&data);
         let mut sub = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32);
-        let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(m).name(c"main")
-            .specialization_info(&si).flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS).push_next(&mut sub);
+        let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(m).name(c"main").specialization_info(&si);
+        let stage = if self.wave64 { stage } else { stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS).push_next(&mut sub) };
         let r = unsafe { self.dev.create_compute_pipelines(vk::PipelineCache::null(),
             &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(self.layout)
                 .flags(if self.stats { vk::PipelineCreateFlags::CAPTURE_STATISTICS_KHR } else { vk::PipelineCreateFlags::empty() })], None) };

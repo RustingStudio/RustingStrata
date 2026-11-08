@@ -1307,3 +1307,27 @@ fn f16_weight_uploads_as_f32() {
         assert!(e <= 1e-5, "{bk} gemm_dense rel err {e}");
     }
 }
+
+/// Exercise logical warp scans across both halves of wave64, with tied QSA scores.
+#[test]
+fn qsa_selection_orders_tied_blocks() {
+    let (nbs, top) = (2048usize, 73usize);
+    let sst = 1 + 4 * top;
+    for (bk, gpu) in common::backends() {
+        let g = &*gpu;
+        let q = up(g, &vec![1.0f32; 512]);
+        let pool = up(g, &(0..nbs).flat_map(|b| std::iter::repeat_n((b % 50) as f32, 128)).collect::<Vec<_>>());
+        let scores = g.zeros::<f32>(nbs).unwrap();
+        let selected = g.zeros::<i32>(sst).unwrap();
+        let step = up(g, &[(4 * nbs - 1) as i32, 0]);
+        g.qsa_select(q.addr(), pool.addr(), scores.addr(), selected.addr(), 0, step.addr(), 0, 1, nbs, top, sst, 0).unwrap();
+        let mut blocks: Vec<usize> = (0..nbs).collect();
+        blocks.sort_by_key(|b| (std::cmp::Reverse(b % 50), *b));
+        blocks.truncate(top);
+        blocks.sort_unstable();
+        let want: Vec<i32> = blocks.iter().flat_map(|b| (0..4).map(move |k| (4 * b + k) as i32)).collect();
+        let got = down::<i32>(g, &selected);
+        assert_eq!(got[0], (4 * top) as i32, "{bk}: count");
+        assert_eq!(&got[1..], want.as_slice(), "{bk}: selection");
+    }
+}

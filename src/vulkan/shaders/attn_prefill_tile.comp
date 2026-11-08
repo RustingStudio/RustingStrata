@@ -1,5 +1,5 @@
 #version 460
-// Prefill attention for devices without cooperative matrices, tiled: one workgroup (1024 threads, 32 subgroups) handles
+// Prefill attention for devices without cooperative matrices, tiled: one workgroup (1024 threads, 32 logical warps) handles
 // `hper` query heads that share one KV head times `bq` queries (32 tasks). The workgroup loads a tile of `BK` K and V
 // rows into shared memory once and every task reads it, instead of every query reading and q8-dequantizing the whole
 // cache from global memory (attn_prefill_dp). The arithmetic is attn_prefill_dp's: f32 Q and online softmax, one key at
@@ -14,7 +14,7 @@ layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 qg; F32 o; I32 step
 shared float16_t sk[8192], sv[8192];
 
 void main() {
-    uint tid = gl_LocalInvocationID.x, task = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    uint tid = gl_LocalInvocationID.x, task = WARP, lane = LANE;
     uint g = p.nh / p.nkv;                     // query heads per KV head
     uint kvh = gl_WorkGroupID.y / p.hgroups, head_group = gl_WorkGroupID.y % p.hgroups;
     uint q0 = gl_WorkGroupID.x * p.bq;
@@ -48,7 +48,7 @@ void main() {
             if (k > last_q || (uint64_t(p.qm) != 0 && !qsa_bit(p.qm, p.mw, q, k))) continue;
             float s = 0.0;
             [[unroll]] for (uint j = 0; j < PER; j++) s += qv[j] * float(sk[r * HD + lane + 32 * j]);
-            s = subgroupAdd(s);
+            s = W64 ? warp_sum(s) : subgroupAdd(s);
             float mn = first ? s : max(m, s), c = expf_(m - mn), e = expf_(s - mn);
             l = first ? e : fma(l, c, e);
             first = false;

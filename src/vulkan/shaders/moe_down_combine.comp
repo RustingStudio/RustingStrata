@@ -29,10 +29,10 @@ const uint RPW = 8;  // rows per workgroup (rpw) at most
 shared float part[32 * RPW];
 shared bool miss, ok;
 void main() {
-    uint tk = gl_WorkGroupID.y, k = p.k, lane = gl_SubgroupInvocationID, n = p.rows;
+    uint tk = gl_WorkGroupID.y, k = p.k, lane = LANE, n = p.rows;
     uint rpw = p.rpw, r0 = gl_WorkGroupID.x * rpw;
     F32 xd = F32(uint64_t(p.xq) + p.ntok * p.nsb * 256);
-    for (uint j = gl_SubgroupID; j < k; j += 8) {
+    for (uint j = WARP; j < k; j += 8) {
         uint t = tk * k + j;
         int e = p.slots.v[t];
         if (e < 0) continue;  // a miss: weight 0, the CPU's result is added below

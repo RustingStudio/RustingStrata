@@ -20,7 +20,7 @@ void step(uint row, uint lane, uint s, inout float acc[NT]) {
 }
 
 void main() {
-    uint row = gl_WorkGroupID.x * (gl_WorkGroupSize.x / 32) + gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    uint row = gl_WorkGroupID.x * (gl_WorkGroupSize.x / 32) + WARP, lane = LANE;
     if (row >= p.rows) return;
     float acc[NT];
     for (uint t = 0; t < NT; t++) acc[t] = 0.0;

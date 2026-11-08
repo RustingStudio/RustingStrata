@@ -6,6 +6,12 @@
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_control_flow_attributes : require
 
+// 1 on devices whose physical subgroup is 64 lanes, split into two logical 32-lane warps. Set on every pipeline.
+layout(constant_id = 14) const bool W64 = false;
+#define LANE (W64 ? (gl_SubgroupInvocationID & 31u) : gl_SubgroupInvocationID)
+#define WARP (W64 ? (gl_SubgroupID * (gl_SubgroupSize / 32u) + gl_SubgroupInvocationID / 32u) : gl_SubgroupID)
+#define NWARPS ((gl_WorkGroupSize.x + 31u) / 32u)
+
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32 { float v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer I32 { int v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32 { uint v[]; };
@@ -23,6 +29,9 @@ float fdiv(float a, float b) {
     // An infinite operand or b = 0 makes the steps inf * 0 = NaN (sigmoid(-100): 1 / inf); a / b is exact there.
     return isinf(a) || isinf(b) || b == 0.0 ? a / b : r;
 }
+// Quantizer reciprocals on wave64: a correctly rounded double division keeps values on a roundEven() tie
+// from moving by one int8 step. Wave32 keeps the fdiv path that its kernels were tuned with.
+float rcp_d(float a, float b) { return W64 ? float(double(a) / double(b)) : fdiv(a, b); }
 float sqrt_(float x) { float s = sqrt(x); precise float r = fma(fma(-s, s, x), fdiv(0.5, s), s); return x > 0.0 && !isinf(x) ? r : s; }
 
 // expf as CUDA compiles it (its PTX): x = j ln2 + r with j from a rounded-down fma, then ex2.approx(r) * 2^j.
@@ -65,6 +74,15 @@ float log1p_(float a) {
 }
 float softplus(float x) { return x > 20.0 ? x : log1p_(expf_(x)); }
 
+// Reductions over each logical 32-lane warp, including either half of a 64-lane subgroup.
+uint warp_max_uint(uint v) { for (uint o = 16; o > 0; o >>= 1) v = max(v, subgroupShuffleXor(v, o)); return v; }
+uint warp_min_uint(uint v) { for (uint o = 16; o > 0; o >>= 1) v = min(v, subgroupShuffleXor(v, o)); return v; }
+uint warp_scan(uint v) {
+    uint lane = gl_SubgroupInvocationID & 31u, base = gl_SubgroupInvocationID & ~31u;
+    for (uint o = 1; o < 32; o <<= 1) { uint x = subgroupShuffle(v, base + (lane >= o ? lane - o : lane)); if (lane >= o) v += x; }
+    return v;
+}
+
 // Sums and maxima over a subgroup of 32 in the butterfly order of the CUDA warp_sum / warp_max.
 float warp_sum(float v) { for (uint o = 16; o > 0; o >>= 1) v += subgroupShuffleXor(v, o); return v; }
 float warp_max(float v) { for (uint o = 16; o > 0; o >>= 1) v = max(v, subgroupShuffleXor(v, o)); return v; }
@@ -74,9 +92,9 @@ shared float block_sum_s[32];
 float block_sum(float v) {
     v = warp_sum(v);
     barrier();
-    if (gl_SubgroupInvocationID == 0) block_sum_s[gl_SubgroupID] = v;
+    if (LANE == 0) block_sum_s[WARP] = v;
     barrier();
-    return warp_sum(gl_SubgroupInvocationID < gl_NumSubgroups ? block_sum_s[gl_SubgroupInvocationID] : 0.0);
+    return warp_sum(LANE < NWARPS ? block_sum_s[LANE] : 0.0);
 }
 
 // QSA mask (see qsa_select): whether query row t (mw words a row) sees key position `key`.
@@ -103,7 +121,7 @@ layout(constant_id = 15) const bool KV_Q8 = false;
 // Store x at value offset e; with KV_Q8 the 32 lanes of the subgroup hold one 32-value block.
 void kv_put(U16 c, uint e, uint hd, float x) {
     if (!KV_Q8) { c.v[e] = uint16_t(f2h(x)); return; }
-    float d = fdiv(warp_max(abs(x)), 127.0), y = d == 0.0 ? 0.0 : fdiv(x, d), q = trunc(y);
+    float d = rcp_d(warp_max(abs(x)), 127.0), y = d == 0.0 ? 0.0 : rcp_d(x, d), q = trunc(y);
     if (abs(y - q) >= 0.5) q += sign(y);  // roundf: halves away from zero
     uint w = e % hd, r = e / hd * (hd + hd / 16);
     U8(uint64_t(c)).v[r + w] = uint8_t(int(q) & 255);
@@ -171,12 +189,12 @@ void quant_x(F32 x, uint xo, uint n, F32 w, float sc, F32 u, U32 q, uint qo, F32
                 float ov = subgroupShuffleXor(sv, o); uint oi = subgroupShuffleXor(si, o);
                 if (abs(ov) > abs(sv) || (abs(ov) == abs(sv) && oi < si)) { sv = ov; si = oi; }
             }
-            id = sv != 0.0 ? fdiv(-127.0, sv) : 0.0;
-            dd = sv != 0.0 ? fdiv(1.0, id) : 0.0;
+            id = sv != 0.0 ? rcp_d(-127.0, sv) : 0.0;
+            dd = sv != 0.0 ? rcp_d(1.0, id) : 0.0;
         } else {
             mx = max(mx, subgroupShuffleXor(mx, 1));
             mx = max(mx, subgroupShuffleXor(mx, 2));
-            dd = fdiv(mx, 127.0); id = mx > 0.0 ? fdiv(127.0, mx) : 0.0;
+            dd = rcp_d(mx, 127.0); id = mx > 0.0 ? rcp_d(127.0, mx) : 0.0;
         }
         int r[8];
         [[unroll]] for (uint j = 0; j < 8; j++) r[j] = int(roundEven(v[j] * id));

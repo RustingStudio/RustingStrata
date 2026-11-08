@@ -14,7 +14,7 @@ void reduce(inout float b, inout int bi) {
     for (uint o = 16; o > 0; o >>= 1) take(b, bi, subgroupShuffleXor(b, o), subgroupShuffleXor(bi, o));
 }
 void main() {
-    uint t = gl_LocalInvocationID.x, lane = gl_SubgroupInvocationID, w = gl_SubgroupID;
+    uint t = gl_LocalInvocationID.x, lane = LANE, w = WARP;
     uint r = FINAL ? gl_WorkGroupID.x : gl_WorkGroupID.y, xo = r * p.n;
     int n = int(p.n), bi = n;
     float b = uintBitsToFloat(0xff800000u);

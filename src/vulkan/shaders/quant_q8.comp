@@ -18,11 +18,11 @@ void main() {
                 float ov = subgroupShuffleXor(sv, o); uint oi = subgroupShuffleXor(si, o);
                 if (abs(ov) > abs(sv) || (abs(ov) == abs(sv) && oi < si)) { sv = ov; si = oi; }
             }
-            id = sv != 0.0 ? fdiv(-127.0, sv) : 0.0;
-            d = sv != 0.0 ? fdiv(1.0, id) : 0.0;
+            id = sv != 0.0 ? rcp_d(-127.0, sv) : 0.0;
+            d = sv != 0.0 ? rcp_d(1.0, id) : 0.0;
         } else {
             mx = max(mx, subgroupShuffleXor(mx, 1));  // lanes 2k, 2k + 1 share one 32-block
-            d = fdiv(mx, 127.0); id = mx > 0.0 ? fdiv(127.0, mx) : 0.0;
+            d = rcp_d(mx, 127.0); id = mx > 0.0 ? rcp_d(127.0, mx) : 0.0;
         }
         int q[16], sum = 0;
         for (uint j = 0; j < 16; j++) { q[j] = int(roundEven(v[j] * id)); sum += q[j]; }

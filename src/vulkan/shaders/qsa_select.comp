@@ -9,11 +9,11 @@ shared uint ws[32];
 
 // Exclusive prefix sum over the workgroup; tot gets the total.
 uint block_scan(uint v, out uint tot) {
-    uint x = subgroupInclusiveAdd(v), w = gl_SubgroupID;
+    uint x = W64 ? warp_scan(v) : subgroupInclusiveAdd(v), w = WARP;
     barrier();
-    if (gl_SubgroupInvocationID == 31) ws[w] = x;
+    if (LANE == 31) ws[w] = x;
     barrier();
-    if (w == 0) ws[gl_SubgroupInvocationID] = subgroupInclusiveAdd(ws[gl_SubgroupInvocationID]);
+    if (w == 0) ws[LANE] = W64 ? warp_scan(ws[LANE]) : subgroupInclusiveAdd(ws[LANE]);
     barrier();
     tot = ws[31];
     return x - v + (w > 0 ? ws[w - 1] : 0);

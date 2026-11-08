@@ -31,7 +31,7 @@ void main() {
     bool sp = uint64_t(p.sel) != 0 && p.sel.v[so] >= 0;
     // At least 16 positions per split: short contexts use few workgroups instead of many near-empty ones.
     uint n_pos = sp ? uint(p.sel.v[so]) : uint(pos) + 1, per_s = max((n_pos + ns - 1) / ns, 16u), p0 = sy * per_s, p1 = min(n_pos, p0 + per_s);
-    uint tid = gl_LocalInvocationID.x, w = gl_SubgroupID, lane = gl_SubgroupInvocationID, h0 = bx * G;
+    uint tid = gl_LocalInvocationID.x, w = WARP, lane = LANE, h0 = bx * G;
     if (p0 >= n_pos) {  // empty split
         for (uint i = 0; i < G; i++)
             for (uint d = tid; d < HD + 2; d += 256) p.part.v[po + ((h0 + i) * ns + sy) * (HD + 2) + d] = d == HD ? ninf : 0.0;
