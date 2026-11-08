@@ -651,6 +651,28 @@ template <> struct QS<22> : QI<22> {
     }
 };
 
+#if GEMV_LOADW
+// M2-T5 candidate (`STRATA_GEMV_LOADW=1`): the Q4_K GEMV reads its 16-byte header/scale block as one vector load,
+// where `QI<12>::get` issues four 4-byte ones. A Q4_K row is 144 B (a multiple of 16), so the row pointer decides:
+// 16-aligned base -> one `ld.global.v4.b32`, otherwise the byte-for-byte original. The four words are the same, so
+// the result is bit-identical; only the GEMV path changes (`gemv_row_q` takes `QS<T>`, the prefill GEMM calls
+// `QI<T>::get`/`get2` directly).
+template <> struct QS<12> : QI<12> {
+    static constexpr bool SH = false;
+    __device__ static void load() {}
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        if (((size_t)b & 15) == 0) {
+            int e = sub * 8, j = e >> 6, h = (e >> 5) & 1, l = e & 31;
+            uint4 s = *(const uint4*)b;
+            k4_dm_w(s.x, s.y, s.z, s.w, 2 * j + h, d, m);
+            const u8* q = b + 16 + 32 * j + l;
+            lo = (int)((ldu32(q) >> (4 * h)) & 0x0F0F0F0Fu);
+            hi = (int)((ldu32(q + 4) >> (4 * h)) & 0x0F0F0F0Fu);
+        } else QI<12>::get(b, sub, lo, hi, d, m);
+    }
+};
+#endif
+
 template <int T, int SBB, bool P, class Q = QI<T>>
 __device__ __forceinline__ void gemv_row_q(const u8* __restrict__ w, const signed char* qs, const float* xd, float* y, int row, int cols) {
     int lane = threadIdx.x & 31;
@@ -743,7 +765,8 @@ QTYPES(DEF_DEQUANT)
 FTYPES(DEF_FGEMV)
 
 // Quantized types: dynamic shared memory holds x as int8 (cols bytes) then its scales ((cols >> 5) floats).
-// Each block covers 8 * rpw rows (warp w: rows w, w + 8, ...) so small matrices amortize the x quantization.
+// Each block covers (warps per block) * rpw rows (warp w: rows w, w + nw, ...) so small matrices amortize the x
+// quantization; nw = blockDim.x / 32, so STRATA_GEMV_BLOCK (128/256/512) only changes the launch shape.
 // moe_gemv: grid.y = k; weights at w + ids[k] * stride (skipped when ids[k] < 0), input x + (k / xg) * x_stride,
 // output y + k * rows. grid.z = 2 also runs a second matrix at byte offset w2 into output at byte offset y2.
 #define DEF_IGEMV(T, NAME, SBB) DEF_IGEMV_(T, NAME, SBB, false) DEF_IGEMV_(T, NAME##_p, SBB, true)
@@ -757,8 +780,9 @@ FTYPES(DEF_FGEMV)
         if (!xq) quant_x<P>(x, cols, sx, (float*)(sx + cols));                                           \
         else if (QS<T>::SH) __syncthreads();                                                                    \
         w += blockIdx.z * w2; y = (float*)((char*)y + blockIdx.z * y2); if (blockIdx.z) rows = rows2;           \
-        int r0 = blockIdx.x * 8 * rpw + (threadIdx.x >> 5), r1 = min(rows, r0 - (threadIdx.x >> 5) + 8 * rpw);  \
-        for (int row = r0; row < r1; row += 8) gemv_row_q<T, SBB, P, QS<T>>(w + row * ROWB(cols, SBB), xs, xd, y, row, cols); \
+        int nw = blockDim.x >> 5, warp = threadIdx.x >> 5;                                                      \
+        int r0 = blockIdx.x * nw * rpw + warp, r1 = min(rows, r0 - warp + nw * rpw);                            \
+        for (int row = r0; row < r1; row += nw) gemv_row_q<T, SBB, P, QS<T>>(w + row * ROWB(cols, SBB), xs, xd, y, row, cols); \
     }                                                                                                           \
     extern "C" __global__ void moe_gemv_##NAME(const u8* w, const int* ids, long long stride, const float* x,  \
                                                int x_stride, int xg, float* y, int rows, int cols, int rpw,      \
@@ -779,8 +803,9 @@ FTYPES(DEF_FGEMV)
         }                                                                                                       \
         const u8* we = w + e * stride + blockIdx.z * w2;                                                        \
         y = (float*)((char*)y + blockIdx.z * y2);                                                               \
-        int r0 = blockIdx.x * 8 * rpw + (threadIdx.x >> 5), r1 = min(rows, r0 - (threadIdx.x >> 5) + 8 * rpw);  \
-        for (int row = r0; row < r1; row += 8)                                                                  \
+        int nw = blockDim.x >> 5, warp = threadIdx.x >> 5;                                                      \
+        int r0 = blockIdx.x * nw * rpw + warp, r1 = min(rows, r0 - warp + nw * rpw);                            \
+        for (int row = r0; row < r1; row += nw)                                                                \
             gemv_row_q<T, SBB, P, QS<T>>(we + row * ROWB(cols, SBB), xs, xd, y + (size_t)k * rows, row, cols);    \
     }
 ITYPES(DEF_IGEMV)
@@ -799,8 +824,9 @@ ITYPES(DEF_IGEMV)
         const float* xd = (const float*)(xs + nt * cols);                                                  \
         if (!xq) for (int t = 0; t < nt; t++)                                                                   \
             quant_x<P>(x + (size_t)t * xs_, cols, sx + t * cols, (float*)(sx + nt * cols) + t * (cols >> 5)); \
-        int r0 = blockIdx.x * 8 * rpw + (threadIdx.x >> 5), r1 = min(rows, r0 - (threadIdx.x >> 5) + 8 * rpw);  \
-        for (int row = r0; row < r1; row += 8) {                                                               \
+        int nw = blockDim.x >> 5, warp = threadIdx.x >> 5;                                                      \
+        int r0 = blockIdx.x * nw * rpw + warp, r1 = min(rows, r0 - warp + nw * rpw);                            \
+        for (int row = r0; row < r1; row += nw) {                                                               \
             const u8* wr = w + row * ROWB(cols, SBB);                                                         \
             if (nt == 2) gemv_row_qn<T, SBB, P, 2>(wr, xs, xd, y, ys, row, cols);                                    \
             else if (nt == 3) gemv_row_qn<T, SBB, P, 3>(wr, xs, xd, y, ys, row, cols);                               \

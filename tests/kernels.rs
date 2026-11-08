@@ -198,6 +198,62 @@ fn gemvn_matches_gemv() {
     }
 }
 
+/// Peak HBM2 read bandwidth of the V100-SXM2-32GB: 2 x 877 MHz x 4096 bit / 8 = 898.0 GB/s. M2-T5 targets 85 % of
+/// it (763 GB/s) on the shapes large enough to stream (issue #30).
+const HBM_PEAK_GBS: f64 = 898.0;
+
+/// One row of the per-token decode byte budget of the reference model (issue #30, GGUF tensor table; 100 % expert
+/// hit rate, no cross-token L2 reuse, `token_embd.weight` excluded because only one row (~1.2 KB) is read).
+struct Budget {
+    category: &'static str,
+    mb: f64,
+    /// Routed experts: the only row the MoE GEMV family streams (19 % of the bytes; the rest is dense GEMV).
+    routed: bool,
+}
+
+const DECODE_BUDGET: [Budget; 6] = [
+    Budget { category: "attention / SSM 2-D", mb: 713.3, routed: false },
+    Budget { category: "routed experts, top-8", mb: 329.0, routed: true },
+    Budget { category: "output.weight (lm head)", mb: 286.1, routed: false },
+    Budget { category: "SSM / delta 2-D", mb: 226.1, routed: false },
+    Budget { category: "shared expert (*_shexp)", mb: 92.9, routed: false },
+    Budget { category: "router (gate_inp)", mb: 83.9, routed: false },
+];
+
+/// GB read per decode token over the budget (MB as 1e6 bytes): `routed` selects the expert row, otherwise dense.
+fn budget_gb(routed: bool) -> f64 {
+    DECODE_BUDGET.iter().filter(|b| b.routed == routed).map(|b| b.mb).sum::<f64>() / 1000.0
+}
+
+/// What a `(rows, cols)` shape of `name` contributes to decode, so the harness's numbers can be read against the
+/// byte budget: the lm head and the routed experts drive most of the stream, `token_embd` is not streamed at all.
+fn decode_shape(name: &str, rows: usize, cols: usize, moe: bool) -> &'static str {
+    if name.starts_with("token_embd") { "embedding (1 row)" }
+    else if name.starts_with("output.") || (rows >= 65536 && cols == 2048) { "lm head" }
+    else if moe { if cols <= 512 { "moe down" } else { "moe gate/up" } }
+    else { "dense attn/ssm" }
+}
+
+/// Device-free: the analytic byte budget and roofline of issue #30, so the denominator the GPU harness prints
+/// cannot drift from the table the adoption decision uses.
+#[test]
+fn gemv_byte_budget_matches_issue() {
+    let (dense, moe) = (budget_gb(false), budget_gb(true));
+    assert!((dense - 1.4023).abs() < 1e-3, "dense {dense}");
+    assert!((moe - 0.3290).abs() < 1e-3, "routed {moe}");
+    let total = dense + moe;
+    assert!((total - 1.7313).abs() < 1e-3, "total {total}");
+    assert!((100.0 * dense / total - 81.0).abs() < 0.1);
+    assert!((100.0 * moe / total - 19.0).abs() < 0.1);
+    // 898.0 GB/s over 1.7313 GB/token, and the 85 % per-kernel target.
+    assert!((HBM_PEAK_GBS / total - 518.7).abs() < 0.5, "roofline {} tok/s", HBM_PEAK_GBS / total);
+    assert!((0.85 * HBM_PEAK_GBS / total - 440.9).abs() < 0.5);
+    // The 119.1 tok/s baseline of docs/V100-results.md implies 206.2 GB/s = 23.0 % of the roofline.
+    let eff = total * 119.1;
+    assert!((eff - 206.2).abs() < 0.5, "effective {eff} GB/s");
+    assert!((100.0 * eff / HBM_PEAK_GBS - 23.0).abs() < 0.1);
+}
+
 #[test]
 #[ignore]
 fn gemv_bandwidth() {
@@ -205,6 +261,17 @@ fn gemv_bandwidth() {
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
+        let (dense, moe) = (budget_gb(false), budget_gb(true));
+        let total = dense + moe;
+        eprintln!("  decode budget/token (issue #30):");
+        for b in &DECODE_BUDGET {
+            eprintln!("    {:<28} {:7.1} MB  {:5.1} %  {}", b.category, b.mb, 100.0 * b.mb / 1000.0 / total,
+                if b.routed { "MoE" } else { "dense" });
+        }
+        eprintln!("    {:<28} {:7.1} MB  100.0 %  (dense {:.3} GB = {:.1} %, routed experts {:.3} GB = {:.1} %)",
+            "total", 1000.0 * total, dense, 100.0 * dense / total, moe, 100.0 * moe / total);
+        eprintln!("  roofline {HBM_PEAK_GBS:.1} GB/s: {:.1} tok/s at 100 %, {:.1} tok/s at 85 % (763 GB/s); 119.1 tok/s = {:.1} GB/s = {:.1} %",
+            HBM_PEAK_GBS / total, 0.85 * HBM_PEAK_GBS / total, total * 119.1, 100.0 * total * 119.1 / HBM_PEAK_GBS);
         let g = Gguf::open(&p).unwrap();
         let w = Weights::new(&g).unwrap();
         let time = |f: &dyn Fn()| {
@@ -216,6 +283,7 @@ fn gemv_bandwidth() {
             gpu.sync().unwrap();
             t0.elapsed().as_secs_f64() / 200.0
         };
+        eprintln!("  {:<8} {:<5} {:<16} {:<32} {:>6} x {:>5}  {:>8}  {:>8}  {:>7}  {:>9}  {:>8}", "type", "kind", "decode shape", "tensor", "rows", "cols", "time", "GB/s", "% roof", "at 100%", "bytes");
         let mut seen = std::collections::BTreeSet::new();
         for (name, info) in &g.tensors {
             let Ok(ty) = GgmlType::from_u32(info.ty) else { continue };
@@ -240,8 +308,11 @@ fn gemv_bandwidth() {
                 eprintln!("  gemvn 2/3/4 inputs: {} us", tn.join(" / "));
             }
             let (s, bytes) = run();
-            eprintln!("{:8} {:5} {name:32} {:6}x{:5}  {:7.1} us  {:6.1} GB/s", ty.name(), if moe { "moe8" } else { "" },
-                t.rows, t.cols, s * 1e6, bytes as f64 / s / 1e9);
+            let gbs = bytes as f64 / s / 1e9;
+            let rows = if moe { t.rows / info.dims[2] as usize } else { t.rows };
+            eprintln!("  {:<8} {:<5} {:<16} {:<32} {:>6} x {:>5}  {:>7.2} us  {:>7.1}  {:>6.1} %  {:>7.2} us  {:>6.2} MB",
+                ty.name(), if moe { "moe8" } else { "" }, decode_shape(name, rows, t.cols, moe), name, rows, t.cols,
+                s * 1e6, gbs, 100.0 * gbs / HBM_PEAK_GBS, bytes as f64 / HBM_PEAK_GBS / 1e9 * 1e6, bytes as f64 / 1e6);
         }
     }
 }

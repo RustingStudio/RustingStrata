@@ -99,25 +99,47 @@ const ATTN_SMEM_PAD: usize = 8;
 struct Tune {
     gemm_bk: usize,
     gemm_min_blocks: usize,
+    /// M2-T5 candidate: widen the Q4_K header/scale read of the GEMV path to one 16-byte load (`GEMV_LOADW`).
+    gemv_loadw: usize,
 }
 
 impl Tune {
-    /// The shipped values: `GEMM_BK = 64`, no minimum-block hint (byte-identical sm_80 codegen).
+    /// The shipped values: `GEMM_BK = 64`, no minimum-block hint, the byte-for-byte `QI` load widths.
     #[cfg(test)]
-    const fn def() -> Tune { Tune { gemm_bk: GEMM_BK, gemm_min_blocks: 1 } }
+    const fn def() -> Tune { Tune { gemm_bk: GEMM_BK, gemm_min_blocks: 1, gemv_loadw: 0 } }
 
-    /// The window-selected candidates: `STRATA_GEMM_BK` (C3, a multiple of 8) and `STRATA_GEMM_MIN_BLOCKS`
-    /// (C2, `__launch_bounds__(·, n)` on `gemm_*`/`gemms_*`). Invalid values fall back to the defaults.
+    /// The window-selected candidates: `STRATA_GEMM_BK` (M2-T3 C3, a multiple of 8), `STRATA_GEMM_MIN_BLOCKS`
+    /// (M2-T3 C2, `__launch_bounds__(·, n)` on `gemm_*`/`gemms_*`) and `STRATA_GEMV_LOADW` (M2-T5, 0 or 1).
+    /// Invalid values fall back to the defaults.
     fn from_env() -> Tune {
         let gemm_bk = tuned(std::env::var("STRATA_GEMM_BK").ok().as_deref(), GEMM_BK, |v| v > 0 && v % 8 == 0);
         let gemm_min_blocks = tuned(std::env::var("STRATA_GEMM_MIN_BLOCKS").ok().as_deref(), 1, |v| (1..=8).contains(&v));
-        Tune { gemm_bk, gemm_min_blocks }
+        let gemv_loadw = tuned(std::env::var("STRATA_GEMV_LOADW").ok().as_deref(), 0, |v| v <= 1);
+        Tune { gemm_bk, gemm_min_blocks, gemv_loadw }
     }
 }
 
 /// `default` unless `v` parses to a value accepted by `valid`.
 fn tuned(v: Option<&str>, default: usize, valid: impl Fn(usize) -> bool) -> usize {
     v.and_then(|s| s.trim().parse::<usize>().ok()).filter(|&x| valid(x)).unwrap_or(default)
+}
+
+/// Rows per warp: the family override (`STRATA_RPW_MOE`/`_DENSE`) first, then `STRATA_RPW`, then the shape default.
+/// 1..=64 keeps a block's row loop bounded; anything else falls back one level, as `tuned` does.
+fn rpw_from(global: Option<&str>, family: Option<&str>, default: usize) -> usize {
+    let ok = |v: usize| (1..=64).contains(&v);
+    family.and_then(|s| s.trim().parse().ok()).filter(|&v| ok(v))
+        .or_else(|| global.and_then(|s| s.trim().parse().ok()).filter(|&v| ok(v)))
+        .unwrap_or(default)
+}
+
+/// Threads per block of the integer GEMV: the family override first, then the global value, then 256. Only the
+/// three warp counts the kernel's row mapping can tile are accepted (4/8/16 warps per block).
+fn gemv_block_from(global: Option<&str>, family: Option<&str>) -> u32 {
+    let ok = |v: u32| matches!(v, 128 | 256 | 512);
+    family.and_then(|s| s.trim().parse::<u32>().ok()).filter(|&v| ok(v))
+        .or_else(|| global.and_then(|s| s.trim().parse::<u32>().ok()).filter(|&v| ok(v)))
+        .unwrap_or(256)
 }
 
 fn source(kv_q8: bool, gemm_tc: bool) -> String { source_with(kv_q8, gemm_tc, Tune::from_env()) }
@@ -134,7 +156,7 @@ fn source_with(kv_q8: bool, gemm_tc: bool, tune: Tune) -> String {
          __device__ const unsigned char ksigns_iq2xs[128] = {{{}}};\n\
          __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n\
          #define LLAMA_Q8 {}\n#define KV_Q8 {}\n#define GEMM_TC {}\n\
-         #define GEMM_BM {}\n#define GEMM_BK {}\n#define GEMM_MIN_BLOCKS {}\n\
+         #define GEMM_BM {}\n#define GEMM_BK {}\n#define GEMM_MIN_BLOCKS {}\n#define GEMV_LOADW {}\n\
          #define FA_BQ {}\n#define FA_BK {}\n{}",
         join(IQ2XS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ2XXS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
@@ -150,6 +172,7 @@ fn source_with(kv_q8: bool, gemm_tc: bool, tune: Tune) -> String {
         GEMM_BM,
         tune.gemm_bk,
         tune.gemm_min_blocks,
+        tune.gemv_loadw,
         FA_BQ,
         FA_BK,
         include_str!("kernels.cu"),
@@ -568,14 +591,30 @@ impl Gpu {
 
     fn float_ty(ty: GgmlType) -> bool { matches!(ty, GgmlType::F32 | GgmlType::BF16) }
 
-    /// Rows per warp for the integer GEMV (env STRATA_RPW overrides). Experts: about 8 super-blocks of work per
-    /// warp. Dense: 2 for 2048 and from 8192 rows, else 1 (measured per shape: the 4B's 2560 and
-    /// 4096 rows are ~10% faster with 1, the default model's 2048 rows ~5% slower).
+    /// Rows per warp for the integer GEMV. Experts: about 8 super-blocks of work per warp. Dense: 2 for 2048 and
+    /// from 8192 rows, else 1 (measured per shape: the 4B's 2560 and 4096 rows are ~10% faster with 1, the default
+    /// model's 2048 rows ~5% slower). `STRATA_RPW` overrides every shape, `STRATA_RPW_MOE` (k > 1) and
+    /// `STRATA_RPW_DENSE` (k == 1) override one family, which is the granularity the M2-T5 sweep needs.
     fn rpw(rows: usize, cols: usize, k: usize) -> usize {
         // The vocab head: more rows per block amortize gemvn's per-block x quantization (nt = 2: 1158 -> 1027 us).
-        // Experts of 512 columns (35B down, 2 superblocks a row): 16 rows per warp, 116.1 -> 116.6 tok/s.
-        let d = if k > 1 { if cols <= 512 { 16 } else { (2048 / cols).max(1) } } else if rows >= 65536 { 8 } else if rows >= 8192 || rows == 2048 { 2 } else { 1 };
-        std::env::var("STRATA_RPW").ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        // Experts of 512 columns (35B down, 2 superblocks a row): 4 rows per warp, M2-T5 measured 208.7 -> 262.4
+        // and 265.2 -> 328.8 GB/s (+25.7 %/+24.0 %, 15.4 -> 12.2 us and 16.8 -> 13.6 us) while 16 rows per warp was
+        // chosen for a 4B model. Gate/up (2048 columns) keep 1: 4 rows per warp there lost 7.4 % on the 2.4 MB
+        // launch, i.e. the gain is per shape and belongs in the table, not in a single family value.
+        let d = if k > 1 { if cols <= 512 { 4 } else { (2048 / cols).max(1) } } else if rows >= 65536 { 8 } else if rows >= 8192 || rows == 2048 { 2 } else { 1 };
+        let fam = if k > 1 { "STRATA_RPW_MOE" } else { "STRATA_RPW_DENSE" };
+        let family = std::env::var(fam).ok();
+        rpw_from(std::env::var("STRATA_RPW").ok().as_deref(), family.as_deref(), d)
+    }
+
+    /// Threads per block of the integer GEMV family (`32 * warps`). `STRATA_GEMV_BLOCK` sets it for every shape,
+    /// `STRATA_GEMV_BLOCK_MOE` (k > 1) / `_DENSE` (k == 1) for one family. Only 128/256/512 are accepted; the
+    /// shipped 256 is the 8-warp shape the kernel's row mapping was written for. Read per launch, so the window
+    /// can sweep every candidate without a rebuild (one process per candidate once a graph is captured).
+    fn gemv_block(k: usize) -> u32 {
+        let fam = if k > 1 { "STRATA_GEMV_BLOCK_MOE" } else { "STRATA_GEMV_BLOCK_DENSE" };
+        let family = std::env::var(fam).ok();
+        gemv_block_from(std::env::var("STRATA_GEMV_BLOCK").ok().as_deref(), family.as_deref())
     }
 
     /// Launch config and rows-per-warp argument for a GEMV with `rows` x `cols` per matrix and `k` matrices.
@@ -586,8 +625,8 @@ impl Gpu {
             let wpb = if rows >= 4096 { 8 } else { 1 };
             return (cfg((rows.div_ceil(wpb) as u32, k as u32), 32 * wpb as u32, 0), 1);
         }
-        let rpw = Self::rpw(rows, cols, k);
-        (cfg((rows.div_ceil(8 * rpw) as u32, k as u32), 256, Self::xq_smem(ty, cols)), rpw as i32)
+        let (rpw, wpb) = (Self::rpw(rows, cols, k), Self::gemv_block(k) as usize / 32);
+        (cfg((rows.div_ceil(wpb * rpw) as u32, k as u32), (32 * wpb) as u32, Self::xq_smem(ty, cols)), rpw as i32)
     }
 
     fn grid(n: usize) -> LaunchConfig { cfg((n.div_ceil(256) as u32, 1), 256, 0) }
@@ -806,8 +845,11 @@ impl Backend for Gpu {
     fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()> {
         let (ncols, kn) = Self::gemv_cols("moe_gemv", ty, cols)?;
         let (mut c, mut rpw) = Self::gemv_cfg(ty, rows, cols, k);
-        // At least 2 rows per warp: an expert's x quantization (once per block) then covers 16 rows.
-        if rpw == 1 && !Self::float_ty(ty) { rpw = 2; c.grid_dim.0 = rows.div_ceil(16) as u32; }
+        // At least 2 rows per warp: an expert's x quantization (once per block) then covers 2 * warps rows.
+        if rpw == 1 && !Self::float_ty(ty) {
+            rpw = 2;
+            c.grid_dim.0 = rows.div_ceil(2 * (Self::gemv_block(k) as usize / 32)) as u32;
+        }
         let (w2, y2) = pair.unwrap_or((0, 0));
         c.grid_dim.2 = if pair.is_some() { 2 } else { 1 };
         if xq != 0 { c.shared_mem_bytes = 0; }
@@ -1087,8 +1129,12 @@ mod tests {
         // Same sm_70 source with the FMA fallback selected: both variants must produce a cubin (M2-T1).
         super::cubin(&super::source(false, false), "sm_70").expect("the STRATA_GEMM_FMA sm_70 source must compile");
         // M2-T3 candidates C2 (`__launch_bounds__(·, 2)`) and C3 (`GEMM_BK = 32`) must compile before the window.
-        let c23 = super::source_with(false, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2 });
+        let c23 = super::source_with(false, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2, ..super::Tune::def() });
         super::cubin(&c23, "sm_70").expect("the C2/C3 candidate tiles must compile for sm_70");
+        // M2-T5 load-width candidate: one 16-byte Q4_K header load in the GEMV path must compile for both arches.
+        let lw = super::source_with(false, true, super::Tune { gemv_loadw: 1, ..super::Tune::def() });
+        super::cubin(&lw, "sm_70").expect("the GEMV_LOADW candidate must compile for sm_70");
+        super::cubin(&lw, "sm_80").expect("the GEMV_LOADW candidate must compile for sm_80");
     }
 
     #[test]
@@ -1227,14 +1273,35 @@ mod tests {
     fn source_injects_tiles() {
         let src = super::source_with(false, true, super::Tune::def());
         for define in [
-            "#define GEMM_BM 128", "#define GEMM_BK 64", "#define GEMM_MIN_BLOCKS 1",
+            "#define GEMM_BM 128", "#define GEMM_BK 64", "#define GEMM_MIN_BLOCKS 1", "#define GEMV_LOADW 0",
             "#define FA_BQ 64", "#define FA_BK 32",
         ] {
             assert!(src.contains(define), "source is missing `{define}`");
         }
-        let c23 = super::source_with(false, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2 });
+        let c23 = super::source_with(false, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2, ..super::Tune::def() });
         assert!(c23.contains("#define GEMM_BK 32"));
         assert!(c23.contains("#define GEMM_MIN_BLOCKS 2"));
+        let lw = super::source_with(false, true, super::Tune { gemv_loadw: 1, ..super::Tune::def() });
+        assert!(lw.contains("#define GEMV_LOADW 1"));
+    }
+
+    /// M2-T5, CPU-only: the GEMV family knobs are parsed defensively and the family override wins over the global
+    /// one. The shipped defaults are the pre-M2-T5 launch: 256 threads, the per-shape rpw table.
+    #[test]
+    fn gemv_knobs_fall_back_and_override_per_family() {
+        assert_eq!(super::gemv_block_from(None, None), 256);
+        assert_eq!(super::gemv_block_from(Some("512"), None), 512);
+        assert_eq!(super::gemv_block_from(Some("512"), Some("128")), 128);
+        assert_eq!(super::gemv_block_from(Some("512"), Some("96")), 512);  // invalid family value falls back
+        assert_eq!(super::gemv_block_from(Some("1000"), None), 256);  // not a warp count the kernel can tile
+        assert_eq!(super::gemv_block_from(Some(" x "), Some("")), 256);
+        // rpw: family, then global, then the shape default; the range guard is 1..=64.
+        assert_eq!(super::rpw_from(None, None, 16), 16);
+        assert_eq!(super::rpw_from(Some("4"), None, 16), 4);
+        assert_eq!(super::rpw_from(Some("4"), Some("2"), 16), 2);
+        assert_eq!(super::rpw_from(Some("4"), Some("0"), 16), 4);
+        assert_eq!(super::rpw_from(Some("0"), Some("65"), 16), 16);
+        assert_eq!(super::rpw_from(Some(" 8 "), None, 2), 8);
     }
 
     /// M2-T3, CPU-only: candidate selection is parsed defensively, so a typo measures the shipped build instead of
