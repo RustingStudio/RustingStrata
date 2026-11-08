@@ -8,7 +8,7 @@ layout(push_constant) uniform P { F32 q; F32 pool; F32 score; I32 step; int r0; 
 shared vec4 sq[8 * 4 * 32];
 void main() {
     uint r1 = gl_WorkGroupID.y * 8, n = min(8u, p.rows - r1), p0 = uint(p.step.v[0] + p.r0) + r1;
-    uint w = (gl_SubgroupID * (gl_SubgroupSize / 32u) + gl_SubgroupInvocationID / 32u), lane = (gl_SubgroupInvocationID & 31u), nbm = (p0 + n) / 4;
+    uint w = WARP, lane = LANE, nbm = (p0 + n) / 4;
     if (nbm <= p.top) return;
     for (uint i = gl_LocalInvocationID.x; i < n * 128; i += 256) {
         uint o = r1 * 512 + 4 * i;

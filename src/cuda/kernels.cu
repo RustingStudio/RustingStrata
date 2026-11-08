@@ -23,6 +23,15 @@ __device__ __forceinline__ float warp_max(float v) {
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
     return v;
 }
+// Unsigned integer forms of warp_max (__reduce_max_sync/__reduce_min_sync need sm_80; the shuffles run on sm_70+).
+__device__ __forceinline__ unsigned warp_max_u(unsigned v) {
+    for (int o = 16; o > 0; o >>= 1) v = max(v, __shfl_xor_sync(0xffffffff, v, o));
+    return v;
+}
+__device__ __forceinline__ unsigned warp_min_u(unsigned v) {
+    for (int o = 16; o > 0; o >>= 1) v = min(v, __shfl_xor_sync(0xffffffff, v, o));
+    return v;
+}
 // Sum over the whole block; every thread gets the result. blockDim.x must be a multiple of 32.
 __device__ float block_sum(float v) {
     __shared__ float s[32];
@@ -268,12 +277,12 @@ __device__ __forceinline__ int2 iq4nl_lut(u32 q) {
     u32 b = __byte_perm(lo, hi, hs >> 16);
     return make_int2((int)__byte_perm(a, b, 0x6420), (int)__byte_perm(a, b, 0x7531));
 }
-// 8 bytes at 2-aligned p with 4-byte loads: at p when 4-aligned, else at p - 2, p + 2, p + 6 and shifted (so the
-// 2 bytes either side must be readable). Superblock offsets keep p's alignment uniform across a warp.
+// 8 bytes at 2-aligned p from the three 4-byte words that cover them, shifted when p is not 4-aligned (so the 2
+// bytes after p + 8 must be readable). No branch, so the loads of unrolled superblocks can be issued together.
 __device__ __forceinline__ uint2 ld8a2(const u8* p) {
-    if (((size_t)p & 3) == 0) return make_uint2(ldu32(p), ldu32(p + 4));
-    u32 a0 = ldu32(p - 2), a1 = ldu32(p + 2), a2 = ldu32(p + 6);
-    return make_uint2(__funnelshift_r(a0, a1, 16), __funnelshift_r(a1, a2, 16));
+    const u8* a = (const u8*)((size_t)p & ~(size_t)3);
+    u32 sh = ((size_t)p & 2) * 8, a0 = ldu32(a), a1 = ldu32(a + 4), a2 = ldu32((const u8*)(((size_t)p + 7) & ~(size_t)3));
+    return make_uint2(__funnelshift_r(a0, a1, sh), __funnelshift_r(a1, a2, sh));
 }
 // Byte j of the result is 0xFF when bit j of s is set (j < 4).
 __device__ __forceinline__ u32 smask4(u32 s) { return ((s * 0x00204081u) & 0x01010101u) * 0xFFu; }
@@ -282,13 +291,20 @@ __device__ __forceinline__ int apply_signs(u32 g, u32 s) { u32 n = (s * 0x002040
 
 // QI form of scale_min_k4: d and dmin from one 4-byte load at b; with WORDS the 12 scale bytes from three 4-byte
 // loads too (faster for the Q4_K output head in gemv_bandwidth, slower for the Q5_K shapes).
+// The WORDS form on the four words already loaded: dm, then the scale bytes 0-3, 4-7, 8-11.
+__device__ __forceinline__ void k4_dm_w(u32 dm, u32 w0, u32 w1, u32 w2, int j, float& d, float& m) {
+    u32 sh = 8 * (j & 3), a = (w0 >> sh) & 255, c = (w1 >> sh) & 255, e = (w2 >> sh) & 255;
+    int s, mi;
+    if (j < 4) { s = a & 63; mi = c & 63; }
+    else { s = (e & 0xF) | ((a >> 6) << 4); mi = (e >> 4) | ((c >> 6) << 4); }
+    d = h2f((u16)dm) * (float)s; m = h2f((u16)(dm >> 16)) * (float)mi;
+}
 template <bool WORDS>
 __device__ __forceinline__ void k4_dm(const u8* b, int j, float& d, float& m) {
     u32 dm = ldu32(b); int s, mi;
     if (WORDS) {
-        u32 sh = 8 * (j & 3), a = (ldu32(b + 4) >> sh) & 255, c = (ldu32(b + 8) >> sh) & 255, e = (ldu32(b + 12) >> sh) & 255;
-        if (j < 4) { s = a & 63; mi = c & 63; }
-        else { s = (e & 0xF) | ((a >> 6) << 4); mi = (e >> 4) | ((c >> 6) << 4); }
+        k4_dm_w(dm, ldu32(b + 4), ldu32(b + 8), ldu32(b + 12), j, d, m);
+        return;
     } else {
         scale_min_k4(j, b + 4, s, mi);
     }
@@ -309,7 +325,8 @@ template <> struct QI<10> {  // Q2_K (84 bytes: rows 4-aligned)
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
         int e = sub * 8, n = e >> 7, r = e & 127, j = r >> 5, r2 = r & 31;
         u8 s = b[n * 8 + j * 2 + (r2 >> 4)];
-        d = ldh(b + 80) * (float)(s & 0xF); m = ldh(b + 82) * (float)(s >> 4);
+        u32 dm = ldu32(b + 80);
+        d = h2f((u16)dm) * (float)(s & 0xF); m = h2f((u16)(dm >> 16)) * (float)(s >> 4);
         const u8* q = b + 16 + 32 * n + r2;
         lo = (int)((ldu32(q) >> (2 * j)) & 0x03030303u); hi = (int)((ldu32(q + 4) >> (2 * j)) & 0x03030303u);
     }
@@ -319,7 +336,7 @@ template <> struct QI<11> {  // Q3_K (110 bytes: rows 2-aligned)
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
         int e = sub * 8, n = e >> 7, r = e & 127, j = r >> 5, i0 = r & 31, is = n * 8 + j * 2 + (i0 >> 4);
         const u8* sc = b + 96;
-        int low = is < 8 ? (sc[is] & 0xF) : (sc[is - 8] >> 4);
+        int low = (sc[is & 7] >> (4 * (is >> 3))) & 0xF;
         int hs = (sc[8 + (is & 3)] >> (2 * (is >> 2))) & 3;
         d = ldh(b + 108) * (float)((low | (hs << 4)) - 32);
         const u8 *q = b + 32 + 32 * n + i0, *h = b + i0;
@@ -337,6 +354,14 @@ template <> struct QI<12> {  // Q4_K (144 bytes)
         k4_dm<true>(b, 2 * j + h, d, m);
         const u8* q = b + 16 + 32 * j + l;
         lo = (int)((ldu32(q) >> (4 * h)) & 0x0F0F0F0Fu); hi = (int)((ldu32(q + 4) >> (4 * h)) & 0x0F0F0F0Fu);
+    }
+    // get(sub) and get(sub + 1) for an even sub with two 16-byte loads; b must be 16-byte aligned.
+    __device__ static void get2(const u8* b, int sub, int& lo0, int& hi0, int& lo1, int& hi1, float& d, float& m) {
+        int e = sub * 8, j = e >> 6, h = (e >> 5) & 1, l = e & 31;
+        uint4 s = *(const uint4*)b, q = *(const uint4*)(b + 16 + 32 * j + l);
+        k4_dm_w(s.x, s.y, s.z, s.w, 2 * j + h, d, m);
+        lo0 = (int)((q.x >> (4 * h)) & 0x0F0F0F0Fu); hi0 = (int)((q.y >> (4 * h)) & 0x0F0F0F0Fu);
+        lo1 = (int)((q.z >> (4 * h)) & 0x0F0F0F0Fu); hi1 = (int)((q.w >> (4 * h)) & 0x0F0F0F0Fu);
     }
 };
 template <> struct QI<13> {  // Q5_K (176 bytes)
@@ -813,8 +838,17 @@ __device__ __forceinline__ void ldsm4t(u32* r, const u16* p) {
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
 }
 __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    // Turing (sm_75) has no m16n8k16 f16 mma: the same product is two m16n8k8 steps, k = 0..7 and k = 8..15
+    // (the a0/a1, a2/a3 and b0, b1 fragments are those half-K fragments of the k16 layout).
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(b0));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a2), "r"(a3), "r"(b1));
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 __device__ __forceinline__ u32 h2pack(float a, float b) { return (u32)f2h(a) | ((u32)f2h(b) << 16); }
 
@@ -973,6 +1007,8 @@ extern "C" __global__ void quant_q8(const float* x, int x_stride, u8* out, int c
     }
 }
 
+// int8 tensor-core mma (sm_80+). On Turing the int8 path is not built: gemm_raw uses the f16 GEMM there.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void mma_s8_16816(int* c, u32 a0, u32 a1, u32 b0) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
                  : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(b0));
@@ -981,22 +1017,52 @@ __device__ __forceinline__ void mma_s8_16832(int* c, u32 a0, u32 a1, u32 a2, u32
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
+#endif
 // int -> float for |c| < 2^22 without the quarter-rate I2F: 2^23 + 2^22 + c has c in its low mantissa bits.
 __device__ __forceinline__ float i2f_small(int c) { return __int_as_float(0x4B400000 + c) - 12582912.0f; }
+// The mma with every accumulator starting at I2F_BIAS: d = I2F_BIAS + sum, so i2f_small's integer add comes free.
+#define I2F_BIAS 0x4B400000
+__device__ __forceinline__ void mma_s8_16816_b(int* d, u32 a0, u32 a1, u32 b0) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};"
+                 : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a0), "r"(a1), "r"(b0), "r"(I2F_BIAS));
+}
+__device__ __forceinline__ void mma_s8_16832_b(int* d, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};"
+                 : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(I2F_BIAS));
+}
 // Weight types whose scale (and min) is constant over 32 weights: one 32-deep mma per scale.
 template <int T> __host__ __device__ constexpr bool scale32() { return T == 42 || T == 2 || T == 3 || T == 6 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23; }
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    // No cp.async before sm_80: copy through registers. A predicated-off cp.async still zero-fills its 16 bytes,
+    // and the kernels rely on that for rows past the last one, so the fallback writes zeros too.
+    if (ok) *(uint4*)dst = *(const uint4*)src; else *(uint4*)dst = make_uint4(0, 0, 0, 0);
+#else
     unsigned d = (unsigned)__cvta_generic_to_shared(dst);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(ok ? 16 : 0));
+#endif
 }
 __device__ __forceinline__ void cp_async8(void* dst, const void* src, bool ok) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    if (ok) *(uint2*)dst = *(const uint2*)src; else *(uint2*)dst = make_uint2(0, 0);
+#else
     unsigned d = (unsigned)__cvta_generic_to_shared(dst);
     asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(d), "l"(src), "r"(ok ? 8 : 0));
+#endif
 }
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
-template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;" :: "n"(N)); }
+__device__ __forceinline__ void cp_async_commit() {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;");
+#endif
+}
+template <int N> __device__ __forceinline__ void cp_async_wait() {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;" :: "n"(N));
+#endif
+}
 
 // SM: as in gemm_q (gemmis_*, the tiles of at most 32 positions, 16 x 16 outputs per warp).
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 template <int T, int SBB, int BM, bool SM>
 __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int nd, const u8* __restrict__ x,
                                         const int* xrow, float* y, int y_stride, int rows, int n64, int act) {
@@ -1004,7 +1070,7 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
     static_assert(BM == 128, "one X row half per thread");
     __shared__ __align__(16) signed char xq[2][XM * P], wq[64 * P];
     __shared__ __align__(16) float xd[2][XM][2], xsum[2][XM][4];
-    __shared__ float wsc[64][4], wmn[64][4];
+    __shared__ __align__(16) float2 wdm[4][64];  // W scale and min per 16 weights: [16-group][row]
     GemmTile tl = tiles ? tiles[blockIdx.y] : GemmTile{wd, (int)blockIdx.y * XM, min(XM, nd - (int)blockIdx.y * XM)};
     if (tiles && (tl.cnt <= 32) != SM) return;
     int n0 = blockIdx.x * 64, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
@@ -1025,6 +1091,7 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
     // W: thread decodes the 16 weights (subs 2 wi, 2 wi + 1 of the step) of row wr_.
     int wr_ = tid >> 2, wi = tid & 3;
     const u8* wp = n0 + wr_ < rows ? tl.w + (size_t)(n0 + wr_) * ROWB(cols, SBB) : nullptr;
+    const bool v16 = ((size_t)tl.w & 15) == 0 && ROWB(cols, SBB) % 16 == 0;  // QI::get2's 16-byte loads
     float acc[2][4][4] = {};
     const int nk = n64;
     // W step kb is decoded into registers during step kb - 1's mma and stored after it.
@@ -1035,13 +1102,16 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
         if (wp) {
             const u8* sbp = wp + (size_t)(kb >> 2) * SBB;
             int sub = (kb & 3) * 8 + 2 * wi;
+            if constexpr (T == 12) {
+                if (v16) { QI<12>::get2(sbp, sub, lo0, hi0, lo1, hi1, wd0, wm0); return; }
+            }
             QI<T>::get(sbp, sub, lo0, hi0, wd0, wm0);
             QI<T>::get(sbp, sub + 1, lo1, hi1, d1, m1);
         }
     };
     auto stw = [&]() {
         *(int4*)(wq + wr_ * P + wi * 16) = make_int4(lo0, hi0, lo1, hi1);
-        wsc[wr_][wi] = wd0; wmn[wr_][wi] = wm0;
+        wdm[wi][wr_] = make_float2(wd0, wm0);
     };
     ldx(0);
     ldw(0);
@@ -1053,9 +1123,19 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
         if (kb + 1 < nk) ldw(kb + 1);
         const int b = kb & 1;
         constexpr int KS = scale32<T>() ? 32 : 16;  // depth of one mma (one weight scale)
+        constexpr int MT = SM ? 1 : 2, NT8 = SM ? 2 : 4;
+        // X scales and sums of the step for this thread's rows (g, g + 8 of each mt), one vector load each.
+        float2 xdv[2][2]; float4 xsv[2][2];
+        #pragma unroll
+        for (int mt = 0; mt < MT; mt++)
+            #pragma unroll
+            for (int i = 0; i < 2; i++) {
+                int r = wm + mt * 16 + g + 8 * i;
+                xdv[mt][i] = *(const float2*)xd[b][r];
+                if (QI<T>::MIN) xsv[mt][i] = *(const float4*)xsum[b][r];
+            }
         #pragma unroll
         for (int h = 0; h < 64 / KS; h++) if (wm < tl.cnt) {
-            constexpr int MT = SM ? 1 : 2, NT8 = SM ? 2 : 4;
             u32 a[2][4], bw[4][2];
             float da[2][2], sa[2][2], dbv[4][2], mb[4][2];
             #pragma unroll
@@ -1064,10 +1144,11 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
                 const signed char* p = &xq[b][r * P + h * KS + 4 * t];
                 a[mt][0] = *(const u32*)p; a[mt][1] = *(const u32*)(p + 8 * P);
                 if (KS == 32) { a[mt][2] = *(const u32*)(p + 16); a[mt][3] = *(const u32*)(p + 8 * P + 16); }
-                da[mt][0] = xd[b][r][h * KS / 32]; da[mt][1] = xd[b][r + 8][h * KS / 32];
-                if (QI<T>::MIN) {
-                    sa[mt][0] = KS == 32 ? xsum[b][r][2 * h] + xsum[b][r][2 * h + 1] : xsum[b][r][h];
-                    sa[mt][1] = KS == 32 ? xsum[b][r + 8][2 * h] + xsum[b][r + 8][2 * h + 1] : xsum[b][r + 8][h];
+                #pragma unroll
+                for (int i = 0; i < 2; i++) {
+                    const float* xs = (const float*)&xsv[mt][i];
+                    da[mt][i] = h * KS / 32 ? xdv[mt][i].y : xdv[mt][i].x;
+                    if (QI<T>::MIN) sa[mt][i] = KS == 32 ? xs[2 * h] + xs[2 * h + 1] : xs[h];
                 }
             }
             #pragma unroll
@@ -1076,22 +1157,19 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
                 const signed char* p = wq + (n + g) * P + h * KS + 4 * t;
                 bw[nt][0] = *(const u32*)p;
                 if (KS == 32) bw[nt][1] = *(const u32*)(p + 16);
-                #pragma unroll
-                for (int e = 0; e < 2; e++) {
-                    dbv[nt][e] = wsc[n + 2 * t + e][h * KS / 16];
-                    if (QI<T>::MIN) mb[nt][e] = wmn[n + 2 * t + e][h * KS / 16];
-                }
+                float4 q = *(const float4*)&wdm[h * KS / 16][n + 2 * t];
+                dbv[nt][0] = q.x; mb[nt][0] = q.y; dbv[nt][1] = q.z; mb[nt][1] = q.w;
             }
             #pragma unroll
             for (int mt = 0; mt < MT; mt++)
                 #pragma unroll
                 for (int nt = 0; nt < NT8; nt++) {
-                    int c[4] = {0, 0, 0, 0};
-                    if (KS == 32) mma_s8_16832(c, a[mt][0], a[mt][1], a[mt][2], a[mt][3], bw[nt][0], bw[nt][1]);
-                    else mma_s8_16816(c, a[mt][0], a[mt][1], bw[nt][0]);
+                    int c[4];
+                    if (KS == 32) mma_s8_16832_b(c, a[mt][0], a[mt][1], a[mt][2], a[mt][3], bw[nt][0], bw[nt][1]);
+                    else mma_s8_16816_b(c, a[mt][0], a[mt][1], bw[nt][0]);
                     #pragma unroll
                     for (int i = 0; i < 4; i++) {
-                        float f = i2f_small(c[i]) * (da[mt][i >> 1] * dbv[nt][i & 1]);
+                        float f = (__int_as_float(c[i]) - 12582912.0f) * (da[mt][i >> 1] * dbv[nt][i & 1]);  // i2f_small
                         if (QI<T>::MIN) f -= sa[mt][i >> 1] * mb[nt][i & 1];
                         acc[mt][nt][i] += f;
                     }
@@ -1119,7 +1197,7 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
 }
 
 #define DEF_GEMMI(T, NAME, SBB)                                                                                   \
-    extern "C" __global__ void __launch_bounds__(256) gemmi_##NAME(const GemmTile* tiles, const u8* wd, int nd,    \
+    extern "C" __global__ void __launch_bounds__(256, 2) gemmi_##NAME(const GemmTile* tiles, const u8* wd, int nd,    \
             const u8* x, const int* xrow, float* y, int y_stride, int rows, int n64, int act) {                    \
         gemmi_q<T, SBB, 128, false>(tiles, wd, nd, x, xrow, y, y_stride, rows, n64, act);                       \
     }                                                                                                             \
@@ -1128,6 +1206,7 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
         gemmi_q<T, SBB, 128, true>(tiles, wd, nd, x, xrow, y, y_stride, rows, n64, act);                        \
     }
 ITYPES(DEF_GEMMI)
+#endif
 
 // ---- elementwise / norm ----
 
@@ -1485,9 +1564,16 @@ extern "C" __global__ void kv_store(const float* k, const float* v, u16* kc, u16
 // grid = rows (heads of n), block 256: rms_norm (out rows of n) then rope_neox of the head, in one launch with the same
 // bits. Head r belongs to token r / per. With kc, then kv_store of the head and its v (v rows of n, like out).
 // Blocks below qrows do the q heads (from qx etc., no cache store); the rest do x etc.
+__device__ __forceinline__ double rope_f(float base, int i, int n_rot) { return pow((double)base, -2.0 * i / n_rot); }
+// fr[i] = rope_f(base, i, n_rot) for i < n_rot / 2, made once so rms_norm_rope skips the f64 pow.
+extern "C" __global__ void rope_freq(double* fr, float base, int n_rot) {
+    for (int i = threadIdx.x; i < n_rot / 2; i += blockDim.x) fr[i] = rope_f(base, i, n_rot);
+}
+// fr: the rope_freq table of base and n_rot, or null to compute it here.
 extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const float* w, float* out, int n, float eps, int per,
                                          int n_rot, const int* step, float base, const float* v, u16* kc, u16* vc,
-                                         int qrows, const float* qx, int q_stride, const float* qw, float* qo, int qper) {
+                                         int qrows, const float* qx, int q_stride, const float* qw, float* qo, int qper,
+                                         const double* fr) {
     int b = (int)blockIdx.x - qrows;
     if (b < 0) { b = blockIdx.x; x = qx; x_stride = q_stride; w = qw; out = qo; per = qper; kc = 0; }
     const float* xr = x + (size_t)b * x_stride;
@@ -1499,8 +1585,10 @@ extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const flo
     __syncthreads();
     int i = threadIdx.x, half = n_rot / 2;
     if (i < half) {
-        double theta = (double)(step[0] + b / per) * pow((double)base, -2.0 * i / n_rot);
-        float sn = (float)sin(theta), c = (float)cos(theta);
+        double theta = (double)(step[0] + b / per) * (fr ? fr[i] : rope_f(base, i, n_rot));
+        double ds, dc;
+        sincos(theta, &ds, &dc);
+        float sn = (float)ds, c = (float)dc;
         float a = o[i], b = o[i + half];
         o[i] = a * c - b * sn;
         o[i + half] = a * sn + b * c;
@@ -1644,9 +1732,10 @@ __device__ void attn_decode_llama(const float* q, const u16* kc, const u16* vc, 
 // [acc (hd) | max | sum] to part; attn_merge combines the splits.
 // CP (f16 cache, the GQA entry point, head_dim 128 or 256): each lane cp.asyncs its own slice of the next two chunks
 // into shared memory while the block works on this one. Only the lane that copies a slice reads it, so the copies need
-// no barriers of their own.
+// no barriers of their own. KV1: one chunk buffer, whose K and V halves each lane refills with the next chunk as soon
+// as it has read them into registers.
 // sel (QSA): when not null and sel[0] >= 0, the block attends to the sel[0] cells sel[1 ..] instead of 0 ..= step[0].
-template <int PER, int G, bool CP = false>
+template <int PER, int G, bool CP = false, bool KV1 = false>
 __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
                               const int* sel, int nh, int nkv, float scale, int bx) {
     constexpr int hd = PER * 32, C = 32, J = C / 8;  // positions per chunk, per warp
@@ -1665,7 +1754,7 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
         return;
     }
     extern __shared__ float sq[];  // G * hd query values, then nw * hd warp partials; with CP the K/V chunks at 8 * hd
-    constexpr int ST = 2;
+    constexpr int ST = KV1 ? 1 : 2;
     u16* kb = (u16*)(sq + 8 * hd);  // [ST][K, V][C][hd]
     __shared__ float ss[G][C], sc[G], sm[G], sl[G];
     int h0 = bx * G, g = h0 / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
@@ -1675,26 +1764,27 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
     for (int i = 0; i < G; i++)
         for (int d = 0; d < PER; d++) acc[i][d] = 0.0f;
     // Positions past p1 copy or load the row p1 - 1 and keep zeros: a select, not a branch around the loads.
-    auto cp = [&](int c0, int b) {
+    // cp(c0, b, kv): copy this lane's K (kv bit 0) and V (bit 1) slices of the chunk at c0 into buffer b, as one group.
+    auto cp = [&](int c0, int b, int kv) {
         if (c0 < p1)
 #pragma unroll
             for (int j = 0; j < J; j++) {
                 size_t r = ((size_t)cell(min(c0 + w * J + j, p1 - 1)) * nkv + g) * hd + lane * PER;
                 u16 *dk = kb + ((b * 2) * C + w * J + j) * hd + lane * PER, *dv = dk + C * hd;
-                if constexpr (PER == 8) { cp_async16(dk, kc + r, true); cp_async16(dv, vc + r, true); }
-                else { cp_async8(dk, kc + r, true); cp_async8(dv, vc + r, true); }
+                if constexpr (PER == 8) { if (kv & 1) cp_async16(dk, kc + r, true); if (kv & 2) cp_async16(dv, vc + r, true); }
+                else { if (kv & 1) cp_async8(dk, kc + r, true); if (kv & 2) cp_async8(dv, vc + r, true); }
             }
         cp_async_commit();
     };
-    if constexpr (CP) {
-        cp(p0, 0);
-        cp(p0 + C, 1);
-    }
+    if constexpr (KV1) { cp(p0, 0, 1); cp(p0, 0, 2); }
+    else if constexpr (CP) { cp(p0, 0, 3); cp(p0 + C, 1, 3); }
     __syncthreads();
     for (int c0 = p0, it = 0; c0 < p1; c0 += C, it++) {
         unsigned kr[J][PER / 2], vr[J][PER / 2];
+        // Two stages: groups commit as chunks 0 1 2 ..., so all but the newest gives this chunk. KV1 (one stage):
+        // groups commit as K0 V0 K1 V1 ..., so all but the newest gives this chunk's K here and its V further down.
         if constexpr (CP) {
-            cp_async_wait<ST - 1>();
+            cp_async_wait<1>();
             asm volatile("" ::: "memory");  // the reads below stay after the wait
         }
 #pragma unroll
@@ -1702,12 +1792,17 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
             int t = c0 + w * J + j;
             if constexpr (CP) {
                 const u16* sk = kb + (((it % ST) * 2) * C + w * J + j) * hd + lane * PER;
-                ldh_raw<PER>(sk, kr[j]); ldh_raw<PER>(sk + C * hd, vr[j]);
+                ldh_raw<PER>(sk, kr[j]);
+                if constexpr (!KV1) ldh_raw<PER>(sk + C * hd, vr[j]);
             } else {
                 size_t r = ((size_t)cell(min(t, p1 - 1)) * nkv + g) * hd + lane * PER;
                 ldkv<PER>(kc, r, hd, kr[j]); ldkv<PER>(vc, r, hd, vr[j]);
             }
             for (int d = 0; d < PER / 2; d++) if (t >= p1) kr[j][d] = vr[j][d] = 0;
+        }
+        if constexpr (KV1) {
+            asm volatile("" ::: "memory");
+            cp(c0 + C, 0, 1);
         }
         float kf[J][PER], p[J * G];
 #pragma unroll
@@ -1738,6 +1833,19 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
             if (lane == 0) sc[w] = cs;
         }
         __syncthreads();
+        // V here, not between the rescale and the adds below: the refill's branch would split them, and they would
+        // contract into other FMAs than in the two-stage path.
+        if constexpr (KV1) {
+            cp_async_wait<1>();
+            asm volatile("" ::: "memory");
+#pragma unroll
+            for (int j = 0; j < J; j++) {
+                ldh_raw<PER>(kb + (C + w * J + j) * hd + lane * PER, vr[j]);
+                for (int d = 0; d < PER / 2; d++) if (c0 + w * J + j >= p1) vr[j][d] = 0;
+            }
+            asm volatile("" ::: "memory");
+            cp(c0 + C, 0, 2);
+        }
 #pragma unroll
         for (int i = 0; i < G; i++) {
             float cs = sc[i];
@@ -1751,10 +1859,28 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
                 for (int d = 0; d < PER; d++) acc[i][d] += e * hraw(vr[j], d);
             }
         __syncthreads();
-        if constexpr (CP) cp(c0 + ST * C, it % ST);
+        if constexpr (CP && !KV1) cp(c0 + 2 * C, it % 2, 3);
     }
     if (w < G && lane == 0) { sm[w] = m; sl[w] = l; }
     float* sacc = sq;  // the queries are no longer needed (the loop ends on a barrier)
+    // With CP the K/V buffers are free too (no copy is pending), so the partials of all G heads fit at once.
+    if constexpr (CP && G * 8 <= 8 + 32 * ST) {
+#pragma unroll
+        for (int i = 0; i < G; i++)
+            for (int d = 0; d < PER; d++) sacc[(i * nw + w) * hd + lane * PER + d] = acc[i][d];
+        __syncthreads();
+        for (int x = threadIdx.x; x < G * hd; x += blockDim.x) {
+            int i = x / hd, d = x % hd;
+            float o = 0.0f;
+            for (int k = 0; k < nw; k++) o += sacc[(i * nw + k) * hd + d];
+            part[((size_t)(h0 + i) * ns + blockIdx.y) * (hd + 2) + d] = o;
+        }
+        if (threadIdx.x < G) {
+            float* pp = part + ((size_t)(h0 + threadIdx.x) * ns + blockIdx.y) * (hd + 2);
+            pp[hd] = sm[threadIdx.x]; pp[hd + 1] = sl[threadIdx.x];
+        }
+        return;
+    }
 #pragma unroll
     for (int i = 0; i < G; i++) {
         for (int d = 0; d < PER; d++) sacc[w * hd + lane * PER + d] = acc[i][d];
@@ -1781,7 +1907,7 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
                  float scale, int gq_min, int pz, int nt, const int* sel, int sst
 #define ATT_TOK int t = blockIdx.x % nt; q += (size_t)t * nh * hd; part += (size_t)t * pz; step += 2 * t; if (sel) sel += (size_t)t * sst;
 #define ATT_RUN(G) attn_decode_t<PER, G>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt)
-#define ATT_RUN_CP(G) attn_decode_t<PER, G, !KV_Q8 && (PER == 4 || PER == 8)>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt)
+#define ATT_RUN_CP(G) attn_decode_t<PER, G, !KV_Q8 && (PER == 4 || (PER == 8 && __CUDA_ARCH__ >= 800))>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt)
 #define DEF_ATT(HD)                                                                                          \
     extern "C" __global__ void attn_decode_##HD(ATT_ARGS) {                                                  \
         constexpr int PER = HD / 32; ATT_TOK                                                                 \
@@ -1798,6 +1924,15 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
         }                                                                                                    \
     }
 DEF_ATT(64) DEF_ATT(128) DEF_ATT(256) DEF_ATT(512)
+// attn_decode_gqa for G = 4 at head_dim 128 with the f16 cache (Qwen3-4B and 8B, Llama 3 8B): one K/V stage
+// refilled as soon as a lane has read it, and 80 registers, so 3 blocks share an SM (72 to 61 us per layer for
+// Qwen3-4B at 4K on a 3060).
+// Other group sizes lose with it: G = 8 spills its 32 accumulators, G = 2 gains nothing from the third block.
+extern "C" __global__ void __launch_bounds__(256, 3) attn_decode_gqa4_128(ATT_ARGS) {
+    constexpr int PER = 4; ATT_TOK
+    if (step[0] + 1 < gq_min) return;
+    if constexpr (!KV_Q8) attn_decode_t<PER, 4, true, true>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt);
+}
 
 // grid = query heads: out = (sum of split partials) / (sum of split sums) * sigmoid(gate), gate skipped when qg is null. Split 0 is never empty.
 // xq not null: out is also quantized there as quant_xq does (not under LLAMA_Q8, whose scales span 256 values).
@@ -1861,8 +1996,13 @@ __device__ void topk_warp(const float* p, int n, int k, float extra_scale, int l
             unsigned i = lane + 32 * r, key = __float_as_uint(v[r]) + 1;
             if (i < n && !(taken >> r & 1) && key > bk) { bk = key; bi = i; }
         }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+        unsigned mk = warp_max_u(bk);
+        bi = warp_min_u(bk == mk ? bi : 0xffffffffu);
+#else
         unsigned mk = __reduce_max_sync(0xffffffff, bk);
         bi = __reduce_min_sync(0xffffffff, bk == mk ? bi : 0xffffffffu);
+#endif
         float bv = __uint_as_float(mk - 1);
         if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
         if (lane == j) { id = bi; mine = bv; }
@@ -1965,7 +2105,14 @@ extern "C" __global__ void moe_combine_seq(float* x, const float* ye, const floa
 // gate at +HD per head; out [T, nh * HD] = softmax(q K^T * scale) V * sigmoid(gate). Shared: Q, K and V tiles, all
 // row-major; mma fragments come from ldmatrix (.trans for V).
 #define FA_BQ 64
-#define FA_BK 32
+#define FA_BK_DEFAULT 32
+// Turing's 64 KB shared memory cannot hold the HD = 256 tile at 32 keys either: 16 fit (the kernel keeps the same
+// 64 queries a block and four warps).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#define FA_BK_FOR(HD) ((HD) == 256 ? 16 : FA_BK_DEFAULT)
+#else
+#define FA_BK_FOR(HD) FA_BK_DEFAULT
+#endif
 // QSA mask (see qsa_select): whether query row t (mw words a row) sees key position `key`. The mask has rows for the
 // tile padding past T too (their output is dropped).
 __device__ __forceinline__ bool qsa_bit(const unsigned* qm, int mw, int t, int key) {
@@ -1975,6 +2122,7 @@ template <int HD>
 __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, const u16* vc, const float* qg, float* out,
                                                const int* step, int T, int nh, int nkv, float scale, const unsigned* qm, int mw) {
     constexpr int PQ = HD + 8;
+    constexpr int FA_BK = FA_BK_FOR(HD);
     extern __shared__ __align__(16) u16 fa_sm[];
     u16 *qs = fa_sm, *ks = qs + FA_BQ * PQ, *vs = ks + FA_BK * PQ;
     // The last query tiles see the most keys: start them first so the short ones fill the tail.

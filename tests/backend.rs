@@ -87,29 +87,31 @@ fn glsl_tables_are_fresh() {
     assert!(std::fs::read_to_string(path).unwrap_or_default() == want, "{path} is stale: rerun with STRATA_WRITE_TABLES=1");
 }
 
-/// Each Vulkan device reads the precision setting once; exercise boundaries in isolated processes.
 #[test]
-fn qwen3_precision_layers_configuration() {
-    const KEY: &str = "STRATA_VK_QWEN3_F32_LAYERS";
-    const CHILD: &str = "STRATA_PRECISION_TEST_CHILD";
-    if let Ok(case) = std::env::var(CHILD) {
-        use rusting_strata::backend::Backend;
-        let gpu = match rusting_strata::vulkan::Vk::new(0) {
-            Ok(gpu) => gpu,
-            Err(e) if format!("{e}") == "Vulkan init" => { eprintln!("SKIP: {e:#}"); return; }
-            Err(e) if case == "invalid" && format!("{e:#}").contains(KEY) => return,
-            Err(e) => panic!("{e:#}"),
-        };
-        assert_ne!(case, "invalid", "invalid layer count must fail");
-        let expected = match case.as_str() { "default" | "large" => 0, "zero" => 28, "eight" => 20, _ => unreachable!() };
-        assert_eq!(gpu.accurate_dense_start(28), expected, "{case}");
-        return;
-    }
-    for (case, value) in [("default", None), ("zero", Some("0")), ("eight", Some("8")), ("large", Some("99")), ("invalid", Some("bad"))] {
-        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-        cmd.args(["--exact", "qwen3_precision_layers_configuration", "--nocapture"]).env(CHILD, case).env_remove(KEY);
-        if let Some(v) = value { cmd.env(KEY, v); }
-        let output = cmd.output().unwrap();
-        assert!(output.status.success(), "{case}: {}", String::from_utf8_lossy(&output.stderr));
+fn batched_quantized_gemm_uses_prepared_x() {
+    use rusting_strata::backend::SAME_X;
+    use rusting_strata::quant::GgmlType;
+    use rusting_strata::weights::Tensor;
+
+    let data = include_bytes!("fixtures/Q4_K.raw").repeat(8);
+    let weight = Tensor { ty: GgmlType::Q4K, cols: 256, rows: 64, data: &data };
+    assert_eq!(data.len(), weight.ty.row_bytes(256) * 64);
+    let n = 128;
+    let input: Vec<f32> = (0..n * 256).map(|i| (i % 127) as f32 / 63.0 - 1.0).collect();
+    for (backend, gpu) in common::backends() {
+        let weight = gpu.upload(&weight).unwrap();
+        let x = common::up(&*gpu, &input);
+        let y = gpu.zeros::<f32>(n * 64).unwrap();
+        gpu.prequant_gemm_x(&weight, n, x.addr(), 256).unwrap();
+        gpu.prequant_gemm_x(&weight, n, x.addr(), 256).unwrap();
+        gpu.batch(&mut || gpu.gemm_dense(&weight, n, x.addr(), 256, y.addr(), 64, SAME_X)).unwrap();
+        let got = common::down::<f32>(&*gpu, &y);
+
+        let expected = gpu.zeros::<f32>(n * 64).unwrap();
+        gpu.gemm_dense(&weight, n, x.addr(), 256, expected.addr(), 64, 0).unwrap();
+        let expected = common::down::<f32>(&*gpu, &expected);
+        assert!(got.iter().any(|v| v.abs() > 1e-5), "{backend}: empty GEMM result");
+        assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "{backend}: batched result differs from non-batched GEMM");
     }
 }
