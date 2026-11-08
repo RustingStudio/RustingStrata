@@ -76,8 +76,10 @@ pub fn llama_numerics() -> bool { std::env::var_os("STRATA_LLAMA_NUMERICS").is_s
 /// `--kv q8`: KV cache rows in ggml q8_0 form (KV_Q8 in kernels.cu), read once by Gpu::new and Vk::new.
 pub fn kv_q8() -> bool { std::env::var_os("STRATA_KV_Q8").is_some() }
 
-/// `STRATA_GEMM_FMA`: force the CUDA-core FMA fallback in the f16 prefill GEMM instead of the sm_70 tensor-core
-/// path (`GEMM_TC` in kernels.cu). Ignored on sm_80+, which always uses `mma.m16n8k16`.
+/// `STRATA_GEMM_FMA`: force the CUDA-core FMA fallback in the f16 prefill kernels instead of the sm_70 tensor-core
+/// path (`GEMM_TC` in kernels.cu). It covers both the f16 prefill GEMM and the prefill attention (`attn_prefill_t`):
+/// the attention's P staging tile is part of every request, so the shared-memory size does not depend on it.
+/// Ignored on sm_80+, which always uses `mma.m16n8k16`.
 pub fn gemm_fma() -> bool { std::env::var_os("STRATA_GEMM_FMA").is_some() }
 
 fn source(kv_q8: bool, gemm_tc: bool) -> String {
@@ -145,17 +147,19 @@ fn device_log(device: usize, name: &str, arch: &str, cc: (i32, i32), gemm_fma: b
 fn int8_gemm_arch(cc: (i32, i32)) -> bool { cc.0 >= 8 }
 
 /// The dynamic shared memory a launch of kernel `name` can request, with its family for the startup log: the fixed
-/// maximum of the attention prefill (`2 * (64 + 32 + 32)` rows of `hd + 8` halves, `attn_prefill_m`) and of the
-/// decode GQA kernels (8 query slices per head group plus the cp.async K/V chunks at head_dim 128/256, `attn`),
-/// `usize::MAX` for `gemvn_*` whose request depends on the tensor shape (`xq_smem * nt`, `gemv_cfg`), and `None`
-/// for every kernel that never asks for more than the 48 KiB default (`attn_decode_*`, `attn_merge`, the rest).
+/// maximum of the attention prefill (`2 * (64 + 32 + 32)` rows of `hd + 8` halves plus the 64 x (32 + 8) half P
+/// staging tile of the sm_70 attention path, `attn_prefill_m`) and of the decode GQA kernels (8 query slices per
+/// head group plus the cp.async K/V chunks at head_dim 128/256, `attn`), `usize::MAX` for `gemvn_*` whose request
+/// depends on the tensor shape (`xq_smem * nt`, `gemv_cfg`), and `None` for every kernel that never asks for more
+/// than the 48 KiB default (`attn_decode_*`, `attn_merge`, the rest).
 fn dyn_shmem_need(name: &str) -> Option<(&'static str, usize)> {
     let family = if name.starts_with("attn_prefill") { "attn_prefill_*" }
         else if name.starts_with("attn_decode_gqa") { "attn_decode_gqa*" }
         else if name.starts_with("gemvn") { "gemvn_*" }
         else { return None };
     let need = match family {
-        "attn_prefill_*" => 2 * (64 + 32 + 32) * (name["attn_prefill_".len()..].parse::<usize>().ok()? + 8),
+        "attn_prefill_*" => 2 * (64 + 32 + 32) * (name["attn_prefill_".len()..].parse::<usize>().ok()? + 8)
+            + 2 * 64 * (32 + 8),  // the sm_70 P staging tile, requested unconditionally
         "attn_decode_gqa*" => {
             let hd = name["attn_decode_gqa".len()..].trim_start_matches('4');
             let hd = hd.strip_prefix('_')?.parse::<usize>().ok()?;
@@ -796,7 +800,7 @@ impl Backend for Gpu {
 
     fn attn_prefill_m(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32, qm: u64, mw: usize) -> anyhow::Result<()> {
         if !matches!(hd, 64 | 128 | 256) { bail!("attention prefill: head_dim {hd} unsupported (64, 128 or 256)"); }
-        let smem = (2 * (64 + 32 + 32) * (hd + 8)) as u32;
+        let smem = (2 * (64 + 32 + 32) * (hd + 8) + 2 * 64 * (32 + 8)) as u32;
         launch!(self, &format!("attn_prefill_{hd}"), cfg((t.div_ceil(64) as u32, nh as u32), 128, smem),
             q, kc, vc, qg, out, step, t as i32, nh as i32, nkv as i32, scale, qm, mw as i32);
         Ok(())
@@ -1036,10 +1040,10 @@ mod tests {
     /// M1-T7, CPU-only: the per-family dynamic shared memory a launch can ask for, from the launcher's tile shapes.
     #[test]
     fn dyn_shmem_need_per_family() {
-        // attn_prefill: 2 * (64 + 32 + 32) rows of hd + 8 halves, 2 bytes each.
-        assert_eq!(super::dyn_shmem_need("attn_prefill_64"), Some(("attn_prefill_*", 2 * 128 * 72)));
-        assert_eq!(super::dyn_shmem_need("attn_prefill_128"), Some(("attn_prefill_*", 2 * 128 * 136)));
-        assert_eq!(super::dyn_shmem_need("attn_prefill_256"), Some(("attn_prefill_*", 67584)));
+        // attn_prefill: 2 * (64 + 32 + 32) rows of hd + 8 halves, 2 bytes each, plus the 64 x 40 half P staging tile.
+        assert_eq!(super::dyn_shmem_need("attn_prefill_64"), Some(("attn_prefill_*", 2 * 128 * 72 + 5120)));
+        assert_eq!(super::dyn_shmem_need("attn_prefill_128"), Some(("attn_prefill_*", 2 * 128 * 136 + 5120)));
+        assert_eq!(super::dyn_shmem_need("attn_prefill_256"), Some(("attn_prefill_*", 72704)));
         // attn_decode_gqa: 8 query slices per head group, plus 2 chunks of 32 K and V positions at head_dim 128/256.
         assert_eq!(super::dyn_shmem_need("attn_decode_gqa_64"), Some(("attn_decode_gqa*", 2048)));
         assert_eq!(super::dyn_shmem_need("attn_decode_gqa_128"), Some(("attn_decode_gqa*", 36864)));
@@ -1080,8 +1084,8 @@ mod tests {
 
     #[test]
     fn smem_log_reports_device_numbers() {
-        assert_eq!(super::smem_log("attn_prefill_*", 98304, 0, Some(67584)),
-            "cuda shared memory: opt-in 98304 B per block, attn_prefill_*: 0 B static, dynamic max 67584 B");
+        assert_eq!(super::smem_log("attn_prefill_*", 98304, 0, Some(72704)),
+            "cuda shared memory: opt-in 98304 B per block, attn_prefill_*: 0 B static, dynamic max 72704 B");
         assert_eq!(super::smem_log("attn_decode_*", 98304, 2112, None),
             "cuda shared memory: opt-in 98304 B per block, attn_decode_*: 2112 B static, dynamic max default (48 KiB)");
     }
