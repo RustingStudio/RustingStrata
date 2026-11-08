@@ -82,7 +82,47 @@ pub fn kv_q8() -> bool { std::env::var_os("STRATA_KV_Q8").is_some() }
 /// Ignored on sm_80+, which always uses `mma.m16n8k16`.
 pub fn gemm_fma() -> bool { std::env::var_os("STRATA_GEMM_FMA").is_some() }
 
-fn source(kv_q8: bool, gemm_tc: bool) -> String {
+/// Prefill attention query / key tile sizes in positions. `FA_BQ` is one warp's 16 query rows times the four warps
+/// of the 128-thread block; `FA_BK` is the K/V tile depth and must stay a multiple of 32 for the sm_70 `m8n8k4`
+/// and sm_80+ `m16n8k16` fragment loops. Injected into kernels.cu by `source()`, never edited there.
+const FA_BQ: usize = 64;
+const FA_BK: usize = 32;
+/// Prefill GEMM K tile in halves (default, candidate C3 overrides it with `STRATA_GEMM_BK=32`). `GEMM_BM` lives in
+/// `backend.rs` because the prefill tile-list builder shares it with Vulkan.
+const GEMM_BK: usize = 64;
+/// Row padding of the attention shared-memory tiles (`PQ = HD + 8`, `FA_BK + 8` in `attn_prefill_t`).
+const ATTN_SMEM_PAD: usize = 8;
+
+/// The kernel tunables `source()` injects as `#define`s. Kept together so a Rust-only edit cannot desync the
+/// kernel, and so the C2/C3 candidates can be selected for a measurement window without a code change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Tune {
+    gemm_bk: usize,
+    gemm_min_blocks: usize,
+}
+
+impl Tune {
+    /// The shipped values: `GEMM_BK = 64`, no minimum-block hint (byte-identical sm_80 codegen).
+    #[cfg(test)]
+    const fn def() -> Tune { Tune { gemm_bk: GEMM_BK, gemm_min_blocks: 1 } }
+
+    /// The window-selected candidates: `STRATA_GEMM_BK` (C3, a multiple of 8) and `STRATA_GEMM_MIN_BLOCKS`
+    /// (C2, `__launch_bounds__(·, n)` on `gemm_*`/`gemms_*`). Invalid values fall back to the defaults.
+    fn from_env() -> Tune {
+        let gemm_bk = tuned(std::env::var("STRATA_GEMM_BK").ok().as_deref(), GEMM_BK, |v| v > 0 && v % 8 == 0);
+        let gemm_min_blocks = tuned(std::env::var("STRATA_GEMM_MIN_BLOCKS").ok().as_deref(), 1, |v| (1..=8).contains(&v));
+        Tune { gemm_bk, gemm_min_blocks }
+    }
+}
+
+/// `default` unless `v` parses to a value accepted by `valid`.
+fn tuned(v: Option<&str>, default: usize, valid: impl Fn(usize) -> bool) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok()).filter(|&x| valid(x)).unwrap_or(default)
+}
+
+fn source(kv_q8: bool, gemm_tc: bool) -> String { source_with(kv_q8, gemm_tc, Tune::from_env()) }
+
+fn source_with(kv_q8: bool, gemm_tc: bool, tune: Tune) -> String {
     let join = |v: Vec<String>| v.join(",");
     format!(
         "__device__ const unsigned long long iq2xs_grid[512] = {{{}}};\n\
@@ -92,7 +132,10 @@ fn source(kv_q8: bool, gemm_tc: bool) -> String {
          __device__ const unsigned int iq3xxs_grid[256] = {{{}}};\n\
          __device__ const unsigned int iq3s_grid[512] = {{{}}};\n\
          __device__ const unsigned char ksigns_iq2xs[128] = {{{}}};\n\
-         __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n#define LLAMA_Q8 {}\n#define KV_Q8 {}\n#define GEMM_TC {}\n{}",
+         __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n\
+         #define LLAMA_Q8 {}\n#define KV_Q8 {}\n#define GEMM_TC {}\n\
+         #define GEMM_BM {}\n#define GEMM_BK {}\n#define GEMM_MIN_BLOCKS {}\n\
+         #define FA_BQ {}\n#define FA_BK {}\n{}",
         join(IQ2XS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ2XXS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ2S_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
@@ -104,8 +147,21 @@ fn source(kv_q8: bool, gemm_tc: bool) -> String {
         llama_numerics() as u8,
         kv_q8 as u8,
         gemm_tc as u8,
+        GEMM_BM,
+        tune.gemm_bk,
+        tune.gemm_min_blocks,
+        FA_BQ,
+        FA_BK,
         include_str!("kernels.cu"),
     )
+}
+
+/// Shared memory one `attn_prefill_*` launch requests: `FA_BQ` query rows, `FA_BK` K and `FA_BK` V rows at
+/// `hd + 8` padded halves, plus the sm_70 P staging tile of `FA_BQ` x (`FA_BK` + 8) halves. The single place that
+/// knows the `qs/ks/vs/ps` layout; both `dyn_shmem_need` and `attn_prefill_m` call it.
+fn attn_prefill_smem(hd: usize) -> usize {
+    let pq = hd + ATTN_SMEM_PAD;
+    2 * (FA_BQ + 2 * FA_BK) * pq + 2 * FA_BQ * (FA_BK + ATTN_SMEM_PAD)
 }
 
 /// The NVRTC version `libloading` actually resolves, or `None` when the library is absent or `nvrtcVersion` fails.
@@ -147,19 +203,17 @@ fn device_log(device: usize, name: &str, arch: &str, cc: (i32, i32), gemm_fma: b
 fn int8_gemm_arch(cc: (i32, i32)) -> bool { cc.0 >= 8 }
 
 /// The dynamic shared memory a launch of kernel `name` can request, with its family for the startup log: the fixed
-/// maximum of the attention prefill (`2 * (64 + 32 + 32)` rows of `hd + 8` halves plus the 64 x (32 + 8) half P
-/// staging tile of the sm_70 attention path, `attn_prefill_m`) and of the decode GQA kernels (8 query slices per
-/// head group plus the cp.async K/V chunks at head_dim 128/256, `attn`), `usize::MAX` for `gemvn_*` whose request
-/// depends on the tensor shape (`xq_smem * nt`, `gemv_cfg`), and `None` for every kernel that never asks for more
-/// than the 48 KiB default (`attn_decode_*`, `attn_merge`, the rest).
+/// maximum of the attention prefill (`attn_prefill_smem`, the only place that knows the tile layout) and of the
+/// decode GQA kernels (8 query slices per head group plus the cp.async K/V chunks at head_dim 128/256, `attn`),
+/// `usize::MAX` for `gemvn_*` whose request depends on the tensor shape (`xq_smem * nt`, `gemv_cfg`), and `None`
+/// for every kernel that never asks for more than the 48 KiB default (`attn_decode_*`, `attn_merge`, the rest).
 fn dyn_shmem_need(name: &str) -> Option<(&'static str, usize)> {
     let family = if name.starts_with("attn_prefill") { "attn_prefill_*" }
         else if name.starts_with("attn_decode_gqa") { "attn_decode_gqa*" }
         else if name.starts_with("gemvn") { "gemvn_*" }
         else { return None };
     let need = match family {
-        "attn_prefill_*" => 2 * (64 + 32 + 32) * (name["attn_prefill_".len()..].parse::<usize>().ok()? + 8)
-            + 2 * 64 * (32 + 8),  // the sm_70 P staging tile, requested unconditionally
+        "attn_prefill_*" => attn_prefill_smem(name["attn_prefill_".len()..].parse::<usize>().ok()?),
         "attn_decode_gqa*" => {
             let hd = name["attn_decode_gqa".len()..].trim_start_matches('4');
             let hd = hd.strip_prefix('_')?.parse::<usize>().ok()?;
@@ -185,11 +239,68 @@ fn dyn_shmem_optin(need: usize, stat: usize, optin: usize) -> Option<usize> {
     (need > DEFAULT).then(|| need.min(optin.saturating_sub(stat)))
 }
 
-/// One startup line per kernel family: the device's dynamic shared memory opt-in (not a table) and what the load set
-/// for the family's largest static usage. Quotable in an issue or PR as the numbers actually observed on the card.
-fn smem_log(family: &str, optin: usize, stat: usize, set: Option<usize>) -> String {
+/// `STRATA_SMEM_CARVEOUT`: the default `off` leaves the driver default, which the M2-T3 window measured as the
+/// fastest (C1 was rejected); `policy` enables the R3 decision, `min` additionally picks the minimal fitting
+/// carveout for the static-only GEMM families (C1's gemm half).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CarveoutMode { Off, Policy, Min }
+
+fn carveout_mode_from(v: Option<&str>) -> CarveoutMode {
+    match v.map(str::trim) {
+        Some("policy") => CarveoutMode::Policy,
+        Some("min") => CarveoutMode::Min,
+        _ => CarveoutMode::Off,
+    }
+}
+
+fn carveout_mode() -> CarveoutMode { carveout_mode_from(std::env::var("STRATA_SMEM_CARVEOUT").ok().as_deref()) }
+
+/// The preferred shared-memory carveout percentage for a function, or `None` to leave the driver's default.
+/// `dyn`/`stat` are one block's dynamic/static usage, `blocks_wanted` the number of blocks per SM the carveout is
+/// meant to hold, `optin` the device's per-SM shared-memory maximum (96 KiB on the V100). Returns `None` when the
+/// 48 KiB default already holds every wanted block (nothing to gain, e.g. the register-bound `gemm_*`) or when the
+/// wanted blocks cannot fit at all (hd 256 attention: two blocks need 142 KiB). Otherwise the percentage is rounded
+/// up so it never requests less than the launch needs, and clamped to `1..=100`.
+fn carveout(dynamic: usize, stat: usize, blocks_wanted: usize, optin: usize) -> Option<i32> {
+    const DEFAULT: usize = 48 << 10;
+    if blocks_wanted == 0 || optin == 0 { return None; }
+    let need = dynamic.checked_add(stat)?;
+    if need == 0 { return None; }
+    let total = need.checked_mul(blocks_wanted)?;
+    if total <= DEFAULT { return None; }  // the default allocation already fits: request it nowhere
+    (total <= optin).then(|| (total * 100).div_ceil(optin).clamp(1, 100) as i32)
+}
+
+/// The smallest carveout that still fits `need` bytes, used only by C1's `min` mode for the static-only GEMM
+/// families: the driver's default allocation may reserve more shared memory than 27 KiB, and every KiB not carved
+/// out is L1 for the weight stream.
+fn carveout_min(need: usize, optin: usize) -> Option<i32> {
+    (need > 0 && need <= optin).then(|| (need * 100).div_ceil(optin).clamp(1, 100) as i32)
+}
+
+/// The carveout to set on kernel `name`: `need` is its `dyn_shmem_need` (the launch's dynamic request, `None` for
+/// kernels that use only static shared memory).
+fn carveout_for(name: &str, need: Option<usize>, stat: usize, optin: usize, mode: CarveoutMode) -> Option<i32> {
+    if mode == CarveoutMode::Off { return None; }
+    let (dynamic, blocks) = match need {
+        // hd 128 gains a second resident block at 96 KiB; hd 64 already fits two in the default; hd 256 cannot fit
+        // two at all (`carveout` returns None), so the request leaves it unchanged.
+        Some(v) if name.starts_with("attn_prefill") => (v, 2),
+        Some(v) => (v, 1),
+        None => (0, 1),
+    };
+    if let Some(p) = carveout(dynamic, stat, blocks, optin) { return Some(p); }
+    let gemm = name.starts_with("gemm_") || name.starts_with("gemms_");
+    (mode == CarveoutMode::Min && gemm).then(|| carveout_min(dynamic + stat, optin)).flatten()
+}
+
+/// One startup line per kernel family: the device's shared-memory opt-in (not a table), what the load set for the
+/// family's largest static usage, and the preferred carveout. Quotable in an issue or PR as the numbers actually
+/// observed on the card.
+fn smem_log(family: &str, optin: usize, stat: usize, set: Option<usize>, carveout: Option<i32>) -> String {
     let dynamic = set.map_or_else(|| "default (48 KiB)".to_string(), |v| format!("{v} B"));
-    format!("cuda shared memory: opt-in {optin} B per block, {family}: {stat} B static, dynamic max {dynamic}")
+    let carveout = carveout.map_or_else(|| "default".to_string(), |p| format!("{p}%"));
+    format!("cuda shared memory: opt-in {optin} B per block, {family}: {stat} B static, dynamic max {dynamic}, carveout {carveout}")
 }
 
 /// The kernel names to load from the cubin: the full list on sm_80+, without the int8 prefill GEMM (`gemmi_*` and
@@ -317,24 +428,34 @@ impl Gpu {
         // possibly less (reserve), and shared with the function's static part. Never a constant.
         let optin = ctx.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)? as usize;
         let mut fns = HashMap::new();
-        // Per family: the largest static usage seen and the largest value set, logged once after the load.
-        let mut smem: BTreeMap<&'static str, (usize, Option<usize>)> = BTreeMap::new();
+        // Per family: the largest static usage, dynamic opt-in and carveout seen, logged once after the load.
+        let mut smem: BTreeMap<&'static str, (usize, Option<usize>, Option<i32>)> = BTreeMap::new();
+        let carveout_mode = carveout_mode();
         for n in kernel_names(i8_gemm) {
             let f = module.load_function(&n).with_context(|| format!("kernel {n}"))?;
-            if let Some((family, need)) = dyn_shmem_need(&n) {
-                let stat = f.shared_size_bytes().with_context(|| format!("static shared memory of {n}"))?.max(0) as usize;
-                let set = dyn_shmem_optin(need, stat, optin);
-                if let Some(v) = set {
-                    f.set_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, v as i32)
-                        .with_context(|| format!("set dynamic shared memory on {n}: {stat} B static, {optin} B device opt-in"))?;
-                }
-                let e = smem.entry(family).or_insert((stat, None));
+            let stat = f.shared_size_bytes().with_context(|| format!("static shared memory of {n}"))?.max(0) as usize;
+            let need = dyn_shmem_need(&n);
+            let set = need.and_then(|(_, need)| dyn_shmem_optin(need, stat, optin));
+            if let Some(v) = set {
+                f.set_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, v as i32)
+                    .with_context(|| format!("set dynamic shared memory on {n}: {stat} B static, {optin} B device opt-in"))?;
+            }
+            // The preferred carveout is a Volta knob (128 KiB unified L1/shared, 96 KiB max shared): sm_80+ keeps the
+            // driver default so its codegen and cache split stay exactly as before (AGENTS.md).
+            let co = if maj < 8 { carveout_for(&n, need.map(|(_, v)| v), stat, optin, carveout_mode) } else { None };
+            if let Some(p) = co {
+                f.set_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, p)
+                    .with_context(|| format!("set preferred carveout on {n}: {p}% of {optin} B"))?;
+            }
+            if let Some((family, _)) = need {
+                let e = smem.entry(family).or_insert((stat, None, None));
                 e.0 = e.0.max(stat);
                 e.1 = e.1.max(set);
+                e.2 = e.2.max(co);
             }
             fns.insert(n, f);
         }
-        for (family, (stat, set)) in &smem { eprintln!("{}", smem_log(family, optin, *stat, *set)); }
+        for (family, (stat, set, co)) in &smem { eprintln!("{}", smem_log(family, optin, *stat, *set, *co)); }
         let q8 = std::sync::Mutex::new((stream.alloc_zeros::<u8>(1)?, None));
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
@@ -800,7 +921,7 @@ impl Backend for Gpu {
 
     fn attn_prefill_m(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32, qm: u64, mw: usize) -> anyhow::Result<()> {
         if !matches!(hd, 64 | 128 | 256) { bail!("attention prefill: head_dim {hd} unsupported (64, 128 or 256)"); }
-        let smem = (2 * (64 + 32 + 32) * (hd + 8) + 2 * 64 * (32 + 8)) as u32;
+        let smem = attn_prefill_smem(hd) as u32;
         launch!(self, &format!("attn_prefill_{hd}"), cfg((t.div_ceil(64) as u32, nh as u32), 128, smem),
             q, kc, vc, qg, out, step, t as i32, nh as i32, nkv as i32, scale, qm, mw as i32);
         Ok(())
@@ -965,6 +1086,9 @@ mod tests {
         super::cubin(&src, "sm_80").expect("the sm_80 path must keep compiling (cubin for sm_80)");
         // Same sm_70 source with the FMA fallback selected: both variants must produce a cubin (M2-T1).
         super::cubin(&super::source(false, false), "sm_70").expect("the STRATA_GEMM_FMA sm_70 source must compile");
+        // M2-T3 candidates C2 (`__launch_bounds__(·, 2)`) and C3 (`GEMM_BK = 32`) must compile before the window.
+        let c23 = super::source_with(false, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2 });
+        super::cubin(&c23, "sm_70").expect("the C2/C3 candidate tiles must compile for sm_70");
     }
 
     #[test]
@@ -1037,13 +1161,14 @@ mod tests {
         assert!(sm80.contains(&"gemmis_q2_k".to_string()));
     }
 
-    /// M1-T7, CPU-only: the per-family dynamic shared memory a launch can ask for, from the launcher's tile shapes.
+    /// M1-T7/M2-T3, CPU-only: the per-family dynamic shared memory a launch can ask for, from the launcher's tile
+    /// shapes. The attention prefill figure comes from `attn_prefill_smem`, the same helper `attn_prefill_m` uses.
     #[test]
     fn dyn_shmem_need_per_family() {
-        // attn_prefill: 2 * (64 + 32 + 32) rows of hd + 8 halves, 2 bytes each, plus the 64 x 40 half P staging tile.
-        assert_eq!(super::dyn_shmem_need("attn_prefill_64"), Some(("attn_prefill_*", 2 * 128 * 72 + 5120)));
-        assert_eq!(super::dyn_shmem_need("attn_prefill_128"), Some(("attn_prefill_*", 2 * 128 * 136 + 5120)));
-        assert_eq!(super::dyn_shmem_need("attn_prefill_256"), Some(("attn_prefill_*", 72704)));
+        // attn_prefill: 2 * (FA_BQ + 2 * FA_BK) rows of hd + 8 halves, plus the FA_BQ x (FA_BK + 8) half P tile.
+        assert_eq!(super::dyn_shmem_need("attn_prefill_64"), Some(("attn_prefill_*", super::attn_prefill_smem(64))));
+        assert_eq!(super::dyn_shmem_need("attn_prefill_128"), Some(("attn_prefill_*", super::attn_prefill_smem(128))));
+        assert_eq!(super::dyn_shmem_need("attn_prefill_256"), Some(("attn_prefill_*", super::attn_prefill_smem(256))));
         // attn_decode_gqa: 8 query slices per head group, plus 2 chunks of 32 K and V positions at head_dim 128/256.
         assert_eq!(super::dyn_shmem_need("attn_decode_gqa_64"), Some(("attn_decode_gqa*", 2048)));
         assert_eq!(super::dyn_shmem_need("attn_decode_gqa_128"), Some(("attn_decode_gqa*", 36864)));
@@ -1082,11 +1207,106 @@ mod tests {
         assert_eq!(super::dyn_shmem_optin(usize::MAX, 100 << 10, 96 << 10), Some(0));
     }
 
+    /// M2-T3, CPU-only: the single shared-memory layout helper, pinned to the historical numbers and to what the
+    /// launcher asks the driver for.
+    #[test]
+    fn attn_prefill_smem_matches_launch() {
+        assert_eq!(super::attn_prefill_smem(64), 23552);
+        assert_eq!(super::attn_prefill_smem(128), 39936);
+        assert_eq!(super::attn_prefill_smem(256), 72704);
+        for hd in [64, 128, 256] {
+            let name = format!("attn_prefill_{hd}");
+            assert_eq!(super::dyn_shmem_need(&name).map(|(_, n)| n), Some(super::attn_prefill_smem(hd)),
+                "dyn_shmem_need({name}) must equal the launch size attn_prefill_m requests");
+        }
+    }
+
+    /// M2-T3, CPU-only: the Rust-owned tiles reach kernels.cu through `source()`, so a Rust edit cannot desync the
+    /// kernel; the C2/C3 window candidates only change the injected values.
+    #[test]
+    fn source_injects_tiles() {
+        let src = super::source_with(false, true, super::Tune::def());
+        for define in [
+            "#define GEMM_BM 128", "#define GEMM_BK 64", "#define GEMM_MIN_BLOCKS 1",
+            "#define FA_BQ 64", "#define FA_BK 32",
+        ] {
+            assert!(src.contains(define), "source is missing `{define}`");
+        }
+        let c23 = super::source_with(false, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2 });
+        assert!(c23.contains("#define GEMM_BK 32"));
+        assert!(c23.contains("#define GEMM_MIN_BLOCKS 2"));
+    }
+
+    /// M2-T3, CPU-only: candidate selection is parsed defensively, so a typo measures the shipped build instead of
+    /// an illegal tile.
+    #[test]
+    fn tuned_falls_back_on_invalid_values() {
+        assert_eq!(super::tuned(Some("32"), 64, |v| v % 8 == 0), 32);
+        assert_eq!(super::tuned(Some(" 32 "), 64, |v| v % 8 == 0), 32);
+        assert_eq!(super::tuned(Some("33"), 64, |v| v % 8 == 0), 64);
+        assert_eq!(super::tuned(Some("x"), 64, |v| v % 8 == 0), 64);
+        assert_eq!(super::tuned(None, 64, |v| v % 8 == 0), 64);
+    }
+
+    #[test]
+    fn carveout_mode_parsing() {
+        assert_eq!(super::carveout_mode_from(Some("off")), super::CarveoutMode::Off);
+        assert_eq!(super::carveout_mode_from(None), super::CarveoutMode::Off);
+        assert_eq!(super::carveout_mode_from(Some("min")), super::CarveoutMode::Min);
+        assert_eq!(super::carveout_mode_from(Some("policy")), super::CarveoutMode::Policy);
+        assert_eq!(super::carveout_mode_from(Some("0")), super::CarveoutMode::Off);
+    }
+
+    /// M2-T3, CPU-only: the carveout decision. Never request less than the launch needs, never request where the
+    /// 48 KiB default already holds every wanted block, and leave hd 256 unchanged (two blocks cannot fit).
+    #[test]
+    fn carveout_policy() {
+        const OPTIN: usize = 96 << 10;  // V100 max shared memory per SM
+        // Nothing to place, or a launch the default already holds with no extra block gained.
+        assert_eq!(super::carveout(0, 0, 2, OPTIN), None);
+        assert_eq!(super::carveout(0, 27648, 1, OPTIN), None);  // gemm_* fits the default, registers bind at 1 block
+        assert_eq!(super::carveout(super::attn_prefill_smem(64), 0, 2, OPTIN), None);  // 2 x 23552 < 48 KiB
+        // hd 128: two blocks no longer fit the default, one 96 KiB carveout holds both.
+        assert_eq!(super::carveout(super::attn_prefill_smem(128), 0, 2, OPTIN), Some(82));
+        // hd 256: two blocks need 142 KiB > the 96 KiB maximum, so the request is left alone.
+        assert_eq!(super::carveout(super::attn_prefill_smem(256), 0, 2, OPTIN), None);
+        // A single hd 256 block still needs more than the default: request at least the launch need.
+        assert_eq!(super::carveout(super::attn_prefill_smem(256), 0, 1, OPTIN), Some(74));
+        // Never below the launch need for any accepted percentage.
+        for blocks in 1..=2 {
+            for hd in [64, 128, 256] {
+                let need = super::attn_prefill_smem(hd);
+                if let Some(p) = super::carveout(need, 0, blocks, OPTIN) {
+                    assert!(p > 0 && p <= 100);
+                    assert!(p as usize * OPTIN / 100 >= need, "hd {hd}, {blocks} blocks: {p}% < {need} B");
+                }
+            }
+        }
+        // A request past the per-SM maximum is infeasible rather than silently clamped.
+        assert_eq!(super::carveout(100000, 0, 1, OPTIN), None);
+    }
+
+    /// M2-T3, CPU-only: C1's `min` mode picks the smallest fitting carveout for the register-bound GEMM families,
+    /// and its off mode leaves every function at the driver default.
+    #[test]
+    fn carveout_for_modes() {
+        const OPTIN: usize = 96 << 10;
+        let gemm = ("gemm_q2_k", None, 27648usize);
+        assert_eq!(super::carveout_for(gemm.0, gemm.1, gemm.2, OPTIN, super::CarveoutMode::Off), None);
+        assert_eq!(super::carveout_for(gemm.0, gemm.1, gemm.2, OPTIN, super::CarveoutMode::Policy), None);
+        assert_eq!(super::carveout_for(gemm.0, gemm.1, gemm.2, OPTIN, super::CarveoutMode::Min), Some(29));
+        // attn_prefill_128 gets the 96 KiB carveout in the default policy, hd 256 does not.
+        let hd128 = super::attn_prefill_smem(128);
+        assert_eq!(super::carveout_for("attn_prefill_128", Some(hd128), 0, OPTIN, super::CarveoutMode::Policy), Some(82));
+        let hd256 = super::attn_prefill_smem(256);
+        assert_eq!(super::carveout_for("attn_prefill_256", Some(hd256), 0, OPTIN, super::CarveoutMode::Policy), None);
+    }
+
     #[test]
     fn smem_log_reports_device_numbers() {
-        assert_eq!(super::smem_log("attn_prefill_*", 98304, 0, Some(72704)),
-            "cuda shared memory: opt-in 98304 B per block, attn_prefill_*: 0 B static, dynamic max 72704 B");
-        assert_eq!(super::smem_log("attn_decode_*", 98304, 2112, None),
-            "cuda shared memory: opt-in 98304 B per block, attn_decode_*: 2112 B static, dynamic max default (48 KiB)");
+        assert_eq!(super::smem_log("attn_prefill_*", 98304, 0, Some(72704), Some(82)),
+            "cuda shared memory: opt-in 98304 B per block, attn_prefill_*: 0 B static, dynamic max 72704 B, carveout 82%");
+        assert_eq!(super::smem_log("attn_decode_*", 98304, 2112, None, None),
+            "cuda shared memory: opt-in 98304 B per block, attn_decode_*: 2112 B static, dynamic max default (48 KiB), carveout default");
     }
 }

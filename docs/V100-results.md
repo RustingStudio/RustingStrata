@@ -599,3 +599,104 @@ No new `Xid`/`NVRM` line in `dmesg` (`grep -ic Xid` = 42 before and after both
 windows), no device lost, no NaN in any of the 3 reps; the GPU was left at
 0 MiB and `llama.router.service` was left stopped for the coordinator to
 restart.
+
+## 2026-11-08 — Shared-memory carveout and tile sizing (M2-T3, V100, sm_70)
+
+Window: `llama.router.service` stopped and queue drained by the coordinator,
+V100 free, `dmesg | grep -ic Xid` = **42 before and after**. 50 min budget.
+Build: `59bf0d4` + the M2-T3 plumbing (Rust-owned tiles, `attn_prefill_smem`,
+`carveout()` decision). Protocol unchanged from M2-T1/T2:
+`--pp 512,4096 --tg 128 --reps 3 --ctx 32896`, median of 3 reps.
+
+### Starting resource usage (`cuobjdump -res-usage`, sm_70 cubin)
+
+| kernel | REG | static smem | threads | blocks/SM by regs | by smem | warps/SM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `gemm_q2_k` | 157 | 27648 | 256 | 1 | 1 at the chosen 32 KiB config | 8 (12.5 %) |
+| `gemms_q2_k` | 64 | 13824 | 256 | 4 | 4 at 64 KiB | 32 (50 %) |
+| `attn_prefill_64` | 123 | 0 (+23552 dyn) | 128 | 4 | 4 | 16 |
+| `attn_prefill_128` | 159 | 0 (+39936 dyn) | 128 | 3 | 2 only with a 96 KiB carveout | 8 |
+| `attn_prefill_256` | 244 | 0 (+72704 dyn) | 128 | 2 | 1 (142 KiB for two) | 4 (6.25 %) |
+| `attn_decode_gqa_128` | 113 | 2112 (+36864 dyn) | 256 | 2 | 2 | 16 |
+| `attn_decode_gqa_256` | 164 | 2112 (+73728 dyn) | 256 | 1 | 1 | 8 |
+
+This confirms the issue's table: `gemm_*` is register-bound at one block/SM,
+`attn_prefill_256` is shared-memory-bound at one block.
+
+`ncu` LaunchStats/Occupancy (`--pp 4096 --tg 1 --launch-count 6`) captured the
+first six `gemm_*` launches before the count ran out; the attention kernels
+were not re-profiled (time budget). The important read-back: with the shipped
+default (no carveout attribute) the driver already selects the **minimal**
+configuration for `gemm_q5_k` (`Shared Memory Configuration Size` 32768 B for
+27648 B static), so there was no L1 to reclaim there:
+
+| kernel | REG | shared config | static | dynamic | block limit (regs/smem) | theoretical occ. |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `gemm_q5_k` | 157 | 32768 | 27648 | 0 | 1 / 1 | 12.50 % |
+| `gemm_q6_k` | 128 | 65536 | 27648 | 0 | 2 / 2 | 25 % |
+| `gemms_f32` | 58 | 65536 | 13824 | 0 | 4 / 4 | 50 % |
+
+### Candidates (median of 3 reps)
+
+All candidates are env-selectable, no rebuild: `STRATA_SMEM_CARVEOUT=off|policy|min`,
+`STRATA_GEMM_MIN_BLOCKS`, `STRATA_GEMM_BK`. C0 is `off`, i.e. the previous
+behaviour; the startup line reads
+`cuda shared memory: opt-in 98304 B per block, attn_prefill_*: 0 B static, dynamic max 72704 B, carveout default`.
+
+| run | changes | pp 512 | pp 4096 | tg @512 | tg @4096 | vs C0 512 / 4096 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| C0 | none (carveout off) | 2050.8 | 2779.1 | 123.0 | 119.0 | — |
+| C1 policy | carveout 82 % (`attn_prefill_*`), 78 % (`attn_decode_gqa_256`) | 2027.2 | 2781.4 | 122.9 | 119.1 | −1.15 % / +0.08 % |
+| C1 min | policy + minimal gemm carveout (29 %) | 1476.7 | 2466.6 | 123.0 | 119.3 | **−28.0 % / −11.3 %** |
+| C2 | `__launch_bounds__(·, 2)` (REG 157→128) | 2012.5 | 2989.4 | 122.5 | 118.6 | −1.87 % / **+7.57 %** |
+| C3 | `GEMM_BK = 32` (REG 157→80, smem 15360) | 1940.8 | 2884.6 | 122.8 | 119.2 | −5.36 % / +3.80 % |
+| C2+C3 | both | 1952.9 | 2862.5 | 123.1 | 119.4 | −4.77 % / +3.00 % |
+| final (default build) | same cubin as C0 | 2029.2 | 2758.8 | 122.9 | 118.7 | −1.05 % / −0.73 % |
+
+Reps ranges: C0 2044.9-2054.0 / 2776.3-2781.7; C2 2001.2-2023.4 /
+2981.9-2999.9; C3 1931.4-1946.1 / 2871.3-2894.8. The final line is a rerun of
+the byte-identical C0 cubin after the correctness tests (2029.2/2758.8,
+2029.2/2765.1 and 2016.2/2765.1); its 0.5-1 % spread is run-to-run drift, not
+a code change.
+
+### Decision
+
+**No candidate adopted.** The adoption rule is pp 4096 **≥ +2 %** *and*
+pp 512 **≥ −1 %**:
+
+- **C1 rejected** — +0.08 % at 4096, −1.15 % at 512, decode unchanged. The
+  `ncu` read-back shows the driver already picks the smallest fitting
+  configuration for `gemm_*`, so the explicit request could only add a hint.
+  `min` mode was actively harmful (−28 % at 512): lowering the carveout below
+  the driver's choice costs L1 outright.
+- **C2 rejected** — the only candidate with a real prefill win (+7.6 % at
+  4096) but −1.87 % at 512. `cuobjdump`: `REG:128 STACK:16 LOCAL:0`, i.e. no
+  local-memory spill flag but a 16-byte stack frame from the 157→128 register
+  cap; `gemms_*` rises 64→101 REG. The rule is strict, so this is documented
+  for a follow-up (why does the small-batch path lose?).
+- **C3 rejected** — +3.8 % at 4096, −5.4 % at 512. `REG:80 SHARED:15360
+  LOCAL:0` for `gemm_q2_k`; `gemms_*` 48 REG. `GEMM_BK=32` halves the K step
+  and doubles the step count.
+- **C2+C3 rejected** — +3.0 % at 4096, −4.8 % at 512.
+- **C4 dropped** — `GEMM_BM=64` changes the tile-list stride shared with
+  Vulkan (`backend.rs`, `gpu_model/prefill.rs`); out of scope per the issue.
+
+The shipped default therefore keeps the previous constants (`GEMM_BM 128`,
+`GEMM_BK 64`, `FA_BQ 64`, `FA_BK 32`, no minimum-block hint) and
+`STRATA_SMEM_CARVEOUT` defaults to `off`. R1/R2 remain: the values are
+Rust-owned, injected as `#define`s with `static_assert`s, and
+`attn_prefill_smem` is the single owner of the attention layout.
+
+### Correctness and safety
+
+```sh
+M=/mnt/models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
+STRATA_MODEL=$M STRATA_TEST_BACKENDS=cuda cargo test --release --test kernels matches \
+  -- --nocapture --test-threads=1        # tensor-core path: 10 passed
+STRATA_GEMM_FMA=1 STRATA_MODEL=$M ...    # FMA fallback: 10 passed
+```
+
+Both runs include `gemm_matches_reference_for_every_type` and
+`attn_prefill_matches_decode`; no failure, no NaN. `dmesg | grep -ic Xid` = 42
+after the window (unchanged), no `NVRM`/`device lost` line, GPU left at
+**0 MiB**. `llama.router.service` was left stopped for the coordinator.
