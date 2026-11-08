@@ -267,7 +267,19 @@ impl<'a> DsModel<'a> {
         let mut logits = vec![0f32; cfg.n_expert];
         l.gate_inp.matvec(cur, &mut logits);
         self.tr("ffn_moe_logits", il as i32, &logits);
-        let sel = route(&logits, &l.bias, cfg.n_used, cfg.weights_norm, cfg.weights_scale);
+        let mut sel = route(&logits, &l.bias, cfg.n_used, cfg.weights_norm, cfg.weights_scale);
+        // debug: force llama.cpp's expert ids (STRATA_DS_FORCE_TOPK=dir of i32 dumps, prompt tokens only) to separate routing flips from math errors
+        if let Some(dir) = std::env::var_os("STRATA_DS_FORCE_TOPK") {
+            let pos = self.cache[0].raw.len().saturating_sub(1);
+            if let Ok(b) = std::fs::read(std::path::Path::new(&dir).join(format!("ffn_moe_topk-{il}.f32"))) {
+                if (pos + 1) * 24 <= b.len() {
+                    let ids: Vec<usize> = (0..6).map(|k| u32::from_le_bytes(b[(pos * 6 + k) * 4..][..4].try_into().unwrap()) as usize).collect();
+                    let p = |i: usize| { let l = logits[i]; (if l > 20.0 { l } else { l.exp().ln_1p() }).sqrt() };
+                    let sum: f32 = ids.iter().map(|&i| p(i)).sum();
+                    sel = ids.into_iter().map(|i| (i, p(i) / (sum + 1e-20) * cfg.weights_scale)).collect();
+                }
+            }
+        }
         let ids: Vec<f32> = sel.iter().map(|s| s.0 as f32).collect();
         self.tr("ffn_moe_topk", il as i32, &ids);
         let n = cfg.n_embd;
