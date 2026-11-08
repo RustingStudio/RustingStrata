@@ -263,6 +263,8 @@ pub struct Stats {
     pub backend: String,
     pub device: String,
     pub ctx: usize,
+    #[serde(skip)]
+    pub ctx_train: Option<u64>,
     /// Requests decoded at once (`--parallel`).
     pub slots: usize,
     /// Device memory in use and in total, measured after the load and after each request.
