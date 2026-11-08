@@ -802,6 +802,20 @@ impl Vk {
 }
 
 impl Vk {
+    /// Quantize `x` for the int8 GEMM, unless the cache already holds the same rows; `None` when `ty` or `cols`
+    /// selects the f16 path. Shared by `gemm_raw` and `prequant_gemm_x`.
+    fn q8_x(&self, q8: &mut (Buf, Option<[u64; 4]>), ty: GgmlType, cols: usize, n_x: usize, x: u64, x_stride: usize) -> anyhow::Result<Option<u64>> {
+        if !crate::cuda::Gpu::mmq(ty) || !cols.is_multiple_of(128) { return Ok(None); }
+        let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
+        if q8.1 == key { return Ok(Some(q8.0.addr())); }
+        let need = n_x * (cols + cols / 8 + cols / 4);
+        if q8.0.len() < need { q8.0 = self.alloc(need)?; }  // dropping the old buffer waits for work that uses it
+        let xq = q8.0.addr();
+        self.run("quant_q8", &[self.0.llama], [n_x, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
+        q8.1 = key;
+        Ok(Some(xq))
+    }
+
     /// `gemm` over a tile list, or (tiles = 0) the dense matrix `wd` over positions 0 .. nd; as `gemm_raw` in
     /// src/cuda/mod.rs, with the same choice of f16 or int8 products (`Gpu::mmq`).
     fn gemm_raw(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, wd: u64, nd: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
@@ -831,14 +845,7 @@ impl Vk {
             if self.0.coop && tiles != 0 { self.run("gemm_fs", &spec, grid, &args)?; }
             return Ok(());
         }
-        let need = n_x * (cols + cols / 8 + cols / 4);
-        if q8.0.len() < need { q8.0 = self.alloc(need)?; }  // dropping the old buffer waits for work that uses it
-        let xq = q8.0.addr();
-        if !reuse {
-            ensure!(!self.0.st().batch, "gemm inside batch: x must be quantized already (SAME_X)");
-            self.run("quant_q8", &[self.0.llama], [n_x, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
-            q8.1 = key;
-        }
+        let xq = self.q8_x(&mut q8, ty, cols, n_x, x, x_stride)?.expect("int8 GEMM without a quantized x");
         let args: [&dyn Arg; 10] = [&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2]];
         self.run(if !self.0.coop_i8 { "gemmi_dp" } else if sm { "gemmi_s" } else { "gemmi" }, &spec, grid, &args)?;
         if self.0.coop_i8 && tiles != 0 { self.run("gemmi_s", &spec, grid, &args)?; }
@@ -1055,14 +1062,8 @@ impl Backend for Vk {
     }
 
     fn prequant_gemm_x(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize) -> anyhow::Result<()> {
-        if !crate::cuda::Gpu::mmq(w.ty) || w.cols % 128 != 0 { return Ok(()); }
-        let cols = w.cols;
-        let need = n * (cols + cols / 8 + cols / 4);
         let mut q8 = self.3.lock().unwrap();
-        if q8.0.len() < need { q8.0 = self.alloc(need)?; }
-        let xq = q8.0.addr();
-        self.run("quant_q8", &[self.0.llama], [n, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
-        q8.1 = Some([x, x_stride as u64, n as u64, cols as u64]);
+        self.q8_x(&mut q8, w.ty, w.cols, n, x, x_stride)?;
         Ok(())
     }
     fn gemv(&self, w: &GpuTensor, x: u64, y: u64) -> anyhow::Result<()> { self.gemvq(w, x, 0, 0, y, 0, 1) }
