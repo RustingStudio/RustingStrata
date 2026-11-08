@@ -1690,3 +1690,32 @@ Reading: on this dense model llama.cpp leads on prefill (+18 %) and decode
 same acceptance rate), even though the prompt is natural text and not a
 repetitive pattern. The fork's MTP closes part of the decode gap (30.5 → 37.7)
 but not all of it. No `Xid` during the run; production was restarted afterwards.
+
+## 2026-11-08 13:12 UTC — Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
+
+First block with the machine-readable `strata.bench.v1` record (M0-T8, #40):
+`tools/bench_v100.sh` writes the fenced `json` block below and appends the same
+line to `target/v100-bench.jsonl`.
+
+```
+$ strata bench --backend vulkan --pp 512,4096,32768 --tg 128 --reps 3 --ctx 32896 --json-out /tmp/strata-bench.DTGAKE.json
+vulkan device 0: Tesla V100-SXM2-32GB
+vulkan: Tesla V100-SXM2-32GB (NVIDIA 580.178.04), cooperative matrix f16 no int8 no, conditional rendering yes, maxComputeSharedMemorySize 49152
+vulkan: shared-memory preflight: 60 (kernel, specialization) pairs checked, largest 49152 bytes (gemmi_dp) of 49152 allowed, 0.7 ms
+plan: weights+state+scratch 2580 MB (KV 642 MB for 32896 tokens, prefill 512 MB), expert slots 10040 MB, resident experts 10240/10240
+expert traffic: 10.4 MB per layer active set (top-8), 313.8 MB per token over 40 MoE layers
+pp    512: prefill 773.6 (770.8-778.0) tok/s | tg 128: decode 123.3 (122.3-124.0) tok/s
+expert traffic: 313.8 MB/token -> 40.7 GB/s at 123.7 tok/s
+pp   4096: prefill 1425.2 (1422.6-1430.1) tok/s | tg 128: decode 117.6 (116.8-118.0) tok/s
+expert traffic: 313.8 MB/token -> 38.8 GB/s at 117.9 tok/s
+pp  32768: prefill 522.0 (520.6-523.8) tok/s | tg 128: decode 95.7 (95.6-95.7) tok/s
+expert traffic: 313.8 MB/token -> 31.5 GB/s at 95.6 tok/s
+expert hit rate 100.0% (0 misses), cache swaps 0
+worker busy 105.2 µs/token, worker stalls 0
+mailbox traffic: 80 GPU writes, 46080 host routing reads (fast path off, 10240/10240 experts resident)
+```
+
+```json
+{"backend":"vulkan","backend_arg":"vulkan","chunk":4096,"ctx":32896,"device":[0],"expert":{"bytes_per_token":328990720,"hit_rate_pct":100.0,"mb_per_token":313.8,"misses":0,"resident":10240,"swaps":0,"total":10240},"kv":"f16","model":{"name":"Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf","path":"/mnt/models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf"},"mtp":0,"reps":3,"results":[{"decode_tok_s":{"max":124.0,"mean":123.3,"min":122.3},"expert":{"at_decode_tok_s":123.7,"bytes_per_token":328990720,"gb_per_s":40.7,"mb_per_token":313.8},"pp":512,"prefill_tok_s":{"max":778.0,"mean":773.6,"min":770.8}},{"decode_tok_s":{"max":118.0,"mean":117.6,"min":116.8},"expert":{"at_decode_tok_s":117.9,"bytes_per_token":328990720,"gb_per_s":38.8,"mb_per_token":313.8},"pp":4096,"prefill_tok_s":{"max":1430.1,"mean":1425.2,"min":1422.6}},{"decode_tok_s":{"max":95.7,"mean":95.7,"min":95.6},"expert":{"at_decode_tok_s":95.6,"bytes_per_token":328990720,"gb_per_s":31.5,"mb_per_token":313.8},"pp":32768,"prefill_tok_s":{"max":523.8,"mean":522.0,"min":520.6}}],"schema":"strata.bench.v1","tg":128,"unix_time":1794143766}
+```
+
