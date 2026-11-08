@@ -1880,3 +1880,17 @@ This is the same root cause measured in M2-T7: the Vulkan parity gap and this
 prefill failure both come from the int8 GEMM, not from attention. A targeted
 f16-fallback (or an int8 accuracy fix) is the M3-T5 direction; the prefill cost
 of that fallback must be measured before adopting it.
+
+## 2026-11-08 — Cost of the f16 GEMM fallback on Vulkan (M3-T5 decision input)
+
+Same model, Vulkan, `--pp 512,4096 --tg 32 --reps 2 --ctx 4200`, mean (min–max):
+
+| GEMM path | pp 512 | pp 4096 | decode @4096 |
+| --- | ---: | ---: | ---: |
+| default (int8 `gemmi_dp`) | 776.1 (773.6–778.6) | 1431.8 (1426.3–1437.2) | 114.7 |
+| `STRATA_MMQ=` (f16 `gemm_f_dp`) | 440.2 (292.0–588.4) | 1135.2 (1131.7–1138.6) | 115.5 |
+
+A blanket f16 fallback costs **−20.7 % prefill at 4K** and −43 % at 512, which
+would violate the M3 Vulkan baseline (1423.9 @4K). M3-T5 therefore needs a
+per-type ablation (f16 only for the types that cause the divergences) or an
+int8 accuracy fix before the parity gap can be closed at an acceptable cost.
