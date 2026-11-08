@@ -38,3 +38,24 @@ and the loss outweighs the gain from accepted drafts.
 - Decode: faster than **67 tok/s** (llama.cpp best; its MTP is slower than plain decode here).
 - Prefill: at least **1017 tok/s** at 4K.
 - Top-1 agreement with llama.cpp: at least 99%.
+
+## V100 parity reference (M0-T7, 2026-11-07)
+
+The gate above ("at least 99% top-1 agreement") was measured on the RTX 3060 against a **CPU**
+llama.cpp build (`5d8ccdf9d`). The V100 baseline uses the CUDA build available on that host:
+
+- `llama-server` `/srv/llama.cpp/build/bin/llama-server`, `version: 0.9.0-dev (build 12110,
+  commit cd959bae9)` (`/props build_info: b12110-cd959bae9`), model fully on CUDA0.
+- Flags: `-ngl 99 -fa auto -c 4096 --seed 1234`; `-fa auto` resolved to **disabled**
+  (`Flash Attention over K/V rows not supported` in this build), `n_ctx_slot 4096`,
+  `n_slots 4`, `kv_unified true`.
+- llama.cpp self-agreement (token-by-token vs one-batch context): **630/640 = 98.44%**
+  (`tools/selfparity.py`, same server/build, 0 refused positions).
+- Strata on Vulkan (commit `d6c2beb`, `--gpu --backend vulkan --llama-numerics
+  --fixed-experts`): strict 625/640 = 97.66%, either llama.cpp mode 629/640 = 98.28%
+  (below the 634/640 bar - documented deviation in `docs/V100-results.md`, M0-T7).
+  Default path: strict 626/640, either 630/640.
+
+Reference numbers and the full per-prompt table: `docs/V100-results.md`, section
+"2026-11-07 - M0-T7 Vulkan parity baseline"; machine-readable artifact
+`docs/parity/vk-sm70.json`.

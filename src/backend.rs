@@ -75,6 +75,11 @@ pub fn open(kind: Option<&str>, device: usize) -> anyhow::Result<Box<dyn Backend
 /// `gemm` `act` flag: x is unchanged since the previous gemm call, which read the same x, so its int8 copy is reused.
 pub const SAME_X: i32 = 4;
 
+/// The weight type `Backend::upload` stores a tensor of type `ty` as: F16 as F32 (no F16 kernels; F32 holds every F16
+/// value exactly) and Q4_0/Q5_0 as Q8_0 (which holds their values exactly). Expert tensors are copied raw by
+/// `GpuModel::load_part`, not through `upload`, so they keep their type.
+pub fn upload_type(ty: GgmlType) -> GgmlType { match ty { GgmlType::F16 => GgmlType::F32, GgmlType::Q4_0 | GgmlType::Q5_0 => GgmlType::Q8_0, ty => ty } }
+
 pub trait Backend: Send {
     /// "cuda" or "vulkan".
     fn name(&self) -> &'static str;
@@ -112,27 +117,44 @@ pub trait Backend: Send {
     /// added nothing and the rest of that submission was skipped: the caller waits for the worker and runs the
     /// forward again from that combine. Clears the flag. Backends whose combines never give up return false.
     fn stalled(&self) -> bool { false }
+    /// Whether the prefill GEMM for `ty` runs on int8 tensor cores on this backend: the type policy of `Gpu::mmq`,
+    /// gated on the device. Tests build their reference math from this, since the CUDA launcher takes the f16
+    /// `gemm_*` path where the arch has no int8 tensor cores (sm_70) even for an int8 type.
+    fn mmq(&self, ty: GgmlType) -> bool { crate::cuda::Gpu::mmq(ty) }
+    /// Whether this backend runs the Volta (sm_70) CUDA fallbacks, whose kernels sum the same f16 products in
+    /// another order than `mma.sync`. A cross-backend comparison against or from such a backend is by tolerance.
+    fn volta(&self) -> bool { false }
     /// Zeroed host memory of `words` u32 that kernels read and write at the `Buf` address. The host pointer is
     /// valid while the `Buf` lives.
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)>;
 
+    /// Refuse, before any weight is uploaded, if a pipeline these weight types (`GpuModel`'s upload types) need would
+    /// exceed the device's shared-memory limit; `verbose` also lists each checked (kernel, specialization) pair.
+    /// Vulkan computes it from the committed SPIR-V and the specialization constants; backends without a Workgroup
+    /// shared-memory limit have nothing to check.
+    fn preflight(&self, _types: &[GgmlType], _verbose: bool) -> anyhow::Result<()> { Ok(()) }
+
     fn upload(&self, t: &Tensor) -> anyhow::Result<GpuTensor> {
-        if t.ty == GgmlType::F16 {  // no F16 kernels: uploaded as F32, which holds every F16 value exactly
-            let mut f = vec![0f32; t.rows * t.cols];
-            crate::quant::dequant_row(GgmlType::F16, t.data, &mut f);
-            let b = self.alloc(4 * f.len())?;
-            self.htod(&f.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), &b, 0)?;
-            return Ok(GpuTensor::new(GgmlType::F32, t.rows, t.cols, b));
+        match upload_type(t.ty) {
+            GgmlType::F32 if t.ty == GgmlType::F16 => {
+                let mut f = vec![0f32; t.rows * t.cols];
+                crate::quant::dequant_row(GgmlType::F16, t.data, &mut f);
+                let b = self.alloc(4 * f.len())?;
+                self.htod(&f.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), &b, 0)?;
+                Ok(GpuTensor::new(GgmlType::F32, t.rows, t.cols, b))
+            }
+            GgmlType::Q8_0 if matches!(t.ty, GgmlType::Q4_0 | GgmlType::Q5_0) => {
+                let q = crate::quant::to_q8_0(t.ty, t.data);
+                let b = self.alloc(q.len())?;
+                self.htod(&q, &b, 0)?;
+                Ok(GpuTensor::new(GgmlType::Q8_0, t.rows, t.cols, b))
+            }
+            ty => {
+                let b = self.alloc(t.data.len())?;
+                self.htod(t.data, &b, 0)?;
+                Ok(GpuTensor::new(ty, t.rows, t.cols, b))
+            }
         }
-        if matches!(t.ty, GgmlType::Q4_0 | GgmlType::Q5_0) {  // as Q8_0, which holds their values exactly (experts keep theirs)
-            let q = crate::quant::to_q8_0(t.ty, t.data);
-            let b = self.alloc(q.len())?;
-            self.htod(&q, &b, 0)?;
-            return Ok(GpuTensor::new(GgmlType::Q8_0, t.rows, t.cols, b));
-        }
-        let b = self.alloc(t.data.len())?;
-        self.htod(t.data, &b, 0)?;
-        Ok(GpuTensor::new(t.ty, t.rows, t.cols, b))
     }
 
     /// u16 words of a KV cache for `n` values: f16, or q8 with one f16 scale per 32 values.
@@ -283,10 +305,25 @@ pub trait Backend: Send {
     fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()>;
     /// Decode routing: `router_topk`, the expert cache lookup (slots[j] = table[ids[j]], -1 = not resident; wh[j] =
     /// wts[j] on a hit, else 0), then the routing and (on a miss) `h` (rows of nh) written to the layer mailbox at
-    /// `mb` and its request flag raised.
-    fn moe_route(&self, p: u64, n: usize, k: usize, extra_scale: f32, table: u64, ids: u64, wts: u64, slots: u64, wh: u64, h: u64, mb: u64, nh: usize, h_off: usize, step: u64, t: usize) -> anyhow::Result<()>;
+    /// `mb` and its request flag raised. `mb` = 0 skips every mailbox store where `moe_mailbox_optional` holds. `pid`
+    /// (0 = none) receives the last token's ids, the prediction the next token's prefetch uses.
+    fn moe_route(&self, p: u64, n: usize, k: usize, extra_scale: f32, table: u64, ids: u64, wts: u64, slots: u64, wh: u64, h: u64, mb: u64, nh: usize, h_off: usize, step: u64, t: usize, pid: u64) -> anyhow::Result<()>;
     /// `mb` = 0: no CPU part. Otherwise adds the CPU result at word `y_off` of the mailbox once its done flag is `seq`.
     fn moe_combine(&self, x: u64, ye: u64, w: u64, k: usize, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, slots: u64, n: usize, t: usize) -> anyhow::Result<()>;
+    /// Whether `moe_route`/`moe_combine` accept `mb = 0`, i.e. a fully resident expert cache costs the CPU worker
+    /// nothing (no mailbox traffic at all). False where the kernels read the mailbox unconditionally (Vulkan).
+    fn moe_mailbox_optional(&self) -> bool { false }
+
+    /// Whether `moe_prefetch` does anything here (CUDA: yes; Vulkan: no kernel, the knob is ignored).
+    fn moe_prefetch_supported(&self) -> bool { false }
+
+    /// Hint into L2 the cached slots of the experts `ids` of a layer (`table` maps expert to slot, -1 = on the CPU):
+    /// `STRATA_MOE_PREFETCH`, a performance knob only. A no-op where `moe_prefetch_supported` is false.
+    fn moe_prefetch(&self, ids: u64, k: usize, table: u64, base: u64, stride: usize, bytes: usize) -> anyhow::Result<()> {
+        let _ = (ids, k, table, base, stride, bytes);
+        Ok(())
+    }
+
     /// `moe_gemv` of the down experts (`k` slots per token, x pre-quantized at `xq` when not 0) into `ye`, then
     /// `moe_combine` of ye into x.
     fn moe_down_combine(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, slots: u64, k: usize, h: u64, ye: u64, xq: u64,

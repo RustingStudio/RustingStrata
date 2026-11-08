@@ -88,10 +88,13 @@ impl GpuModel<'_> {
             self.prefill_chunk(ch, None)?;
         }
         // The prompt's routing predicts the reply's: place its hot experts now instead of 64 per adapt during decode.
+        // A fully resident cache has no hot missed expert to place: skip the scan over all its entries (issue #34 R2).
         let adapt = self.adapt_every > 0;
         let mut p = Some(&mut *self);
         while let Some(q) = p {
-            if adapt && let Some(cache) = q.cache.as_mut() { cache.adapt(q.m, &*q.gpu, usize::MAX)?; }
+            if let Some(cache) = q.cache.as_mut() {
+                if adapt && !cache.fully_resident() { cache.adapt(q.m, &*q.gpu, usize::MAX)?; }
+            }
             p = q.next.as_deref_mut();
         }
         let s = self.tail();
