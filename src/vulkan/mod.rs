@@ -25,6 +25,7 @@ const SPV: &[(&str, &[u8])] = &[
     ("attn_prefill_64", include_bytes!("spv/attn_prefill_64.spv")),
     ("attn_prefill_dp", include_bytes!("spv/attn_prefill_dp.spv")),
     ("attn_prefill_llama", include_bytes!("spv/attn_prefill_llama.spv")),
+    ("attn_prefill_tile", include_bytes!("spv/attn_prefill_tile.spv")),
     ("attn_prefill_128", include_bytes!("spv/attn_prefill_128.spv")),
     ("attn_prefill_256", include_bytes!("spv/attn_prefill_256.spv")),
     ("conv_silu", include_bytes!("spv/conv_silu.spv")),
@@ -139,6 +140,9 @@ struct Inner {
     budget: bool,
     /// VK_KHR_cooperative_matrix with the 16 x 16 x 16 f16 / f32 shape is enabled (`gemm_f`, `attn_prefill`).
     coop: bool,
+    /// Without cooperative matrices: run the tiled `attn_prefill_tile` (one KV-head tile shared by 32 query/head tasks)
+    /// when the device allows it. STRATA_VK_DP_OLD=1 keeps the older per-query `attn_prefill_dp`.
+    dp_tile: bool,
     /// The 16 x 16 x 32 int8 / int32 shape is there too (`gemmi`).
     coop_i8: bool,
     /// VK_AMD_device_coherent_memory is enabled (the mailbox uses `BAR_AMD`).
@@ -349,6 +353,10 @@ impl Vk {
         let coop = shape(16, vk::ComponentTypeKHR::FLOAT16, vk::ComponentTypeKHR::FLOAT32)
             && std::env::var_os("STRATA_VK_NO_COOP").is_none();  // STRATA_VK_NO_COOP: run the kernels for devices without them
         let coop_i8 = coop && shape(32, vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32);
+        // The tiled fallback needs a 1024-thread workgroup and 32 KB of shared memory (see attn_prefill_tile.comp).
+        let limits = unsafe { instance.get_physical_device_properties(pd) }.limits;
+        let dp_tile = !coop && limits.max_compute_work_group_invocations >= 1024 && limits.max_compute_shared_memory_size >= 32 << 10
+            && std::env::var_os("STRATA_VK_DP_OLD").is_none();
         if coop { exts.push(ash::khr::cooperative_matrix::NAME.as_ptr()) }
         let mut fdc = vk::PhysicalDeviceCoherentMemoryFeaturesAMD::default();
         let amd_coherent = has(ash::amd::device_coherent_memory::NAME) && {
@@ -408,7 +416,7 @@ impl Vk {
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, coop, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -438,6 +446,7 @@ impl Vk {
         let amd = if v.0.amd_plain || v.0.amd_coherent { format!(", device-coherent memory {}", yn(v.0.amd_coherent)) } else { String::new() };
         eprintln!("vulkan: {name} ({} {}){amd}, cooperative matrix f16 {} int8 {}, conditional rendering {}", s(&drv.driver_name),
             s(&drv.driver_info), yn(v.0.coop), yn(v.0.coop_i8), yn(v.0.cr.is_some() && !v.0.st().no_cond));
+        if !v.0.coop { eprintln!("vulkan: prefill attention: {} (no cooperative matrices)", if v.0.dp_tile { "tiled" } else { "per-query" }); }
         Ok(v)
     }
 
@@ -800,14 +809,19 @@ impl Vk {
         ensure!(cols % 64 == 0, "{} matrix with {cols} columns: GEMM needs a multiple of 64", ty.name());
         if n_tiles == 0 { return Ok(()); }
         let (spec, grid, nk) = (self.wspec(ty), [rows.div_ceil(64), n_tiles, 1], (cols / 64) as u32);
+        let (same, act) = (act & SAME_X != 0, act & !SAME_X);
+        let mut q8 = self.3.lock().unwrap();
+        let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);  // as on CUDA
+        let reuse = same && q8.1 == key;
+        // A SAME_X gemm inside a batch cannot quantize x (the quantize and the gemm would not be ordered): when the
+        // cached q8 rows are not x's, use the f16 kernel (as on CUDA).
+        let int8 = crate::cuda::Gpu::mmq(ty) && cols.is_multiple_of(128);
+        let f = !int8 || (same && !reuse && self.0.st().batch);
         // A dense GEMM of few workgroups runs as gemm_fs/gemmi_s (cooperative matrices only), 32 positions a
         // workgroup (as on CUDA).
-        let f = !crate::cuda::Gpu::mmq(ty) || cols % 128 != 0;
         let sm = tiles == 0 && grid[0] * grid[1] < 112 && if f { self.0.coop } else { self.0.coop_i8 };
         let grid = if sm { [grid[0], nd.div_ceil(32), 1] } else { grid };
-        let (same, act) = (act & SAME_X != 0, act & !SAME_X);
         let tail = [&(rows as u32) as &dyn Arg, &nk, &act];
-        let mut q8 = self.3.lock().unwrap();
         // gemmi loads q8 rows 16 bytes at a time: their stride (cols * 11 / 8) is aligned only for cols % 128 == 0.
         if f {
             if !same { q8.1 = None; }
@@ -820,8 +834,7 @@ impl Vk {
         let need = n_x * (cols + cols / 8 + cols / 4);
         if q8.0.len() < need { q8.0 = self.alloc(need)?; }  // dropping the old buffer waits for work that uses it
         let xq = q8.0.addr();
-        let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);  // as on CUDA
-        if !(same && q8.1 == key) {
+        if !reuse {
             ensure!(!self.0.st().batch, "gemm inside batch: x must be quantized already (SAME_X)");
             self.run("quant_q8", &[self.0.llama], [n_x, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
             q8.1 = key;
@@ -1156,6 +1169,17 @@ impl Backend for Vk {
             return self.run("attn_prefill_llama", &[0, hd as u32], [t, nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32)]);
         }
         if !self.0.coop {
+            if self.0.dp_tile {
+                // One workgroup: 32 (query, head) tasks of one KV head, sharing a 32 KB K/V tile. hper query heads
+                // per KV head, bq queries each; h groups when there are more than 32 heads per KV head.
+                let g = nh / nkv;
+                let hper = g.min(32);
+                let bq = 32 / hper;
+                let hgroups = g.div_ceil(hper);
+                return self.run("attn_prefill_tile", &[0, hd as u32], [t.div_ceil(bq), nkv * hgroups, 1],
+                    &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32),
+                      &(bq as u32), &(hper as u32), &(hgroups as u32)]);
+            }
             return self.run("attn_prefill_dp", &[0, (hd / 32) as u32], [t.div_ceil(4), nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32)]);
         }
         self.run(name, &[], [t.div_ceil(64), nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32)])

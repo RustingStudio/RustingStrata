@@ -9,6 +9,7 @@ told us what they need. Thank you all.
   downclock in the gaps of a layer split.
 - [charmoky](https://github.com/charmoky): RX 9070 XT reports and reruns on Vulkan/RADV (issue #3).
 - [ike287](https://github.com/ike287): feedback and feature requests.
+- [pberenyi](https://github.com/pberenyi): fount bug with Swift-1.5-Qwen3.8-27B (issue #11)
 
 ## Ideas
 
