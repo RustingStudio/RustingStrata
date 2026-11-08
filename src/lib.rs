@@ -15,3 +15,4 @@ pub mod cpu_worker;
 pub mod serve;
 pub mod chat;
 pub mod hf;
+pub mod deepseek;

@@ -4,6 +4,7 @@ use rusting_strata::gguf::{Gguf, Value};
 fn show(v: &Value) -> String {
     match v {
         Value::Str(s) => format!("{:?}", s.chars().take(120).collect::<String>()),
+        Value::Arr(a) if a.len() <= 64 => format!("[{}]", a.iter().map(show).collect::<Vec<_>>().join(", ")),
         Value::Arr(a) => format!("[{} items; first: {}]", a.len(), a.first().map(show).unwrap_or_default()),
         v => format!("{v:?}"),
     }
