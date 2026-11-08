@@ -23,19 +23,43 @@ pub fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
 
 use rusting_strata::backend::{Backend, Buf, Plain};
 
+/// The backend names in `STRATA_TEST_BACKENDS` (comma-separated, case-insensitive), or `None` when it is absent or
+/// empty. A selection lets GPU tests run on one backend while another cannot open (the CUDA sm_70 NVRTC panic).
+fn selected_backends() -> Option<Vec<String>> {
+    let v = std::env::var("STRATA_TEST_BACKENDS").ok()?;
+    let names: Vec<String> = v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_ascii_lowercase).collect();
+    (!names.is_empty()).then_some(names)
+}
+
 /// Every GPU backend that opens on this machine, by name. One that fails to open for lack of a device is skipped
-/// with a note; any other error (such as a kernel compile error) fails the test.
+/// with a note; any other error (such as a kernel compile error) fails the test. `STRATA_TEST_BACKENDS` restricts
+/// the set: a backend it does not name is reported as `SKIP: <name> (filtered)` and never opened, so it cannot panic.
 pub fn backends() -> Vec<(&'static str, Box<dyn Backend>)> {
+    let sel = selected_backends();
+    let wanted = |name: &str| sel.as_ref().is_none_or(|s| s.iter().any(|n| n == name));
     let mut v: Vec<(&'static str, Box<dyn Backend>)> = vec![];
-    match rusting_strata::cuda::Gpu::new(0) {
-        Ok(g) => v.push(("cuda", Box::new(g))),
-        Err(e) if format!("{e}") == "CUDA init" => eprintln!("SKIP: cuda: {e:#}"),
-        Err(e) => panic!("{e:#}"),
+    if wanted("cuda") {
+        match rusting_strata::cuda::Gpu::new(0) {
+            Ok(g) => v.push(("cuda", Box::new(g))),
+            Err(e) if format!("{e}") == "CUDA init" => eprintln!("SKIP: cuda: {e:#}"),
+            Err(e) => panic!("{e:#}"),
+        }
+    } else {
+        eprintln!("SKIP: cuda (filtered)");
     }
-    match rusting_strata::vulkan::Vk::new(0) {
-        Ok(g) => v.push(("vulkan", Box::new(g))),
-        Err(e) if format!("{e}") == "Vulkan init" => eprintln!("SKIP: vulkan: {e:#}"),
-        Err(e) => panic!("{e:#}"),
+    if wanted("vulkan") {
+        match rusting_strata::vulkan::Vk::new(0) {
+            Ok(g) => v.push(("vulkan", Box::new(g))),
+            Err(e) if format!("{e}") == "Vulkan init" => eprintln!("SKIP: vulkan: {e:#}"),
+            Err(e) => panic!("{e:#}"),
+        }
+    } else {
+        eprintln!("SKIP: vulkan (filtered)");
+    }
+    if let Some(sel) = sel {
+        for name in sel.iter().filter(|n| !matches!(n.as_str(), "cuda" | "vulkan")) {
+            eprintln!("SKIP: {name} (filtered)");
+        }
     }
     v
 }

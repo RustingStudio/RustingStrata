@@ -18,6 +18,7 @@ shared uint64_t s_g2[T == 22 ? 1024 : 1];
 #define KV_IQ4NL kvalues_iq4nl
 #define IQ3S_GRID iq3s_grid
 #define IQ2S_GRID iq2s_grid
+void load_tables() {}  // the tables come from the buffer
 #endif
 
 
