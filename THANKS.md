@@ -10,10 +10,12 @@ told us what they need. Thank you all.
 - [charmoky](https://github.com/charmoky): RX 9070 XT reports and reruns on Vulkan/RADV (issue #3).
 - [ike287](https://github.com/ike287): feedback and feature requests.
 - [pberenyi](https://github.com/pberenyi): fount bug with Swift-1.5-Qwen3.8-27B (issue #11)
+- [luckydevil13](https://github.com/luckydevil13): helped with AMD benchmarks and some Ideas about new models.
 
 ## Ideas
 
 - [FredWalter](https://github.com/FredWalter): multi-GPU and Qwen3.8-Flash-Next support (issue #1).
+- [Ocean572](https://github.com/Ocean572): configurable allowed-host setting for LAN access (issue #13).
 
 ## Code
 
