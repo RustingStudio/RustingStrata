@@ -410,3 +410,16 @@ pp  65536: prefill  79.5 tok/s | tg 128: decode 22.0 tok/s
 128k and 256k were not completed: the run was stopped at the production
 window limit. Estimated on this build: 128k ~30-40 min, 256k ~80-100 min of
 prefill. KV q8 at 256k is 8708 MB; the plan fits in 32 GB.
+
+### Follow-up: 128k measured, 256k not completed
+
+```
+strata bench --gpu --backend cuda --kv q8 --ctx 262272 \
+  --pp 131072,262144 --tg 128 --reps 1
+
+pp 131072: prefill 53.9 tok/s | tg 128: decode 17.8 tok/s
+```
+
+256k did not complete: the prefill was still running when the production
+window closed and the run was stopped. At this rate it needs roughly 100-120
+minutes of prefill on this build (sm_70 FMA fallback).
