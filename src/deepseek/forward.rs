@@ -92,7 +92,7 @@ impl<'a> DsModel<'a> {
             let engram = if cfg.engram_index(il).is_some() { Some((m("engram_kv.weight")?, v("engram_gate.weight")?)) } else { None };
             layers.push(Layer {
                 attn_norm: v("attn_norm.weight")?, sinks: v("attn_sinks.weight")?, q_a_norm: v("attn_q_a_norm.weight")?, kv_a_norm: v("attn_kv_a_norm.weight")?,
-                wq_a: m("attn_q_a.weight")?, wq_b: m("attn_q_b.weight")?, wkv: m("attn_kv.weight")?, wo_a: m("attn_output_a.weight")?, wo_b: m("attn_output_b.weight")?,
+                wq_a: m("attn_q_a.weight")?, wq_b: m("attn_q_b.weight")?, wkv: m("attn_kv.weight")?, wo_a: Mat::load_groups(g, &format!("blk.{il}.attn_output_a.weight"), cfg.o_groups)?, wo_b: m("attn_output_b.weight")?,
                 hc_attn: hcw("attn")?, hc_ffn: hcw("ffn")?, ffn_norm: v("ffn_norm.weight")?, gate_inp: m("ffn_gate_inp.weight")?, bias: v("exp_probs_b.bias")?,
                 gexps: m("ffn_gate_exps.weight")?, uexps: m("ffn_up_exps.weight")?, dexps: m("ffn_down_exps.weight")?,
                 gsh: m("ffn_gate_shexp.weight")?, ush: m("ffn_up_shexp.weight")?, dsh: m("ffn_down_shexp.weight")?,
@@ -252,7 +252,7 @@ impl<'a> DsModel<'a> {
         let gsz = nh * hd / cfg.o_groups;
         let mut oa = vec![0f32; cfg.o_groups * cfg.o_lora];
         for g in 0..cfg.o_groups {
-            let sub = Mat { data: &l.wo_a.data[g * cfg.o_lora * l.wo_a.ty.row_bytes(l.wo_a.cols as u64)..], rows: cfg.o_lora, ..l.wo_a };
+            let sub = l.wo_a.group(g, cfg.o_groups);
             sub.matvec(&out[g * gsz..(g + 1) * gsz], &mut oa[g * cfg.o_lora..(g + 1) * cfg.o_lora]);
         }
         self.tr("attn_wo_a", il as i32, &oa);

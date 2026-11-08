@@ -14,6 +14,20 @@ fn main() -> anyhow::Result<()> {
         logits = m.step(t);
         eprintln!("prompt tok {t} {:?}", t0.elapsed());
     }
+    // Teacher forcing against a llama-server completion JSON (tools/deepseek_ref/ref_*.json): feed the reference
+    // tokens and count how often our argmax equals the reference token.
+    if let Some(path) = a.get(4) {
+        let j: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        let refs: Vec<u32> = j["completion_probabilities"].as_array().unwrap().iter().map(|c| c["id"].as_u64().unwrap() as u32).collect();
+        let (mut hit, mut first_miss) = (0, None);
+        for (i, &r) in refs.iter().take(n_new).enumerate() {
+            let top = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+            if top == r { hit += 1 } else { first_miss.get_or_insert(i); eprintln!("step {i}: ours {top} ref {r}") }
+            logits = m.step(r);
+        }
+        println!("teacher-forced top-1: {hit}/{} first_miss={first_miss:?}", n_new.min(refs.len()));
+        return Ok(());
+    }
     let mut out = vec![];
     for _ in 0..n_new.max(1) {
         let mut top: Vec<(usize, f32)> = logits.iter().cloned().enumerate().collect();
