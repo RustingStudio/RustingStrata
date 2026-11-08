@@ -154,6 +154,10 @@ pub fn route(logits: &[f32], bias: &[f32], n_used: usize, norm: bool, scale: f32
     let probs: Vec<f32> = logits.iter().map(|&l| (if l > 20.0 { l } else { l.exp().ln_1p() }).sqrt()).collect();
     let mut idx: Vec<usize> = (0..probs.len()).collect();
     idx.sort_by(|&a, &b| (probs[b] + bias[b]).partial_cmp(&(probs[a] + bias[a])).unwrap().then(a.cmp(&b)));
+    if std::env::var_os("STRATA_DS_MARGIN").is_some() {
+        let s = |i: usize| probs[i] + bias[i];
+        eprintln!("margin {:.4} sel={:?} next={}", s(idx[n_used - 1]) - s(idx[n_used]), &idx[..n_used], idx[n_used]);
+    }
     idx.truncate(n_used);
     let sum: f32 = idx.iter().map(|&i| probs[i]).sum();
     idx.into_iter()
