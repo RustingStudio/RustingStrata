@@ -1866,3 +1866,17 @@ no Xid
 llama.router.service: inactive
 ```
 
+
+## 2026-11-08 — Vulkan prefill numeric failure is the int8 GEMM (M3-T5 evidence)
+
+`tests/gpu_model.rs::prefill_matches_reference` on the reference model, Vulkan:
+
+| GEMM path | next-step argmax (prefill) | CPU | max abs dlogit | verdict |
+| --- | ---: | ---: | ---: | --- |
+| default (int8 `gemmi_dp`) | 15019 | 4938 | 1.4263 | FAIL |
+| `STRATA_MMQ=` (forced f16 `gemm_f_dp`) | 4938 | 4938 | 0.7616 | PASS |
+
+This is the same root cause measured in M2-T7: the Vulkan parity gap and this
+prefill failure both come from the int8 GEMM, not from attention. A targeted
+f16-fallback (or an int8 accuracy fix) is the M3-T5 direction; the prefill cost
+of that fallback must be measured before adopting it.
