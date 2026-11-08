@@ -55,10 +55,11 @@ IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL.
 ## Build
 
 Needs Rust (2024 edition) and either an NVIDIA driver with the CUDA 13 NVRTC library (loaded at run time) or a
-Vulkan 1.3 driver with shaderFloat64, int8/16/64 and subgroup size 32 or fixed size 64 (tested on RTX 3060 and
-Radeon VII; Intel Arc lacks shaderFloat64). `--gpu` picks CUDA when it loads, else Vulkan; `--backend`
-chooses. The first CUDA run compiles the kernels (~15 s) and caches them. AMD GPUs: see [docs/AMD.md](docs/AMD.md)
-for known issues and what to send in a report.
+Vulkan 1.3 driver with shaderFloat64, int8/16/64 and subgroup size 32 or a fixed size 64 (tested on RTX 3060 and
+Radeon VII; Intel Arc lacks shaderFloat64). The CUDA kernels need Ampere or newer (compute capability 8.0, for
+`cp.async` and int8 tensor cores); on Pascal, Turing or Volta use `--backend vulkan`. `--gpu` picks CUDA when it
+loads, else Vulkan; `--backend` chooses. The first CUDA run compiles the kernels (~15 s) and caches them. AMD GPUs:
+see [docs/AMD.md](docs/AMD.md) for known issues and what to send in a report.
 
 ```sh
 cargo build --release
@@ -92,13 +93,16 @@ STRATA_API_KEY=secret target/release/strata serve --model $M --gpu --addr 127.0.
 ```
 
 `serve` speaks the OpenAI chat completions API (`POST /v1/chat/completions`, streamed or not, `GET /v1/models`).
-It runs one request at a time. `temperature`, `top_k`, `top_p` and `seed` are honored, and decoding is greedy when
-they are left out. When a request repeats the previous request's messages and adds new ones, only the new part is
+It runs one request at a time; `--parallel N` (GPU) decodes up to N together (4 requests: 164 tok/s in total on the
+3060, 41 each; see [docs/HOSTING.md](docs/HOSTING.md)). `temperature`, `top_k`, `top_p` and `seed` are honored, and decoding is greedy when
+they are left out. `max_tokens` (or `max_completion_tokens`) and `stop` (up to 16 strings) work as in the OpenAI
+API; `n` must be 1. Thinking is off unless a request sets `chat_template_kwargs.enable_thinking` (Anthropic:
+`thinking: {"type": "enabled"}`). When a request repeats the previous request's messages and adds new ones, only the new part is
 prefilled (`usage.prompt_tokens_details.cached_tokens`). `tools` and `tool_choice` work as in the OpenAI API (calls
 come back as `tool_calls` with `finish_reason: "tool_calls"`). The prompt follows the model's own chat template,
 rendered like llama.cpp's `--jinja`. `tool_choice: "required"` does not force a call.
 `POST /v1/messages` speaks the Anthropic Messages API (text, `tool_use` and `tool_result` blocks, streamed or not,
-the key in `x-api-key`), so Claude Code can use the server:
+the key in `x-api-key`, and `POST /v1/messages/count_tokens`), so Claude Code can use the server:
 `ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=secret ANTHROPIC_MODEL=local ANTHROPIC_SMALL_FAST_MODEL=local claude`.
 OpenCode and other agents use the OpenAI address. Qwen3.6's template leaves the think block out of replies before the
 last user message, so each new user message changes the text of the earlier turns and the whole conversation is
@@ -107,9 +111,9 @@ prefilled again. Strata keeps those blocks by default, so a long agent session p
 A request with another history (an agent's side request for a title or a summary) parks the conversation's state in
 host memory (`--cache-ram`, 4096 MB by default), and the next request that continues it takes it back instead of
 prefilling it again.
-The server has one key and treats all clients as one user: the cached-token count and the response time show
-whether the previous request started with the same messages, so do not share one server between people who must
-not learn each other's prompts.
+For a server that other people use (customer keys in a file, a usage log for billing, `/health`, TLS through a
+reverse proxy, systemd), see [docs/HOSTING.md](docs/HOSTING.md). Each customer key reuses only its own cached
+conversations; all requests under one key count as one user.
 
 Useful flags: `--ctx` (KV cache size, default 4096), `--mtp [N]` (speculative decoding with the model's draft
 head; greedy tokens stay the same, sampling keeps its distribution), `--chunk`, `--threads`, `--vram-margin`. On a

@@ -142,21 +142,17 @@ pub trait Backend: Send {
     /// y = silu(y) * result (SwiGLU with the gate already in y), 2 adds to y; `| SAME_X` as below. `n_x`: rows of x
     /// the tiles read.
     fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()>;
+    /// Whether `gemm` and `gemm_dense` run on int8 tensor cores for `ty` (the alternative is f16 products), so tests
+    /// and callers build their reference the way this backend will.
+    fn int8_gemm(&self, ty: GgmlType) -> bool;
     /// y[m] (op) W x[m] for positions m < n, x and y rows `x_stride` / `y_stride` floats apart.
     fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()>;
+    fn prequant_gemm_x(&self, _w: &GpuTensor, _n: usize, _x: u64, _x_stride: usize) -> anyhow::Result<()> { Ok(()) }
     /// y = W x (all rows of `w`).
     fn gemv(&self, w: &GpuTensor, x: u64, y: u64) -> anyhow::Result<()>;
     /// y[t] = W x[t] for t < nt (1 to 4; x[t] at x + 4 * t * x_stride bytes, y[t] at y + 4 * t * y_stride); each
     /// weight block is read once for all nt.
     fn gemvn(&self, w: &GpuTensor, x: u64, x_stride: usize, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()>;
-    /// Whether this backend can use unquantized activations for a numerically sensitive dense layer.
-    fn accurate_dense_layer(&self) -> bool { false }
-    /// First layer to use unquantized activations; the output head stays unquantized.
-    fn accurate_dense_start(&self, _layers: usize) -> usize { 0 }
-    /// Dense GEMV with unquantized activations, when supported by the backend.
-    fn gemv_unquantized(&self, w: &GpuTensor, x: u64, xs: usize, y: u64, ys: usize, nt: usize) -> anyhow::Result<()> {
-        self.gemvn(w, x, xs, y, ys, nt)
-    }
     /// `gemvn` that reads x pre-quantized by `quant_xq` at `xq` (0 = quantize x itself; float weights read x).
     fn gemvq(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()>;
     /// `gemvq` of `a` into `ya` and of `b` into `yb` on the same x (columns alike; output rows `a.rows` / `b.rows` apart).

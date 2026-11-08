@@ -12,10 +12,10 @@ layout(push_constant) uniform P { F32 p; I32 table; I32 ids; F32 wts; I32 slots;
 // missed) copied to the host-mapped mailbox, T stored in word 1, word 8 zeroed and the request flag (word 0) raised to step[1].
 shared bool miss;
 void main() {
-    uint lane = (gl_SubgroupInvocationID & 31u), kt = p.k * p.T;
+    uint lane = LANE, kt = p.k * p.T;
     if (gl_LocalInvocationID.x == 0) miss = false;
     barrier();
-    for (uint t = (gl_SubgroupID * (gl_SubgroupSize / 32u) + gl_SubgroupInvocationID / 32u); t < p.T; t += ((gl_WorkGroupSize.x + 31u) / 32u)) {
+    for (uint t = WARP; t < p.T; t += ((gl_WorkGroupSize.x + 31u) / 32u)) {
         int id;
         float w;
         topk(p.p, t * p.n, p.n, p.k, p.extra_scale, lane, id, w);

@@ -11,7 +11,7 @@ shared float sq[HD], sc[32];
 float hf(uint16_t b) { return float(uint16BitsToHalf(b)); }
 
 void main() {
-    uint t = gl_WorkGroupID.x, h = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x, w = (gl_SubgroupID * (gl_SubgroupSize / 32u) + gl_SubgroupInvocationID / 32u), lane = (gl_SubgroupInvocationID & 31u);
+    uint t = gl_WorkGroupID.x, h = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x, w = WARP, lane = LANE;
     uint kvh = h / (p.nh / p.nkv), last = uint(p.step.v[0]) + t;
     for (uint d = tid; d < HD; d += 128) sq[d] = p.q.v[(t * p.nh + h) * HD + d];
     precise float acc[R], l = 0.0;

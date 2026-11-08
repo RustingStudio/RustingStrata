@@ -24,7 +24,7 @@ shared float rs[4 * 16];           // per row: the rescale factor, at the end th
 
 void main() {
     uint pos0 = uint(p.step.v[0]), q0 = (gl_NumWorkGroups.x - 1 - gl_WorkGroupID.x) * BQ, h = gl_WorkGroupID.y, kvh = h / (p.nh / p.nkv), kvd = p.nkv * HD;
-    uint tid = gl_LocalInvocationID.x, w = (gl_SubgroupID * (gl_SubgroupSize / 32u) + gl_SubgroupInvocationID / 32u), lane = (gl_SubgroupInvocationID & 31u), g = lane >> 2, t4 = lane & 3;
+    uint tid = gl_LocalInvocationID.x, w = WARP, lane = LANE, g = lane >> 2, t4 = lane & 3;
     float ninf = uintBitsToFloat(0xff800000u);
     for (uint i = tid; i < BQ * HD / 8; i += 128) {
         uint r = i / (HD / 8), c = i % (HD / 8), o = ((q0 + r) * p.nh * HD + h * HD) / 4 + 2 * c;

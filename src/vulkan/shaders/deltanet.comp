@@ -19,9 +19,9 @@ void ld(uint tok, uint kh, uint vh, uint j, uint s, out vec4 k4[4], out vec4 q4[
     if (uint64_t(p.dtb) != 0) { g = softplus(g + p.dtb.v[vh]) * p.ga.v[vh]; b = sigmoid(b); }
 }
 void main() {
-    uint dk = p.dk, L = dk >> 4, R = 32 / L, lane = (gl_SubgroupInvocationID & 31u), s = lane % L, vh = gl_WorkGroupID.x;
+    uint dk = p.dk, L = dk >> 4, R = 32 / L, lane = LANE, s = lane % L, vh = gl_WorkGroupID.x;
     uint kh = p.ilv != 0 ? vh / (p.nv / p.nk) : vh % p.nk;
-    uint j0 = (gl_WorkGroupID.y * 8 + (gl_SubgroupID * (gl_SubgroupSize / 32u) + gl_SubgroupInvocationID / 32u)) * R, j = j0 + lane / L;
+    uint j0 = (gl_WorkGroupID.y * 8 + WARP) * R, j = j0 + lane / L;
     if (j0 >= p.dv) return;  // whole subgroup past the end (R divides dv)
     uint row = (vh * p.dv + j) * dk, ns = min(p.nsnap, p.T - 1);
     precise float r[16];

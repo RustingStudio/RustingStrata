@@ -9,7 +9,7 @@ layout(constant_id = 1) const uint PER = 4;  // head_dim / 32
 const uint HD = 32 * PER;
 
 void main() {
-    uint t = gl_WorkGroupID.x * 4 + (gl_SubgroupID * (gl_SubgroupSize / 32u) + gl_SubgroupInvocationID / 32u), h = gl_WorkGroupID.y, lane = (gl_SubgroupInvocationID & 31u);
+    uint t = gl_WorkGroupID.x * 4 + WARP, h = gl_WorkGroupID.y, lane = LANE;
     if (t >= p.t) return;
     uint kvo = h / (p.nh / p.nkv) * HD + lane, kvd = p.nkv * HD, last = uint(p.step.v[0]) + t;
     float q[PER], acc[PER], m = 0.0, l = 0.0;
@@ -22,7 +22,7 @@ void main() {
         if (uint64_t(p.qm) != 0 && !qsa_bit(p.qm, p.mw, t, k)) continue;
         float s = 0.0;
         [[unroll]] for (uint j = 0; j < PER; j++) s += q[j] * ldkv(p.kc, k * kvd + kvo + 32 * j, HD);
-        s = warp_sum(s);
+        s = W64 ? warp_sum(s) : subgroupAdd(s);
         float mn = first ? s : max(m, s), c = expf_(m - mn), e = expf_(s - mn);
         l = first ? e : fma(l, c, e);
         first = false;
