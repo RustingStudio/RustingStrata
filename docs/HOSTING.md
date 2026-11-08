@@ -155,6 +155,11 @@ chunk.
 - With customer keys and no admin key, nobody can use the admin routes.
 - With no key at all the server is open to anyone who reaches it. That is meant for a local machine only.
 
+When the server is reached through a LAN name while bound to `0.0.0.0` (for example `http://ai-server.lan:8080`),
+add that name to the Host check: `--allowed-hosts ai-server.lan,ai-server.local` or
+`STRATA_ALLOWED_HOSTS=ai-server.lan,ai-server.local`. Names match exactly and ignore case and the port; loopback
+names and the bound address stay allowed. Without keys this check still stops DNS rebinding.
+
 Clients send the key as `Authorization: Bearer <key>` (OpenAI; `Bearer` as written) or `x-api-key: <key>`
 (Anthropic).
 

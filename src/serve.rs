@@ -47,11 +47,15 @@ pub fn read_request(r: &mut impl BufRead) -> anyhow::Result<Request> {
     Ok(Request { method, path, host, auth, json, body })
 }
 
-/// Host header check against DNS rebinding: a loopback name, or the host the server was bound to.
-pub fn host_ok(host: &str, bound: &str) -> bool {
-    let name = |s: &str| s.rsplit_once(':').filter(|(_, p)| p.parse::<u16>().is_ok()).map_or(s, |x| x.0).to_ascii_lowercase();
+/// Host header check against DNS rebinding: a loopback name, the host the server was bound to, or a name the user
+/// explicitly allowed (`--allowed-hosts` / `STRATA_ALLOWED_HOSTS`).
+pub fn host_ok(host: &str, bound: &str, allowed: &[String]) -> bool {
+    let name = |s: &str| {
+        let s = s.trim();
+        s.rsplit_once(':').filter(|(_, p)| p.parse::<u16>().is_ok()).map_or(s, |x| x.0).trim_end_matches('.').to_ascii_lowercase()
+    };
     let n = name(host);
-    matches!(n.as_str(), "localhost" | "127.0.0.1" | "[::1]") || n == name(bound)
+    !n.is_empty() && (matches!(n.as_str(), "localhost" | "127.0.0.1" | "[::1]") || n == name(bound) || allowed.iter().any(|a| name(a) == n))
 }
 
 /// Whether the client closed the connection (it sends nothing more after its request).

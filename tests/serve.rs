@@ -157,9 +157,13 @@ fn parses_request() {
 
 #[test]
 fn rejects_bad_hosts_and_huge_headers() {
-    assert!(host_ok("localhost:8080", "127.0.0.1:8080") && host_ok("127.0.0.1", "127.0.0.1:8080") && host_ok("[::1]:9", "x:1"));
-    assert!(host_ok("box.lan:8080", "box.lan:8080"));
-    assert!(!host_ok("evil.example:8080", "127.0.0.1:8080") && !host_ok("", "127.0.0.1:8080"));
+    assert!(host_ok("localhost:8080", "127.0.0.1:8080", &[]) && host_ok("127.0.0.1", "127.0.0.1:8080", &[]) && host_ok("[::1]:9", "x:1", &[]));
+    assert!(host_ok("box.lan:8080", "box.lan:8080", &[]));
+    assert!(!host_ok("evil.example:8080", "127.0.0.1:8080", &[]) && !host_ok("", "127.0.0.1:8080", &[]));
+    let lan = ["ai-server.lan".to_string()];
+    assert!(host_ok("ai-server.lan:8080", "0.0.0.0:8080", &lan));
+    assert!(host_ok("AI-SERVER.LAN.:8080", "0.0.0.0:8080", &lan));
+    assert!(!host_ok("evil.example:8080", "0.0.0.0:8080", &lan) && !host_ok("ai-server.lan.evil:8080", "0.0.0.0:8080", &lan));
     let raw = format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(70_000));
     assert!(read_request(&mut raw.as_bytes()).is_err());
     let bad = |raw: &str| read_request(&mut raw.as_bytes()).err().map(|e| e.to_string());
@@ -321,6 +325,33 @@ fn per_key_holds() {
     assert!(c.is_some());
     drop((b, c));
     assert!(open.lock().unwrap().is_empty());
+}
+
+/// A server with no keys checks `Host`; `--allowed-hosts` adds a LAN name without opening it to other names.
+#[test]
+fn serve_allows_configured_host_names() {
+    use std::io::{Read, Write};
+    let dir = std::env::temp_dir().join(format!("strata-host-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_strata"))
+        .args(["serve", "--addr", &addr, "--allowed-hosts", "ai-server.lan"])
+        .arg("--models-dir").arg(&dir)
+        .env_remove("STRATA_API_KEY").env_remove("STRATA_ALLOWED_HOSTS")
+        .stderr(std::process::Stdio::null()).spawn().unwrap();
+    let get = |host: &str| -> String {
+        let mut c = (0..100).find_map(|_| std::net::TcpStream::connect(&addr).ok().or_else(|| { std::thread::sleep(std::time::Duration::from_millis(50)); None }))
+            .expect("server up");
+        c.write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes()).unwrap();
+        let mut s = String::new();
+        c.read_to_string(&mut s).unwrap();
+        s.lines().next().unwrap_or_default().to_string()
+    };
+    assert!(get("ai-server.lan:8080").contains("200"));
+    assert!(get("evil.example:8080").contains("403"));
+    let _ = p.kill();
+    let _ = p.wait();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `strata serve` without a model, over HTTP: what the connection threads answer before the queue, a customer key
