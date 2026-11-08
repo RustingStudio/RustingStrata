@@ -1067,7 +1067,7 @@ fn moe_mailbox_round_trip() {
             unsafe { at(DONE).write_volatile(seq) };
         };
         let ops = |step: &rusting_strata::backend::Buf| {
-            gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), mb.addr(), n, lay.h, step.addr(), t)?;
+            gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), mb.addr(), n, lay.h, step.addr(), t, 0)?;
             gpu.moe_combine(dx.addr(), dye.addr(), wh.addr(), k, dsh.addr(), dsg.addr(), mb.addr(), lay.y, step.addr(), slots.addr(), n, t)?;
             gpu.sync()
         };
@@ -1104,6 +1104,19 @@ fn moe_mailbox_round_trip() {
         let want = if bk == "cuda" { (4, 3) } else { (0, 4) };
         assert_eq!(unsafe { (at(SKIP).read_volatile(), at(REQ).read_volatile()) }, want);
         gpu.put(&table, &dtable, 0).unwrap();
+        // #34 R2: `mb = 0` (a fully resident cache) still routes, and writes no mailbox word, even with missed
+        // experts in the table: the combine must not wait for a CPU part that does not exist. CUDA only (the Vulkan
+        // kernels read the mailbox unconditionally).
+        if bk == "cuda" {
+            let before = unsafe { (at(SKIP).read_volatile(), at(REQ).read_volatile()) };
+            gpu.put(&[0i32, 6], &step, 0).unwrap();
+            gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), 0, n, lay.h, step.addr(), t, 0).unwrap();
+            gpu.moe_combine(dx.addr(), dye.addr(), wh.addr(), k, dsh.addr(), dsg.addr(), 0, lay.y, step.addr(), slots.addr(), n, t).unwrap();
+            gpu.sync().unwrap();
+            let (gi, gs) = (down::<i32>(gpu, &dids), down::<i32>(gpu, &slots));
+            for j in 0..k * t { assert_eq!((gi[j], gs[j]), (ids[j], table[ids[j] as usize]), "null-mailbox routing {j}"); }
+            assert_eq!(unsafe { (at(SKIP).read_volatile(), at(REQ).read_volatile()) }, before, "mb = 0 must not write the mailbox");
+        }
         if bk == "vulkan" {
             // Unanswered: with conditional rendering the combine adds nothing, the rest of the submission (the add) is
             // skipped and stalled() tells the caller; without it the wait is an error.
@@ -1111,7 +1124,7 @@ fn moe_mailbox_round_trip() {
             gpu.put(&[0i32, 5], &step, 0).unwrap();
             let t0 = std::time::Instant::now();
             let r = (|| {
-                gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), mb.addr(), n, lay.h, step.addr(), t)?;
+                gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), mb.addr(), n, lay.h, step.addr(), t, 0)?;
                 gpu.moe_combine(dx.addr(), dye.addr(), wh.addr(), k, dsh.addr(), dsg.addr(), mb.addr(), lay.y, step.addr(), slots.addr(), n, t)?;
                 gpu.add(dx.addr(), dx.addr(), n)?;
                 gpu.sync()

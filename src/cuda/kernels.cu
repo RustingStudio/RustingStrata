@@ -2206,10 +2206,12 @@ extern "C" __global__ void router_topk(const float* p, int n, int k, float extra
 
 // Decode routing of T tokens in one block (warp i routes tokens i, i + 8, ...): router_topk, the expert cache lookup
 // (slots = table[ids], -1 = not resident; wh = weight of hits, else 0), then the routing (and h, if an expert missed)
-// copied to the host-mapped mailbox `mb`, T stored in word 1 and the request flag raised.
+// copied to the host-mapped mailbox `mb`, T stored in word 1 and the request flag raised. `mb` = 0: the cache is fully
+// resident, there is no CPU part to tell, so every mailbox store is skipped (the ids, weights, slots and wh stay valid
+// for moe_gemv/moe_combine). `pid` (may be 0): last token's ids, the next token's prefetch prediction.
 extern "C" __global__ void moe_route(const float* p, int n, int k, float extra_scale, const int* table, int* ids,
                                      float* wts, int* slots, float* wh, const float* h, unsigned int* mb, int nh,
-                                     int h_off, const int* step, int T) {
+                                     int h_off, const int* step, int T, int* pid) {
     __shared__ int miss;
     int lane = threadIdx.x & 31, kt = k * T;
     unsigned int seq = step[1];
@@ -2222,11 +2224,14 @@ extern "C" __global__ void moe_route(const float* p, int n, int k, float extra_s
         if (lane < k) {
             int o = t * k + lane, s = table[id];
             ids[o] = id; wts[o] = w; slots[o] = s; wh[o] = s >= 0 ? w : 0.0f;
-            mb[32 + o] = id; mb[32 + kt + o] = __float_as_uint(w); mb[32 + 2 * kt + o] = s;
+            if (mb) { mb[32 + o] = id; mb[32 + kt + o] = __float_as_uint(w); mb[32 + 2 * kt + o] = s; }
+            if (pid && t == T - 1) pid[lane] = id;
             if (s < 0) miss = 1;
         }
     }
     __syncthreads();
+    // No CPU part and so no flag to raise: nobody reads this layer's words (R2 of issue #34).
+    if (!mb) return;
     if (threadIdx.x == 0) mb[1] = T;  // also read by routing() after the token
     // No miss: nobody waits on this layer. Raise only the skip flag, without the ~4 us system fence.
     if (!miss) { if (threadIdx.x == 0) ((volatile unsigned int*)mb)[2] = seq; return; }
@@ -2234,6 +2239,21 @@ extern "C" __global__ void moe_route(const float* p, int n, int k, float extra_s
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) *(volatile unsigned int*)mb = seq;
+}
+
+// Hint into L2 the cached expert of each of the `k` experts `ids` (the previous token's routing of a layer), whole
+// slot lines: the next layer's GEMVs may then find their rows in L2. `table[e] < 0` (expert on the CPU) is skipped.
+// One block per expert (grid.y) and line range (grid.x). STRATA_MOE_PREFETCH=1 only; a hint, never a correctness
+// dependency. Volta: prefetch.global.L2 exists since sm_20.
+extern "C" __global__ void moe_prefetch(const int* ids, int k, const int* table, const char* base, int stride, int bytes) {
+    int j = blockIdx.y;
+    if (j >= k) return;
+    int s = table[ids[j]];
+    if (s < 0) return;
+    const char* p = base + (size_t)((unsigned int)s * (unsigned int)stride);
+    int lines = bytes >> 7;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < lines; i += gridDim.x * blockDim.x)
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(p + ((size_t)i << 7)));
 }
 
 // x += sum_j w[j] ye[j] + sigmoid(sg) sh + cpu. If a slot missed, wait for the CPU worker's done flag first.

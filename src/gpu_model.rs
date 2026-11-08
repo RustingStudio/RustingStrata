@@ -13,6 +13,13 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
+/// Hits and misses of one layer's routing read from the mailbox (a slot < 0 is an expert on the CPU). R1 prints
+/// their sum per run; `record` and the hit rate use the same numbers.
+fn tally(routing: &[(i32, f32, i32)]) -> (usize, usize) {
+    let misses = routing.iter().filter(|x| x.2 < 0).count();
+    (routing.len() - misses, misses)
+}
+
 /// The decode attention `gq_min` for `nt` tokens from position `pos`. The kernels pick the regime per token; when all
 /// tokens fall on one side of ATT_GQA_MIN, i32::MAX (one head per block) or 0 (GQA) gives the same result and lets the
 /// backend launch only the kernel that works.
@@ -179,6 +186,13 @@ pub struct GpuModel<'a> {
     pub adapt_every: usize,
     pub hits: usize,
     pub misses: usize,
+    /// Forwards this part ran (decode tokens): the base of the per-token stats `Runner::finish` prints.
+    pub tokens: usize,
+    /// `moe_route` calls that wrote the mailbox (a GPU mailbox write) and `routing()` calls that read it back.
+    pub mailbox_writes: std::cell::Cell<usize>,
+    pub mailbox_reads: std::cell::Cell<usize>,
+    /// Last token's routing ids of each layer, the next token's prefetch prediction (`STRATA_MOE_PREFETCH=1`).
+    pids: Option<Buf>,
     /// Time the CPU worker spent computing missed experts (overlaps GPU work).
     pub cpu_time: Duration,
     /// Forwards run again from a MoE combine that gave up waiting for the CPU worker (`finish`).
@@ -394,6 +408,12 @@ impl<'a> GpuModel<'a> {
             Some(ExpertCache::new(m, &*gpu, budget, range.start..range.end + mtp as usize)?)
         } else { None };
         let worker = if c.is_moe() { Some(CpuWorker::new(m, &*gpu, range.clone().collect())?) } else { None };
+        // R3a: prefetch the next layer's experts predicted by the previous token's routing there. Default off; the GPU
+        // window of issue #34 measures it and accepts or rejects it. CUDA has the kernel, Vulkan's `moe_prefetch` is a
+        // no-op.
+        let prefetch = c.is_moe() && gpu.moe_prefetch_supported()
+            && std::env::var("STRATA_MOE_PREFETCH").is_ok_and(|v| v != "0");
+        let pids = if prefetch { Some(gpu.zeros::<i32>((c.n_layer + 1) * c.n_expert_used)?) } else { None };
         let mb = |b: usize| b as f64 / 1048576.0;
         eprintln!(
             "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {ctx} tokens{}, prefill {:.0} MB), expert slots {:.0} MB, resident experts {}/{}",
@@ -402,6 +422,15 @@ impl<'a> GpuModel<'a> {
             mb(cache.as_ref().map_or(0, |x| x.slot_bytes_total())),
             cache.as_ref().map_or(0, |x| x.resident_count()), cache.as_ref().map_or(0, |x| x.total_experts()),
         );
+        // R3: expert bytes per token and the per-layer working set, against the 6 MB L2 of the V100, so the prefetch
+        // decision has numbers in the log (the attained GB/s is printed after a bench run).
+        if let Some(ca) = &cache {
+            let k = c.n_expert_used;
+            let per = (0..ca.layers_len()).map(|il| ca.active_set_bytes(il, k)).max().unwrap_or(0);
+            eprintln!("expert traffic: {:.1} MB per layer active set (top-{k}), {:.1} MB per token over {} MoE layers{}",
+                mb(per), mb(ca.token_bytes(k)), ca.total_experts() / c.n_expert.max(1),
+                if prefetch { ", next-layer L2 prefetch on (STRATA_MOE_PREFETCH)" } else { "" });
+        }
         let mtp = match mtp_parts {
             Some((layer, eh_proj, enorm, hnorm, head_norm, step_buf, emb, eh, x)) => Some(MtpHead {
                 layer, eh_proj, enorm, hnorm, head_norm, worker: CpuWorker::new(m, &*gpu, vec![c.n_layer])?,
@@ -409,7 +438,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None,
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None,
                       cur: 0, seqs, rows: vec![], row_tokens: 0 })
     }
 
@@ -497,7 +526,7 @@ impl<'a> GpuModel<'a> {
     /// is graphed by its slots and attention regimes; the last part's is left running.
     fn rows_pass(&mut self, rows: &[(usize, u32, bool)], pos: &[usize]) -> anyhow::Result<()> {
         let nt = rows.len();
-        let seq = self.worker.as_mut().map_or(0, |w| w.begin());
+        let seq = self.begin_seq();
         self.gpu.put(&pos.iter().flat_map(|&p| [p as i32, seq as i32]).collect::<Vec<_>>(), &self.step_buf, 0)?;
         self.rows = rows.iter().zip(pos).map(|(r, &p)| (r.0, p)).collect();
         const _: () = assert!(TMAX <= 4, "step_rows graph key");
@@ -534,7 +563,7 @@ impl<'a> GpuModel<'a> {
         let nx = self.next.as_deref_mut().unwrap();
         nx.gpu.put(&xs, &nx.x, 0)?;
         if !pe.is_empty() { nx.gpu.put(&pe, &nx.bufs["emb"], 0)?; }
-        let seq = nx.worker.as_mut().map_or(0, |w| w.begin());
+        let seq = nx.begin_seq();
         let steps: Vec<i32> = (0..nt).flat_map(|t| [(nx.pos + t) as i32, seq as i32]).collect();
         nx.gpu.put(&steps, &nx.step_buf, 0)?;
         self.split_time.0 += t1 - t0;
@@ -557,7 +586,7 @@ impl<'a> GpuModel<'a> {
     /// Run one token; returns logits over the vocabulary.
     pub fn step(&mut self, token: u32) -> anyhow::Result<Vec<f32>> {
         if self.pos >= self.ctx { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
-        let seq = self.worker.as_mut().map_or(0, |w| w.begin());
+        let seq = self.begin_seq();
         self.put_embed(&[token])?;
         self.gpu.put(&[self.pos as i32, seq as i32], &self.step_buf, 0)?;
         self.pass(1)?;
@@ -607,7 +636,7 @@ impl<'a> GpuModel<'a> {
         let nt = tokens.len();
         if !(1..=TMAX).contains(&nt) { bail!("verify: {nt} tokens (1 to {TMAX})"); }
         if self.pos + nt > self.ctx { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
-        let seq = self.worker.as_mut().map_or(0, |w| w.begin());
+        let seq = self.begin_seq();
         self.put_embed(tokens)?;
         let steps: Vec<i32> = (0..nt).flat_map(|t| [(self.pos + t) as i32, seq as i32]).collect();
         self.gpu.put(&steps, &self.step_buf, 0)?;
@@ -904,7 +933,8 @@ impl<'a> GpuModel<'a> {
         let c = &self.m.cfg;
         let Some(h) = self.mtp.as_mut() else { bail!("MTP head not loaded") };
         if h.pos + nt > self.ctx { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
-        let seq = h.worker.begin();
+        let fast = self.cache.as_ref().is_some_and(|c| c.fully_resident()) && self.gpu.moe_mailbox_optional();
+        let seq = if fast { 0 } else { h.worker.begin() };
         let g = &self.gpu;
         let emb: Vec<f32> = tokens.iter().flat_map(|&t| self.m.embed(t)).collect();
         g.put(&emb, &h.emb, 0)?;
@@ -918,8 +948,19 @@ impl<'a> GpuModel<'a> {
         if self.finish(nt, gq, Some((hid, head)))? && head { d = self.gpu.get::<i32>(&self.amax, 0, 1)?[0] as u32; }
         let h = self.mtp.as_mut().unwrap();
         h.pos += nt;
-        if let Some(cache) = self.cache.as_mut() {
-            cache.record(c.n_layer, &h.worker.routing(c.n_layer).iter().map(|x| x.0).collect::<Vec<_>>());
+        // Fast path: every expert of the draft layer is resident, so nothing can miss and there is nothing to record
+        // (R2). The routing counters keep the head's share of the hit rate.
+        if fast {
+            self.hits += c.n_expert_used * nt;
+        } else if let Some(cache) = self.cache.as_mut() {
+            // One mailbox read per layer, as in `after_experts` (each is a bulk copy of the routing words).
+            let r = h.worker.routing(c.n_layer);
+            self.mailbox_reads.set(self.mailbox_reads.get() + 1);
+            let (hits, misses) = tally(&r);
+            self.hits += hits;
+            self.misses += misses;
+            debug_assert!(misses == 0 || !cache.fully_resident(), "a missed expert in a fully resident cache");
+            cache.record(c.n_layer, &r.iter().map(|x| x.0).collect::<Vec<_>>());
         }
         Ok(d)
     }
@@ -1107,9 +1148,20 @@ impl<'a> GpuModel<'a> {
                     let slots = self.slots.addr();
                     let (mut sq, mut dq) = (0, 0);
                     let w = worker.unwrap();
-                    let mb = w.dev + (4 * il * w.layout.stride) as u64;
+                    // Fully resident (and the backend takes a null mailbox): no CPU part, so `mb = 0` makes the
+                    // kernels skip every mailbox store and the combine never waits (R2). Vulkan reads the mailbox
+                    // unconditionally, so `moe_mailbox_optional` keeps its behaviour unchanged.
+                    let fast = cache.fully_resident() && g.moe_mailbox_optional();
+                    debug_assert!(!fast || (0..c.n_expert).all(|e| cache.slot(il, e) >= 0),
+                        "the fast path needs every expert of layer {il} in VRAM");
+                    let mb = if fast { 0 } else { w.dev + (4 * il * w.layout.stride) as u64 };
+                    if !fast { self.mailbox_writes.set(self.mailbox_writes.get() + 1); }
+                    // The previous token's routing of this layer, for the next token's prefetch (R3a).
+                    let pid = self.pids.as_ref().map_or(0, |b| b.addr() + (4 * k * il) as u64);
                     // Resuming: what the skipped part left (the swiglu_q of Vulkan, the only backend that resumes).
                     if resume { dq = if matches!(md.ty, GgmlType::F32 | GgmlType::BF16) { 0 } else { p("ffq") }; }
+                    // Prefetch the next layer's predicted experts while this layer runs (knob off by default).
+                    if !resume { self.prefetch_next(il, &**g, cache, k)?; }
                     // The shared expert's GEMVs and swiglu share batches with the routed ones.
                     if !resume {
                     g.batch(&mut || {
@@ -1119,7 +1171,7 @@ impl<'a> GpuModel<'a> {
                         } else { mv(router, "h", ne, "rl", c.n_expert)?; }
                         Ok(())
                     })?;
-                    g.moe_route(p("rl"), c.n_expert, k, c.expert_weights_scale, lx.table_dev.addr(), ids, p("wts"), slots, p("wh"), p("h"), mb, ne, w.layout.h, step, nt)?;
+                    g.moe_route(p("rl"), c.n_expert, k, c.expert_weights_scale, lx.table_dev.addr(), ids, p("wts"), slots, p("wh"), p("h"), mb, ne, w.layout.h, step, nt, pid)?;
                     g.batch(&mut || {
                         if mg.ty == mu.ty && (mg.rows, mg.cols) == (mu.rows, mu.cols) {
                             let pair = (mu.off as i64 - mg.off as i64, p("ue") as i64 - p("ge") as i64);
@@ -1149,6 +1201,34 @@ impl<'a> GpuModel<'a> {
         Ok(0)
     }
 
+    /// Whether this part's experts are all in VRAM and the backend takes `mb = 0`: no worker request, no mailbox
+    /// write or read, no `record`, no `adapt` (issue #34 R2). Recomputed on every call (after the load and after every
+    /// `adapt`), so the flag can never disagree with the placement tables.
+    pub fn expert_fast_path(&self) -> bool {
+        self.cache.as_ref().is_some_and(|c| c.fully_resident()) && self.gpu.moe_mailbox_optional()
+    }
+
+    /// The worker sequence number to publish in `step_buf`: 0 on the fast path, where the GPU asks the worker nothing.
+    fn begin_seq(&mut self) -> u32 {
+        let fast = self.expert_fast_path();
+        match self.worker.as_mut() { Some(w) if !fast => w.begin(), _ => 0 }
+    }
+
+    /// Bytes of routed-expert weights one decode token reads from this part (0: no expert cache).
+    pub fn expert_bytes_per_token(&self) -> usize {
+        self.cache.as_ref().map_or(0, |c| c.token_bytes(self.m.cfg.n_expert_used))
+    }
+
+    /// Hint the next MoE layer's predicted experts into L2 (their routing of the previous token: `pids`) while this
+    /// layer runs. R3a, `STRATA_MOE_PREFETCH=1` only (`pids` is None otherwise), a hint with no correctness role.
+    fn prefetch_next(&self, il: usize, g: &dyn Backend, cache: &ExpertCache, k: usize) -> anyhow::Result<()> {
+        let Some(pids) = &self.pids else { return Ok(()) };
+        let last = self.first + self.layers.len();
+        let Some(nil) = (il + 1..last).find(|&j| cache.layer(j).is_some()) else { return Ok(()) };
+        let Some((table, base, stride, bytes)) = cache.prefetch_geom(nil) else { return Ok(()) };
+        g.moe_prefetch(pids.addr() + (4 * k * nil) as u64, k, table, base, stride, bytes)
+    }
+
     /// Advance the position and update expert statistics and placement after a token.
     fn after_forward(&mut self, nt: usize) -> anyhow::Result<()> {
         self.pos += nt;
@@ -1163,18 +1243,56 @@ impl<'a> GpuModel<'a> {
     /// Expert statistics after a forward of `nt` tokens, and the placement update every `adapt_every` tokens of
     /// `count`.
     fn after_experts(&mut self, nt: usize, count: usize) -> anyhow::Result<()> {
+        self.tokens += nt;
+        let fast = self.expert_fast_path();
+        let k = self.m.cfg.n_expert_used;
         if let (Some(cache), Some(w)) = (self.cache.as_mut(), self.worker.as_ref()) {
             for il in self.first..self.first + self.layers.len() {
                 if cache.layer(il).is_none() { continue; }
+                // Fast path: every routed expert of the layer is resident by construction, so each token reads k
+                // hits and the mailbox is not touched. Reading it back to learn that would cost what R2 removes.
+                if fast { self.hits += k * nt; continue; }
                 let r = w.routing(il);
-                let miss = r.iter().filter(|x| x.2 < 0).count();
-                self.misses += miss;
-                self.hits += r.len() - miss;
+                self.mailbox_reads.set(self.mailbox_reads.get() + 1);
+                let (hits, misses) = tally(&r);
+                self.hits += hits;
+                self.misses += misses;
+                debug_assert!(misses == 0 || !cache.fully_resident(), "a missed expert in a fully resident cache");
                 cache.record(il, &r.iter().map(|x| x.0).collect::<Vec<_>>());
             }
             self.cpu_time = w.busy();
-            if self.adapt_every > 0 && (count - nt) / self.adapt_every < count / self.adapt_every { cache.adapt(self.m, &*self.gpu, 64)?; }
+            // No swap can be beneficial with no miss: `adapt` would only scan all 10240 entries (R2).
+            if !fast && self.adapt_every > 0 && (count - nt) / self.adapt_every < count / self.adapt_every {
+                cache.adapt(self.m, &*self.gpu, 64)?;
+            }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GpuModel, tally};
+
+    /// R1: a layer's routing gives the hit rate its numbers; a slot < 0 is an expert left on the CPU.
+    #[test]
+    fn routing_tally_of_a_partial_cache_counts_every_miss() {
+        let r = [(4, 0.5, 3), (11, 0.25, -1), (7, 0.25, 0), (9, 0.0, -1)];
+        assert_eq!(tally(&r), (2, 2));
+        assert_eq!(tally(&[(1, 1.0, -1); 8]), (0, 8));
+    }
+
+    /// R1: a fully resident layer cannot miss, which is what the fast path asserts instead of reading the mailbox.
+    #[test]
+    fn routing_tally_of_a_resident_layer_has_no_miss() {
+        let r: Vec<(i32, f32, i32)> = (0..8).map(|e| (e, 0.125, e)).collect();
+        assert_eq!(tally(&r), (8, 0));
+    }
+
+    /// The fast-path method is off without a cache (CPU experts or a dense model): the compile-time check that the
+    /// signature stays usable by `Runner::finish`.
+    #[test]
+    fn no_cache_has_no_fast_path_bytes() {
+        fn _uses(g: &GpuModel) -> (bool, usize) { (g.expert_fast_path(), g.expert_bytes_per_token()) }
     }
 }
