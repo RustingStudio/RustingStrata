@@ -24,7 +24,7 @@ void sb_step(U8 w, F32 xd, uint row, uint lane, uint t, uint s, inout precise fl
 }
 
 void main() {
-    uint k = gl_WorkGroupID.y, lane = gl_SubgroupInvocationID;
+    uint k = gl_WorkGroupID.y, lane = LANE;
     int e = p.ids.v[k];
     if (e < 0) return;  // the whole workgroup
     load_tables();
@@ -32,7 +32,7 @@ void main() {
     F32 y = F32(uint64_t(p.y) + gl_WorkGroupID.z * p.y2);
     F32 xd = F32(uint64_t(p.xq) + p.ntok * p.cols);
     uint t = k / p.xg, nsb = p.cols >> 8, r0 = gl_WorkGroupID.x * 8 * p.rpw, r1 = min(p.rows, r0 + 8 * p.rpw);
-    for (uint row = r0 + gl_SubgroupID; row < r1; row += 8) {
+    for (uint row = r0 + WARP; row < r1; row += 8) {
         precise float acc = 0.0;
         // Four super-blocks per iteration so their loads overlap (kernels.cu: unroll 4); the sums keep their order.
         uint s = 0;

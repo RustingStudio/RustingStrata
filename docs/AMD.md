@@ -4,7 +4,11 @@ All benchmarks in the README were run on an NVIDIA RTX 3060. AMD GPUs run the Vu
 (`--backend vulkan`), and everything known about them comes from user reports (RX 9070 XT on Linux with RADV, and on
 Windows with AMD's driver). Expect problems; this page lists the known ones and what to send when you hit a new one.
 
-Needs RDNA or newer (older AMD GPUs lack subgroup size 32) and a Vulkan 1.3 driver.
+Needs a Vulkan 1.3 driver and subgroup size 32 or a fixed subgroup size 64. The wave64 path has been tested on
+Radeon VII (Vega 20) with RADV Mesa 26.0.8. It runs the same int8 kernels as wave32: each 64-lane subgroup is split
+into two logical 32-lane warps. The optimized batched-prefill path can differ from token-by-token inference at near
+ties; `--chunk 0` uses token-by-token prefill when closer agreement with the CPU reference matters more than prompt
+processing speed.
 
 ## First line of the output
 

@@ -12,7 +12,7 @@ float hf(uint16_t b) { return float(uint16BitsToHalf(b)); }
 
 void main() {
     uint t = gl_WorkGroupID.x % p.nt, h = gl_WorkGroupID.x / p.nt, sy = gl_WorkGroupID.y, ns = gl_NumWorkGroups.y;
-    uint tid = gl_LocalInvocationID.x, w = gl_SubgroupID, lane = gl_SubgroupInvocationID, g = h / (p.nh / p.nkv);
+    uint tid = gl_LocalInvocationID.x, w = WARP, lane = LANE, g = h / (p.nh / p.nkv);
     uint so = t * p.sst;
     bool sp = uint64_t(p.sel) != 0 && p.sel.v[so] >= 0;  // QSA cells, as attn_decode
     uint n_pos = sp ? uint(p.sel.v[so]) : uint(p.step.v[2 * t]) + 1, n_kv = (n_pos + 255) / 256 * 256, nc = n_kv >= 512 ? NTH : 1;
