@@ -948,3 +948,88 @@ nvidia-smi --query-gpu=...    # 0 MiB used, 50 C, 0 % utilisation at the end
 
 No `Xid`, no `device lost`, no trap (`worker stalls 0` in every arm). `llama.router.service` was
 left **stopped** for the coordinator.
+
+## 2026-11-08 — Flags on sm_70: KV q8, serve --parallel, MTP (M2-T6, V100, sm_70)
+
+Build `c54714b` (`task/32-cuda-flags`, current `v100` merged in, so M2-T4/M2-T5 are included). Reference
+`M=/mnt/models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf` (no `nextn` head),
+MTP model `M27=/mnt/models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf` (`n_nextn: 1`).
+One window, `llama.router.service` stopped by the coordinator; `cuda` backend only.
+
+### Correctness after the merge
+
+`STRATA_MODEL=$M STRATA_TEST_BACKENDS=cuda cargo test --release --test kv_q8 -- --test-threads=1`
+→ 2 passed. q8 prefill vs decode 5.98e-5…7.67e-5 (limit 5e-4), q8 vs f16 decode 1.55e-3…2.06e-3
+(limit 3e-3), 3-slot plan `KV 3 MB for 256 tokens in each of 3 slots`.
+
+`cargo test --release --test serve serve_parallel_smoke -- --nocapture` → 1 passed: `serve --parallel 2
+--kv q8` answered two concurrent chat requests with `200`/`choices`, plan `KV 5 MB for 512 tokens in each
+of 2 slots`.
+
+### KV cache: f16 vs q8 (`--pp 512,4096 --tg 128 --reps 3 --ctx 32896`)
+
+| cache | KV @32896 | pp 512 | pp 4096 | tg @512 | tg @4096 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| f16 | 642 MB | 2132.3 (2119.5–2139.5) | 2945.2 (2941.8–2948.6) | 129.5 (128.7–129.9) | 125.1 (124.8–125.3) |
+| q8 | 341 MB | 2129.6 (2124.6–2132.1) | 2950.9 (2948.0–2956.8) | 129.1 (128.5–129.5) | 124.2 (124.0–124.3) |
+
+q8 halves the KV (341/642 = 53.1 %) and moves throughput by −0.1…+0.2 % for prefill and −0.3…−0.7 %
+for decode (inside the rep spread). Regression gate (0.97 × M2-T2 medians, pp 4096 ≥ 2711, tg @4096 ≥
+115.5): **pass** on both arms.
+
+`generate --kv q8 -n 64` produced coherent text and stopped at EOS after 22 tokens
+(`prompt 5 tok 102.96 tok/s | gen 22 tok 130.32 tok/s`, 100 % expert hit rate).
+
+### `serve --parallel`: aggregate decode
+
+`serve --model $M --gpu --backend cuda --kv q8 --parallel 4 --ctx 4096`, one warm-up then one round per N,
+four identical greedy requests of 64 tokens, completion tokens from `/metrics`:
+
+| N concurrent | wall | completion tokens | aggregate tok/s | per request (s) |
+| ---: | ---: | ---: | ---: | --- |
+| 1 | 0.57 s | 64 | 112.4 | 0.56 |
+| 2 | 0.84 s | 128 | 153.1 | 0.84 / 0.83 |
+| 4 | 1.37 s | 256 | 187.2 | 1.35 / 1.35 / 1.37 / 1.35 |
+
+Scaling over one request: **1.36× at N=2, 1.67× at N=4**. Plan: `KV 42 MB for 4096 tokens in each of
+4 slots`.
+
+### `--mtp` on Qwen3.8-27B (`--pp 512 --tg 128 --reps 1 --ctx 8192`)
+
+The reference model has no draft head, so MTP numbers are from `$M27` (different model: not comparable
+with the M2-T8 gate). `bench` does not sweep k; four separate runs, same prompt:
+
+| drafts/step | prefill 512 | decode | drafts accepted |
+| ---: | ---: | ---: | ---: |
+| 0 (no `--mtp`) | 377.1 | 28.7 | — |
+| 1 | 370.7 | 41.5 | 63/65 (96.9 %) |
+| 2 | 372.9 | 47.1 | 85/90 (94.4 %) |
+| 3 | 372.1 | 46.5 | 94/102 (92.2 %) |
+
+Best k = 2 (**+64 %** over plain decoding). `generate --mtp 3 -n 64` produced coherent text,
+`prompt 5 tok 26.83 tok/s | gen 64 tok 32.86 tok/s`, `MTP drafts accepted 40/72 (55.6 %)` (a different,
+free-running prompt than the bench; acceptance falls over a longer greedy chain).
+
+### Unsupported combinations
+
+All messages name the flag(s); no silent fallback.
+
+| command | exit | message |
+| --- | ---: | --- |
+| `bench --kv q8 --llama-numerics …` | 1 | `--kv q8 does not combine with --llama-numerics (its attention reads f16 KV)` |
+| `serve --parallel 0` | 1 | `--parallel 0: 1 to 255 slots` |
+| `serve --parallel 256` | 1 | `--parallel 256: 1 to 255 slots` |
+| `serve --parallel 4 --mtp 1` | serving | `--parallel 4 and --mtp 1: not supported together, decoding without MTP drafts` (MTP off, exit 0) |
+| `generate --mtp 1` on `$M` (no head) | 0 | `--mtp 1: this model has no MTP head: decoding without drafts` |
+| `generate --mtp 1` without `--gpu` | 0 | `--mtp 1: requires --gpu: decoding without drafts` |
+
+### Safety
+
+```sh
+dmesg -T | grep -c Xid        # 42 before the window and 42 after
+nvidia-smi --query-gpu=...    # 0 MiB used, 47 C, 0 % utilisation at the end
+```
+
+No `Xid`, no `device lost`, no trap. One `serve` process from the parallel test was still listening after
+the wrapper shell was signalled; it was sent SIGTERM and the GPU returned to 0 MiB before the Xid/`nvidia-smi`
+reading above. `llama.router.service` was left **stopped** for the coordinator.
