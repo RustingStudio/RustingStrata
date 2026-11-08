@@ -103,6 +103,7 @@ fn batched_quantized_gemm_uses_prepared_x() {
         let x = common::up(&*gpu, &input);
         let y = gpu.zeros::<f32>(n * 64).unwrap();
         gpu.prequant_gemm_x(&weight, n, x.addr(), 256).unwrap();
+        gpu.prequant_gemm_x(&weight, n, x.addr(), 256).unwrap();
         gpu.batch(&mut || gpu.gemm_dense(&weight, n, x.addr(), 256, y.addr(), 64, SAME_X)).unwrap();
         let got = common::down::<f32>(&*gpu, &y);
 
@@ -110,7 +111,7 @@ fn batched_quantized_gemm_uses_prepared_x() {
         gpu.gemm_dense(&weight, n, x.addr(), 256, expected.addr(), 64, 0).unwrap();
         let expected = common::down::<f32>(&*gpu, &expected);
         assert!(got.iter().any(|v| v.abs() > 1e-5), "{backend}: empty GEMM result");
-        assert!(got.iter().zip(&expected).all(|(a, b)| a.is_finite() && (a - b).abs() < 1e-4),
+        assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             "{backend}: batched result differs from non-batched GEMM");
     }
 }

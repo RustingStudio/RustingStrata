@@ -251,6 +251,9 @@ impl GpuModel<'_> {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, .. } => {
                     let (eb, eg) = (at(l.e), at(l.e + n * nv));
                     g.gemm_dense(qkv, t, h, ne, at(l.a), channels, 0)?;
+                    // The qkv GEMM above already quantized `h`; when it did not (IQ2_XS, or a shape the int8 GEMM
+                    // skips), prepare it now so beta, alpha and the gate can all reuse one copy.
+                    g.prequant_gemm_x(gate, t, h, ne)?;
                     g.conv_seq(at(l.a), conv[self.cur].addr(), conv_w.ptr, at(l.c), channels, c.ssm_conv, t, 0, 0)?;
                     // The beta and alpha GEMMs (16 blocks each) run beside the norm: batch launches alternate streams.
                     g.batch(&mut || {
@@ -264,7 +267,6 @@ impl GpuModel<'_> {
                     probe(&mut tr, "beta", &pf.slab, eb, nv, t)?;
                     probe(&mut tr, "alpha", &pf.slab, eg, nv, t)?;
                     // The z GEMM runs beside the scan, on the SMs its last wave of blocks leaves idle.
-                    g.prequant_gemm_x(gate, t, h, ne)?;
                     g.batch(&mut || {
                         g.deltanet(at(l.c), s[self.cur].addr(), eb, eg, 0, 0, at(l.d), nk, nv, c.k_interleave, dk, dv, 1.0 / (dk as f32).sqrt(), t, channels, 0, 0)?;
                         g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, SAME_X)
