@@ -1,7 +1,7 @@
 //! Kernel tests, run on every backend that opens (`common::backends`).
 mod common;
 use common::{down, up};
-use rusting_strata::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
+use rusting_strata::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor, SAME_X};
 use rusting_strata::{cuda::Gpu, gguf::Gguf, quant::GgmlType, weights::{Tensor, Weights}};
 
 fn xs(n: usize) -> Vec<f32> {
@@ -299,6 +299,43 @@ fn gemm_matches_reference_for_every_type() {
     }
 }
 
+/// A `SAME_X` GEMM inside `batch` whose x was not quantized by the previous GEMM (that one's type is off the int8
+/// path, e.g. IQ2_XS) falls back to the f16 kernel instead of failing. Mixed-quant models hit this in prefill.
+#[test]
+fn same_x_inside_batch_falls_back_when_x_is_not_quantized() {
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let w = Weights::new(&g).unwrap();
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        // A tensor off the int8 path (IQ2_XS or a float type) and an int8 one with the same row length.
+        let (mut slow, mut fast) = (std::collections::HashMap::new(), std::collections::HashMap::new());
+        for (name, info) in &g.tensors {
+            if info.dims.len() != 2 { continue }
+            let cols = info.dims[0] as usize;
+            if !cols.is_multiple_of(128) { continue }
+            let Ok(ty) = GgmlType::from_u32(info.ty) else { continue };
+            if Gpu::mmq(ty) { fast.entry(cols).or_insert((name, ty)); } else { slow.entry(cols).or_insert((name, ty)); }
+        }
+        let Some((&cols, &(slow_name, _))) = slow.iter().find(|(c, _)| fast.contains_key(c)) else {
+            eprintln!("{bk}: SKIP, no mixed-type pair with equal columns");
+            continue;
+        };
+        let (fast_name, _) = fast[&cols];
+        let (ts, tf) = (w.get(slow_name).unwrap(), w.get(fast_name).unwrap());
+        let (ds, df) = (gpu.upload(&ts).unwrap(), gpu.upload(&tf).unwrap());
+        let n_x = 8;
+        let x = xs(n_x * cols);
+        let dx = up(gpu, &x);
+        let (dy1, dy2) = (gpu.zeros::<f32>(n_x * ts.rows).unwrap(), gpu.zeros::<f32>(n_x * tf.rows).unwrap());
+        // The first GEMM takes the f16 path and leaves no int8 copy of x.
+        gpu.gemm_dense(&ds, n_x, dx.addr(), cols, dy1.addr(), ts.rows, 0).unwrap();
+        // Inside a batch this GEMM cannot quantize x: it must use its f16 kernel rather than fail.
+        gpu.batch(&mut || gpu.gemm_dense(&df, n_x, dx.addr(), cols, dy2.addr(), tf.rows, SAME_X)).unwrap();
+        assert!(down::<f32>(gpu, &dy2).iter().all(|v| v.is_finite()), "{bk}: {fast_name} after SAME_X fallback");
+    }
+}
+
 /// Prefill GEMM throughput on 4096 positions for a few layer matrices. Run with --ignored.
 #[test]
 #[ignore]
@@ -473,6 +510,37 @@ fn attn_prefill_matches_decode() {
                 assert!(e <= 5e-4, "attn_prefill_{hd} nh {nh} nkv {nkv} gq_min {gq_min}: rel err {e}");
             }
         }
+    }
+}
+
+/// A QSA mask with every block selected leaves `attn_prefill_m` equal to `attn_prefill` (the tiled no-coop fallback
+/// uses the same mask rows as the other prefill kernels).
+#[test]
+fn attn_prefill_qsa_mask_all_ones_matches_unmasked() {
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        eprintln!("backend {bk}");
+        let (pos0, t, nh, nkv, hd) = (37, 40, 8, 2, 128);
+        let n = (pos0 + t) * nkv * hd;
+        let (kf, vf) = (xs(n), xs(n + 5)[5..].to_vec());
+        let (dk, dv) = (gpu.zeros::<u16>(n).unwrap(), gpu.zeros::<u16>(n).unwrap());
+        let step = up(gpu, &[pos0 as i32]);
+        let zero = up(gpu, &[0i32]);
+        gpu.kv_store(up(gpu, &kf).addr(), up(gpu, &vf).addr(), dk.addr(), dv.addr(), nkv * hd, pos0 + t, zero.addr(), hd).unwrap();
+        let q: Vec<f32> = xs(t * nh * hd + 3)[3..].iter().map(|v| 4.0 * v).collect();
+        let dq = up(gpu, &q);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let want_buf = gpu.zeros::<f32>(t * nh * hd).unwrap();
+        gpu.attn_prefill(dq.addr(), dk.addr(), dv.addr(), 0, want_buf.addr(), step.addr(), t, nh, nkv, hd, scale).unwrap();
+        let want = down::<f32>(gpu, &want_buf);
+        let mw = (pos0 + t).div_ceil(128);
+        // The cooperative tile reads mask rows in 64-query blocks, including rows past `t`.
+        let dmask = up(gpu, &vec![u32::MAX; t.next_multiple_of(64) * mw]);
+        let got_buf = gpu.zeros::<f32>(t * nh * hd).unwrap();
+        gpu.attn_prefill_m(dq.addr(), dk.addr(), dv.addr(), 0, got_buf.addr(), step.addr(), t, nh, nkv, hd, scale,
+            dmask.addr(), mw).unwrap();
+        let e = rel_l2(&down::<f32>(gpu, &got_buf), &want);
+        assert!(e <= 1e-6, "{bk} attn_prefill all-ones mask: rel err {e}");
     }
 }
 

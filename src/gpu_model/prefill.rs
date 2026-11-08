@@ -75,11 +75,18 @@ impl Scratch {
 impl GpuModel<'_> {
     /// Run `tokens` from the current position; returns the logits after the last one. Short prompts (and models
     /// loaded without a prefill chunk) go through the decode step.
-    pub fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+    pub fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> { self.prefill_with(tokens, &mut |_| Ok(())) }
+
+    /// `prefill`, calling `between` between two chunks (`serve --parallel` decodes the other slots there; it must
+    /// leave the current slot's state alone).
+    pub fn prefill_with(&mut self, tokens: &[u32], between: &mut dyn FnMut(&mut Self) -> anyhow::Result<()>) -> anyhow::Result<Vec<f32>> {
         let Some(chunk) = self.pf.as_ref().map(|p| p.chunk) else { return self.step_all(tokens) };
         if tokens.len() < self.short { return self.step_all(tokens); }
         anyhow::ensure!(self.pos + tokens.len() <= self.ctx, "context full ({} tokens; raise --ctx)", self.ctx);
-        for ch in tokens.chunks(chunk) { self.prefill_chunk(ch, None)?; }
+        for (i, ch) in tokens.chunks(chunk).enumerate() {
+            if i > 0 { between(self)?; }
+            self.prefill_chunk(ch, None)?;
+        }
         // The prompt's routing predicts the reply's: place its hot experts now instead of 64 per adapt during decode.
         let adapt = self.adapt_every > 0;
         let mut p = Some(&mut *self);
@@ -108,12 +115,18 @@ impl GpuModel<'_> {
     /// memory (up to `cache_ram`), and a later call that continues it takes it back, so a side request with another
     /// prompt does not cost the main conversation its cache. Returns the logits and the tokens reused.
     pub fn prefill_cached(&mut self, tokens: &[u32], sys: usize, keep: usize) -> anyhow::Result<(Vec<f32>, usize)> {
+        self.prefill_cached_with(tokens, sys, keep, &mut |_| Ok(()))
+    }
+
+    /// `prefill_cached` with `prefill_with`'s `between`.
+    pub fn prefill_cached_with(&mut self, tokens: &[u32], sys: usize, keep: usize, between: &mut dyn FnMut(&mut Self) -> anyhow::Result<()>)
+        -> anyhow::Result<(Vec<f32>, usize)> {
         anyhow::ensure!(sys <= keep && keep < tokens.len(), "prefill_cached: sys {sys}, keep {keep} of {} tokens", tokens.len());
-        let hit = self.saved_ids.len();
-        let stashed = self.sys.as_ref().map_or(0, |s| if tokens[..keep].starts_with(&s.3) { s.3.len() } else { 0 });
-        let extends = hit > 0 && hit >= stashed && tokens[..keep].starts_with(&self.saved_ids);
+        let (hit, own) = (self.saved_ids.len(), self.owner);
+        let stashed = self.sys.as_ref().filter(|_| self.sys_owner == own).map_or(0, |s| if tokens[..keep].starts_with(&s.3) { s.3.len() } else { 0 });
+        let extends = hit > 0 && hit >= stashed && self.saved_owner == own && tokens[..keep].starts_with(&self.saved_ids);
         // The longest parked state this prompt continues, if it beats the saved one and the stash.
-        let best = self.parked.iter().enumerate().filter(|(_, p)| tokens[..keep].starts_with(&p.ids))
+        let best = self.parked.iter().enumerate().filter(|(_, p)| p.owner == own && tokens[..keep].starts_with(&p.ids))
             .max_by_key(|(_, p)| p.ids.len()).map(|(i, p)| (i, p.ids.len()))
             .filter(|&(_, n)| n > stashed && !(extends && n <= hit));
         let reused = if let Some((i, n)) = best {
@@ -135,16 +148,16 @@ impl GpuModel<'_> {
         // brings its own KV, which may have been computed in other chunks.
         if best.is_some() || stashed == 0 && self.sys.as_ref().is_some_and(|s| reused < s.3.len()) { self.sys = None; }
         if sys > reused {
-            self.prefill(&tokens[reused..sys])?;
+            self.prefill_with(&tokens[reused..sys], between)?;
             self.stash(&tokens[..sys])?;
         }
         let from = reused.max(sys);
         if keep > from {
-            self.prefill(&tokens[from..keep])?;
+            self.prefill_with(&tokens[from..keep], between)?;
             self.save_state()?;
-            self.saved_ids = tokens[..keep].to_vec();
+            (self.saved_ids, self.saved_owner) = (tokens[..keep].to_vec(), own);
         }
-        Ok((self.prefill(&tokens[keep..])?, reused))
+        Ok((self.prefill_with(&tokens[keep..], between)?, reused))
     }
 
     fn step_all(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
@@ -238,7 +251,7 @@ impl GpuModel<'_> {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, .. } => {
                     let (eb, eg) = (at(l.e), at(l.e + n * nv));
                     g.gemm_dense(qkv, t, h, ne, at(l.a), channels, 0)?;
-                    g.conv_seq(at(l.a), conv.addr(), conv_w.ptr, at(l.c), channels, c.ssm_conv, t, 0, 0)?;
+                    g.conv_seq(at(l.a), conv[self.cur].addr(), conv_w.ptr, at(l.c), channels, c.ssm_conv, t, 0, 0)?;
                     // The beta and alpha GEMMs (16 blocks each) run beside the norm: batch launches alternate streams.
                     g.batch(&mut || {
                         g.gemm_dense(beta, t, h, ne, eb, nv, SAME_X)?;
@@ -253,11 +266,11 @@ impl GpuModel<'_> {
                     // The z GEMM runs beside the scan, on the SMs its last wave of blocks leaves idle.
                     g.prequant_gemm_x(gate, t, h, ne)?;
                     g.batch(&mut || {
-                        g.deltanet(at(l.c), s.addr(), eb, eg, 0, 0, at(l.d), nk, nv, c.k_interleave, dk, dv, 1.0 / (dk as f32).sqrt(), t, channels, 0, 0)?;
+                        g.deltanet(at(l.c), s[self.cur].addr(), eb, eg, 0, 0, at(l.d), nk, nv, c.k_interleave, dk, dv, 1.0 / (dk as f32).sqrt(), t, channels, 0, 0)?;
                         g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, SAME_X)
                     })?;
                     probe(&mut tr, "deltanet", &pf.slab, at(l.d), c.ssm_d_inner, t)?;
-                    probe(&mut tr, "state", s, s.addr(), s.len() / 4, 1)?;
+                    probe(&mut tr, "state", &s[self.cur], s[self.cur].addr(), s[self.cur].len() / 4, 1)?;
                     probe(&mut tr, "z", &pf.slab, at(l.b), c.ssm_d_inner, t)?;
                     if ly.hc.is_some() { g.norm_gate_sig(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps, 0)?; } else { g.norm_gate(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps)?; }
                     g.gemm_dense(out, t, at(l.d), c.ssm_d_inner, mx, ne, mact)?;
@@ -272,7 +285,7 @@ impl GpuModel<'_> {
                     g.gemm_dense(v, t, h, ne, vv, kv, SAME_X)?;
                     g.rms_norm(kraw, hd, kn.ptr, kk, hd, hd, t * nkv, eps)?;
                     g.rope_neox(kk, hd, t * nkv, nkv, c.n_rot, step, c.rope_base)?;
-                    g.kv_store(kk, vv, kc.addr(), vc.addr(), kv, t, step, hd)?;
+                    g.kv_store(kk, vv, kc[self.cur].addr(), vc[self.cur].addr(), kv, t, step, hd)?;
                     // QSA: region c (free after kv_store) holds the raw indexer keys, raw queries and normed queries.
                     let (qm, mw) = match (qsa, &self.qsa) {
                         (Some(a), Some(b)) => {
@@ -294,7 +307,7 @@ impl GpuModel<'_> {
                         }
                         _ => (0, 0),
                     };
-                    g.attn_prefill_m(at(l.b), kc.addr(), vc.addr(), if c.q_gate { at(l.a) } else { 0 }, at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), qm, mw)?;
+                    g.attn_prefill_m(at(l.b), kc[self.cur].addr(), vc[self.cur].addr(), if c.q_gate { at(l.a) } else { 0 }, at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), qm, mw)?;
                     probe(&mut tr, "q", &pf.slab, at(l.a), nh * qs, t)?;
                     probe(&mut tr, "k", &pf.slab, kk, kv, t)?;
                     probe(&mut tr, "v", &pf.slab, vv, kv, t)?;
