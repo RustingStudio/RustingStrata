@@ -688,8 +688,14 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         // Clients list the models often; a model still loading is listed, as its chats wait for the load.
                         Ok(r) if r.method == "GET" && r.path.split('?').next() == Some("/v1/models") && (k.read().unwrap().any() || serve::host_ok(&r.host, &a)) => {
                             let created = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                            let m = st.lock().unwrap().model.clone();
-                            return reply(json!({"object": "list", "data": m.map(|id| json!([{"id": id, "object": "model", "created": created, "owned_by": "strata"}])).unwrap_or(json!([]))}), "200 OK");
+                            let (m, n_ctx, n_ctx_train) = {
+                                let state = st.lock().unwrap();
+                                (state.model.clone(), state.ctx, state.ctx_train)
+                            };
+                            return reply(json!({"object": "list", "data": m.map(|id| json!([{
+                                "id": id, "object": "model", "created": created, "owned_by": "strata",
+                                "meta": {"n_ctx": n_ctx, "n_ctx_train": n_ctx_train}
+                            }])).unwrap_or(json!([]))}), "200 OK");
                         }
                         _ => {}
                     }
@@ -1146,8 +1152,14 @@ impl Serving {
 fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<TcpStream>) -> anyhow::Result<Option<(PathBuf, TcpStream)>> {
     eprintln!("loading {}", model.display());
     let name = model.file_stem().and_then(|s| s.to_str()).unwrap_or("strata").to_string();
-    s.stats.lock().unwrap().unload(Some(name.clone()));
+    {
+        let mut st = s.stats.lock().unwrap();
+        st.unload(Some(name.clone()));
+        st.ctx = engine.ctx;
+    }
     let g = Gguf::open(model)?;
+    let arch = g.get("general.architecture")?.as_str().context("general.architecture")?;
+    s.stats.lock().unwrap().ctx_train = g.meta.get(&format!("{arch}.context_length")).and_then(|v| v.as_u64());
     let m = Model::load(&g)?;
     let tok = Tokenizer::from_gguf(&g)?;
     let r = engine.runner(&m, model)?;
@@ -1357,14 +1369,21 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                         write!(w, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), None))?;
                     }
                 }
+                let mut last_stream_activity = Instant::now();
                 decode(r, tok, e.mtp() > 0, &mut smp, logits, n, &mut |t| {
                     s.stats.lock().unwrap().live_tokens += 1;
                     // A client that left stops the reply (a stream notices on the next write; held text writes nothing).
                     k += 1;
                     if k % 16 == 0 && serve::gone(&w) { anyhow::bail!("client closed the connection"); }
                     let t = hold.push(t);
-                    if req.stream && !t.is_empty() {
-                        if !anth { write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?; } else { text_delta(&mut w, &mut opened, &t)?; }
+                    if req.stream {
+                        if !t.is_empty() {
+                            if !anth { write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?; } else { text_delta(&mut w, &mut opened, &t)?; }
+                            last_stream_activity = Instant::now();
+                        } else if last_stream_activity.elapsed() >= Duration::from_secs(15) {
+                            w.write_all(b": keep-alive\n\n")?;
+                            last_stream_activity = Instant::now();
+                        }
                     }
                     Ok(hold.stopped)
                 })
