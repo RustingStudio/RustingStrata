@@ -2,6 +2,42 @@
 use crate::gguf::{Gguf, TensorInfo};
 use crate::quant::{GgmlType, dequant_row};
 use rayon::prelude::*;
+use std::sync::{Mutex, OnceLock};
+
+/// Optional CUDA offload of the non-expert matvecs (STRATA_DS_GPU=1). Weights stay resident in VRAM; the activation is
+/// copied up and the result down per call, so everything else in the forward stays the CPU reference code.
+mod dev {
+    use super::*;
+    use crate::backend::{Backend, Buf, GpuTensor};
+    use crate::weights::Tensor;
+    pub struct Dev { be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, pub bytes: usize }
+    static DEV: OnceLock<Option<Mutex<Dev>>> = OnceLock::new();
+    pub fn get() -> Option<&'static Mutex<Dev>> {
+        DEV.get_or_init(|| {
+            if std::env::var_os("STRATA_DS_GPU").is_none() { return None; }
+            let be = crate::backend::open(Some("cuda"), 0).ok()?;
+            let (x, y) = (be.alloc(4 * 40960).ok()?, be.alloc(4 * 140000).ok()?);
+            Some(Mutex::new(Dev { be, ts: vec![], x, y, bytes: 0 }))
+        }).as_ref()
+    }
+    impl Dev {
+        pub fn upload(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize) -> Option<u32> {
+            let t = self.be.upload(&Tensor { ty, cols, rows, data }).ok()?;
+            self.bytes += data.len();
+            self.ts.push(t);
+            Some(self.ts.len() as u32 - 1)
+        }
+        pub fn gemv(&self, i: u32, x: &[f32], y: &mut [f32]) {
+            let xb: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+            self.be.htod(&xb, &self.x, 0).unwrap();
+            self.be.gemv(&self.ts[i as usize], self.x.addr(), self.y.addr()).unwrap();
+            let mut yb = vec![0u8; 4 * y.len()];
+            self.be.dtoh(&self.y, 0, &mut yb).unwrap();
+            for (o, c) in y.iter_mut().zip(yb.chunks_exact(4)) { *o = f32::from_le_bytes(c.try_into().unwrap()); }
+        }
+    }
+}
+pub fn gpu_bytes() -> usize { dev::get().map_or(0, |d| d.lock().unwrap().bytes) }
 
 /// Row-major weight: `rows` rows of `cols` elements (ggml dims[0] = cols, dims[1] = rows).
 /// A 3-D expert tensor is addressed with `expert(e)`.
@@ -13,6 +49,8 @@ pub struct Mat<'a> {
     pub cols: usize,
     /// Routed-expert tensor: llama.cpp runs these on the CPU (Q8_K activations); the rest runs on CUDA (Q8_1 blocks of 32).
     pub cpu: bool,
+    /// Index of the VRAM copy (STRATA_DS_GPU).
+    pub gpu: Option<u32>,
 }
 
 impl<'a> Mat<'a> {
@@ -21,14 +59,37 @@ impl<'a> Mat<'a> {
         let ty = GgmlType::from_u32(t.ty)?;
         let cols = t.dims[0] as usize;
         let rows = t.dims[1..].iter().product::<u64>() as usize;
-        Ok(Mat { data: g.bytes(t), ty, rows, cols, cpu: name.contains("_exps") })
+        let cpu = name.contains("_exps");
+        let data = g.bytes(t);
+        let gpu = if cpu || t.dims.len() != 2 { None } else { dev::get().and_then(|d| d.lock().unwrap().upload(data, ty, rows, cols)) };
+        Ok(Mat { data, ty, rows, cols, cpu, gpu })
+    }
+
+    /// Like `load` for a matrix used as `n` row groups (grouped output projection): each group gets its own VRAM copy.
+    pub fn load_groups(g: &'a Gguf, name: &str, n: usize) -> anyhow::Result<Self> {
+        let mut m = Self::load(g, name)?;
+        m.gpu = None;
+        if let Some(d) = dev::get() {
+            let (gr, rb) = (m.rows / n, m.ty.row_bytes(m.cols as u64));
+            let mut d = d.lock().unwrap();
+            let ids: Vec<_> = (0..n).map(|i| d.upload(&m.data[i * gr * rb..(i + 1) * gr * rb], m.ty, gr, m.cols)).collect();
+            if ids.iter().all(|i| i.is_some()) { m.gpu = ids[0]; }
+        }
+        Ok(m)
+    }
+
+    /// Row group `i` of `n` (see `load_groups`).
+    pub fn group(&self, i: usize, n: usize) -> Mat<'a> {
+        let rows = self.rows / n;
+        let sz = rows * self.ty.row_bytes(self.cols as u64);
+        Mat { data: &self.data[i * sz..(i + 1) * sz], rows, gpu: self.gpu.map(|b| b + i as u32), ..*self }
     }
 
     /// Slice of a [cols, rows, n_expert] tensor for expert e.
     pub fn expert(&self, e: usize, n_expert: usize) -> Mat<'a> {
         let rows = self.rows / n_expert;
         let sz = rows * self.ty.row_bytes(self.cols as u64);
-        Mat { data: &self.data[e * sz..(e + 1) * sz], ty: self.ty, rows, cols: self.cols, cpu: self.cpu }
+        Mat { data: &self.data[e * sz..(e + 1) * sz], ty: self.ty, rows, cols: self.cols, cpu: self.cpu, gpu: None }
     }
 
     pub fn row_into(&self, r: usize, out: &mut [f32]) {
@@ -40,6 +101,9 @@ impl<'a> Mat<'a> {
     pub fn matvec(&self, x: &[f32], y: &mut [f32]) {
         assert_eq!(x.len(), self.cols);
         assert_eq!(y.len(), self.rows);
+        if let (Some(i), Some(d)) = (self.gpu, dev::get()) {
+            return d.lock().unwrap().gemv(i, x, y);
+        }
         let rb = self.ty.row_bytes(self.cols as u64);
         let xq = q8_roundtrip(self.ty, self.cpu, x);
         let x = &xq[..];
