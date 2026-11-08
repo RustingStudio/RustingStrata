@@ -805,6 +805,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Check { model, backend, device } => {
             let g = Gguf::open(&model)?;
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
+                let c = rusting_strata::deepseek::DsConfig::from_gguf(&g)?;
+                c.validate(&g)?;
+                println!("check: deepseek41 ok: {} layers, {} experts ({} used), {} tensors, tensor table valid (CPU reference only; no GPU path yet)", c.n_layer, c.n_expert, c.n_used, g.tensors.len());
+                return Ok(());
+            }
             let types = rusting_strata::gpu_model::gpu_weight_types(&g);
             let b = backend::open(backend.as_deref(), device)?;
             if b.name() != "vulkan" {
