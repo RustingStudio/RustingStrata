@@ -660,6 +660,28 @@ template <> struct QS<22> : QI<22> {
     }
 };
 
+#if GEMV_LOADW
+// M2-T5 candidate (`STRATA_GEMV_LOADW=1`): the Q4_K GEMV reads its 16-byte header/scale block as one vector load,
+// where `QI<12>::get` issues four 4-byte ones. A Q4_K row is 144 B (a multiple of 16), so the row pointer decides:
+// 16-aligned base -> one `ld.global.v4.b32`, otherwise the byte-for-byte original. The four words are the same, so
+// the result is bit-identical; only the GEMV path changes (`gemv_row_q` takes `QS<T>`, the prefill GEMM calls
+// `QI<T>::get`/`get2` directly).
+template <> struct QS<12> : QI<12> {
+    static constexpr bool SH = false;
+    __device__ static void load() {}
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        if (((size_t)b & 15) == 0) {
+            int e = sub * 8, j = e >> 6, h = (e >> 5) & 1, l = e & 31;
+            uint4 s = *(const uint4*)b;
+            k4_dm_w(s.x, s.y, s.z, s.w, 2 * j + h, d, m);
+            const u8* q = b + 16 + 32 * j + l;
+            lo = (int)((ldu32(q) >> (4 * h)) & 0x0F0F0F0Fu);
+            hi = (int)((ldu32(q + 4) >> (4 * h)) & 0x0F0F0F0Fu);
+        } else QI<12>::get(b, sub, lo, hi, d, m);
+    }
+};
+#endif
+
 template <int T, int SBB, bool P, class Q = QI<T>>
 __device__ __forceinline__ void gemv_row_q(const u8* __restrict__ w, const signed char* qs, const float* xd, float* y, int row, int cols) {
     int lane = threadIdx.x & 31;
@@ -752,7 +774,8 @@ QTYPES(DEF_DEQUANT)
 FTYPES(DEF_FGEMV)
 
 // Quantized types: dynamic shared memory holds x as int8 (cols bytes) then its scales ((cols >> 5) floats).
-// Each block covers 8 * rpw rows (warp w: rows w, w + 8, ...) so small matrices amortize the x quantization.
+// Each block covers (warps per block) * rpw rows (warp w: rows w, w + nw, ...) so small matrices amortize the x
+// quantization; nw = blockDim.x / 32, so STRATA_GEMV_BLOCK (128/256/512) only changes the launch shape.
 // moe_gemv: grid.y = k; weights at w + ids[k] * stride (skipped when ids[k] < 0), input x + (k / xg) * x_stride,
 // output y + k * rows. grid.z = 2 also runs a second matrix at byte offset w2 into output at byte offset y2.
 #define DEF_IGEMV(T, NAME, SBB) DEF_IGEMV_(T, NAME, SBB, false) DEF_IGEMV_(T, NAME##_p, SBB, true)
@@ -766,8 +789,9 @@ FTYPES(DEF_FGEMV)
         if (!xq) quant_x<P>(x, cols, sx, (float*)(sx + cols));                                           \
         else if (QS<T>::SH) __syncthreads();                                                                    \
         w += blockIdx.z * w2; y = (float*)((char*)y + blockIdx.z * y2); if (blockIdx.z) rows = rows2;           \
-        int r0 = blockIdx.x * 8 * rpw + (threadIdx.x >> 5), r1 = min(rows, r0 - (threadIdx.x >> 5) + 8 * rpw);  \
-        for (int row = r0; row < r1; row += 8) gemv_row_q<T, SBB, P, QS<T>>(w + row * ROWB(cols, SBB), xs, xd, y, row, cols); \
+        int nw = blockDim.x >> 5, warp = threadIdx.x >> 5;                                                      \
+        int r0 = blockIdx.x * nw * rpw + warp, r1 = min(rows, r0 - warp + nw * rpw);                            \
+        for (int row = r0; row < r1; row += nw) gemv_row_q<T, SBB, P, QS<T>>(w + row * ROWB(cols, SBB), xs, xd, y, row, cols); \
     }                                                                                                           \
     extern "C" __global__ void moe_gemv_##NAME(const u8* w, const int* ids, long long stride, const float* x,  \
                                                int x_stride, int xg, float* y, int rows, int cols, int rpw,      \
@@ -788,8 +812,9 @@ FTYPES(DEF_FGEMV)
         }                                                                                                       \
         const u8* we = w + e * stride + blockIdx.z * w2;                                                        \
         y = (float*)((char*)y + blockIdx.z * y2);                                                               \
-        int r0 = blockIdx.x * 8 * rpw + (threadIdx.x >> 5), r1 = min(rows, r0 - (threadIdx.x >> 5) + 8 * rpw);  \
-        for (int row = r0; row < r1; row += 8)                                                                  \
+        int nw = blockDim.x >> 5, warp = threadIdx.x >> 5;                                                      \
+        int r0 = blockIdx.x * nw * rpw + warp, r1 = min(rows, r0 - warp + nw * rpw);                            \
+        for (int row = r0; row < r1; row += nw)                                                                \
             gemv_row_q<T, SBB, P, QS<T>>(we + row * ROWB(cols, SBB), xs, xd, y + (size_t)k * rows, row, cols);    \
     }
 ITYPES(DEF_IGEMV)
@@ -808,8 +833,9 @@ ITYPES(DEF_IGEMV)
         const float* xd = (const float*)(xs + nt * cols);                                                  \
         if (!xq) for (int t = 0; t < nt; t++)                                                                   \
             quant_x<P>(x + (size_t)t * xs_, cols, sx + t * cols, (float*)(sx + nt * cols) + t * (cols >> 5)); \
-        int r0 = blockIdx.x * 8 * rpw + (threadIdx.x >> 5), r1 = min(rows, r0 - (threadIdx.x >> 5) + 8 * rpw);  \
-        for (int row = r0; row < r1; row += 8) {                                                               \
+        int nw = blockDim.x >> 5, warp = threadIdx.x >> 5;                                                      \
+        int r0 = blockIdx.x * nw * rpw + warp, r1 = min(rows, r0 - warp + nw * rpw);                            \
+        for (int row = r0; row < r1; row += nw) {                                                               \
             const u8* wr = w + row * ROWB(cols, SBB);                                                         \
             if (nt == 2) gemv_row_qn<T, SBB, P, 2>(wr, xs, xd, y, ys, row, cols);                                    \
             else if (nt == 3) gemv_row_qn<T, SBB, P, 3>(wr, xs, xd, y, ys, row, cols);                               \
@@ -827,18 +853,66 @@ struct GemmTile { const u8* w; int m0, cnt; };
 
 __device__ __forceinline__ u32 ld_s32(const u16* p) { return *(const u32*)p; }
 // Four 8x8 f16 matrices from shared memory; lane l gives the row address for matrix l / 8 (.trans transposes each).
+//
+// sm_75+ uses ldmatrix.x4. On sm_70 (Volta) ldmatrix does not exist, so the same fragments are loaded per lane with
+// plain shared loads. `p` is the lane's own matrix origin (lane l addresses matrix l / 8, row l & 7); its position
+// relative to the four matrices depends on the matrix order `RM` used by the call site. `my = l >> 3`, `mr = l & 7`,
+// and relative to the lane's own matrix origin:
+//
+//   RM = true : own_row = (my & 1) * 8, own_col = (my >> 1) * 8;  m_row = (m & 1) * 8, m_col = (m >> 1) * 8
+//   RM = false: own_row = (my >> 1) * 8, own_col = (my & 1) * 8;  m_row = (m >> 1) * 8, m_col = (m & 1) * 8
+//
+// ldmatrix register m of lane l holds matrix m, row l >> 2, columns 2*(l & 3), 2*(l & 3) + 1 (low half first):
+//   plain:  addr(m) = p + (m_row + (l >> 2) - own_row - mr) * PQ + (m_col + 2*(l & 3) - own_col)
+//   trans:  the matrix is transposed, so register m of lane l holds matrix m rows 2*(l & 3), 2*(l & 3) + 1 at
+//           column l >> 2. Those two halves are one row apart, so two 16-bit loads:
+//   trans:  addr(m) = p + (m_row + 2*(l & 3) - own_row - mr) * PQ + (m_col + (l >> 2) - own_col), high at +PQ
+//
+// The loads are warp-synchronous plain loads (no __syncwarp()): every lane reads only elements it will own, and the
+// tile is published by the __syncthreads() before the loop. The plain case is a 4-byte load because the two halves
+// are adjacent and the address is even; the transposed halves are not contiguous and use 16-bit loads.
+template <int PQ, bool RM>
 __device__ __forceinline__ void ldsm4(u32* r, const u16* p) {
+#if __CUDA_ARCH__ < 750
+    int l = threadIdx.x & 31, my = l >> 3, mr = l & 7;
+    int own_row = (RM ? (my & 1) : (my >> 1)) * 8, own_col = (RM ? (my >> 1) : (my & 1)) * 8;
+    int row = (l >> 2) - own_row - mr, col = 2 * (l & 3) - own_col;
+#pragma unroll
+    for (int m = 0; m < 4; m++) {
+        int m_row = (RM ? (m & 1) : (m >> 1)) * 8, m_col = (RM ? (m >> 1) : (m & 1)) * 8;
+        unsigned a = (unsigned)__cvta_generic_to_shared(p + (m_row + row) * PQ + m_col + col);
+        asm("ld.shared.b32 %0, [%1];" : "=r"(r[m]) : "r"(a));
+    }
+#else
     unsigned a = (unsigned)__cvta_generic_to_shared(p);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+#endif
 }
+template <int PQ, bool RM>
 __device__ __forceinline__ void ldsm4t(u32* r, const u16* p) {
+#if __CUDA_ARCH__ < 750
+    int l = threadIdx.x & 31, my = l >> 3, mr = l & 7;
+    int own_row = (RM ? (my & 1) : (my >> 1)) * 8, own_col = (RM ? (my >> 1) : (my & 1)) * 8;
+    int row = 2 * (l & 3) - own_row - mr, col = (l >> 2) - own_col;
+#pragma unroll
+    for (int m = 0; m < 4; m++) {
+        int m_row = (RM ? (m & 1) : (m >> 1)) * 8, m_col = (RM ? (m >> 1) : (m & 1)) * 8;
+        unsigned a = (unsigned)__cvta_generic_to_shared(p + (m_row + row) * PQ + m_col + col);
+        unsigned short lo, hi;
+        asm("ld.shared.u16 %0, [%1];" : "=h"(lo) : "r"(a));
+        asm("ld.shared.u16 %0, [%1];" : "=h"(hi) : "r"(a + 2 * PQ));
+        r[m] = (u32)lo | ((u32)hi << 16);
+    }
+#else
     unsigned a = (unsigned)__cvta_generic_to_shared(p);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+#endif
 }
 __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#if __CUDA_ARCH__ >= 750
     // Turing (sm_75) has no m16n8k16 f16 mma: the same product is two m16n8k8 steps, k = 0..7 and k = 8..15
     // (the a0/a1, a2/a3 and b0, b1 fragments are those half-K fragments of the k16 layout).
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
@@ -846,10 +920,57 @@ __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a2), "r"(a3), "r"(b1));
 #else
+    // D[16,8] += A[16,16] * B[16,8] on CUDA cores. mma.sync.aligned.m16n8k16 is sm_80+ (unlike ldmatrix, which is
+    // sm_75+, hence the different guard). Lane l = 4*g + t (g = l >> 2, t = l & 3) owns A rows g / g+8 at the
+    // k-halves {2t, 2t+1, 2t+8, 2t+9}, and B column g at those same k. The four accumulators are sums over all 16
+    // k, so A of rows g / g+8 comes from lanes 4*g + tp and B of columns 2t / 2t+1 from lanes 4*n + tp
+    // (n = 2t, 2t+1), i.e. 8*t + tp and 8*t + 4 + tp. Accumulation order is k = 0,1,8,9, 2,3,10,11,
+    // 4,5,12,13, 6,7,14,15 (tp = 0..3): the only difference vs the tensor core is f32 summation order, the f16
+    // inputs are the same values. Every lane computes every accumulator, so this must stay in warp-uniform
+    // control flow: gemm_q's `wm < tl.cnt` (wm is per warp) and attn_prefill_t's `!skip` (`__any_sync`) are.
+    int l = threadIdx.x & 31, g = l >> 2, t = l & 3;
+#pragma unroll
+    for (int tp = 0; tp < 4; tp++) {
+        u32 sa0 = __shfl_sync(0xffffffff, a0, 4 * g + tp);      // A[g][2tp], A[g][2tp+1]
+        u32 sa2 = __shfl_sync(0xffffffff, a2, 4 * g + tp);      // A[g][2tp+8], A[g][2tp+9]
+        u32 sa1 = __shfl_sync(0xffffffff, a1, 4 * g + tp);      // A[g+8][2tp], A[g+8][2tp+1]
+        u32 sa3 = __shfl_sync(0xffffffff, a3, 4 * g + tp);      // A[g+8][2tp+8], A[g+8][2tp+9]
+        u32 sb0 = __shfl_sync(0xffffffff, b0, 8 * t + tp);      // B[2tp][2t], B[2tp+1][2t]
+        u32 sb1 = __shfl_sync(0xffffffff, b1, 8 * t + tp);      // B[2tp+8][2t], B[2tp+9][2t]
+        u32 sc0 = __shfl_sync(0xffffffff, b0, 8 * t + 4 + tp);  // B[2tp][2t+1], B[2tp+1][2t+1]
+        u32 sc1 = __shfl_sync(0xffffffff, b1, 8 * t + 4 + tp);  // B[2tp+8][2t+1], B[2tp+9][2t+1]
+        // The four k values 2tp, 2tp+1, 2tp+8, 2tp+9 of A (row g in ar, row g+8 in ar8) and of B (column 2t in
+        // bc, column 2t+1 in bc1), low half first.
+        float ar[4] = {h2f((u16)sa0), h2f((u16)(sa0 >> 16)), h2f((u16)sa2), h2f((u16)(sa2 >> 16))};
+        float ar8[4] = {h2f((u16)sa1), h2f((u16)(sa1 >> 16)), h2f((u16)sa3), h2f((u16)(sa3 >> 16))};
+        float bc[4] = {h2f((u16)sb0), h2f((u16)(sb0 >> 16)), h2f((u16)sb1), h2f((u16)(sb1 >> 16))};
+        float bc1[4] = {h2f((u16)sc0), h2f((u16)(sc0 >> 16)), h2f((u16)sc1), h2f((u16)(sc1 >> 16))};
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            c[0] = fmaf(ar[i], bc[i], c[0]);
+            c[1] = fmaf(ar[i], bc1[i], c[1]);
+            c[2] = fmaf(ar8[i], bc[i], c[2]);
+            c[3] = fmaf(ar8[i], bc1[i], c[3]);
+        }
+    }
+#endif
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 #endif
 }
+#if __CUDA_ARCH__ < 800
+// D[8,8] += A[8,4] * B[4,8] with the four independent computations of mma.m8n8k4 (Volta, SASS HMMA.884) selected
+// by g & 3. PTX ISA 8.5 §9.7.13.4.1: lane l = 4*g + t owns A row t + 4*(g >= 4) at k 0..3 and D elements by the
+// column/row formulas implemented in gemm_q's sm_70 path. mma.m16n8k16 is sm_80+, so this helper only exists for
+// the pre-Volta/Volta build: the guard keeps the sm_80+ preprocessed source byte-identical.
+__device__ __forceinline__ void mma884(float* d, u32 a0, u32 a1, u32 b0, u32 b1) {
+    asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+}
+#endif
 __device__ __forceinline__ u32 h2pack(float a, float b) { return (u32)f2h(a) | ((u32)f2h(b) << 16); }
 
 // act: 0 = store, 1 = y = silu(y) * result (SwiGLU over a gate already in y), 2 = y += result.
@@ -874,6 +995,10 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
         xr[q] = r < tl.cnt ? x + (size_t)(xrow ? xrow[tl.m0 + r] : tl.m0 + r) * x_stride : nullptr;
     }
     float acc[2][4][4] = {};
+#if __CUDA_ARCH__ < 800 && GEMM_TC
+    // Same 32 f32 storage as acc, seen as 4 m8 tiles x 8 D registers: accv[j][i] == &acc[0][0][0][j*8+i].
+    float (&accv)[4][8] = reinterpret_cast<float (&)[4][8]>(acc);
+#endif
     // W step kb is decoded into registers (as halves) during step kb - 1's mma and stored after it.
     constexpr int WQ = 64 * SUBS / NT;
     static_assert(64 * SUBS % NT == 0, "whole W groups per thread");
@@ -915,6 +1040,25 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
         if (wm < tl.cnt)
 #pragma unroll
         for (int kk = 0; kk < BK; kk += 16) {
+#if __CUDA_ARCH__ < 800 && GEMM_TC
+            // Volta: eight m8n8k4 ops replace one m16n8k16 for the same 16-deep k step. The four computations of
+            // each instruction are selected by c = g & 3: SM == false maps them to the four n8 tiles (m8 = j, n8 =
+            // c, 32 f32 per lane in accv[0..3]); SM == true maps them to the four 8x8 quadrants of the 16x16 warp
+            // tile (m8 = c >> 1, n8 = c & 1, accv[0] only). A depends on m8 only (broadcast across c), B on n8.
+            const int c = g & 3, hi = g >> 2;
+            #pragma unroll
+            for (int j = 0; j < (SM ? 1 : 4); j++) {
+                int m8 = SM ? (c >> 1) : j, n8 = SM ? (c & 1) : c;
+                const u16* pa = xs + (wm + 8 * m8 + t + 4 * hi) * P + kk;
+                const u16* pb = ws + (wn + 8 * n8 + t + 4 * hi) * P + kk;
+                #pragma unroll
+                for (int ks = 0; ks < 4; ks++) {
+                    u32 a0 = ld_s32(pa + 4 * ks), a1 = ld_s32(pa + 4 * ks + 2);
+                    u32 b0 = ld_s32(pb + 4 * ks), b1 = ld_s32(pb + 4 * ks + 2);
+                    mma884(accv[j], a0, a1, b0, b1);
+                }
+            }
+#else
             constexpr int MT = SM ? 1 : 2, NT8 = SM ? 2 : 4;
             u32 a[2][4], b[4][2];
             #pragma unroll
@@ -931,10 +1075,34 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
             for (int mt = 0; mt < MT; mt++)
                 #pragma unroll
                 for (int nt = 0; nt < NT8; nt++) mma16816(acc[mt][nt], a[mt][0], a[mt][1], a[mt][2], a[mt][3], b[nt][0], b[nt][1]);
+#endif
         }
         __syncthreads();
         if (kb + 1 < nk) stw();
     }
+#if __CUDA_ARCH__ < 800 && GEMM_TC
+    // m8n8k4 D layout (PTX ISA 8.5 §9.7.13.4.1): register i = 4*p4 + 2*p2 + e sits at row (t & 1) + 2*p2 + 4*hi
+    // and column (t & 2) + 4*p4 + e of the 8x8 tile. For each fixed c, lanes {4c..4c+3} and {16+4c..19+4c} cover
+    // that tile exactly once; the tile itself is picked by c (n8 = c) and j (m8 = j), or by c alone for SM.
+    const int c = g & 3, hi = g >> 2;
+    #pragma unroll
+    for (int j = 0; j < (SM ? 1 : 4); j++)
+        #pragma unroll
+        for (int p4 = 0; p4 < 2; p4++)
+            #pragma unroll
+            for (int p2 = 0; p2 < 2; p2++) {
+                int r = wm + 8 * (SM ? (c >> 1) : j) + (t & 1) + 2 * p2 + 4 * hi;
+                int n = n0 + wn + 8 * (SM ? (c & 1) : c) + (t & 2) + 4 * p4;
+                if (r >= tl.cnt) continue;
+                float* yr = y + (size_t)(tl.m0 + r) * y_stride;
+                #pragma unroll
+                for (int e = 0; e < 2; e++) {
+                    if (n + e >= rows) break;
+                    float v = accv[j][4 * p4 + 2 * p2 + e];
+                    yr[n + e] = act == 0 ? v : act == 1 ? silu(yr[n + e]) * v : yr[n + e] + v;
+                }
+            }
+#else
     #pragma unroll
     for (int mt = 0; mt < (SM ? 1 : 2); mt++)
         #pragma unroll
@@ -951,20 +1119,34 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
                     yr[n + e] = act == 0 ? v : act == 1 ? silu(yr[n + e]) * v : yr[n + e] + v;
                 }
             }
+#endif
 }
 
 #ifndef GEMM_BM
 #define GEMM_BM 128
+#endif
+#ifndef GEMM_BK
 #define GEMM_BK 64
 #endif
+#ifndef GEMM_MIN_BLOCKS
+#define GEMM_MIN_BLOCKS 1
+#endif
+static_assert(GEMM_BM % 32 == 0, "GEMM_BM must be a multiple of 32 (warp rows)");
+static_assert(GEMM_BK % 8 == 0, "GEMM_BK must be a multiple of 8 (one super-block sub-tile)");
+static_assert((64 * (GEMM_BK / 8)) % (2 * GEMM_BM) == 0, "whole W groups per thread");
+#if GEMM_MIN_BLOCKS > 1
+#define GEMM_LAUNCH_BOUNDS __launch_bounds__(GEMM_BM * 2, GEMM_MIN_BLOCKS)
+#else
+#define GEMM_LAUNCH_BOUNDS __launch_bounds__(GEMM_BM * 2)
+#endif
 #define DEF_GEMM(T, NAME, SBB)                                                                                    \
-    extern "C" __global__ void __launch_bounds__(GEMM_BM * 2) gemm_##NAME(const GemmTile* tiles, const u8* wd, int nd, \
+    extern "C" __global__ void GEMM_LAUNCH_BOUNDS gemm_##NAME(const GemmTile* tiles, const u8* wd, int nd,         \
             const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act) {  \
         gemm_q<T, SBB, GEMM_BM, GEMM_BK, false>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act); \
     }                                                                                                             \
-    extern "C" __global__ void __launch_bounds__(GEMM_BM * 2) gemms_##NAME(const GemmTile* tiles, const u8* wd, int nd, \
+    extern "C" __global__ void GEMM_LAUNCH_BOUNDS gemms_##NAME(const GemmTile* tiles, const u8* wd, int nd,        \
             const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act) {  \
-        gemm_q<T, SBB, GEMM_BM, GEMM_BK, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act); \
+        gemm_q<T, SBB, GEMM_BM, GEMM_BK, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act);  \
     }
 QTYPES(DEF_GEMM)
 
@@ -1017,7 +1199,6 @@ __device__ __forceinline__ void mma_s8_16832(int* c, u32 a0, u32 a1, u32 a2, u32
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
-#endif
 // int -> float for |c| < 2^22 without the quarter-rate I2F: 2^23 + 2^22 + c has c in its low mantissa bits.
 __device__ __forceinline__ float i2f_small(int c) { return __int_as_float(0x4B400000 + c) - 12582912.0f; }
 // The mma with every accumulator starting at I2F_BIAS: d = I2F_BIAS + sum, so i2f_small's integer add comes free.
@@ -1030,8 +1211,34 @@ __device__ __forceinline__ void mma_s8_16832_b(int* d, u32 a0, u32 a1, u32 a2, u
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};"
                  : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(I2F_BIAS));
 }
+#endif  // __CUDA_ARCH__ >= 800
 // Weight types whose scale (and min) is constant over 32 weights: one 32-deep mma per scale.
 template <int T> __host__ __device__ constexpr bool scale32() { return T == 42 || T == 2 || T == 3 || T == 6 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23; }
+// Volta (sm_70) has no cp.async (sm_80+). There the copy is a synchronous typed load/store by the same thread,
+// which is also why the "wait" sites need no thread barrier (see the audit at attn_decode_t / attn_prefill_t).
+// Zero fill: with `ok == false` the source is not read at all (cp.async's size operand 0 contract) and `dst`
+// receives zeros. The explicit `if (ok)` branch keeps ptxas from hoisting an unconditional ld.global; all current
+// sm_70 call sites pass a valid source anyway (prefill clamps the row to `last`, decode always passes true), so
+// the branch is a contract, not a hot path. The store is a typed C++ store through the same pointer type the
+// reader uses (uint4/uint2, like ldh_raw), so the compiler sees the alias; st.shared asm would hide it and let
+// the typed reads be reordered. The trailing empty asm is a compiler barrier only (not a thread barrier): no
+// reader can be hoisted above the store.
+#if __CUDA_ARCH__ < 800
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok) {
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (ok) v = *(const uint4*)src;
+    *(uint4*)dst = v;
+    asm volatile("" ::: "memory");
+}
+__device__ __forceinline__ void cp_async8(void* dst, const void* src, bool ok) {
+    uint2 v = make_uint2(0, 0);
+    if (ok) v = *(const uint2*)src;
+    *(uint2*)dst = v;
+    asm volatile("" ::: "memory");
+}
+__device__ __forceinline__ void cp_async_commit() {}
+template <int N> __device__ __forceinline__ void cp_async_wait() {}
+#else
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
     // No cp.async before sm_80: copy through registers. A predicated-off cp.async still zero-fills its 16 bytes,
@@ -1060,7 +1267,9 @@ template <int N> __device__ __forceinline__ void cp_async_wait() {
     asm volatile("cp.async.wait_group %0;" :: "n"(N));
 #endif
 }
+#endif
 
+// sm_80+ only: Volta and Turing have no usable int8 tensor-core path here (see the guard above).
 // SM: as in gemm_q (gemmis_*, the tiles of at most 32 positions, 16 x 16 outputs per warp).
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 template <int T, int SBB, int BM, bool SM>
@@ -1730,10 +1939,11 @@ __device__ void attn_decode_llama(const float* q, const u16* kc, const u16* vc, 
 // scores, warp h runs the online softmax of head h over the chunk, then warps add the weighted V rows. All warps
 // share one running max per head, so their partials just add up. The block writes per head its unnormalized partial
 // [acc (hd) | max | sum] to part; attn_merge combines the splits.
-// CP (f16 cache, the GQA entry point, head_dim 128 or 256): each lane cp.asyncs its own slice of the next two chunks
-// into shared memory while the block works on this one. Only the lane that copies a slice reads it, so the copies need
-// no barriers of their own. KV1: one chunk buffer, whose K and V halves each lane refills with the next chunk as soon
-// as it has read them into registers.
+// CP (f16 cache, the GQA entry point, head_dim 128 or 256): each lane copies its own slice of the next two chunks
+// into shared memory while the block works on this one (cp.async on sm_80+, a synchronous store on sm_70, at the
+// same program point). Only the lane that copies a slice reads it, so the copies need no barriers of their own.
+// KV1: one chunk buffer, whose K and V halves each lane refills with the next chunk as soon as it has read them
+// into registers.
 // sel (QSA): when not null and sel[0] >= 0, the block attends to the sel[0] cells sel[1 ..] instead of 0 ..= step[0].
 template <int PER, int G, bool CP = false, bool KV1 = false>
 __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
@@ -1764,7 +1974,8 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
     for (int i = 0; i < G; i++)
         for (int d = 0; d < PER; d++) acc[i][d] = 0.0f;
     // Positions past p1 copy or load the row p1 - 1 and keep zeros: a select, not a branch around the loads.
-    // cp(c0, b, kv): copy this lane's K (kv bit 0) and V (bit 1) slices of the chunk at c0 into buffer b, as one group.
+    // cp(c0, b, kv): copy this lane's K (kv bit 0) and V (bit 1) slices of the chunk at c0 into buffer b, as one
+    // cp.async group on sm_80+ (no group to commit on sm_70, where the copies are synchronous).
     auto cp = [&](int c0, int b, int kv) {
         if (c0 < p1)
 #pragma unroll
@@ -1783,8 +1994,9 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
         unsigned kr[J][PER / 2], vr[J][PER / 2];
         // Two stages: groups commit as chunks 0 1 2 ..., so all but the newest gives this chunk. KV1 (one stage):
         // groups commit as K0 V0 K1 V1 ..., so all but the newest gives this chunk's K here and its V further down.
+        // On sm_70 cp_async_wait is empty and each copy already happened in this lane's program order: no barrier.
         if constexpr (CP) {
-            cp_async_wait<1>();
+            cp_async_wait<1>();  // sm_80+: chunk it%2 landed; sm_70: same-lane copy, no barrier needed
             asm volatile("" ::: "memory");  // the reads below stay after the wait
         }
 #pragma unroll
@@ -1836,7 +2048,7 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
         // V here, not between the rescale and the adds below: the refill's branch would split them, and they would
         // contract into other FMAs than in the two-stage path.
         if constexpr (KV1) {
-            cp_async_wait<1>();
+            cp_async_wait<1>();  // sm_80+: this chunk's V landed; sm_70: same-lane copy, no barrier needed
             asm volatile("" ::: "memory");
 #pragma unroll
             for (int j = 0; j < J; j++) {
@@ -1858,7 +2070,7 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
                 float e = ss[i][w * J + j];
                 for (int d = 0; d < PER; d++) acc[i][d] += e * hraw(vr[j], d);
             }
-        __syncthreads();
+        __syncthreads();  // every lane has read buffer it%2 (lines above), so refilling it cannot clobber a live read
         if constexpr (CP && !KV1) cp(c0 + 2 * C, it % 2, 3);
     }
     if (w < G && lane == 0) { sm[w] = m; sl[w] = l; }
@@ -2023,10 +2235,12 @@ extern "C" __global__ void router_topk(const float* p, int n, int k, float extra
 
 // Decode routing of T tokens in one block (warp i routes tokens i, i + 8, ...): router_topk, the expert cache lookup
 // (slots = table[ids], -1 = not resident; wh = weight of hits, else 0), then the routing (and h, if an expert missed)
-// copied to the host-mapped mailbox `mb`, T stored in word 1 and the request flag raised.
+// copied to the host-mapped mailbox `mb`, T stored in word 1 and the request flag raised. `mb` = 0: the cache is fully
+// resident, there is no CPU part to tell, so every mailbox store is skipped (the ids, weights, slots and wh stay valid
+// for moe_gemv/moe_combine). `pid` (may be 0): last token's ids, the next token's prefetch prediction.
 extern "C" __global__ void moe_route(const float* p, int n, int k, float extra_scale, const int* table, int* ids,
                                      float* wts, int* slots, float* wh, const float* h, unsigned int* mb, int nh,
-                                     int h_off, const int* step, int T) {
+                                     int h_off, const int* step, int T, int* pid) {
     __shared__ int miss;
     int lane = threadIdx.x & 31, kt = k * T;
     unsigned int seq = step[1];
@@ -2039,11 +2253,14 @@ extern "C" __global__ void moe_route(const float* p, int n, int k, float extra_s
         if (lane < k) {
             int o = t * k + lane, s = table[id];
             ids[o] = id; wts[o] = w; slots[o] = s; wh[o] = s >= 0 ? w : 0.0f;
-            mb[32 + o] = id; mb[32 + kt + o] = __float_as_uint(w); mb[32 + 2 * kt + o] = s;
+            if (mb) { mb[32 + o] = id; mb[32 + kt + o] = __float_as_uint(w); mb[32 + 2 * kt + o] = s; }
+            if (pid && t == T - 1) pid[lane] = id;
             if (s < 0) miss = 1;
         }
     }
     __syncthreads();
+    // No CPU part and so no flag to raise: nobody reads this layer's words (R2 of issue #34).
+    if (!mb) return;
     if (threadIdx.x == 0) mb[1] = T;  // also read by routing() after the token
     // No miss: nobody waits on this layer. Raise only the skip flag, without the ~4 us system fence.
     if (!miss) { if (threadIdx.x == 0) ((volatile unsigned int*)mb)[2] = seq; return; }
@@ -2051,6 +2268,21 @@ extern "C" __global__ void moe_route(const float* p, int n, int k, float extra_s
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) *(volatile unsigned int*)mb = seq;
+}
+
+// Hint into L2 the cached expert of each of the `k` experts `ids` (the previous token's routing of a layer), whole
+// slot lines: the next layer's GEMVs may then find their rows in L2. `table[e] < 0` (expert on the CPU) is skipped.
+// One block per expert (grid.y) and line range (grid.x). STRATA_MOE_PREFETCH=1 only; a hint, never a correctness
+// dependency. Volta: prefetch.global.L2 exists since sm_20.
+extern "C" __global__ void moe_prefetch(const int* ids, int k, const int* table, const char* base, int stride, int bytes) {
+    int j = blockIdx.y;
+    if (j >= k) return;
+    int s = table[ids[j]];
+    if (s < 0) return;
+    const char* p = base + (size_t)((unsigned int)s * (unsigned int)stride);
+    int lines = bytes >> 7;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < lines; i += gridDim.x * blockDim.x)
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(p + ((size_t)i << 7)));
 }
 
 // x += sum_j w[j] ye[j] + sigmoid(sg) sh + cpu. If a slot missed, wait for the CPU worker's done flag first.
@@ -2104,15 +2336,21 @@ extern "C" __global__ void moe_combine_seq(float* x, const float* ye, const floa
 // step[0] + t) attends to cached keys 0 .. step[0] + t. q is [T, nh * HD] after rope, qg [T, nh * 2 * HD] holds the
 // gate at +HD per head; out [T, nh * HD] = softmax(q K^T * scale) V * sigmoid(gate). Shared: Q, K and V tiles, all
 // row-major; mma fragments come from ldmatrix (.trans for V).
+#ifndef FA_BQ
 #define FA_BQ 64
-#define FA_BK_DEFAULT 32
+#endif
+#define FA_BK_DEFAULT FA_BK
 // Turing's 64 KB shared memory cannot hold the HD = 256 tile at 32 keys either: 16 fit (the kernel keeps the same
 // 64 queries a block and four warps).
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 800
 #define FA_BK_FOR(HD) ((HD) == 256 ? 16 : FA_BK_DEFAULT)
 #else
 #define FA_BK_FOR(HD) FA_BK_DEFAULT
 #endif
+#ifndef FA_BK
+#define FA_BK 32
+#endif
+static_assert(FA_BQ == 16 * (128 / 32), "FA_BQ must be 16 query rows per warp of the 128-thread block");
 // QSA mask (see qsa_select): whether query row t (mw words a row) sees key position `key`. The mask has rows for the
 // tile padding past T too (their output is dropped).
 __device__ __forceinline__ bool qsa_bit(const unsigned* qm, int mw, int t, int key) {
@@ -2122,9 +2360,14 @@ template <int HD>
 __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, const u16* vc, const float* qg, float* out,
                                                const int* step, int T, int nh, int nkv, float scale, const unsigned* qm, int mw) {
     constexpr int PQ = HD + 8;
-    constexpr int FA_BK = FA_BK_FOR(HD);
+    constexpr int FA_BKL = FA_BK_FOR(HD);
     extern __shared__ __align__(16) u16 fa_sm[];
-    u16 *qs = fa_sm, *ks = qs + FA_BQ * PQ, *vs = ks + FA_BK * PQ;
+    u16 *qs = fa_sm, *ks = qs + FA_BQ * PQ, *vs = ks + FA_BKL * PQ;
+#if __CUDA_ARCH__ < 800 && GEMM_TC
+    // Volta only: warp-private P tile for the PV A fragments (see the staging in the PV step below). Appended after
+    // `vs` so the qs/ks/vs offsets above do not move; FA_BQ * (FA_BKL + 8) halves = 5120 B.
+    u16* ps = vs + FA_BKL * PQ;
+#endif
     // The last query tiles see the most keys: start them first so the short ones fill the tail.
     int pos0 = step[0], q0 = (gridDim.x - 1 - blockIdx.x) * FA_BQ, h = blockIdx.y, kvh = h / (nh / nkv), kvd = nkv * HD;
     int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
@@ -2137,10 +2380,18 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
     int last = pos0 + min(q0 + FA_BQ, T) - 1;  // last key any query of the tile sees
     int qp[2] = {pos0 + q0 + warp * 16 + g, pos0 + q0 + warp * 16 + g + 8};
     float o[HD / 8][4] = {}, m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
-    constexpr int N = FA_BK * HD / 8 / 128;
+#if __CUDA_ARCH__ < 800 && GEMM_TC
+    // Same storage as o / extra softmax state for the m8n8k4 layout (PTX ISA 8.5 §9.7.13.4.1). o2[j][grp][i] ==
+    // &o[0][0][j * HD / 4 + grp * 8 + i]: the lane owns 4 rows (query half j, p2), so m and l need four entries each;
+    // the m16n8k16 m / l above are dead here.
+    float (&o2)[2][HD / 32][8] = reinterpret_cast<float (&)[2][HD / 32][8]>(o);
+    float mT[2][2] = {{-INFINITY, -INFINITY}, {-INFINITY, -INFINITY}}, lT[2][2] = {};
+#endif
+    constexpr int N = FA_BKL * HD / 8 / 128;
 #if !KV_Q8
-    // f16: cp.async the V tile while the scores use K, and the next K tile while the sums use V (one block per SM,
-    // so nothing else hides the loads). Rows past `last` are zero-filled.
+    // f16: copy the V tile while the scores use K, and the next K tile while the sums use V (one block per SM,
+    // so nothing else hides the loads); cp.async on sm_80+, a blocking copy at the same program point on sm_70.
+    // Rows past `last` are zero-filled (synchronous path: the source is not read at all).
     auto ld = [&](int k0, u16* dst, const u16* src) {
 #pragma unroll
         for (int n = 0; n < N; n++) {
@@ -2152,7 +2403,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
     ld(0, ks, kc);
     ld(0, vs, vc);
 #endif
-    for (int k0 = 0; k0 <= last; k0 += FA_BK) {
+    for (int k0 = 0; k0 <= last; k0 += FA_BKL) {
 #if KV_Q8
         __syncthreads();
         // All of a thread's loads, then its stores: with q8 the dequant between them kept the compiler from
@@ -2172,36 +2423,138 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
             *(uint4*)(vs + r * PQ + c) = k0 + r <= last ? vv[n] : z;
         }
 #else
-        cp_async_wait<1>();  // this K tile; its V tile may still be in flight
+        cp_async_wait<1>();  // sm_80+: this K tile, its V tile may still be in flight; sm_70: already copied here
 #endif
         __syncthreads();
         // QSA: the tile's 8 blocks are bits (k0 >> 2) & 31 .. + 7 of one mask word per row. A warp whose 16 rows see
         // none of them skips the tile (its keys would add exactly nothing).
+#if __CUDA_ARCH__ < 800 && GEMM_TC
+        // m8n8k4 query rows: the lane owns rows 8*j + (t & 1) + 2*p2 + 4*hi of the warp tile, so four `vis` words.
+        int qp2[2][2];
+        unsigned vis2[2][2];
+#pragma unroll
+        for (int j = 0; j < 2; j++)
+#pragma unroll
+            for (int p2 = 0; p2 < 2; p2++) {
+                qp2[j][p2] = pos0 + q0 + warp * 16 + 8 * j + (t4 & 1) + 2 * p2 + 4 * (g >> 2);
+                vis2[j][p2] = 0xff;
+            }
+        if (qm)
+            for (int j = 0; j < 2; j++)
+                for (int p2 = 0; p2 < 2; p2++)
+                    vis2[j][p2] = (qm[(size_t)(qp2[j][p2] - pos0) * mw + (k0 >> 7)] >> ((k0 >> 2) & 31)) & 0xff;
+        bool skip = qm && !__any_sync(0xffffffff, (vis2[0][0] | vis2[0][1] | vis2[1][0] | vis2[1][1]) != 0);
+#else
         unsigned vis[2] = {0xff, 0xff};
         if (qm)
             for (int r = 0; r < 2; r++) vis[r] = (qm[(size_t)(qp[r] - pos0) * mw + (k0 >> 7)] >> ((k0 >> 2) & 31)) & 0xff;
         bool skip = qm && !__any_sync(0xffffffff, (vis[0] | vis[1]) != 0);
-        float s[FA_BK / 8][4] = {};
+#endif
+        float s[FA_BKL / 8][4] = {};
+#if __CUDA_ARCH__ < 800 && GEMM_TC
+        // Same 16 f32 storage as s, seen as m8n8k4 D registers: s2[ng][j][4*p4 + 2*p2 + e] is S[8*j + (t & 1) +
+        // 2*p2 + 4*hi][8*(4*ng + c) + (t & 2) + 4*p4 + e] of the 16 x FA_BKL score tile. Every lane holds the four
+        // computations its c selects, so the warp must stay in uniform control flow (`skip` is warp-uniform).
+        float (&s2)[FA_BKL / 32][2][8] = reinterpret_cast<float (&)[FA_BKL / 32][2][8]>(s);
+        if (!skip) {
+            const int c = g & 3, hi = g >> 2;
+#pragma unroll
+            for (int kg = 0; kg < FA_BKL / 32; kg++)
+#pragma unroll
+                for (int kk = 0; kk < HD; kk += 16)
+#pragma unroll
+                    for (int j = 0; j < 2; j++) {
+                        // A = Q rows 8*j + t + 4*hi of the warp tile, B = K row 8*(4*kg + c) + t + 4*hi, both at
+                        // k 4*ks4 .. 4*ks4 + 3 ({a0,a1} = k 0..3 of the 8 x 4 A / 4 x 8 B fragments).
+                        const u16* pa = qs + (warp * 16 + 8 * j + t4 + 4 * hi) * PQ + kk;
+                        const u16* pb = ks + (8 * (4 * kg + c) + t4 + 4 * hi) * PQ + kk;
+#pragma unroll
+                        for (int ks4 = 0; ks4 < 4; ks4++)
+                            mma884(s2[kg][j], ld_s32(pa + 4 * ks4), ld_s32(pa + 4 * ks4 + 2),
+                                                ld_s32(pb + 4 * ks4), ld_s32(pb + 4 * ks4 + 2));
+                    }
+        }
+#else
         if (!skip)
 #pragma unroll
         for (int kk = 0; kk < HD; kk += 16) {
             u32 a[4], b[4];
-            ldsm4(a, qs + (warp * 16 + lr) * PQ + kk + lc);
-            for (int nt = 0; nt < FA_BK / 8; nt += 2) {
+            ldsm4<PQ, true>(a, qs + (warp * 16 + lr) * PQ + kk + lc);
+            for (int nt = 0; nt < FA_BKL / 8; nt += 2) {
                 // matrices: keys nt*8 / dims kk, keys nt*8 / dims kk+8, keys nt*8+8 / dims kk, keys nt*8+8 / dims kk+8
-                ldsm4(b, ks + (nt * 8 + (lane & 7) + (lane >> 4) * 8) * PQ + kk + ((lane >> 3) & 1) * 8);
+                ldsm4<PQ, false>(b, ks + (nt * 8 + (lane & 7) + (lane >> 4) * 8) * PQ + kk + ((lane >> 3) & 1) * 8);
                 mma16816(s[nt], a[0], a[1], a[2], a[3], b[0], b[1]);
                 mma16816(s[nt + 1], a[0], a[1], a[2], a[3], b[2], b[3]);
             }
         }
+#endif
 #if !KV_Q8
         __syncthreads();
-        if (k0 + FA_BK <= last) ld(k0 + FA_BK, ks, kc);
-        else cp_async_commit();  // keep one group per tile for the waits
+        if (k0 + FA_BKL <= last) ld(k0 + FA_BKL, ks, kc);
+        else cp_async_commit();  // keep one group per tile for the waits (sm_80+; nothing to commit on sm_70)
 #endif
+#if __CUDA_ARCH__ < 800 && GEMM_TC
+        if (!skip) {
+        const int c = g & 3, hi = g >> 2;
+        // Mask, then the row max over the lane's keys and the three shuffles that reach the other eight lanes holding
+        // this row (xor 2 swaps t & 2, xor 4 and 8 swap c: together they split the FA_BKL keys of the row). keep is
+        // the rescale factor of each of the lane's four rows; lT is left unreduced inside the loop.
+        float keep[2][2], ms2[2][2];
+#pragma unroll
+        for (int j = 0; j < 2; j++)
+#pragma unroll
+            for (int p2 = 0; p2 < 2; p2++) {
+                float mx = mT[j][p2];
+#pragma unroll
+                for (int kg = 0; kg < FA_BKL / 32; kg++)
+#pragma unroll
+                    for (int p4 = 0; p4 < 2; p4++)
+#pragma unroll
+                        for (int e = 0; e < 2; e++) {
+                            float& v = s2[kg][j][4 * p4 + 2 * p2 + e];
+                            int key = k0 + 8 * (4 * kg + c) + (t4 & 2) + 4 * p4 + e;
+                            if (key > qp2[j][p2] || !((vis2[j][p2] >> ((key >> 2) & 7)) & 1)) v = -INFINITY;
+                            mx = fmaxf(mx, v);
+                        }
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 4));
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 8));
+                // mx is -inf while a QSA mask has hidden every key so far (key 0 is visible without one).
+                ms2[j][p2] = mx == -INFINITY ? 0.0f : mx;
+                keep[j][p2] = expf(mT[j][p2] - ms2[j][p2]);
+                mT[j][p2] = mx;
+                lT[j][p2] *= keep[j][p2];
+            }
+#pragma unroll
+        for (int j = 0; j < 2; j++)
+#pragma unroll
+            for (int p2 = 0; p2 < 2; p2++)
+#pragma unroll
+                for (int kg = 0; kg < FA_BKL / 32; kg++)
+#pragma unroll
+                    for (int p4 = 0; p4 < 2; p4++)
+#pragma unroll
+                        for (int e = 0; e < 2; e++) {
+                            float p = expf(s2[kg][j][4 * p4 + 2 * p2 + e] - ms2[j][p2]);
+                            s2[kg][j][4 * p4 + 2 * p2 + e] = p;
+                            lT[j][p2] += p;
+                        }
+#pragma unroll
+        for (int j = 0; j < 2; j++)
+#pragma unroll
+            for (int grp = 0; grp < HD / 32; grp++)
+#pragma unroll
+                for (int p4 = 0; p4 < 2; p4++)
+#pragma unroll
+                    for (int p2 = 0; p2 < 2; p2++) {
+                        o2[j][grp][4 * p4 + 2 * p2] *= keep[j][p2];
+                        o2[j][grp][4 * p4 + 2 * p2 + 1] *= keep[j][p2];
+                    }
+        }
+#else
         if (!skip) {
         float mx[2] = {m[0], m[1]};
-        for (int nt = 0; nt < FA_BK / 8; nt++)
+        for (int nt = 0; nt < FA_BKL / 8; nt++)
             for (int e = 0; e < 4; e++) {
                 int key = k0 + nt * 8 + 2 * t4 + (e & 1), r = e >> 1;
                 if (key > qp[r] || !((vis[r] >> ((key >> 2) & 7)) & 1)) s[nt][e] = -INFINITY;
@@ -2217,34 +2570,106 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
             m[r] = mx[r];
             l[r] *= c[r];
         }
-        for (int nt = 0; nt < FA_BK / 8; nt++)
+        for (int nt = 0; nt < FA_BKL / 8; nt++)
             for (int e = 0; e < 4; e++) { float p = expf(s[nt][e] - ms[e >> 1]); s[nt][e] = p; l[e >> 1] += p; }
 #pragma unroll
         for (int d = 0; d < HD / 8; d++) { o[d][0] *= c[0]; o[d][1] *= c[0]; o[d][2] *= c[1]; o[d][3] *= c[1]; }
         }
+#endif
 #if !KV_Q8
-        cp_async_wait<1>();  // this V tile; the next K tile may still be in flight
+        cp_async_wait<1>();  // sm_80+: this V tile, the next K tile may still be in flight; sm_70: already copied here
         __syncthreads();
 #endif
+#if __CUDA_ARCH__ < 800 && GEMM_TC
+        // P -> the warp-private staging tile: the m8n8k4 A fragment of the PV product wants row t + 4*hi and four
+        // contiguous keys per lane, which the QK^T D layout does not give for free. One 32-bit store per half pair;
+        // the __syncwarp() publishes the tile to the mma step below (the next tile's stores follow the loop's
+        // __syncthreads(), so no other barrier is needed).
+        if (!skip) {
+            const int c = g & 3, hi = g >> 2;
+#pragma unroll
+            for (int kg = 0; kg < FA_BKL / 32; kg++)
+#pragma unroll
+                for (int j = 0; j < 2; j++)
+#pragma unroll
+                    for (int p2 = 0; p2 < 2; p2++)
+#pragma unroll
+                        for (int p4 = 0; p4 < 2; p4++)
+                            *(u32*)(ps + (warp * 16 + 8 * j + (t4 & 1) + 2 * p2 + 4 * hi) * (FA_BKL + 8)
+                                       + 8 * (4 * kg + c) + (t4 & 2) + 4 * p4) =
+                                h2pack(s2[kg][j][4 * p4 + 2 * p2], s2[kg][j][4 * p4 + 2 * p2 + 1]);
+            __syncwarp();
+            // O[8*j + (t & 1) + 2*p2 + 4*hi][8*(4*grp + c) + (t & 2) + 4*p4 + e] += sum over the tile's keys of
+            // P * V: A from ps (four contiguous keys per lane), B is the transposed V tile, column t + 4*hi, key
+            // 4*kg + 0..3 as two half-pairs (the same two 16-bit loads per register that ldsm4t emulation costs).
+#pragma unroll
+            for (int kg = 0; kg < FA_BKL / 4; kg++)
+#pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    const u16* pa = ps + (warp * 16 + 8 * j + t4 + 4 * hi) * (FA_BKL + 8) + 4 * kg;
+                    u32 a0 = ld_s32(pa), a1 = ld_s32(pa + 2);
+#pragma unroll
+                    for (int grp = 0; grp < HD / 32; grp++) {
+                        const u16* pb = vs + 4 * kg * PQ + 8 * (4 * grp + c) + t4 + 4 * hi;
+                        u32 b0 = (u32)pb[0] | ((u32)pb[PQ] << 16);
+                        u32 b1 = (u32)pb[2 * PQ] | ((u32)pb[3 * PQ] << 16);
+                        mma884(o2[j][grp], a0, a1, b0, b1);
+                    }
+                }
+        }
+#else
         if (!skip)
 #pragma unroll
-        for (int kb = 0; kb < FA_BK / 16; kb++) {
+        for (int kb = 0; kb < FA_BKL / 16; kb++) {
             u32 a0 = h2pack(s[2 * kb][0], s[2 * kb][1]), a1 = h2pack(s[2 * kb][2], s[2 * kb][3]);
             u32 a2 = h2pack(s[2 * kb + 1][0], s[2 * kb + 1][1]), a3 = h2pack(s[2 * kb + 1][2], s[2 * kb + 1][3]);
 #pragma unroll
             for (int d = 0; d < HD / 8; d += 2) {
                 u32 b[4];  // transposed: keys kb*16 / dims d*8, keys +8 / dims d*8, keys / dims d*8+8, keys +8 / dims d*8+8
-                ldsm4t(b, vs + (kb * 16 + lr) * PQ + d * 8 + lc);
+                ldsm4t<PQ, true>(b, vs + (kb * 16 + lr) * PQ + d * 8 + lc);
                 mma16816(o[d], a0, a1, a2, a3, b[0], b[1]);
                 mma16816(o[d + 1], a0, a1, a2, a3, b[2], b[3]);
             }
         }
+#endif
 #if !KV_Q8
         __syncthreads();
-        if (k0 + FA_BK <= last) ld(k0 + FA_BK, vs, vc);
-        else cp_async_commit();
+        if (k0 + FA_BKL <= last) ld(k0 + FA_BKL, vs, vc);
+        else cp_async_commit();  // keep one group per tile for the waits (sm_80+; nothing to commit on sm_70)
 #endif
     }
+#if __CUDA_ARCH__ < 800 && GEMM_TC
+    const int c = g & 3, hi = g >> 2;
+    // One reduction of the lane's row sums after the last tile: the eight lanes holding a row split its keys.
+#pragma unroll
+    for (int j = 0; j < 2; j++)
+#pragma unroll
+        for (int p2 = 0; p2 < 2; p2++) {
+            lT[j][p2] += __shfl_xor_sync(0xffffffff, lT[j][p2], 2);
+            lT[j][p2] += __shfl_xor_sync(0xffffffff, lT[j][p2], 4);
+            lT[j][p2] += __shfl_xor_sync(0xffffffff, lT[j][p2], 8);
+        }
+    // gemm_q's sm_70 store loop: register i = 4*p4 + 2*p2 + e sits at row (t & 1) + 2*p2 + 4*hi and column
+    // (t & 2) + 4*p4 + e of the 8x8 tile.
+#pragma unroll
+    for (int j = 0; j < 2; j++)
+#pragma unroll
+        for (int grp = 0; grp < HD / 32; grp++)
+#pragma unroll
+            for (int p2 = 0; p2 < 2; p2++) {
+                int row = q0 + warp * 16 + 8 * j + (t4 & 1) + 2 * p2 + 4 * hi;
+                if (row >= T) continue;
+                float* orow = out + (size_t)row * nh * HD + h * HD;
+                const float* gate = qg ? qg + (size_t)row * nh * 2 * HD + h * 2 * HD + HD : nullptr;
+#pragma unroll
+                for (int p4 = 0; p4 < 2; p4++)
+#pragma unroll
+                    for (int e = 0; e < 2; e++) {
+                        int col = 8 * (4 * grp + c) + (t4 & 2) + 4 * p4 + e;
+                        orow[col] = o2[j][grp][4 * p4 + 2 * p2 + e] / lT[j][p2] * (gate ? sigmoid(gate[col]) : 1.0f);
+                    }
+            }
+#else
     for (int r = 0; r < 2; r++) {
         l[r] += __shfl_xor_sync(0xffffffff, l[r], 1);
         l[r] += __shfl_xor_sync(0xffffffff, l[r], 2);
@@ -2262,6 +2687,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
                 orow[col] = o[d][2 * r + e] / l[r] * (gate ? sigmoid(gate[col]) : 1.0f);
             }
     }
+#endif
 }
 // --llama-numerics prefill attention: f32 throughout, like llama.cpp's CPU tiled path (the tensor-core kernel above
 // rounds q and the softmax weights to f16). One query at a time per block; slow, for parity runs only.

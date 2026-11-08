@@ -125,9 +125,13 @@ for pi, p in enumerate(prompts[a.start :], a.start):
             "first_miss": bad,
             "top2_gap_at_miss": gap,
             "argmax": mine,
+            # Top-5 (token, logprob) pairs per position. target/ only, never committed: the
+            # cross-backend report needs each backend's top-5 gap at a divergent position
+            # (tools/consistency.py, M2-T7).
+            "top5": res["top5"],
         }
     )
-    print({k: v for k, v in rows[-1].items() if k != "argmax"}, flush=True)
+    print({k: v for k, v in rows[-1].items() if k not in ("argmax", "top5")}, flush=True)
 pct = 100 * agree / total
 print(f"TOP1 AGREEMENT {agree}/{total} = {pct:.2f}%")
 if alt is not None:

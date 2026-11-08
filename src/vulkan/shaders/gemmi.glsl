@@ -14,7 +14,8 @@
 #extension GL_EXT_control_flow_attributes : require
 layout(local_size_x = 256) in;
 #include "common.glsl"
-#define SHARED_TABLES
+// The IQ tables are read from the buffer, not a spec-constant-sized shared array: with KS = 16 that array makes the
+// pipeline ask for 49168 bytes, 16 over the 48 KB of a 3060 or V100 (V100 first chunked prefill: Xid 13 L1_CONFIG_TOO_SMALL).
 #include "deq.glsl"
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64 { uint64_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer UV4 { uvec4 v[]; };

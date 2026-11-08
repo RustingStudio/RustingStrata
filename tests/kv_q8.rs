@@ -90,3 +90,63 @@ fn q8_kv_attention_matches_f16() {
         }
     }
 }
+
+/// `serve --parallel` with `--kv q8`: the three slots each get a q8_0-sized KV cache, and one batched decode forward
+/// over all of them gives the same logits, bit for bit, as decoding each slot alone. The per-slot `kc`/`vc` are
+/// allocated with `Backend::kv_words`, so a slot wrongly sized for f16 would fail or corrupt the rows here.
+#[test]
+fn q8_multi_slot_matches_single() {
+    use rusting_strata::{gguf::Gguf, gpu_model::GpuModel, model::Model, ops, tokenizer::Tokenizer};
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    unsafe { std::env::set_var("STRATA_KV_Q8", "1") };
+    let gpu = match Gpu::new(0) {
+        Ok(g) => g,
+        Err(e) if format!("{e}") == "CUDA init" => { eprintln!("SKIP: no GPU: {e:#}"); return }
+        Err(e) => panic!("{e:#}"),
+    };
+    assert_eq!(gpu.kv_words(64), 34);
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let prompts: Vec<Vec<u32>> = ["The capital of France is", "def fib(n):\n    return", "Once upon a time, in a small village"]
+        .iter().map(|s| tok.encode(s).unwrap()).collect();
+    let mut gm = GpuModel::load_slots(&m, Box::new(gpu), 256, 4, 512 << 20, 3).unwrap();
+    assert_eq!(gm.slots(), 3);
+    gm.adapt_every = 0;
+    // Reference: each prompt alone in slot 0, greedy, three steps.
+    let (mut want, mut toks) = (vec![], vec![]);
+    for ids in &prompts {
+        gm.use_slot(0);
+        gm.reset().unwrap();
+        let mut l = vec![gm.prefill(ids).unwrap()];
+        let mut ts = vec![];
+        for _ in 0..3 {
+            let t = ops::argmax(l.last().unwrap()) as u32;
+            ts.push(t);
+            l.push(gm.step(t).unwrap());
+        }
+        want.push(l);
+        toks.push(ts);
+    }
+    // Batched: prefill each slot, then one `step_rows` forward over all three per step.
+    for (s, ids) in prompts.iter().enumerate() {
+        gm.use_slot(s);
+        gm.reset().unwrap();
+        gm.prefill(ids).unwrap();
+    }
+    let mut got: Vec<Vec<Vec<f32>>> = vec![vec![]; 3];
+    for k in 0..3 {
+        let rows: Vec<(usize, u32, bool)> = (0..3).map(|s| (s, toks[s][k], true)).collect();
+        for (s, (t, l)) in gm.step_rows(&rows).unwrap().into_iter().enumerate() {
+            // `t` is the argmax after the fed token: the next reference token, when there is one.
+            if let Some(&next) = toks[s].get(k + 1) { assert_eq!(t, next, "slot {s} step {k}: greedy token"); }
+            got[s].push(l);
+        }
+    }
+    for s in 0..3 {
+        for (k, (g, w)) in got[s].iter().zip(want[s].iter().skip(1)).enumerate() {
+            assert_eq!(g, w, "q8 slot {s} step {k}");
+        }
+    }
+}
