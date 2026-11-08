@@ -16,6 +16,13 @@ const QWEN35_RE: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[d
 /// llama.cpp `LLAMA_VOCAB_PRE_TYPE_QWEN2` pre-tokenizer regex (qwen3, qwen3moe, qwen3next).
 const QWEN2_RE: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// llama.cpp `LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM` (DeepSeek-V4): three splits applied one after another.
+const JOYAI_RE: [&str; 3] = [
+    r"\p{N}{1,3}",
+    "[一-龥\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+",
+    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+",
+];
+
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
     eos: Vec<u32>,
@@ -26,7 +33,10 @@ impl Tokenizer {
         let model = g.get("tokenizer.ggml.model")?.as_str().unwrap_or("");
         if model != "gpt2" { bail!("unsupported tokenizer model '{model}'"); }
         let pre = g.get("tokenizer.ggml.pre")?.as_str().unwrap_or("");
-        let re = match pre { "qwen35" => QWEN35_RE, "qwen2" => QWEN2_RE, _ => bail!("unsupported pre-tokenizer '{pre}'") };
+        let res: &[&str] = match pre {
+            "qwen35" => &[QWEN35_RE], "qwen2" => &[QWEN2_RE], "joyai-llm" => &JOYAI_RE,
+            _ => bail!("unsupported pre-tokenizer '{pre}'"),
+        };
         let strs = |k: &str| -> anyhow::Result<Vec<String>> {
             g.get(k)?.as_arr().with_context(|| format!("{k}: not an array"))?
                 .iter().map(|v| v.as_str().map(str::to_string).with_context(|| format!("{k}: not a string"))).collect()
@@ -40,12 +50,14 @@ impl Tokenizer {
         let bpe = BPE::builder().vocab_and_merges(vocab, merges).build().map_err(|e| anyhow!("{e}"))?;
 
         let mut inner = tokenizers::Tokenizer::new(bpe);
-        let split = Split::new(SplitPattern::Regex(re.into()), SplitDelimiterBehavior::Isolated, false)
-            .map_err(|e| anyhow!("{e}"))?;
-        inner.with_pre_tokenizer(Some(Sequence::new(vec![
-            PreTokenizerWrapper::Split(split),
-            PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, false, false)),
-        ])));
+        let mut pre_tok = Vec::new();
+        for re in res {
+            let split = Split::new(SplitPattern::Regex((*re).into()), SplitDelimiterBehavior::Isolated, false)
+                .map_err(|e| anyhow!("{e}"))?;
+            pre_tok.push(PreTokenizerWrapper::Split(split));
+        }
+        pre_tok.push(PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, false, false)));
+        inner.with_pre_tokenizer(Some(Sequence::new(pre_tok)));
         inner.with_decoder(Some(ByteLevelDecoder::default()));
 
         let types = g.get("tokenizer.ggml.token_type")?.as_arr().context("token_type")?;
