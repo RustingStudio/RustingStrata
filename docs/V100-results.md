@@ -700,3 +700,142 @@ Both runs include `gemm_matches_reference_for_every_type` and
 `attn_prefill_matches_decode`; no failure, no NaN. `dmesg | grep -ic Xid` = 42
 after the window (unchanged), no `NVRM`/`device lost` line, GPU left at
 **0 MiB**. `llama.router.service` was left stopped for the coordinator.
+
+## 2026-11-08 — Decode GEMV bandwidth (M2-T5, V100, sm_70)
+
+Window: `llama.router.service` stopped and queue drained by the coordinator,
+V100 free, `dmesg | grep -ic Xid` = **42 before and after**, GPU left at
+**0 MiB**, service left stopped for the coordinator. Build: `task/30` on top of
+`d59a52b`. Roofline: peak HBM2 = 2 x 877 MHz x 4096 bit / 8 = **898.0 GB/s**;
+85 % target = 763 GB/s. Bench protocol unchanged from M2-T3:
+`--pp 512,4096,32768 --tg 128 --reps 3 --ctx 32896`, median of 3.
+
+### Per-token byte budget (the roofline denominator)
+
+From the GGUF tensor table of the reference model, 100 % expert hit rate, no
+cross-token L2 reuse, `token_embd.weight` excluded (one row per token):
+
+| category | MB/token | share | family |
+| --- | ---: | ---: | --- |
+| attention / SSM 2-D | 713.3 | 41.2 % | dense GEMV |
+| routed experts, top-8 | 329.0 | 19.0 % | `moe_gemv_*` |
+| `output.weight` (lm head) | 286.1 | 16.5 % | dense GEMV |
+| SSM / delta 2-D | 226.1 | 13.1 % | dense GEMV |
+| shared expert (`*_shexp`) | 92.9 | 5.4 % | dense GEMV |
+| router (`gate_inp`) | 83.9 | 4.8 % | dense GEMV |
+| **total** | **1731.3** | 100 % | dense 81.0 %, routed 19.0 % |
+
+Roofline: 1.7313 GB x 898.0 GB/s -> **518.7 tok/s at 100 %**, 440.9 at 85 %.
+Measured baseline 119.9 tok/s = **207.6 GB/s = 23.1 %** end-to-end; the
+adopted build 123.7 tok/s = **214.2 GB/s = 23.9 %**.
+
+### Per-shape achieved bandwidth and % of roofline (baseline, `gemv_bandwidth`)
+
+200 launches after a 300 ms clock ramp, one launch per row (MoE: 8 experts,
+`grid.y = 8`) — `at 100 %` is `bytes / 898 GB/s`, so `measured - at 100 %` is
+the launch/ramp overhead of that shape.
+
+| tensor | type | shape | measured | GB/s | % of 898 | at 100 % | bytes |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `blk.0.attn_gate` | Q5_K | 4096x2048 | 10.47 us | 551.0 | 61.4 % | 6.42 us | 5.77 MB |
+| `blk.0.attn_qkv` | Q5_K | 8192x2048 | 25.51 us | 452.2 | 50.4 % | 12.84 us | 11.53 MB |
+| `blk.0.ffn_down_exps` (8) | IQ3_XXS | 2048x512 | 15.39 us | 208.7 | 23.2 % | 3.58 us | 3.21 MB |
+| `blk.0.ffn_down_shexp` | Q6_K | 2048x512 | 4.89 us | 175.9 | 19.6 % | 0.96 us | 0.86 MB |
+| `blk.0.ffn_gate_exps` (8) | IQ2_XS | 512x2048 | 10.15 us | 238.9 | 26.6 % | 2.70 us | 2.42 MB |
+| `blk.0.ffn_gate_inp` | F32 | 256x2048 | 4.95 us | 423.8 | 47.2 % | 2.34 us | 2.10 MB |
+| `blk.0.ffn_gate_shexp` | Q5_K | 512x2048 | 5.05 us | 142.6 | 15.9 % | 0.80 us | 0.72 MB |
+| `blk.0.ssm_alpha` | F32 | 32x2048 | 3.46 us | 75.8 | 8.4 % | 0.29 us | 0.26 MB |
+| `blk.0.ssm_out` | Q6_K | 2048x4096 | 21.46 us | 320.7 | 35.7 % | 7.66 us | 6.88 MB |
+| `blk.1.attn_gate` | Q6_K | 4096x2048 | 15.62 us | 440.4 | 49.0 % | 7.66 us | 6.88 MB |
+| `blk.1.attn_qkv` | Q6_K | 8192x2048 | 28.31 us | 486.1 | 54.1 % | 15.33 us | 13.76 MB |
+| `blk.1.ffn_down_exps` (8) | IQ4_XS | 2048x512 | 16.80 us | 265.2 | 29.5 % | 4.96 us | 4.46 MB |
+| `blk.1.ffn_down_shexp` | Q8_0 | 2048x512 | 4.69 us | 237.7 | 26.5 % | 1.24 us | 1.11 MB |
+| `blk.1.ffn_gate_exps` (8) | IQ3_XXS | 512x2048 | 10.94 us | 293.4 | 32.7 % | 3.58 us | 3.21 MB |
+| `blk.1.ffn_gate_shexp` | Q6_K | 512x2048 | 5.18 us | 166.1 | 18.5 % | 0.96 us | 0.86 MB |
+| `blk.11.attn_output` | Q5_K | 2048x4096 | 11.90 us | 484.5 | 54.0 % | 6.42 us | 5.77 MB |
+| `output.weight` (lm head) | Q4_K | 248320x2048 | 594.41 us | 481.3 | 53.6 % | 318.56 us | 286.06 MB |
+| `token_embd.weight` (1 row) | Q5_K | 248320x2048 | 603.66 us | 579.2 | 64.5 % | 389.35 us | 349.63 MB |
+
+`token_embd` is printed for completeness only: decode reads one row of it, so
+it is not part of the budget.
+
+### Candidates (median of 3 reps, one process each)
+
+| id | env | tg @512 | tg @4096 | pp 4096 | tg @32768 | decision |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| B0 | — | 123.8 | 119.9 | 2934.2 | 106.5 | baseline |
+| R1 | `STRATA_RPW_MOE=4` | 128.2 (+3.55 %) | 124.0 (+3.42 %) | 2929.4 (-0.16 %) | 109.7 | prototype |
+| B2 | `STRATA_GEMV_BLOCK=512` | 124.3 (+0.40 %) | 120.5 (+0.50 %) | 2930.7 (-0.12 %) | 107.0 | rejected: < +2 % |
+| W | R1 + B2 | 128.2 (+3.55 %) | 124.1 (+3.50 %) | 2922.3 (-0.40 %) | 110.0 | rejected: per-shape |
+| **D** | **rpw: experts 2048-col `1`, 512-col `4`** (Rust default) | **127.9 (+3.31 %)** | **123.7 (+3.17 %)** | **2933.1 (-0.04 %)** | **109.5 (+2.82 %)** | **adopted** |
+
+Rejected on the per-shape guard or on their own numbers:
+
+- **R1** (all experts 4 rows per warp): the gain is entirely the down GEMV —
+  `ffn_down_exps` 208.7 -> 262.4 GB/s (+25.7 %, 15.4 -> 12.2 us) and 265.2 ->
+  328.8 (+24.0 %) — but gate/up (2048 columns) lost 7.4 % (238.9 -> 221.2) and
+  2.8 %. The 2048-column launch is 2.4 MB, short enough that fewer blocks hurt
+  more than the larger rows/block help.
+- **W** (R1 + 512-thread blocks): same decode gain, but `attn_gate` -5.4 %
+  (551.0 -> 521.5), `ffn_gate_exps` -4.4 %, `blk.1.attn_qkv` -2.8 %: fails the
+  "no per-shape regression > 2 %" guard.
+- **B2** (512-thread blocks alone): `attn_output` +6.2 % and `ssm_out` +3.3 %,
+  but `attn_qkv` -2.5 %, and decode only +0.5 % — below the +2 % threshold.
+- **L1** (`STRATA_GEMV_LOADW=1`, one 16-byte Q4_K header load): **rejected**,
+  lm head 481.3 -> 376.7 GB/s (-21.7 %, 594 -> 759 us). The uniform alignment
+  branch and the vector load cost more than the four scalar loads they replace
+  at this block layout.
+- **R2** (`STRATA_RPW_DENSE=4`): lm head +2.2 % but `ssm_out` -33 %
+  (320.7 -> 214.1) and `attn_output` -30 % (484.5 -> 338.6). Rejected.
+
+Adopted default: `Gpu::rpw` uses **4 rows per warp for the 512-column expert
+GEMV** (was 16) and keeps 1 (2 after the MoE bump) for 2048-column gate/up.
+Per-shape after adoption: down 262.0/327.0 GB/s (+25.5 %/+23.3 %), gate/up
+238.8/295.6 (unchanged), every dense shape unchanged. No env var is needed.
+
+### Why 85 % is not reached (ceiling)
+
+`ncu` attribution could not be completed in this window: the unbounded
+`tools/ncu_gemv.sh` run (kernel replay, 4 metrics, all decode kernels) was
+still running after 17 min and was stopped, and a bounded re-run
+(`--launch-count 240`, `gemv|gemvn|moe_gemv`) produced no metric rows — ncu
+2025.2.1 does not profile the CUDA-graph launches of this build on sm_70 with
+driver 580 (the app saw `decode 0.0 tok/s` with the profiler attached). No
+counter is reported that was not measured; the attribution below is the
+harness's own bytes/time per shape, as the issue allows.
+
+The arithmetic per shape (bytes / 898 GB/s vs measured) shows a fixed
+launch/ramp cost of roughly 4-13 us that dominates the small launches:
+
+- MoE gate/up: 2.42-3.21 MB -> 2.70-3.58 us at 100 %, measured 10.2-10.9 us.
+- MoE down: 3.21-4.46 MB -> 3.58-4.96 us, measured 15.4-16.8 us (before the
+  adopted rpw change) and 12.3-13.7 us after.
+- lm head: 286.06 MB -> 318.6 us at 100 %, measured 594.4 us: 276 us of
+  overhead on the one shape large enough to amortize everything, i.e. the
+  stream itself runs at ~53.6 %.
+- Best streamed shape: `attn_gate` 5.77 MB at 61.4 % (551 GB/s).
+
+Occupancy explains the common factor: `cuobjdump -res-usage` gives
+`gemv_q4_k` 56 REG, `moe_gemv_q4_k` 64, `gemvn_q4_k` 96, `moe_gemv_iq3_xxs` 56,
+`gemv_q5_k` 64 — at 56-64 registers an SM holds 4 blocks of 256 threads
+(32 of 64 warps, 50 % occupancy) whether the block is 128, 256 or 512 threads,
+which is why the block-size sweep moved almost nothing. sm_70 has no
+`cp.async` (M1-T6), so the only in-flight bytes are the 8 B per lane per
+super-block (`ldu32`+`ldu32`), and 50 % occupancy cannot hide the remaining
+latency. 85 % (763 GB/s) would require ~1 us of launch cost on a 5 MB launch
+and a stream several times more parallel than the current 8 B/lane: that is a
+kernel restructuring (more independent loads per lane, fewer per-row shuffles),
+not a launch-shape knob. Documented as the ceiling; no re-fusion of gate/up or
+down/combine was attempted.
+
+### Correctness and safety
+
+```sh
+STRATA_MODEL=$M STRATA_TEST_BACKENDS=cuda cargo test --release --test kernels matches \
+  -- --nocapture --test-threads=1        # 11 passed, 0 failed (gemvn_matches_gemv, gemm, moe, attn)
+dmesg -T | grep -ic Xid                  # 42 before and after (unchanged)
+nvidia-smi --query-gpu=memory.used       # 0 MiB at the end
+```
+
+`gemv_byte_budget_matches_issue` (device-free) pins the budget table above.
+`llama.router.service` was left stopped for the coordinator.
