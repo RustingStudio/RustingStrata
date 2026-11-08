@@ -114,13 +114,19 @@ fn moe_gemv_selects_experts() {
         let dy = gpu.zeros::<f32>(3 * rows).unwrap();
         gpu.moe_gemv(t.ty, rows, t.cols, dt.ptr, dt.bytes() / n_expert, di.addr(), 3, dx.addr(), 0, 1, dy.addr(), None, 0).unwrap();
         let got = down::<f32>(gpu, &dy);
+        let mut want_all = vec![0f32; 3 * rows];
         for (k, &e) in ids.iter().enumerate() {
             let mut want = vec![0f32; rows];
             if e >= 0 { t.expert(e as usize, n_expert).matvec(&as_seen(t.ty, &x), &mut want); }
             else { assert!(got[k * rows..(k + 1) * rows].iter().all(|&v| v == 0.0), "skipped slot written"); continue; }
             let err = rel_l2(&got[k * rows..(k + 1) * rows], &want);
             assert!(err <= 1e-4, "expert {e}: rel err {err}");
+            want_all[k * rows..(k + 1) * rows].copy_from_slice(&want);
         }
+        // Measurement only (M2-T7): the CPU figure and the differing bits from the first backend.
+        let nd = first.as_ref().map_or(0, |f: &Vec<u32>| got.iter().zip(f).filter(|(a, b)| a.to_bits() != **b).count());
+        eprintln!("op moe_gemv {bk} [3 experts {}x{} {}]: rel err vs CPU {:.2e}, {} of {} differ from the first backend",
+                  rows, t.cols, t.ty.name(), rel_l2(&got, &want_all), nd, got.len());
         // The paired launch (gate and up in one) matches a separate launch of the up matrices bit for bit.
         let u = gpu.upload(&w.get("blk.0.ffn_up_exps.weight").unwrap()).unwrap();
         let (dg, du) = (gpu.zeros::<f32>(3 * rows).unwrap(), gpu.zeros::<f32>(3 * rows).unwrap());
@@ -342,7 +348,7 @@ fn gemm_matches_reference_for_every_type() {
     // Results of the first backend per (tensor, GEMM path), the others of that path match it; and the last result of
     // each backend for the per-tensor cross-path figure that this test only records.
     let mut first = std::collections::HashMap::new();
-    let mut last: std::collections::HashMap<String, (&'static str, Vec<f32>)> = std::collections::HashMap::new();
+    let mut last: std::collections::HashMap<String, (&'static str, Vec<f32>, bool)> = std::collections::HashMap::new();
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
@@ -417,8 +423,11 @@ fn gemm_matches_reference_for_every_type() {
                     }
                 }
             }
-            if let Some((bk0, f0)) = last.insert(name.clone(), (bk, got.clone())) {
-                if bk0 != bk {
+            // Only a real int8-vs-f16 pair is a "different GEMM math" row: for the types both backends run
+            // as f16 (F32, IQ2_XS, ...) the cross-backend line above already carries the figure, and printing
+            // this one too duplicated it under a wrong label.
+            if let Some((bk0, f0, int8_0)) = last.insert(name.clone(), (bk, got.clone(), int8)) {
+                if bk0 != bk && int8 != int8_0 {
                     eprintln!("{:8} {name}: {bk} vs {bk0} (different GEMM math, recorded): rel err {:.2e}",
                         ty.name(), rel_l2(&got, &f0));
                 }
@@ -738,6 +747,8 @@ fn conv_seq_matches_steps() {
             assert_eq!(d(&snap)[..snaps.len()], snaps[..], "T {t}: snapshots");
             if t == 10 {
                 let bits: Vec<u32> = d(&y1).iter().map(|x| x.to_bits()).collect();
+                let nd = first.as_ref().map_or(0, |f: &Vec<u32>| bits.iter().zip(f).filter(|(a, b)| a != b).count());
+                eprintln!("op conv_seq {bk} [T {t} ch {ch} kw {kw}]: {nd} of {} differ from the first backend", bits.len());
                 match &first { None => first = Some(bits), Some(f) => assert!(*f == bits, "{bk}: conv_seq differs from the first backend") }
             }
         }
@@ -747,6 +758,7 @@ fn conv_seq_matches_steps() {
 /// conv_silu with its l2 norms of the first heads gives the same bits as conv_silu, then l2_norm.
 #[test]
 fn conv_silu_l2_matches_l2_norm() {
+    let mut first: Option<Vec<u32>> = None;
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
@@ -761,6 +773,11 @@ fn conv_silu_l2_matches_l2_norm() {
         let bits = |b| down::<f32>(gpu, b).iter().map(|v| v.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(&y1), bits(&y2));
         assert_eq!(bits(&s1), bits(&s2));
+        // Measurement only (M2-T7): cross-backend differing bits for the fused conv+l2_norm output.
+        let b1 = bits(&y1);
+        let nd = first.as_ref().map_or(0, |f: &Vec<u32>| b1.iter().zip(f).filter(|(a, b)| a != b).count());
+        eprintln!("op conv_l2_norm {bk} [ch {ch} kw {kw}]: {nd} of {} differ from the first backend", b1.len());
+        first.get_or_insert(b1);
     }
 }
 
@@ -774,6 +791,7 @@ fn moe_combine_seq_matches_cpu() {
     let inv: Vec<i32> = (0..t * k).map(|i| ((i * 7) % ne) as i32).collect();
     let (sh, sg) = (xs(t * n + 3)[3..].to_vec(), xs(t + 4)[4..].to_vec());
     let mut first: Option<Vec<u32>> = None;
+    let mut first_shared: [Option<Vec<u32>>; 2] = [None, None];
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         let mut bits = vec![];
@@ -790,6 +808,11 @@ fn moe_combine_seq_matches_cpu() {
                 x0[i] + y
             }).collect();
             assert!(rel_l2(&got, &want) < 1e-6, "{bk} shared {shared}: rel err {}", rel_l2(&got, &want));
+            // Measurement only (M2-T7).
+            let nd = first_shared[shared as usize].as_ref().map_or(0, |f: &Vec<u32>| got.iter().zip(f).filter(|(a, b)| a.to_bits() != **b).count());
+            eprintln!("op moe_combine {bk} [shared {shared}]: rel err vs CPU {:.2e}, {} of {} differ from the first backend",
+                      rel_l2(&got, &want), nd, got.len());
+            first_shared[shared as usize].get_or_insert_with(|| got.iter().map(|x| x.to_bits()).collect());
             bits.extend(got.iter().map(|x| x.to_bits()));
         }
         match &first { None => first = Some(bits), Some(f) => assert!(*f == bits, "{bk}: moe_combine_seq differs from the first backend") }
@@ -798,18 +821,31 @@ fn moe_combine_seq_matches_cpu() {
 
 #[test]
 fn elementwise_ops_match_cpu() {
+    // Measurement only (M2-T7): relative error against the CPU reference and differing bits from the
+    // first backend. The assertions below are unchanged.
+    let mut seen: std::collections::HashMap<&'static str, Vec<u32>> = std::collections::HashMap::new();
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
+        let mut report = |op: &'static str, got: &[f32], want: &[f32]| {
+            let e = rel_l2(got, want);
+            let nd = seen.get(op).map_or(0, |f: &Vec<u32>| got.iter().zip(f).filter(|(a, b)| a.to_bits() != **b).count());
+            eprintln!("op {op} {bk} [n 1000, not a block multiple]: rel err vs CPU {e:.2e}, {nd} of {} differ from the first backend", got.len());
+            seen.entry(op).or_insert_with(|| got.iter().map(|x| x.to_bits()).collect());
+        };
         let n = 1000; // not a multiple of the block size
         let (g, u) = (xs(n).iter().map(|v| v * 8.0).collect::<Vec<f32>>(), xs(n + 1)[1..].to_vec());
         let (dg, du) = (up(gpu, &g), up(gpu, &u));
         gpu.swiglu(dg.addr(), du.addr(), n).unwrap();
         let want: Vec<f32> = g.iter().zip(&u).map(|(g, u)| g / (1.0 + (-g).exp()) * u).collect();
-        assert!(rel_l2(&down::<f32>(gpu, &dg), &want) < 1e-6);
+        let got = down::<f32>(gpu, &dg);
+        assert!(rel_l2(&got, &want) < 1e-6);
+        report("swiglu", &got, &want);
         gpu.add(dg.addr(), du.addr(), n).unwrap();
         let want: Vec<f32> = want.iter().zip(&u).map(|(a, b)| a + b).collect();
-        assert!(rel_l2(&down::<f32>(gpu, &dg), &want) < 1e-6);
+        let got = down::<f32>(gpu, &dg);
+        assert!(rel_l2(&got, &want) < 1e-6);
+        report("add", &got, &want);
         // kv_store rounds to f16 to nearest even, through subnormals, ties, overflow and infinities.
         let k = [0.0, -0.0, 1e-8, -3e-8, 5.96e-8, 6.1e-5, 6.0e-5, 1.0 + 1.0 / 2048.0, 1.0 + 3.0 / 2048.0, 65504.0, 65519.0,
                  65520.0, 1e9, f32::INFINITY, f32::NEG_INFINITY, -2.5e-3, 3.14159, -1234.5678, 0.1, 7e-6, 1e-40, -1.0, 2.0, 0.5,
@@ -847,17 +883,28 @@ fn ssm_gates_match_across_backends() {
 #[test]
 fn norm_rope_and_gate_ops_match_cpu() {
     use rusting_strata::ops;
+    // Measurement only (M2-T7): relative error against the CPU reference and the differing bits from
+    // the first backend, per operation. The assertions below are unchanged.
+    let mut seen: std::collections::HashMap<&'static str, Vec<u32>> = std::collections::HashMap::new();
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let close = |got: &[f32], want: &[f32], what: &str| assert!(rel_l2(got, want) < 1e-6, "{what}: rel err {}", rel_l2(got, want));
+        let mut report = |op: &'static str, case: &str, got: &[f32], want: &[f32]| {
+            let e = rel_l2(got, want);
+            let nd = seen.get(op).map_or(0, |f: &Vec<u32>| got.iter().zip(f).filter(|(a, b)| a.to_bits() != **b).count());
+            eprintln!("op {op} {bk} [{case}]: rel err vs CPU {e:.2e}, {nd} of {} differ from the first backend", got.len());
+            seen.entry(op).or_insert_with(|| got.iter().map(|x| x.to_bits()).collect());
+        };
         let (n, rows) = (2048, 3);
         let (x, w) = (xs(rows * n).iter().map(|v| v * 3.0).collect::<Vec<f32>>(), xs(n + 7)[7..].to_vec());
         let (dx, dw, dout) = (up(gpu, &x), up(gpu, &w), gpu.zeros::<f32>(rows * n).unwrap());
         gpu.rms_norm(dx.addr(), n, dw.addr(), dout.addr(), n, n, rows, 1e-6).unwrap();
         let mut want = vec![0f32; rows * n];
         for (o, r) in want.chunks_mut(n).zip(x.chunks(n)) { ops::rms_norm(r, &w, 1e-6, o) }
-        close(&down::<f32>(gpu, &dout), &want, "rms_norm");
+        let got = down::<f32>(gpu, &dout);
+        close(&got, &want, "rms_norm");
+        report("rms_norm", &format!("{n} x {rows} rows"), &got, &want);
 
         // quant_xq: int8 rows, then scales, as the CPU rounds them.
         let dq = gpu.zeros::<u8>(rows * n * 9 / 8).unwrap();
@@ -888,7 +935,9 @@ fn norm_rope_and_gate_ops_match_cpu() {
         gpu.l2_norm(dx.addr(), hn, per, stride, 3 * per, 1e-6).unwrap();
         let mut want = x[..3 * stride].to_vec();
         for t in 0..3 { for h in 0..per { ops::l2_norm(&mut want[t * stride + h * hn..][..hn], 1e-6) } }
-        close(&down::<f32>(gpu, &dx), &want, "l2_norm");
+        let got = down::<f32>(gpu, &dx);
+        close(&got, &want, "l2_norm");
+        report("l2_norm", "128 x 2 per token, 3 tokens", &got, &want);
 
         // rope_neox: 3 tokens from position 30000, 2 heads each, 64 of 128 dims rotated.
         let (hd, n_rot, pos) = (128, 64, 30_000);
@@ -897,7 +946,9 @@ fn norm_rope_and_gate_ops_match_cpu() {
         gpu.rope_neox(dx.addr(), hd, 6, 2, n_rot, step.addr(), 1e7).unwrap();
         let mut want = x[..6 * hd].to_vec();
         for (h, v) in want.chunks_mut(hd).enumerate() { ops::rope_neox(v, n_rot, pos + h / 2, 1e7) }
-        close(&down::<f32>(gpu, &dx), &want, "rope_neox");
+        let got = down::<f32>(gpu, &dx);
+        close(&got, &want, "rope_neox");
+        report("rope_neox", "hd 128, 64 rotated, pos 30000", &got, &want);
         // rms_norm_rope == rms_norm then rope_neox, from rows 160 floats apart.
         let dx = up(gpu, &x[..6 * 160]);
         let (d1, d2) = (gpu.zeros::<f32>(6 * hd).unwrap(), gpu.zeros::<f32>(6 * hd).unwrap());
@@ -934,7 +985,9 @@ fn norm_rope_and_gate_ops_match_cpu() {
             ops::rms_norm(&x[h * hn..][..hn], &w[..hn], 1e-6, &mut want[h * hn..][..hn]);
             for i in h * hn..(h + 1) * hn { want[i] *= ops::silu(z[i]) }
         }
-        close(&down::<f32>(gpu, &dx), &want, "norm_gate");
+        let got = down::<f32>(gpu, &dx);
+        close(&got, &want, "norm_gate");
+        report("norm_gate", "4 heads of 128", &got, &want);
 
         // ssm_gates on 3 tokens of 5 heads, with g reaching the softplus cutoff.
         let (nv, nt) = (5, 3);
@@ -942,9 +995,14 @@ fn norm_rope_and_gate_ops_match_cpu() {
         let (dt, a) = (xs(nv + 1)[1..].to_vec(), xs(nv + 2)[2..].to_vec());
         let (db, dg, ddt, da) = (up(gpu, &beta), up(gpu, &g), up(gpu, &dt), up(gpu, &a));
         gpu.ssm_gates(db.addr(), dg.addr(), ddt.addr(), da.addr(), nv * nt, nv).unwrap();
-        close(&down::<f32>(gpu, &db), &beta.iter().map(|&b| ops::sigmoid(b)).collect::<Vec<_>>(), "ssm_gates beta");
+        let wb: Vec<f32> = beta.iter().map(|&b| ops::sigmoid(b)).collect();
+        let gb = down::<f32>(gpu, &db);
+        close(&gb, &wb, "ssm_gates beta");
+        report("ssm_gates", "beta, 3 tokens of 5 heads", &gb, &wb);
         let want: Vec<f32> = g.iter().enumerate().map(|(i, &g)| ops::softplus(g + dt[i % nv]) * a[i % nv]).collect();
-        close(&down::<f32>(gpu, &dg), &want, "ssm_gates g");
+        let gg = down::<f32>(gpu, &dg);
+        close(&gg, &want, "ssm_gates g");
+        report("ssm_gates_g", "g, 3 tokens of 5 heads", &gg, &want);
 
         // conv_silu: 300 channels, kernel 4, two steps so the state shifts.
         let (ch, kw) = (300, 4);
@@ -961,8 +1019,14 @@ fn norm_rope_and_gate_ops_match_cpu() {
             }).collect();
             st.drain(..ch);
             st.extend(&qkv);
-            close(&down::<f32>(gpu, &dy), &want, "conv_silu y");
-            close(&down::<f32>(gpu, &dst), &st, "conv_silu state");
+            let gy = down::<f32>(gpu, &dy);
+            let gs = down::<f32>(gpu, &dst);
+            close(&gy, &want, "conv_silu y");
+            close(&gs, &st, "conv_silu state");
+            if s == 0 {
+                report("conv", "ch 300 kw 4, 2 steps", &gy, &want);
+                report("conv_state", "ch 300 kw 4, 2 steps", &gs, &st);
+            }
         }
     }
 }
@@ -1013,6 +1077,17 @@ fn router_topk_matches_ops_top_k() {
         }
         assert_eq!(ids[k..k + 2], [7, 200]);
         let bits = (ids, w.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        // Measurement only (M2-T7): max |weight - CPU| and differing bits from the first backend.
+        let mut wmax = 0f32;
+        for r in 0..t {
+            let mut p = x[r * n..(r + 1) * n].to_vec();
+            rusting_strata::ops::softmax(&mut p);
+            let want = rusting_strata::ops::top_k(&p, k);
+            let s: f32 = want.iter().map(|&i| p[i]).sum();
+            for (j, &i) in want.iter().enumerate() { wmax = wmax.max((w[r * k + j] - p[i] / s * 2.5).abs()); }
+        }
+        let nd = first.as_ref().map_or(0, |f: &(Vec<i32>, Vec<u32>)| f.1.iter().zip(&bits.1).filter(|(a, b)| a != b).count());
+        eprintln!("op router_topk {bk} [n {n} k {k} t {t}]: max abs {wmax:.2e}, {nd} of {} differ from the first backend", bits.1.len());
         match &first { None => first = Some(bits), Some(f) => assert!(*f == bits, "{bk} differs from the first backend") }
     }
 }
