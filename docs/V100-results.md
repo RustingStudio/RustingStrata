@@ -1719,3 +1719,150 @@ mailbox traffic: 80 GPU writes, 46080 host routing reads (fast path off, 10240/1
 {"backend":"vulkan","backend_arg":"vulkan","chunk":4096,"ctx":32896,"device":[0],"expert":{"bytes_per_token":328990720,"hit_rate_pct":100.0,"mb_per_token":313.8,"misses":0,"resident":10240,"swaps":0,"total":10240},"kv":"f16","model":{"name":"Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf","path":"/mnt/models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf"},"mtp":0,"reps":3,"results":[{"decode_tok_s":{"max":124.0,"mean":123.3,"min":122.3},"expert":{"at_decode_tok_s":123.7,"bytes_per_token":328990720,"gb_per_s":40.7,"mb_per_token":313.8},"pp":512,"prefill_tok_s":{"max":778.0,"mean":773.6,"min":770.8}},{"decode_tok_s":{"max":118.0,"mean":117.6,"min":116.8},"expert":{"at_decode_tok_s":117.9,"bytes_per_token":328990720,"gb_per_s":38.8,"mb_per_token":313.8},"pp":4096,"prefill_tok_s":{"max":1430.1,"mean":1425.2,"min":1422.6}},{"decode_tok_s":{"max":95.7,"mean":95.7,"min":95.6},"expert":{"at_decode_tok_s":95.6,"bytes_per_token":328990720,"gb_per_s":31.5,"mb_per_token":313.8},"pp":32768,"prefill_tok_s":{"max":523.8,"mean":522.0,"min":520.6}}],"schema":"strata.bench.v1","tg":128,"unix_time":1794143766}
 ```
 
+## 2026-11-08 14:54 UTC — M0-T6 Vulkan flag/knob matrix (Vulkan, V100)
+
+Backend `vulkan`, device 0, reference MoE Q2_K_XL (12.3 GB) as `$M`. Each bench row is
+a fresh process; the JSON records live under `target/m0t6/` and are not committed.
+
+| row | setting | status | numbers | message/exit code |
+| --- | --- | --- | --- | --- |
+| C0 | control (no knob) | supported | pp 4096: prefill 1424.9 (1414.3-1435.5) tok/s, decode 117.2 (116.2-118.2) tok/s; KV 642 MB; experts 10040 MB (10240/10240) | exit 0 |
+| C1 | short chunk 512 | supported | pp 512: prefill 772.1 (769.3-774.9) tok/s, decode 122.6 (122.0-123.2) tok/s; pp 4096: prefill 748.9 (748.1-749.8) tok/s, decode 117.4 (117.1-117.6) tok/s; KV 642 MB; experts 10040 MB (10240/10240) | exit 0 |
+| K1 | q8 KV | supported | pp 4096: prefill 1020.7 (1016.0-1025.3) tok/s, decode 117.0 (116.1-118.0) tok/s; KV 341 MB; experts 10040 MB (10240/10240) | exit 0 |
+| K2 | q8 KV + llama numerics | rejected (Error: --kv q8 does not combine with --llama-numerics (its attention reads f16 KV)) | — | exit 1; Error: --kv q8 does not combine with --llama-numerics (its attention reads f16 KV) |
+| K3 | llama numerics alone | supported | pp 512: prefill 1119.0 (1119.0-1119.0) tok/s, decode 106.0 (106.0-106.0) tok/s; KV 642 MB; experts 10040 MB (10240/10240) | exit 0 |
+| N1 | coop disabled (STRATA_VK_NO_COOP=1) | supported | pp 4096: prefill 1425.0 (1417.8-1432.1) tok/s, decode 116.9 (115.7-118.1) tok/s; KV 642 MB; experts 10040 MB (10240/10240) | exit 0 |
+| N2 | graphs disabled (STRATA_NO_GRAPH=1) | supported | pp 4096: prefill 1424.1 (1419.2-1429.0) tok/s, decode 90.1 (89.9-90.4) tok/s; KV 642 MB; experts 10040 MB (10240/10240) | exit 0 |
+| M1 | MTP on MoE (no MTP head) | supported (caveat: --mtp 1: this model has no MTP head: decoding without drafts) | pp 512: prefill 771.8 (771.8-771.8) tok/s, decode 122.0 (122.0-122.0) tok/s; KV 642 MB; experts 10040 MB (10240/10240) | exit 0; --mtp 1: this model has no MTP head: decoding without drafts |
+| P2M | parallel + MTP | degraded (--parallel 2 and --mtp 1: not supported together, decoding without MTP drafts) | KV 160 MB; experts 10040 MB (10240/10240) | exit 0 (stopped with SIGTERM); --parallel 2 and --mtp 1: not supported together, decoding without MTP drafts |
+
+### Plan lines
+
+```
+C0: plan: weights+state+scratch 2580 MB (KV 642 MB for 32896 tokens, prefill 512 MB), expert slots 10040 MB, resident experts 10240/10240
+C1: plan: weights+state+scratch 2187 MB (KV 642 MB for 32896 tokens, prefill 118 MB), expert slots 10040 MB, resident experts 10240/10240
+K1: plan: weights+state+scratch 2280 MB (KV 341 MB for 32896 tokens, prefill 512 MB), expert slots 10040 MB, resident experts 10240/10240
+K3: plan: weights+state+scratch 2580 MB (KV 642 MB for 32896 tokens, prefill 512 MB), expert slots 10040 MB, resident experts 10240/10240
+N1: plan: weights+state+scratch 2580 MB (KV 642 MB for 32896 tokens, prefill 512 MB), expert slots 10040 MB, resident experts 10240/10240
+N2: plan: weights+state+scratch 2580 MB (KV 642 MB for 32896 tokens, prefill 512 MB), expert slots 10040 MB, resident experts 10240/10240
+M1: plan: weights+state+scratch 2580 MB (KV 642 MB for 32896 tokens, prefill 512 MB), expert slots 10040 MB, resident experts 10240/10240
+P2M: plan: weights+state+scratch 2449 MB (KV 160 MB for 8192 tokens in each of 2 slots, prefill 512 MB), expert slots 10040 MB, resident experts 10240/10240
+```
+
+### JSON records
+
+- `target/m0t6/C0.json` — valid JSON (`strata.bench.v1`), key fields in the table above.
+- `target/m0t6/C1.json` — valid JSON (`strata.bench.v1`), key fields in the table above.
+- `target/m0t6/K1.json` — valid JSON (`strata.bench.v1`), key fields in the table above.
+- `target/m0t6/K3.json` — valid JSON (`strata.bench.v1`), key fields in the table above.
+- `target/m0t6/N1.json` — valid JSON (`strata.bench.v1`), key fields in the table above.
+- `target/m0t6/N2.json` — valid JSON (`strata.bench.v1`), key fields in the table above.
+- `target/m0t6/M1.json` — valid JSON (`strata.bench.v1`), key fields in the table above.
+
+### Drift guard
+
+- C0 control at pp 4096: prefill 1424.9 tok/s, decode 117.2 tok/s.
+- N1 (coop off) vs C0: prefill +0.0%, decode -0.3%.
+- M1 (MTP downgraded) decode at pp 512 vs C0 decode at pp 4096: +4.1% (different prompt length; the prefill means are not comparable, so only decode is checked).
+- N2 (graphs off) vs C0, informational: prefill -0.1%, decode -23.1%. This is the cost of re-recording every submission, not a pass/fail row.
+- K1 (q8 KV) is exempt from the drift guard: the numerics differ by design.
+
+### Notes
+
+- K1: KV 341 MB vs 642 MB for C0. Prefill -28.4% and decode -0.2% against C0 (decode is exempt from the drift guard: numerics differ).
+- C1: pp 4096 prefill is -47.4% against C0, expected with `--chunk 512` (more expert restaging per chunk); the pp 512 row keeps the short-prompt rate.
+- N2: the decode drop against C0 is the `STRATA_NO_GRAPH` re-record cost.
+
+### Output sanity (`strata generate -n 16`)
+
+| row | status | vs C0 | text |
+| --- | --- | --- | --- |
+| C0 | coherent, non-empty | reference |   ```python import numpy as np import matplotlib.pyplot as plt  # |
+| K1 | coherent, non-empty | no C0 reference |   ```python import os import sys import time import json |
+| N2 | coherent, non-empty | identical to C0 |   ```python import numpy as np import matplotlib.pyplot as plt  # |
+
+### Commands
+
+```
+C0: strata bench --model "$M" --gpu --backend vulkan --json-out target/m0t6/C0.json --ctx 32896 --chunk 4096 --pp 4096 --tg 128 --reps 2 ; strata generate --model "$M" --gpu --backend vulkan --ctx 4096 --chunk 4096 -n 16 --prompt "The quick brown fox jumps over the lazy dog."
+C1: strata bench --model "$M" --gpu --backend vulkan --json-out target/m0t6/C1.json --ctx 32896 --chunk 512 --pp 512,4096 --tg 128 --reps 2
+K1: strata bench --model "$M" --gpu --backend vulkan --json-out target/m0t6/K1.json --ctx 32896 --kv q8 --chunk 4096 --pp 4096 --tg 128 --reps 2 ; strata generate --model "$M" --gpu --backend vulkan --ctx 4096 --chunk 4096 --kv q8 -n 16 --prompt "The quick brown fox jumps over the lazy dog."
+K2: strata bench --model "$M" --gpu --backend vulkan --json-out target/m0t6/K2.json --ctx 32896 --kv q8 --llama-numerics --pp 64 --tg 8
+K3: strata bench --model "$M" --gpu --backend vulkan --json-out target/m0t6/K3.json --ctx 32896 --llama-numerics --pp 512 --tg 32 --reps 1
+N1: STRATA_VK_NO_COOP=1 strata bench --model "$M" --gpu --backend vulkan --json-out target/m0t6/N1.json --ctx 32896 --chunk 4096 --pp 4096 --tg 128 --reps 2
+N2: STRATA_NO_GRAPH=1 strata bench --model "$M" --gpu --backend vulkan --json-out target/m0t6/N2.json --ctx 32896 --chunk 4096 --pp 4096 --tg 128 --reps 2 ; STRATA_NO_GRAPH=1 strata generate --model "$M" --gpu --backend vulkan --ctx 4096 --chunk 4096 -n 16 --prompt "The quick brown fox jumps over the lazy dog."
+M1: strata bench --model "$M" --gpu --backend vulkan --json-out target/m0t6/M1.json --ctx 32896 --mtp --chunk 4096 --pp 512 --tg 128 --reps 1
+P2M: strata serve --model "$M" --gpu --backend vulkan --ctx 8192 --parallel 2 --addr 127.0.0.1:8201 --mtp
+```
+
+### Environment
+
+```
+name, memory.used [MiB], utilization.gpu [%]
+Tesla V100-SXM2-32GB, 0 MiB, 49 %
+no Xid
+llama.router.service: inactive
+```
+
+## 2026-11-08 14:55 UTC — M0-T6 Vulkan flag/knob matrix (Vulkan, V100)
+
+Backend `vulkan`, device 0, reference MoE Q2_K_XL (12.3 GB) as `$M`. Each bench row is
+a fresh process; the JSON records live under `target/m0t6/` and are not committed.
+
+| row | setting | status | numbers | message/exit code |
+| --- | --- | --- | --- | --- |
+| C2 | full-length chunk 32768 | supported | pp 32768: prefill 541.7 (541.7-541.7) tok/s, decode 93.4 (93.4-93.4) tok/s; KV 642 MB; experts 10040 MB (10240/10240) | exit 0 |
+| P2 | 2 slots | supported | wall 1802 ms; aggregate decode 142.1 tok/s (256 tok); #1 1.781778s/128 tok, #2 1.785440s/128 tok; KV 160 MB; experts 10040 MB (10240/10240) | exit 0 (stopped with SIGTERM); HTTP 2/2 |
+| P4 | 4 slots | supported | wall 2856 ms; aggregate decode 179.3 tok/s (512 tok); #1 2.826011s/128 tok, #2 2.825075s/128 tok, #3 2.826425s/128 tok, #4 2.835191s/128 tok; KV 160 MB; experts 10040 MB (10240/10240) | exit 0 (stopped with SIGTERM); HTTP 4/4 |
+| M2 | MTP on the dense 27B (optional) | supported | pp 512: prefill 311.3 (311.3-311.3) tok/s, decode 40.4 (40.4-40.4) tok/s; KV 512 MB; experts 0 MB (0/0) | exit 0; MTP drafts accepted 63/65 (96.9%) |
+
+### Plan lines
+
+```
+C2: plan: weights+state+scratch 5726 MB (KV 642 MB for 32896 tokens, prefill 3657 MB), expert slots 10040 MB, resident experts 10240/10240
+P2: plan: weights+state+scratch 2449 MB (KV 160 MB for 8192 tokens in each of 2 slots, prefill 512 MB), expert slots 10040 MB, resident experts 10240/10240
+P4: plan: weights+state+scratch 3024 MB (KV 160 MB for 8192 tokens in each of 4 slots, prefill 512 MB), expert slots 10040 MB, resident experts 10240/10240
+M2: plan: weights+state+scratch 17636 MB (KV 512 MB for 8192 tokens, prefill 706 MB), expert slots 0 MB, resident experts 0/0
+```
+
+### JSON records
+
+- `target/m0t6/C2.json` — valid JSON (`strata.bench.v1`), key fields in the table above.
+- `target/m0t6/M2.json` — valid JSON (`strata.bench.v1`), key fields in the table above.
+
+### Drift guard
+
+- C0 control at pp 4096: prefill 1424.9 tok/s, decode 117.2 tok/s.
+- N1 (coop off) vs C0: prefill +0.0%, decode -0.3%.
+- M1 (MTP downgraded) decode at pp 512 vs C0 decode at pp 4096: +4.1% (different prompt length; the prefill means are not comparable, so only decode is checked).
+- N2 (graphs off) vs C0, informational: prefill -0.1%, decode -23.1%. This is the cost of re-recording every submission, not a pass/fail row.
+- K1 (q8 KV) is exempt from the drift guard: the numerics differ by design.
+
+### Notes
+
+- C2: `--chunk 32768` fits: prefill scratch 3657 MB, KV 642 MB, expert slots unchanged.
+
+### Output sanity (`strata generate -n 16`)
+
+| row | status | vs C0 | text |
+| --- | --- | --- | --- |
+| C2 | coherent, non-empty | no C0 reference |   ```python import numpy as np import matplotlib.pyplot as plt  # |
+
+### Commands
+
+```
+C2: strata bench --model "$M" --gpu --backend vulkan --json-out target/m0t6/C2.json --ctx 32896 --chunk 32768 --pp 32768 --tg 64 --reps 1 ; strata generate --model "$M" --gpu --backend vulkan --ctx 4096 --chunk 32768 -n 16 --prompt "The quick brown fox jumps over the lazy dog."
+P2: strata serve --model "$M" --gpu --backend vulkan --ctx 8192 --parallel 2 --addr 127.0.0.1:8199
+P4: strata serve --model "$M" --gpu --backend vulkan --ctx 8192 --parallel 4 --addr 127.0.0.1:8200
+M2: strata bench --model "$M27B" --gpu --backend vulkan --json-out target/m0t6/M2.json --ctx 8192 --mtp --chunk 4096 --pp 512 --tg 128 --reps 1
+```
+
+### Environment
+
+```
+name, memory.used [MiB], utilization.gpu [%]
+Tesla V100-SXM2-32GB, 0 MiB, 0 %
+no Xid
+llama.router.service: inactive
+```
+
