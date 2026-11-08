@@ -285,14 +285,7 @@ impl Gpu {
             }
             return Ok(());
         }
-        let need = n_x * (cols + cols / 8 + cols / 4);
-        if q8.0.len() < need { q8.0 = self.stream.alloc_zeros::<u8>(need)?; }
-        let xq = self.ptr(&q8.0);
-        if !reuse {
-            anyhow::ensure!(self.nb.load(Relaxed) >= BESIDE, "gemm inside batch: x must be quantized already (SAME_X)");
-            launch!(self, "quant_q8", cfg((n_x as u32, 1), 256, 0), x, x_stride as i32, xq, cols as i32);
-            q8.1 = key;
-        }
+        let xq = self.q8_x(&mut q8, ty, cols, n_x, x, x_stride)?.expect("int8 GEMM without a quantized x");
         launch!(self, &kname(if sm { "gemmis" } else { "gemmi" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
             tiles, wd, nd as i32, xq, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act);
         if tiles != 0 {
@@ -300,6 +293,20 @@ impl Gpu {
                 tiles, wd, nd as i32, xq, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act);
         }
         Ok(())
+    }
+
+    /// Quantize `x` for the int8 GEMM, unless the cache already holds the same rows; `None` when `ty` or `cols`
+    /// selects the f16 path. Shared by `gemm_raw` and `prequant_gemm_x`.
+    fn q8_x(&self, q8: &mut (CudaSlice<u8>, Option<[u64; 4]>), ty: GgmlType, cols: usize, n_x: usize, x: u64, x_stride: usize) -> anyhow::Result<Option<u64>> {
+        if !Self::mmq(ty) || !cols.is_multiple_of(128) { return Ok(None); }
+        let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
+        if q8.1 == key { return Ok(Some(self.ptr(&q8.0))); }
+        let need = n_x * (cols + cols / 8 + cols / 4);
+        if q8.0.len() < need { q8.0 = self.stream.alloc_zeros::<u8>(need)?; }
+        let xq = self.ptr(&q8.0);
+        launch!(self, "quant_q8", cfg((n_x as u32, 1), 256, 0), x, x_stride as i32, xq, cols as i32);
+        q8.1 = key;
+        Ok(Some(xq))
     }
 
     /// Shared memory for x quantized to int8 plus per-32 scales (quantized weight types only).
@@ -510,6 +517,12 @@ impl Backend for Gpu {
 
     fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
         self.gemm_raw(w.ty, w.rows, w.cols, 0, n.div_ceil(GEMM_BM), w.ptr, n, x, x_stride, n, 0, y, y_stride, act)
+    }
+
+    fn prequant_gemm_x(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize) -> anyhow::Result<()> {
+        let mut q8 = self.q8.lock().unwrap();
+        self.q8_x(&mut q8, w.ty, w.cols, n, x, x_stride)?;
+        Ok(())
     }
 
     fn gemv(&self, w: &GpuTensor, x: u64, y: u64) -> anyhow::Result<()> {
