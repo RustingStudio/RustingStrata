@@ -11,6 +11,8 @@ pub struct Mat<'a> {
     pub ty: GgmlType,
     pub rows: usize,
     pub cols: usize,
+    /// Routed-expert tensor: llama.cpp runs these on the CPU (Q8_K activations); the rest runs on CUDA (Q8_1 blocks of 32).
+    pub cpu: bool,
 }
 
 impl<'a> Mat<'a> {
@@ -19,14 +21,14 @@ impl<'a> Mat<'a> {
         let ty = GgmlType::from_u32(t.ty)?;
         let cols = t.dims[0] as usize;
         let rows = t.dims[1..].iter().product::<u64>() as usize;
-        Ok(Mat { data: g.bytes(t), ty, rows, cols })
+        Ok(Mat { data: g.bytes(t), ty, rows, cols, cpu: name.contains("_exps") })
     }
 
     /// Slice of a [cols, rows, n_expert] tensor for expert e.
     pub fn expert(&self, e: usize, n_expert: usize) -> Mat<'a> {
         let rows = self.rows / n_expert;
         let sz = rows * self.ty.row_bytes(self.cols as u64);
-        Mat { data: &self.data[e * sz..(e + 1) * sz], ty: self.ty, rows, cols: self.cols }
+        Mat { data: &self.data[e * sz..(e + 1) * sz], ty: self.ty, rows, cols: self.cols, cpu: self.cpu }
     }
 
     pub fn row_into(&self, r: usize, out: &mut [f32]) {
@@ -39,6 +41,8 @@ impl<'a> Mat<'a> {
         assert_eq!(x.len(), self.cols);
         assert_eq!(y.len(), self.rows);
         let rb = self.ty.row_bytes(self.cols as u64);
+        let xq = q8_roundtrip(self.ty, self.cpu, x);
+        let x = &xq[..];
         y.par_iter_mut().enumerate().for_each_init(
             || vec![0f32; self.cols],
             |tmp, (r, o)| {
@@ -47,6 +51,37 @@ impl<'a> Mat<'a> {
             },
         );
     }
+}
+
+/// ggml quantises the activation to Q8_K (k-quants, IQ1/IQ2) or Q8_0 (Q8_0, IQ4_NL) before a quantised dot.
+/// Reproduce that rounding so the f32 reference tracks llama.cpp; other types see the activation unchanged.
+fn q8_roundtrip(ty: GgmlType, cpu: bool, x: &[f32]) -> Vec<f32> {
+    use GgmlType::*;
+    let mut out = x.to_vec();
+    match ty {
+        Q5K | IQ1M | IQ2XXS | IQ2XS if cpu => {
+            for b in out.chunks_exact_mut(256) {
+                let (mut amax, mut max) = (0f32, 0f32);
+                for &v in b.iter() {
+                    if v.abs() > amax { amax = v.abs(); max = v; }
+                }
+                if amax == 0.0 { b.fill(0.0); continue; }
+                let iscale = -127.0 / max;
+                for v in b.iter_mut() { *v = (iscale * *v).round_ties_even().min(127.0) / iscale; }
+            }
+        }
+        Q5K | IQ1M | IQ2XXS | IQ2XS | Q8_0 | IQ4NL => {
+            for b in out.chunks_exact_mut(32) {
+                let amax = b.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let d = amax / 127.0;
+                if d == 0.0 { continue; }
+                let dh = half::f16::from_f32(d).to_f32();
+                for v in b.iter_mut() { *v = (*v / d).round() * dh; }
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 /// Small F32/BF16 tensor fully dequantised.
