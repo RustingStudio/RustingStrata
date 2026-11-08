@@ -53,14 +53,15 @@ impl<'a> Tensor<'a> {
 pub struct Weights<'a> {
     pub g: &'a Gguf,
     aliases: &'static [(&'static str, &'static str)],
-    /// Tensors built at load time: qwen3next `ssm_ba` split into `ssm_beta` and `ssm_alpha`.
-    built: HashMap<String, Tensor<'a>>,
+    /// Loader-owned overrides: synthesized `ssm_beta`/`ssm_alpha` and LoRA-baked tensors.
+    pub built: HashMap<String, Tensor<'a>>,
+    pub lora_baked: std::collections::HashSet<String>,
 }
 
 impl<'a> Weights<'a> {
     pub fn new(g: &'a Gguf) -> anyhow::Result<Weights<'a>> {
         let c = ModelConfig::from_gguf(g)?;
-        let mut w = Weights { g, aliases: c.aliases, built: HashMap::new() };
+        let mut w = Weights { g, aliases: c.aliases, built: HashMap::new(), lora_baked: std::collections::HashSet::new() };
         // llama.cpp src/models/qwen3next.cpp: per key head group, r = nv / nk beta rows, then r alpha rows.
         for il in 0..c.n_layer {
             let Ok(ba) = w.layer(il, "ssm_ba.weight") else { continue };
@@ -101,6 +102,36 @@ impl<'a> Weights<'a> {
 
     /// Refuse files containing quant types this engine does not implement, except in the MTP (nextn) layers, blocks
     /// `n_layer` on: false if one of those has such a type, so that the model loads without MTP.
+    pub fn bake_lora(&mut self, loras: &[crate::model::Lora]) {
+        for lora in loras {
+            for (name, entry) in &lora.entries {
+                if name.ends_with("ffn_down_exps.weight") { continue; }
+                let base = match self.get(name) { Ok(t) => t, Err(_) => { eprintln!("lora: target {name} not found, skipping"); continue; } };
+                let mut w = base.to_f32();
+                for e in 0..entry.n_expert {
+                    let a = &entry.a[e];
+                    let b = &entry.b[e];
+                    let rank = entry.rank;
+                    let in_dim = entry.in_dim;
+                    let out_dim = entry.out_dim;
+                    for o in 0..out_dim {
+                        for i in 0..in_dim {
+                            let mut d = 0f32;
+                            for r in 0..rank { d += b[o * rank + r] * a[r * in_dim + i]; }
+                            let row = e * out_dim + o;
+                            let mult = if lora.alpha > 0.0 { lora.scale * lora.alpha / rank as f32 } else { lora.scale };
+                            w[row * in_dim + i] += mult * d;
+                        }
+                    }
+                }
+                let bytes: Vec<u8> = w.iter().flat_map(|f| f.to_le_bytes()).collect();
+                let leaked: &'a [u8] = Box::leak(bytes.into_boxed_slice());
+                let t = Tensor { ty: crate::quant::GgmlType::F32, cols: base.cols, rows: base.rows, data: leaked };
+                self.built.insert(name.clone(), t);
+                self.lora_baked.insert(name.clone());
+            }
+        }
+    }
     pub fn validate(&self, n_layer: usize) -> anyhow::Result<bool> {
         let mut nextn = true;
         for t in self.g.tensors.values() {
