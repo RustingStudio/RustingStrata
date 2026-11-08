@@ -1,7 +1,7 @@
 //! Kernel tests, run on every backend that opens (`common::backends`).
 mod common;
 use common::{down, up};
-use rusting_strata::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor, SAME_X};
+use rusting_strata::backend::{Backend, ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor, SAME_X};
 use rusting_strata::{cuda::Gpu, gguf::Gguf, quant::GgmlType, weights::{Tensor, Weights}};
 
 fn xs(n: usize) -> Vec<f32> {
@@ -114,13 +114,19 @@ fn moe_gemv_selects_experts() {
         let dy = gpu.zeros::<f32>(3 * rows).unwrap();
         gpu.moe_gemv(t.ty, rows, t.cols, dt.ptr, dt.bytes() / n_expert, di.addr(), 3, dx.addr(), 0, 1, dy.addr(), None, 0).unwrap();
         let got = down::<f32>(gpu, &dy);
+        let mut want_all = vec![0f32; 3 * rows];
         for (k, &e) in ids.iter().enumerate() {
             let mut want = vec![0f32; rows];
             if e >= 0 { t.expert(e as usize, n_expert).matvec(&as_seen(t.ty, &x), &mut want); }
             else { assert!(got[k * rows..(k + 1) * rows].iter().all(|&v| v == 0.0), "skipped slot written"); continue; }
             let err = rel_l2(&got[k * rows..(k + 1) * rows], &want);
             assert!(err <= 1e-4, "expert {e}: rel err {err}");
+            want_all[k * rows..(k + 1) * rows].copy_from_slice(&want);
         }
+        // Measurement only (M2-T7): the CPU figure and the differing bits from the first backend.
+        let nd = first.as_ref().map_or(0, |f: &Vec<u32>| got.iter().zip(f).filter(|(a, b)| a.to_bits() != **b).count());
+        eprintln!("op moe_gemv {bk} [3 experts {}x{} {}]: rel err vs CPU {:.2e}, {} of {} differ from the first backend",
+                  rows, t.cols, t.ty.name(), rel_l2(&got, &want_all), nd, got.len());
         // The paired launch (gate and up in one) matches a separate launch of the up matrices bit for bit.
         let u = gpu.upload(&w.get("blk.0.ffn_up_exps.weight").unwrap()).unwrap();
         let (dg, du) = (gpu.zeros::<f32>(3 * rows).unwrap(), gpu.zeros::<f32>(3 * rows).unwrap());
@@ -198,6 +204,62 @@ fn gemvn_matches_gemv() {
     }
 }
 
+/// Peak HBM2 read bandwidth of the V100-SXM2-32GB: 2 x 877 MHz x 4096 bit / 8 = 898.0 GB/s. M2-T5 targets 85 % of
+/// it (763 GB/s) on the shapes large enough to stream (issue #30).
+const HBM_PEAK_GBS: f64 = 898.0;
+
+/// One row of the per-token decode byte budget of the reference model (issue #30, GGUF tensor table; 100 % expert
+/// hit rate, no cross-token L2 reuse, `token_embd.weight` excluded because only one row (~1.2 KB) is read).
+struct Budget {
+    category: &'static str,
+    mb: f64,
+    /// Routed experts: the only row the MoE GEMV family streams (19 % of the bytes; the rest is dense GEMV).
+    routed: bool,
+}
+
+const DECODE_BUDGET: [Budget; 6] = [
+    Budget { category: "attention / SSM 2-D", mb: 713.3, routed: false },
+    Budget { category: "routed experts, top-8", mb: 329.0, routed: true },
+    Budget { category: "output.weight (lm head)", mb: 286.1, routed: false },
+    Budget { category: "SSM / delta 2-D", mb: 226.1, routed: false },
+    Budget { category: "shared expert (*_shexp)", mb: 92.9, routed: false },
+    Budget { category: "router (gate_inp)", mb: 83.9, routed: false },
+];
+
+/// GB read per decode token over the budget (MB as 1e6 bytes): `routed` selects the expert row, otherwise dense.
+fn budget_gb(routed: bool) -> f64 {
+    DECODE_BUDGET.iter().filter(|b| b.routed == routed).map(|b| b.mb).sum::<f64>() / 1000.0
+}
+
+/// What a `(rows, cols)` shape of `name` contributes to decode, so the harness's numbers can be read against the
+/// byte budget: the lm head and the routed experts drive most of the stream, `token_embd` is not streamed at all.
+fn decode_shape(name: &str, rows: usize, cols: usize, moe: bool) -> &'static str {
+    if name.starts_with("token_embd") { "embedding (1 row)" }
+    else if name.starts_with("output.") || (rows >= 65536 && cols == 2048) { "lm head" }
+    else if moe { if cols <= 512 { "moe down" } else { "moe gate/up" } }
+    else { "dense attn/ssm" }
+}
+
+/// Device-free: the analytic byte budget and roofline of issue #30, so the denominator the GPU harness prints
+/// cannot drift from the table the adoption decision uses.
+#[test]
+fn gemv_byte_budget_matches_issue() {
+    let (dense, moe) = (budget_gb(false), budget_gb(true));
+    assert!((dense - 1.4023).abs() < 1e-3, "dense {dense}");
+    assert!((moe - 0.3290).abs() < 1e-3, "routed {moe}");
+    let total = dense + moe;
+    assert!((total - 1.7313).abs() < 1e-3, "total {total}");
+    assert!((100.0 * dense / total - 81.0).abs() < 0.1);
+    assert!((100.0 * moe / total - 19.0).abs() < 0.1);
+    // 898.0 GB/s over 1.7313 GB/token, and the 85 % per-kernel target.
+    assert!((HBM_PEAK_GBS / total - 518.7).abs() < 0.5, "roofline {} tok/s", HBM_PEAK_GBS / total);
+    assert!((0.85 * HBM_PEAK_GBS / total - 440.9).abs() < 0.5);
+    // The 119.1 tok/s baseline of docs/V100-results.md implies 206.2 GB/s = 23.0 % of the roofline.
+    let eff = total * 119.1;
+    assert!((eff - 206.2).abs() < 0.5, "effective {eff} GB/s");
+    assert!((100.0 * eff / HBM_PEAK_GBS - 23.0).abs() < 0.1);
+}
+
 #[test]
 #[ignore]
 fn gemv_bandwidth() {
@@ -205,6 +267,17 @@ fn gemv_bandwidth() {
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
+        let (dense, moe) = (budget_gb(false), budget_gb(true));
+        let total = dense + moe;
+        eprintln!("  decode budget/token (issue #30):");
+        for b in &DECODE_BUDGET {
+            eprintln!("    {:<28} {:7.1} MB  {:5.1} %  {}", b.category, b.mb, 100.0 * b.mb / 1000.0 / total,
+                if b.routed { "MoE" } else { "dense" });
+        }
+        eprintln!("    {:<28} {:7.1} MB  100.0 %  (dense {:.3} GB = {:.1} %, routed experts {:.3} GB = {:.1} %)",
+            "total", 1000.0 * total, dense, 100.0 * dense / total, moe, 100.0 * moe / total);
+        eprintln!("  roofline {HBM_PEAK_GBS:.1} GB/s: {:.1} tok/s at 100 %, {:.1} tok/s at 85 % (763 GB/s); 119.1 tok/s = {:.1} GB/s = {:.1} %",
+            HBM_PEAK_GBS / total, 0.85 * HBM_PEAK_GBS / total, total * 119.1, 100.0 * total * 119.1 / HBM_PEAK_GBS);
         let g = Gguf::open(&p).unwrap();
         let w = Weights::new(&g).unwrap();
         let time = |f: &dyn Fn()| {
@@ -216,6 +289,7 @@ fn gemv_bandwidth() {
             gpu.sync().unwrap();
             t0.elapsed().as_secs_f64() / 200.0
         };
+        eprintln!("  {:<8} {:<5} {:<16} {:<32} {:>6} x {:>5}  {:>8}  {:>8}  {:>7}  {:>9}  {:>8}", "type", "kind", "decode shape", "tensor", "rows", "cols", "time", "GB/s", "% roof", "at 100%", "bytes");
         let mut seen = std::collections::BTreeSet::new();
         for (name, info) in &g.tensors {
             let Ok(ty) = GgmlType::from_u32(info.ty) else { continue };
@@ -240,20 +314,44 @@ fn gemv_bandwidth() {
                 eprintln!("  gemvn 2/3/4 inputs: {} us", tn.join(" / "));
             }
             let (s, bytes) = run();
-            eprintln!("{:8} {:5} {name:32} {:6}x{:5}  {:7.1} us  {:6.1} GB/s", ty.name(), if moe { "moe8" } else { "" },
-                t.rows, t.cols, s * 1e6, bytes as f64 / s / 1e9);
+            let gbs = bytes as f64 / s / 1e9;
+            let rows = if moe { t.rows / info.dims[2] as usize } else { t.rows };
+            eprintln!("  {:<8} {:<5} {:<16} {:<32} {:>6} x {:>5}  {:>7.2} us  {:>7.1}  {:>6.1} %  {:>7.2} us  {:>6.2} MB",
+                ty.name(), if moe { "moe8" } else { "" }, decode_shape(name, rows, t.cols, moe), name, rows, t.cols,
+                s * 1e6, gbs, 100.0 * gbs / HBM_PEAK_GBS, bytes as f64 / HBM_PEAK_GBS / 1e9 * 1e6, bytes as f64 / 1e6);
         }
     }
 }
 
 fn f16r(v: f32) -> f32 { half::f16::from_f32(v).to_f32() }
 
+/// The f16 value the Vulkan f16 GEMM path (`packFloat2x16(f16vec2(..))`, SPIR-V `OpFConvert`) sees on this driver:
+/// the conversion truncates toward zero instead of rounding to nearest even. A reference built with it compares the
+/// kernel, not the driver's conversion; a 1-ulp input difference would otherwise read as a kernel error.
+fn f16tz(v: f32) -> f32 {
+    let h = half::f16::from_f32(v);
+    let b = h.to_bits();
+    let mag = b & 0x7fff;
+    if h.to_f32().abs() > v.abs() && mag > 1 { half::f16::from_bits((b & 0x8000) | (mag - 1)).to_f32() } else { h.to_f32() }
+}
+
+/// The f16 conversion the backend's f16 GEMM uses: CUDA `__float2half` rounds to nearest even; the Vulkan shader's
+/// `OpFConvert` truncates toward zero on the NVIDIA Volta driver (set `STRATA_VK_F16_TRUNC=1` there); the RTX 3060
+/// and Radeon VII round to nearest even, like CUDA.
+fn f16_in(bk: &str, v: f32) -> f32 {
+    if bk == "vulkan" && std::env::var_os("STRATA_VK_F16_TRUNC").is_some() { f16tz(v) } else { f16r(v) }
+}
+
 /// Tensor-core GEMM over a tile list matches per-row dot products, for every type, with a gathered X and partial
-/// tiles. Types on the int8 path (`Backend::int8_gemm`) see X as int8 per 32 (as the GEMV path does), the others fp16 inputs.
+/// tiles. Types on the int8 path (`Backend::mmq`, i.e. `Gpu::mmq` gated on the device) see X as int8 per 32 (as the
+/// GEMV path does), the others fp16 inputs.
 #[test]
 fn gemm_matches_reference_for_every_type() {
     let Some(p) = common::model_path() else { return };
-    let mut first = std::collections::HashMap::new();  // results of the first backend, which the others match bit for bit
+    // Results of the first backend per (tensor, GEMM path), the others of that path match it; and the last result of
+    // each backend for the per-tensor cross-path figure that this test only records.
+    let mut first = std::collections::HashMap::new();
+    let mut last: std::collections::HashMap<String, (&'static str, Vec<f32>, bool)> = std::collections::HashMap::new();
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
@@ -276,14 +374,27 @@ fn gemm_matches_reference_for_every_type() {
             let got = down::<f32>(gpu, &dy);
             let mut wr = vec![0f32; t.cols];
             let mut want = vec![0f32; m * rows];
+            // The path this backend's launcher takes: int8 needs the type policy *and* the arch (sm_70 CUDA has no
+            // int8 tensor cores) *and* 16-byte aligned q8 rows (src/cuda/mod.rs:342).
+            let int8 = gpu.mmq(t.ty) && t.cols % 128 == 0;
+            // CUDA's `__float2half` rounds f16 operands, this Vulkan driver's `OpFConvert` truncates (f16tz/f16_in).
+            // Where the two disagree on this tensor's operands the two f16 GEMMs multiply different numbers.
+            let same_f16 = int8 || {
+                let mut all = x.iter().all(|&v| f16tz(v) == f16r(v));
+                for r in 0..rows {
+                    t.row(r, &mut wr);
+                    all &= wr.iter().all(|&v| f16tz(v) == f16r(v));
+                }
+                all
+            };
             for r in 0..rows {
                 t.row(r, &mut wr);
                 for (i, &xr) in xrow.iter().enumerate() {
                     let xv = &x[xr as usize * t.cols..][..t.cols];
-                    want[i * rows + r] = if gpu.int8_gemm(t.ty) {
+                    want[i * rows + r] = if int8 {
                         wr.iter().zip(as_seen(t.ty, xv)).map(|(a, b)| a * b).sum()
                     } else {
-                        wr.iter().zip(xv).map(|(a, b)| f16r(*a) * f16r(*b)).sum()
+                        wr.iter().zip(xv).map(|(a, b)| f16_in(bk, *a) * f16_in(bk, *b)).sum()
                     };
                 }
             }
@@ -291,10 +402,39 @@ fn gemm_matches_reference_for_every_type() {
             eprintln!("{:8} {name}: gemm rel err {e:.2e}", ty.name());
             assert!(e <= 1e-4, "{} gemm ({name}): rel err {e}", ty.name());
             // Vulkan without cooperative matrices sums the f16 products in another order than mma.sync.
-            if bk == "vulkan" && !gpu.int8_gemm(t.ty) && std::env::var_os("STRATA_VK_NO_COOP").is_some() { continue; }
-            let f = first.entry(name.clone()).or_insert_with(|| got.clone());
-            let bits = got.iter().zip(f.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-            assert_eq!(bits, 0, "{} gemm ({name}) on {bk}: {bits} values differ from the first backend", ty.name());
+            if bk == "vulkan" && !int8 && std::env::var_os("STRATA_VK_NO_COOP").is_some() { continue; }
+            // Cross-backend: bit for bit between backends on the same GEMM math and f16 operands, except by tolerance
+            // where an sm_70 CUDA backend is involved (its `mma16816` sums the same f16 products in another order).
+            // Backends whose math differs (sm_70 CUDA f16 vs Vulkan int8 for an int8 type, a truncating f16
+            // conversion, and Vulkan order without cooperative matrices) are recorded, not asserted: the per-backend
+            // reference above at 1e-4 is what catches a wrong kernel, and the measured figure goes in the PR.
+            let key = (name.clone(), int8);
+            match first.entry(key) {
+                std::collections::hash_map::Entry::Vacant(v) => { v.insert((bk, gpu.volta(), got.clone())); }
+                std::collections::hash_map::Entry::Occupied(o) => {
+                    let &(bk0, volta, ref f) = o.get();
+                    let bits = got.iter().zip(f.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                    if !same_f16 {
+                        eprintln!("{:8} {name}: {bk} vs {bk0} (different f16 input conversion, recorded): rel err {:.2e}",
+                            ty.name(), rel_l2(&got, f));
+                    } else if volta || gpu.volta() {
+                        let e = rel_l2(&got, f);
+                        eprintln!("{:8} {name}: gemm on {bk} vs {bk0} (same math): rel err {e:.2e}", ty.name());
+                        assert!(e <= 1e-4, "{} gemm ({name}) on {bk}: rel err {e} vs {bk0}", ty.name());
+                    } else {
+                        assert_eq!(bits, 0, "{} gemm ({name}) on {bk}: {bits} values differ from {bk0}", ty.name());
+                    }
+                }
+            }
+            // Only a real int8-vs-f16 pair is a "different GEMM math" row: for the types both backends run
+            // as f16 (F32, IQ2_XS, ...) the cross-backend line above already carries the figure, and printing
+            // this one too duplicated it under a wrong label.
+            if let Some((bk0, f0, int8_0)) = last.insert(name.clone(), (bk, got.clone(), int8)) {
+                if bk0 != bk && int8 != int8_0 {
+                    eprintln!("{:8} {name}: {bk} vs {bk0} (different GEMM math, recorded): rel err {:.2e}",
+                        ty.name(), rel_l2(&got, &f0));
+                }
+            }
         }
     }
 }
@@ -439,12 +579,26 @@ fn attn_prefill_matches_decode() {
                 r => {
                     r.unwrap();
                     let got = down::<f32>(gpu, &dout);
-                    // Vulkan's cooperative matrices are the same f16 products summed in f32 as CUDA's mma.sync.
-                    let f = first_pf.entry((pos0, nh, nkv, hd)).or_insert_with(|| got.clone());
-                    let nd = got.iter().zip(f.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-                    // Without cooperative matrices Vulkan sums in another order.
-                    let nd = if bk == "vulkan" && std::env::var_os("STRATA_VK_NO_COOP").is_some() { 0 } else { nd };
-                    assert!(nd == 0, "{bk} attn_prefill pos {pos0} nh {nh} nkv {nkv} hd {hd}: {nd} of {} differ from the first backend", got.len());
+                    // Cross-backend: bit for bit where every backend sums the same f16 products in the same order
+                    // (Vulkan's cooperative matrices and CUDA's mma.sync), by tolerance from or against an sm_70 CUDA
+                    // backend, whose `mma16816` runs the same products on CUDA cores in another order, and where
+                    // Vulkan has no cooperative matrices.
+                    match first_pf.entry((pos0, nh, nkv, hd)) {
+                        std::collections::hash_map::Entry::Vacant(v) => { v.insert((bk, gpu.volta(), got.clone())); }
+                        std::collections::hash_map::Entry::Occupied(o) => {
+                            let &(bk0, volta, ref f) = o.get();
+                            if bk == "vulkan" && std::env::var_os("STRATA_VK_NO_COOP").is_some() {
+                                // Without cooperative matrices Vulkan sums in another order.
+                            } else if volta || gpu.volta() {
+                                let e = rel_l2(&got, f);
+                                eprintln!("attn_prefill {bk} vs {bk0} pos {pos0} nh {nh} nkv {nkv} hd {hd}: rel err {e:.2e}");
+                                assert!(e <= 5e-4, "{bk} attn_prefill pos {pos0} nh {nh} nkv {nkv} hd {hd}: rel err {e}");
+                            } else {
+                                let nd = got.iter().zip(f.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                                assert!(nd == 0, "{bk} attn_prefill pos {pos0} nh {nh} nkv {nkv} hd {hd}: {nd} of {} differ from {bk0}", got.len());
+                            }
+                        }
+                    }
                     gpu.attn_prefill(dq.addr(), dk.addr(), dv.addr(), 0, dout.addr(), step.addr(), t, nh, nkv, hd, scale).unwrap();
                     let e = rel_l2(&gated(&down::<f32>(gpu, &dout)), &got);
                     assert!(e <= 1e-6, "attn_prefill without gate nh {nh} hd {hd}: {e}");
@@ -664,6 +818,8 @@ fn conv_seq_matches_steps() {
             assert_eq!(d(&snap)[..snaps.len()], snaps[..], "T {t}: snapshots");
             if t == 10 {
                 let bits: Vec<u32> = d(&y1).iter().map(|x| x.to_bits()).collect();
+                let nd = first.as_ref().map_or(0, |f: &Vec<u32>| bits.iter().zip(f).filter(|(a, b)| a != b).count());
+                eprintln!("op conv_seq {bk} [T {t} ch {ch} kw {kw}]: {nd} of {} differ from the first backend", bits.len());
                 match &first { None => first = Some(bits), Some(f) => assert!(*f == bits, "{bk}: conv_seq differs from the first backend") }
             }
         }
@@ -673,6 +829,7 @@ fn conv_seq_matches_steps() {
 /// conv_silu with its l2 norms of the first heads gives the same bits as conv_silu, then l2_norm.
 #[test]
 fn conv_silu_l2_matches_l2_norm() {
+    let mut first: Option<Vec<u32>> = None;
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
@@ -687,6 +844,11 @@ fn conv_silu_l2_matches_l2_norm() {
         let bits = |b| down::<f32>(gpu, b).iter().map(|v| v.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(&y1), bits(&y2));
         assert_eq!(bits(&s1), bits(&s2));
+        // Measurement only (M2-T7): cross-backend differing bits for the fused conv+l2_norm output.
+        let b1 = bits(&y1);
+        let nd = first.as_ref().map_or(0, |f: &Vec<u32>| b1.iter().zip(f).filter(|(a, b)| a != b).count());
+        eprintln!("op conv_l2_norm {bk} [ch {ch} kw {kw}]: {nd} of {} differ from the first backend", b1.len());
+        first.get_or_insert(b1);
     }
 }
 
@@ -700,6 +862,7 @@ fn moe_combine_seq_matches_cpu() {
     let inv: Vec<i32> = (0..t * k).map(|i| ((i * 7) % ne) as i32).collect();
     let (sh, sg) = (xs(t * n + 3)[3..].to_vec(), xs(t + 4)[4..].to_vec());
     let mut first: Option<Vec<u32>> = None;
+    let mut first_shared: [Option<Vec<u32>>; 2] = [None, None];
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         let mut bits = vec![];
@@ -716,6 +879,11 @@ fn moe_combine_seq_matches_cpu() {
                 x0[i] + y
             }).collect();
             assert!(rel_l2(&got, &want) < 1e-6, "{bk} shared {shared}: rel err {}", rel_l2(&got, &want));
+            // Measurement only (M2-T7).
+            let nd = first_shared[shared as usize].as_ref().map_or(0, |f: &Vec<u32>| got.iter().zip(f).filter(|(a, b)| a.to_bits() != **b).count());
+            eprintln!("op moe_combine {bk} [shared {shared}]: rel err vs CPU {:.2e}, {} of {} differ from the first backend",
+                      rel_l2(&got, &want), nd, got.len());
+            first_shared[shared as usize].get_or_insert_with(|| got.iter().map(|x| x.to_bits()).collect());
             bits.extend(got.iter().map(|x| x.to_bits()));
         }
         match &first { None => first = Some(bits), Some(f) => assert!(*f == bits, "{bk}: moe_combine_seq differs from the first backend") }
@@ -724,18 +892,31 @@ fn moe_combine_seq_matches_cpu() {
 
 #[test]
 fn elementwise_ops_match_cpu() {
+    // Measurement only (M2-T7): relative error against the CPU reference and differing bits from the
+    // first backend. The assertions below are unchanged.
+    let mut seen: std::collections::HashMap<&'static str, Vec<u32>> = std::collections::HashMap::new();
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
+        let mut report = |op: &'static str, got: &[f32], want: &[f32]| {
+            let e = rel_l2(got, want);
+            let nd = seen.get(op).map_or(0, |f: &Vec<u32>| got.iter().zip(f).filter(|(a, b)| a.to_bits() != **b).count());
+            eprintln!("op {op} {bk} [n 1000, not a block multiple]: rel err vs CPU {e:.2e}, {nd} of {} differ from the first backend", got.len());
+            seen.entry(op).or_insert_with(|| got.iter().map(|x| x.to_bits()).collect());
+        };
         let n = 1000; // not a multiple of the block size
         let (g, u) = (xs(n).iter().map(|v| v * 8.0).collect::<Vec<f32>>(), xs(n + 1)[1..].to_vec());
         let (dg, du) = (up(gpu, &g), up(gpu, &u));
         gpu.swiglu(dg.addr(), du.addr(), n).unwrap();
         let want: Vec<f32> = g.iter().zip(&u).map(|(g, u)| g / (1.0 + (-g).exp()) * u).collect();
-        assert!(rel_l2(&down::<f32>(gpu, &dg), &want) < 1e-6);
+        let got = down::<f32>(gpu, &dg);
+        assert!(rel_l2(&got, &want) < 1e-6);
+        report("swiglu", &got, &want);
         gpu.add(dg.addr(), du.addr(), n).unwrap();
         let want: Vec<f32> = want.iter().zip(&u).map(|(a, b)| a + b).collect();
-        assert!(rel_l2(&down::<f32>(gpu, &dg), &want) < 1e-6);
+        let got = down::<f32>(gpu, &dg);
+        assert!(rel_l2(&got, &want) < 1e-6);
+        report("add", &got, &want);
         // kv_store rounds to f16 to nearest even, through subnormals, ties, overflow and infinities.
         let k = [0.0, -0.0, 1e-8, -3e-8, 5.96e-8, 6.1e-5, 6.0e-5, 1.0 + 1.0 / 2048.0, 1.0 + 3.0 / 2048.0, 65504.0, 65519.0,
                  65520.0, 1e9, f32::INFINITY, f32::NEG_INFINITY, -2.5e-3, 3.14159, -1234.5678, 0.1, 7e-6, 1e-40, -1.0, 2.0, 0.5,
@@ -773,17 +954,28 @@ fn ssm_gates_match_across_backends() {
 #[test]
 fn norm_rope_and_gate_ops_match_cpu() {
     use rusting_strata::ops;
+    // Measurement only (M2-T7): relative error against the CPU reference and the differing bits from
+    // the first backend, per operation. The assertions below are unchanged.
+    let mut seen: std::collections::HashMap<&'static str, Vec<u32>> = std::collections::HashMap::new();
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         let close = |got: &[f32], want: &[f32], what: &str| assert!(rel_l2(got, want) < 1e-6, "{what}: rel err {}", rel_l2(got, want));
+        let mut report = |op: &'static str, case: &str, got: &[f32], want: &[f32]| {
+            let e = rel_l2(got, want);
+            let nd = seen.get(op).map_or(0, |f: &Vec<u32>| got.iter().zip(f).filter(|(a, b)| a.to_bits() != **b).count());
+            eprintln!("op {op} {bk} [{case}]: rel err vs CPU {e:.2e}, {nd} of {} differ from the first backend", got.len());
+            seen.entry(op).or_insert_with(|| got.iter().map(|x| x.to_bits()).collect());
+        };
         let (n, rows) = (2048, 3);
         let (x, w) = (xs(rows * n).iter().map(|v| v * 3.0).collect::<Vec<f32>>(), xs(n + 7)[7..].to_vec());
         let (dx, dw, dout) = (up(gpu, &x), up(gpu, &w), gpu.zeros::<f32>(rows * n).unwrap());
         gpu.rms_norm(dx.addr(), n, dw.addr(), dout.addr(), n, n, rows, 1e-6).unwrap();
         let mut want = vec![0f32; rows * n];
         for (o, r) in want.chunks_mut(n).zip(x.chunks(n)) { ops::rms_norm(r, &w, 1e-6, o) }
-        close(&down::<f32>(gpu, &dout), &want, "rms_norm");
+        let got = down::<f32>(gpu, &dout);
+        close(&got, &want, "rms_norm");
+        report("rms_norm", &format!("{n} x {rows} rows"), &got, &want);
 
         // quant_xq: int8 rows, then scales, as the CPU rounds them.
         let dq = gpu.zeros::<u8>(rows * n * 9 / 8).unwrap();
@@ -814,7 +1006,9 @@ fn norm_rope_and_gate_ops_match_cpu() {
         gpu.l2_norm(dx.addr(), hn, per, stride, 3 * per, 1e-6).unwrap();
         let mut want = x[..3 * stride].to_vec();
         for t in 0..3 { for h in 0..per { ops::l2_norm(&mut want[t * stride + h * hn..][..hn], 1e-6) } }
-        close(&down::<f32>(gpu, &dx), &want, "l2_norm");
+        let got = down::<f32>(gpu, &dx);
+        close(&got, &want, "l2_norm");
+        report("l2_norm", "128 x 2 per token, 3 tokens", &got, &want);
 
         // rope_neox: 3 tokens from position 30000, 2 heads each, 64 of 128 dims rotated.
         let (hd, n_rot, pos) = (128, 64, 30_000);
@@ -823,7 +1017,9 @@ fn norm_rope_and_gate_ops_match_cpu() {
         gpu.rope_neox(dx.addr(), hd, 6, 2, n_rot, step.addr(), 1e7).unwrap();
         let mut want = x[..6 * hd].to_vec();
         for (h, v) in want.chunks_mut(hd).enumerate() { ops::rope_neox(v, n_rot, pos + h / 2, 1e7) }
-        close(&down::<f32>(gpu, &dx), &want, "rope_neox");
+        let got = down::<f32>(gpu, &dx);
+        close(&got, &want, "rope_neox");
+        report("rope_neox", "hd 128, 64 rotated, pos 30000", &got, &want);
         // rms_norm_rope == rms_norm then rope_neox, from rows 160 floats apart.
         let dx = up(gpu, &x[..6 * 160]);
         let (d1, d2) = (gpu.zeros::<f32>(6 * hd).unwrap(), gpu.zeros::<f32>(6 * hd).unwrap());
@@ -860,7 +1056,9 @@ fn norm_rope_and_gate_ops_match_cpu() {
             ops::rms_norm(&x[h * hn..][..hn], &w[..hn], 1e-6, &mut want[h * hn..][..hn]);
             for i in h * hn..(h + 1) * hn { want[i] *= ops::silu(z[i]) }
         }
-        close(&down::<f32>(gpu, &dx), &want, "norm_gate");
+        let got = down::<f32>(gpu, &dx);
+        close(&got, &want, "norm_gate");
+        report("norm_gate", "4 heads of 128", &got, &want);
 
         // ssm_gates on 3 tokens of 5 heads, with g reaching the softplus cutoff.
         let (nv, nt) = (5, 3);
@@ -868,9 +1066,14 @@ fn norm_rope_and_gate_ops_match_cpu() {
         let (dt, a) = (xs(nv + 1)[1..].to_vec(), xs(nv + 2)[2..].to_vec());
         let (db, dg, ddt, da) = (up(gpu, &beta), up(gpu, &g), up(gpu, &dt), up(gpu, &a));
         gpu.ssm_gates(db.addr(), dg.addr(), ddt.addr(), da.addr(), nv * nt, nv).unwrap();
-        close(&down::<f32>(gpu, &db), &beta.iter().map(|&b| ops::sigmoid(b)).collect::<Vec<_>>(), "ssm_gates beta");
+        let wb: Vec<f32> = beta.iter().map(|&b| ops::sigmoid(b)).collect();
+        let gb = down::<f32>(gpu, &db);
+        close(&gb, &wb, "ssm_gates beta");
+        report("ssm_gates", "beta, 3 tokens of 5 heads", &gb, &wb);
         let want: Vec<f32> = g.iter().enumerate().map(|(i, &g)| ops::softplus(g + dt[i % nv]) * a[i % nv]).collect();
-        close(&down::<f32>(gpu, &dg), &want, "ssm_gates g");
+        let gg = down::<f32>(gpu, &dg);
+        close(&gg, &want, "ssm_gates g");
+        report("ssm_gates_g", "g, 3 tokens of 5 heads", &gg, &want);
 
         // conv_silu: 300 channels, kernel 4, two steps so the state shifts.
         let (ch, kw) = (300, 4);
@@ -887,8 +1090,14 @@ fn norm_rope_and_gate_ops_match_cpu() {
             }).collect();
             st.drain(..ch);
             st.extend(&qkv);
-            close(&down::<f32>(gpu, &dy), &want, "conv_silu y");
-            close(&down::<f32>(gpu, &dst), &st, "conv_silu state");
+            let gy = down::<f32>(gpu, &dy);
+            let gs = down::<f32>(gpu, &dst);
+            close(&gy, &want, "conv_silu y");
+            close(&gs, &st, "conv_silu state");
+            if s == 0 {
+                report("conv", "ch 300 kw 4, 2 steps", &gy, &want);
+                report("conv_state", "ch 300 kw 4, 2 steps", &gs, &st);
+            }
         }
     }
 }
@@ -939,6 +1148,17 @@ fn router_topk_matches_ops_top_k() {
         }
         assert_eq!(ids[k..k + 2], [7, 200]);
         let bits = (ids, w.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        // Measurement only (M2-T7): max |weight - CPU| and differing bits from the first backend.
+        let mut wmax = 0f32;
+        for r in 0..t {
+            let mut p = x[r * n..(r + 1) * n].to_vec();
+            rusting_strata::ops::softmax(&mut p);
+            let want = rusting_strata::ops::top_k(&p, k);
+            let s: f32 = want.iter().map(|&i| p[i]).sum();
+            for (j, &i) in want.iter().enumerate() { wmax = wmax.max((w[r * k + j] - p[i] / s * 2.5).abs()); }
+        }
+        let nd = first.as_ref().map_or(0, |f: &(Vec<i32>, Vec<u32>)| f.1.iter().zip(&bits.1).filter(|(a, b)| a != b).count());
+        eprintln!("op router_topk {bk} [n {n} k {k} t {t}]: max abs {wmax:.2e}, {nd} of {} differ from the first backend", bits.1.len());
         match &first { None => first = Some(bits), Some(f) => assert!(*f == bits, "{bk} differs from the first backend") }
     }
 }
@@ -993,7 +1213,7 @@ fn moe_mailbox_round_trip() {
             unsafe { at(DONE).write_volatile(seq) };
         };
         let ops = |step: &rusting_strata::backend::Buf| {
-            gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), mb.addr(), n, lay.h, step.addr(), t)?;
+            gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), mb.addr(), n, lay.h, step.addr(), t, 0)?;
             gpu.moe_combine(dx.addr(), dye.addr(), wh.addr(), k, dsh.addr(), dsg.addr(), mb.addr(), lay.y, step.addr(), slots.addr(), n, t)?;
             gpu.sync()
         };
@@ -1030,6 +1250,19 @@ fn moe_mailbox_round_trip() {
         let want = if bk == "cuda" { (4, 3) } else { (0, 4) };
         assert_eq!(unsafe { (at(SKIP).read_volatile(), at(REQ).read_volatile()) }, want);
         gpu.put(&table, &dtable, 0).unwrap();
+        // #34 R2: `mb = 0` (a fully resident cache) still routes, and writes no mailbox word, even with missed
+        // experts in the table: the combine must not wait for a CPU part that does not exist. CUDA only (the Vulkan
+        // kernels read the mailbox unconditionally).
+        if bk == "cuda" {
+            let before = unsafe { (at(SKIP).read_volatile(), at(REQ).read_volatile()) };
+            gpu.put(&[0i32, 6], &step, 0).unwrap();
+            gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), 0, n, lay.h, step.addr(), t, 0).unwrap();
+            gpu.moe_combine(dx.addr(), dye.addr(), wh.addr(), k, dsh.addr(), dsg.addr(), 0, lay.y, step.addr(), slots.addr(), n, t).unwrap();
+            gpu.sync().unwrap();
+            let (gi, gs) = (down::<i32>(gpu, &dids), down::<i32>(gpu, &slots));
+            for j in 0..k * t { assert_eq!((gi[j], gs[j]), (ids[j], table[ids[j] as usize]), "null-mailbox routing {j}"); }
+            assert_eq!(unsafe { (at(SKIP).read_volatile(), at(REQ).read_volatile()) }, before, "mb = 0 must not write the mailbox");
+        }
         if bk == "vulkan" {
             // Unanswered: with conditional rendering the combine adds nothing, the rest of the submission (the add) is
             // skipped and stalled() tells the caller; without it the wait is an error.
@@ -1037,7 +1270,7 @@ fn moe_mailbox_round_trip() {
             gpu.put(&[0i32, 5], &step, 0).unwrap();
             let t0 = std::time::Instant::now();
             let r = (|| {
-                gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), mb.addr(), n, lay.h, step.addr(), t)?;
+                gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), mb.addr(), n, lay.h, step.addr(), t, 0)?;
                 gpu.moe_combine(dx.addr(), dye.addr(), wh.addr(), k, dsh.addr(), dsg.addr(), mb.addr(), lay.y, step.addr(), slots.addr(), n, t)?;
                 gpu.add(dx.addr(), dx.addr(), n)?;
                 gpu.sync()
@@ -1094,26 +1327,96 @@ fn attn_decode_bandwidth() {
 }
 
 
-/// Random rows of `ty` with sane block scales: f16 d in [0.01, 0.02) at each block's start (Q2_0, Q8_0, IQ4_NL, Q4_0, Q5_0; Q4_1 and Q5_1 also a small m), or
-/// float values (F32, BF16).
+/// Random rows of `ty` with finite, non-degenerate block fields. Payload/code bytes stay random; every scale field
+/// the CPU dequantizer reads is overwritten at its offset with a value in `[0.01, 0.02)` (`m` / `dmin` as noted):
+///
+/// | type | block | scale fields (byte offsets) |
+/// | --- | --- | --- |
+/// | F32 | 4 | one f32 value per element |
+/// | F16 | 2 | one f16 value per element |
+/// | BF16 | 2 | one bf16 value per element |
+/// | Q2_0 | 18 | `d` f16 @0 |
+/// | Q4_0 | 18 | `d` f16 @0 |
+/// | Q5_0 | 22 | `d` f16 @0 |
+/// | Q8_0 | 34 | `d` f16 @0 |
+/// | Q4_1 | 20 | `d` f16 @0, `m` f16 @2 (`[-0.15, 0.05)`) |
+/// | Q5_1 | 24 | `d` f16 @0, `m` f16 @2 (`[-0.15, 0.05)`) |
+/// | Q2_K | 84 | `d` f16 @80, `dmin` f16 @82 (16 4-bit scale pairs @0 random) |
+/// | Q3_K | 110 | `d` f16 @108 (6-bit scales @96 random) |
+/// | Q4_K | 144 | `d` f16 @0, `dmin` f16 @2 (6 4-bit scale pairs @4 random) |
+/// | Q5_K | 176 | `d` f16 @0, `dmin` f16 @2 (6 4-bit scale pairs @4 random) |
+/// | Q6_K | 210 | `d` f16 @208 (8-bit scales @192 random) |
+/// | IQ1_S | 50 | `d` f16 @0 |
+/// | IQ1_M | 56 | `d` bits split over the top nibbles of the four u16 scale words @48..56 |
+/// | IQ2_XXS | 66 | `d` f16 @0 |
+/// | IQ2_XS | 74 | `d` f16 @0 |
+/// | IQ2_S | 82 | `d` f16 @0 |
+/// | IQ3_XXS | 98 | `d` f16 @0 |
+/// | IQ3_S | 110 | `d` f16 @0 |
+/// | IQ4_XS | 136 | `d` f16 @0 |
+/// | IQ4_NL | 18 | `d` f16 @0 |
+///
+/// Every produced f32 is asserted finite, so a NaN/inf scale cannot mask a kernel bug later.
 fn random_tensor(ty: GgmlType, rows: usize, cols: usize, seed: u32) -> Vec<u8> {
     let mut s = seed.wrapping_mul(2654435761) | 1;
     let mut rnd = move || { s ^= s << 13; s ^= s >> 17; s ^= s << 5; s };
-    match ty {
+    let scale = |rnd: &mut dyn FnMut() -> u32| half::f16::from_f32(0.01 + (rnd() % 100) as f32 * 1e-4).to_le_bytes();
+    let data: Vec<u8> = match ty {
         GgmlType::F32 => (0..rows * cols).flat_map(|_| ((rnd() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()).collect(),
+        GgmlType::F16 => (0..rows * cols).flat_map(|_| half::f16::from_f32((rnd() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()).collect(),
         GgmlType::BF16 => (0..rows * cols).flat_map(|_| half::bf16::from_f32((rnd() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()).collect(),
         _ => {
-            let (bb, n) = (ty.block_bytes(), rows * cols / ty.block_elems());
+            let (bb, n) = (ty.block_bytes(), rows * (cols / ty.block_elems()));
             (0..n).flat_map(|_| {
                 let mut b: Vec<u8> = (0..bb).map(|_| rnd() as u8).collect();
-                b[..2].copy_from_slice(&half::f16::from_f32(0.01 + (rnd() % 100) as f32 * 1e-4).to_le_bytes());
-                if matches!(ty, GgmlType::Q4_1 | GgmlType::Q5_1) {  // m in [-0.15, 0.05)
-                    b[2..4].copy_from_slice(&half::f16::from_f32(-0.15 + (rnd() % 100) as f32 * 2e-3).to_le_bytes());
+                match ty {
+                    GgmlType::Q2K => { b[80..82].copy_from_slice(&scale(&mut rnd)); b[82..84].copy_from_slice(&scale(&mut rnd)); }
+                    GgmlType::Q3K => b[108..110].copy_from_slice(&scale(&mut rnd)),
+                    GgmlType::Q4K | GgmlType::Q5K => { b[0..2].copy_from_slice(&scale(&mut rnd)); b[2..4].copy_from_slice(&scale(&mut rnd)); }
+                    GgmlType::Q6K => b[208..210].copy_from_slice(&scale(&mut rnd)),
+                    GgmlType::Q4_1 | GgmlType::Q5_1 => {
+                        b[0..2].copy_from_slice(&scale(&mut rnd));
+                        b[2..4].copy_from_slice(&half::f16::from_f32(-0.15 + (rnd() % 100) as f32 * 2e-3).to_le_bytes());
+                    }
+                    GgmlType::IQ1M => {
+                        // d is composed from the top nibbles of the four u16 scale words at 48..56 (src/quant/mod.rs:201).
+                        let d = half::f16::from_f32(0.01 + (rnd() % 100) as f32 * 1e-4).to_bits();
+                        for i in 0..4 {
+                            let o = 48 + 2 * i;
+                            let w = (u16::from_le_bytes([b[o], b[o + 1]]) & 0x0FFF) | (((d >> (4 * i)) & 0xF) << 12);
+                            b[o..o + 2].copy_from_slice(&w.to_le_bytes());
+                        }
+                    }
+                    _ => b[0..2].copy_from_slice(&scale(&mut rnd)),
                 }
                 b
             }).collect()
         }
+    };
+    let mut values = vec![0f32; rows * cols];
+    rusting_strata::quant::dequant_row(ty, &data, &mut values);
+    assert!(values.iter().all(|v| v.is_finite()), "{}: random block produced a non-finite value", ty.name());
+    data
+}
+
+/// `random_tensor` gives every type a finite reference: no GPU needed, so the generator is checked on its own.
+#[test]
+fn random_tensor_scales_are_finite() {
+    for ty in all_types() {
+        for (rows, cols) in [(1, 256), (3, 512), (2, 2560)] {
+            let d = random_tensor(ty, rows, cols, cols as u32 + ty as u32);
+            assert_eq!(d.len(), ty.row_bytes(cols as u64) * rows, "{} bytes", ty.name());
+            let mut v = vec![0f32; rows * cols];
+            rusting_strata::quant::dequant_row(ty, &d, &mut v);
+            assert!(v.iter().all(|f| f.is_finite()), "{} {rows}x{cols}", ty.name());
+            assert!(v.iter().any(|&f| f != 0.0), "{} {rows}x{cols}: all-zero block", ty.name());
+        }
     }
+}
+
+/// Every supported `GgmlType`, in the order `from_u32` accepts them.
+fn all_types() -> Vec<GgmlType> {
+    (0..64).filter_map(|i| GgmlType::from_u32(i).ok()).collect()
 }
 
 #[test]
@@ -1180,8 +1483,8 @@ fn gemv_partial_superblocks_and_q2_0() {
                 for r in 0..rows {
                     t.row(r, &mut wr);
                     for (i, xv) in xm.chunks(cols).enumerate() {
-                        want[i * rows + r] = if gpu.int8_gemm(ty) && cols % 128 == 0 { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
-                                             else { wr.iter().zip(xv).map(|(a, b)| f16r(*a) * f16r(*b)).sum() };
+                        want[i * rows + r] = if gpu.mmq(ty) && cols % 128 == 0 { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
+                                             else { wr.iter().zip(xv).map(|(a, b)| f16_in(bk, *a) * f16_in(bk, *b)).sum() };
                     }
                 }
                 let e = rel_l2(&down::<f32>(gpu, &dym), &want);
@@ -1198,6 +1501,178 @@ fn gemv_partial_superblocks_and_q2_0() {
         gpu.quant_xq(dg2.addr(), n, n, rows, q2.addr()).unwrap();
         assert_eq!(down::<u8>(gpu, &q1), down::<u8>(gpu, &q2), "{bk}: swiglu_q of 640");
     }
+}
+
+/// Per-type Vulkan pass/fail matrix over all 23 `GgmlType` variants: dequant, GEMV/GEMV-N/GEMV-Q, MoE GEMV, dense
+/// and tiled GEMM, plus each type's largest shared-memory request. Synthetic raw blocks bypass `Backend::upload`, so
+/// native kernels run even for the types the loader converts (F16, Q4_0, Q5_0). Vulkan only: run it with
+/// `STRATA_TEST_BACKENDS=vulkan`. Prints one `MATRIX ty=...` line per type for `docs/V100-results.md`.
+#[test]
+fn vulkan_type_matrix() {
+    let Ok(g) = rusting_strata::vulkan::Vk::new(0) else { return eprintln!("SKIP: no Vulkan device"); };
+    let gpu: &dyn Backend = &g;
+    let not_impl = |e: &anyhow::Error| format!("{e:#}").contains("not implemented");
+    let types = all_types();
+    assert_eq!(types.len(), 23, "GgmlType variants");
+    let (rows, ne, cols, nt) = (40, 4, 256, 3);
+    let mut failures = 0;
+    for ty in types {
+        let smem = match g.max_shared_bytes(&[ty]) {
+            Ok(b) => b,
+            Err(e) => { eprintln!("MATRIX ty={} dequant=fail gemv=fail gemvn=fail gemvq=fail moe_gemv=fail gemm_dense=fail gemm=fail smem=? note=preflight: {e:#}", ty.name()); failures += 1; continue; }
+        };
+        if let Err(e) = g.preflight(&[ty], true) {
+            eprintln!("MATRIX ty={} dequant=fail gemv=fail gemvn=fail gemvq=fail moe_gemv=fail gemm_dense=fail gemm=fail smem={smem} note=preflight: {e:#}", ty.name());
+            failures += 1;
+            continue;
+        }
+        if ty == GgmlType::F16 {
+            eprintln!("MATRIX ty={} dequant=unsupported gemv=unsupported gemvn=unsupported gemvq=unsupported moe_gemv=unsupported gemm_dense=unsupported gemm=unsupported smem={smem} note=no F16 shader path; loader uploads it as F32", ty.name());
+            continue;
+        }
+        let (mut dequant, mut gemv, mut gemvn, mut gemvq, mut moe_gemv, mut gemm_dense, mut gemm) =
+            ("pass", "pass", "pass", "pass", "pass", "pass", "pass");
+        let mut note = if matches!(ty, GgmlType::Q4_0 | GgmlType::Q5_0) { "native bytes; loader uploads Q8_0".to_string() } else { String::new() };
+        // The f16 GEMM path converts its operands with packFloat2x16; on this Volta driver OpFConvert truncates.
+        if matches!(ty, GgmlType::F32 | GgmlType::BF16 | GgmlType::IQ2XS | GgmlType::IQ2S) {
+            note = format!("{note}{}f16 GEMM inputs truncate (Volta OpFConvert); reference matches", if note.is_empty() { "" } else { "; " });
+        }
+        let data = random_tensor(ty, ne * rows, cols, cols as u32 + ty as u32);
+        let all = Tensor { ty, cols, rows: ne * rows, data: &data };
+        let t = Tensor { rows, data: &data[..ty.row_bytes(cols as u64) * rows], ..all };
+        // Raw bytes, as experts are uploaded.
+        let raw = |t: &Tensor| {
+            let b = gpu.alloc(t.data.len()).unwrap();
+            gpu.htod(t.data, &b, 0).unwrap();
+            GpuTensor::new(t.ty, t.rows, t.cols, b)
+        };
+        let (dt, dall) = (raw(&t), raw(&all));
+        // dequant
+        let dq = gpu.zeros::<f32>(rows * cols).unwrap();
+        match gpu.dequant(&dt, rows, dq.addr()) {
+            Ok(()) => {
+                let got = down::<f32>(gpu, &dq);
+                let mut want = vec![0f32; rows * cols];
+                for (r, out) in want.chunks_exact_mut(cols).enumerate() { t.row(r, out); }
+                let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-30);
+                let diff = got.iter().zip(&want).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+                if diff > 1e-5 * scale { dequant = "fail"; note = format!("dequant max diff {diff} vs scale {scale}"); }
+            }
+            Err(e) if not_impl(&e) => { dequant = "unsupported"; note = format!("dequant: {e:#}"); }
+            Err(e) => panic!("{}: dequant: {e:#}", ty.name()),
+        }
+        // gemv, gemvn and gemvq on the same quant_xq input
+        let x = xs(nt * cols + 5)[5..].to_vec();
+        let dx = up(gpu, &x);
+        let want: Vec<Vec<f32>> = x.chunks(cols).map(|xt| { let mut y = vec![0f32; rows]; t.matvec(&as_seen(ty, xt), &mut y); y }).collect();
+        let dy = gpu.zeros::<f32>(nt * rows).unwrap();
+        match gpu.gemv(&dt, dx.addr(), dy.addr()) {
+            Ok(()) => {
+                let e = rel_l2(&down::<f32>(gpu, &dy)[..rows], &want[0]);
+                if e > 1e-4 { gemv = "fail"; note = format!("gemv rel err {e}"); }
+            }
+            Err(e) if not_impl(&e) => { gemv = "unsupported"; note = format!("gemv: {e:#}"); }
+            Err(e) => panic!("{}: gemv: {e:#}", ty.name()),
+        }
+        let mut gemvn_got: Option<Vec<f32>> = None;
+        match gpu.gemvn(&dt, dx.addr(), cols, dy.addr(), rows, nt) {
+            Ok(()) => {
+                let got = down::<f32>(gpu, &dy);
+                for k in 0..nt {
+                    let e = rel_l2(&got[k * rows..(k + 1) * rows], &want[k]);
+                    if e > 1e-4 { gemvn = "fail"; note = format!("gemvn token {k} rel err {e}"); }
+                }
+                gemvn_got = Some(got);
+            }
+            Err(e) if not_impl(&e) => { gemvn = "unsupported"; note = format!("gemvn: {e:#}"); }
+            Err(e) => panic!("{}: gemvn: {e:#}", ty.name()),
+        }
+        let xq = gpu.zeros::<u8>(nt * cols * 9 / 8).unwrap();
+        let dz = gpu.zeros::<f32>(nt * rows).unwrap();
+        match gpu.quant_xq(dx.addr(), cols, cols, nt, xq.addr()).and_then(|()| gpu.gemvq(&dt, dx.addr(), cols, xq.addr(), dz.addr(), rows, nt)) {
+            Ok(()) => {
+                let got = down::<f32>(gpu, &dz);
+                match &gemvn_got {
+                    Some(w) if got.iter().zip(w).any(|(a, b)| a.to_bits() != b.to_bits()) => { gemvq = "fail"; note = format!("gemvq differs from gemvn on quant_xq: {note}"); }
+                    _ => {}
+                }
+            }
+            Err(e) if not_impl(&e) => { gemvq = "unsupported"; note = format!("gemvq: {e:#}"); }
+            Err(e) => panic!("{}: gemvq: {e:#}", ty.name()),
+        }
+        // moe_gemv: the first expert, a skipped (-1) slot and the last expert.
+        let ids = [0i32, -1, ne as i32 - 1];
+        let di = up(gpu, &ids);
+        let dm = gpu.zeros::<f32>(3 * rows).unwrap();
+        match gpu.moe_gemv(ty, rows, cols, dall.ptr, dall.bytes() / ne, di.addr(), 3, dx.addr(), cols, 1, dm.addr(), None, 0) {
+            Ok(()) => {
+                let got = down::<f32>(gpu, &dm);
+                for (k, &e) in ids.iter().enumerate() {
+                    let g = &got[k * rows..(k + 1) * rows];
+                    if e < 0 {
+                        if g.iter().any(|&v| v != 0.0) { moe_gemv = "fail"; note = format!("moe_gemv wrote skipped slot {k}: {note}"); }
+                        continue;
+                    }
+                    let mut w = vec![0f32; rows];
+                    all.expert(e as usize, ne).matvec(&as_seen(ty, &x[k * cols..(k + 1) * cols]), &mut w);
+                    let err = rel_l2(g, &w);
+                    if err > 1e-4 { moe_gemv = "fail"; note = format!("moe_gemv expert {e} rel err {err}: {note}"); }
+                }
+            }
+            Err(e) if not_impl(&e) => { moe_gemv = "unsupported"; note = format!("moe_gemv: {e:#}"); }
+            Err(e) => panic!("{}: moe_gemv: {e:#}", ty.name()),
+        }
+        // Dense GEMM over 130 positions (a full and a partial tile) and the tiled `gemm` entry point with 3 tiles.
+        let m = 130;
+        let xm = xs(m * cols);
+        let (dxm, dym) = (up(gpu, &xm), gpu.zeros::<f32>(m * rows).unwrap());
+        match gpu.gemm_dense(&dt, m, dxm.addr(), cols, dym.addr(), rows, 0) {
+            Ok(()) => {
+                let mut wr = vec![0f32; cols];
+                let mut want = vec![0f32; m * rows];
+                for r in 0..rows {
+                    t.row(r, &mut wr);
+                    for (i, xv) in xm.chunks(cols).enumerate() {
+                        want[i * rows + r] = if gpu.mmq(ty) && cols % 128 == 0 { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
+                                             else { wr.iter().zip(xv).map(|(a, b)| f16_in("vulkan", *a) * f16_in("vulkan", *b)).sum() };
+                    }
+                }
+                let e = rel_l2(&down::<f32>(gpu, &dym), &want);
+                if e > 1e-4 { gemm_dense = "fail"; note = format!("gemm_dense rel err {e}: {note}"); }
+            }
+            Err(e) if not_impl(&e) => { gemm_dense = "unsupported"; note = format!("gemm_dense: {e:#}"); }
+            Err(e) => panic!("{}: gemm_dense: {e:#}", ty.name()),
+        }
+        let (n_x, mt) = (50, 170);
+        let xr: Vec<f32> = xs(n_x * cols);
+        let xrow: Vec<i32> = (0..mt).map(|i| ((i * 7) % n_x) as i32).collect();
+        let tiles: Vec<u64> = [(0u64, 128u64), (128, 16), (144, 26)].iter().flat_map(|&(m0, c)| [dt.ptr, m0 | c << 32]).collect();
+        let (dtl, dxr, drow) = (up(gpu, &tiles), up(gpu, &xr), up(gpu, &xrow));
+        let dyt = gpu.zeros::<f32>(mt * rows).unwrap();
+        match gpu.gemm(ty, rows, cols, dtl.addr(), 3, dxr.addr(), cols, n_x, drow.addr(), dyt.addr(), rows, 0) {
+            Ok(()) => {
+                let got = down::<f32>(gpu, &dyt);
+                let mut wr = vec![0f32; cols];
+                let mut want = vec![0f32; mt * rows];
+                for r in 0..rows {
+                    t.row(r, &mut wr);
+                    for (i, &xri) in xrow.iter().enumerate() {
+                        let xv = &xr[xri as usize * cols..][..cols];
+                        want[i * rows + r] = if gpu.mmq(ty) && cols % 128 == 0 { wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum() }
+                                             else { wr.iter().zip(xv).map(|(a, b)| f16_in("vulkan", *a) * f16_in("vulkan", *b)).sum() };
+                    }
+                }
+                let e = rel_l2(&got, &want);
+                if e > 1e-4 { gemm = "fail"; note = format!("gemm rel err {e}: {note}"); }
+            }
+            Err(e) if not_impl(&e) => { gemm = "unsupported"; note = format!("gemm: {e:#}"); }
+            Err(e) => panic!("{}: gemm: {e:#}", ty.name()),
+        }
+        if [dequant, gemv, gemvn, gemvq, moe_gemv, gemm_dense, gemm].contains(&"fail") { failures += 1; }
+        eprintln!("MATRIX ty={} dequant={dequant} gemv={gemv} gemvn={gemvn} gemvq={gemvq} moe_gemv={moe_gemv} \
+            gemm_dense={gemm_dense} gemm={gemm} smem={smem} note={note}", ty.name());
+    }
+    assert_eq!(failures, 0, "type matrix failures");
 }
 
 /// qwen4exp hyper-connection and PLE kernels against loops over the same f32 inputs.
@@ -1302,7 +1777,12 @@ fn f16_weight_uploads_as_f32() {
         assert!(e <= 1e-5, "{bk} gemvn rel err {e}");
         let dy = gpu.zeros::<f32>(nt * rows).unwrap();
         gpu.gemm_dense(&dt, nt, dx.addr(), cols, dy.addr(), rows, 0).unwrap();
-        let e = rel_l2(&down::<f32>(gpu, &dy), &want);
+        // The prefill path converts x and w to f16; the decode paths above read them as f32.
+        let wantg: Vec<f32> = (0..nt * rows).map(|i| {
+            let (m, r) = (i / rows, i % rows);
+            (0..cols).map(|c| f16_in(bk, wf[r * cols + c]) as f64 * f16_in(bk, x[m * cols + c]) as f64).sum::<f64>() as f32
+        }).collect();
+        let e = rel_l2(&down::<f32>(gpu, &dy), &wantg);
         eprintln!("{bk}: gemm_dense rel err {e:.2e}");
         assert!(e <= 1e-5, "{bk} gemm_dense rel err {e}");
     }
