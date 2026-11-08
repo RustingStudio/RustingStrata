@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use anyhow::Context;
+use rusting_strata::memory;
 use rusting_strata::model::{Model, State};
 use rusting_strata::{backend, gpu_model::GpuModel};
 use rusting_strata::{config::ModelConfig, gguf::Gguf, hf, ops, ops::Sampler, quant::GgmlType, serve, tokenizer::Tokenizer};
@@ -57,10 +58,21 @@ struct Engine {
     /// repeat exactly.
     #[arg(long)]
     fixed_experts: bool,
+    /// Host RAM left free for the OS, in MB. The usable RAM cap is `total RAM - margin`, so on a 32 GB
+    /// host `--ram-margin 6135` leaves ~6 GB free and caps Strata at ~26 GB. See `--max-ram`.
+    #[arg(long, default_value_t = 512)]
+    ram_margin: usize,
+    /// Absolute host RAM ceiling for this process, in MB; overrides `--ram-margin` (which otherwise
+    /// caps at total minus the margin above). `0` disables the cap.
+    #[arg(long, default_value_t = 0)]
+    max_ram: usize,
     /// Host memory in MB for conversation states that a request with another history replaced (GPU): a later request
     /// that continues one of them takes it back instead of prefilling it again. 0 keeps none.
     #[arg(long, default_value_t = 4096)]
     cache_ram: usize,
+    /// GGUF LoRA adapter(s) to apply at runtime as "path:scale" (repeatable; CPU and GPU).
+    #[arg(long, value_name = "PATH:SCALE", action = clap::ArgAction::Append)]
+    lora: Vec<String>,
     /// Keep the think block of earlier replies in the prompt (Qwen3.5/3.6 templates' `preserve_thinking`; a request
     /// can set it in `chat_template_kwargs`). The template drops it from replies before the last user message, so
     /// each new user message changes the earlier text and the whole conversation is prefilled again; with this, a
@@ -180,6 +192,18 @@ impl Runner<'_> {
 impl Engine {
     /// Fills settings not given on the command line from the model's calibration file, else built-in defaults.
     fn runner<'a>(&mut self, m: &'a Model<'a>, model: &Path) -> anyhow::Result<Runner<'a>> {
+        let cap = self.ram_cap();
+        if let Some(c) = cap {
+            let used_est = m.ram_estimate() as u64;
+            anyhow::ensure!(used_est <= c, "model needs ~{} MB of RAM, over the {} MB cap (--ram-margin {} leaves {:.0} GB for the OS; raise it or set --max-ram)", used_est >> 20, c >> 20, self.ram_margin, self.ram_margin as f64 / 1024.0);
+            let room = c.saturating_sub(used_est);
+            let want = ((self.cache_ram << 20) as u64).min(room);
+            if want < (self.cache_ram << 20) as u64 {
+                eprintln!("RAM cap: clamping --cache-ram from {} MB to {} MB (model ~{} MB, cap {} MB)", self.cache_ram, want >> 20, used_est >> 20, c >> 20);
+            }
+            self.cache_ram = (want >> 20) as usize;
+            unsafe { std::env::set_var("STRATA_RAM_CAP_BYTES", c.to_string()); }
+        }
         if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
         if self.kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
         let open = || self.device.iter().map(|&d| backend::open(self.backend.as_deref(), d)).collect::<anyhow::Result<Vec<_>>>();
@@ -221,6 +245,10 @@ impl Engine {
     }
     fn chunk(&self) -> usize { self.chunk.unwrap_or(4096) }
     fn mtp(&self) -> usize { self.mtp.unwrap_or(0) }
+    fn ram_cap(&self) -> Option<u64> {
+        if self.max_ram > 0 { return Some((self.max_ram << 20) as u64); }
+        memory::ram_cap((self.ram_margin << 20) as u64, None)
+    }
 }
 
 /// The negative log-likelihood of `tok` under `logits`, and in `row` the log-probabilities as llama-perplexity stores
@@ -251,6 +279,19 @@ fn calibration_path(model: &Path, backend: &str) -> PathBuf {
     let stem = model.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
     let sfx = if backend == "cuda" { String::new() } else { format!("-{backend}") };
     rusting_strata::expert_cache::cache_dir().join(format!("strata-{stem}{sfx}.json"))
+}
+
+impl Engine {
+    pub fn lora_specs(&self) -> Vec<(String, f32)> {
+        self.lora.iter().map(|s| {
+            if let Some(idx) = s.rfind(':') {
+                if let Ok(scale) = s[idx+1..].parse::<f32>() {
+                    return (s[..idx].to_string(), scale);
+                }
+            }
+            (s.clone(), 1.0)
+        }).collect()
+    }
 }
 
 #[derive(Subcommand)]
@@ -320,12 +361,18 @@ enum Cmd {
         /// GPU context length used while measuring and assumed for the results.
         #[arg(long, default_value_t = 4096)]
         ctx: usize,
-        #[arg(long, default_value_t = 512)]
-        vram_margin: usize,
-        #[arg(long)]
-        backend: Option<String>,
-        #[arg(long, default_value_t = 0)]
-        device: usize,
+    #[arg(long, default_value_t = 512)]
+    vram_margin: usize,
+    #[arg(long, default_value_t = 512)]
+    ram_margin: usize,
+    #[arg(long, default_value_t = 0)]
+    max_ram: usize,
+    #[arg(long)]
+    backend: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    device: usize,
+    #[arg(long, value_name = "PATH:SCALE", action = clap::ArgAction::Append)]
+    lora: Vec<String>,
         /// KV cache format to calibrate with (q8 leaves more VRAM for experts), as `--kv` of the runs that use it.
         #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
         kv: String,
@@ -424,7 +471,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let (prompt, cont) = (ids("prompt")?, ids("continuation")?);
             anyhow::ensure!(!prompt.is_empty() && !cont.is_empty(), "empty prompt or continuation");
             let g = Gguf::open(&model)?;
-            let m = Model::load(&g)?;
+            let mut m = Model::load(&g)?;
+            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             if let Some(&t) = prompt.iter().chain(&cont).find(|&&t| t as usize >= m.cfg.n_vocab) {
                 anyhow::bail!("token id {t} out of range (vocabulary has {} tokens)", m.cfg.n_vocab);
             }
@@ -444,7 +492,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Generate { model, prompt, n, mut engine } => {
             let g = Gguf::open(&model)?;
-            let m = Model::load(&g)?;
+            let mut m = Model::load(&g)?;
+            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
             let prompt = if prompt == "-" {
                 let mut s = String::new();
@@ -473,7 +522,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Perplexity { model, file, ctx_len: n, chunks, kld_base, mut engine } => {
             let g = Gguf::open(&model)?;
-            let m = Model::load(&g)?;
+            let mut m = Model::load(&g)?;
+            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
             // ponytail: no BOS at chunk starts (llama-perplexity adds one where the vocabulary asks for it; Qwen does not)
             let ids = tok.encode(&std::fs::read_to_string(&file)?)?;
@@ -508,7 +558,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Bench { model, pp, tg, reps, mut engine } => {
             let g = Gguf::open(&model)?;
-            let m = Model::load(&g)?;
+            let mut m = Model::load(&g)?;
+            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
             engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
             let mut r = engine.runner(&m, &model)?;
@@ -532,13 +583,24 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             r.finish()?;
         }
-        Cmd::Calibrate { model, ctx, vram_margin, backend, device, kv, gpu: _ } => {
+        Cmd::Calibrate { model, ctx, vram_margin, ram_margin, max_ram, backend, device, kv, lora, gpu: _ } => {
+            let cap = if max_ram > 0 { Some((max_ram << 20) as u64) } else { memory::ram_cap((ram_margin << 20) as u64, None) };
+            if let Some(c) = cap { unsafe { std::env::set_var("STRATA_RAM_CAP_BYTES", c.to_string()); } }
             if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
-            calibrate(&model, ctx, vram_margin << 20, backend.as_deref(), device)?
+            let specs: Vec<(String, f32)> = lora.iter().map(|s| {
+                if let Some(idx) = s.rfind(':') {
+                    if let Ok(scale) = s[idx+1..].parse::<f32>() {
+                        return (s[..idx].to_string(), scale);
+                    }
+                }
+                (s.clone(), 1.0)
+            }).collect();
+            calibrate(&model, ctx, vram_margin << 20, backend.as_deref(), device, &specs)?
         }
         Cmd::Chat { model, system, n, think, mut engine } => {
             let g = Gguf::open(&model)?;
-            let m = Model::load(&g)?;
+            let mut m = Model::load(&g)?;
+            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
             let mut r = engine.runner(&m, &model)?;
             let mut smp = engine.sampler();
@@ -688,14 +750,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         // Clients list the models often; a model still loading is listed, as its chats wait for the load.
                         Ok(r) if r.method == "GET" && r.path.split('?').next() == Some("/v1/models") && (k.read().unwrap().any() || serve::host_ok(&r.host, &a)) => {
                             let created = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                            let (m, n_ctx, n_ctx_train) = {
-                                let state = st.lock().unwrap();
-                                (state.model.clone(), state.ctx, state.ctx_train)
-                            };
-                            return reply(json!({"object": "list", "data": m.map(|id| json!([{
-                                "id": id, "object": "model", "created": created, "owned_by": "strata",
-                                "meta": {"n_ctx": n_ctx, "n_ctx_train": n_ctx_train}
-                            }])).unwrap_or(json!([]))}), "200 OK");
+                            let m = st.lock().unwrap().model.clone();
+                            return reply(json!({"object": "list", "data": m.map(|id| json!([{"id": id, "object": "model", "created": created, "owned_by": "strata"}])).unwrap_or(json!([]))}), "200 OK");
                         }
                         _ => {}
                     }
@@ -766,9 +822,10 @@ fn best(f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<f64> {
     Ok(b)
 }
 
-fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device: usize) -> anyhow::Result<()> {
+fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device: usize, lora: &[(String, f32)]) -> anyhow::Result<()> {
     let g = Gguf::open(model)?;
-    let m = Model::load(&g)?;
+    let mut m = Model::load(&g)?;
+    if !lora.is_empty() { m.apply_lora(lora)?; }
     let tok = Tokenizer::from_gguf(&g)?;
     let n_pf = 4096.min(ctx.saturating_sub(256));
     anyhow::ensure!(n_pf >= 512, "--ctx too small to calibrate");
@@ -1152,15 +1209,10 @@ impl Serving {
 fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<TcpStream>) -> anyhow::Result<Option<(PathBuf, TcpStream)>> {
     eprintln!("loading {}", model.display());
     let name = model.file_stem().and_then(|s| s.to_str()).unwrap_or("strata").to_string();
-    {
-        let mut st = s.stats.lock().unwrap();
-        st.unload(Some(name.clone()));
-        st.ctx = engine.ctx;
-    }
+    s.stats.lock().unwrap().unload(Some(name.clone()));
     let g = Gguf::open(model)?;
-    let arch = g.get("general.architecture")?.as_str().context("general.architecture")?;
-    s.stats.lock().unwrap().ctx_train = g.meta.get(&format!("{arch}.context_length")).and_then(|v| v.as_u64());
-    let m = Model::load(&g)?;
+    let mut m = Model::load(&g)?;
+    if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
     let tok = Tokenizer::from_gguf(&g)?;
     let r = engine.runner(&m, model)?;
     {
@@ -1369,21 +1421,14 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                         write!(w, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), None))?;
                     }
                 }
-                let mut last_stream_activity = Instant::now();
                 decode(r, tok, e.mtp() > 0, &mut smp, logits, n, &mut |t| {
                     s.stats.lock().unwrap().live_tokens += 1;
                     // A client that left stops the reply (a stream notices on the next write; held text writes nothing).
                     k += 1;
                     if k % 16 == 0 && serve::gone(&w) { anyhow::bail!("client closed the connection"); }
                     let t = hold.push(t);
-                    if req.stream {
-                        if !t.is_empty() {
-                            if !anth { write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?; } else { text_delta(&mut w, &mut opened, &t)?; }
-                            last_stream_activity = Instant::now();
-                        } else if last_stream_activity.elapsed() >= Duration::from_secs(15) {
-                            w.write_all(b": keep-alive\n\n")?;
-                            last_stream_activity = Instant::now();
-                        }
+                    if req.stream && !t.is_empty() {
+                        if !anth { write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?; } else { text_delta(&mut w, &mut opened, &t)?; }
                     }
                     Ok(hold.stopped)
                 })

@@ -37,7 +37,7 @@ pub struct Gguf {
     pub meta: BTreeMap<String, Value>,
     pub tensors: BTreeMap<String, TensorInfo>,
     /// Each shard's map and data offset (one entry unless the model is split).
-    files: Vec<(Mmap, usize)>,
+    pub files: Vec<(Mmap, usize)>,
 }
 
 struct Cur<'a> { b: &'a [u8], p: usize }

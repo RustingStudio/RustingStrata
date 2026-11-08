@@ -1,6 +1,7 @@
 //! The small HTTP/1.1 subset `strata serve` speaks (std::net, one request per connection) and its chat request.
 
 use crate::chat::{Json, Msg, tool_def};
+use crate::memory;
 use anyhow::{Context, bail};
 use serde_json::Value;
 use std::io::{BufRead, Read};
@@ -263,12 +264,12 @@ pub struct Stats {
     pub backend: String,
     pub device: String,
     pub ctx: usize,
-    #[serde(skip)]
-    pub ctx_train: Option<u64>,
     /// Requests decoded at once (`--parallel`).
     pub slots: usize,
     /// Device memory in use and in total, measured after the load and after each request.
     pub vram: Option<(u64, u64)>,
+    /// Host RAM cap in bytes (`total - --ram-margin`, or `--max-ram`), `None` if undetectable/unlimited.
+    pub ram_cap: Option<u64>,
     /// MoE expert cache hits and misses, and MTP drafts tried and accepted, since the model loaded.
     pub experts: Option<(u64, u64)>,
     pub drafts: Option<(u64, u64)>,
@@ -330,6 +331,9 @@ impl Stats {
             m("vram_used_bytes", "gauge", "Device memory in use.", u);
             m("vram_total_bytes", "gauge", "Device memory in total.", t);
         }
+        if let Some(c) = self.ram_cap {
+            m("ram_cap_bytes", "gauge", "Host RAM cap (total minus margin).", c);
+        }
         if let Some((h, x)) = self.experts {
             m("expert_hits_total", "counter", "Routed experts found on the GPU since the model loaded.", h);
             m("expert_misses_total", "counter", "Routed experts computed on the CPU since the model loaded.", x);
@@ -341,7 +345,8 @@ impl Stats {
     pub fn unload(&mut self, model: Option<String>) {
         let recent = std::mem::take(&mut self.recent);
         *self = Stats { loading: model.is_some(), model, requests: self.requests, prompt_tokens: self.prompt_tokens,
-            cached_tokens: self.cached_tokens, completion_tokens: self.completion_tokens, recent, ..Default::default() };
+            cached_tokens: self.cached_tokens, completion_tokens: self.completion_tokens, recent,
+            ram_cap: std::env::var("STRATA_RAM_CAP_BYTES").ok().and_then(|v| v.parse().ok()), ..Default::default() };
     }
 }
 

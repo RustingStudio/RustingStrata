@@ -691,6 +691,7 @@ async function stats() {
   $('meters').innerHTML = [
     y.cpu_pct != null && meter('Processor', y.cpu_pct, 100, y.cpu_pct.toFixed(0) + '%'),
     y.ram_total && meter('Memory', y.ram_used, y.ram_total, `${gb(y.ram_used)} of ${gb(y.ram_total)}`),
+    s.ram_cap && meter('RAM cap', y.rss || 0, s.ram_cap, `${gb(y.rss || 0)} of ${gb(s.ram_cap)} allowed`),
     y.rss && y.ram_total && meter('Used by Strata', y.rss, y.ram_total, gb(y.rss)),
     s.vram && meter('Graphics memory', s.vram[0], s.vram[1], `${gb(s.vram[0])} of ${gb(s.vram[1])}`),
   ].filter(Boolean).join('') || '<p class="none">Not available on this system.</p>';
