@@ -61,6 +61,9 @@ struct Engine {
     /// that continues one of them takes it back instead of prefilling it again. 0 keeps none.
     #[arg(long, default_value_t = 4096)]
     cache_ram: usize,
+    /// GGUF LoRA adapter(s) to apply at runtime as "path:scale" (repeatable; CPU and GPU).
+    #[arg(long, value_name = "PATH:SCALE", action = clap::ArgAction::Append)]
+    lora: Vec<String>,
     /// Keep the think block of earlier replies in the prompt (Qwen3.5/3.6 templates' `preserve_thinking`; a request
     /// can set it in `chat_template_kwargs`). The template drops it from replies before the last user message, so
     /// each new user message changes the earlier text and the whole conversation is prefilled again; with this, a
@@ -253,6 +256,19 @@ fn calibration_path(model: &Path, backend: &str) -> PathBuf {
     rusting_strata::expert_cache::cache_dir().join(format!("strata-{stem}{sfx}.json"))
 }
 
+impl Engine {
+    pub fn lora_specs(&self) -> Vec<(String, f32)> {
+        self.lora.iter().map(|s| {
+            if let Some(idx) = s.rfind(':') {
+                if let Ok(scale) = s[idx+1..].parse::<f32>() {
+                    return (s[..idx].to_string(), scale);
+                }
+            }
+            (s.clone(), 1.0)
+        }).collect()
+    }
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Print model config and tensor type histogram.
@@ -326,6 +342,9 @@ enum Cmd {
         backend: Option<String>,
         #[arg(long, default_value_t = 0)]
         device: usize,
+        /// Accepted for consistency with the other commands; calibration always uses the base model.
+        #[arg(long, value_name = "PATH:SCALE", action = clap::ArgAction::Append)]
+        lora: Vec<String>,
         /// KV cache format to calibrate with (q8 leaves more VRAM for experts), as `--kv` of the runs that use it.
         #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
         kv: String,
@@ -424,7 +443,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let (prompt, cont) = (ids("prompt")?, ids("continuation")?);
             anyhow::ensure!(!prompt.is_empty() && !cont.is_empty(), "empty prompt or continuation");
             let g = Gguf::open(&model)?;
-            let m = Model::load(&g)?;
+            let mut m = Model::load(&g)?;
+            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             if let Some(&t) = prompt.iter().chain(&cont).find(|&&t| t as usize >= m.cfg.n_vocab) {
                 anyhow::bail!("token id {t} out of range (vocabulary has {} tokens)", m.cfg.n_vocab);
             }
@@ -444,7 +464,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Generate { model, prompt, n, mut engine } => {
             let g = Gguf::open(&model)?;
-            let m = Model::load(&g)?;
+            let mut m = Model::load(&g)?;
+            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
             let prompt = if prompt == "-" {
                 let mut s = String::new();
@@ -473,7 +494,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Perplexity { model, file, ctx_len: n, chunks, kld_base, mut engine } => {
             let g = Gguf::open(&model)?;
-            let m = Model::load(&g)?;
+            let mut m = Model::load(&g)?;
+            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
             // ponytail: no BOS at chunk starts (llama-perplexity adds one where the vocabulary asks for it; Qwen does not)
             let ids = tok.encode(&std::fs::read_to_string(&file)?)?;
@@ -508,7 +530,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Bench { model, pp, tg, reps, mut engine } => {
             let g = Gguf::open(&model)?;
-            let m = Model::load(&g)?;
+            let mut m = Model::load(&g)?;
+            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
             engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
             let mut r = engine.runner(&m, &model)?;
@@ -532,13 +555,15 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             r.finish()?;
         }
-        Cmd::Calibrate { model, ctx, vram_margin, backend, device, kv, gpu: _ } => {
+        Cmd::Calibrate { model, ctx, vram_margin, backend, device, kv, lora, gpu: _ } => {
             if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
+            if !lora.is_empty() { eprintln!("note: --lora is ignored by calibrate; calibration uses the base model"); }
             calibrate(&model, ctx, vram_margin << 20, backend.as_deref(), device)?
         }
         Cmd::Chat { model, system, n, think, mut engine } => {
             let g = Gguf::open(&model)?;
-            let m = Model::load(&g)?;
+            let mut m = Model::load(&g)?;
+            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
             let mut r = engine.runner(&m, &model)?;
             let mut smp = engine.sampler();
@@ -1160,7 +1185,8 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
     let g = Gguf::open(model)?;
     let arch = g.get("general.architecture")?.as_str().context("general.architecture")?;
     s.stats.lock().unwrap().ctx_train = g.meta.get(&format!("{arch}.context_length")).and_then(|v| v.as_u64());
-    let m = Model::load(&g)?;
+    let mut m = Model::load(&g)?;
+    if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
     let tok = Tokenizer::from_gguf(&g)?;
     let r = engine.runner(&m, model)?;
     {

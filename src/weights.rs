@@ -53,14 +53,18 @@ impl<'a> Tensor<'a> {
 pub struct Weights<'a> {
     pub g: &'a Gguf,
     aliases: &'static [(&'static str, &'static str)],
-    /// Tensors built at load time: qwen3next `ssm_ba` split into `ssm_beta` and `ssm_alpha`.
-    built: HashMap<String, Tensor<'a>>,
+    /// Loader-owned overrides: synthesized `ssm_beta`/`ssm_alpha` and LoRA-baked tensors.
+    pub built: HashMap<String, Tensor<'a>>,
+    /// Heap storage the baked tensors in `built` point into. Kept beside `built` so a reload frees it instead of
+    /// leaking the F32 copy; `built` is cleared before `baked` so no tensor outlives its bytes.
+    baked: HashMap<String, Box<[u8]>>,
+    pub lora_baked: std::collections::HashSet<String>,
 }
 
 impl<'a> Weights<'a> {
     pub fn new(g: &'a Gguf) -> anyhow::Result<Weights<'a>> {
         let c = ModelConfig::from_gguf(g)?;
-        let mut w = Weights { g, aliases: c.aliases, built: HashMap::new() };
+        let mut w = Weights { g, aliases: c.aliases, built: HashMap::new(), baked: HashMap::new(), lora_baked: std::collections::HashSet::new() };
         // llama.cpp src/models/qwen3next.cpp: per key head group, r = nv / nk beta rows, then r alpha rows.
         for il in 0..c.n_layer {
             let Ok(ba) = w.layer(il, "ssm_ba.weight") else { continue };
@@ -101,6 +105,48 @@ impl<'a> Weights<'a> {
 
     /// Refuse files containing quant types this engine does not implement, except in the MTP (nextn) layers, blocks
     /// `n_layer` on: false if one of those has such a type, so that the model loads without MTP.
+    /// Drop the LoRA-baked overrides and the heap copies they point into; synthesized `ssm_*` tensors stay.
+    pub fn clear_baked(&mut self) {
+        for name in std::mem::take(&mut self.lora_baked) { self.built.remove(&name); }
+        self.baked.clear();
+    }
+
+    pub fn bake_lora(&mut self, loras: &[crate::model::Lora]) {
+        for lora in loras {
+            for (name, entry) in &lora.entries {
+                if name.ends_with("ffn_down_exps.weight") { continue; }
+                if entry.n_expert != 1 {
+                    eprintln!("lora: target {name} has {} experts, expected 1; skipping", entry.n_expert);
+                    continue;
+                }
+                let base = match self.get(name) { Ok(t) => t, Err(_) => { eprintln!("lora: target {name} not found, skipping"); continue; } };
+                if base.cols != entry.in_dim || base.rows != entry.out_dim {
+                    eprintln!("lora: target {name} is {}x{}, adapter is {}x{}; skipping", base.rows, base.cols, entry.out_dim, entry.in_dim);
+                    continue;
+                }
+                let mut w = base.to_f32();
+                let (a, b) = (&entry.a[0], &entry.b[0]);
+                let (rank, in_dim, out_dim) = (entry.rank, entry.in_dim, entry.out_dim);
+                let mult = if lora.alpha > 0.0 { lora.scale * lora.alpha / rank as f32 } else { lora.scale };
+                for o in 0..out_dim {
+                    for i in 0..in_dim {
+                        let mut d = 0f32;
+                        for r in 0..rank { d += b[o * rank + r] * a[r * in_dim + i]; }
+                        w[o * in_dim + i] += mult * d;
+                    }
+                }
+                self.built.remove(name);
+                self.baked.remove(name);
+                let bytes: Box<[u8]> = w.iter().flat_map(|f| f.to_le_bytes()).collect();
+                // `bytes` lives in `self.baked` until `clear_baked`, which removes the tensor below first.
+                let data: &'a [u8] = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
+                let t = Tensor { ty: crate::quant::GgmlType::F32, cols: base.cols, rows: base.rows, data };
+                self.baked.insert(name.clone(), bytes);
+                self.built.insert(name.clone(), t);
+                self.lora_baked.insert(name.clone());
+            }
+        }
+    }
     pub fn validate(&self, n_layer: usize) -> anyhow::Result<bool> {
         let mut nextn = true;
         for t in self.g.tensors.values() {
