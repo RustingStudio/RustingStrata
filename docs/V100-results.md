@@ -1523,3 +1523,148 @@ python3 -I tools/consistency.py --cuda target/parity-result-cuda-sm70.json \
   --status pre-m2 --out docs/parity/cross-backend.json    # 9 of 640, unexplained 0, exit 0
 ```
 
+## 2026-11-08 09:32 UTC — Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
+
+```
+$ strata bench --backend cuda --pp 512,4096,32768 --tg 128 --reps 3 --ctx 32896
+cuda device 0: Tesla V100-SXM2-32GB, sm_70 (Volta, m8n8k4)
+cuda shared memory: opt-in 98304 B per block, attn_decode_gqa*: 2112 B static, dynamic max 73728 B, carveout default
+cuda shared memory: opt-in 98304 B per block, attn_prefill_*: 0 B static, dynamic max 72704 B, carveout default
+cuda shared memory: opt-in 98304 B per block, gemvn_*: 0 B static, dynamic max 98304 B, carveout default
+plan: weights+state+scratch 2560 MB (KV 642 MB for 32896 tokens, prefill 512 MB), expert slots 10040 MB, resident experts 10240/10240
+expert traffic: 10.4 MB per layer active set (top-8), 313.8 MB per token over 40 MoE layers
+pp    512: prefill 2127.5 (2120.4-2132.9) tok/s | tg 128: decode 129.4 (128.6-129.8) tok/s
+expert traffic: 313.8 MB/token -> 42.7 GB/s at 129.8 tok/s
+pp   4096: prefill 2945.7 (2940.8-2949.2) tok/s | tg 128: decode 125.1 (124.8-125.3) tok/s
+expert traffic: 313.8 MB/token -> 41.2 GB/s at 125.3 tok/s
+pp  32768: prefill 2369.8 (2365.9-2372.9) tok/s | tg 128: decode 110.6 (110.5-110.6) tok/s
+expert traffic: 313.8 MB/token -> 36.4 GB/s at 110.6 tok/s
+expert hit rate 100.0% (0 misses), cache swaps 0
+worker busy 0.0 µs/token, worker stalls 0
+mailbox traffic: 0 GPU writes, 0 host routing reads (fast path on, 10240/10240 experts resident)
+```
+
+## 2026-11-08 09:33 UTC — Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
+
+```
+$ strata bench --backend vulkan --pp 512,4096,32768 --tg 128 --reps 3 --ctx 32896
+vulkan device 0: Tesla V100-SXM2-32GB
+vulkan: Tesla V100-SXM2-32GB (NVIDIA 580.178.04), cooperative matrix f16 no int8 no, conditional rendering yes, maxComputeSharedMemorySize 49152
+vulkan: shared-memory preflight: 60 (kernel, specialization) pairs checked, largest 49152 bytes (gemmi_dp) of 49152 allowed, 0.6 ms
+plan: weights+state+scratch 2580 MB (KV 642 MB for 32896 tokens, prefill 512 MB), expert slots 10040 MB, resident experts 10240/10240
+expert traffic: 10.4 MB per layer active set (top-8), 313.8 MB per token over 40 MoE layers
+pp    512: prefill 766.5 (761.8-769.1) tok/s | tg 128: decode 124.2 (122.3-125.3) tok/s
+expert traffic: 313.8 MB/token -> 41.1 GB/s at 125.0 tok/s
+pp   4096: prefill 1418.4 (1416.2-1420.3) tok/s | tg 128: decode 118.7 (118.6-118.7) tok/s
+expert traffic: 313.8 MB/token -> 39.0 GB/s at 118.7 tok/s
+pp  32768: prefill 521.7 (520.7-523.0) tok/s | tg 128: decode 95.8 (95.7-96.1) tok/s
+expert traffic: 313.8 MB/token -> 31.5 GB/s at 95.7 tok/s
+expert hit rate 100.0% (0 misses), cache swaps 0
+worker busy 106.1 µs/token, worker stalls 0
+mailbox traffic: 80 GPU writes, 46080 host routing reads (fast path off, 10240/10240 experts resident)
+```
+
+## 2026-11-08 — M2 gate (M2-T8, V100, sm_70)
+
+Window: `llama.router.service` stopped and queue drained by the coordinator,
+V100 free (0 MiB, 0 %), one process per arm, CUDA first then Vulkan in the same
+window (09:32 UTC and 09:33 UTC blocks above). Build: `v100` at
+`e4b0477` (`task/38-cuda-gate`), driver **580.178.04**, NVRTC **12.9**
+(`cuda_12.9.r12.9/compiler.36037853_0`), Vulkan **1.4.312**. Model:
+`Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf`, 10240/10240 experts resident, 100.0 % hit
+rate, 0 cache swaps. Protocol unchanged:
+`tools/bench_v100.sh` -> `strata bench --gpu --backend <b> --pp 512,4096,32768
+--tg 128 --reps 3 --ctx 32896`. **Statistic: mean over the 3 repetitions, with
+min-max in parentheses, exactly as the binary prints it** (`src/main.rs:583-587`);
+the median is used only for the expert-traffic bandwidth line.
+
+### Target vs measured (M2 exit criteria, CUDA)
+
+| criterion | target | measured (mean, min-max) | delta | verdict |
+| --- | ---: | --- | ---: | --- |
+| prefill @4096 | >= 2000 tok/s | **2945.7** (2940.8-2949.2) | **+47.3 %** | **MET** |
+| prefill @512 | - | 2127.5 (2120.4-2132.9) | - | reference |
+| prefill @32768 | - | 2369.8 (2365.9-2372.9) | - | reference |
+| decode @512 (reference depth) | >= 130 tok/s | **129.4** (128.6-129.8) | **-0.5 %** | **NOT MET** (see decision) |
+| decode @4096 (sustained) | >= 130 tok/s | **125.1** (124.8-125.3) | **-3.8 %** | **NOT MET** (see decision) |
+| decode @32768 | - | 110.6 (110.5-110.6) | - | reference |
+
+Against M2-T4 (one window earlier, same protocol) every figure is within
+-0.8..0.0 %: prefill 2127.5/2945.7/2369.8 vs 2135.7/2970.2/2386.8, decode
+129.4/125.1/110.6 vs 129.5/125.2/110.6. The M2 build is reproducible across
+windows; the gate did not move the numbers.
+
+### CUDA vs Vulkan, same window, and delta vs the M0 baseline
+
+| depth | CUDA (this window) | Vulkan (this window) | CUDA lead | Vulkan baseline | Vulkan delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| prefill 512 | 2127.5 | 766.5 (steady ~775) | 2.78x | 635.6 (steady 775) | +20.6 % (0 % steady) |
+| prefill 4096 | 2945.7 | **1418.4** | 2.08x | **1423.9** | **-0.4 %** |
+| prefill 32768 | 2369.8 | 521.7 | 4.54x | 523.5 | -0.3 % |
+| decode 512 | 129.4 | 124.2 | +4.2 % | 109.8 | +13.1 % |
+| decode 4096 | 125.1 | 118.7 | +5.4 % | 108.6 | +9.3 % |
+| decode 32768 | 110.6 | 95.8 | +15.4 % | 95.7 | +0.1 % |
+
+The M0 Vulkan baseline is the 2026-11-06 entry at the top of this file. Vulkan
+decode improved at all three depths since then (+13.1 % / +9.3 % / +0.1 %). The
+one bar missed is **prefill @4096: 1418.4 vs 1423.9 (-0.4 %, 5.5 tok/s)** with
+disjoint min-max (1416.2-1420.3 vs 1422.0-1427.0), i.e. a real but tiny
+regression; `pp 512` first-repetition overhead is excluded by comparing the
+steady-state value, as the 2026-11-06 note requires. Recorded here as
+**M3-T4 evidence** and not fixed in T8 (Vulkan tuning is out of scope).
+
+### Safety
+
+```sh
+dmesg -T | grep -ic Xid                                   # 42 before, 42 after
+dmesg -T | grep -i "device lost"                          # no match
+nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader   # 0 MiB, 0 %
+```
+
+No `Xid`, no `device lost`, no trap during either arm; all 42 `Xid` lines are
+the historical Nov 6 entries. The GPU was left at 0 MiB and
+`llama.router.service` left stopped for the coordinator.
+
+### Verdict per exit criterion
+
+1. prefill @4096 >= 2000 tok/s — **MET**: 2945.7 tok/s (+47.3 % margin).
+2. decode >= 130 tok/s — **NOT MET** at any depth: 129.4 @512 (-0.5 %),
+   125.1 @4096 (-3.8 %), 110.6 @32768. **Coordinator-approved revised target**
+   (recorded in the issue #38 comment): *decode >= 129 tok/s @512 and >= 125
+   tok/s @4096 sustained*, pending a decode follow-up. Evidence for the
+   revision is the M2-T5 ceiling: 214.2 GB/s = **23.9 % of the 898.0 GB/s
+   HBM2 roofline**, **50 % occupancy** (56-96 registers/thread pin the SM to
+   4x256-thread blocks), **no `cp.async` on sm_70** so the only in-flight bytes
+   are 8 B per lane per super-block, and 85 % of the roofline requires a GEMV
+   restructuring (more independent loads per lane, fewer per-row shuffles), not
+   a launch-shape knob. If 130 tok/s is required, the coordinator opens that
+   restructuring as a new task; it is not in M2/T8.
+3. Vulkan not below the M0 baseline — decode **PASS** (+13.1 % / +9.3 % /
+   +0.1 %); prefill @4096 **-0.4 %** vs 1423.9, stated with numbers and
+   attributed to M3-T4.
+4. no `Xid` — **PASS**: 42 before and after, no `device lost`.
+5. M2 summary (T1..T8) present — **PASS**, below.
+6. only `docs/V100-results.md` changed on the branch — **PASS**
+   (`git diff --stat`: 1 file, append-only).
+7. entry self-contained (commit, driver, NVRTC, backend, command, mean
+   wording) — **PASS**, see the Window paragraph.
+
+### M2 summary (T1..T8)
+
+| task | issue / PR | headline measured result |
+| --- | --- | --- |
+| M2-T1 Volta tensor cores in the prefill GEMM | #24 / #25 (`3d1aa82`) | +123.6 % prefill @512, +90.7 % @4096 over the FMA fallback |
+| M2-T2 Volta tensor cores in prefill attention | #26 / #27 (`0273d6e`) | prefill 2795 tok/s @4096 (+171 % vs FMA), attention kernel -91 % |
+| M2-T3 shared-memory carveout and tile sizing | #28 / #29 (`a14d3e0`) | 96 KB dynamic limit validated on sm_70, occupancy/register report captured, no regression |
+| M2-T4 MoE expert residency and next-layer prefetch | #34 / #35 (`64d690e`) | 100 % hit rate, 0 worker/mailbox traffic, decode +1.0-1.2 % |
+| M2-T5 decode GEMV bandwidth | #30 / #31 (`b4d7408`) | 214.2 GB/s = 23.9 % of the 898.0 GB/s roofline, decode +3.2-3.3 % |
+| M2-T6 CUDA flags: KV q8, parallel, MTP | #32 / #33 (`54a0c1f`) | q8 halves KV at equal speed, `--serve --parallel 4` = 1.67x, MTP k=2 +64 % on the 27B |
+| M2-T7 cross-backend numerical consistency | #36 / #37 (`78dbbcd`) | CUDA 634/640 either-mode (2 near-tie positions from tensor-core summation order), Vulkan 629/640 (int8 GEMM, M3-T5) |
+| M2-T8 CUDA performance gate | #38 / #39 (`07e2cba`) | prefill @4096 2945.7 tok/s (met), decode 129.4/125.1/110.6 with a coordinator-approved revised target, no `Xid`, Vulkan prefill @4096 -0.4 % (M3-T4) |
+
+Net M2 effect, as recorded by the individual tasks: prefill @512 +123.6 % and
+@4096 +90.7 % from the Volta tensor cores (T1), a further prefill gain of
++171 % vs the FMA fallback path in attention (T2), decode +3.2-3.3 % from the
+GEMV rework (T5) and +1.0-1.2 % from residency (T4), with numerical parity held
+at 634/640 either-mode (T7). Both arms in this window were single-process, model
+fully resident, 0.0 µs/token of CPU worker cost on CUDA.
