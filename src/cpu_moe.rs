@@ -769,6 +769,9 @@ pub fn experts(m: &Model, il: usize, h: &[f32], sel: &[(usize, f32)]) -> Vec<f32
     let ds: Vec<Tensor> = sel.iter().map(|&(e, _)| down.expert(e, n)).collect();
     let mut o = vec![0f32; k * c.n_embd];
     batch_rows(&ds, &acts.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), &mut o);
+    for (j, &(e, _)) in sel.iter().enumerate() {
+        m.lora_delta(&format!("blk.{il}.ffn_down_exps.weight"), &acts[j], &mut o[j * c.n_embd..(j + 1) * c.n_embd], Some(e));
+    }
     for (oj, &(_, w)) in o.chunks_exact(c.n_embd).zip(sel) {
         for (yy, oo) in y.iter_mut().zip(oj) { *yy += w * oo; }
     }

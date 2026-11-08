@@ -6,10 +6,30 @@ use crate::gguf::Gguf;
 use crate::ops;
 use crate::weights::{Tensor, Weights};
 use anyhow::Context;
+use std::collections::HashMap;
+use std::path::Path;
+
+#[derive(Clone)]
+pub struct LoraEntry {
+    pub rank: usize,
+    pub in_dim: usize,
+    pub out_dim: usize,
+    pub n_expert: usize,
+    pub a: Vec<Vec<f32>>,
+    pub b: Vec<Vec<f32>>,
+}
+
+#[derive(Clone)]
+pub struct Lora {
+    pub scale: f32,
+    pub alpha: f32,
+    pub entries: HashMap<String, LoraEntry>,
+}
 
 pub struct Model<'a> {
     pub cfg: ModelConfig,
     pub w: Weights<'a>,
+    pub loras: Vec<Lora>,
     ple: Option<Ple>,
 }
 
@@ -72,7 +92,8 @@ fn mv(t: &Tensor, x: &[f32]) -> Vec<f32> {
 }
 
 impl<'a> Model<'a> {
-    pub fn load(g: &'a Gguf) -> anyhow::Result<Model<'a>> {
+    pub fn load(g: &'a Gguf) -> anyhow::Result<Model<'a>> { Self::load_with_lora(g, &[]) }
+    pub fn load_with_lora(g: &'a Gguf, loras: &[(String, f32)]) -> anyhow::Result<Model<'a>> {
         let mut cfg = ModelConfig::from_gguf(g)?;
         let w = Weights::new(g)?;
         if !w.validate(cfg.n_layer)? && cfg.n_nextn > 0 {
@@ -98,7 +119,42 @@ impl<'a> Model<'a> {
             w.get("output_norm.weight")?;
             None
         };
-        Ok(Model { cfg, w, ple })
+        let mut m = Model { cfg, w, loras: Vec::new(), ple };
+        m.apply_lora(loras)?;
+        Ok(m)
+    }
+
+    pub fn apply_lora(&mut self, specs: &[(String, f32)]) -> anyhow::Result<()> {
+        // Load everything before touching the current overlays, so a bad adapter leaves the model unchanged.
+        let loras: Vec<Lora> = specs.iter().map(|(path, scale)| load_lora(path, *scale)).collect::<anyhow::Result<_>>()?;
+        self.w.clear_baked();
+        self.loras = loras;
+        self.w.bake_lora(&self.loras);
+        Ok(())
+    }
+
+    pub fn lora_delta(&self, name: &str, x: &[f32], y: &mut [f32], expert: Option<usize>) {
+        for lora in &self.loras {
+            if let Some(e) = lora.entries.get(name) {
+                let ei = if e.n_expert == 1 { 0 } else { expert.unwrap_or(0) };
+                if ei >= e.n_expert && e.n_expert > 1 { continue; }
+                let a = &e.a[ei];
+                let b = &e.b[ei];
+                let rank = e.rank;
+                let in_dim = e.in_dim;
+                let out_dim = e.out_dim;
+                for r in 0..rank {
+                    let mut s = 0f32;
+                    for i in 0..in_dim {
+                        if i < x.len() { s += a[r * in_dim + i] * x[i]; }
+                    }
+                    let coef = if lora.alpha > 0.0 { lora.scale * lora.alpha / rank as f32 * s } else { lora.scale * s };
+                    for o in 0..out_dim {
+                        if o < y.len() { y[o] += coef * b[o * rank + r]; }
+                    }
+                }
+            }
+        }
     }
 
     fn t(&self, il: usize, suffix: &str) -> Tensor<'a> {
@@ -417,21 +473,25 @@ impl<'a> Model<'a> {
         mv(&self.t(il, "attn_output.weight"), &out)
     }
 
-    fn ffn(gate: &Tensor, up: &Tensor, down: &Tensor, h: &[f32]) -> Vec<f32> {
+    fn ffn(&self, il: usize, gate: &Tensor, up: &Tensor, down: &Tensor, down_name: &str, expert: Option<usize>, h: &[f32]) -> Vec<f32> {
         let mut a = mv(gate, h);
         for (x, u) in a.iter_mut().zip(mv(up, h)) { *x = ops::silu(*x) * u; }
-        mv(down, &a)
+        let mut y = mv(down, &a);
+        if down_name == "ffn_down_exps.weight" {
+            self.lora_delta(&format!("blk.{il}.{down_name}"), &a, &mut y, expert);
+        }
+        y
     }
 
     fn dense_ffn(&self, il: usize, h: &[f32]) -> Vec<f32> {
-        Self::ffn(&self.t(il, "ffn_gate.weight"), &self.t(il, "ffn_up.weight"), &self.t(il, "ffn_down.weight"), h)
+        self.ffn(il, &self.t(il, "ffn_gate.weight"), &self.t(il, "ffn_up.weight"), &self.t(il, "ffn_down.weight"), "ffn_down.weight", None, h)
     }
 
     fn moe(&self, il: usize, h: &[f32]) -> Vec<f32> {
         let mut y = self.routed_experts(il, h);
         if let Ok(sg) = self.w.layer(il, "ffn_gate_inp_shexp.weight") {
             let s = ops::sigmoid(mv(&sg, h)[0]);
-            let o = Self::ffn(&self.t(il, "ffn_gate_shexp.weight"), &self.t(il, "ffn_up_shexp.weight"), &self.t(il, "ffn_down_shexp.weight"), h);
+            let o = self.ffn(il, &self.t(il, "ffn_gate_shexp.weight"), &self.t(il, "ffn_up_shexp.weight"), &self.t(il, "ffn_down_shexp.weight"), "ffn_down_shexp.weight", Some(0), h);
             for (a, b) in y.iter_mut().zip(o) { *a += s * b; }
         }
         y
@@ -455,9 +515,105 @@ impl<'a> Model<'a> {
         let n = self.cfg.n_expert;
         let mut y = vec![0f32; self.cfg.n_embd];
         for (e, w) in self.route(il, h) {
-            let o = Self::ffn(&gate.expert(e, n), &up.expert(e, n), &down.expert(e, n), h);
+            let o = self.ffn(il, &gate.expert(e, n), &up.expert(e, n), &down.expert(e, n), "ffn_down_exps.weight", Some(e), h);
             for (a, b) in y.iter_mut().zip(o) { *a += w * b; }
         }
         y
+    }
+}
+
+
+pub fn load_lora(path: &str, scale: f32) -> anyhow::Result<Lora> {
+    use crate::quant::GgmlType;
+    use crate::weights::Tensor;
+    anyhow::ensure!(scale.is_finite(), "lora: {path}: scale must be finite");
+    let g = Gguf::open(Path::new(path))?;
+    let alpha = g.meta.get("adapter.lora.alpha").and_then(|v| v.as_f32()).unwrap_or(0.0);
+    let mut bases = std::collections::BTreeSet::new();
+    for name in g.tensors.keys() {
+        if let Some(b) = name.strip_suffix(".lora_a") { bases.insert(b.to_string()); }
+        if let Some(b) = name.strip_suffix(".lora_b") { bases.insert(b.to_string()); }
+    }
+    let mut entries = HashMap::new();
+    for base in bases {
+        let a_info = g.tensors.get(&format!("{base}.lora_a")).context("missing lora_a")?;
+        let b_info = g.tensors.get(&format!("{base}.lora_b")).context("missing lora_b")?;
+        let a_t = Tensor { ty: GgmlType::from_u32(a_info.ty)?, cols: a_info.dims[0] as usize, rows: a_info.dims[1..].iter().product::<u64>() as usize, data: g.bytes(a_info) };
+        let b_t = Tensor { ty: GgmlType::from_u32(b_info.ty)?, cols: b_info.dims[0] as usize, rows: b_info.dims[1..].iter().product::<u64>() as usize, data: g.bytes(b_info) };
+        let a_flat = a_t.to_f32();
+        let b_flat = b_t.to_f32();
+        let a_dims = &a_info.dims;
+        let b_dims = &b_info.dims;
+        anyhow::ensure!(a_dims.len() >= 2 && b_dims.len() >= 2, "lora: {base}: rank or dimensions missing");
+        let in_dim = a_dims[0] as usize;
+        let rank = a_dims[1] as usize;
+        let n_expert = *a_dims.get(2).unwrap_or(&1) as usize;
+        let out_dim = b_dims[1] as usize;
+        anyhow::ensure!(rank > 0 && in_dim > 0 && out_dim > 0 && n_expert > 0, "lora: {base}: empty dimension");
+        anyhow::ensure!(b_dims[0] as usize == rank, "lora: {base}: lora_b rank {} != lora_a rank {rank}", b_dims[0]);
+        anyhow::ensure!(*b_dims.get(2).unwrap_or(&1) as usize == n_expert, "lora: {base}: expert count differs between lora_a and lora_b");
+        anyhow::ensure!(a_flat.len() >= n_expert * rank * in_dim, "lora: {base}: truncated lora_a");
+        anyhow::ensure!(b_flat.len() >= n_expert * out_dim * rank, "lora: {base}: truncated lora_b");
+        let mut a_experts = vec![vec![0f32; rank * in_dim]; n_expert];
+        let mut b_experts = vec![vec![0f32; out_dim * rank]; n_expert];
+        for e in 0..n_expert {
+            for r in 0..rank {
+                for i in 0..in_dim {
+                    a_experts[e][r * in_dim + i] = a_flat[(r + e * rank) * in_dim + i];
+                }
+                for o in 0..out_dim {
+                    b_experts[e][o * rank + r] = b_flat[(o + e * out_dim) * rank + r];
+                }
+            }
+        }
+        entries.insert(base, LoraEntry { rank, in_dim, out_dim, n_expert, a: a_experts, b: b_experts });
+    }
+    Ok(Lora { scale, alpha, entries })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn w_str(b: &mut Vec<u8>, s: &str) { b.extend((s.len() as u64).to_le_bytes()); b.extend(s.as_bytes()); }
+
+    fn tiny_adapter(tag: &str) -> std::path::PathBuf {
+        let (in_dim, rank, out_dim) = (4u64, 2u64, 3u64);
+        let (mut b, mut off) = (Vec::new(), 0u64);
+        b.extend(b"GGUF");
+        b.extend(3u32.to_le_bytes());
+        b.extend(2u64.to_le_bytes());
+        b.extend(1u64.to_le_bytes());
+        w_str(&mut b, "adapter.lora.alpha");
+        b.extend(6u32.to_le_bytes());
+        b.extend(2.0f32.to_le_bytes());
+        for (name, dims) in [("blk.0.ffn_down_exps.weight.lora_a", [in_dim, rank, 1]), ("blk.0.ffn_down_exps.weight.lora_b", [rank, out_dim, 1])] {
+            w_str(&mut b, name);
+            b.extend(3u32.to_le_bytes());
+            for d in dims { b.extend(d.to_le_bytes()); }
+            b.extend(0u32.to_le_bytes());  // F32
+            b.extend(off.to_le_bytes());
+            off += (dims[0] * dims[1] * dims[2] * 4).next_multiple_of(32);
+        }
+        while b.len() % 32 != 0 { b.push(0); }
+        let a: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let w: Vec<f32> = (0..6).map(|i| 10.0 + i as f32).collect();
+        b.extend(a.iter().flat_map(|f| f.to_le_bytes()));
+        b.extend(w.iter().flat_map(|f| f.to_le_bytes()));
+        let p = std::env::temp_dir().join(format!("strata-lora-{}-{tag}.gguf", std::process::id()));
+        std::fs::write(&p, &b).unwrap();
+        p
+    }
+
+    #[test]
+    fn load_lora_adapter() {
+        let p = tiny_adapter("parse");
+        let l = load_lora(p.to_str().unwrap(), 0.5).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert_eq!((l.scale, l.alpha), (0.5, 2.0));
+        let e = &l.entries["blk.0.ffn_down_exps.weight"];
+        assert_eq!((e.rank, e.in_dim, e.out_dim, e.n_expert), (2, 4, 3, 1));
+        assert_eq!(e.a[0], (0..8).map(|i| i as f32).collect::<Vec<_>>());
+        assert_eq!(e.b[0], (0..6).map(|i| 10.0 + i as f32).collect::<Vec<_>>());
     }
 }
