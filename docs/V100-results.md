@@ -1033,3 +1033,493 @@ nvidia-smi --query-gpu=...    # 0 MiB used, 47 C, 0 % utilisation at the end
 No `Xid`, no `device lost`, no trap. One `serve` process from the parallel test was still listening after
 the wrapper shell was signalled; it was sent SIGTERM and the GPU returned to 0 MiB before the Xid/`nvidia-smi`
 reading above. `llama.router.service` was left **stopped** for the coordinator.
+
+## 2026-11-08 — Cross-backend numerical consistency (M2-T7, CPU part)
+
+Issue #36, branch `task/36-cuda-consistency-report`, base `v100` after M2-T6. This block is the CPU
+half of the report: the reproducible comparison script, the legitimate-difference registry and the
+dry run that reproduces the documented 9/640 on the **pre-M2** artifacts. The M2-build numbers
+(per-op, parity, attribution arms, KLD) are appended in the GPU-window section right below, same
+heading, same artifacts.
+
+### The comparison script
+
+`tools/consistency.py` (new, no GPU, no model, no network) turns two `target/parity-result-<tag>.json`
+files into `docs/parity/cross-backend.json` plus the markdown rows of this section:
+
+- end-to-end: strict/either per backend, the cross-backend divergence count and its classification
+  (CUDA-only correct, Vulkan-only correct, both wrong);
+- the divergence list: prompt, position, both backends' token id, the llama.cpp reference token, the
+  one-batch llama.cpp token, each backend's top-5 gap at that position when the artifact carries
+  `top5` (recorded from this change on, `tools/parity.py`), and the registry entry that explains it;
+- the per-op table, aggregated from the `--nocapture` logs of `tests/kernels.rs`,
+  `tests/llama_numerics.rs` and `tests/kv_q8.rs` (`--kernels`), with CUDA-vs-CPU, Vulkan-vs-CPU and
+  CUDA-vs-Vulkan columns; measurement lines that no pattern matches are listed in
+  `per_op_unparsed` instead of being dropped;
+- attribution arms (`--arm name=file`) compared against the CUDA artifact: how many of the base
+  divergences an arm resolves and how many it leaves;
+- full-vocabulary KLD from two `perplexity --kld-base` dumps (`--kld`), pure Python (no numpy on
+  this host), computing mean/max KLD, RMS Δp, top-1 agreement and Σp as a normalization check;
+- exit 1 if any divergence is unexplained. The committed summary has no full-vocabulary arrays: no
+  640-position `argmax` and no per-position logprobs. The only arrays are the five `(token, logprob)`
+  pairs at each divergent position, for both backends (7 positions × 2 × 5 in the M2 run) — the
+  evidence the report needs for the top-5 gaps, not a logits dump.
+
+### Dry run on the pre-M2 artifacts (history, not current evidence)
+
+```
+python3 -I tools/consistency.py \
+  --cuda   target/parity-result-cuda-sm70.json \
+  --vulkan target/parity-result-vk-sm70.json \
+  --cuda-tag cuda-sm70 --vulkan-tag vk-sm70 --status pre-m2 \
+  --out docs/parity/cross-backend.json     # exit 0
+```
+
+The CUDA artifact is from the M1 build `ae95739`, the Vulkan one from M0 `d6c2beb`: this run only
+proves the comparison reproduces the known 9/640 and that the registry covers it. It is **not**
+evidence about the M2 build.
+
+| backend | tag | strict | either | divergent vs the other backend |
+| --- | --- | ---: | ---: | ---: |
+| CUDA sm_70 | `cuda-sm70` (M1 `ae95739`) | 630/640 (98.44 %) | 636/640 (99.38 %) | 9 of 640 (1.41 %) |
+| Vulkan sm_70 | `vk-sm70` (M0 `d6c2beb`) | 625/640 (97.66 %) | 629/640 (98.28 %) | same positions |
+
+- CUDA matches the reference and Vulkan does not: 7 positions.
+- Vulkan matches the reference and CUDA does not: 2 positions (both are also the one-batch
+  llama.cpp token: a near-tie where llama.cpp's own two modes disagree).
+- both miss the reference: 0. unexplained: 0.
+- top-5 gaps: `n/a` in these artifacts, they predate the `top5` field; the M2 run fills them.
+
+### Divergent positions (pre-M2 dry run)
+
+| # | prompt | pos | CUDA | Vulkan | reference | llama one-batch | explained by |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 12 | A train leaves at 9:15 and travels 180 km at 72 km | 5 | 314 | 11 | 11 | 314 | `either-mode-ambiguity` |
+| 16 | What license terms apply here? Summarize: | 0 | 27775 | 760 | 27775 | 27775 | `gemm-int8-vs-f16` |
+| 16 | What license terms apply here? Summarize: | 23 | 3665 | 4530 | 3665 | 3665 | `gemm-int8-vs-f16` |
+| 17 | Find the error in this log: | 8 | 29269 | 12662 | 29269 | 29269 | `gemm-int8-vs-f16` |
+| 17 | Find the error in this log: | 13 | 8240 | 332 | 332 | 8240 | `either-mode-ambiguity` |
+| 17 | Find the error in this log: | 16 | 4490 | 1412 | 4490 | 4490 | `gemm-int8-vs-f16` |
+| 18 | Which of these cities is the largest by population | 30 | 364 | 12041 | 364 | 364 | `gemm-int8-vs-f16` |
+| 19 | List the keys whose value is false: | 0 | 27775 | 760 | 27775 | 27775 | `gemm-int8-vs-f16` |
+| 19 | List the keys whose value is false: | 3 | 4566 | 3766 | 4566 | 4566 | `gemm-int8-vs-f16` |
+
+This is the list first summarized from prose in the M1-T8 block above, now machine-generated. Seven
+positions are Vulkan-only misses that CUDA resolves; two are positions where llama.cpp's own
+token-by-token and one-batch runs disagree and the backends split across the tie.
+
+### End-to-end on the M2 build
+
+Both backends re-run on this build (`8200a75`, `v100` + this PR's tools/docs only) with the same
+cached reference (`target/parity-ref.json`, sha256 `0c30267c…`, unchanged; `target/llama-batch-argmax.json`,
+sha256 `ba5e28ac…`):
+
+```
+python3 -I tools/parity.py "$M" --extra "--gpu --backend cuda   --llama-numerics --fixed-experts" --tag m2-cuda-sm70
+python3 -I tools/parity.py "$M" --extra "--gpu --backend vulkan --llama-numerics --fixed-experts" --tag m2-vk-sm70
+STRATA_MMQ=      python3 -I tools/parity.py "$M" --extra "--gpu --backend vulkan --llama-numerics --fixed-experts" --tag m2-vk-sm70-f16
+STRATA_GEMM_FMA=1 python3 -I tools/parity.py "$M" --extra "--gpu --backend cuda   --llama-numerics --fixed-experts" --tag m2-cuda-sm70-fma
+```
+
+CUDA takes **628/640 strict, 634/640 either** (98.12 % / 99.06 %): **2 positions below the M1
+figures** (630/636, `ae95739`). Vulkan takes **625/640 strict, 629/640 either** (97.66 % /
+98.28 %), bit-identical to the M0 baseline (`d6c2beb`), exit 1 as `tools/parity.py:140` designs for
+Vulkan. The CUDA drop is the M2 tensor-core path and is isolated by the arms below; it is a measured
+regression against the M1 parity record and is reported here, not hidden. M2-T8 is gated on this
+report and must weigh it.
+
+| backend | tag | strict | either | divergent vs the other backend |
+| --- | --- | ---: | ---: | ---: |
+| CUDA sm_70 | `m2-cuda-sm70` | 628/640 (98.12 %) | 634/640 (99.06 %) | 7 of 640 (1.09 %) |
+| Vulkan sm_70 | `m2-vk-sm70` | 625/640 (97.66 %) | 629/640 (98.28 %) | same positions |
+
+- CUDA matches the reference and Vulkan does not: 5
+- Vulkan matches the reference and CUDA does not: 2
+- both miss the reference: 0
+- unexplained: 0
+
+### Divergent positions
+
+| # | prompt | pos | CUDA | Vulkan | reference | alt | explained by | CUDA top-5 gap | Vulkan top-5 gap |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| 12 | A train leaves at 9:15 and travels 180 km at 72 km | 5 | 314 | 11 | 11 | 314 | `either-mode-ambiguity` | 0.08893 | 0.2579 |
+| 16 | What license terms apply here? Summarize: | 0 | 27775 | 760 | 27775 | 27775 | `gemm-int8-vs-f16` | 0.3123 | 0.0319 |
+| 16 | What license terms apply here? Summarize: | 23 | 3665 | 4530 | 3665 | 3665 | `gemm-int8-vs-f16` | 0.5384 | 0.4321 |
+| 17 | Find the error in this log: | 13 | 8240 | 332 | 332 | 8240 | `either-mode-ambiguity` | 0.03493 | 0.02267 |
+| 17 | Find the error in this log: | 16 | 4490 | 1412 | 4490 | 4490 | `no-coop-matrices` | 0.2655 | 0.2728 |
+| 18 | Which of these cities is the largest by population | 30 | 364 | 12041 | 364 | 364 | `gemm-int8-vs-f16` | 0.249 | 0.1016 |
+| 19 | List the keys whose value is false: | 3 | 4566 | 3766 | 4566 | 4566 | `gemm-int8-vs-f16` | 0.2722 | 0.2307 |
+
+### Attribution arms
+
+| arm | file | strict | either | divergent vs CUDA | base divergences resolved | still divergent |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `f16` | `target/parity-result-m2-vk-sm70-f16.json` | 629/640 | 635/640 | 3 | 6 | 3 |
+| `cuda-fma` | `target/parity-result-m2-cuda-sm70-fma.json` | 630/640 | 636/640 | 2 | 7 | 2 |
+
+**Attribution**
+
+- The CUDA M2 artifact differs from the M1 artifact at exactly **2 positions**: prompt 17 pos 8
+  (29269 → 12662) and prompt 19 pos 0 (27775 → 760). The `STRATA_GEMM_FMA=1` arm reproduces the M1
+  artifact **bit for bit** (0 differing positions, 630/636): the move is the `mma.sync.m8n8k4`
+  summation order of M2-T1/M2-T2, not a kernel error. Both positions are near-ties (CUDA top-2 gaps
+  at 17/8 = 0.1714, at 19/0 = 0.0642).
+- The Vulkan `STRATA_MMQ=` (empty, f16 GEMM) arm moves **8 positions** and reaches **629/640 strict,
+  635/640 either** (up from 625/629). It resolves **6 of the 7** cross-backend divergences, so those
+  six are the int8 GEMM path, not attention or the KV cache (M3-T5's hypothesis, now measured). It
+  leaves **3** divergences:
+  - prompt 17 pos 16 **persists**: the f16 Vulkan GEMM still picks 1412 where CUDA and the reference
+    take 4490. The arm refutes `gemm-int8-vs-f16` for this position: it is the same-math reduction
+    order of a f16 GEMM without cooperative matrices, so it is attributed to `no-coop-matrices`
+    (M3-T5) instead.
+  - prompt 17 pos 8 and prompt 19 pos 0 become divergences **in the opposite direction**: the f16
+    Vulkan GEMM is on the reference there and the M2 CUDA tensor-core path is not (the two positions
+    isolated by the FMA arm above).
+- Where the table below shows `0 bits`, the kernels are bit-identical across backends (decode
+  attention, DeltaNet, KV store, dequant, GEMV); the end-to-end differences are GEMM arithmetic only.
+  MoE combine, conv, router top-k, norm/rope/gate and swiglu/add are assert-only in the tests, so
+  they carry measurement-only lines added by this PR (see the per-op table): they are bit-identical
+  across backends except one bit of `ssm_gates_g` (see the highlights).
+
+### Per-op table (M2 build)
+
+`STRATA_MODEL=$M STRATA_TEST_BACKENDS=cuda,vulkan cargo test --release --test kernels -- --nocapture
+--test-threads=1` (23 passed, 4 ignored, 11.97 s), the same for `llama_numerics` (1 passed, 48.29 s)
+and `kv_q8` (2 passed, 4.03 s); `grep -c "SKIP: cuda"` = 0, `grep -c "SKIP: model file missing"` = 0
+in both logs, `per_op_unparsed` = 0.
+
+The assert-only tests now print measurement lines (`op <op> <backend> [<case>]: rel err vs CPU …,
+<n> of <m> differ from the first backend`), added by this PR without changing an assertion: MoE GEMV,
+conv (`conv_seq`, `conv_state`, `conv_silu+l2_norm`), MoE combine, `rms_norm`/`l2_norm`/`rope_neox`/
+`norm_gate`/`ssm_gates`, router top-k and `swiglu`/`add` now have rows for both backends.
+
+Caveat: in a single kernels process Vulkan stops enumerating after ~20 backend instantiations
+(`no usable Vulkan device 0 (… llvmpipe …)`). `router_topk_matches_ops_top_k`,
+`ssm_gates_match_across_backends` and `vulkan_type_matrix` therefore ran CUDA-only in the full log and
+were rerun in a fresh process (`cargo test --test kernels -- --nocapture --test-threads=1 router_topk
+ssm_gates_match_across_backends`, 0.69 s): `router_topk` now has both backends, `ssm_gates` prints no
+`op` line (it is still assert-only, cross-backend bit equality), and `vulkan_type_matrix` is M0-T5
+territory and not re-recorded here. No `Xid`, GPU 0 MiB.
+
+**add**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `n 1000, not a block multiple` | L2 6.03e-09 | L2 6.03e-09 | 0 bits | — |
+
+**attn_decode**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `pos 0 nh 24 nkv 2 hd 256 gq_min 0` | L2 8.69e-08 | L2 8.69e-08 | 0 bits | `same-kernel (bit-exact)` |
+| `pos 0 nh 24 nkv 2 hd 256 gq_min 2048` | L2 8.69e-08 | L2 8.69e-08 | 0 bits | `same-kernel (bit-exact)` |
+| `pos 1000 nh 16 nkv 2 hd 256 gq_min 0` | L2 1.28e-07 | L2 1.28e-07 | 0 bits | `same-kernel (bit-exact)` |
+| `pos 1000 nh 16 nkv 2 hd 256 gq_min 2048` | L2 1.09e-07 | L2 1.09e-07 | 0 bits | `same-kernel (bit-exact)` |
+| `pos 2100 nh 32 nkv 8 hd 128 gq_min 0` | L2 1.38e-07 | L2 1.38e-07 | 0 bits | `same-kernel (bit-exact)` |
+| `pos 2100 nh 32 nkv 8 hd 128 gq_min 2048` | L2 1.38e-07 | L2 1.38e-07 | 0 bits | `same-kernel (bit-exact)` |
+| `pos 5 nh 16 nkv 2 hd 256 gq_min 0` | L2 9.74e-08 | L2 9.74e-08 | 0 bits | `same-kernel (bit-exact)` |
+| `pos 5 nh 16 nkv 2 hd 256 gq_min 2048` | L2 9.74e-08 | L2 9.74e-08 | 0 bits | `same-kernel (bit-exact)` |
+| `pos 5 nh 32 nkv 8 hd 128 gq_min 0` | L2 9.65e-08 | L2 9.65e-08 | 0 bits | `same-kernel (bit-exact)` |
+| `pos 5 nh 32 nkv 8 hd 128 gq_min 2048` | L2 9.65e-08 | L2 9.65e-08 | 0 bits | `same-kernel (bit-exact)` |
+| `pos 5 nh 4 nkv 2 hd 128 gq_min 0` | L2 1.04e-07 | L2 1.04e-07 | 0 bits | `same-kernel (bit-exact)` |
+| `pos 5 nh 4 nkv 2 hd 128 gq_min 2048` | L2 1.04e-07 | L2 1.04e-07 | 0 bits | `same-kernel (bit-exact)` |
+| `pos 5 nh 4 nkv 2 hd 256 gq_min 0` | L2 9.91e-08 | L2 9.91e-08 | 0 bits | `same-kernel (bit-exact)` |
+| `pos 5 nh 4 nkv 2 hd 256 gq_min 2048` | L2 9.91e-08 | L2 9.91e-08 | 0 bits | `same-kernel (bit-exact)` |
+| `pos 5 nh 4 nkv 2 hd 64 gq_min 0` | L2 9.56e-08 | L2 9.56e-08 | 0 bits | `same-kernel (bit-exact)` |
+| `pos 5 nh 4 nkv 2 hd 64 gq_min 2048` | L2 9.56e-08 | L2 9.56e-08 | 0 bits | `same-kernel (bit-exact)` |
+| `pos 5 nh 8 nkv 8 hd 128 gq_min 0` | L2 1.06e-07 | L2 1.06e-07 | 0 bits | `same-kernel (bit-exact)` |
+| `pos 5 nh 8 nkv 8 hd 128 gq_min 2048` | L2 1.06e-07 | L2 1.06e-07 | 0 bits | `same-kernel (bit-exact)` |
+
+**attn_prefill**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `pos 0 nh 24 nkv 2 hd 256` | n/a | n/a | L2 6.14e-05 | `summation-order` |
+| `pos 1000 nh 16 nkv 2 hd 256` | n/a | n/a | L2 3.52e-05 | `summation-order` |
+| `pos 2100 nh 32 nkv 8 hd 128` | n/a | n/a | L2 3.02e-05 | `summation-order` |
+| `pos 5 nh 16 nkv 2 hd 256` | n/a | n/a | L2 6.11e-05 | `summation-order` |
+| `pos 5 nh 32 nkv 8 hd 128` | n/a | n/a | L2 6.24e-05 | `summation-order` |
+| `pos 5 nh 4 nkv 2 hd 128` | n/a | n/a | L2 7.26e-05 | `summation-order` |
+| `pos 5 nh 4 nkv 2 hd 256` | n/a | n/a | L2 6.37e-05 | `summation-order` |
+| `pos 5 nh 4 nkv 2 hd 64` | n/a | n/a | L2 6.42e-05 | `summation-order` |
+| `pos 5 nh 8 nkv 8 hd 128` | n/a | n/a | L2 6.13e-05 | `summation-order` |
+
+**attn_prefill_vs_decode**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `hd 128 nh 32 nkv 8 gq_min 0` | L2 2.98e-05 | L2 1.36e-06 | n/a | — |
+| `hd 128 nh 32 nkv 8 gq_min 2048` | L2 2.98e-05 | L2 1.36e-06 | n/a | — |
+| `hd 128 nh 4 nkv 2 gq_min 0` | L2 7.26e-05 | L2 2.45e-07 | n/a | — |
+| `hd 128 nh 4 nkv 2 gq_min 2048` | L2 7.26e-05 | L2 2.45e-07 | n/a | — |
+| `hd 128 nh 8 nkv 8 gq_min 0` | L2 6.13e-05 | L2 2.68e-07 | n/a | — |
+| `hd 128 nh 8 nkv 8 gq_min 2048` | L2 6.13e-05 | L2 2.68e-07 | n/a | — |
+| `hd 256 nh 16 nkv 2 gq_min 0` | L2 3.51e-05 | L2 4.42e-07 | n/a | — |
+| `hd 256 nh 16 nkv 2 gq_min 2048` | L2 3.51e-05 | L2 4.28e-07 | n/a | — |
+| `hd 256 nh 24 nkv 2 gq_min 0` | L2 6.14e-05 | L2 1.21e-07 | n/a | — |
+| `hd 256 nh 24 nkv 2 gq_min 2048` | L2 6.14e-05 | L2 1.21e-07 | n/a | — |
+| `hd 256 nh 4 nkv 2 gq_min 0` | L2 6.37e-05 | L2 1.95e-07 | n/a | — |
+| `hd 256 nh 4 nkv 2 gq_min 2048` | L2 6.37e-05 | L2 1.95e-07 | n/a | — |
+| `hd 64 nh 4 nkv 2 gq_min 0` | L2 6.42e-05 | L2 2.22e-07 | n/a | — |
+| `hd 64 nh 4 nkv 2 gq_min 2048` | L2 6.42e-05 | L2 2.22e-07 | n/a | — |
+
+**conv**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `ch 300 kw 4, 2 steps` | L2 5.49e-08 | L2 5.49e-08 | 0 bits | `summation-order` |
+
+**conv_l2_norm**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `ch 424 kw 4` | n/a | n/a | 0 bits | `summation-order` |
+
+**conv_seq**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `T 10 ch 96 kw 4` | n/a | n/a | 0 bits | `summation-order` |
+
+**conv_state**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `ch 300 kw 4, 2 steps` | L2 0.00e+00 | L2 0.00e+00 | 0 bits | `summation-order` |
+
+**deltanet**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `ilv false` | L2 1.96e-07 | L2 1.96e-07 | 0 bits | `same-kernel (bit-exact)` |
+| `ilv true` | L2 2.02e-07 | L2 2.02e-07 | 0 bits | `same-kernel (bit-exact)` |
+
+**dequant+gemv**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `F32 blk.0.ffn_gate_inp.weight` | L2 7.17e-07 / max 0.00e+00 | L2 7.17e-07 / max 0.00e+00 | n/a | — |
+| `IQ2_XS blk.0.ffn_gate_exps.weight` | L2 8.18e-07 / max 0.00e+00 | L2 8.18e-07 / max 0.00e+00 | n/a | — |
+| `IQ3_XXS blk.0.ffn_down_exps.weight` | L2 4.13e-07 / max 0.00e+00 | L2 4.13e-07 / max 0.00e+00 | n/a | — |
+| `IQ4_XS blk.1.ffn_down_exps.weight` | L2 4.12e-07 / max 0.00e+00 | L2 4.12e-07 / max 0.00e+00 | n/a | — |
+| `Q4_K output.weight` | L2 8.16e-07 / max 0.00e+00 | L2 8.16e-07 / max 0.00e+00 | n/a | — |
+| `Q5_K blk.0.attn_gate.weight` | L2 8.36e-07 / max 0.00e+00 | L2 8.36e-07 / max 0.00e+00 | n/a | — |
+| `Q6_K blk.0.ffn_down_shexp.weight` | L2 4.19e-07 / max 0.00e+00 | L2 4.19e-07 / max 0.00e+00 | n/a | — |
+| `Q8_0 blk.1.ffn_down_shexp.weight` | L2 4.19e-07 / max 0.00e+00 | L2 4.19e-07 / max 0.00e+00 | n/a | — |
+
+**gemm**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `F32 blk.0.ffn_gate_inp.weight` | L2 4.87e-07 | L2 0.00e+00 | n/a | — |
+| `F32 blk.0.ffn_gate_inp.weight [different f16 input conversion]` | n/a | n/a | L2 4.79e-05 | `f16-round-vs-trunc` |
+| `IQ2_XS blk.0.ffn_gate_exps.weight` | L2 8.95e-07 | L2 0.00e+00 | n/a | — |
+| `IQ2_XS blk.0.ffn_gate_exps.weight [different f16 input conversion]` | n/a | n/a | L2 5.41e-04 | `f16-round-vs-trunc` |
+| `IQ3_XXS blk.0.ffn_down_exps.weight` | L2 6.31e-07 | L2 4.02e-07 | n/a | — |
+| `IQ3_XXS blk.0.ffn_down_exps.weight [different GEMM math]` | n/a | n/a | L2 3.51e-03 | `gemm-int8-vs-f16` |
+| `IQ4_XS blk.1.ffn_down_exps.weight` | L2 6.42e-07 | L2 4.39e-07 | n/a | — |
+| `IQ4_XS blk.1.ffn_down_exps.weight [different GEMM math]` | n/a | n/a | L2 4.08e-03 | `gemm-int8-vs-f16` |
+| `Q4_K output.weight` | L2 9.13e-07 | L2 7.71e-07 | n/a | — |
+| `Q4_K output.weight [different GEMM math]` | n/a | n/a | L2 3.17e-03 | `gemm-int8-vs-f16` |
+| `Q5_K blk.0.attn_gate.weight` | L2 9.58e-07 | L2 8.16e-07 | n/a | — |
+| `Q5_K blk.0.attn_gate.weight [different GEMM math]` | n/a | n/a | L2 3.32e-03 | `gemm-int8-vs-f16` |
+| `Q6_K blk.0.ffn_down_shexp.weight` | L2 6.47e-07 | L2 4.12e-07 | n/a | — |
+| `Q6_K blk.0.ffn_down_shexp.weight [different GEMM math]` | n/a | n/a | L2 3.78e-03 | `gemm-int8-vs-f16` |
+| `Q8_0 blk.1.ffn_down_shexp.weight` | L2 6.01e-07 | L2 4.12e-07 | n/a | — |
+| `Q8_0 blk.1.ffn_down_shexp.weight [different GEMM math]` | n/a | n/a | L2 3.60e-03 | `gemm-int8-vs-f16` |
+
+**gemm_dense**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `dense 4096` | L2 5.56e-06 | L2 6.92e-07 | n/a | — |
+
+**l2_norm**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `128 x 2 per token, 3 tokens` | L2 5.89e-09 | L2 5.89e-09 | 0 bits | — |
+
+**moe_combine**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `shared false` | L2 3.71e-08 | L2 3.71e-08 | 0 bits | `expert-slot-layout` |
+| `shared true` | L2 4.45e-08 | L2 4.45e-08 | 0 bits | `expert-slot-layout` |
+
+**moe_gemv**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `3 experts 512x2048 IQ2_XS` | L2 8.86e-07 | L2 8.86e-07 | 0 bits | `expert-slot-layout` |
+
+**norm_gate**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `4 heads of 128` | L2 4.31e-08 | L2 4.31e-08 | 0 bits | — |
+
+**rms_norm**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `2048 x 3 rows` | L2 4.30e-07 | L2 4.30e-07 | 0 bits | — |
+
+**rope_neox**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `hd 128, 64 rotated, pos 30000` | L2 2.52e-08 | L2 2.52e-08 | 0 bits | — |
+
+**router_topk**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `n 256 k 8 t 3` | max 1.19e-07 | max 1.19e-07 | 0 bits | — |
+
+**ssm_gates**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `beta, 3 tokens of 5 heads` | L2 3.00e-08 | L2 3.00e-08 | 0 bits | `summation-order` |
+
+**ssm_gates_g**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `g, 3 tokens of 5 heads` | L2 1.44e-10 | L2 1.44e-10 | 1 bits | `summation-order` |
+
+**swiglu**
+
+| case / shape | CUDA vs CPU | Vulkan vs CPU | CUDA vs Vulkan | explained by |
+| --- | ---: | ---: | ---: | --- |
+| `n 1000, not a block multiple` | L2 4.24e-09 | L2 4.24e-09 | 0 bits | — |
+
+**Other measurements** (comparisons that are not CUDA/Vulkan vs the CPU reference)
+
+| op | case / shape | comparison | value |
+| --- | --- | --- | --- |
+| attn_decode_llama | `n_pos 1400 gq_min 0` | llama_vs_cpu | L2 1.45e-05 |
+| attn_decode_llama | `n_pos 1400 gq_min 0` | default_vs_cpu | L2 6.23e-04 |
+| attn_decode_llama | `n_pos 1400 gq_min 2048` | llama_vs_cpu | L2 1.45e-05 |
+| attn_decode_llama | `n_pos 1400 gq_min 2048` | default_vs_cpu | L2 6.23e-04 |
+| attn_decode_llama | `n_pos 300 gq_min 0` | llama_vs_cpu | L2 2.94e-05 |
+| attn_decode_llama | `n_pos 300 gq_min 0` | default_vs_cpu | L2 6.19e-04 |
+| attn_decode_llama | `n_pos 300 gq_min 2048` | llama_vs_cpu | L2 2.94e-05 |
+| attn_decode_llama | `n_pos 300 gq_min 2048` | default_vs_cpu | L2 6.19e-04 |
+| attn_decode_llama | `n_pos 511 gq_min 0` | llama_vs_cpu | L2 2.96e-05 |
+| attn_decode_llama | `n_pos 511 gq_min 0` | default_vs_cpu | L2 6.22e-04 |
+| attn_decode_llama | `n_pos 511 gq_min 2048` | llama_vs_cpu | L2 2.96e-05 |
+| attn_decode_llama | `n_pos 511 gq_min 2048` | default_vs_cpu | L2 6.22e-04 |
+| attn_decode_llama | `n_pos 512 gq_min 0` | llama_vs_cpu | L2 2.96e-05 |
+| attn_decode_llama | `n_pos 512 gq_min 0` | default_vs_cpu | L2 6.23e-04 |
+| attn_decode_llama | `n_pos 512 gq_min 2048` | llama_vs_cpu | L2 2.96e-05 |
+| attn_decode_llama | `n_pos 512 gq_min 2048` | default_vs_cpu | L2 6.23e-04 |
+| attn_decode_llama | `n_pos 7 gq_min 0` | llama_vs_cpu | L2 5.10e-05 |
+| attn_decode_llama | `n_pos 7 gq_min 0` | default_vs_cpu | L2 3.32e-04 |
+| attn_decode_llama | `n_pos 7 gq_min 2048` | llama_vs_cpu | L2 5.10e-05 |
+| attn_decode_llama | `n_pos 7 gq_min 2048` | default_vs_cpu | L2 3.32e-04 |
+| attn_prefill_llama | `hd 128` | llama_vs_cpu | L2 2.39e-07 |
+| attn_prefill_llama | `hd 128` | default_vs_cpu | L2 7.26e-05 |
+| attn_prefill_llama | `hd 256` | llama_vs_cpu | L2 1.73e-07 |
+| attn_prefill_llama | `hd 256` | default_vs_cpu | L2 6.11e-05 |
+| attn_prefill_llama | `hd 64` | llama_vs_cpu | L2 2.18e-07 |
+| attn_prefill_llama | `hd 64` | default_vs_cpu | L2 6.42e-05 |
+
+### Per-op highlights
+
+- dequant is **bit-exact** on every type on both backends (`max 0.00e+00` against the CPU reference);
+  GEMV vs CPU is **4.12e-7 … 8.36e-7** on both backends (identical figures: the GEMV outputs are the
+  same bits), GEMM vs CPU is 4.0e-7 … 9.6e-7.
+- GEMM across backends: the Q4_K … IQ4_XS int8-vs-f16 rows are 3.17e-3 … 4.08e-3 and the
+  f16-conversion rows 4.79e-5 (F32) and 5.41e-4 (IQ2_XS) — the pre-M2 registry magnitudes,
+  reproduced on the M2 build. No `[same math]` row is produced in this window: for every type the
+  two backends either take different GEMM math (int8 vs f16) or different f16 input conversions, so
+  the test's same-math branch is never entered.
+- attention: decode is **bit-identical** across backends (0 differing bits, 18 shapes, rel err vs
+  CPU 9.6e-8 … 1.4e-7); prefill is 3.0e-5 … 7.3e-5 cross-backend (tensor cores vs no cooperative
+  matrices), prefill-vs-decode 1.2e-7 … 4.4e-7 on Vulkan and 3.0e-5 … 7.3e-5 on CUDA — i.e. the M2
+  tensor-core prefill is what moves, the Vulkan f16 prefill stays closer to its own decode.
+- `--llama-numerics` attention: decode vs the CPU model 1.45e-5 … 5.10e-5 (llama mode) against
+  3.32e-4 … 6.23e-4 for the default kernel, prefill 1.73e-7 … 2.39e-7 against 6.11e-5 … 7.26e-5;
+  Vulkan is bit-identical to CUDA in llama mode (asserted by the test).
+- q8 KV: 1.55e-3 … 2.06e-3 q8 vs f16 decode, 5.98e-5 … 7.67e-5 q8 prefill vs decode (CUDA; the
+  test binary does not open Vulkan).
+- MoE GEMV (IQ2_XS, 3 experts of 512×2048): 8.86e-7 vs CPU on both backends, **0 differing bits**
+  across backends. MoE combine (1500 values, shared expert on and off): 3.71e-8 / 4.45e-8 vs CPU,
+  0 bits.
+- conv: `conv_silu` 5.49e-8 vs CPU, `conv_state` **0.00e+00** (bit-exact, the state is just a shift),
+  `conv_seq` chunk-vs-steps and `conv_silu+l2_norm` 0 differing bits across backends. Router top-k:
+  max |Δweight| 1.19e-7, ids identical, 0 differing weight bits.
+- norm/rope/gate/elementwise vs CPU: `rms_norm` 4.30e-7, `l2_norm` 5.89e-9, `rope_neox` 2.52e-8,
+  `norm_gate` 4.31e-8, `swiglu` 4.24e-9, `add` 6.03e-9, `ssm_gates` 3.00e-8; all 0 differing bits
+  across backends except `ssm_gates_g`: 1 of 15 bits differs on Vulkan at rel err 1.44e-10 (one ULP
+  in `softplus`/`expf` on this driver). The dedicated `ssm_gates_match_across_backends` test (4000
+  values, different shapes) still asserts and passes bit equality, so this is a shape-dependent
+  last-bit difference the test does not cover — recorded here as a measured one-ULP item, not a
+  failure.
+
+### Legitimate-difference registry
+
+| id | mechanism | measured (M2 build; the window reproduces the pre-M2 magnitudes) | arm that isolates it | follow-up |
+| --- | --- | --- | --- | --- |
+| `gemm-int8-vs-f16` | int8-quantized GEMM (Vulkan) vs f16 tensor-core GEMM (CUDA); sm_70 CUDA has no int8 tensor cores | 3.17e-3 .. 4.08e-3 relative L2 per-op (M1-T7 block) | `STRATA_MMQ=` forces the f16 GEMM on Vulkan | M3-T5 |
+| `f16-round-vs-trunc` | f16 conversion: CUDA `__float2half` rounds, this driver's `OpFConvert` truncates | 5.41e-4 (IQ2_XS), 4.79e-5 (F32) relative L2, recorded not asserted (`tests/kernels.rs:409`) | — | M3-T5 |
+| `summation-order` | `mma.sync.m8n8k4` tile order vs Vulkan workgroup reduction vs FMA accumulation | M2 build: 4.0e-7 .. 9.6e-7 per backend vs the CPU reference (GEMV 4.12e-7 .. 8.36e-7, identical on both); cross-backend prefill attention 3.0e-5 .. 7.3e-5, decode attention 0 bits; the `STRATA_GEMM_FMA=1` arm moves 2 argmax positions | `STRATA_VK_NO_COOP=` / `STRATA_GEMM_FMA=1` | — |
+| `no-coop-matrices` | Vulkan 1.4.312 on this host exposes no `VK_KHR_cooperative_matrix` | M2 build: 3.0e-5 .. 7.3e-5 relative L2 cross-backend on prefill attention, and the one end-to-end position the `STRATA_MMQ=` arm does not move (17/16) | `STRATA_VK_NO_COOP=` | M3-T5 |
+| `q8-kv` | `--kv q8` stores K/V as int8 with per-32 scales; not combinable with `--llama-numerics` by design | 1.55e-3 .. 2.06e-3 relative L2 q8 vs f16; KV 341/642 = 53.1 % (M2-T6) | `--kv q8` | — |
+| `expert-slot-layout` | MoE slot gather/combine order differs; parity passes `--fixed-experts` so routing is identical | not measured above the summation-order floor yet; re-recorded in the window | `--fixed-experts` | — |
+| `either-mode-ambiguity` | llama.cpp's token-by-token and one-batch runs disagree here; both backends sit on a near-tie | llama.cpp self-agreement 630/640 (`docs/m6-results.md`) | — | — |
+
+### Unexplained
+
+None, on the pre-M2 dry run (9/640) or on the M2 build (**7/640**). Every M2 divergence maps to a
+registry entry: 4 to `gemm-int8-vs-f16` (Vulkan int8 GEMM, M3-T5), 2 to `either-mode-ambiguity`
+(prompt 12 pos 5, prompt 17 pos 13 — CUDA takes the one-batch llama.cpp token, Vulkan the reference
+token) and 1 to `no-coop-matrices` (prompt 17 pos 16, where the `STRATA_MMQ=` f16 arm does not move
+the token at all, so quantization cannot be the cause). The arm evidence sets each attribution's
+`confidence`; the FMA arm confirms that the two positions lost against the M1 parity record are
+tensor-core summation order, not a fault.
+
+**Open follow-ups** (not fixed here, per the issue's out-of-scope): M3-T5 for the Vulkan int8 GEMM
+gap (with the arm as evidence), and the CUDA 628/634 vs M1 630/636 tensor-core delta for M2-T8.
+`tools/parity.py` writes top-5 logprobs from this PR on, and the M2 artifacts carry them; the pre-M2
+ones cannot be back-filled.
+
+### Safety and window notes
+
+```sh
+dmesg -T | grep -ic Xid     # 42 before the window and 42 after
+nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader   # 0 MiB, 0 % at the end
+```
+
+No `Xid`, no `device lost`, no `strata score` failure (20/20 exit 0 in each of the four parity
+runs). `llama.router.service` was stopped by the coordinator before the window and is left stopped.
+The full-vocabulary KLD between the backends was **not run**: the window budget went to the four
+parity runs and the two test binaries. The command is in `tools/consistency.py --kld` and in the
+issue; it is the one remaining optional item, recorded as not run rather than skipped silently.
+
+### Commands (GPU window)
+
+```sh
+M=/mnt/models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
+STRATA_MODEL=$M STRATA_TEST_BACKENDS=cuda,vulkan cargo test --release --no-fail-fast --test kernels -- --nocapture --test-threads=1
+STRATA_MODEL=$M STRATA_TEST_BACKENDS=cuda,vulkan cargo test --release --no-fail-fast --test llama_numerics -- --nocapture --test-threads=1
+STRATA_MODEL=$M STRATA_TEST_BACKENDS=cuda,vulkan cargo test --release --no-fail-fast --test kv_q8 -- --nocapture --test-threads=1
+python3 -I tools/parity.py "$M" --extra "--gpu --backend cuda   --llama-numerics --fixed-experts" --tag m2-cuda-sm70
+python3 -I tools/parity.py "$M" --extra "--gpu --backend vulkan --llama-numerics --fixed-experts" --tag m2-vk-sm70
+STRATA_MMQ=       python3 -I tools/parity.py "$M" --extra "--gpu --backend vulkan --llama-numerics --fixed-experts" --tag m2-vk-sm70-f16
+STRATA_GEMM_FMA=1 python3 -I tools/parity.py "$M" --extra "--gpu --backend cuda   --llama-numerics --fixed-experts" --tag m2-cuda-sm70-fma
+python3 -I tools/consistency.py --cuda target/parity-result-m2-cuda-sm70.json   --vulkan target/parity-result-m2-vk-sm70.json --cuda-tag m2-cuda-sm70 --vulkan-tag m2-vk-sm70   --kernels /tmp/m2t7-kernels.txt --kernels /tmp/m2t7-llama.txt   --arm f16=target/parity-result-m2-vk-sm70-f16.json --arm cuda-fma=target/parity-result-m2-cuda-sm70-fma.json   --status m2 --date 2026-11-08 --out docs/parity/cross-backend.json   # 7 of 640, unexplained 0
+```
+
+### Commands (CPU part)
+
+```sh
+cargo build --release
+cargo test --release --lib cuda::            # 21 passed
+python3 -I tools/consistency.py --cuda target/parity-result-cuda-sm70.json \
+  --vulkan target/parity-result-vk-sm70.json --cuda-tag cuda-sm70 --vulkan-tag vk-sm70 \
+  --status pre-m2 --out docs/parity/cross-backend.json    # 9 of 640, unexplained 0, exit 0
+```
+
