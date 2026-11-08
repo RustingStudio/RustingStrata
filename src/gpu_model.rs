@@ -162,6 +162,8 @@ pub struct GpuModel<'a> {
     pub cpu_time: Duration,
     /// Forwards run again from a MoE combine that gave up waiting for the CPU worker (`finish`).
     pub resumed: std::cell::Cell<usize>,
+    /// LoRA overlays already added to the current forward's residual state.
+    lora_applied: std::cell::Cell<u64>,
     /// MTP drafts (made, accepted).
     pub drafts: (usize, usize),
     /// Split model, all parts but the last: seconds from the start of this part's forward until its GPU is done, and
@@ -349,7 +351,7 @@ impl<'a> GpuModel<'a> {
         // Hyper-connection prefill scratch is ~4x larger a token, so a large chunk leaves fewer expert slots: qwen4exp at
         // 943 tokens (warm) prefills 447 tok/s with 1024, 347 with 4096. Long prompts gain (each chunk restages the experts
         // not resident: Flash-Next at 4764 tokens 132 -> 158 tok/s on a 3060), so `calibrate` picks per machine.
-        let pf = if chunk > 0 { Some(prefill::Scratch::new(m, &*gpu, chunk.min(ctx))?) } else { None };
+        let pf = if chunk > 0 && m.loras.is_empty() { Some(prefill::Scratch::new(m, &*gpu, chunk.min(ctx))?) } else { None };
         let qsa = if qsa_on {
             let (top, nbs) = (c.idx_top_k / QSA_POOL, ctx / QSA_POOL);
             let (sst, mw) = (1 + c.idx_top_k + QSA_POOL, (nbs + 1).div_ceil(32));
@@ -392,7 +394,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None,
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None,
                       cur: 0, seqs, rows: vec![], row_tokens: 0 })
     }
 
@@ -742,6 +744,7 @@ impl<'a> GpuModel<'a> {
 
     /// Run the forward of `nt` tokens as a recorded graph (graph key `nt` and the attention regime), recorded on first use.
     fn run(&self, nt: usize) -> anyhow::Result<()> {
+        self.lora_applied.set(0);
         let gq = gq_min(self.pos, nt);
         self.gpu.graph(nt as u64 | (gq as u32 as u64) << 8 | (self.cur as u64) << 40, &mut || self.forward(nt, gq, None))
     }
@@ -1124,7 +1127,11 @@ impl<'a> GpuModel<'a> {
                     // Hyper-connections: the FFN output collects in "mo" (zero) and goes to the streams from there.
                     let fx = if l.hc.is_some() { p("mo") } else { x };
                     g.moe_down_combine(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, k, p("ge"), p("ye"), dq,
-                                       fx, p("wh"), sh, sg, mb, w.layout.y, step, nt)?;
+                                        fx, p("wh"), sh, sg, mb, w.layout.y, step, nt)?;
+                    if !self.m.loras.is_empty() && !resume {
+                        let use_ge = matches!(md.ty, GgmlType::F32 | GgmlType::BF16);
+                        self.apply_lora_gpu_down(il, nt, k, c.n_ff_exp, c.n_embd, l.hc.is_some(), use_ge)?;
+                    }
                     if l.hc.is_some() { g.hc_write(x, p("mo"), p("inj"), ne, c.hc_n, nt, true)?; }
                 }
             }
@@ -1133,6 +1140,90 @@ impl<'a> GpuModel<'a> {
     }
 
     /// Advance the position and update expert statistics and placement after a token.
+    fn apply_lora_gpu_down(&self, il: usize, nt: usize, k: usize, ff: usize, ne: usize, hc: bool, use_ge: bool) -> anyhow::Result<()> {
+        if !self.m.loras.is_empty() {
+            let mask = self.lora_applied.get();
+            if mask & (1u64 << il) != 0 { return Ok(()); }
+            self.lora_applied.set(mask | (1u64 << il));
+        }
+        let name = format!("blk.{il}.ffn_down_exps.weight");
+        let mut adapters: Vec<(f32, f32, &crate::model::LoraEntry)> = Vec::new();
+        for lora in &self.m.loras {
+            if let Some(e) = lora.entries.get(&name) {
+                adapters.push((lora.scale, lora.alpha, e));
+            }
+        }
+        if adapters.is_empty() { return Ok(()); }
+        let kt = nt * k;
+        let slots = self.gpu.get::<i32>(&self.slots, 0, kt)?;
+        let ids = self.gpu.get::<i32>(&self.ids, 0, kt)?;
+        let wts = self.gpu.get::<f32>(&self.bufs["wts"], 0, kt)?;
+        // activation: float (ge, post-swiglu) for float weights; dequantized ffq (Q8) for quantized
+        let mut acts = vec![0f32; kt * ff];
+        if use_ge {
+            let ge = self.gpu.get::<f32>(&self.bufs["ge"], 0, kt * ff)?;
+            acts.copy_from_slice(&ge);
+        } else {
+            let quant_bytes = kt * ff;
+            let quant_words = quant_bytes / 4;
+            let scale_words = kt * (ff / 32);
+            let packed = self.gpu.get::<f32>(&self.bufs["ffq"], 0, quant_words + scale_words)?;
+            // quantized region: first quant_words f32s hold int8 bytes; scales follow
+            let mut bytes = vec![0u8; quant_bytes];
+            for w in 0..quant_words {
+                let v = packed[w].to_bits();
+                bytes[w*4] = (v & 0xff) as u8;
+                bytes[w*4+1] = ((v >> 8) & 0xff) as u8;
+                bytes[w*4+2] = ((v >> 16) & 0xff) as u8;
+                bytes[w*4+3] = ((v >> 24) & 0xff) as u8;
+            }
+            let scales = &packed[quant_words..quant_words + scale_words];
+            for slot in 0..kt {
+                for blk in 0..(ff / 32) {
+                    let scale = scales[slot * (ff / 32) + blk];
+                    for i in 0..32 {
+                        let byte = bytes[slot * ff + blk * 32 + i] as i8;
+                        acts[slot * ff + blk * 32 + i] = byte as f32 * scale;
+                    }
+                }
+            }
+        }
+        let res_buf = if hc { &self.bufs["mo"] } else { &self.x };
+        let mut residual = self.gpu.get::<f32>(res_buf, 0, nt * ne)?;
+        for t in 0..nt {
+            for j in 0..k {
+                let slot = t * k + j;
+                if slots[slot] < 0 { continue; }
+                let expert_id = ids[slot] as usize;
+                let w = wts[slot];
+                let act = &acts[slot * ff..(slot + 1) * ff];
+                for (scale, alpha, entry) in &adapters {
+                    let ei = if entry.n_expert == 1 { 0 } else { expert_id };
+                    if ei >= entry.n_expert && entry.n_expert > 1 { continue; }
+                    let a = &entry.a[ei];
+                    let b = &entry.b[ei];
+                    let rank = entry.rank;
+                    let in_dim = entry.in_dim;
+                    let out_dim = entry.out_dim;
+                    let mult = if *alpha > 0.0 { *scale * *alpha / rank as f32 } else { *scale };
+                    for o in 0..out_dim {
+                        let mut s = 0f32;
+                        for r in 0..rank {
+                            let mut dot = 0f32;
+                            for i in 0..in_dim {
+                                dot += a[r * in_dim + i] * act[i];
+                            }
+                            s += b[o * rank + r] * dot;
+                        }
+                        residual[t * ne + o] += w * mult * s;
+                    }
+                }
+            }
+        }
+        self.gpu.put(&residual, res_buf, 0)?;
+        Ok(())
+    }
+
     fn after_forward(&mut self, nt: usize) -> anyhow::Result<()> {
         self.pos += nt;
         self.after_experts(nt, self.pos)?;
