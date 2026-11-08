@@ -111,6 +111,10 @@ struct Hosting {
     /// [default: no limit besides `--max-waiting`].
     #[arg(long)]
     max_per_key: Option<usize>,
+    /// Extra `Host` header names accepted by the chat page, model list and stats, comma-separated. Needed when the
+    /// server is reached through a LAN name while bound to `0.0.0.0`. [default: $STRATA_ALLOWED_HOSTS]
+    #[arg(long, value_delimiter = ',')]
+    allowed_hosts: Vec<String>,
     /// Most reply tokens a request may ask for (and the default when it asks for none) [default: what the context
     /// leaves].
     #[arg(long)]
@@ -588,6 +592,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             engine.parallel = host.parallel;
             let api_key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
             anyhow::ensure!(api_key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
+            let mut allowed_hosts = host.allowed_hosts.clone();
+            if allowed_hosts.is_empty() && let Ok(v) = std::env::var("STRATA_ALLOWED_HOSTS") {
+                allowed_hosts.extend(v.split(',').map(str::trim).filter(|h| !h.is_empty()).map(str::to_owned));
+            }
             let mut keys_time = host.api_keys.as_ref().and_then(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok());
             let users = match &host.api_keys {
                 Some(f) => serve::Keys::parse(&std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?)
@@ -617,7 +625,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let open_conns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let waiting = open_conns.clone();
             let stats = std::sync::Arc::new(std::sync::Mutex::new(serve::Stats::default()));
-            let (st, a, k, t0) = (stats.clone(), addr.clone(), keys.clone(), Instant::now());
+            let (st, a, k, allowed, t0) = (stats.clone(), addr.clone(), keys.clone(), allowed_hosts.clone(), Instant::now());
             let (per_key, held) = (host.max_per_key, serve::Open::default());
             let stop = on_sigterm();
             // SIGTERM (systemctl stop or restart): new requests get 503, the requests accepted before it finish, then
@@ -663,7 +671,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         Err(e) => eprintln!("{}: {e:#}, keeping the old keys", f.display()),
                     }
                 }
-                let (tx, oc, st, a, k, held) = (tx.clone(), open_conns.clone(), st.clone(), a.clone(), k.clone(), held.clone());
+                let (tx, oc, st, a, k, allowed, held) = (tx.clone(), open_conns.clone(), st.clone(), a.clone(), k.clone(), allowed.clone(), held.clone());
                 std::thread::spawn(move || {
                     let q = c.set_read_timeout(Some(Duration::from_secs(30))).and_then(|_| c.set_write_timeout(Some(Duration::from_secs(30))))
                         .map_err(Into::into).and_then(|_| serve::read_request(&mut BufReader::new(&c)));
@@ -682,7 +690,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     // The page's side panel is answered here, so it stays current while a reply is generated or a
                     // model loads. A bad Host or key falls through to `handle`, which refuses it.
                     if let Ok(r) = &q && r.method == "GET" && matches!(r.path.as_str(), "/api/stats" | "/metrics") && let k = k.read().unwrap().clone()
-                        && (k.any() || serve::host_ok(&r.host, &a)) && k.who(&r.auth).is_some_and(|w| w.admin) {
+                        && (k.any() || serve::host_ok(&r.host, &a, &allowed)) && k.who(&r.auth).is_some_and(|w| w.admin) {
                         if r.path == "/metrics" {
                             let b = st.lock().unwrap().prometheus(oc.load(Relaxed) - 1, t0.elapsed().as_secs());
                             let _ = write!(&c, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
@@ -703,7 +711,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                             eprintln!("request {i}: {e:#}");
                             return reply(json!({"error": {"message": format!("{e:#}"), "type": "invalid_request_error"}}), "400 Bad Request");
                         }
-                        Ok(r) if r.method == "GET" && r.path == "/" && (k.read().unwrap().any() || serve::host_ok(&r.host, &a)) => {
+                        Ok(r) if r.method == "GET" && r.path == "/" && (k.read().unwrap().any() || serve::host_ok(&r.host, &a, &allowed)) => {
                             let _ = write!(&c, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PAGE}", PAGE.len());
                             oc.fetch_sub(1, Relaxed);
                             return;
@@ -711,7 +719,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         Ok(_) if who.is_none() =>
                             return reply(json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}}), "401 Unauthorized"),
                         // Clients list the models often; a model still loading is listed, as its chats wait for the load.
-                        Ok(r) if r.method == "GET" && r.path.split('?').next() == Some("/v1/models") && (k.read().unwrap().any() || serve::host_ok(&r.host, &a)) => {
+                        Ok(r) if r.method == "GET" && r.path.split('?').next() == Some("/v1/models") && (k.read().unwrap().any() || serve::host_ok(&r.host, &a, &allowed)) => {
                             let created = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
                             let (m, n_ctx, n_ctx_train) = {
                                 let state = st.lock().unwrap();
@@ -741,7 +749,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     let _ = tx.send((c, q, i, hold));
                 });
             });
-            let s = Serving { rx: rx.into(), waiting, stop, addr, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(),
+            let s = Serving { rx: rx.into(), waiting, stop, addr, allowed_hosts, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(),
                 dl: Default::default(), stats };
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
@@ -916,6 +924,7 @@ struct Serving {
     /// Set by SIGTERM.
     stop: &'static std::sync::atomic::AtomicBool,
     addr: String,
+    allowed_hosts: Vec<String>,
     keys: std::sync::Arc<std::sync::RwLock<serve::Keys>>,
     usage: Option<std::sync::Mutex<std::fs::File>>,
     max_tokens: usize,
@@ -1267,7 +1276,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
     // makes a cross-site POST need a CORS preflight, which is never answered.
     // With a key the check is not needed (a rebinding page has no key) and would refuse a reverse proxy's Host.
     let keys = s.keys.read().unwrap().clone();
-    if !keys.any() && !serve::host_ok(&host, &s.addr) { return send(&mut w, "403 Forbidden", json!({"error": {"message": "bad Host header", "type": "forbidden"}})); }
+    if !keys.any() && !serve::host_ok(&host, &s.addr, &s.allowed_hosts) { return send(&mut w, "403 Forbidden", json!({"error": {"message": "bad Host header", "type": "forbidden"}})); }
     let Some(who) = keys.who(&auth) else { return send(&mut w, "401 Unauthorized", json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}})) };
     if method == "POST" && !json { return send(&mut w, "415 Unsupported Media Type", json!({"error": {"message": "Content-Type must be application/json", "type": "invalid_request_error"}})); }
     // Claude Code adds `?beta=true`.

@@ -120,6 +120,8 @@ head; greedy tokens stay the same, sampling keeps its distribution), `--chunk`, 
 GPU that drives no display, `--vram-margin 256` keeps more experts resident (+1-2% prefill); 128 runs out of
 memory. `--kv q8` halves the KV cache (345 instead of 650 MB at 32K) at about 6% slower 32K decode and 14% slower
 32K prefill. Without `--gpu` everything runs on the CPU reference, which is slow and meant for checking.
+If you reach `serve` through a LAN name while it is bound to `0.0.0.0`, allow that name with
+`--allowed-hosts ai-server.lan` (or `STRATA_ALLOWED_HOSTS=ai-server.lan`).
 
 Several GPUs: `--device 0,1` splits the layers over the cards in proportion to their free VRAM, so more experts stay
 resident. The cards run one after the other, so one request gets more memory, not twice the speed of one card. MTP
