@@ -1,6 +1,8 @@
 //! DeepSeek-V4.1-Flash (GGUF arch `deepseek41`): hyperparameters and tensor-table validation.
 //! Mirrors llama.cpp `llama_model_deepseek41::load_arch_hparams` / `load_arch_tensors`.
 
+pub mod ops;
+
 use crate::gguf::Gguf;
 use anyhow::{Context, bail, ensure};
 
