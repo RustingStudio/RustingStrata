@@ -15,17 +15,17 @@ strata.exe serve --model MODEL.gguf --lora ADAPTER.gguf:1.0 --addr 127.0.0.1:808
 strata.exe chat --model MODEL.gguf --lora ADAPTER.gguf:1.0
 ```
 
-`--lora` takes `path:scale` (repeatable) at the top level so `generate`/`chat`/`serve`/`bench`/`perplexity`/`score`/`calibrate` all apply it. Scale defaults to `1.0`; with `n_expert == 1` an adapter applies to every routed expert slot. Missing adapter targets warn (`lora: target … not found, skipping`). Graph capture (`CUDA graph` / Vulkan conditional) is bypassed for LoRA decode forwards.
+`--lora` takes `path:scale` (repeatable) at the top level so `generate`/`chat`/`serve`/`bench`/`perplexity`/`score` apply it. `calibrate` accepts it for consistency but always calibrates the base model. Scale defaults to `1.0`; with `n_expert == 1` an adapter applies to every routed expert slot. Missing adapter targets warn (`lora: target … not found, skipping`). Graph capture (`CUDA graph` / Vulkan conditional) is bypassed for LoRA decode forwards.
 
 ## Two application paths (both lossless)
 
 - **Baked (non-expert tensors).** `attn_output`, `ssm_out`, `ple_value`, and the shared-expert `ffn_down_shexp` are dequantized to F32 **once at load** and `scale·(B·A)` is added in F32, then stored as F32 `Weights::built` overrides. CPU and GPU read these modified weights identically; oven-resume is a no-op for them.
-- **Runtime (routed experts).** `ffn_down_exps` stays quantized in memory (to avoid materializing huge F32 expert matrices). Routed expert down LoRA is applied on the fly in `Model::ffn` (CPU) and in `GpuModel::apply_lora_gpu_down` (GPU): `y += Σ_e w_e · Σ_r b_r·(a_r·act_e)`. The GPU path reads expert identity from `ids` (misses filtered via `slots < 0`) and dequantizes Q8 packed activations (`ffq`) to F32 for quantized down weights; float-typed down weights read post-SwiGLU `ge`. The correction is added to the residual (`x`/`mo`) **before** `hc_write` so hyper-connection models keep it. Vulkan `finish`/resume replay skips re-applying to the same layer (resume-trims). Prefill uses the step path when LoRA is present (`pf=None`).
+- **Runtime (routed experts).** `ffn_down_exps` stays quantized in memory (to avoid materializing huge F32 expert matrices). Routed expert down LoRA is applied on the fly in `Model::ffn` (CPU) and in `GpuModel::apply_lora_gpu_down` (GPU): `y += Σ_e w_e · Σ_r b_r·(a_r·act_e)`. The GPU path reads expert identity from `ids` (misses filtered via `slots < 0`) and dequantizes Q8 packed activations (`ffq`) to F32 for quantized down weights; float-typed down weights read post-SwiGLU `ge`. The correction is added to the residual (`x`/`mo`) **before** `hc_write` so hyper-connection models keep it. A per-layer mark makes Vulkan `finish`/resume replay skip layers that already got the correction. Prefill uses the step path when LoRA is present (`pf=None`).
 
 ## Verification status
 
 - Unit/integration tests green (`cargo test --release --lib`, `--test model`, `--test gpu_model`, `--test cpu_moe`).
-- Reported audit found and fixed: Vulkan resume double-apply, `Box::leak` growth on model switch (now tracked via `lora_baked` — loader-owned overrides, synthesized `ssm_beta`/`ssm_alpha` preserved), LoRA calibration poisoning (calibration is skipped for LoRA runs so tuning stays clean), stale help text, Windows `path:scale` parsing, `alpha/rank` scaling, single-expert fan-out.
+- Reported audit found and fixed: Vulkan resume double-apply, baked-tensor growth on model switch (the F32 copies are owned by `Weights` and freed on reload; synthesized `ssm_beta`/`ssm_alpha` are preserved), LoRA calibration poisoning (calibration is skipped for LoRA runs so tuning stays clean), stale help text, Windows `path:scale` parsing, `alpha/rank` scaling, single-expert fan-out.
 
 ## Limits
 
