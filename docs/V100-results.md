@@ -494,3 +494,108 @@ was taken on the FMA fallback.
 No new `Xid`/`NVRM` line in `dmesg` (`grep -ic Xid` = 42 before and after the
 window), no device lost, no engine crash; the GPU was left at 0 MiB and
 `llama.router.service` was restarted by the coordinator after the window.
+
+## 2026-11-08 — Volta tensor cores in the prefill attention (M2-T2, V100, sm_70)
+
+Model: `Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf`. Build: `task/26-cuda-attn-tc`
+(PR #27), based on `v100` at `1aaf6af`. `attn_prefill_t` now computes both its
+products (QKᵀ and PV) with `mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32`
+on sm_70, under the same `GEMM_TC` switch as the M2-T1 prefill GEMM; the
+`m16n8k16` path stays for sm_80+ and `STRATA_GEMM_FMA=1` selects the
+CUDA-core fallback for both.
+
+### Fragment mapping
+
+Constants as in `gemm_q` (`l = lane`, `t = l & 3`, `g = l >> 2`, `c = g & 3`,
+`hi = g >> 2`). QKᵀ: A = Q rows `8*j + t + 4*hi` of the 16-row warp tile, B = K
+row `8*(4*ng + c) + t + 4*hi`, eight `mma884` per 16-deep k step (2 `j` x 4
+`ks4`), accumulators `s2[ng][j][4*p4 + 2*p2 + e]` =
+`S[8*j + (t & 1) + 2*p2 + 4*hi][8*(4*ng + c) + (t & 2) + 4*p4 + e]`. Softmax in
+that layout: rows `qp2[j][p2]`, keys `k0 + 8*(4*ng + c) + (t & 2) + 4*p4 + e`,
+row max/sum across the eight lanes of a row with `__shfl_xor_sync(.., 2/4/8)`
+(`xor 2` swaps `t & 2`, `xor 4`/`8` swap `c`), `mT`/`lT` of four entries each,
+`lT` reduced once after the last tile. P is staged per warp into a
+`FA_BQ x (FA_BK + 8)` half tile appended after `vs` in `fa_sm` (5120 B,
+`__syncwarp()` before the reads); PV reads A as two `ld_s32` from it, B from
+the transposed V tile as four `ld.shared.u16` (`vs + (4*kg + {0..3})*PQ + ...`),
+64 `mma884` per tile at HD = 128, accumulators
+`o2[j][grp][4*p4 + 2*p2 + e]`, and the store loop mirrors `gemm_q`'s sm_70 one.
+SASS (`cuobjdump -sass`, NVRTC 12.9 sm_70 cubin): `attn_prefill_128` has 128
+`HMMA.884.F32.F32` (64 QKᵀ + 64 PV, the same FLOPs as 32 `m16n8k16`),
+`REG:159 LOCAL:0` (FMA build: `REG:248`). The sm_80+ preprocessed source is
+byte-identical to `v100` (1861 lines) and the sm_70 `GEMM_TC=0` variant is
+source-identical (1763 lines); `kernels.cu` is +187 lines and -0.
+
+### Correctness (same window)
+
+```sh
+M=/mnt/models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
+STRATA_MODEL=$M STRATA_TEST_BACKENDS=cuda cargo test --release --test kernels \
+  attn_prefill_matches_decode -- --nocapture --test-threads=1
+STRATA_GEMM_FMA=1 STRATA_MODEL=$M ... (same test)
+STRATA_MODEL=$M cargo test --release --test kv_q8 -- --test-threads=1
+```
+
+`attn_prefill_{hd}` rel err vs decode, assertion `<= 5e-4`:
+
+| case | `GEMM_TC = 1` | `STRATA_GEMM_FMA=1` |
+| --- | ---: | ---: |
+| hd 64, nh 4/nkv 2 | 6.42e-5 | 6.44e-5 |
+| hd 128, nh 4/nkv 2 | 7.26e-5 | 7.39e-5 |
+| hd 256, nh 4/nkv 2 | 6.37e-5 | 6.40e-5 |
+| hd 256, nh 16/nkv 2 | 6.11e-5 | 6.11e-5 |
+| hd 128, nh 8/nkv 8 | 6.13e-5 | 6.17e-5 |
+| hd 128, nh 32/nkv 8 | 6.24e-5 | 6.26e-5 |
+| hd 128, nh 32/nkv 8, pos 2100 | 2.98e-5 | 2.83e-5 |
+| hd 256, nh 16/nkv 2, pos 1000 | 3.51e-5 | 3.36e-5 |
+| hd 256, nh 24/nkv 2, pos 0 | 6.14e-5 | 6.18e-5 |
+
+The decode reference itself is `8.7e-8 … 1.4e-7` against the CPU. The two
+implementations agree with decode in the third significant digit of the error
+metric, i.e. the difference between them is far below the f16 rounding error.
+`kv_q8`: `q8 prefill vs decode` 6.16e-5 / 7.67e-5 / 6.16e-5 / 5.98e-5
+(hd 64 / 128 / 256 / nh 8,nkv 8), `q8 vs f16 decode` 1.55e-3 … 2.06e-3
+(cache quantisation, unchanged). The QSA mask path
+(`qwen4exp_qsa_gpu_matches_cpu`) was **not run**: the qwen4exp GGUF is not
+present on this host.
+
+### Benchmarks (median of 3 reps, `--pp 512,4096,32768 --tg 128 --ctx 32896`)
+
+| run | pp 512 | pp 4096 | pp 32768 | tg 128 @512 | @4096 | @32768 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `GEMM_TC = 1` (m8n8k4) | 2045.3 | 2795.3 | 2263.7 | 123.1 | 119.1 | 105.5 |
+| `STRATA_GEMM_FMA=1` | 833.6 | 1030.7 | 489.2 | 121.9 | 118.4 | 105.3 |
+| delta | **+145.3 %** | **+171.2 %** | **+362.7 %** | +1.0 % | +0.6 % | +0.2 % |
+
+Against M2-T1 (same model and protocol, `docs/V100-results.md` block above):
+prefill @512 1880.4 → **2045.3** (+8.8 %), @4096 1976.0 → **2795.3** (+41.5 %),
+so the M2 exit target of 2000 tok/s at 4096 is met with the attention on the
+tensor cores. Decode is unchanged within noise (decode does not use
+`attn_prefill_t`). Reps ranges: 2034.8-2062.3 / 2786.7-2803.5 / 2263.1-2264.2.
+
+`strata generate --prompt "The capital of France is" -n 32` (TC build) produced
+"That is correct. Paris is the capital and most populous city of France. …"
+at 123.38 tok/s, no NaN.
+
+### Kernel time (`nsys profile --trace=cuda`, pp 4096, 10 prefill chunks)
+
+```sh
+nsys profile --trace=cuda -o nsys_tc target/release/strata bench --model "$M" \
+  --gpu --backend cuda --pp 4096 --tg 1 --reps 1 --ctx 4200
+nsys stats --report cuda_gpu_kern_sum nsys_tc.nsys-rep
+```
+
+| kernel | `GEMM_TC = 1` | `STRATA_GEMM_FMA=1` | delta |
+| --- | ---: | ---: | ---: |
+| `attn_prefill_256` self time per launch | 6.124 ms | 70.760 ms | **-91.3 %** |
+| `attn_prefill_256` share of kernel time | 4.5 % | 18.3 % | |
+| total kernel time (10 chunks) | 1.371 s | 3.869 s | -64.6 % |
+
+The per-kernel requirement (at least 20 % lower self time per launch) is met by
+a wide margin. The end-to-end prefill gain (+171 % vs the FMA build) also
+includes the M2-T1 `gemm_q` win, since this build carries both.
+
+No new `Xid`/`NVRM` line in `dmesg` (`grep -ic Xid` = 42 before and after both
+windows), no device lost, no NaN in any of the 3 reps; the GPU was left at
+0 MiB and `llama.router.service` was left stopped for the coordinator to
+restart.
