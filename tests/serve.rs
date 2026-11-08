@@ -1,5 +1,5 @@
 use rusting_strata::chat::{Hold, Json, Msg, Template};
-use rusting_strata::serve::{chat_request, host_ok, key_ok, list_models, messages_body, read_request};
+use rusting_strata::serve::{Keys, Who, chat_request, host_ok, key_ok, list_models, messages_body, models, read_request};
 
 /// Every request in tests/fixtures/chat renders byte-identical to llama.cpp's Jinja rendering of the model's own
 /// template (tools/gen_chat_fixtures.py); a request llama.cpp rejects must be rejected too.
@@ -235,6 +235,26 @@ fn lists_models_once_per_split() {
 }
 
 #[test]
+fn lists_only_complete_split_models() {
+    let files = vec![
+        ("model-00001-of-00003.gguf".into(), 10),
+        ("model-00002-of-00003.gguf".into(), 20),
+        ("model-00001-of-00002.gguf".into(), 100),
+        ("model-00002-of-00002.gguf".into(), 20),
+        ("plain.gguf".into(), 7),
+    ];
+    assert_eq!(models(&files), vec![("model-00001-of-00002.gguf".into(), 120), ("plain.gguf".into(), 7)]);
+
+    let mut complete = files;
+    complete.push(("model-00003-of-00003.gguf".into(), 30));
+    assert_eq!(models(&complete), vec![
+        ("model-00001-of-00003.gguf".into(), 60),
+        ("model-00001-of-00002.gguf".into(), 120),
+        ("plain.gguf".into(), 7),
+    ]);
+}
+
+#[test]
 fn download_names_stay_in_the_models_folder() {
     use rusting_strata::hf::local_name;
     assert_eq!(local_name("Q4_K_M/m-00001-of-00002.gguf"), Some("m-00001-of-00002.gguf"));
@@ -260,4 +280,95 @@ fn stats_keep_totals_across_loads() {
     assert!(s.loading && s.vram.is_none() && s.model.as_deref() == Some("b"));
     s.unload(None);
     assert!(!s.loading && s.model.is_none() && s.requests == 45);
+    let p = s.prometheus(3, 9);
+    for l in ["strata_up 0\n", "strata_waiting 3\n", "strata_uptime_seconds 9\n", "strata_prompt_tokens_total 450\n", "# TYPE strata_requests_total counter\n"] {
+        assert!(p.contains(l), "{l:?} missing from\n{p}");
+    }
+    assert!(!p.contains("vram") && !p.contains("expert"));
+}
+
+#[test]
+fn keys_file_and_access() {
+    let users = Keys::parse("# customers\nacme  acme-0123456789abcdef  # first\n\nbeta beta-0123456789abcdef\n").unwrap();
+    assert_eq!(users, [("acme".to_string(), "acme-0123456789abcdef".to_string()), ("beta".into(), "beta-0123456789abcdef".into())]);
+    assert!(Keys::parse("acme short").is_err() && Keys::parse("acme").is_err() && Keys::parse("a b c").is_err());
+    assert!(Keys::parse("a acme-0123456789abcdef\na beta-0123456789abcdef").is_err(), "repeated name");
+    assert!(Keys::parse("a acme-0123456789abcdef\nb acme-0123456789abcdef").is_err(), "repeated key");
+    let open = Keys::default();
+    assert_eq!(open.who(""), Some(Who { name: "".into(), id: 0, admin: true }));
+    let k = Keys { admin: Some("root-key".into()), users };
+    assert_eq!(k.who("Bearer root-key").map(|w| (w.id, w.admin)), Some((0, true)));
+    let beta = k.who("Bearer beta-0123456789abcdef").unwrap();
+    assert!(beta.name == "beta" && beta.id != 0 && !beta.admin && beta.id != k.who("Bearer acme-0123456789abcdef").unwrap().id);
+    // A reloaded file with the lines in another order keeps each key's id (its cached conversations).
+    let swapped = Keys { admin: None, users: k.users.iter().rev().cloned().collect() };
+    assert_eq!(swapped.who("Bearer beta-0123456789abcdef"), Some(beta));
+    assert_eq!(k.who("Bearer nope"), None);
+    assert_eq!(k.who(""), None);
+    let only_users = Keys { admin: None, users: k.users.clone() };
+    assert_eq!(only_users.who(""), None, "customer keys alone close the server to keyless requests");
+}
+
+#[test]
+fn per_key_holds() {
+    use rusting_strata::serve::{Hold, Open};
+    let open = Open::default();
+    let (a, b) = (Hold::take(&open, 7, 2), Hold::take(&open, 7, 2));
+    assert!(a.is_some() && b.is_some() && Hold::take(&open, 7, 2).is_none());
+    assert!(Hold::take(&open, 8, 2).is_some(), "another key has its own count");
+    drop(a);
+    let c = Hold::take(&open, 7, 2);
+    assert!(c.is_some());
+    drop((b, c));
+    assert!(open.lock().unwrap().is_empty());
+}
+
+/// `strata serve` without a model, over HTTP: what the connection threads answer before the queue, a customer key
+/// refused an admin route by `handle`, and a SIGTERM that exits.
+#[test]
+fn serve_without_a_model() {
+    use std::io::{Read, Write};
+    let dir = std::env::temp_dir().join(format!("strata-serve-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("keys.txt"), "acme acme-0123456789abcdef\n").unwrap();
+    let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_strata"))
+        .args(["serve", "--addr", &addr, "--api-key", "root-0123456789abcdef", "--api-keys"]).arg(dir.join("keys.txt"))
+        .arg("--models-dir").arg(&dir).stderr(std::process::Stdio::null()).spawn().unwrap();
+    // The status line and body of one request.
+    let get = |raw: &str| -> (String, String) {
+        let mut c = (0..100).find_map(|_| std::net::TcpStream::connect(&addr).ok().or_else(|| { std::thread::sleep(std::time::Duration::from_millis(50)); None }))
+            .expect("server up");
+        c.write_all(raw.as_bytes()).unwrap();
+        let mut s = String::new();
+        c.read_to_string(&mut s).unwrap();
+        let (head, body) = s.split_once("\r\n\r\n").unwrap();
+        (head.lines().next().unwrap().to_string(), body.to_string())
+    };
+    let req = |method: &str, path: &str, key: &str| {
+        get(&format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {key}\r\nContent-Length: 0\r\n\r\n"))
+    };
+    let (s, b) = req("GET", "/health", "");
+    assert!(s.contains("503") && b.contains("no model"), "{s} {b}");
+    let (s, b) = req("POST", "/v1/chat/completions", "wrong");
+    assert!(s.contains("401") && b.contains("invalid_api_key"), "{s} {b}");
+    assert!(req("GET", "/", "").0.contains("200"), "the page loads without a key");
+    let (s, b) = req("GET", "/v1/models?x=1", "acme-0123456789abcdef");
+    assert!(s.contains("200") && b.contains(r#""data":[]"#), "{s} {b}");
+    let (s, b) = req("GET", "/api/stats", "acme-0123456789abcdef");
+    assert!(s.contains("403") && b.contains("permission_error"), "{s} {b}");
+    assert!(req("GET", "/metrics", "root-0123456789abcdef").1.contains("strata_up"));
+    assert!(get("GARBAGE\r\n\r\n").0.contains("400"));
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill").args(["-TERM", &p.id().to_string()]).status().unwrap();
+        let t = std::time::Instant::now();
+        while p.try_wait().unwrap().is_none() {
+            assert!(t.elapsed().as_secs() < 15, "no exit after SIGTERM");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(p.wait().unwrap().success());
+    }
+    let _ = p.kill();
+    let _ = std::fs::remove_dir_all(&dir);
 }

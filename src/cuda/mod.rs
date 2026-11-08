@@ -15,8 +15,8 @@ const QTYPES: [GgmlType; 22] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, Q4_1, Q5_1, Q4_0, Q5_0]
 };
-const KERNELS: [&str; 34] = [
-    "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
+const KERNELS: [&str; 35] = [
+    "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv",
@@ -40,6 +40,8 @@ pub struct Gpu {
     pub kv_q8: bool,
     /// The GPU has int8 tensor-core mma (sm_80+). Turing runs the prefill GEMM on the f16 path instead.
     pub int8_mma: bool,
+    /// The device's opt-in shared memory per block (96 KB on Ampere, 64 KB on Turing).
+    max_smem: u32,
     /// `argmax_rows` partials, AMAX_PARTS per row.
     am: CudaSlice<[i32; 2]>,
     /// Recorded graphs by `Backend::graph` key.
@@ -51,6 +53,8 @@ pub struct Gpu {
     done: CudaEvent,
     /// The side stream after the last `beside`'s copies; the next `beside` makes the stream wait for it.
     lag: std::sync::Mutex<Option<CudaEvent>>,
+    /// rope_freq tables by (base bits, n_rot), and the ones a graph capture asked for (see `rope_fr`).
+    fr: std::sync::Mutex<(HashMap<(u32, usize), CudaSlice<f64>>, Vec<(f32, usize)>)>,
 }
 
 const RING: usize = 64 << 20;
@@ -191,7 +195,8 @@ impl Gpu {
             .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm", "gemms"].map(|p| kname(p, t))))
             .chain(QTYPES.iter().flat_map(|&t| ["gemv", "gemvn", "moe_gemv"].map(|p| kname(p, t) + "_p")))
             .chain(QTYPES.iter().filter(|&&t| int8_mma && !Self::float_ty(t)).flat_map(|&t| [kname("gemmi", t), kname("gemmis", t)]))
-            .chain([64, 128, 256, 512].iter().flat_map(|h| [format!("attn_decode_{h}"), format!("attn_decode_gqa_{h}")]));
+            .chain([64, 128, 256, 512].iter().flat_map(|h| [format!("attn_decode_{h}"), format!("attn_decode_gqa_{h}")]))
+            .chain(["attn_decode_gqa4_128".to_string()]);
         for n in names {
             let f = module.load_function(&n).with_context(|| format!("kernel {n}"))?;
             // gemvn caches nt quantized inputs: 4 x 17408 columns (Qwen3.8-27B ffn_down) need 77 KB.
@@ -209,10 +214,31 @@ impl Gpu {
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = ctx.new_event(None)?;
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_q8, int8_mma, am, graphs: Default::default(), ring, done, lag: Default::default() })
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_q8, int8_mma, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
+
+    /// The rope frequencies base^(-2i / n_rot) as rms_norm_rope computes them in f64 (slow on consumer cards), made
+    /// once by the rope_freq kernel. While a graph is captured, a missing table gives 0 (the kernel computes them
+    /// itself) and is made after the capture, which `graph` then repeats.
+    fn rope_fr(&self, base: f32, n_rot: usize) -> anyhow::Result<u64> {
+        let mut fr = self.fr.lock().unwrap();
+        if let Some(t) = fr.0.get(&(base.to_bits(), n_rot)) { return Ok(self.ptr(t)); }
+        if self.stream.capture_status()? != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE {
+            fr.1.push((base, n_rot));
+            return Ok(0);
+        }
+        let t = self.stream.alloc_zeros::<f64>((n_rot / 2).max(1))?;
+        let p = self.ptr(&t);
+        let mut b = self.stream.launch_builder(self.f("rope_freq"));
+        let (bs, nr) = (base, n_rot as i32);
+        b.arg(&p); b.arg(&bs); b.arg(&nr);
+        unsafe { b.launch(cfg((1, 1), 256, 0)) }.context("launch rope_freq")?;
+        self.stream.synchronize()?;
+        fr.0.insert((base.to_bits(), n_rot), t);
+        Ok(p)
+    }
 
     /// The stream for the next launch: inside `batch`, odd launches go to `side`.
     fn st(&self) -> &Arc<CudaStream> {
@@ -254,8 +280,13 @@ impl Gpu {
         let grid = if sm { (grid.0, nd.div_ceil(32) as u32) } else { grid };
         let (same, act) = (act & SAME_X != 0, act & !SAME_X);
         let mut q8 = self.q8.lock().unwrap();
+        let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
+        let reuse = same && q8.1 == key;
         // The int8 path loads q8 rows 16 bytes at a time: their stride (cols * 11 / 8) is aligned only for cols % 128 == 0.
-        if !self.int8_mma || !Self::mmq(ty) || cols % 128 != 0 {
+        // A SAME_X gemm inside a batch cannot quantize x (the quantize and the gemm would land on different streams):
+        // when the cached q8 rows are not x's, use the f16 kernel. Turing has no int8 tensor-core mma.
+        let int8 = self.int8_mma && Self::mmq(ty) && cols.is_multiple_of(128);
+        if !int8 || (same && !reuse && self.nb.load(Relaxed) < BESIDE) {
             if !same { q8.1 = None; }
             launch!(self, &kname(if sm { "gemms" } else { "gemm" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
                 tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act);
@@ -269,8 +300,7 @@ impl Gpu {
         let need = n_x * (cols + cols / 8 + cols / 4);
         if q8.0.len() < need { q8.0 = self.stream.alloc_zeros::<u8>(need)?; }
         let xq = self.ptr(&q8.0);
-        let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
-        if !(same && q8.1 == key) {
+        if !reuse {
             anyhow::ensure!(self.nb.load(Relaxed) >= BESIDE, "gemm inside batch: x must be quantized already (SAME_X)");
             launch!(self, "quant_q8", cfg((n_x as u32, 1), 256, 0), x, x_stride as i32, xq, cols as i32);
             q8.1 = key;
@@ -321,8 +351,19 @@ impl Gpu {
         if !(1..=4).contains(&nt) { bail!("gemvn: {nt} inputs (1 to 4)"); }
         let (ncols, k1) = Self::gemv_cols("gemv", w.ty, w.cols)?;
         let (mut c, rpw) = Self::gemv_cfg(w.ty, w.rows, w.cols, 1);
-        c.shared_mem_bytes = if xq == 0 { c.shared_mem_bytes * nt as u32 } else { 0 };
+        let per = c.shared_mem_bytes;
+        c.shared_mem_bytes = if xq == 0 { per * nt as u32 } else { 0 };
         c.grid_dim.2 = z;
+        // Turing has 64 KB of opt-in shared memory, less than gemvn's nt cached x rows need for wide matrices
+        // (4 x 17408 columns is 77 KB). Run one token at a time there instead of failing the launch.
+        if xq == 0 && c.shared_mem_bytes > self.max_smem {
+            c.shared_mem_bytes = per;
+            for t in 0..nt {
+                let (xt, yt) = (x + 4 * t as u64 * x_stride as u64, y + 4 * t as u64 * y_stride as u64);
+                launch!(self, &k1, c, w.ptr, xt, yt, w.rows as i32, ncols, rpw, xq, pair.0, pair.1, pair.2);
+            }
+            return Ok(());
+        }
         // One token: gemv, whose kernel has no nt branches (gemvn's nt = 4 path costs it registers).
         if nt == 1 {
             launch!(self, &k1, c, w.ptr, x, y, w.rows as i32, ncols, rpw, xq, pair.0, pair.1, pair.2);
@@ -341,11 +382,13 @@ impl Gpu {
         let pz = (nh * ATT_SPLITS * (hd + 2)) as i32;
         // gq_min i32::MAX or 0 fixes the regime, so the kernel that would exit at once is not launched.
         if gq_min != 0 { launch!(self, &format!("attn_decode_{hd}"), cfg(((nh * nt) as u32, ATT_SPLITS_1 as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32); }
-        // attn_decode_gqa with the f16 cache at head_dim 128 or 256 also holds 2 chunks of K and V for its cp.async.
-        // Turing (sm_75) has 64 KB of shared memory a block: the head_dim 256 chunks do not fit, so it loads them
-        // through registers instead (kernels.cu ATT_RUN_CP).
-        let cp = if !self.kv_q8 && (hd == 128 || (hd == 256 && self.int8_mma)) { 2 * 2 * 32 * hd * 2 } else { 0 };
-        if gq_min != i32::MAX { launch!(self, &format!("attn_decode_gqa_{hd}"), cfg(((nh / g * nt) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4 + cp) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32); }
+        // attn_decode_gqa with the f16 cache at head_dim 128 or 256 also holds 2 chunks of K and V for its cp.async,
+        // attn_decode_gqa4_128 one. Turing (sm_75) has 64 KB of shared memory a block: the head_dim 256 chunks do
+        // not fit, so it loads them through registers instead (kernels.cu ATT_RUN_CP).
+        let cp = !self.kv_q8 && (hd == 128 || (hd == 256 && self.int8_mma));
+        let g4 = cp && g == 4 && hd == 128;
+        let (name, cp) = if g4 { ("attn_decode_gqa4_128".to_string(), 2 * 32 * hd * 2) } else { (format!("attn_decode_gqa_{hd}"), if cp { 2 * 2 * 32 * hd * 2 } else { 0 }) };
+        if gq_min != i32::MAX { launch!(self, &name, cfg(((nh / g * nt) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4 + cp) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32); }
         launch!(self, "attn_merge", LaunchConfig { grid_dim: (nh as u32, 1, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, part, qg, out, hd as i32, ATT_SPLITS as i32, step, ATT_SPLITS_1 as i32, gq_min, xq);
         Ok(())
     }
@@ -461,6 +504,12 @@ impl Backend for Gpu {
         r?;
         let g = g.ok_or_else(|| anyhow::anyhow!("empty CUDA graph"))?;
         g.launch()?;
+        // A rope table the capture lacked: make it, and capture again next time (this graph computes it per call).
+        let want = std::mem::take(&mut self.fr.lock().unwrap().1);
+        if !want.is_empty() {
+            for (base, n_rot) in want { self.rope_fr(base, n_rot)?; }
+            return Ok(());
+        }
         self.graphs.lock().unwrap().insert(key, Graph(g));
         Ok(())
     }
@@ -576,8 +625,9 @@ impl Backend for Gpu {
 
     fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
         anyhow::ensure!(n_rot <= n.min(512) && n % 32 == 0, "rms_norm_rope: head of {n}, n_rot {n_rot}");
+        let fr = self.rope_fr(base, n_rot)?;
         launch!(self, "rms_norm_rope", cfg((rows as u32, 1), 256, 0), x, x_stride as i32, w, out, n as i32, eps, per as i32, n_rot as i32, step, base, v, kc, vc,
-                0i32, 0u64, 0i32, 0u64, 0u64, 0i32);
+                0i32, 0u64, 0i32, 0u64, 0u64, 0i32, fr);
         Ok(())
     }
 
@@ -585,8 +635,9 @@ impl Backend for Gpu {
     fn rms_norm_rope_qk(&self, q: u64, q_stride: usize, qw: u64, qo: u64, qrows: usize, qper: usize, k: u64, kw: u64, ko: u64, krows: usize, kper: usize,
                         n: usize, eps: f32, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
         anyhow::ensure!(n_rot <= n.min(512) && n % 32 == 0, "rms_norm_rope: head of {n}, n_rot {n_rot}");
+        let fr = self.rope_fr(base, n_rot)?;
         launch!(self, "rms_norm_rope", cfg(((qrows + krows) as u32, 1), 256, 0), k, n as i32, kw, ko, n as i32, eps, kper as i32, n_rot as i32, step, base, v, kc, vc,
-                qrows as i32, q, q_stride as i32, qw, qo, qper as i32);
+                qrows as i32, q, q_stride as i32, qw, qo, qper as i32, fr);
         Ok(())
     }
 

@@ -54,11 +54,89 @@ pub fn host_ok(host: &str, bound: &str) -> bool {
     matches!(n.as_str(), "localhost" | "127.0.0.1" | "[::1]") || n == name(bound)
 }
 
+/// Whether the client closed the connection (it sends nothing more after its request).
+pub fn gone(c: &std::net::TcpStream) -> bool {
+    if c.set_nonblocking(true).is_err() { return false; }
+    let r = c.peek(&mut [0]);
+    let _ = c.set_nonblocking(false);
+    match r { Ok(n) => n == 0, Err(e) => e.kind() != std::io::ErrorKind::WouldBlock }
+}
+
 /// `Authorization` header check for `--api-key`, without an early exit on the first differing byte.
 pub fn key_ok(auth: &str, key: &str) -> bool {
     if key.is_empty() { return false; }
     let a = auth.strip_prefix("Bearer ").unwrap_or("").as_bytes();
     a.len() == key.len() && a.iter().zip(key.as_bytes()).fold(0, |x, (p, q)| x | (p ^ q)) == 0
+}
+
+/// The requests each customer key has open (`--max-per-key`), by key id.
+pub type Open = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, usize>>>;
+
+/// One request's place in its key's count of open requests; dropping it frees the place.
+pub struct Hold(Open, u64);
+
+impl Hold {
+    /// A place for key `id`, or None when it already has `cap` requests open.
+    pub fn take(open: &Open, id: u64, cap: usize) -> Option<Hold> {
+        let mut m = open.lock().unwrap();
+        let n = m.entry(id).or_default();
+        if *n >= cap { return None; }
+        *n += 1;
+        Some(Hold(open.clone(), id))
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let mut m = self.0.lock().unwrap();
+        if let Some(n) = m.get_mut(&self.1) { *n -= 1; if *n == 0 { m.remove(&self.1); } }
+    }
+}
+
+/// The API keys: `--api-key` (all routes) and the `--api-keys` file (chat and model list only). No key at all
+/// leaves the server open, as for local use.
+#[derive(Clone, Default)]
+pub struct Keys {
+    pub admin: Option<String>,
+    /// (name, key), the name as the file gives it.
+    pub users: Vec<(String, String)>,
+}
+
+/// Who sent a request: the key's name for the usage log, a number that keeps each key's cached conversations
+/// apart (0 for the admin key or an open server), and whether it may use the admin routes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Who { pub name: String, pub id: u64, pub admin: bool }
+
+impl Keys {
+    /// Reads a key file: one `name key` pair a line, `#` starts a comment.
+    pub fn parse(text: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let mut v: Vec<(String, String)> = vec![];
+        for (n, line) in text.lines().enumerate() {
+            let l = line.split('#').next().unwrap_or("").trim();
+            if l.is_empty() { continue; }
+            let mut it = l.split_whitespace();
+            let (Some(name), Some(key), None) = (it.next(), it.next(), it.next()) else { bail!("line {}: want `name key`", n + 1) };
+            if key.len() < 16 { bail!("line {}: key of {name} is shorter than 16 characters", n + 1); }
+            if v.iter().any(|(a, k)| a == name || k == key) { bail!("line {}: name or key of {name} repeats", n + 1); }
+            v.push((name.into(), key.into()));
+        }
+        Ok(v)
+    }
+
+    pub fn any(&self) -> bool { self.admin.is_some() || !self.users.is_empty() }
+
+    /// The sender of `auth` (an `Authorization` header), or None for a missing or wrong key.
+    pub fn who(&self, auth: &str) -> Option<Who> {
+        if !self.any() { return Some(Who { name: String::new(), id: 0, admin: true }); }
+        if self.admin.as_deref().is_some_and(|k| key_ok(auth, k)) { return Some(Who { name: "admin".into(), id: 0, admin: true }); }
+        // The id comes from the key, not its line, so a reloaded file with other lines gives no key another's id.
+        self.users.iter().find(|(_, k)| key_ok(auth, k)).map(|(n, k)| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::hash::DefaultHasher::new();
+            k.hash(&mut h);
+            Who { name: n.clone(), id: h.finish().max(1), admin: false }
+        })
+    }
 }
 
 /// GGUF models under `dir` and two folder levels below it, as (name relative to `dir` with `/` separators, path,
@@ -78,13 +156,18 @@ pub fn list_models(dir: &Path) -> Vec<(String, PathBuf, u64)> {
     out
 }
 
-/// The models among files given as (name, bytes): .gguf files, a split model once by its first shard with the
-/// bytes of all its shards, vision projectors (`mmproj*`) left out.
+/// The models among files given as (name, bytes): .gguf files, complete split models once by their first shard
+/// with the bytes of their shards, vision projectors (`mmproj*`) left out.
 pub fn models(files: &[(String, u64)]) -> Vec<(String, u64)> {
-    let parts = |stem: &str| files.iter().filter(|(m, _)| shard(m).is_some_and(|(s, _)| s == stem)).map(|x| x.1).sum();
+    let sizes: std::collections::HashMap<&str, u64> = files.iter().map(|(name, bytes)| (name.as_str(), *bytes)).collect();
     files.iter().filter(|(n, _)| n.ends_with(".gguf") && !n.rsplit('/').next().unwrap_or(n).starts_with("mmproj"))
-        .filter_map(|(n, b)| match shard(n) {
-            Some((stem, 1)) => Some((n.clone(), parts(stem))),
+        .filter_map(|(n, b)| match shard_parts(n) {
+            Some((stem, 1, total)) if total > 0 && total as usize <= files.len() => {
+                (1..=total).try_fold(0u64, |bytes, i| {
+                    sizes.get(format!("{stem}-{i:05}-of-{total:05}.gguf").as_str())
+                        .and_then(|part| bytes.checked_add(*part))
+                }).map(|bytes| (n.clone(), bytes))
+            }
             Some(_) => None,
             None => Some((n.clone(), *b)),
         }).collect()
@@ -92,11 +175,15 @@ pub fn models(files: &[(String, u64)]) -> Vec<(String, u64)> {
 
 /// "dir/name-00002-of-00003.gguf" gives ("dir/name", 2).
 pub fn shard(n: &str) -> Option<(&str, u32)> {
+    shard_parts(n).map(|(stem, i, _)| (stem, i))
+}
+
+fn shard_parts(n: &str) -> Option<(&str, u32, u32)> {
     let (head, total) = n.strip_suffix(".gguf")?.rsplit_once("-of-")?;
     let (stem, i) = head.rsplit_once('-')?;
     let digits = |s: &str| s.len() == 5 && s.bytes().all(|b| b.is_ascii_digit());
     if !digits(total) || !digits(i) { return None; }
-    Some((stem, i.parse().ok()?))
+    Some((stem, i.parse().ok()?, total.parse().ok()?))
 }
 
 /// The parts of an OpenAI chat completion request that strata uses. Sampling fields left out fall back to the
@@ -176,13 +263,17 @@ pub struct Stats {
     pub backend: String,
     pub device: String,
     pub ctx: usize,
+    #[serde(skip)]
+    pub ctx_train: Option<u64>,
+    /// Requests decoded at once (`--parallel`).
+    pub slots: usize,
     /// Device memory in use and in total, measured after the load and after each request.
     pub vram: Option<(u64, u64)>,
     /// MoE expert cache hits and misses, and MTP drafts tried and accepted, since the model loaded.
     pub experts: Option<(u64, u64)>,
     pub drafts: Option<(u64, u64)>,
-    /// A reply is being generated, and its tokens so far.
-    pub busy: bool,
+    /// Replies being generated, and their tokens so far.
+    pub busy: usize,
     pub live_tokens: usize,
     pub requests: u64,
     pub prompt_tokens: u64,
@@ -195,7 +286,7 @@ pub struct Stats {
 /// One answered chat request.
 #[derive(Clone, Default, serde::Serialize)]
 pub struct Last {
-    /// Unix time in seconds when it finished.
+    /// Unix time in seconds when it started.
     pub at: u64,
     pub model: String,
     /// Prompt tokens: the system part, reused from the previous request (cached, which includes the system part
@@ -218,6 +309,32 @@ impl Stats {
         self.completion_tokens += l.completion_tokens as u64;
         if self.recent.len() == 40 { self.recent.pop_front(); }
         self.recent.push_back(l);
+    }
+
+    /// The stats in Prometheus text format, with `waiting` requests open besides the scrape.
+    pub fn prometheus(&self, waiting: usize, uptime_s: u64) -> String {
+        let mut s = String::new();
+        let mut m = |name: &str, kind: &str, help: &str, v: u64| {
+            s += &format!("# HELP strata_{name} {help}\n# TYPE strata_{name} {kind}\nstrata_{name} {v}\n");
+        };
+        m("up", "gauge", "1 when a model is loaded and not loading.", (self.model.is_some() && !self.loading) as u64);
+        m("slots", "gauge", "Requests generated at once (--parallel).", self.slots as u64);
+        m("busy", "gauge", "Replies being generated.", self.busy as u64);
+        m("waiting", "gauge", "Requests being read, generated or queued.", waiting as u64);
+        m("uptime_seconds", "counter", "Seconds since the server started.", uptime_s);
+        m("requests_total", "counter", "Chat requests answered since start.", self.requests);
+        m("prompt_tokens_total", "counter", "Prompt tokens of answered requests.", self.prompt_tokens);
+        m("cached_prompt_tokens_total", "counter", "Prompt tokens reused from earlier requests.", self.cached_tokens);
+        m("completion_tokens_total", "counter", "Reply tokens of answered requests.", self.completion_tokens);
+        if let Some((u, t)) = self.vram {
+            m("vram_used_bytes", "gauge", "Device memory in use.", u);
+            m("vram_total_bytes", "gauge", "Device memory in total.", t);
+        }
+        if let Some((h, x)) = self.experts {
+            m("expert_hits_total", "counter", "Routed experts found on the GPU since the model loaded.", h);
+            m("expert_misses_total", "counter", "Routed experts computed on the CPU since the model loaded.", x);
+        }
+        s
     }
 
     /// The stats with no model loaded (`model` while it loads), keeping the totals and recent requests since start.

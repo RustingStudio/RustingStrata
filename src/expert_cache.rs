@@ -8,6 +8,10 @@ use crate::quant::GgmlType;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// Share of each count kept per `adapt` (every 8 tokens by default): `counts` and `long`.
+const KEEP: f32 = 0.95;
+const LONG_KEEP: f32 = 0.999;
+
 pub const MATS: [&str; 3] = ["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"];
 
 #[derive(Clone, Copy)]
@@ -26,8 +30,12 @@ pub struct ExpertCache {
     pools: Vec<Pool>,
     layers: Vec<Option<LayerExperts>>,
     n_expert: usize,
-    /// Decayed routing counts, [layer * n_expert + expert].
+    /// Decayed routing counts, [layer * n_expert + expert]: they forget in a few hundred tokens, for `adapt`.
     counts: Vec<f32>,
+    /// The same counts with a memory of some ten thousand tokens: the saved profile and the initial placement. A
+    /// profile of the last reply alone made the next run's placement fit that reply only, and where the placement
+    /// changes the greedy text (CPU and GPU experts round differently), runs alternated between two placements.
+    long: Vec<f32>,
     /// None under `STRATA_FIXED_EXPERTS`: placement ignores and keeps the saved profile and never adapts.
     profile: Option<PathBuf>,
     pub swaps: usize,
@@ -74,8 +82,12 @@ impl ExpertCache {
             .filter(|b| b.len() >= 4 * c.n_layer * n)
             .map(|b| b.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect::<Vec<_>>())
             .unwrap_or_default();
-        let mut counts = counts;
-        counts.resize(n_layers * n, 0.0);
+        let mut long = counts;
+        long.resize(n_layers * n, 0.0);
+        // `counts` start from the profile at the size routing gives them in steady state (k experts per token, an
+        // adapt every 8 tokens), so the first tokens of a run do not move the placement more than later ones.
+        let steady = (c.n_expert_used * 8) as f32 / (1.0 - KEEP);
+        let counts = long.chunks(n.max(1)).flat_map(|l| { let s = l.iter().sum::<f32>(); l.iter().map(move |x| if s > 0.0 { x * steady / s } else { 0.0 }) }).collect();
 
         // The budget comes from the driver's free-memory estimate, which can be more than it will allocate (AMD's
         // Windows driver): on a failed allocation, free the pools and try a tenth less.
@@ -103,7 +115,7 @@ impl ExpertCache {
                 }),
             });
         }
-        let mut cache = ExpertCache { pools, layers: out, n_expert: n, counts, profile, swaps: 0 };
+        let mut cache = ExpertCache { pools, layers: out, n_expert: n, counts, long, profile, swaps: 0 };
         // Initial fill: hottest first by profile; ties (and no profile) keep layer order.
         let mut order: Vec<usize> = (0..n_layers * n).filter(|&i| cache.layers[i / n].is_some()).collect();
         order.sort_by(|&a, &b| cache.counts[b].total_cmp(&cache.counts[a]).then(a.cmp(&b)));
@@ -160,13 +172,17 @@ impl ExpertCache {
     pub fn total_experts(&self) -> usize { self.layers.iter().flatten().count() * self.n_expert }
 
     pub fn record(&mut self, il: usize, ids: &[i32]) {
-        for &e in ids { self.counts[il * self.n_expert + e as usize] += 1.0; }
+        for &e in ids {
+            self.counts[il * self.n_expert + e as usize] += 1.0;
+            self.long[il * self.n_expert + e as usize] += 1.0;
+        }
     }
 
     /// Decay counts, then per pool swap up to `max_swaps` cold residents for clearly hotter missed experts.
     pub fn adapt(&mut self, m: &Model, gpu: &dyn Backend, max_swaps: usize) -> anyhow::Result<()> {
         if self.profile.is_none() { return Ok(()); }
-        for c in &mut self.counts { *c *= 0.95; }
+        for c in &mut self.counts { *c *= KEEP; }
+        for c in &mut self.long { *c *= LONG_KEEP; }
         let n = self.n_expert;
         for p in 0..self.pools.len() {
             let mut hot: Vec<usize> = (0..self.counts.len())
@@ -197,10 +213,10 @@ impl ExpertCache {
         std::fs::create_dir_all(profile.parent().unwrap())?;
         // Layers of other caches (a model split over devices) keep the counts their caches saved.
         let mut all: Vec<f32> = std::fs::read(profile).unwrap_or_default().chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect();
-        all.resize(all.len().max(self.counts.len()), 0.0);
+        all.resize(all.len().max(self.long.len()), 0.0);
         let n = self.n_expert;
         for (il, l) in self.layers.iter().enumerate() {
-            if l.is_some() { all[il * n..(il + 1) * n].copy_from_slice(&self.counts[il * n..(il + 1) * n]); }
+            if l.is_some() { all[il * n..(il + 1) * n].copy_from_slice(&self.long[il * n..(il + 1) * n]); }
         }
         std::fs::write(profile, all.iter().flat_map(|c| c.to_le_bytes()).collect::<Vec<u8>>())?;
         Ok(())

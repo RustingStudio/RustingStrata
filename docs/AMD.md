@@ -15,7 +15,8 @@ vulkan: AMD Radeon RX 9070 XT (radv Mesa 26.2.5), device-coherent memory yes, co
 ```
 
 - `device-coherent memory` must be `yes` for models whose experts do not all fit in VRAM (see below).
-- `cooperative matrix` speeds up prefill. `int8 no` is normal on RDNA.
+- `cooperative matrix` speeds up prefill. `int8 no` is normal on RDNA. Without it, prefill attention uses a
+  shared-memory tiled fallback; the `_dp` GEMM kernels still run without tensor cores.
 - `conditional rendering` lets decode recover when the CPU expert worker is slow. With `no`, a slow worker is an error.
 
 ## Known issues
@@ -48,6 +49,7 @@ be more than it will allocate. Lower `--ctx`, use `--kv q8`, or a smaller `--chu
 Environment variables; set any of them to turn the feature off:
 
 - `STRATA_VK_NO_COOP`: no cooperative matrices.
+- `STRATA_VK_DP_OLD`: use the old per-query prefill attention fallback instead of the tiled one (A/B and rollback).
 - `STRATA_VK_NO_COND`: no conditional rendering.
 - `STRATA_VK_NO_TQ`: no separate transfer queue for expert uploads.
 - `radv_device_coherent_memory=false`: undo the RADV option strata sets.

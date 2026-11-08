@@ -32,16 +32,18 @@ const uint PX = 20, PW = KS == 32 ? 20 : 36;
 // X and W are double buffered: step kb + 1 is stored while step kb's products run, so one barrier per step.
 shared uint xq[2 * XM * PX], wq[2 * 64 * PW];
 shared float xd[2][XM][2], xsum[2][XM][4], wsc[2][64][4], wmn[2][64][4];
-// int to float for |c| < 2^22 without the quarter-rate I2F, as i2f_small in kernels.cu.
-float i2f_small(int c) { return intBitsToFloat(0x4B400000 + c) - 12582912.0; }
-// acc += dx dw c - sx mw, rounded as in kernels.cu.
-void scale_add(inout precise float acc, int c, float dx, float dw, float sx, float mw) {
+// The int32 sums start at I2F_BIAS, so a sum c is held as I2F_BIAS + c: for |c| < 2^22 its float is then the
+// bits minus 2^23 + 2^22, without the quarter-rate I2F (i2f_small in kernels.cu).
+const int I2F_BIAS = 0x4B400000;
+float i2f_small(int bc) { return intBitsToFloat(bc) - 12582912.0; }
+// acc += dx dw c - sx mw for the biased sum bc, rounded as in kernels.cu.
+void scale_add(inout precise float acc, int bc, float dx, float dw, float sx, float mw) {
     precise float s = dx * dw;
     if (MIN) {
-        precise float f = fma(i2f_small(c), s, -(sx * mw));
+        precise float f = fma(i2f_small(bc), s, -(sx * mw));
         acc = acc + f;
     } else {
-        acc = fma(i2f_small(c), s, acc);
+        acc = fma(i2f_small(bc), s, acc);
     }
 }
 // The 16 weights (subs 2 wi, 2 wi + 1 of step kb) of row n0 + wr, packed, with the first sub's scale and min.
@@ -164,7 +166,7 @@ void main() {
             [[unroll]] for (uint mt = 0; mt < 2; mt++)
                 [[unroll]] for (uint nt = 0; nt < 2; nt++) if (!sm || mt + nt == 0) {
 #if COOP
-                    IACC c = coopMatMulAdd(a[mt], b[nt], IACC(0));
+                    IACC c = coopMatMulAdd(a[mt], b[nt], IACC(I2F_BIAS));
 #else
                     // The KS int8 of x rows RI and w rows CI (for KS = 16 the zeros after them add nothing).
                     uint xw[2][KS / 4], ww[4][KS / 4];
@@ -174,7 +176,7 @@ void main() {
                         [[unroll]] for (uint e = 0; e < 4; e++) ww[e][j] = wq[(xb * 64 + bn + 16 * nt + CI(e)) * PW + h * 8 + j];
                     }
                     [[unroll]] for (uint i = 0; i < 8; i++) {
-                        c[i] = 0;
+                        c[i] = I2F_BIAS;
                         [[unroll]] for (uint j = 0; j < KS / 4; j++) c[i] += dotPacked4x8EXT(int(xw[i >> 2][j]), int(ww[i & 3][j]));
                     }
 #endif
