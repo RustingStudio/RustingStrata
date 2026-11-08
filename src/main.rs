@@ -340,10 +340,11 @@ enum Cmd {
         vram_margin: usize,
         #[arg(long)]
         backend: Option<String>,
-    #[arg(long, default_value_t = 0)]
-    device: usize,
-    #[arg(long, value_name = "PATH:SCALE", action = clap::ArgAction::Append)]
-    lora: Vec<String>,
+        #[arg(long, default_value_t = 0)]
+        device: usize,
+        /// Accepted for consistency with the other commands; calibration always uses the base model.
+        #[arg(long, value_name = "PATH:SCALE", action = clap::ArgAction::Append)]
+        lora: Vec<String>,
         /// KV cache format to calibrate with (q8 leaves more VRAM for experts), as `--kv` of the runs that use it.
         #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
         kv: String,
@@ -556,15 +557,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Calibrate { model, ctx, vram_margin, backend, device, kv, lora, gpu: _ } => {
             if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
-            let specs: Vec<(String, f32)> = lora.iter().map(|s| {
-                if let Some(idx) = s.rfind(':') {
-                    if let Ok(scale) = s[idx+1..].parse::<f32>() {
-                        return (s[..idx].to_string(), scale);
-                    }
-                }
-                (s.clone(), 1.0)
-            }).collect();
-            calibrate(&model, ctx, vram_margin << 20, backend.as_deref(), device, &specs)?
+            if !lora.is_empty() { eprintln!("note: --lora is ignored by calibrate; calibration uses the base model"); }
+            calibrate(&model, ctx, vram_margin << 20, backend.as_deref(), device)?
         }
         Cmd::Chat { model, system, n, think, mut engine } => {
             let g = Gguf::open(&model)?;
@@ -719,8 +713,14 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         // Clients list the models often; a model still loading is listed, as its chats wait for the load.
                         Ok(r) if r.method == "GET" && r.path.split('?').next() == Some("/v1/models") && (k.read().unwrap().any() || serve::host_ok(&r.host, &a)) => {
                             let created = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                            let m = st.lock().unwrap().model.clone();
-                            return reply(json!({"object": "list", "data": m.map(|id| json!([{"id": id, "object": "model", "created": created, "owned_by": "strata"}])).unwrap_or(json!([]))}), "200 OK");
+                            let (m, n_ctx, n_ctx_train) = {
+                                let state = st.lock().unwrap();
+                                (state.model.clone(), state.ctx, state.ctx_train)
+                            };
+                            return reply(json!({"object": "list", "data": m.map(|id| json!([{
+                                "id": id, "object": "model", "created": created, "owned_by": "strata",
+                                "meta": {"n_ctx": n_ctx, "n_ctx_train": n_ctx_train}
+                            }])).unwrap_or(json!([]))}), "200 OK");
                         }
                         _ => {}
                     }
@@ -791,10 +791,9 @@ fn best(f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<f64> {
     Ok(b)
 }
 
-fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device: usize, lora: &[(String, f32)]) -> anyhow::Result<()> {
+fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device: usize) -> anyhow::Result<()> {
     let g = Gguf::open(model)?;
-    let mut m = Model::load(&g)?;
-    if !lora.is_empty() { m.apply_lora(lora)?; }
+    let m = Model::load(&g)?;
     let tok = Tokenizer::from_gguf(&g)?;
     let n_pf = 4096.min(ctx.saturating_sub(256));
     anyhow::ensure!(n_pf >= 512, "--ctx too small to calibrate");
@@ -1178,8 +1177,14 @@ impl Serving {
 fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<TcpStream>) -> anyhow::Result<Option<(PathBuf, TcpStream)>> {
     eprintln!("loading {}", model.display());
     let name = model.file_stem().and_then(|s| s.to_str()).unwrap_or("strata").to_string();
-    s.stats.lock().unwrap().unload(Some(name.clone()));
+    {
+        let mut st = s.stats.lock().unwrap();
+        st.unload(Some(name.clone()));
+        st.ctx = engine.ctx;
+    }
     let g = Gguf::open(model)?;
+    let arch = g.get("general.architecture")?.as_str().context("general.architecture")?;
+    s.stats.lock().unwrap().ctx_train = g.meta.get(&format!("{arch}.context_length")).and_then(|v| v.as_u64());
     let mut m = Model::load(&g)?;
     if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
     let tok = Tokenizer::from_gguf(&g)?;
@@ -1390,14 +1395,21 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                         write!(w, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), None))?;
                     }
                 }
+                let mut last_stream_activity = Instant::now();
                 decode(r, tok, e.mtp() > 0, &mut smp, logits, n, &mut |t| {
                     s.stats.lock().unwrap().live_tokens += 1;
                     // A client that left stops the reply (a stream notices on the next write; held text writes nothing).
                     k += 1;
                     if k % 16 == 0 && serve::gone(&w) { anyhow::bail!("client closed the connection"); }
                     let t = hold.push(t);
-                    if req.stream && !t.is_empty() {
-                        if !anth { write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?; } else { text_delta(&mut w, &mut opened, &t)?; }
+                    if req.stream {
+                        if !t.is_empty() {
+                            if !anth { write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?; } else { text_delta(&mut w, &mut opened, &t)?; }
+                            last_stream_activity = Instant::now();
+                        } else if last_stream_activity.elapsed() >= Duration::from_secs(15) {
+                            w.write_all(b": keep-alive\n\n")?;
+                            last_stream_activity = Instant::now();
+                        }
                     }
                     Ok(hold.stopped)
                 })

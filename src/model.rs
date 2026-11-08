@@ -125,20 +125,11 @@ impl<'a> Model<'a> {
     }
 
     pub fn apply_lora(&mut self, specs: &[(String, f32)]) -> anyhow::Result<()> {
-        for name in &self.w.lora_baked.clone() {
-            self.w.built.remove(name);
-        }
-        self.w.lora_baked.clear();
-        self.loras.clear();
-        for (path, scale) in specs {
-            self.loras.push(load_lora(path, *scale)?);
-        }
+        // Load everything before touching the current overlays, so a bad adapter leaves the model unchanged.
+        let loras: Vec<Lora> = specs.iter().map(|(path, scale)| load_lora(path, *scale)).collect::<anyhow::Result<_>>()?;
+        self.w.clear_baked();
+        self.loras = loras;
         self.w.bake_lora(&self.loras);
-        if !self.loras.is_empty() {
-            unsafe { std::env::set_var("STRATA_NO_GRAPH", "1"); }
-        } else {
-            unsafe { std::env::remove_var("STRATA_NO_GRAPH"); }
-        }
         Ok(())
     }
 
@@ -157,7 +148,7 @@ impl<'a> Model<'a> {
                     for i in 0..in_dim {
                         if i < x.len() { s += a[r * in_dim + i] * x[i]; }
                     }
-                let coef = if lora.alpha > 0.0 { lora.scale * lora.alpha / rank as f32 * s } else { lora.scale * s };
+                    let coef = if lora.alpha > 0.0 { lora.scale * lora.alpha / rank as f32 * s } else { lora.scale * s };
                     for o in 0..out_dim {
                         if o < y.len() { y[o] += coef * b[o * rank + r]; }
                     }
@@ -535,6 +526,7 @@ impl<'a> Model<'a> {
 pub fn load_lora(path: &str, scale: f32) -> anyhow::Result<Lora> {
     use crate::quant::GgmlType;
     use crate::weights::Tensor;
+    anyhow::ensure!(scale.is_finite(), "lora: {path}: scale must be finite");
     let g = Gguf::open(Path::new(path))?;
     let alpha = g.meta.get("adapter.lora.alpha").and_then(|v| v.as_f32()).unwrap_or(0.0);
     let mut bases = std::collections::BTreeSet::new();
@@ -552,10 +544,16 @@ pub fn load_lora(path: &str, scale: f32) -> anyhow::Result<Lora> {
         let b_flat = b_t.to_f32();
         let a_dims = &a_info.dims;
         let b_dims = &b_info.dims;
+        anyhow::ensure!(a_dims.len() >= 2 && b_dims.len() >= 2, "lora: {base}: rank or dimensions missing");
         let in_dim = a_dims[0] as usize;
         let rank = a_dims[1] as usize;
         let n_expert = *a_dims.get(2).unwrap_or(&1) as usize;
         let out_dim = b_dims[1] as usize;
+        anyhow::ensure!(rank > 0 && in_dim > 0 && out_dim > 0 && n_expert > 0, "lora: {base}: empty dimension");
+        anyhow::ensure!(b_dims[0] as usize == rank, "lora: {base}: lora_b rank {} != lora_a rank {rank}", b_dims[0]);
+        anyhow::ensure!(*b_dims.get(2).unwrap_or(&1) as usize == n_expert, "lora: {base}: expert count differs between lora_a and lora_b");
+        anyhow::ensure!(a_flat.len() >= n_expert * rank * in_dim, "lora: {base}: truncated lora_a");
+        anyhow::ensure!(b_flat.len() >= n_expert * out_dim * rank, "lora: {base}: truncated lora_b");
         let mut a_experts = vec![vec![0f32; rank * in_dim]; n_expert];
         let mut b_experts = vec![vec![0f32; out_dim * rank]; n_expert];
         for e in 0..n_expert {
@@ -576,9 +574,46 @@ pub fn load_lora(path: &str, scale: f32) -> anyhow::Result<Lora> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn w_str(b: &mut Vec<u8>, s: &str) { b.extend((s.len() as u64).to_le_bytes()); b.extend(s.as_bytes()); }
+
+    fn tiny_adapter(tag: &str) -> std::path::PathBuf {
+        let (in_dim, rank, out_dim) = (4u64, 2u64, 3u64);
+        let (mut b, mut off) = (Vec::new(), 0u64);
+        b.extend(b"GGUF");
+        b.extend(3u32.to_le_bytes());
+        b.extend(2u64.to_le_bytes());
+        b.extend(1u64.to_le_bytes());
+        w_str(&mut b, "adapter.lora.alpha");
+        b.extend(6u32.to_le_bytes());
+        b.extend(2.0f32.to_le_bytes());
+        for (name, dims) in [("blk.0.ffn_down_exps.weight.lora_a", [in_dim, rank, 1]), ("blk.0.ffn_down_exps.weight.lora_b", [rank, out_dim, 1])] {
+            w_str(&mut b, name);
+            b.extend(3u32.to_le_bytes());
+            for d in dims { b.extend(d.to_le_bytes()); }
+            b.extend(0u32.to_le_bytes());  // F32
+            b.extend(off.to_le_bytes());
+            off += (dims[0] * dims[1] * dims[2] * 4).next_multiple_of(32);
+        }
+        while b.len() % 32 != 0 { b.push(0); }
+        let a: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let w: Vec<f32> = (0..6).map(|i| 10.0 + i as f32).collect();
+        b.extend(a.iter().flat_map(|f| f.to_le_bytes()));
+        b.extend(w.iter().flat_map(|f| f.to_le_bytes()));
+        let p = std::env::temp_dir().join(format!("strata-lora-{}-{tag}.gguf", std::process::id()));
+        std::fs::write(&p, &b).unwrap();
+        p
+    }
+
     #[test]
     fn load_lora_adapter() {
-        let l = load_lora("C:/Users/mmeadow/.cache/huggingface/hub/models--apetersson--Qwen3.8-Flash-Next-Abliterated-Adapter/snapshots/3f8a78ea4c6a21fa798f4c34dc39a8b06e5c19ce/UD-IQ4_XS/adapter.gguf", 1.0).unwrap();
-        assert_eq!(l.entries.len(), 145);
+        let p = tiny_adapter("parse");
+        let l = load_lora(p.to_str().unwrap(), 0.5).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert_eq!((l.scale, l.alpha), (0.5, 2.0));
+        let e = &l.entries["blk.0.ffn_down_exps.weight"];
+        assert_eq!((e.rank, e.in_dim, e.out_dim, e.n_expert), (2, 4, 3, 1));
+        assert_eq!(e.a[0], (0..8).map(|i| i as f32).collect::<Vec<_>>());
+        assert_eq!(e.b[0], (0..6).map(|i| 10.0 + i as f32).collect::<Vec<_>>());
     }
 }
