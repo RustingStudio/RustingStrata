@@ -308,8 +308,8 @@ mod tests {
     fn shared_memory_matches_the_committed_spirv() {
         assert_eq!(shared_bytes("gemmi_dp", &[0, 10, 84, 0, 0], false).unwrap(), 49152);  // Q2_K: KS = 16
         assert_eq!(shared_bytes("gemmi_dp", &[0, 21, 110, 0, 0], false).unwrap(), 40960);  // IQ3_S: KS = 32
-        // The COOP variant carries the 16-byte IQ lookup tables: the historical 49168-byte request.
-        assert_eq!(shared_bytes("gemmi", &[0, 10, 84, 0, 0], false).unwrap(), 49168);
+        // The COOP variant reads the IQ tables from the buffer too (a shared copy made it ask for 49168, 16 over 48 KB).
+        assert_eq!(shared_bytes("gemmi", &[0, 10, 84, 0, 0], false).unwrap(), 49152);
     }
 
     #[test]
