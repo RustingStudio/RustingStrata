@@ -1060,6 +1060,7 @@ impl Backend for Vk {
     fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
         self.gemm_raw(w.ty, w.rows, w.cols, 0, n.div_ceil(128), w.ptr, n, x, x_stride, n, 0, y, y_stride, act)
     }
+    fn int8_gemm(&self, ty: GgmlType) -> bool { crate::cuda::Gpu::mmq(ty) }
 
     fn prequant_gemm_x(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize) -> anyhow::Result<()> {
         let mut q8 = self.3.lock().unwrap();
