@@ -155,6 +155,10 @@ impl Runner<'_> {
     }
     /// Seconds spent waiting on CPU experts so far (GPU only).
     fn cpu_secs(&self) -> f64 { if let Runner::Gpu(g) = self { g.parts().map(|p| p.cpu_time.as_secs_f64()).sum() } else { 0.0 } }
+    /// Bytes of routed-expert weights one decode token reads from the cache (0 without an expert cache).
+    fn expert_bytes_per_token(&self) -> usize {
+        if let Runner::Gpu(g) = self { g.parts().map(|p| p.expert_bytes_per_token()).sum() } else { 0 }
+    }
     /// Split model: seconds per part but the last (forward until its GPU is done, copy to the next part).
     fn split_secs(&self) -> Vec<(f64, f64)> {
         let Runner::Gpu(g) = self else { return vec![] };
@@ -169,8 +173,18 @@ impl Runner<'_> {
             if g.drafts.0 > 0 { eprintln!("MTP drafts accepted {}/{} ({:.1}%)", g.drafts.1, g.drafts.0, 100.0 * g.drafts.1 as f64 / g.drafts.0 as f64); }
             eprintln!("expert hit rate {:.1}% ({} misses), cache swaps {}", 100.0 * hits as f64 / (hits + misses).max(1) as f64, misses,
                 sum(&|p| p.cache.as_ref().map_or(0, |c| c.swaps)));
-            let resumed = sum(&|p| p.resumed.get());
-            if resumed > 0 { eprintln!("GPU waits for the CPU expert worker that timed out and resumed: {resumed}"); }
+            // Issue #34 R1: printed on every run, so a fully resident run reads as a measured 0 in the log instead of
+            // an absent line. `tokens` counts the token forwards the worker could have been asked about.
+            let tokens = sum(&|p| p.tokens);
+            let busy: f64 = g.parts().map(|p| p.cpu_time.as_secs_f64()).sum();
+            let stalls = sum(&|p| p.resumed.get());
+            eprintln!("worker busy {:.1} µs/token, worker stalls {stalls}", if tokens > 0 { 1e6 * busy / tokens as f64 } else { 0.0 });
+            let cached = g.parts().filter(|p| p.cache.is_some()).collect::<Vec<_>>();
+            let (res, tot) = (sum(&|p| p.cache.as_ref().map_or(0, |c| c.resident_count())), sum(&|p| p.cache.as_ref().map_or(0, |c| c.total_experts())));
+            let mode = if cached.is_empty() { "no expert cache".to_string() }
+                else if cached.iter().all(|p| p.expert_fast_path()) { format!("fast path on, {res}/{tot} experts resident") }
+                else { format!("fast path off, {res}/{tot} experts resident") };
+            eprintln!("mailbox traffic: {} GPU writes, {} host routing reads ({mode})", sum(&|p| p.mailbox_writes.get()), sum(&|p| p.mailbox_reads.get()));
             for p in g.parts() { if let Some(c) = &p.cache { c.save_profile()?; } }
         }
         Ok(())
@@ -544,6 +558,13 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     format!("{:.1} ({lo:.1}-{hi:.1})", v.iter().sum::<f64>() / v.len() as f64)
                 };
                 println!("pp {n:6}: prefill {} tok/s | tg {tg}: decode {} tok/s", stat(&p), stat(&d));
+                // R3: the attained expert-read bandwidth (bytes per token x tokens per second), against the ~900 GB/s
+                // of the V100, for the prefetch decision the window records.
+                let eb = r.expert_bytes_per_token();
+                if eb > 0 {
+                    let mid = { let mut v = d.clone(); v.sort_by(f64::total_cmp); v[v.len() / 2] };
+                    eprintln!("expert traffic: {:.1} MB/token -> {:.1} GB/s at {mid:.1} tok/s", eb as f64 / 1048576.0, eb as f64 * mid / 1e9);
+                }
             }
             r.finish()?;
         }

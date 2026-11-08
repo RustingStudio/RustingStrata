@@ -839,3 +839,112 @@ nvidia-smi --query-gpu=memory.used       # 0 MiB at the end
 
 `gemv_byte_budget_matches_issue` (device-free) pins the budget table above.
 `llama.router.service` was left stopped for the coordinator.
+
+## 2026-11-08 — MoE expert residency and next-layer prefetch (M2-T4, V100, sm_70)
+
+Window: `llama.router.service` stopped and queue drained by the coordinator, V100 free,
+`dmesg | grep -c Xid` = **42 before and after** (the Nov 6 entries, unchanged), GPU left at
+**0 MiB** / 50 °C idle, service left stopped for the coordinator. Build:
+`task/34-cuda-moe-residency` merged with `v100` @ `fd78100` (M2-T5 `b4d7408`), one binary per arm
+(CUDA sm_70 via NVRTC 12.9). Protocol unchanged: `tools/bench_v100.sh` →
+`--pp 512,4096,32768 --tg 128 --reps 3 --ctx 32896`, median of 3 reps, min–max in parentheses,
+one process per arm, ~60 s per arm.
+
+### Fully resident fast path (R1/R2)
+
+The reference model is 100 % resident, so the log now reads every counter of the task as a
+measured zero instead of omitting it (log of run 1; the other arms differ only in the numbers):
+
+```
+plan: weights+state+scratch 2560 MB (KV 642 MB for 32896 tokens, prefill 512 MB), expert slots 10040 MB, resident experts 10240/10240
+expert traffic: 10.4 MB per layer active set (top-8), 313.8 MB per token over 40 MoE layers
+pp    512: prefill 2135.7 (2129.6-2144.9) tok/s | tg 128: decode 129.5 (128.9-129.8) tok/s
+expert traffic: 313.8 MB/token -> 42.7 GB/s at 129.7 tok/s
+pp   4096: prefill 2970.2 (2966.9-2973.0) tok/s | tg 128: decode 125.2 (124.9-125.4) tok/s
+expert traffic: 313.8 MB/token -> 41.2 GB/s at 125.2 tok/s
+pp  32768: prefill 2386.8 (2385.6-2388.1) tok/s | tg 128: decode 110.6 (110.5-110.6) tok/s
+expert traffic: 313.8 MB/token -> 36.4 GB/s at 110.6 tok/s
+expert hit rate 100.0% (0 misses), cache swaps 0
+worker busy 0.0 µs/token, worker stalls 0
+mailbox traffic: 0 GPU writes, 0 host routing reads (fast path on, 10240/10240 experts resident)
+```
+
+`10.4 MB` is the **largest** layer's active set (biggest expert size class, 1.30 MB per slot); the
+mean layer is **7.85 MB** (313.8 MB / 40), which matches the 7.9 MB of the issue. Both exceed the
+6 MB L2 and the token set is 313.8 MB, read at **36.4–42.7 GB/s = 4.1–4.8 %** of the 898.0 GB/s
+HBM2 roofline of M2-T5: decode is not expert-bandwidth bound, which is what R3 assumes.
+
+| arm | pp 512 | pp 4096 | pp 32768 | tg @512 | tg @4096 | tg @32768 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `v100` `fd78100` (no #34) | 2122.7 (2116.9–2129.0) | 2939.3 (2935.7–2941.4) | 2364.8 (2361.2–2368.3) | 128.1 (127.4–128.4) | 123.7 (123.4–123.9) | 109.5 (109.5–109.5) |
+| #34, run 1 | 2135.7 (2129.6–2144.9) | 2970.2 (2966.9–2973.0) | 2386.8 (2385.6–2388.1) | 129.5 (128.9–129.8) | 125.2 (124.9–125.4) | 110.6 (110.5–110.6) |
+| #34, run 2 | 2113.5 (2106.1–2123.9) | 2924.7 (2921.2–2929.1) | 2360.3 (2358.9–2362.4) | 129.4 (128.6–129.8) | 125.1 (125.0–125.3) | 110.6 (110.5–110.7) |
+
+Against the same-code reference, decode gains **+1.1 / +1.2 / +1.0 %** (`tg @512/@4096/@32768`,
+run 1) and **+1.0 / +1.1 / +1.0 %** (run 2); prefill is within −0.5 … +1.1 % of the reference's own
+spread. Removed per token, all now printed as zero: the worker request, the worker's scan of every
+layer's REQ/SKIP words, the host routing read + `record` per layer, and `adapt`'s scan of all 10240
+entries every 8 tokens. What remains is the GEMV work of M2-T5.
+
+Caveat on the size of the gain: the *same* `v100` reference binary measured **121.2 (120.9–121.3)
+@4096 and 107.4 @32768** at 07:33 UTC and **123.7 / 109.5** at 08:42 UTC in this window, i.e. the
+window itself drifts ~2 % (clock ramp), more than the +1 % this task earns. The direction is
+consistent across two runs and three sizes, but the margin is inside the window-to-window noise.
+
+Issue acceptance thresholds (derived from M2-T2/T3): `tg @4096 ≥ 121.8` → 125.2 **pass**,
+`pp 512 ≥ 2010` → 2135.7 **pass**, `pp 4096 ≥ 2730` → 2970.2 **pass**, `tg @32768 ≥ 117.5` → 110.6
+**not met**. That bar predates M2-T5, whose own window measured 109.5 @32768 after the 512-column
+expert `rpw` change (block above), and the same-code reference here is 109.5 as well: #34 is
+**+1.0 % on it**, so the miss is the stale bar rather than a regression of this task.
+
+### Forced partial residency (R2c)
+
+`STRATA_EXPERT_MB=6000` on the same binary, `--pp 4096 --tg 128 --reps 1`: 6117/10240 experts
+resident, the miss path runs to completion with no hang, no trap, no `Xid`:
+
+```
+plan: weights+state+scratch 2560 MB (KV 642 MB for 32896 tokens, prefill 512 MB), expert slots 5997 MB, resident experts 6117/10240
+pp   4096: prefill 2648.3 (2648.3-2648.3) tok/s | tg 128: decode 72.0 (72.0-72.0) tok/s
+expert hit rate 98.3% (702 misses), cache swaps 594
+worker busy 5937.3 µs/token, worker stalls 0
+mailbox traffic: 80 GPU writes, 5120 host routing reads (fast path off, 6117/10240 experts resident)
+```
+
+Hit rate < 100 %, non-zero swaps (594) and 5.9 ms/token of CPU expert work prove the partial path
+still publishes to the mailbox, waits on the worker and adapts, exactly as before #34. The 702
+misses are 1.7 % of the 40 960 routed experts of the run. `80 GPU writes` counts the `moe_route`
+launches the **host** enqueued (two graph recordings for 40 layers each); a replayed CUDA graph
+re-writes the same mailbox without a host call, so the figure is a lower bound on the partial path
+and exactly 0 on the fast path, where the recorded graph carries `mb = 0`.
+
+### Next-layer L2 prefetch (`STRATA_MOE_PREFETCH=1`) — rejected
+
+Same binary, same window, same protocol, one arm with the knob (default off), interleaved with the
+two baseline runs above:
+
+| arm | pp 512 | pp 4096 | pp 32768 | tg @512 | tg @4096 | tg @32768 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| #34, no prefetch (2 runs) | 2113.5–2135.7 | 2924.7–2970.2 | 2360.3–2386.8 | 129.4–129.5 | 125.1–125.2 | 110.6 |
+| #34, `STRATA_MOE_PREFETCH=1` | 2121.7 (2117.8–2124.6) | 2933.7 (2930.4–2937.2) | 2361.6 (2358.9–2365.4) | 126.7 (126.0–127.1) | 122.5 (122.2–122.7) | 108.5 (108.4–108.6) |
+| Δ decode | | | | −2.2 % | −2.1 % | −1.9 % |
+
+Adoption rule (from the issue): adopt only if the median decode gain exceeds the rep spread at
+both 4K and 32K. Here it is a **loss of 1.9–2.2 % with a ±0.3 % spread** at all three sizes, i.e.
+well outside noise and in the opposite direction: **rejected** and left off by default.
+
+The result matches the prediction of the analysis: the previous token's routing of the next layer
+(8 experts ≈ 7.85 MB mean, 10.4 MB largest) does not fit the 6 MB L2 alongside the layer being
+computed, and decode runs at 4.1–4.8 % of the roofline, so a miss there costs nothing to hide.
+The prefetch adds ~256 blocks per layer per token (one 128-byte line per thread over the whole
+slot) whose issue bandwidth is not free, and no arm shows one L2 hit's worth of gain. The knob
+stays as the measurement hook (`STRATA_MOE_PREFETCH=1`), default off, no CLI flag.
+
+### Safety
+
+```sh
+dmesg -T | grep -c Xid        # 42 before the window and 42 after
+nvidia-smi --query-gpu=...    # 0 MiB used, 50 C, 0 % utilisation at the end
+```
+
+No `Xid`, no `device lost`, no trap (`worker stalls 0` in every arm). `llama.router.service` was
+left **stopped** for the coordinator.

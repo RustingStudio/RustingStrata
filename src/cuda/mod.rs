@@ -15,10 +15,10 @@ const QTYPES: [GgmlType; 22] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, Q4_1, Q5_1, Q4_0, Q5_0]
 };
-const KERNELS: [&str; 35] = [
+const KERNELS: [&str; 36] = [
     "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
-    "moe_combine_seq", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
+    "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv",
 ];
 
@@ -1055,9 +1055,19 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    fn moe_route(&self, p: u64, n: usize, k: usize, extra_scale: f32, table: u64, ids: u64, wts: u64, slots: u64, wh: u64, h: u64, mb: u64, nh: usize, h_off: usize, step: u64, t: usize) -> anyhow::Result<()> {
+    fn moe_route(&self, p: u64, n: usize, k: usize, extra_scale: f32, table: u64, ids: u64, wts: u64, slots: u64, wh: u64, h: u64, mb: u64, nh: usize, h_off: usize, step: u64, t: usize, pid: u64) -> anyhow::Result<()> {
         anyhow::ensure!(n <= 512 && k <= 32, "moe_route: {n} experts, top {k}");
-        launch!(self, "moe_route", cfg((1, 1), 256, 0), p, n as i32, k as i32, extra_scale, table, ids, wts, slots, wh, h, mb, nh as i32, h_off as i32, step, t as i32);
+        launch!(self, "moe_route", cfg((1, 1), 256, 0), p, n as i32, k as i32, extra_scale, table, ids, wts, slots, wh, h, mb, nh as i32, h_off as i32, step, t as i32, pid);
+        Ok(())
+    }
+
+    fn moe_mailbox_optional(&self) -> bool { true }
+
+    fn moe_prefetch_supported(&self) -> bool { true }
+
+    fn moe_prefetch(&self, ids: u64, k: usize, table: u64, base: u64, stride: usize, bytes: usize) -> anyhow::Result<()> {
+        let lines = (bytes >> 7) as u32;
+        launch!(self, "moe_prefetch", cfg((lines.div_ceil(256).max(1), k as u32), 256, 0), ids, k as i32, table, base, stride as i32, bytes as i32);
         Ok(())
     }
 
@@ -1194,12 +1204,13 @@ mod tests {
     }
 
     /// M1-T5, CPU-only: the loaded name list drops `gemmi_*`/`gemmis_*` only on a device where kernels.cu compiles
-    /// them out. 282 names today (sm_80, unchanged); 20 non-float types x 2 fewer names = 242 on sm_70.
+    /// them out. 283 names today (sm_80, unchanged by #34's `moe_prefetch`); 20 non-float types x 2 fewer names = 243
+    /// on sm_70.
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 282);
-        assert_eq!(sm70.len(), 242);
+        assert_eq!(sm80.len(), 283);
+        assert_eq!(sm70.len(), 243);
         assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmis")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());
