@@ -1,5 +1,5 @@
 # Greedy gate: strata and llama-server produce the same greedy continuation of one prompt.
-# Usage: python -I tools/greedy24.py <model.gguf> [--extra=--gpu] [--port 8199] [--bin target/release/strata]
+# Usage: python -I tools/greedy24.py <model.gguf> [--extra=--gpu] [--port 8199] [--bin target/release/rustingstrata]
 # Needs llama-server running on --port with the same model. Exit status 0 = identical.
 import argparse
 import json
@@ -11,7 +11,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("model")
 ap.add_argument("--extra", default="")
 ap.add_argument("--port", type=int, default=8199)
-ap.add_argument("--bin", default="target/release/strata")
+ap.add_argument("--bin", default="target/release/rustingstrata")
 ap.add_argument("--prompt", default="The capital of France is")
 ap.add_argument("-n", type=int, default=24)
 a = ap.parse_args()

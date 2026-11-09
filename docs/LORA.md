@@ -10,9 +10,9 @@ Abliteration via LoRA is a **rank-1, closed-form** weight edit, not a fine-tune.
 ## Usage
 
 ```
-strata.exe generate --model MODEL.gguf --lora ADAPTER.gguf:1.0 --prompt "..." -n 50
-strata.exe serve --model MODEL.gguf --lora ADAPTER.gguf:1.0 --addr 127.0.0.1:8080 --ctx 32768
-strata.exe chat --model MODEL.gguf --lora ADAPTER.gguf:1.0
+rustingstrata.exe generate --model MODEL.gguf --lora ADAPTER.gguf:1.0 --prompt "..." -n 50
+rustingstrata.exe serve --model MODEL.gguf --lora ADAPTER.gguf:1.0 --addr 127.0.0.1:8080 --ctx 32768
+rustingstrata.exe chat --model MODEL.gguf --lora ADAPTER.gguf:1.0
 ```
 
 `--lora` takes `path:scale` (repeatable) at the top level so `generate`/`chat`/`serve`/`bench`/`perplexity`/`score` apply it. `calibrate` accepts it for consistency but always calibrates the base model. Scale defaults to `1.0`; with `n_expert == 1` an adapter applies to every routed expert slot. Missing adapter targets warn (`lora: target … not found, skipping`). Graph capture (`CUDA graph` / Vulkan conditional) is bypassed for LoRA decode forwards.

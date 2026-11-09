@@ -2,7 +2,7 @@
 
 Every GPU that has run RustingStrata, what was tested on it, and by whom. "Tested" means a person ran it on that card;
 "compiles" means the source builds for that architecture but nobody has run it there. Numbers are from
-`strata bench` on `Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf` unless the row says otherwise, and are only comparable within one
+`rustingstrata bench` on `Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf` unless the row says otherwise, and are only comparable within one
 row.
 
 ## Tested
@@ -45,8 +45,8 @@ row.
 Open an issue or PR that adds a row. Please send:
 
 1. The first lines of output (`cuda device ...` or `vulkan: ...`), which name the GPU, driver and capabilities.
-2. `strata bench --model <gguf> --gpu --pp 512,4096 --tg 128 --reps 3` and the model file name.
-3. `cargo test --release` result (or the failing test names), and `strata check --backend vulkan --model <gguf>` for
+2. `rustingstrata bench --model <gguf> --gpu --pp 512,4096 --tg 128 --reps 3` and the model file name.
+3. `cargo test --release` result (or the failing test names), and `rustingstrata check --backend vulkan --model <gguf>` for
    Vulkan.
 4. Anything that failed: the exact error text.
 

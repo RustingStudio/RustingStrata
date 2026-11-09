@@ -1,6 +1,6 @@
 # Hosting RustingStrata for other people
 
-This page is for running `strata serve` as a service that other people or programs use over the network, for
+This page is for running `rustingstrata serve` as a service that other people or programs use over the network, for
 example to sell API access to a model. It covers keys, TLS through a reverse proxy, a systemd unit, health checks,
 the usage log for billing, and how many requests one server answers at once.
 
@@ -10,7 +10,7 @@ its own license (most Qwen models are Apache 2.0; check the model card).
 
 ## How much one server does
 
-By default `strata serve` answers one chat request at a time. Others wait in a queue (`--max-waiting`, 16 by default)
+By default `rustingstrata serve` answers one chat request at a time. Others wait in a queue (`--max-waiting`, 16 by default)
 and run in arrival order. `--max-waiting` counts every open connection (being read, generated or queued, health
 checks included), so with one reply running 15 places are left for the queue. Beyond it a connection gets
 `503 Service Unavailable` with `Retry-After: 2` (`--max-per-key` keeps one customer from taking all the places). One
@@ -63,7 +63,7 @@ What changes with `--parallel N`:
   another customer's one. Without `--api-keys` the queue is first come, first served.
 - **More than 4 slots** do not raise the total, because one pass decodes at most 4 requests. They let more users
   stream at the same time instead of waiting in the queue, each at a lower speed.
-- **Prefill.** Prompts are prefilled one at a time, in chunks (`--chunk`, from `strata calibrate`). After each
+- **Prefill.** Prompts are prefilled one at a time, in chunks (`--chunk`, from `rustingstrata calibrate`). After each
   chunk the requests that are decoding run for as long as the chunk took, so a long prompt and the streams share
   the GPU evenly: the prompt takes about twice as long to its first token, and each stream pauses for one chunk at a
   time. A smaller `--chunk` gives shorter pauses but a slower prefill. A 10K-token prompt that arrives while 3
@@ -98,14 +98,14 @@ On a Linux machine with an NVIDIA driver (or a Vulkan 1.3 driver):
 ```sh
 # 1. The binary: a release binary, or build it on this machine (.cargo/config.toml builds for the local CPU).
 cargo build --release
-sudo install -m 755 target/release/strata /usr/local/bin/strata
+sudo install -m 755 target/release/rustingstrata /usr/local/bin/rustingstrata
 
 # 2. A service user, a model, and the calibration for this machine (once per model and machine). It runs as the
 #    service user, with the --ctx and --kv of the server, because it is kept in that user's ~/.cache/rusting_strata.
 sudo useradd --system --create-home --home-dir /var/lib/strata strata
 sudo usermod -aG video,render strata      # GPU device access on most distributions
 M=/srv/models/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
-sudo -u strata strata calibrate --model $M --ctx 32768 --kv q8
+sudo -u strata rustingstrata calibrate --model $M --ctx 32768 --kv q8
 
 # 3. Keys: one admin key, and a file of customer keys.
 openssl rand -hex 24                            # run once per key
@@ -119,7 +119,7 @@ sudo chown strata /etc/strata/keys.txt && sudo chmod 600 /etc/strata/keys.txt
 
 # 4. Run it on the loopback address; the reverse proxy below is the only thing that faces the network.
 #    (systemd below runs the same command as a service.)
-sudo -u strata env STRATA_API_KEY=<admin key> strata serve --model $M --gpu --ctx 32768 --addr 127.0.0.1:8080 \
+sudo -u strata env STRATA_API_KEY=<admin key> rustingstrata serve --model $M --gpu --ctx 32768 --addr 127.0.0.1:8080 \
     --api-keys /etc/strata/keys.txt --usage-log /var/lib/strata/usage.jsonl --max-tokens 4096 --parallel 4 --kv q8 \
     --max-per-key 4
 ```
@@ -258,7 +258,7 @@ Wants=network-online.target
 [Service]
 User=strata
 EnvironmentFile=/etc/strata/env
-ExecStart=/usr/local/bin/strata serve --model /srv/models/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf --gpu --ctx 32768 \
+ExecStart=/usr/local/bin/rustingstrata serve --model /srv/models/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf --gpu --ctx 32768 \
     --addr 127.0.0.1:8080 --api-keys /etc/strata/keys.txt --usage-log /var/lib/strata/usage.jsonl --max-tokens 4096 \
     --parallel 4 --kv q8 --max-per-key 4
 StateDirectory=strata
@@ -373,8 +373,8 @@ The file only grows; rotate it with logrotate (`copytruncate`, since RustingStra
 **One server per GPU, more users.** Start one server per card on its own port and balance between them:
 
 ```sh
-strata serve --model $M --gpu --device 0 --addr 127.0.0.1:8081 --threads 6 ...
-strata serve --model $M --gpu --device 1 --addr 127.0.0.1:8082 --threads 6 ...
+rustingstrata serve --model $M --gpu --device 0 --addr 127.0.0.1:8081 --threads 6 ...
+rustingstrata serve --model $M --gpu --device 1 --addr 127.0.0.1:8082 --threads 6 ...
 ```
 
 ```nginx
@@ -405,4 +405,4 @@ keeps its last conversation. For many users on cards that each fit the model, on
 - [ ] `--max-per-key` below `--max-waiting`, so one customer cannot fill the queue.
 - [ ] `--usage-log` is on and rotated.
 - [ ] `/health` (or `/metrics`) is monitored, and systemd restarts the server on failure.
-- [ ] `strata calibrate` ran on this machine as the service user.
+- [ ] `rustingstrata calibrate` ran on this machine as the service user.

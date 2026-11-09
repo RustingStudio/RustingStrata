@@ -334,7 +334,7 @@ fn serve_allows_configured_host_names() {
     let dir = std::env::temp_dir().join(format!("strata-host-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
-    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_strata"))
+    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_rustingstrata"))
         .args(["serve", "--addr", &addr, "--allowed-hosts", "ai-server.lan"])
         .arg("--models-dir").arg(&dir)
         .env_remove("STRATA_API_KEY").env_remove("STRATA_ALLOWED_HOSTS")
@@ -363,7 +363,7 @@ fn serve_without_a_model() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("keys.txt"), "acme acme-0123456789abcdef\n").unwrap();
     let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
-    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_strata"))
+    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_rustingstrata"))
         .args(["serve", "--addr", &addr, "--api-key", "root-0123456789abcdef", "--api-keys"]).arg(dir.join("keys.txt"))
         .arg("--models-dir").arg(&dir).stderr(std::process::Stdio::null()).spawn().unwrap();
     // The status line and body of one request.
@@ -409,7 +409,7 @@ fn serve_without_a_model() {
 #[test]
 fn serve_rejects_a_bad_parallel_count() {
     for n in ["0", "256"] {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_strata"))
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_rustingstrata"))
             .args(["serve", "--addr", "127.0.0.1:0", "--parallel", n])
             .output().unwrap();
         let err = String::from_utf8_lossy(&out.stderr);
@@ -432,7 +432,7 @@ fn serve_parallel_smoke() {
     }
     use std::io::{Read, Write};
     let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
-    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_strata"))
+    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_rustingstrata"))
         .args(["serve", "--model"]).arg(&model)
         .args(["--gpu", "--backend", "cuda", "--kv", "q8", "--ctx", "512", "--parallel", "2", "--addr", &addr])
         .spawn().unwrap();
