@@ -299,9 +299,22 @@ impl<'a> DsModel<'a> {
             }
         }
         let t1 = std::time::Instant::now();
-        for (e, w) in sel {
+        // All selected experts resident in VRAM: 2 GPU round trips per layer instead of 3 per expert.
+        let gu: Vec<_> = sel.iter().map(|s| l.gexps.expert(s.0, cfg.n_expert)).chain(sel.iter().map(|s| l.uexps.expert(s.0, cfg.n_expert))).collect();
+        let nf = cfg.n_ff_exp;
+        let fast = crate::deepseek::mat::gpu_batch(&gu, cur, 0, nf).and_then(|gu_y| {
+            let k = sel.len();
+            let a: Vec<f32> = (0..k * nf).map(|i| act(gu_y[i], gu_y[k * nf + i], cfg.clamp_exp[il])).collect();
+            let dm: Vec<_> = sel.iter().map(|s| l.dexps.expert(s.0, cfg.n_expert)).collect();
+            crate::deepseek::mat::gpu_batch(&dm, &a, nf, n)
+        });
+        if let Some(dy) = &fast {
+            PROF[3].fetch_add(1000 * sel.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            for (i, &(_, w)) in sel.iter().enumerate() { for j in 0..n { out[j] += w * dy[i * n + j]; } }
+        }
+        for (e, w) in sel.into_iter().filter(|_| fast.is_none()) {
             let ge = l.gexps.expert(e, cfg.n_expert);
-            PROF[3].fetch_add(ge.gpu.is_some() as u64 * 1000, std::sync::atomic::Ordering::Relaxed);
+            PROF[3].fetch_add((ge.gpu.is_some_and(|i| i != u32::MAX)) as u64 * 1000, std::sync::atomic::Ordering::Relaxed);
             ge.matvec(cur, &mut g);
             l.uexps.expert(e, cfg.n_expert).matvec(cur, &mut u);
             for j in 0..g.len() { g[j] = act(g[j], u[j], cfg.clamp_exp[il]); }

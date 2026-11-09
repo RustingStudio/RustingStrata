@@ -5,7 +5,7 @@ use std::io::{BufRead, Write};
 
 fn gpu_defaults() {
     // GPU on by default; VRAM expert cache 8 GB (rest of the experts stream through one staging slot).
-    for (k, v) in [("STRATA_DS_GPU", "1"), ("STRATA_DS_GPU_EXPERTS", "8")] {
+    for (k, v) in [("STRATA_DS_GPU", "1"), ("STRATA_DS_GPU_EXPERTS", "9")] {
         if std::env::var_os(k).is_none() { unsafe { std::env::set_var(k, v) } }
     }
 }
