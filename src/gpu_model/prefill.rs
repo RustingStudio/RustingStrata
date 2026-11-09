@@ -83,20 +83,17 @@ impl GpuModel<'_> {
         let Some(chunk) = self.pf.as_ref().map(|p| p.chunk) else { return self.step_all(tokens) };
         if tokens.len() < self.short { return self.step_all(tokens); }
         anyhow::ensure!(self.pos + tokens.len() <= self.ctx, "context full ({} tokens; raise --ctx)", self.ctx);
+        // STRATA_PF_ADAPT=N: place the hot experts after every N-th chunk of a long prompt, not only after all of it,
+        // so the later chunks run with the placement the first ones showed (0 = off, the default; untested on real hardware).
+        let every = std::env::var("STRATA_PF_ADAPT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+        let nchunks = tokens.len().div_ceil(chunk);
         for (i, ch) in tokens.chunks(chunk).enumerate() {
             if i > 0 { between(self)?; }
             self.prefill_chunk(ch, None)?;
+            if every > 0 && (i + 1) % every == 0 && i + 1 < nchunks { self.adapt_experts()?; }
         }
         // The prompt's routing predicts the reply's: place its hot experts now instead of 64 per adapt during decode.
-        // A fully resident cache has no hot missed expert to place: skip the scan over all its entries (issue #34 R2).
-        let adapt = self.adapt_every > 0;
-        let mut p = Some(&mut *self);
-        while let Some(q) = p {
-            if let Some(cache) = q.cache.as_mut() {
-                if adapt && !cache.fully_resident() { cache.adapt(q.m, &*q.gpu, usize::MAX)?; }
-            }
-            p = q.next.as_deref_mut();
-        }
+        self.adapt_experts()?;
         let s = self.tail();
         let (g, ne) = (&s.gpu, s.m.cfg.n_embd);
         let h = s.bufs["h"].addr();
@@ -108,6 +105,20 @@ impl GpuModel<'_> {
         }
         g.gemv(s.output.as_ref().unwrap(), h, s.logits.addr())?;
         g.get::<f32>(&s.logits, 0, s.m.cfg.n_vocab)
+    }
+
+    /// Move the hot missed experts into VRAM (all parts of a split model). A fully resident cache has no hot missed
+    /// expert to place: skip the scan over all its entries (issue #34 R2).
+    fn adapt_experts(&mut self) -> anyhow::Result<()> {
+        let adapt = self.adapt_every > 0;
+        let mut p = Some(&mut *self);
+        while let Some(q) = p {
+            if let Some(cache) = q.cache.as_mut() {
+                if adapt && !cache.fully_resident() { cache.adapt(q.m, &*q.gpu, usize::MAX)?; }
+            }
+            p = q.next.as_deref_mut();
+        }
+        Ok(())
     }
 
     /// A fresh sequence: `prefill(tokens)` from position 0, reusing earlier work. The state after `tokens[..keep]` is
