@@ -323,7 +323,16 @@ impl<'a> DsModel<'a> {
     }
 
     /// Feed one token at the next position; returns logits.
-    pub fn step(&mut self, tok: u32) -> Vec<f32> {
+    pub fn step(&mut self, tok: u32) -> Vec<f32> { self.step_opt(tok, true) }
+
+    /// Feed prompt tokens; only the last one computes logits (the vocab matvec is wasted on the rest).
+    pub fn prefill(&mut self, toks: &[u32]) -> Vec<f32> {
+        let mut logits = vec![];
+        for (i, &t) in toks.iter().enumerate() { logits = self.step_opt(t, i + 1 == toks.len()); }
+        logits
+    }
+
+    fn step_opt(&mut self, tok: u32, want: bool) -> Vec<f32> {
         let t_all = std::time::Instant::now();
         let pos = self.toks.len();
         self.toks.push(tok);
@@ -371,6 +380,7 @@ impl<'a> DsModel<'a> {
             let rb = std::fs::read_to_string("/proc/self/io").ok().and_then(|t| t.lines().find_map(|l| l.strip_prefix("read_bytes: ")?.trim().parse::<u64>().ok())).unwrap_or(0);
             eprintln!("disk_read_MB {} prof ms: route {:.0} experts {:.0} attn {:.0} gpu-expert-hits(of 240) {:.0} total {:.0}", rb >> 20, g(0), g(1), g(2), g(3), t_all.elapsed().as_secs_f64() * 1e3);
         }
+        if !want { return vec![]; }
         hc_collapse(&x, &self.pre_prev, &mut cur);
         self.tr("hc_out", -1, &cur);
         rms_norm_w(&cur, &self.out_norm, self.cfg.eps, &mut nrm);
