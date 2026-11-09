@@ -147,6 +147,17 @@ strata generate --model $M --prompt "The capital of France is" -n 64
 strata serve    --model $M --addr 127.0.0.1:8080 [--api-key K]   # /v1/chat/completions, JSON and SSE
 ```
 
+| DeepSeek-V4.1-Flash IQ2_XXS (249 GB), RTX 3060 12 GB, 30 GB RAM | RustingStrata | llama.cpp b12116 (`--cpu-moe`) |
+|---|---|---|
+| Decode | 1.8 tok/s at first, 2-3.6 tok/s now (VRAM expert cache with LRU) | 0.3-1.5 tok/s (cold) |
+| Prefill | 0.5 s/token short prompts (2-3 tok/s is not reached; one token at a time) | 0.5-0.9 tok/s (cold) |
+| Greedy output | reference | reference |
+| Teacher-forced top-1 vs llama.cpp | 189/192 short, 21/23 on 1425 tokens (misses are near-ties) | - |
+| Sampling, tool calls | not supported | supported |
+
+The llama.cpp numbers are from the first cold runs on this box and the RustingStrata numbers from the last runs
+before the model was deleted; they were not re-measured side by side, and both move with the page cache.
+
 Greedy only. On an RTX 3060 12 GB with 30 GB RAM it decodes at about 2-3.6 tok/s (run to run it varies with the page
 cache, since the experts that miss VRAM are read from the GGUF), and prefill is one token at a time (about 0.5 s per
 token, 2 s per token at 1400 tokens). Context is capped at 4096 tokens. `STRATA_DS_GPU_EXPERTS=<GB>` changes the VRAM
