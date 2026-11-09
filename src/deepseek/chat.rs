@@ -17,7 +17,7 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
     let mut m = DsModel::new(g)?;
     let eos = tok.eos_ids();
     let mut logits = vec![];
-    for t in tok.encode(prompt)? { logits = m.step(t); }
+    logits = m.prefill(&tok.encode(prompt)?);
     let (mut out, mut shown) = (vec![], 0);
     for i in 0..n {
         let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
@@ -61,7 +61,7 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
         };
         first = false;
         let mut logits = vec![];
-        for t in tok.encode(&text)? { logits = m.step(t); }
+        logits = m.prefill(&tok.encode(&text)?);
         let (mut out, mut shown) = (vec![], 0);
         for i in 0..n {
             let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
@@ -131,7 +131,7 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
                 }
                 let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
                 let mut logits = vec![];
-                for &t in &ids[keep..] { logits = m.step(t); }
+                logits = m.prefill(&ids[keep..]);
                 let n = q.max_tokens.unwrap_or(256).min(CTX - ids.len());
                 if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
                 let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
