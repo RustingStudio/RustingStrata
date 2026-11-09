@@ -3,11 +3,40 @@ use super::forward::DsModel;
 use crate::{chat::{Msg, Template}, gguf::Gguf, tokenizer::Tokenizer};
 use std::io::{BufRead, Write};
 
-pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::Result<()> {
-    // GPU on by default for the chat; VRAM expert cache 8 GB (rest of the experts stream through one staging slot).
+fn gpu_defaults() {
+    // GPU on by default; VRAM expert cache 8 GB (rest of the experts stream through one staging slot).
     for (k, v) in [("STRATA_DS_GPU", "1"), ("STRATA_DS_GPU_EXPERTS", "8")] {
         if std::env::var_os(k).is_none() { unsafe { std::env::set_var(k, v) } }
     }
+}
+
+/// `strata generate`: raw prompt (no template), greedy, prints the continuation.
+pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
+    gpu_defaults();
+    let tok = Tokenizer::from_gguf(g)?;
+    let mut m = DsModel::new(g)?;
+    let eos = tok.eos_ids();
+    let mut logits = vec![];
+    for t in tok.encode(prompt)? { logits = m.step(t); }
+    let (mut out, mut shown) = (vec![], 0);
+    for i in 0..n {
+        let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+        if eos.contains(&next) { break; }
+        out.push(next);
+        let s = tok.decode(&out)?;
+        if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
+            print!("{}", &s[shown..]);
+            std::io::stdout().flush()?;
+            shown = s.len();
+        }
+        if i + 1 < n { logits = m.step(next); }
+    }
+    println!();
+    Ok(())
+}
+
+pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::Result<()> {
+    gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
     let mut m = DsModel::new(g)?;
     let eos = tok.eos_ids();
