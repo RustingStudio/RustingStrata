@@ -150,8 +150,7 @@ strata serve    --model $M --addr 127.0.0.1:8080 [--api-key K]   # /v1/chat/comp
 | DeepSeek-V4.1-Flash IQ2_XXS (249 GB), RTX 3060 12 GB, 30 GB RAM | RustingStrata | llama.cpp b12116 (`--cpu-moe`) |
 |---|---|---|
 | Decode | 1.8 tok/s at first, 2-3.6 tok/s now (VRAM expert cache with LRU) | 0.3-1.5 tok/s (cold) |
-| Prefill | 0.5 s/token short prompts (2-3 tok/s is not reached; one token at a time) | 0.5-0.9 tok/s (cold) |
-| Greedy output | reference | reference |
+| Prefill | ~2 tok/s on short prompts (0.5 s/token), ~0.5 tok/s at 1400 tokens | 0.5-0.9 tok/s (cold) |
 | Teacher-forced top-1 vs llama.cpp | 189/192 short, 21/23 on 1425 tokens (misses are near-ties) | - |
 | Sampling, tool calls | not supported | supported |
 
