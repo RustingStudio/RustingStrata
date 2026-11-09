@@ -74,23 +74,33 @@ mod dev {
             self.be.dtoh(&self.y, 0, &mut yb).unwrap();
             for (o, c) in y.iter_mut().zip(yb.chunks_exact(4)) { *o = f32::from_le_bytes(c.try_into().unwrap()); }
         }
-        /// One gemv per tensor, all queued before a single readback. Job i reads x[i*xs..] and writes y[i*rows..].
-        pub fn batch(&self, ts: &[u32], x: &[f32], xs: usize, rows: usize) -> Vec<f32> {
+        /// One gemv per tensor, all queued before a single readback. Job i reads x[i*xs..] and writes its rows after job i-1's.
+        pub fn batch(&self, ts: &[(u32, usize)], x: &[f32], xs: usize) -> Vec<f32> {
             let xb: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
             self.be.htod(&xb, &self.x, 0).unwrap();
-            for (i, &t) in ts.iter().enumerate() {
-                self.be.gemv(&self.ts[t as usize], self.x.addr() + (4 * i * xs) as u64, self.y.addr() + (4 * i * rows) as u64).unwrap();
+            let mut off = 0;
+            for (i, &(t, rows)) in ts.iter().enumerate() {
+                self.be.gemv(&self.ts[t as usize], self.x.addr() + (4 * i * xs) as u64, self.y.addr() + (4 * off) as u64).unwrap();
+                off += rows;
             }
-            let mut yb = vec![0u8; 4 * rows * ts.len()];
+            let mut yb = vec![0u8; 4 * off];
             self.be.dtoh(&self.y, 0, &mut yb).unwrap();
             yb.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
         }
     }
 }
-/// Batched matvec over VRAM-resident matrices (see `Dev::batch`); None unless every matrix is resident.
-pub fn gpu_batch(ms: &[Mat], x: &[f32], xs: usize, rows: usize) -> Option<Vec<f32>> {
-    let ts: Option<Vec<u32>> = ms.iter().map(|m| m.gpu.filter(|&i| i != dev::STAGED)).collect();
-    Some(dev::get()?.lock().unwrap().batch(&ts?, x, xs, rows))
+/// Matvecs of several matrices on one activation (xs = 0) or on consecutive slices x[i*xs..] (xs > 0); outputs concatenated.
+/// All matrices VRAM-resident: one GPU round trip. Otherwise each runs on its own, as `Mat::matvec`.
+pub fn matvec_many(ms: &[Mat], x: &[f32], xs: usize) -> Vec<f32> {
+    let ts: Option<Vec<(u32, usize)>> = ms.iter().map(|m| m.gpu.filter(|&i| i != dev::STAGED).map(|i| (i, m.rows))).collect();
+    if let Some(y) = ts.and_then(|ts| Some(dev::get()?.lock().unwrap().batch(&ts, x, xs))) { return y; }
+    let mut y = vec![0f32; ms.iter().map(|m| m.rows).sum()];
+    let mut off = 0;
+    for (i, m) in ms.iter().enumerate() {
+        m.matvec(&x[i * xs..i * xs + m.cols], &mut y[off..off + m.rows]);
+        off += m.rows;
+    }
+    y
 }
 /// Expert cache lookups since the last PROF print: [hit, miss].
 pub static EX_LOOKUPS: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
