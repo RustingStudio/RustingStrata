@@ -679,6 +679,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Generate { model, prompt, n, mut engine } => {
             let g = Gguf::open(&model)?;
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
+                let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
+                return rusting_strata::deepseek::chat::generate(&g, &prompt, n);
+            }
             let mut m = Model::load(&g)?;
             if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
