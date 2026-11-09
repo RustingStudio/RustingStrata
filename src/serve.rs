@@ -1,4 +1,4 @@
-//! The small HTTP/1.1 subset `strata serve` speaks (std::net, one request per connection) and its chat request.
+//! The small HTTP/1.1 subset `rustingstrata serve` speaks (std::net, one request per connection) and its chat request.
 
 use crate::chat::{Json, Msg, tool_def};
 use anyhow::{Context, bail};

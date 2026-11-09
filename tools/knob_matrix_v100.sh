@@ -8,7 +8,7 @@
 # Options:
 #   --model PATH          reference model (default $STRATA_MODEL or the MoE Q2_K_XL)
 #   --model-27b PATH      model of the optional M2 row
-#   --bin PATH            release binary (default $STRATA_BIN or target/release/strata)
+#   --bin PATH            release binary (default $STRATA_BIN or target/release/rustingstrata)
 #   --pass 1|2|all        pass 1 (C0 C1 K1 K2 K3 N1 N2 M1 P2M), pass 2 (C2 P2 P4 M2), or all
 #   --only ID[,ID...]     run exactly these rows, ignoring --pass
 #   --dry-run             print the commands and an empty table; touch no model, GPU or file
@@ -37,7 +37,7 @@ cd "$ROOT"
 
 MODEL=${STRATA_MODEL:-/mnt/models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf}
 MODEL_27B=${STRATA_MODEL_27B:-/mnt/models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf}
-BIN=${STRATA_BIN:-target/release/strata}
+BIN=${STRATA_BIN:-target/release/rustingstrata}
 JSON_DIR=${STRATA_JSON_DIR:-target/m0t6}
 LOG_DIR=$JSON_DIR/logs
 PASS=all

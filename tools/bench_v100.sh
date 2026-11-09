@@ -8,7 +8,7 @@ set -e
 M=${1:?usage: tools/bench_v100.sh <model.gguf> [cuda|vulkan] [out.md]}
 B=${2:-vulkan}
 O=${3:-docs/V100-results.md}
-BIN=${STRATA_BIN:-target/release/strata}
+BIN=${STRATA_BIN:-target/release/rustingstrata}
 CTX=${STRATA_CTX:-32896}
 JSONL=${STRATA_BENCH_JSONL:-target/v100-bench.jsonl}
 

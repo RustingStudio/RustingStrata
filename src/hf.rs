@@ -1,4 +1,4 @@
-//! Model downloads from Hugging Face for the chat page of `strata serve`. `HF_TOKEN`, if set, is sent for gated
+//! Model downloads from Hugging Face for the chat page of `rustingstrata serve`. `HF_TOKEN`, if set, is sent for gated
 //! and private repos.
 
 use crate::serve::{models, shard};

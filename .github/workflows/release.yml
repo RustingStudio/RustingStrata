@@ -21,11 +21,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04  # the oldest glibc the binary will need
-            bin: strata
-            asset: strata-linux-x86_64
+            bin: rustingstrata
+            asset: rustingstrata-linux-x86_64
           - os: windows-latest
-            bin: strata.exe
-            asset: strata-windows-x86_64.exe
+            bin: rustingstrata.exe
+            asset: rustingstrata-windows-x86_64.exe
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write

@@ -56,7 +56,7 @@ Environment variables; set any of them to turn the feature off:
 - `STRATA_VK_DP_OLD`: use the old per-query prefill attention fallback instead of the tiled one (A/B and rollback).
 - `STRATA_VK_NO_COND`: no conditional rendering.
 - `STRATA_VK_NO_TQ`: no separate transfer queue for expert uploads.
-- `radv_device_coherent_memory=false`: undo the RADV option strata sets.
+- `radv_device_coherent_memory=false`: undo the RADV option RustingStrata sets.
 
 If one of these makes a problem go away, say which one in the report.
 
@@ -65,4 +65,4 @@ If one of these makes a problem go away, say which one in the report.
 - GPU model, OS, driver and version (Mesa version on Linux).
 - The output of `vulkaninfo --summary`.
 - The full output of the failing command, including the first `vulkan:` line.
-- If decode is slow: `strata bench --model <file> --gpu --backend vulkan --pp 1024 --tg 128` with the same model.
+- If decode is slow: `rustingstrata bench --model <file> --gpu --backend vulkan --pp 1024 --tg 128` with the same model.

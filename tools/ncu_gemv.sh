@@ -13,7 +13,7 @@ set -e
 M=${1:?usage: tools/ncu_gemv.sh <model.gguf> [outdir]}
 O=${2:-target/ncu_m2t5}
 NCU=${NCU:-/usr/local/cuda/bin/ncu}
-BIN=${STRATA_BIN:-target/release/strata}
+BIN=${STRATA_BIN:-target/release/rustingstrata}
 TG=${TG:-8}
 
 test -x "$NCU" || { echo "no ncu at $NCU (set NCU=/path/to/ncu)" >&2; exit 1; }

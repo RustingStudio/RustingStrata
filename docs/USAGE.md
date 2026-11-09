@@ -1,11 +1,11 @@
 # Usage
 
-Everything here applies to `strata chat`, `generate`, `bench` and `serve` unless noted. See the
+Everything here applies to `rustingstrata chat`, `generate`, `bench` and `serve` unless noted. See the
 [README](../README.md) for install and a quick start, and [HOSTING.md](HOSTING.md) for running a server for other people.
 
 ## Chat page
 
-`strata` with no arguments starts the server on http://127.0.0.1:8080 and opens a chat page. The page keeps chats in
+`rustingstrata` with no arguments starts the server on http://127.0.0.1:8080 and opens a chat page. The page keeps chats in
 the browser, downloads models from Hugging Face (Models and settings; `HF_TOKEN` for gated repos), switches between the
 models in the models folder (`%LOCALAPPDATA%\rusting_strata\models` on Windows, `~/.local/share/rusting_strata/models`
 elsewhere, or `serve --models-dir`), and shows context use, speed, totals, and CPU, memory and graphics memory use of
@@ -16,7 +16,7 @@ the server.
 - `--ctx` KV cache size in tokens (default 4096).
 - `--mtp [N]` speculative decoding with the model's draft head. Greedy tokens stay the same; sampling keeps its
   distribution.
-- `--chunk`, `--threads` prefill chunk size and CPU threads. `strata calibrate` measures the best values for a machine
+- `--chunk`, `--threads` prefill chunk size and CPU threads. `rustingstrata calibrate` measures the best values for a machine
   and later runs read them from `~/.cache/rusting_strata/strata-<model>.json` unless flags override.
 - `--vram-margin` MB of VRAM left free. On a GPU that drives no display, `--vram-margin 256` keeps more experts
   resident (+1-2% prefill); 128 runs out of memory.

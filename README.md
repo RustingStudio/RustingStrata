@@ -25,7 +25,7 @@ does not fit in VRAM). llama.cpp is the 2026-10-28 build 11876, tuned for the sa
 | 32K: prefill / decode | **1800 / 91.9 tok/s** | 1582 / 90.7 | |
 | Greedy top-1 agreement with llama.cpp (20 prompts x 32 tokens), either llama.cpp mode | 98-99% | 98-99% | 98.3% (its batch vs token-by-token modes) |
 
-Measured with `strata bench --gpu --mtp 0 --pp 512,4096,32768 --tg 128 --reps 3 --ctx 32896`, mean of 3 rounds
+Measured with `rustingstrata bench --gpu --mtp 0 --pp 512,4096,32768 --tg 128 --reps 3 --ctx 32896`, mean of 3 rounds
 (range in brackets); llama.cpp from `llama-server` timings, 4047-token prompt + 128 tokens, 3 runs.
 MTP gains depend on the text.
 Agreement counts a token when it matches llama.cpp run token by token or with the context as one batch;
@@ -74,7 +74,7 @@ On Windows, install the Visual Studio C++ Build Tools first (one dependency comp
 
 ## Quick start
 
-Run `strata` with no arguments (double-click `strata.exe` on Windows; release binaries are on the GitHub releases page).
+Run `rustingstrata` with no arguments (double-click `rustingstrata.exe` on Windows; release binaries are on the GitHub releases page).
 It starts a server on http://127.0.0.1:8080 and opens a chat page that downloads models from Hugging Face and switches
 between the ones in your models folder. Any app that takes an OpenAI-compatible address (Open WebUI, Jan, SillyTavern,
 code editors) can use `http://127.0.0.1:8080/v1`.
@@ -84,11 +84,11 @@ From a terminal:
 ```sh
 M=path/to/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
 
-target/release/strata calibrate --model $M     # once per model and machine: best chunk size, MTP drafts
-target/release/strata generate --model $M --gpu --prompt "Write a haiku about rivers." -n 128
-target/release/strata chat --model $M --gpu    # --think for thinking mode, --temp 0.7 to sample
-target/release/strata bench --model $M --gpu --pp 512,4096 --tg 128
-STRATA_API_KEY=secret target/release/strata serve --model $M --gpu --addr 127.0.0.1:8080
+target/release/rustingstrata calibrate --model $M     # once per model and machine: best chunk size, MTP drafts
+target/release/rustingstrata generate --model $M --gpu --prompt "Write a haiku about rivers." -n 128
+target/release/rustingstrata chat --model $M --gpu    # --think for thinking mode, --temp 0.7 to sample
+target/release/rustingstrata bench --model $M --gpu --pp 512,4096 --tg 128
+STRATA_API_KEY=secret target/release/rustingstrata serve --model $M --gpu --addr 127.0.0.1:8080
 ```
 
 Without `--gpu` everything runs on the CPU reference, which is slow and meant for checking. Flags, the OpenAI and
@@ -102,9 +102,9 @@ next to it.
 
 ```sh
 M=DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00006.gguf
-strata chat     --model $M [--think]
-strata generate --model $M --prompt "The capital of France is" -n 64
-strata serve    --model $M --addr 127.0.0.1:8080 [--api-key K]
+rustingstrata chat     --model $M [--think]
+rustingstrata generate --model $M --prompt "The capital of France is" -n 64
+rustingstrata serve    --model $M --addr 127.0.0.1:8080 [--api-key K]
 ```
 
 | DeepSeek-V4.1-Flash IQ2_XXS (249 GB), RTX 3060 12 GB, 30 GB RAM | RustingStrata | llama.cpp b12116 (`--cpu-moe`) |

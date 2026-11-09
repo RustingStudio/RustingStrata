@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::{collections::BTreeMap, net::{TcpListener, TcpStream}, sync::atomic::Ordering::Relaxed, path::{Path, PathBuf}, time::{Duration, Instant, SystemTime}};
 
 #[derive(Parser)]
-#[command(name = "strata", version, about = "Rust inference engine for Qwen3.5/3.6-family GGUF models")]
+#[command(name = "rustingstrata", version, about = "Rust inference engine for Qwen3.5/3.6-family GGUF models")]
 struct Cli {
     /// Without a command, strata serves the chat page on 127.0.0.1:8080 on the GPU (else the CPU) and opens it in
     /// the browser.
@@ -637,7 +637,7 @@ enum Cmd {
 fn main() -> anyhow::Result<()> {
     let Some(cmd) = Cli::parse().cmd else {
         // Started without arguments, as by a double click: keep the window open on an error so it can be read.
-        let Some(Cmd::Serve { model, models_dir, addr, api_key, open, host, mut engine }) = Cli::parse_from(["strata", "serve", "--gpu", "--open"]).cmd else { unreachable!() };
+        let Some(Cmd::Serve { model, models_dir, addr, api_key, open, host, mut engine }) = Cli::parse_from(["rustingstrata", "serve", "--gpu", "--open"]).cmd else { unreachable!() };
         engine.cpu_fallback = true;
         let r = run(Cmd::Serve { model, models_dir, addr, api_key, open, host, engine });
         if let Err(e) = &r {
@@ -1975,8 +1975,8 @@ mod bench_tests {
 
     #[test]
     fn bench_record_rejects_json_out_dash() {
-        let e = Cli::try_parse_from(["strata", "bench", "--model", "m.gguf", "--json-out", "-"]).err().unwrap();
+        let e = Cli::try_parse_from(["rustingstrata", "bench", "--model", "m.gguf", "--json-out", "-"]).err().unwrap();
         assert!(e.to_string().contains("stdout carries the text block"), "{e}");
-        assert!(Cli::try_parse_from(["strata", "bench", "--model", "m.gguf", "--json-out", "/tmp/x.json"]).is_ok());
+        assert!(Cli::try_parse_from(["rustingstrata", "bench", "--model", "m.gguf", "--json-out", "/tmp/x.json"]).is_ok());
     }
 }

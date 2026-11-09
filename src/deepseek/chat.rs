@@ -1,4 +1,4 @@
-//! `strata chat` for DeepSeek-V4.1: greedy, CUDA for the matvecs and expert staging, KV kept across turns.
+//! `rustingstrata chat` for DeepSeek-V4.1: greedy, CUDA for the matvecs and expert staging, KV kept across turns.
 use super::forward::DsModel;
 use crate::{chat::{Msg, Template}, gguf::Gguf, tokenizer::Tokenizer};
 use std::io::{BufRead, Write};
@@ -10,7 +10,7 @@ fn gpu_defaults() {
     }
 }
 
-/// `strata generate`: raw prompt (no template), greedy, prints the continuation.
+/// `rustingstrata generate`: raw prompt (no template), greedy, prints the continuation.
 pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
     gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
@@ -83,7 +83,7 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
 /// Prompt plus reply cap per request (ponytail: fixed; the KV cache is untested far beyond this).
 const CTX: usize = 4096;
 
-/// `strata serve` for DeepSeek: one request at a time, OpenAI `/v1/chat/completions` (JSON or SSE), `/v1/models`, `/health`.
+/// `rustingstrata serve` for DeepSeek: one request at a time, OpenAI `/v1/chat/completions` (JSON or SSE), `/v1/models`, `/health`.
 /// Earlier reasoning is kept by default, like llama-server (`chat_template_kwargs.preserve_thinking:false` drops it).
 /// ponytail: greedy only, no tools/stop strings; the KV cache is reused only when the new prompt extends the last sequence.
 pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow::Result<()> {
