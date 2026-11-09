@@ -175,6 +175,9 @@ pub enum Template {
     /// Qwen3 2507 and Qwen3-Next: `{"name": .., "arguments": ..}` calls. `reasoning` (2507) puts the turns after the
     /// last user query in a think block.
     Json { reasoning: bool },
+    /// DeepSeek-V4.1: `<｜User｜>`/`<｜Assistant｜>` turns, think mode with a reasoning-effort line. Plain chat only;
+    // ponytail: no DSML tool calls, add when serving DeepSeek tools matters.
+    Ds,
 }
 
 const XML_RULES: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
@@ -202,6 +205,7 @@ impl Template {
     /// The family of a GGUF's `tokenizer.chat_template`. Files without one get Qwen3.6's format.
     pub fn detect(src: Option<&str>) -> Template {
         match src {
+            Some(s) if s.contains("｜DSML｜") => Template::Ds,
             Some(s) if !s.contains("<function=") && s.contains(TAG) => Template::Json { reasoning: s.contains("reasoning_content") },
             _ => Template::Xml,
         }
@@ -217,6 +221,36 @@ impl Template {
             if i + 1 == msgs.len() || msgs[i + 1].role != "tool" { *s += "<|im_end|>\n"; }
         };
         match *self {
+            Template::Ds => {
+                // Mirrors chat_template.jinja for system/user/assistant text. Default reasoning effort "high" = 75.
+                let last_user = msgs.iter().rposition(|m| m.role == "user").map(|i| i as i64).unwrap_or(-1);
+                s += "<｜begin▁of▁sentence｜>";
+                for (i, m) in msgs.iter().enumerate() {
+                    if i == 0 {
+                        if think || m.role == "system" { s += "<｜System｜>"; }
+                        if think { s += "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"; }
+                    }
+                    match m.role.as_str() {
+                        "system" => { if i > 0 { s += "<｜System｜>"; } s += &m.content; }
+                        "user" => { s += "<｜User｜>"; s += &m.content; }
+                        "assistant" => {
+                            if think && (preserve || i as i64 > last_user) {
+                                let (r, c) = split_think(m, &m.content);
+                                s += r; s += "</think>"; s += c;
+                            } else {
+                                s += split_think(m, &m.content).1;
+                            }
+                            s += "<｜end▁of▁sentence｜>";
+                        }
+                        _ => {}
+                    }
+                    let last = i + 1 == msgs.len();
+                    if (last || msgs[i + 1].role == "assistant") && (m.role == "user" || (m.role == "system" && i > 0)) && (generate || !last) {
+                        s += "<｜Assistant｜>";
+                        s += if think && (preserve || i as i64 >= last_user) { "<think>" } else { "</think>" };
+                    }
+                }
+            }
             Template::Xml => {
                 let (n_sys, sys) = match msgs {
                     [a, b, ..] if a.role == "system" && b.role == "system" => (2, format!("{}\n{}", a.content.trim(), b.content.trim())),
@@ -319,7 +353,7 @@ impl Template {
             if rest.is_empty() { break; }
             let inner;
             (inner, rest) = rest.strip_prefix(TAG)?.split_once("</tool_call>")?;
-            calls.push(match self { Template::Xml => xml_call(inner, tools)?, Template::Json { .. } => json_call(inner)? });
+            calls.push(match self { Template::Ds => return None, Template::Xml => xml_call(inner, tools)?, Template::Json { .. } => json_call(inner)? });
         }
         Some((text[..start].trim_end().to_string(), calls))
     }
@@ -396,4 +430,23 @@ impl Hold {
     }
     /// The text not sent yet.
     pub fn rest(&self) -> &str { &self.text[self.sent..] }
+}
+
+#[cfg(test)]
+mod ds_tests {
+    use super::*;
+    // Expected strings come from rendering models/deepseek-v4.1/chat_template.jinja with jinja2 (tools/deepseek_ref/render_template.py).
+    #[test]
+    fn deepseek_plain_chat() {
+        let t = Template::Ds;
+        let u = [Msg::new("user", "Hi")];
+        assert_eq!(t.render(&u, &[], true, false, true), "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Hi<｜Assistant｜><think>");
+        assert_eq!(t.render(&u, &[], false, false, true), "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜></think>");
+        let m = [Msg::new("system", "Be brief."), Msg::new("user", "Hi"), Msg::new("assistant", "Hello."), Msg::new("user", "Bye")];
+        assert_eq!(t.render(&m, &[], false, false, true), "<｜begin▁of▁sentence｜><｜System｜>Be brief.<｜User｜>Hi<｜Assistant｜></think>Hello.<｜end▁of▁sentence｜><｜User｜>Bye<｜Assistant｜></think>");
+        let mut a = Msg::new("assistant", "Hello.");
+        a.reasoning = Some("greet".into());
+        let m = [Msg::new("system", "Be brief."), Msg::new("user", "Hi"), a, Msg::new("user", "Bye")];
+        assert_eq!(t.render(&m, &[], true, false, true), "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nBe brief.<｜User｜>Hi<｜Assistant｜></think>Hello.<｜end▁of▁sentence｜><｜User｜>Bye<｜Assistant｜><think>");
+    }
 }
