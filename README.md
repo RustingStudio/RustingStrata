@@ -135,6 +135,24 @@ The experts that do not fit in VRAM are read from the GGUF through the page cach
 out of the page cache (ZFS with `primarycache=metadata`) makes every run read them from disk again; load the model
 from a file system that caches data, or from a tmpfs copy.
 
+### DeepSeek-V4.1-Flash (IQ2_XXS, 249 GB)
+
+`chat`, `generate` and `serve` detect the `deepseek41` architecture and run it on the CPU reference forward with the
+matvecs and a 9 GB expert cache on the CUDA card (no `--gpu` flag needed). Pass the first shard; the others are found next to it.
+
+```sh
+M=DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00006.gguf
+strata chat     --model $M [--think]            # multi-turn, KV cache kept between turns
+strata generate --model $M --prompt "The capital of France is" -n 64
+strata serve    --model $M --addr 127.0.0.1:8080 [--api-key K]   # /v1/chat/completions, JSON and SSE
+```
+
+Greedy only. On an RTX 3060 12 GB with 30 GB RAM it decodes at about 2-3.6 tok/s (run to run it varies with the page
+cache, since the experts that miss VRAM are read from the GGUF), and prefill is one token at a time (about 0.5 s per
+token, 2 s per token at 1400 tokens). Context is capped at 4096 tokens. `STRATA_DS_GPU_EXPERTS=<GB>` changes the VRAM
+expert budget (10 worked on a 12 GB card). Output matches llama.cpp's greedy tokens up to near-ties: teacher-forced
+top-1 is 189/192 on three short prompts and 21/23 on a 1425-token prompt. Tool calls and sampling are not supported.
+
 ## Tests
 
 ```sh
