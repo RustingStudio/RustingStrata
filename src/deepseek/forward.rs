@@ -107,6 +107,13 @@ impl<'a> DsModel<'a> {
         })
     }
 
+    /// Forget the whole sequence (new conversation).
+    pub fn reset(&mut self) {
+        self.cache.iter_mut().for_each(|c| *c = Cache::default());
+        self.pre_prev = [1.0, 0.0, 0.0, 0.0];
+        self.toks.clear();
+    }
+
     fn tr(&self, name: &str, il: i32, v: &[f32]) {
         if let Ok(dir) = std::env::var("STRATA_DS_DUMP") {
             use std::io::Write;

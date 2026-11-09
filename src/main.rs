@@ -851,6 +851,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             r.finish()?;
         }
         Cmd::Serve { model, models_dir, addr, api_key, open, host, mut engine } => {
+            if let Some(mp) = &model && let Ok(g) = Gguf::open(mp) && g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
+                let name = mp.file_name().map_or("deepseek".into(), |n| n.to_string_lossy().into_owned());
+                return rusting_strata::deepseek::chat::serve(&g, &name, &addr);
+            }
             engine.parallel = host.parallel;
             // Before the model is loaded: a slot count outside 1..=255 is an invalid request, not a downgrade.
             anyhow::ensure!((1..=255).contains(&engine.parallel), "--parallel {}: 1 to 255 slots", engine.parallel);

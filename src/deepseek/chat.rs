@@ -79,3 +79,66 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
     }
     Ok(())
 }
+
+/// `strata serve` for DeepSeek: one request at a time, OpenAI `/v1/chat/completions` (JSON or SSE), `/v1/models`, `/health`.
+/// ponytail: greedy only, no tools/stop strings/API key; the KV cache is reused only when the new prompt extends the last sequence.
+pub fn serve(g: &Gguf, name: &str, addr: &str) -> anyhow::Result<()> {
+    use serde_json::json;
+    gpu_defaults();
+    let tok = Tokenizer::from_gguf(g)?;
+    let mut m = DsModel::new(g)?;
+    let eos = tok.eos_ids();
+    let l = std::net::TcpListener::bind(addr)?;
+    eprintln!("deepseek serve on http://{addr}/ model {name}");
+    for c in l.incoming() {
+        let Ok(mut c) = c else { continue };
+        let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+        let Ok(r) = crate::serve::read_request(&mut std::io::BufReader::new(&c)) else { continue };
+        let send = |c: &mut std::net::TcpStream, status: &str, ty: &str, b: &str| {
+            let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+        };
+        let path = r.path.split('?').next().unwrap_or("");
+        match (r.method.as_str(), path) {
+            ("GET", "/health") => send(&mut c, "200 OK", "application/json", r#"{"status":"ok"}"#),
+            ("GET", "/v1/models") => send(&mut c, "200 OK", "application/json", &json!({"object": "list", "data": [{"id": name, "object": "model", "owned_by": "strata"}]}).to_string()),
+            ("POST", "/v1/chat/completions") => {
+                let q = match crate::serve::chat_request(&r.body) {
+                    Ok(q) => q,
+                    Err(e) => { send(&mut c, "400 Bad Request", "application/json", &json!({"error": {"message": format!("{e:#}"), "type": "invalid_request_error"}}).to_string()); continue }
+                };
+                let ids = match tok.encode(&Template::Ds.render(&q.messages, &[], q.think, false, true)) {
+                    Ok(i) if !i.is_empty() => i,
+                    _ => { send(&mut c, "400 Bad Request", "application/json", r#"{"error":{"message":"cannot encode prompt"}}"#); continue }
+                };
+                let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
+                let mut logits = vec![];
+                for &t in &ids[keep..] { logits = m.step(t); }
+                let n = q.max_tokens.unwrap_or(256);
+                if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
+                let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
+                let (mut out, mut shown, mut done) = (vec![], 0, "length");
+                for i in 0..n {
+                    let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+                    if eos.contains(&next) { done = "stop"; break; }
+                    out.push(next);
+                    let s = tok.decode(&out).unwrap_or_default();
+                    if q.stream && !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
+                        let ok = write!(c, "data: {}\n\n", chunk(json!({"content": &s[shown..]}), None)).is_ok();
+                        shown = s.len();
+                        if !ok { break; }
+                    }
+                    if i + 1 < n { logits = m.step(next); }
+                }
+                let text = tok.decode(&out).unwrap_or_default();
+                if q.stream { let _ = write!(c, "data: {}\n\ndata: [DONE]\n\n", chunk(json!({}), Some(done))); }
+                else {
+                    let b = json!({"object": "chat.completion", "model": name, "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": done}],
+                        "usage": {"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len()}});
+                    send(&mut c, "200 OK", "application/json", &b.to_string());
+                }
+            }
+            _ => send(&mut c, "404 Not Found", "application/json", r#"{"error":{"message":"not found"}}"#),
+        }
+    }
+    Ok(())
+}
