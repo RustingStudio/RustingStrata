@@ -13,7 +13,7 @@ mod dev {
     /// Scratch slot for experts that missed the VRAM cache: copied up per use, so the CPU never dequantises them.
     pub const STAGE: usize = 16 << 20;
     pub const STAGED: u32 = u32::MAX;
-    pub struct Dev { be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, pub bytes: usize, ex: std::collections::HashMap<usize, u32>, budget: usize, stage: Buf }
+    pub struct Dev { be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, pub bytes: usize, ex: std::collections::HashMap<usize, usize>, exs: Vec<(u32, usize, u64)>, now: u64, budget: usize, stage: Buf }
     static DEV: OnceLock<Option<Mutex<Dev>>> = OnceLock::new();
     pub fn get() -> Option<&'static Mutex<Dev>> {
         DEV.get_or_init(|| {
@@ -22,7 +22,7 @@ mod dev {
             let (x, y) = (be.alloc(4 * 40960).ok()?, be.alloc(4 * 140000).ok()?);
             let stage = be.alloc(STAGE).ok()?;
             let gb: f64 = std::env::var("STRATA_DS_GPU_EXPERTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-            Some(Mutex::new(Dev { be, ts: vec![], x, y, bytes: 0, ex: Default::default(), budget: (gb * 1e9) as usize, stage }))
+            Some(Mutex::new(Dev { be, ts: vec![], x, y, bytes: 0, ex: Default::default(), exs: vec![], now: 0, budget: (gb * 1e9) as usize, stage }))
         }).as_ref()
     }
     impl Dev {
@@ -32,14 +32,31 @@ mod dev {
             self.ts.push(t);
             Some(self.ts.len() as u32 - 1)
         }
-        /// VRAM copy of one routed expert, uploaded on first use while under the STRATA_DS_GPU_EXPERTS budget (GB).
-        /// ponytail: no eviction, first experts touched win; add an LRU if hit rate matters.
+        /// VRAM copy of one routed expert: uploaded on first use while under the STRATA_DS_GPU_EXPERTS budget (GB), then the
+        /// least recently used slot of the same shape is overwritten. Slots touched in the last 24 lookups are kept (one layer's
+        /// 18 experts are in flight together). No slot to take: STAGED (copied up per use).
         pub fn expert(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize) -> Option<u32> {
             let k = data.as_ptr() as usize;
-            if let Some(&i) = self.ex.get(&k) { return Some(i); }
-            if self.bytes + data.len() > self.budget { return (self.budget > 0 && data.len() <= STAGE).then_some(STAGED); }
-            let i = self.upload(data, ty, rows, cols)?;
-            self.ex.insert(k, i);
+            self.now += 1;
+            let now = self.now;
+            if let Some(&p) = self.ex.get(&k) { self.exs[p].2 = now; return Some(self.exs[p].0); }
+            if self.bytes + data.len() <= self.budget {
+                let i = self.upload(data, ty, rows, cols)?;
+                self.ex.insert(k, self.exs.len());
+                self.exs.push((i, k, now));
+                return Some(i);
+            }
+            if self.budget == 0 || data.len() > STAGE { return None; }
+            let ts = &self.ts;
+            let victim = self.exs.iter().enumerate()
+                .filter(|(_, e)| e.2 + 24 <= now && { let t = &ts[e.0 as usize]; t.ty == ty && t.rows == rows && t.cols == cols })
+                .min_by_key(|(_, e)| e.2).map(|(p, _)| p);
+            let Some(p) = victim else { return Some(STAGED) };
+            let (i, old, _) = self.exs[p];
+            if self.be.htod(data, &Buf::new(self.ts[i as usize].ptr, data.len(), ()), 0).is_err() { return Some(STAGED); }
+            self.ex.remove(&old);
+            self.ex.insert(k, p);
+            self.exs[p] = (i, k, now);
             Some(i)
         }
         pub fn gemv(&self, i: u32, x: &[f32], y: &mut [f32], staged: Option<(&[u8], GgmlType, usize, usize)>) {
@@ -56,7 +73,23 @@ mod dev {
             self.be.dtoh(&self.y, 0, &mut yb).unwrap();
             for (o, c) in y.iter_mut().zip(yb.chunks_exact(4)) { *o = f32::from_le_bytes(c.try_into().unwrap()); }
         }
+        /// One gemv per tensor, all queued before a single readback. Job i reads x[i*xs..] and writes y[i*rows..].
+        pub fn batch(&self, ts: &[u32], x: &[f32], xs: usize, rows: usize) -> Vec<f32> {
+            let xb: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+            self.be.htod(&xb, &self.x, 0).unwrap();
+            for (i, &t) in ts.iter().enumerate() {
+                self.be.gemv(&self.ts[t as usize], self.x.addr() + (4 * i * xs) as u64, self.y.addr() + (4 * i * rows) as u64).unwrap();
+            }
+            let mut yb = vec![0u8; 4 * rows * ts.len()];
+            self.be.dtoh(&self.y, 0, &mut yb).unwrap();
+            yb.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+        }
     }
+}
+/// Batched matvec over VRAM-resident matrices (see `Dev::batch`); None unless every matrix is resident.
+pub fn gpu_batch(ms: &[Mat], x: &[f32], xs: usize, rows: usize) -> Option<Vec<f32>> {
+    let ts: Option<Vec<u32>> = ms.iter().map(|m| m.gpu.filter(|&i| i != dev::STAGED)).collect();
+    Some(dev::get()?.lock().unwrap().batch(&ts?, x, xs, rows))
 }
 pub fn gpu_bytes() -> usize { dev::get().map_or(0, |d| d.lock().unwrap().bytes) }
 
