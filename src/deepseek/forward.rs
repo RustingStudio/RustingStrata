@@ -391,7 +391,7 @@ impl<'a> DsModel<'a> {
         if std::env::var_os("STRATA_DS_PROF").is_some() {
             let g = |i: usize| PROF[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
             let rb = std::fs::read_to_string("/proc/self/io").ok().and_then(|t| t.lines().find_map(|l| l.strip_prefix("read_bytes: ")?.trim().parse::<u64>().ok())).unwrap_or(0);
-            eprintln!("disk_read_MB {} prof ms: route {:.0} experts {:.0} attn {:.0} gpu-expert-hits(of 240) {:.0} total {:.0}", rb >> 20, g(0), g(1), g(2), g(3), t_all.elapsed().as_secs_f64() * 1e3);
+            eprintln!("disk_read_MB {} prof ms: route {:.0} experts {:.0} attn {:.0} vram-expert-lookups hit {} miss {} total {:.0}", rb >> 20, g(0), g(1), g(2), super::mat::EX_LOOKUPS[0].swap(0, std::sync::atomic::Ordering::Relaxed), super::mat::EX_LOOKUPS[1].swap(0, std::sync::atomic::Ordering::Relaxed), t_all.elapsed().as_secs_f64() * 1e3);
         }
         if !want { return vec![]; }
         hc_collapse(&x, &self.pre_prev, &mut cur);
