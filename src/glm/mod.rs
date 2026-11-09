@@ -1,6 +1,7 @@
 //! GLM-5.3-Flash (GGUF arch `glm5-next`): hyperparameters and tensor-table validation.
 //! Mirrors llama.cpp `src/models/glm5-next.cpp` (hparams and tensor creation).
 
+pub mod forward;
 use crate::gguf::Gguf;
 use anyhow::{Context, ensure};
 
@@ -220,4 +221,30 @@ impl GlmConfig {
         ensure!(errs.is_empty(), "{} tensor problems:\n{}", errs.len(), errs.iter().take(40).cloned().collect::<Vec<_>>().join("\n"));
         Ok(())
     }
+}
+
+/// `rustingstrata generate` for glm5-next: raw prompt (no template), greedy, prints the continuation. CPU reference only.
+pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
+    use std::io::Write;
+    let tok = crate::tokenizer::Tokenizer::from_gguf(g)?;
+    let mut m = forward::GlmModel::new(g)?;
+    let eos = tok.eos_ids();
+    let ids = tok.encode(prompt)?;
+    if std::env::var_os("STRATA_GLM_TRACE").is_some() { eprintln!("prompt ids {ids:?}"); }
+    let mut logits = m.prefill(&ids);
+    let (mut out, mut shown) = (vec![], 0);
+    for i in 0..n {
+        let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+        if eos.contains(&next) { break; }
+        out.push(next);
+        let s = tok.decode(&out)?;
+        if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
+            print!("{}", &s[shown..]);
+            std::io::stdout().flush()?;
+            shown = s.len();
+        }
+        if i + 1 < n { logits = m.step(next); }
+    }
+    println!();
+    Ok(())
 }
