@@ -821,6 +821,9 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Chat { model, system, n, think, mut engine } => {
             let g = Gguf::open(&model)?;
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
+                return rusting_strata::deepseek::chat::chat(&g, system, n, think);
+            }
             let mut m = Model::load(&g)?;
             if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;

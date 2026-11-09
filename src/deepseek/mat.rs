@@ -117,11 +117,11 @@ impl<'a> Mat<'a> {
 
     /// Ask the kernel to read expert e's pages now (madvise WILLNEED), so all selected experts of a layer queue on the SSD together.
     pub fn prefetch_expert(&self, e: usize, n_expert: usize) {
-        unsafe extern "C" { fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32; }
+        unsafe extern "C" { fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32; }
         let sz = self.rows / n_expert * self.ty.row_bytes(self.cols as u64);
         let a = self.data[e * sz..].as_ptr() as usize;
         let start = a & !4095;
-        unsafe { madvise(start as *mut u8, a + sz - start, 3) };
+        unsafe { madvise(start as *mut std::ffi::c_void, a + sz - start, 3) };
     }
 
     pub fn row_into(&self, r: usize, out: &mut [f32]) {
