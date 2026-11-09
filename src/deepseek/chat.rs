@@ -80,8 +80,11 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
     Ok(())
 }
 
-/// Prompt plus reply cap per request (ponytail: fixed; the KV cache is untested far beyond this).
-const CTX: usize = 4096;
+/// Prompt plus reply cap per request: `STRATA_DS_CTX` tokens, default 16384.
+/// ponytail: only checked against llama.cpp up to a 1425-token prompt; the candidate-block prune (beyond 4096 compressed rows) is not implemented.
+fn ctx_limit() -> usize {
+    std::env::var("STRATA_DS_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(16384)
+}
 
 /// `rustingstrata serve` for DeepSeek: one request at a time, OpenAI `/v1/chat/completions` (JSON or SSE), `/v1/models`, `/health`.
 /// Earlier reasoning is kept by default, like llama-server (`chat_template_kwargs.preserve_thinking:false` drops it).
@@ -92,6 +95,7 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
     let tok = Tokenizer::from_gguf(g)?;
     let mut m = DsModel::new(g)?;
     let eos = tok.eos_ids();
+    let ctx = ctx_limit();
     let l = std::net::TcpListener::bind(addr)?;
     eprintln!("deepseek serve on http://{addr}/ model {name}");
     for c in l.incoming() {
@@ -125,14 +129,14 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
                     Ok(i) if !i.is_empty() => i,
                     _ => { send(&mut c, "400 Bad Request", "application/json", r#"{"error":{"message":"cannot encode prompt"}}"#); continue }
                 };
-                if ids.len() > CTX {
-                    send(&mut c, "400 Bad Request", "application/json", &json!({"error": {"message": format!("prompt is {} tokens, the limit is {CTX}", ids.len()), "type": "invalid_request_error"}}).to_string());
+                if ids.len() > ctx {
+                    send(&mut c, "400 Bad Request", "application/json", &json!({"error": {"message": format!("prompt is {} tokens, the limit is {ctx}", ids.len()), "type": "invalid_request_error"}}).to_string());
                     continue;
                 }
                 let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
                 let mut logits = vec![];
                 logits = m.prefill(&ids[keep..]);
-                let n = q.max_tokens.unwrap_or(256).min(CTX - ids.len());
+                let n = q.max_tokens.unwrap_or(256).min(ctx - ids.len());
                 if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
                 let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
                 let (mut out, mut shown, mut done) = (vec![], 0, "length");

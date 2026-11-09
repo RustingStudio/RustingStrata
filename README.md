@@ -118,7 +118,7 @@ The llama.cpp numbers are from the first cold runs on this box and the RustingSt
 before the model was deleted; they were not re-measured side by side, and both move with the page cache.
 Decode varies run to run with the page cache, because the experts that miss VRAM are read from the GGUF.
 `STRATA_DS_GPU_EXPERTS=<GB>` changes the VRAM expert budget (10 worked on a 12 GB card). Prefill is one token at a
-time. Context is capped at 4096 tokens, decoding is greedy only, and tool calls and sampling are not supported.
+time. Prompt plus reply is capped at 16384 tokens (`STRATA_DS_CTX` changes it; only checked up to a 1425-token prompt), decoding is greedy only, and tool calls and sampling are not supported.
 
 ## Development
 
