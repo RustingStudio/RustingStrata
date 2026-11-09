@@ -10,15 +10,19 @@ mod dev {
     use super::*;
     use crate::backend::{Backend, Buf, GpuTensor};
     use crate::weights::Tensor;
-    pub struct Dev { be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, pub bytes: usize, ex: std::collections::HashMap<usize, u32>, budget: usize }
+    /// Scratch slot for experts that missed the VRAM cache: copied up per use, so the CPU never dequantises them.
+    pub const STAGE: usize = 16 << 20;
+    pub const STAGED: u32 = u32::MAX;
+    pub struct Dev { be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, pub bytes: usize, ex: std::collections::HashMap<usize, u32>, budget: usize, stage: Buf }
     static DEV: OnceLock<Option<Mutex<Dev>>> = OnceLock::new();
     pub fn get() -> Option<&'static Mutex<Dev>> {
         DEV.get_or_init(|| {
             if std::env::var_os("STRATA_DS_GPU").is_none() { return None; }
             let be = crate::backend::open(Some("cuda"), 0).ok()?;
             let (x, y) = (be.alloc(4 * 40960).ok()?, be.alloc(4 * 140000).ok()?);
+            let stage = be.alloc(STAGE).ok()?;
             let gb: f64 = std::env::var("STRATA_DS_GPU_EXPERTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-            Some(Mutex::new(Dev { be, ts: vec![], x, y, bytes: 0, ex: Default::default(), budget: (gb * 1e9) as usize }))
+            Some(Mutex::new(Dev { be, ts: vec![], x, y, bytes: 0, ex: Default::default(), budget: (gb * 1e9) as usize, stage }))
         }).as_ref()
     }
     impl Dev {
@@ -33,15 +37,21 @@ mod dev {
         pub fn expert(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize) -> Option<u32> {
             let k = data.as_ptr() as usize;
             if let Some(&i) = self.ex.get(&k) { return Some(i); }
-            if self.bytes + data.len() > self.budget { return None; }
+            if self.bytes + data.len() > self.budget { return (self.budget > 0 && data.len() <= STAGE).then_some(STAGED); }
             let i = self.upload(data, ty, rows, cols)?;
             self.ex.insert(k, i);
             Some(i)
         }
-        pub fn gemv(&self, i: u32, x: &[f32], y: &mut [f32]) {
+        pub fn gemv(&self, i: u32, x: &[f32], y: &mut [f32], staged: Option<(&[u8], GgmlType, usize, usize)>) {
             let xb: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
             self.be.htod(&xb, &self.x, 0).unwrap();
-            self.be.gemv(&self.ts[i as usize], self.x.addr(), self.y.addr()).unwrap();
+            if let Some((d, ty, rows, cols)) = staged {
+                self.be.htod(d, &self.stage, 0).unwrap();
+                let w = GpuTensor::new(ty, rows, cols, Buf::new(self.stage.addr(), d.len(), ()));
+                self.be.gemv(&w, self.x.addr(), self.y.addr()).unwrap();
+            } else {
+                self.be.gemv(&self.ts[i as usize], self.x.addr(), self.y.addr()).unwrap();
+            }
             let mut yb = vec![0u8; 4 * y.len()];
             self.be.dtoh(&self.y, 0, &mut yb).unwrap();
             for (o, c) in y.iter_mut().zip(yb.chunks_exact(4)) { *o = f32::from_le_bytes(c.try_into().unwrap()); }
@@ -115,7 +125,7 @@ impl<'a> Mat<'a> {
         assert_eq!(x.len(), self.cols);
         assert_eq!(y.len(), self.rows);
         if let (Some(i), Some(d)) = (self.gpu, dev::get()) {
-            return d.lock().unwrap().gemv(i, x, y);
+            return d.lock().unwrap().gemv(i, x, y, (i == dev::STAGED).then_some((self.data, self.ty, self.rows, self.cols)));
         }
         let rb = self.ty.row_bytes(self.cols as u64);
         let xq = q8_roundtrip(self.ty, self.cpu, x);
