@@ -262,6 +262,7 @@ impl<'a> DsModel<'a> {
     }
 
     fn ffn(&self, il: usize, cur: &[f32]) -> Vec<f32> {
+        let t0 = std::time::Instant::now();
         let cfg = &self.cfg;
         let l = &self.layers[il];
         let mut logits = vec![0f32; cfg.n_expert];
@@ -285,13 +286,18 @@ impl<'a> DsModel<'a> {
         let n = cfg.n_embd;
         let mut out = vec![0f32; n];
         let (mut g, mut u, mut d) = (vec![0f32; cfg.n_ff_exp], vec![0f32; cfg.n_ff_exp], vec![0f32; n]);
+        let t1 = std::time::Instant::now();
         for (e, w) in sel {
-            l.gexps.expert(e, cfg.n_expert).matvec(cur, &mut g);
+            let ge = l.gexps.expert(e, cfg.n_expert);
+            PROF[3].fetch_add(ge.gpu.is_some() as u64 * 1000, std::sync::atomic::Ordering::Relaxed);
+            ge.matvec(cur, &mut g);
             l.uexps.expert(e, cfg.n_expert).matvec(cur, &mut u);
             for j in 0..g.len() { g[j] = act(g[j], u[j], cfg.clamp_exp[il]); }
             l.dexps.expert(e, cfg.n_expert).matvec(&g, &mut d);
             for j in 0..n { out[j] += w * d[j]; }
         }
+        PROF[1].fetch_add(t1.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        PROF[0].fetch_add((t1 - t0).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         self.tr("ffn_moe_out", il as i32, &out);
         let fs = cfg.n_ff_exp * cfg.n_shared;
         let (mut g, mut u, mut d) = (vec![0f32; fs], vec![0f32; fs], vec![0f32; n]);
@@ -306,6 +312,7 @@ impl<'a> DsModel<'a> {
 
     /// Feed one token at the next position; returns logits.
     pub fn step(&mut self, tok: u32) -> Vec<f32> {
+        let t_all = std::time::Instant::now();
         let pos = self.toks.len();
         self.toks.push(tok);
         let n = self.cfg.n_embd;
@@ -326,7 +333,9 @@ impl<'a> DsModel<'a> {
             self.tr("hc_attn_pre", il as i32, &cur);
             rms_norm_w(&cur, &self.layers[il].attn_norm, self.cfg.eps, &mut nrm);
             self.tr("attn_norm", il as i32, &nrm);
+            let ta = std::time::Instant::now();
             let att = self.attention(il, pos, &nrm);
+            PROF[2].fetch_add(ta.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             self.tr("attn_out", il as i32, &att);
             let mut x2 = vec![0f32; 4 * n];
             hc_post(&att, &x, &a, &mut x2);
@@ -345,6 +354,10 @@ impl<'a> DsModel<'a> {
             self.pre_prev = f.pre;
             self.tr("l_out", il as i32, &x);
         }
+        if std::env::var_os("STRATA_DS_PROF").is_some() {
+            let g = |i: usize| PROF[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
+            eprintln!("prof ms: route {:.0} experts {:.0} attn {:.0} gpu-expert-hits(of 240) {:.0} total {:.0}", g(0), g(1), g(2), g(3), t_all.elapsed().as_secs_f64() * 1e3);
+        }
         hc_collapse(&x, &self.pre_prev, &mut cur);
         self.tr("hc_out", -1, &cur);
         rms_norm_w(&cur, &self.out_norm, self.cfg.eps, &mut nrm);
@@ -355,3 +368,5 @@ impl<'a> DsModel<'a> {
         logits
     }
 }
+
+static PROF: [std::sync::atomic::AtomicU64; 4] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
