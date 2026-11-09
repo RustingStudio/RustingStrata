@@ -286,6 +286,11 @@ impl<'a> DsModel<'a> {
         let n = cfg.n_embd;
         let mut out = vec![0f32; n];
         let (mut g, mut u, mut d) = (vec![0f32; cfg.n_ff_exp], vec![0f32; cfg.n_ff_exp], vec![0f32; n]);
+        if std::env::var_os("STRATA_DS_NOPREFETCH").is_none() {
+            for &(e, _) in &sel {
+                for m in [&l.gexps, &l.uexps, &l.dexps] { m.prefetch_expert(e, cfg.n_expert); }
+            }
+        }
         let t1 = std::time::Instant::now();
         for (e, w) in sel {
             let ge = l.gexps.expert(e, cfg.n_expert);
@@ -356,7 +361,8 @@ impl<'a> DsModel<'a> {
         }
         if std::env::var_os("STRATA_DS_PROF").is_some() {
             let g = |i: usize| PROF[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
-            eprintln!("prof ms: route {:.0} experts {:.0} attn {:.0} gpu-expert-hits(of 240) {:.0} total {:.0}", g(0), g(1), g(2), g(3), t_all.elapsed().as_secs_f64() * 1e3);
+            let rb = std::fs::read_to_string("/proc/self/io").ok().and_then(|t| t.lines().find_map(|l| l.strip_prefix("read_bytes: ")?.trim().parse::<u64>().ok())).unwrap_or(0);
+            eprintln!("disk_read_MB {} prof ms: route {:.0} experts {:.0} attn {:.0} gpu-expert-hits(of 240) {:.0} total {:.0}", rb >> 20, g(0), g(1), g(2), g(3), t_all.elapsed().as_secs_f64() * 1e3);
         }
         hc_collapse(&x, &self.pre_prev, &mut cur);
         self.tr("hc_out", -1, &cur);
