@@ -33,6 +33,15 @@ pub struct Model<'a> {
     ple: Option<Ple>,
 }
 
+impl Model<'_> {
+    /// Host memory this process owns outright: baked/synthesized tensors and LoRA factors. The mmapped GGUF is
+    /// evictable page cache and is not counted, so models larger than RAM still load.
+    pub fn ram_estimate(&self) -> usize {
+        let lora: usize = self.loras.iter().flat_map(|l| l.entries.values()).map(|e| (e.a.len() * e.in_dim + e.b.len() * e.out_dim) * 4).sum();
+        self.w.built.values().map(|t| t.data.len()).sum::<usize>() + lora
+    }
+}
+
 /// qwen4exp per-layer embedding (PLE): n-gram hash constants from the GGUF.
 struct Ple { mult: Vec<u64>, off: Vec<u64>, vocab: Vec<u64>, eos: i64 }
 
