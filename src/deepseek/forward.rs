@@ -1,7 +1,7 @@
 //! Slow single-token CPU reference forward for DeepSeek-V4.1 (mirrors llama.cpp deepseek41.cpp).
 //! Not implemented: indexer top-k (only matters beyond 512 visible compressed rows, i.e. >1024 tokens)
 //! and the candidate-block prune (beyond 4096 rows). The window boundary (128) is unverified.
-use super::mat::{Mat, vec_f32};
+use super::mat::{Mat, matvec_many, vec_f32};
 use super::ops::*;
 use super::{AttnKind, DsConfig};
 use crate::gguf::Gguf;
@@ -183,8 +183,11 @@ impl<'a> DsModel<'a> {
         let cfg = &self.cfg;
         let (nh, hd, nr) = (cfg.n_head, cfg.head_dim, cfg.n_rot);
         let l = &self.layers[il];
-        let mut qa = vec![0f32; cfg.q_lora];
-        l.wq_a.matvec(cur, &mut qa);
+        // wq_a, wkv and the compressor's kv/gate all read `cur`: one GPU round trip.
+        let mut first = vec![l.wq_a, l.wkv];
+        if let Some(cw) = &l.comp { first.push(cw.kv); first.extend(cw.gate); }
+        let y0 = matvec_many(&first, cur, 0);
+        let (qa, kv0_pre) = (y0[..cfg.q_lora].to_vec(), &y0[cfg.q_lora..]);
         let mut qr = vec![0f32; cfg.q_lora];
         rms_norm_w(&qa, &l.q_a_norm, cfg.eps, &mut qr);
         self.tr("qr_norm", il as i32, &qr);
@@ -193,10 +196,9 @@ impl<'a> DsModel<'a> {
         for h in 0..nh {
             l.rope.apply(&mut q[h * hd..(h + 1) * hd], pos, false);
         }
-        let mut kv0 = vec![0f32; hd];
-        l.wkv.matvec(cur, &mut kv0);
+        let kv0 = &kv0_pre[..hd];
         let mut kv = vec![0f32; hd];
-        rms_norm_w(&kv0, &l.kv_a_norm, cfg.eps, &mut kv);
+        rms_norm_w(kv0, &l.kv_a_norm, cfg.eps, &mut kv);
         l.rope.apply(&mut kv, pos, false);
         self.tr("q", il as i32, &q);
         self.tr("kv", il as i32, &kv);
@@ -205,12 +207,8 @@ impl<'a> DsModel<'a> {
         let src = cfg.kv_src[il].max(0) as usize;
         let ratio = match cfg.attn[il] { AttnKind::Window => 0, AttnKind::Csa => 2, AttnKind::Hca => 1 };
         if let Some(cw) = &self.layers[il].comp {
-            let mut v = vec![0f32; hd];
-            cw.kv.matvec(cur, &mut v);
-            let s = match &cw.gate {
-                Some(g) => { let mut s = vec![0f32; hd]; g.matvec(cur, &mut s); s }
-                None => vec![0f32; hd],
-            };
+            let v = kv0_pre[hd..2 * hd].to_vec();
+            let s = if cw.gate.is_some() { kv0_pre[2 * hd..3 * hd].to_vec() } else { vec![0f32; hd] };
             let c = &mut self.cache[il];
             c.pend_v.push(v);
             c.pend_s.push(s);
@@ -241,27 +239,25 @@ impl<'a> DsModel<'a> {
         let comp = &self.cache[src].comp;
         let scale = 1.0 / (hd as f32).sqrt();
         let mut out = vec![0f32; nh * hd];
-        for h in 0..nh {
+        let keys: Vec<&[f32]> = raw[w0..=pos].iter().map(|k| &k[..]).chain(comp[..ncomp].iter().map(|k| &k[..hd])).collect();
+        // heads are independent: same math per head, spread over the cores
+        use rayon::prelude::*;
+        out.par_chunks_mut(hd).enumerate().for_each(|(h, o)| {
             let qh = &q[h * hd..(h + 1) * hd];
-            let keys: Vec<&[f32]> = raw[w0..=pos].iter().map(|k| &k[..]).chain(comp[..ncomp].iter().map(|k| &k[..hd])).collect();
             let mut sc: Vec<f32> = keys.iter().map(|k| k.iter().zip(qh).map(|(a, b)| a * b).sum::<f32>() * scale).collect();
             let mx = sc.iter().cloned().fold(l.sinks[h], f32::max);
             let mut z = (l.sinks[h] - mx).exp();
             for s in sc.iter_mut() { *s = (*s - mx).exp(); z += *s; }
-            let o = &mut out[h * hd..(h + 1) * hd];
             for (s, k) in sc.iter().zip(&keys) {
                 for j in 0..hd { o[j] += s / z * k[j]; }
             }
             l.rope.apply(o, pos, true);
-        }
+        });
         let _ = nr;
         self.tr("attn_derope", il as i32, &out);
         let gsz = nh * hd / cfg.o_groups;
-        let mut oa = vec![0f32; cfg.o_groups * cfg.o_lora];
-        for g in 0..cfg.o_groups {
-            let sub = l.wo_a.group(g, cfg.o_groups);
-            sub.matvec(&out[g * gsz..(g + 1) * gsz], &mut oa[g * cfg.o_lora..(g + 1) * cfg.o_lora]);
-        }
+        let subs: Vec<_> = (0..cfg.o_groups).map(|g| l.wo_a.group(g, cfg.o_groups)).collect();
+        let oa = matvec_many(&subs, &out, gsz);
         self.tr("attn_wo_a", il as i32, &oa);
         let mut res = vec![0f32; cfg.n_embd];
         l.wo_b.matvec(&oa, &mut res);
@@ -302,11 +298,12 @@ impl<'a> DsModel<'a> {
         // All selected experts resident in VRAM: 2 GPU round trips per layer instead of 3 per expert.
         let gu: Vec<_> = sel.iter().map(|s| l.gexps.expert(s.0, cfg.n_expert)).chain(sel.iter().map(|s| l.uexps.expert(s.0, cfg.n_expert))).collect();
         let nf = cfg.n_ff_exp;
-        let fast = crate::deepseek::mat::gpu_batch(&gu, cur, 0, nf).and_then(|gu_y| {
+        let fast = gu.iter().all(|m| m.gpu.is_some_and(|i| i != u32::MAX)).then(|| {
+            let gu_y = matvec_many(&gu, cur, 0);
             let k = sel.len();
             let a: Vec<f32> = (0..k * nf).map(|i| act(gu_y[i], gu_y[k * nf + i], cfg.clamp_exp[il])).collect();
             let dm: Vec<_> = sel.iter().map(|s| l.dexps.expert(s.0, cfg.n_expert)).collect();
-            crate::deepseek::mat::gpu_batch(&dm, &a, nf, n)
+            matvec_many(&dm, &a, nf)
         });
         if let Some(dy) = &fast {
             PROF[3].fetch_add(1000 * sel.len() as u64, std::sync::atomic::Ordering::Relaxed);
