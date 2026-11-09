@@ -209,10 +209,10 @@ fn nvrtc_version() -> Option<(i32, i32)> {
 }
 
 /// The user-facing error for a device `cc` with an NVRTC that cannot target it, `None` when the pair is fine.
-/// CUDA 13 dropped Volta, so an sm_70 device must be compiled by NVRTC 12.x; saying it here keeps NVRTC's own
+/// CUDA 13 dropped Volta (and older), not Turing, so an sm_70 device must be compiled by NVRTC 12.x; saying it here keeps NVRTC's own
 /// `invalid value for --gpu-architecture` from being the first thing the user sees.
 fn arch_support_error(cc: (i32, i32), nvrtc: (i32, i32)) -> Option<String> {
-    (cc.0 < 8 && nvrtc.0 >= 13).then(|| format!(
+    (cc < (7, 5) && nvrtc.0 >= 13).then(|| format!(
         "NVRTC {}.{} cannot compile for sm_{}{}: 13.x removed Volta (sm_70) support; install toolkit/NVRTC 12.x",
         nvrtc.0, nvrtc.1, cc.0, cc.1))
 }
@@ -220,10 +220,11 @@ fn arch_support_error(cc: (i32, i32), nvrtc: (i32, i32)) -> Option<String> {
 /// The startup line for the device: arch always, plus the sm_70 prefill GEMM path (tensor cores vs FMA fallback).
 /// `gemm_fma` is passed explicitly so the log reflects the cubin actually compiled, not the env at print time.
 fn device_log(device: usize, name: &str, arch: &str, cc: (i32, i32), gemm_fma: bool) -> String {
-    let path = match (cc.0 < 8, gemm_fma) {
-        (true, false) => " (Volta, m8n8k4)",
-        (true, true) => " (Volta fallback)",
-        (false, _) => "",  // sm_80+ always uses mma.m16n8k16
+    let path = match (cc, gemm_fma) {
+        (c, false) if c < (7, 5) => " (Volta, m8n8k4)",
+        (c, true) if c < (7, 5) => " (Volta fallback)",
+        (c, _) if c < (8, 0) => " (Turing, m16n8k8)",
+        _ => "",  // sm_80+ always uses mma.m16n8k16
     };
     format!("cuda device {device}: {name}, {arch}{path}")
 }
@@ -1206,6 +1207,19 @@ mod tests {
         let msg = super::arch_support_error((7, 0), (13, 0)).expect("13.x cannot target sm_70");
         assert!(msg.contains("12.x"), "message must name the required toolkit: {msg}");
         assert!(msg.contains("sm_70"), "message must name the arch: {msg}");
+    }
+
+    #[test]
+    fn arch_support_error_allows_cuda13_on_turing_and_newer() {
+        for cc in [(7, 5), (8, 0), (8, 6), (9, 0)] {
+            assert_eq!(super::arch_support_error(cc, (13, 1)), None, "sm_{}{}", cc.0, cc.1);
+        }
+    }
+
+    #[test]
+    fn device_log_names_turing_not_volta() {
+        assert!(super::device_log(0, "x", "sm_75", (7, 5), false).contains("Turing"));
+        assert!(super::device_log(0, "x", "sm_70", (7, 0), false).contains("Volta"));
     }
 
     #[test]
