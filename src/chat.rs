@@ -448,5 +448,12 @@ mod ds_tests {
         a.reasoning = Some("greet".into());
         let m = [Msg::new("system", "Be brief."), Msg::new("user", "Hi"), a, Msg::new("user", "Bye")];
         assert_eq!(t.render(&m, &[], true, false, true), "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nBe brief.<｜User｜>Hi<｜Assistant｜></think>Hello.<｜end▁of▁sentence｜><｜User｜>Bye<｜Assistant｜><think>");
+        // llama-server /apply-template default (reasoning of earlier turns kept): checked against build b12116.
+        let mut r = Msg::new("assistant", "Hello!");
+        r.reasoning = Some("greet".into());
+        let m = [Msg::new("user", "Hi"), r, Msg::new("user", "Bye")];
+        assert_eq!(t.render(&m, &[], true, true, true), "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Hi<｜Assistant｜><think>greet</think>Hello!<｜end▁of▁sentence｜><｜User｜>Bye<｜Assistant｜><think>");
+        let m = [Msg::new("system", "Be brief."), Msg::new("user", "Hi"), Msg::new("assistant", "Hello!"), Msg::new("user", "Bye")];
+        assert_eq!(t.render(&m, &[], true, true, true), "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nBe brief.<｜User｜>Hi<｜Assistant｜><think></think>Hello!<｜end▁of▁sentence｜><｜User｜>Bye<｜Assistant｜><think>");
     }
 }
