@@ -273,6 +273,8 @@ pub struct Stats {
     pub slots: usize,
     /// Device memory in use and in total, measured after the load and after each request.
     pub vram: Option<(u64, u64)>,
+    /// Host RAM cap in bytes (`total - --ram-margin`, or `--max-ram`); `None` if undetectable.
+    pub ram_cap: Option<u64>,
     /// MoE expert cache hits and misses, and MTP drafts tried and accepted, since the model loaded.
     pub experts: Option<(u64, u64)>,
     pub drafts: Option<(u64, u64)>,
@@ -333,6 +335,9 @@ impl Stats {
         if let Some((u, t)) = self.vram {
             m("vram_used_bytes", "gauge", "Device memory in use.", u);
             m("vram_total_bytes", "gauge", "Device memory in total.", t);
+        }
+        if let Some(c) = self.ram_cap {
+            m("ram_cap_bytes", "gauge", "Host RAM cap (total minus margin, or --max-ram).", c);
         }
         if let Some((h, x)) = self.experts {
             m("expert_hits_total", "counter", "Routed experts found on the GPU since the model loaded.", h);

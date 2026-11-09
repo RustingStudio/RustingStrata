@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use anyhow::Context;
+use rusting_strata::memory;
 use rusting_strata::model::{Model, State};
 use rusting_strata::{backend, gpu_model::GpuModel};
 use rusting_strata::{config::ModelConfig, gguf::Gguf, hf, ops, ops::Sampler, quant::GgmlType, serve, tokenizer::Tokenizer};
@@ -57,6 +58,13 @@ struct Engine {
     /// repeat exactly.
     #[arg(long)]
     fixed_experts: bool,
+    /// Host RAM left free for the OS, in MB. The cap is `total RAM - margin` and bounds memory the process owns
+    /// (baked tensors, LoRA factors, `--cache-ram`); the mmapped model is evictable page cache and is not counted.
+    #[arg(long, default_value_t = 512)]
+    ram_margin: usize,
+    /// Absolute host RAM cap in MB; overrides `--ram-margin`. 0 uses the margin.
+    #[arg(long, default_value_t = 0)]
+    max_ram: usize,
     /// Host memory in MB for conversation states that a request with another history replaced (GPU): a later request
     /// that continues one of them takes it back instead of prefilling it again. 0 keeps none.
     #[arg(long, default_value_t = 4096)]
@@ -226,7 +234,18 @@ impl Runner<'_> {
 
 impl Engine {
     /// Fills settings not given on the command line from the model's calibration file, else built-in defaults.
+    fn ram_cap(&self) -> Option<u64> { memory::ram_cap((self.ram_margin as u64) << 20, (self.max_ram as u64) << 20) }
     fn runner<'a>(&mut self, m: &'a Model<'a>, model: &Path) -> anyhow::Result<Runner<'a>> {
+        if let Some(cap) = self.ram_cap() {
+            let used = m.ram_estimate() as u64;
+            anyhow::ensure!(used <= cap, "model needs ~{} MB of host RAM (baked tensors, LoRA), over the {} MB cap; lower --ram-margin or raise --max-ram", used >> 20, cap >> 20);
+            let want = (self.cache_ram as u64) << 20;
+            let room = cap - used;
+            if want > room {
+                eprintln!("RAM cap: clamping --cache-ram from {} MB to {} MB", self.cache_ram, room >> 20);
+                self.cache_ram = (room >> 20) as usize;
+            }
+        }
         if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
         if self.kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
         let open = || self.device.iter().map(|&d| backend::open(self.backend.as_deref(), d)).collect::<anyhow::Result<Vec<_>>>();
@@ -1460,6 +1479,7 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
         let mut st = s.stats.lock().unwrap();
         st.unload(Some(name.clone()));
         st.ctx = engine.ctx;
+        st.ram_cap = engine.ram_cap();
     }
     let g = Gguf::open(model)?;
     let arch = g.get("general.architecture")?.as_str().context("general.architecture")?;
