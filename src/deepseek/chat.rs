@@ -80,9 +80,12 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
     Ok(())
 }
 
+/// Prompt plus reply cap per request (ponytail: fixed; the KV cache is untested far beyond this).
+const CTX: usize = 4096;
+
 /// `strata serve` for DeepSeek: one request at a time, OpenAI `/v1/chat/completions` (JSON or SSE), `/v1/models`, `/health`.
-/// ponytail: greedy only, no tools/stop strings/API key; the KV cache is reused only when the new prompt extends the last sequence.
-pub fn serve(g: &Gguf, name: &str, addr: &str) -> anyhow::Result<()> {
+/// ponytail: greedy only, no tools/stop strings; the KV cache is reused only when the new prompt extends the last sequence.
+pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow::Result<()> {
     use serde_json::json;
     gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
@@ -93,11 +96,22 @@ pub fn serve(g: &Gguf, name: &str, addr: &str) -> anyhow::Result<()> {
     for c in l.incoming() {
         let Ok(mut c) = c else { continue };
         let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+        let _ = c.set_write_timeout(Some(std::time::Duration::from_secs(30)));
         let Ok(r) = crate::serve::read_request(&mut std::io::BufReader::new(&c)) else { continue };
         let send = |c: &mut std::net::TcpStream, status: &str, ty: &str, b: &str| {
             let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
         };
         let path = r.path.split('?').next().unwrap_or("");
+        // /health stays open for load balancers, like the main server.
+        // Without a key the Host check stops DNS rebinding, as in the main server.
+        if path != "/health" && api_key.is_none() && !crate::serve::host_ok(&r.host, addr, &[]) {
+            send(&mut c, "403 Forbidden", "application/json", r#"{"error":{"message":"bad Host header"}}"#);
+            continue;
+        }
+        if path != "/health" && api_key.is_some_and(|k| !crate::serve::key_ok(&r.auth, k)) {
+            send(&mut c, "401 Unauthorized", "application/json", r#"{"error":{"message":"missing or wrong API key","type":"invalid_api_key"}}"#);
+            continue;
+        }
         match (r.method.as_str(), path) {
             ("GET", "/health") => send(&mut c, "200 OK", "application/json", r#"{"status":"ok"}"#),
             ("GET", "/v1/models") => send(&mut c, "200 OK", "application/json", &json!({"object": "list", "data": [{"id": name, "object": "model", "owned_by": "strata"}]}).to_string()),
@@ -110,10 +124,14 @@ pub fn serve(g: &Gguf, name: &str, addr: &str) -> anyhow::Result<()> {
                     Ok(i) if !i.is_empty() => i,
                     _ => { send(&mut c, "400 Bad Request", "application/json", r#"{"error":{"message":"cannot encode prompt"}}"#); continue }
                 };
+                if ids.len() > CTX {
+                    send(&mut c, "400 Bad Request", "application/json", &json!({"error": {"message": format!("prompt is {} tokens, the limit is {CTX}", ids.len()), "type": "invalid_request_error"}}).to_string());
+                    continue;
+                }
                 let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
                 let mut logits = vec![];
                 for &t in &ids[keep..] { logits = m.step(t); }
-                let n = q.max_tokens.unwrap_or(256);
+                let n = q.max_tokens.unwrap_or(256).min(CTX - ids.len());
                 if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
                 let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
                 let (mut out, mut shown, mut done) = (vec![], 0, "length");
