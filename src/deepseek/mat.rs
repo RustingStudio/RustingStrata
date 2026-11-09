@@ -10,14 +10,15 @@ mod dev {
     use super::*;
     use crate::backend::{Backend, Buf, GpuTensor};
     use crate::weights::Tensor;
-    pub struct Dev { be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, pub bytes: usize }
+    pub struct Dev { be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, pub bytes: usize, ex: std::collections::HashMap<usize, u32>, budget: usize }
     static DEV: OnceLock<Option<Mutex<Dev>>> = OnceLock::new();
     pub fn get() -> Option<&'static Mutex<Dev>> {
         DEV.get_or_init(|| {
             if std::env::var_os("STRATA_DS_GPU").is_none() { return None; }
             let be = crate::backend::open(Some("cuda"), 0).ok()?;
             let (x, y) = (be.alloc(4 * 40960).ok()?, be.alloc(4 * 140000).ok()?);
-            Some(Mutex::new(Dev { be, ts: vec![], x, y, bytes: 0 }))
+            let gb: f64 = std::env::var("STRATA_DS_GPU_EXPERTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+            Some(Mutex::new(Dev { be, ts: vec![], x, y, bytes: 0, ex: Default::default(), budget: (gb * 1e9) as usize }))
         }).as_ref()
     }
     impl Dev {
@@ -26,6 +27,16 @@ mod dev {
             self.bytes += data.len();
             self.ts.push(t);
             Some(self.ts.len() as u32 - 1)
+        }
+        /// VRAM copy of one routed expert, uploaded on first use while under the STRATA_DS_GPU_EXPERTS budget (GB).
+        /// ponytail: no eviction, first experts touched win; add an LRU if hit rate matters.
+        pub fn expert(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize) -> Option<u32> {
+            let k = data.as_ptr() as usize;
+            if let Some(&i) = self.ex.get(&k) { return Some(i); }
+            if self.bytes + data.len() > self.budget { return None; }
+            let i = self.upload(data, ty, rows, cols)?;
+            self.ex.insert(k, i);
+            Some(i)
         }
         pub fn gemv(&self, i: u32, x: &[f32], y: &mut [f32]) {
             let xb: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -89,7 +100,9 @@ impl<'a> Mat<'a> {
     pub fn expert(&self, e: usize, n_expert: usize) -> Mat<'a> {
         let rows = self.rows / n_expert;
         let sz = rows * self.ty.row_bytes(self.cols as u64);
-        Mat { data: &self.data[e * sz..(e + 1) * sz], ty: self.ty, rows, cols: self.cols, cpu: self.cpu, gpu: None }
+        let data = &self.data[e * sz..(e + 1) * sz];
+        let gpu = dev::get().and_then(|d| d.lock().unwrap().expert(data, self.ty, rows, self.cols));
+        Mat { data, ty: self.ty, rows, cols: self.cols, cpu: self.cpu, gpu }
     }
 
     pub fn row_into(&self, r: usize, out: &mut [f32]) {
