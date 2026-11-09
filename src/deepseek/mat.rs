@@ -39,7 +39,8 @@ mod dev {
             let k = data.as_ptr() as usize;
             self.now += 1;
             let now = self.now;
-            if let Some(&p) = self.ex.get(&k) { self.exs[p].2 = now; return Some(self.exs[p].0); }
+            if let Some(&p) = self.ex.get(&k) { self.exs[p].2 = now; EX_LOOKUPS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed); return Some(self.exs[p].0); }
+            EX_LOOKUPS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if self.bytes + data.len() <= self.budget {
                 let i = self.upload(data, ty, rows, cols)?;
                 self.ex.insert(k, self.exs.len());
@@ -91,6 +92,8 @@ pub fn gpu_batch(ms: &[Mat], x: &[f32], xs: usize, rows: usize) -> Option<Vec<f3
     let ts: Option<Vec<u32>> = ms.iter().map(|m| m.gpu.filter(|&i| i != dev::STAGED)).collect();
     Some(dev::get()?.lock().unwrap().batch(&ts?, x, xs, rows))
 }
+/// Expert cache lookups since the last PROF print: [hit, miss].
+pub static EX_LOOKUPS: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 pub fn gpu_bytes() -> usize { dev::get().map_or(0, |d| d.lock().unwrap().bytes) }
 
 /// Row-major weight: `rows` rows of `cols` elements (ggml dims[0] = cols, dims[1] = rows).
