@@ -29,7 +29,7 @@ vulkan: AMD Radeon RX 9070 XT (radv Mesa 26.2.5), device-coherent memory yes, co
 While the CPU computes the experts that are not in VRAM, the GPU polls a small mailbox buffer for the answer. On AMD the
 GPU caches that buffer unless it comes from device-coherent memory (`VK_AMD_device_coherent_memory`), and then it misses
 the answer and waits until it gives up. RADV hides the extension on RDNA4 (RX 9000) unless the driconf option
-`radv_device_coherent_memory` is set. Strata sets it before it opens Vulkan (unless you set it yourself) and prints a
+`radv_device_coherent_memory` is set. RustingStrata sets it before it opens Vulkan (unless you set it yourself) and prints a
 warning when an AMD GPU still has no device-coherent memory. If the first line says `device-coherent memory no`, send
 the output of `vulkaninfo | grep -i coherent`. A few resumed waits on a busy CPU are normal; hundreds are not.
 
