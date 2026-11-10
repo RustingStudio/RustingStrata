@@ -56,7 +56,7 @@ Environment variables; set any of them to turn the feature off:
 - `STRATA_VK_DP_OLD`: use the old per-query prefill attention fallback instead of the tiled one (A/B and rollback).
 - `STRATA_VK_NO_COND`: no conditional rendering.
 - `STRATA_VK_NO_TQ`: no separate transfer queue for expert uploads.
-- `STRATA_VK_SMEM_LIMIT=49152`: treat the device as allowing this much workgroup shared memory. The AMD Windows driver reports 32768 on a RX 9070 XT although the card has 64 KB, and a model then stops with `needs 40960 bytes of shared memory; this device allows 32768`. No kernel needs more than 49152. Do not set it above what the card really has (issue #20).
+- `STRATA_VK_SMEM_LIMIT=49152`: treat the device as allowing this much workgroup shared memory. The AMD proprietary driver reports 32768 on an RX 9070 XT although the card has 64 KB; RustingStrata raises that to 49152 itself on RDNA3/4 cards with this driver (no kernel needs more). For any other card that reports too little, set it by hand. Do not set it above what the card really has (issue #20).
 - `radv_device_coherent_memory=false`: undo the RADV option RustingStrata sets.
 
 If one of these makes a problem go away, say which one in the report.

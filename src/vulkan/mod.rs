@@ -422,6 +422,11 @@ impl Vk {
         // device with Xid 13). STRATA_VK_SMEM_LIMIT pretends the device reports another value, so a test can exercise
         // the refusal without a doctored shader.
         let mut smem_limit = unsafe { instance.get_physical_device_properties(pd) }.limits.max_compute_shared_memory_size;
+        // The AMD proprietary driver on Windows reports 32768 on RDNA3/4 cards (cooperative matrices), which really have
+        // 64 KB (issue #20; vulkaninfo agrees with the driver, Linux RADV reports 65536). No kernel needs more than 49152.
+        let mut drv = vk::PhysicalDeviceDriverProperties::default();
+        unsafe { instance.get_physical_device_properties2(pd, &mut vk::PhysicalDeviceProperties2::default().push_next(&mut drv)) };
+        if drv.driver_id == vk::DriverId::AMD_PROPRIETARY && coop && smem_limit == 32768 { smem_limit = 49152; }
         if let Ok(v) = std::env::var("STRATA_VK_SMEM_LIMIT") { smem_limit = v.parse().context("STRATA_VK_SMEM_LIMIT")?; }
         let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(qf);
         let pool = unsafe { dev.create_command_pool(&pool_info, None) }?;
