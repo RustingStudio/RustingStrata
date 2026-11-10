@@ -358,6 +358,121 @@ impl<'a> GlmModel<'a> {
         out
     }
 
+    /// FFN for several tokens of one layer: each routed expert is loaded once and applied to every token that picked it.
+    /// Per-token numerics equal `ffn` (expert outputs summed in the token's own selection order).
+    fn ffn_batch(&self, il: usize, curs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let cfg = &self.cfg;
+        let Ffn::Moe { gate_inp, bias, g: ge, u: ue, d: de, gsh, ush, dsh } = &self.layers[il].ffn else {
+            return curs.iter().map(|c| self.ffn(il, c)).collect();
+        };
+        let (n, nf) = (cfg.n_embd, cfg.n_ff_exp);
+        let sels: Vec<Vec<(usize, f32)>> = curs
+            .iter()
+            .map(|c| {
+                let mut logits = vec![0f32; cfg.n_expert];
+                gate_inp.matvec(c, &mut logits);
+                route_sigmoid(&logits, bias, cfg.n_used, cfg.weights_norm, cfg.weights_scale)
+            })
+            .collect();
+        let mut by_e: std::collections::BTreeMap<usize, Vec<(usize, usize)>> = Default::default();
+        for (t, sel) in sels.iter().enumerate() {
+            for (k, &(e, _)) in sel.iter().enumerate() {
+                by_e.entry(e).or_default().push((t, k));
+            }
+        }
+        for &e in by_e.keys() {
+            for m in [ge, ue, de] {
+                m.prefetch_expert(e, cfg.n_expert);
+            }
+        }
+        let mut ds: Vec<Vec<Vec<f32>>> = sels.iter().map(|s| vec![vec![]; s.len()]).collect();
+        let (mut g, mut u) = (vec![0f32; nf], vec![0f32; nf]);
+        for (e, uses) in by_e {
+            let (me_g, me_u, me_d) = (ge.expert(e, cfg.n_expert), ue.expert(e, cfg.n_expert), de.expert(e, cfg.n_expert));
+            for (t, k) in uses {
+                me_g.matvec(&curs[t], &mut g);
+                me_u.matvec(&curs[t], &mut u);
+                for j in 0..nf {
+                    g[j] = swiglu_clamp(g[j], u[j], cfg.clamp_exp[il]);
+                }
+                let mut d = vec![0f32; n];
+                me_d.matvec(&g, &mut d);
+                ds[t][k] = d;
+            }
+        }
+        let fs = nf * cfg.n_shared;
+        curs.iter()
+            .enumerate()
+            .map(|(t, c)| {
+                let mut out = vec![0f32; n];
+                for (k, &(_, w)) in sels[t].iter().enumerate() {
+                    for j in 0..n {
+                        out[j] += w * ds[t][k][j];
+                    }
+                }
+                let (mut g, mut u) = (vec![0f32; fs], vec![0f32; fs]);
+                gsh.matvec(c, &mut g);
+                ush.matvec(c, &mut u);
+                g.iter_mut().zip(&u).for_each(|(g, u)| *g = silu(*g) * u);
+                let mut d = vec![0f32; n];
+                dsh.matvec(&g, &mut d);
+                for j in 0..n {
+                    out[j] += d[j];
+                }
+                out
+            })
+            .collect()
+    }
+
+    /// Layer-major pass over a chunk of prompt tokens (no logits).
+    fn prefill_chunk(&mut self, toks: &[u32]) {
+        let n = self.cfg.n_embd;
+        assert!(self.toks.len() + toks.len() <= self.cfg.idx_top_k, "GLM context is limited to {} tokens (indexer top-k not implemented)", self.cfg.idx_top_k);
+        self.toks.extend_from_slice(toks);
+        let mut xs: Vec<Vec<f32>> = toks
+            .iter()
+            .map(|&t| {
+                let mut emb = vec![0f32; n];
+                self.tok_embd.row_into(t as usize, &mut emb);
+                (0..4).flat_map(|_| emb.iter().cloned()).collect()
+            })
+            .collect();
+        let (mut cur, mut nrm) = (vec![0f32; n], vec![0f32; n]);
+        let t0 = std::time::Instant::now();
+        for il in 0..self.cfg.n_layer {
+            for x in xs.iter_mut() {
+                let a = self.hc_mix(&self.layers[il].hc_attn, x);
+                hc_collapse(x, &a.pre, &mut cur);
+                rms_norm_w(&cur, &self.layers[il].attn_norm, self.cfg.eps, &mut nrm);
+                let att = match self.cfg.kind[il] {
+                    LayerKind::Kda => self.kda(il, &nrm),
+                    LayerKind::Dsa => self.dsa(il, &nrm),
+                };
+                let mut x2 = vec![0f32; 4 * n];
+                hc_post(&att, x, &a, &mut x2);
+                *x = x2;
+            }
+            let mut fs = vec![];
+            let mut nrms = vec![];
+            for x in xs.iter() {
+                let f = self.hc_mix(&self.layers[il].hc_ffn, x);
+                hc_collapse(x, &f.pre, &mut cur);
+                rms_norm_w(&cur, &self.layers[il].ffn_norm, self.cfg.eps, &mut nrm);
+                nrms.push(nrm.clone());
+                fs.push(f);
+            }
+            let ffs = self.ffn_batch(il, &nrms);
+            for ((x, f), ff) in xs.iter_mut().zip(&fs).zip(&ffs) {
+                let mut x2 = vec![0f32; 4 * n];
+                hc_post(ff, x, f, &mut x2);
+                *x = x2;
+            }
+        }
+        if std::env::var_os("STRATA_GLM_PROF").is_some() {
+            eprintln!("PROF chunk {} toks, now {} total {:.0}ms", toks.len(), self.toks.len(), t0.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+
     /// Feed one token at the next position; returns logits.
     pub fn step(&mut self, tok: u32) -> Vec<f32> {
         self.step_opt(tok, true)
@@ -365,11 +480,21 @@ impl<'a> GlmModel<'a> {
 
     /// Feed prompt tokens; only the last one computes logits.
     pub fn prefill(&mut self, toks: &[u32]) -> Vec<f32> {
-        let mut logits = vec![];
-        for (i, &t) in toks.iter().enumerate() {
-            logits = self.step_opt(t, i + 1 == toks.len());
+        let chunk: usize = std::env::var("STRATA_GLM_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+        if toks.is_empty() {
+            return vec![];
         }
-        logits
+        let (head, last) = toks.split_at(toks.len() - 1);
+        if chunk > 1 {
+            for c in head.chunks(chunk) {
+                self.prefill_chunk(c);
+            }
+        } else {
+            for &t in head {
+                self.step_opt(t, false);
+            }
+        }
+        self.step_opt(last[0], true)
     }
 
     fn step_opt(&mut self, tok: u32, want: bool) -> Vec<f32> {
