@@ -8,7 +8,7 @@ placement adapts to the routing it sees.
 
 Version 1.2.1. Docs: [usage and server API](docs/USAGE.md), [hosting for other people](docs/HOSTING.md),
 [supported GPUs](docs/SUPPORTED_GPUS.md), [AMD notes](docs/AMD.md), [LoRA](docs/LORA.md),
-[benchmark history](docs/README.md).
+[all benchmarks](docs/BENCHMARKS.md), [benchmark history](docs/README.md).
 
 ## Numbers
 

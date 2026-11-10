@@ -10,6 +10,8 @@
 
 ## Benchmark history
 
+- [BENCHMARKS.md](BENCHMARKS.md): every model against llama.cpp (and other engines where measured), one table per model.
+
 Raw results and methods, newest work last. The headline numbers are in the [README](../README.md).
 
 - [baseline.md](baseline.md): llama.cpp baseline and `--n-cpu-moe` sweep on the RTX 3060.
