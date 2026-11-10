@@ -236,6 +236,14 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
     let (mut out, mut shown) = (vec![], 0);
     for i in 0..n {
         let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+        if std::env::var_os("STRATA_GLM_TOP5").is_some() {
+            let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let lz = mx as f64 + logits.iter().map(|&l| ((l - mx) as f64).exp()).sum::<f64>().ln();
+            let mut idx: Vec<usize> = (0..logits.len()).collect();
+            idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+            let t: Vec<String> = idx[..5].iter().map(|&k| format!("{k}:{:.4}", logits[k] as f64 - lz)).collect();
+            eprintln!("TOP5 {i} {}", t.join(" "));
+        }
         if eos.contains(&next) { break; }
         out.push(next);
         let s = tok.decode(&out)?;
