@@ -185,6 +185,79 @@ const JSON_HEAD: &str = "# Tools\n\nYou may call one or more functions to assist
 const JSON_TAIL: &str = "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n";
 const TAG: &str = "<tool_call>";
 
+const DS_TOOLS_HEAD: &str = "## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n";
+const DS_TOOLS_TAIL: &str = "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n";
+const DS_CALLS: &str = "<｜DSML｜ calls>";
+
+/// DeepSeek-V4.1 (Unsloth template): tool results merge into the user turn, the tools go after the system text
+/// (a new empty system message when there is none), and tools anywhere keep the reasoning of earlier turns.
+// ponytail: tool results print in message order; the template re-sorts them by tool_call_id (Msg keeps no ids).
+fn render_ds(msgs: &[Msg], tools: &[Json], think: bool, preserve: bool, generate: bool) -> String {
+    enum It<'a> { Sys(&'a str), User(Vec<String>, bool), Asst(&'a Msg) }
+    let mut items: Vec<It> = vec![];
+    if !tools.is_empty() && msgs.first().is_none_or(|m| m.role != "system") { items.push(It::Sys("")); }
+    for m in msgs {
+        match m.role.as_str() {
+            "tool" => {
+                let p = format!("<tool_result>{}</tool_result>", m.content);
+                match items.last_mut() { Some(It::User(v, _)) => v.push(p), _ => items.push(It::User(vec![p], false)) }
+            }
+            "user" => match items.last_mut() {
+                Some(It::User(v, real)) => { v.push(m.content.clone()); *real = true }
+                _ => items.push(It::User(vec![m.content.clone()], true)),
+            },
+            "assistant" => items.push(It::Asst(m)),
+            "system" => items.push(It::Sys(&m.content)),
+            _ => {}
+        }
+    }
+    let last_user = items.iter().rposition(|x| matches!(x, It::User(_, true)) || matches!(x, It::Sys(_))).filter(|&i| i > 0 || matches!(items[0], It::User(..))).map_or(-1, |i| i as i64);
+    let keep_all = preserve || !tools.is_empty();
+    let mut s = String::from("<｜begin▁of▁sentence｜>");
+    for (i, it) in items.iter().enumerate() {
+        if i == 0 {
+            if think || matches!(it, It::Sys(_)) { s += "<｜System｜>"; }
+            if think { s += "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"; }
+        }
+        match it {
+            It::Sys(c) => {
+                if i > 0 { s += "<｜System｜>"; }
+                s += c;
+                if i == 0 && !tools.is_empty() {
+                    s += "\n\n";
+                    s += DS_TOOLS_HEAD;
+                    s += &tools.iter().map(|t| t.get("function").dump()).collect::<Vec<_>>().join("\n");
+                    s += DS_TOOLS_TAIL;
+                }
+            }
+            It::User(v, _) => { s += "<｜User｜>"; s += &v.join("\n\n"); }
+            It::Asst(m) => {
+                let (r, c) = split_think(m, &m.content);
+                if think && (keep_all || i as i64 > last_user) { s += r; s += "</think>"; }
+                s += c;
+                if !m.calls.is_empty() {
+                    let inv: Vec<String> = m.calls.iter().map(|call| {
+                        let params: Vec<String> = match &call.args {
+                            Json::Obj(o) => o.iter().map(|(k, v)| format!("<｜DSML｜ parameter name=\"{k}\" string=\"{}\">{}</｜DSML｜ parameter>",
+                                v.as_str().is_some(), v.as_str().map_or_else(|| v.dump(), String::from))).collect(),
+                            _ => vec![],
+                        };
+                        format!("<｜DSML｜ invoke name=\"{}\">\n{}\n</｜DSML｜ invoke>", call.name, params.join("\n"))
+                    }).collect();
+                    s += &format!("\n\n{DS_CALLS}\n{}\n</｜DSML｜ calls>", inv.join("\n"));
+                }
+                s += "<｜end▁of▁sentence｜>";
+            }
+        }
+        let last = i + 1 == items.len();
+        if (last || matches!(items[i + 1], It::Asst(_))) && (matches!(it, It::User(..)) || (matches!(it, It::Sys(_)) && i > 0)) && (generate || !last) {
+            s += "<｜Assistant｜>";
+            s += if think && (keep_all || i as i64 >= last_user) { "<think>" } else { "</think>" };
+        }
+    }
+    s
+}
+
 /// Index of the last user turn that is not a tool response (the templates' `last_query_index`).
 fn last_query(msgs: &[Msg], trim: bool) -> usize {
     msgs.iter().rposition(|m| {
@@ -221,36 +294,7 @@ impl Template {
             if i + 1 == msgs.len() || msgs[i + 1].role != "tool" { *s += "<|im_end|>\n"; }
         };
         match *self {
-            Template::Ds => {
-                // Mirrors chat_template.jinja for system/user/assistant text. Default reasoning effort "high" = 75.
-                let last_user = msgs.iter().rposition(|m| m.role == "user").map(|i| i as i64).unwrap_or(-1);
-                s += "<｜begin▁of▁sentence｜>";
-                for (i, m) in msgs.iter().enumerate() {
-                    if i == 0 {
-                        if think || m.role == "system" { s += "<｜System｜>"; }
-                        if think { s += "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"; }
-                    }
-                    match m.role.as_str() {
-                        "system" => { if i > 0 { s += "<｜System｜>"; } s += &m.content; }
-                        "user" => { s += "<｜User｜>"; s += &m.content; }
-                        "assistant" => {
-                            if think && (preserve || i as i64 > last_user) {
-                                let (r, c) = split_think(m, &m.content);
-                                s += r; s += "</think>"; s += c;
-                            } else {
-                                s += split_think(m, &m.content).1;
-                            }
-                            s += "<｜end▁of▁sentence｜>";
-                        }
-                        _ => {}
-                    }
-                    let last = i + 1 == msgs.len();
-                    if (last || msgs[i + 1].role == "assistant") && (m.role == "user" || (m.role == "system" && i > 0)) && (generate || !last) {
-                        s += "<｜Assistant｜>";
-                        s += if think && (preserve || i as i64 >= last_user) { "<think>" } else { "</think>" };
-                    }
-                }
-            }
+            Template::Ds => s += &render_ds(msgs, tools, think, preserve, generate),
             Template::Xml => {
                 let (n_sys, sys) = match msgs {
                     [a, b, ..] if a.role == "system" && b.role == "system" => (2, format!("{}\n{}", a.content.trim(), b.content.trim())),
@@ -340,11 +384,15 @@ impl Template {
         s
     }
 
+    /// The text that starts a tool call in a reply.
+    pub fn call_tag(&self) -> &'static str { if let Template::Ds = self { DS_CALLS } else { TAG } }
+
     /// Tool calls at the end of a reply: the text before them, and the name and arguments (JSON text) of each call.
     /// None when the reply has no call or a call is malformed; the reply then goes out as plain text.
     // ponytail: a literal `<tool_call>` inside the thinking part makes the reply plain text; strip the think block
     // first if thinking with tools matters.
     pub fn parse_calls(&self, text: &str, tools: &[Json]) -> Option<(String, Vec<(String, String)>)> {
+        if let Template::Ds = self { return ds_calls(text); }
         let start = text.find(TAG)?;
         let mut rest = &text[start..];
         let mut calls = Vec::new();
@@ -353,10 +401,41 @@ impl Template {
             if rest.is_empty() { break; }
             let inner;
             (inner, rest) = rest.strip_prefix(TAG)?.split_once("</tool_call>")?;
-            calls.push(match self { Template::Ds => return None, Template::Xml => xml_call(inner, tools)?, Template::Json { .. } => json_call(inner)? });
+            calls.push(match self { Template::Ds => unreachable!(), Template::Xml => xml_call(inner, tools)?, Template::Json { .. } => json_call(inner)? });
         }
         Some((text[..start].trim_end().to_string(), calls))
     }
+}
+
+/// DeepSeek reply: a `<｜DSML｜ calls>` block of `invoke` items with `parameter name=".." string="true|false"`. A
+/// parameter is a string when the model says so, else JSON (a string if it does not parse). The reply's thinking part
+/// is skipped, so a tag inside it is not taken for a call.
+// ponytail: not run against the real model (the weights are deleted); the format is the template's own.
+fn ds_calls(text: &str) -> Option<(String, Vec<(String, String)>)> {
+    let from = text.rfind("</think>").map_or(0, |p| p + 8);
+    let start = from + text[from..].find(DS_CALLS)?;
+    let mut rest = text[start..].strip_prefix(DS_CALLS)?;
+    let mut calls = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        if let Some(x) = rest.strip_prefix("</｜DSML｜ calls>") {
+            if !x.trim().is_empty() || calls.is_empty() { return None; }
+            break;
+        }
+        let (name, mut r) = rest.strip_prefix("<｜DSML｜ invoke name=\"")?.split_once("\">")?;
+        let mut args = Vec::new();
+        loop {
+            r = r.trim_start();
+            if let Some(x) = r.strip_prefix("</｜DSML｜ invoke>") { rest = x; break; }
+            let (head, x) = r.strip_prefix("<｜DSML｜ parameter name=\"")?.split_once("\">")?;
+            let (k, string) = head.split_once("\" string=\"")?;
+            let (v, x) = x.split_once("</｜DSML｜ parameter>")?;
+            r = x;
+            args.push((k.to_string(), if string == "true" { Json::Str(v.into()) } else { serde_json::from_str(v).unwrap_or_else(|_| Json::Str(v.into())) }));
+        }
+        calls.push((name.to_string(), Json::Obj(args).dump()));
+    }
+    Some((text[..start].trim_end().to_string(), calls))
 }
 
 /// `{"name": .., "arguments": {..}}`; arguments given as a JSON string are accepted too.
@@ -399,10 +478,12 @@ fn xml_call(inner: &str, tools: &[Json]) -> Option<(String, String)> {
 /// Streams reply text but holds back everything from a `<tool_call>` tag on (unless `no_tag`), so a call is never
 /// sent as content, and ends the reply before the first of the `stops` strings.
 #[derive(Default)]
-pub struct Hold { pub text: String, sent: usize, held: bool, no_tag: bool, stops: Vec<String>, pub stopped: bool }
+pub struct Hold { pub text: String, sent: usize, held: bool, no_tag: bool, tag: &'static str, stops: Vec<String>, pub stopped: bool }
 
 impl Hold {
     pub fn new(tag: bool, stops: Vec<String>) -> Hold { Hold { no_tag: !tag, stops, ..Hold::default() } }
+    /// Holds back from `tag` instead of `<tool_call>` (the DeepSeek call block).
+    pub fn tagged(mut self, tag: &'static str) -> Hold { self.tag = tag; self }
     /// Adds a piece of the reply; returns the text that is safe to send now.
     pub fn push(&mut self, piece: &str) -> &str {
         let from = self.sent;
@@ -414,7 +495,7 @@ impl Hold {
             self.stopped = true;
         }
         if !self.held {
-            self.sent = match self.text[from..].find(TAG).filter(|_| !self.no_tag) {
+            self.sent = match self.text[from..].find(self.tag()).filter(|_| !self.no_tag) {
                 Some(p) => { self.held = true; from + p }
                 None if self.stopped => self.text.len(),
                 None => (self.text.len() - self.tail()).max(from),
@@ -422,9 +503,10 @@ impl Hold {
         }
         &self.text[from..self.sent]
     }
+    fn tag(&self) -> &'static str { if self.tag.is_empty() { TAG } else { self.tag } }
     /// The longest end of the text that could be the start of the tag or of a stop string.
     fn tail(&self) -> usize {
-        (!self.no_tag).then_some(TAG).into_iter().chain(self.stops.iter().map(String::as_str))
+        (!self.no_tag).then_some(self.tag()).into_iter().chain(self.stops.iter().map(String::as_str))
             .flat_map(|s| s.char_indices().skip(1).map(move |(k, _)| &s[..k]))
             .filter(|p| self.text.ends_with(p)).map(str::len).max().unwrap_or(0)
     }
@@ -455,5 +537,27 @@ mod ds_tests {
         assert_eq!(t.render(&m, &[], true, true, true), "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Hi<｜Assistant｜><think>greet</think>Hello!<｜end▁of▁sentence｜><｜User｜>Bye<｜Assistant｜><think>");
         let m = [Msg::new("system", "Be brief."), Msg::new("user", "Hi"), Msg::new("assistant", "Hello!"), Msg::new("user", "Bye")];
         assert_eq!(t.render(&m, &[], true, true, true), "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nBe brief.<｜User｜>Hi<｜Assistant｜><think></think>Hello!<｜end▁of▁sentence｜><｜User｜>Bye<｜Assistant｜><think>");
+    }
+
+    #[test]
+    fn deepseek_tools() {
+        // tools/deepseek_ref/render_tools.py renders the model's template with jinja2.
+        let j: Json = serde_json::from_str(include_str!("../tools/deepseek_ref/tpl_tools.json")).unwrap();
+        let Json::Arr(cases) = j else { panic!() };
+        for c in &cases {
+            let q = crate::serve::chat_request(c.get("req").dump().as_bytes()).unwrap();
+            let think = matches!(c.get("think"), Json::Bool(true));
+            assert_eq!(Template::Ds.render(&q.messages, &q.tools, think, true, true), c.get("prompt").as_str().unwrap());
+        }
+    }
+
+    #[test]
+    fn deepseek_parses_calls() {
+        let t = "<think>a <｜DSML｜ calls> b</think>ok\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"s\" string=\"true\">12</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"n\" string=\"false\">[1, 2]</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        let (txt, c) = Template::Ds.parse_calls(t, &[]).unwrap();
+        assert_eq!(txt, "<think>a <｜DSML｜ calls> b</think>ok");
+        assert_eq!(c, vec![("f".to_string(), r#"{"s": "12", "n": [1, 2]}"#.to_string()), ("g".to_string(), "{}".to_string())]);
+        assert!(Template::Ds.parse_calls("plain", &[]).is_none());
+        assert!(Template::Ds.parse_calls("<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">", &[]).is_none());
     }
 }

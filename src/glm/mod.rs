@@ -35,6 +35,8 @@ pub struct GlmConfig {
     pub idx_n_head: usize,
     pub idx_head_dim: usize,
     pub idx_top_k: usize,
+    /// Trained context (`glm5-next.context_length`), the default request limit.
+    pub n_ctx_train: usize,
     pub kpool: usize,
     pub hc_n: usize,
     pub hc_eps: f32,
@@ -91,6 +93,7 @@ impl GlmConfig {
             idx_n_head: u("attention.indexer.head_count")?,
             idx_head_dim: u("attention.indexer.key_length")?,
             idx_top_k: u("attention.indexer.top_k")?,
+            n_ctx_train: u("context_length")?,
             kpool: u("attention.indexer.kpool")?,
             hc_n: u("hyper_connection.count")?,
             hc_eps: f("hyper_connection.epsilon")?,
@@ -370,7 +373,7 @@ fn gpu_defaults() {
     }
 }
 
-/// Context cap per request. The k-pool indexer is not implemented, so attention sees every row: limit is `idx_top_k` (2048).
+/// Context limit per request: the model's trained context, or `STRATA_GLM_CTX`.
 fn ctx_limit(m: &forward::GlmModel) -> usize { forward::max_ctx(&m.cfg) }
 
 /// `rustingstrata chat` for GLM: greedy, thinking on, KV kept across turns while the history extends it.
@@ -402,7 +405,7 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize) -> anyhow::Result<()> {
 }
 
 /// `rustingstrata serve` for GLM: one request at a time, OpenAI `/v1/chat/completions` (JSON or SSE), `/v1/models`, `/health`.
-/// ponytail: greedy only, no stop strings; prompt + reply capped at 8192 tokens (STRATA_GLM_CTX); KV reused when the prompt extends it.
+/// ponytail: greedy only, no stop strings; prompt + reply limited to the model's context (STRATA_GLM_CTX overrides); KV reused when the prompt extends it.
 pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow::Result<()> {
     use serde_json::json;
     use std::io::Write;
