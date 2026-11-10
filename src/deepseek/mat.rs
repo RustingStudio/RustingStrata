@@ -19,7 +19,7 @@ mod dev {
         DEV.get_or_init(|| {
             if std::env::var_os("STRATA_DS_GPU").is_none() { return None; }
             let be = crate::backend::open(Some("cuda"), 0).ok()?;
-            let (x, y) = (be.alloc(4 * 40960).ok()?, be.alloc(4 * 140000).ok()?);
+            let (x, y) = (be.alloc(4 * 40960).ok()?, be.alloc(4 * 160000).ok()?);
             let stage = be.alloc(STAGE).ok()?;
             let gb: f64 = std::env::var("STRATA_DS_GPU_EXPERTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
             Some(Mutex::new(Dev { be, ts: vec![], x, y, bytes: 0, ex: Default::default(), exs: vec![], now: 0, budget: (gb * 1e9) as usize, stage }))
