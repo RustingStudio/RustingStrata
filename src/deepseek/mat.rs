@@ -162,6 +162,7 @@ impl<'a> Mat<'a> {
     }
 
     /// Ask the kernel to read expert e's pages now (madvise WILLNEED), so all selected experts of a layer queue on the SSD together.
+    #[cfg(target_os = "linux")]
     pub fn prefetch_expert(&self, e: usize, n_expert: usize) {
         unsafe extern "C" { fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32; }
         let sz = self.rows / n_expert * self.ty.row_bytes(self.cols as u64);
@@ -169,6 +170,9 @@ impl<'a> Mat<'a> {
         let start = a & !4095;
         unsafe { madvise(start as *mut std::ffi::c_void, a + sz - start, 3) };
     }
+    /// No madvise outside Linux (the MSVC linker has no such symbol, issue #21): the pages are read when touched.
+    #[cfg(not(target_os = "linux"))]
+    pub fn prefetch_expert(&self, _e: usize, _n_expert: usize) {}
 
     pub fn row_into(&self, r: usize, out: &mut [f32]) {
         let rb = self.ty.row_bytes(self.cols as u64);
