@@ -248,3 +248,32 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
     println!();
     Ok(())
 }
+
+/// GLM-5.3 chat template (default reasoning effort, thinking on). `msgs` = (role, content) with role system|user|assistant.
+/// Matches llama.cpp `/apply-template` for plain text messages (no tools).
+pub fn chat_prompt(msgs: &[(&str, &str)]) -> String {
+    let mut s = String::from("[gMASK]<sop><|system|>Reasoning Effort: Max");
+    for (role, c) in msgs {
+        match *role {
+            "user" => s += &format!("<|user|>{c}"),
+            "assistant" => s += &format!("<|assistant|><think></think>{}", c.trim()),
+            _ => s += &format!("<|system|>{c}"),
+        }
+    }
+    s + "<|assistant|><think>"
+}
+
+#[cfg(test)]
+mod chat_tests {
+    use super::chat_prompt;
+
+    /// Expected strings come from llama.cpp b12119 `/apply-template` (tools/glm_ref/llama_tok.json).
+    #[test]
+    fn template_matches_llama() {
+        let j: serde_json::Value = serde_json::from_str(include_str!("../../tools/glm_ref/llama_tok.json")).unwrap();
+        let t = &j["tpl"];
+        assert_eq!(chat_prompt(&[("user", "Hello")]), t[0]["prompt"].as_str().unwrap());
+        let m = [("system", "Be brief."), ("user", "Hi"), ("assistant", "Hey"), ("user", "Bye")];
+        assert_eq!(chat_prompt(&m), t[1]["prompt"].as_str().unwrap());
+    }
+}
