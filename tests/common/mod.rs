@@ -8,9 +8,10 @@ pub fn model_path() -> Option<std::path::PathBuf> {
     if p.exists() { Some(p) } else { eprintln!("SKIP: model file missing"); None }
 }
 
-/// True for the default model; tests of its exact shapes and type mix skip those checks on any other.
+/// True for the default model, wherever it is stored (`STRATA_MODEL` pointing at a copy with the same file name
+/// counts); tests of its exact shapes and type mix skip those checks on any other.
 pub fn is_default_model(p: &std::path::Path) -> bool {
-    let d = p == std::path::Path::new(DEFAULT_MODEL);
+    let d = p.file_name().is_some() && p.file_name() == std::path::Path::new(DEFAULT_MODEL).file_name();
     if !d { eprintln!("SKIP: default-model checks on {}", p.display()); }
     d
 }
