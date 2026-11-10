@@ -312,7 +312,7 @@ fn gpu_defaults() {
 }
 
 /// Context cap per request. The k-pool indexer is not implemented, so attention sees every row: limit is `idx_top_k` (2048).
-fn ctx_limit(m: &forward::GlmModel) -> usize { m.cfg.idx_top_k - 1 }
+fn ctx_limit(m: &forward::GlmModel) -> usize { forward::max_ctx(&m.cfg) }
 
 /// `rustingstrata chat` for GLM: greedy, thinking on, KV kept across turns while the history extends it.
 pub fn chat(g: &Gguf, system: Option<String>, n: usize) -> anyhow::Result<()> {

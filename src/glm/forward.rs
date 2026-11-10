@@ -40,6 +40,15 @@ struct Dsa<'a> {
     k_b: Mat<'a>,
     v_b: Mat<'a>,
     wo: Mat<'a>,
+    /// k-pool indexer
+    ix_k: Mat<'a>,
+    ix_qb: Mat<'a>,
+    ix_proj: Mat<'a>,
+    ix_gate: Mat<'a>,
+    ix_kn_w: Vec<f32>,
+    ix_kn_b: Vec<f32>,
+    /// [kpool][head_dim]
+    ix_ape: Vec<f32>,
 }
 
 enum Mixer<'a> {
@@ -70,6 +79,10 @@ struct State {
     s: Vec<f32>,
     /// DSA: latent rows
     lat: Vec<Vec<f32>>,
+    /// DSA indexer: per-position normed key and pool gate [pos][dim], and pooled keys of the complete pools [pool][dim]
+    ik: Vec<f32>,
+    ig: Vec<f32>,
+    pooled: Vec<f32>,
 }
 
 pub struct GlmModel<'a> {
@@ -81,6 +94,11 @@ pub struct GlmModel<'a> {
     state: Vec<State>,
     pub toks: Vec<u32>,
     pub trace: bool,
+}
+
+/// Context cap. Beyond `idx_top_k` the k-pool indexer selects rows; that path is checked against llama.cpp only up to `STRATA_GLM_CTX`'s default.
+pub fn max_ctx(cfg: &GlmConfig) -> usize {
+    std::env::var("STRATA_GLM_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(cfg.idx_top_k - 1)
 }
 
 fn silu(x: f32) -> f32 {
@@ -115,6 +133,8 @@ impl<'a> GlmModel<'a> {
                     q_a: m("attn_q_a.weight")?, q_a_norm: v("attn_q_a_norm.weight")?, q_b: m("attn_q_b.weight")?,
                     kv_a: m("attn_kv_a_mqa.weight")?, kv_a_norm: v("attn_kv_a_norm.weight")?,
                     k_b: m("attn_k_b.weight")?, v_b: m("attn_v_b.weight")?, wo: m("attn_output.weight")?,
+                    ix_k: m("indexer.attn_k.weight")?, ix_qb: m("indexer.attn_q_b.weight")?, ix_proj: m("indexer.proj.weight")?, ix_gate: m("indexer_compressor_gate.weight")?,
+                    ix_kn_w: v("indexer.k_norm.weight")?, ix_kn_b: v("indexer.k_norm.bias")?, ix_ape: v("indexer_compressor_ape.weight")?,
                 }),
             };
             let ffn = if il < cfg.n_dense {
@@ -266,8 +286,54 @@ impl<'a> GlmModel<'a> {
         let mut lat = vec![0f32; kl];
         rms_norm_w(&kv, &w.kv_a_norm, cfg.eps, &mut lat);
         self.tr("kv_cmpr", il as i32, &lat);
-        self.state[il].lat.push(lat);
-        let cache = &self.state[il].lat;
+        // indexer key (layer norm) and pool gate of this position
+        let (hd, nih, kp) = (cfg.idx_head_dim, cfg.idx_n_head, cfg.kpool);
+        let mut ik = vec![0f32; hd];
+        w.ix_k.matvec(cur, &mut ik);
+        let mean = ik.iter().sum::<f32>() / hd as f32;
+        let var = ik.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / hd as f32;
+        let inv = 1.0 / (var + cfg.kda_eps).sqrt();
+        ik.iter_mut().enumerate().for_each(|(i, v)| *v = (*v - mean) * inv * w.ix_kn_w[i] + w.ix_kn_b[i]);
+        let mut ig = vec![0f32; hd];
+        w.ix_gate.matvec(cur, &mut ig);
+        let st = &mut self.state[il];
+        st.lat.push(lat);
+        st.ik.extend_from_slice(&ik);
+        st.ig.extend_from_slice(&ig);
+        let pos = st.lat.len() - 1;
+        if (pos + 1) % kp == 0 {
+            // pooled key = sum over the pool of softmax_k(gate + ape) * key, per dimension
+            let b0 = (pos + 1 - kp) * hd;
+            for d in 0..hd {
+                let l: Vec<f32> = (0..kp).map(|k| st.ig[b0 + k * hd + d] + w.ix_ape[k * hd + d]).collect();
+                let mx = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let e: Vec<f32> = l.iter().map(|x| (x - mx).exp()).collect();
+                let z: f32 = e.iter().sum();
+                st.pooled.push((0..kp).map(|k| e[k] / z * st.ik[b0 + k * hd + d]).sum());
+            }
+        }
+        // sparse selection: only beyond idx_top_k rows; the top idx_top_k/kpool pools by indexer score plus the incomplete tail
+        let rows: Vec<usize> = if pos < cfg.idx_top_k {
+            (0..=pos).collect()
+        } else {
+            let mut iq = vec![0f32; nih * hd];
+            w.ix_qb.matvec(&qr, &mut iq);
+            let mut wt = vec![0f32; nih];
+            w.ix_proj.matvec(cur, &mut wt);
+            let sc = 1.0 / ((hd * nih) as f32).sqrt();
+            let nv = (pos + 1) / kp;
+            let pooled = &st.pooled;
+            let score: Vec<f32> = (0..nv)
+                .into_par_iter()
+                .map(|j| (0..nih).map(|h| iq[h * hd..(h + 1) * hd].iter().zip(&pooled[j * hd..(j + 1) * hd]).map(|(a, b)| a * b).sum::<f32>().max(0.0) * wt[h] * sc).sum())
+                .collect();
+            let mut order: Vec<usize> = (0..nv).collect();
+            order.sort_by(|&a, &b| score[b].partial_cmp(&score[a]).unwrap().then(a.cmp(&b)));
+            order.truncate(cfg.idx_top_k / kp);
+            order.sort_unstable();
+            order.iter().flat_map(|&j| j * kp..(j + 1) * kp).chain(nv * kp..=pos).collect()
+        };
+        let cache = &st.lat;
         let scale = 1.0 / (kd as f32).sqrt();
         let mut out = vec![0f32; nh * cfg.v_mla];
         let mut qabs = vec![0f32; nh * kl];
@@ -278,7 +344,7 @@ impl<'a> GlmModel<'a> {
             .into_par_iter()
             .map(|h| {
                 let qa = &qabs[h * kl..(h + 1) * kl];
-                let mut sc: Vec<f32> = cache.iter().map(|r| r.iter().zip(qa).map(|(a, b)| a * b).sum::<f32>() * scale).collect();
+                let mut sc: Vec<f32> = rows.iter().map(|&i| cache[i].iter().zip(qa).map(|(a, b)| a * b).sum::<f32>() * scale).collect();
                 let mx = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut z = 0.0;
                 for s in sc.iter_mut() {
@@ -286,8 +352,8 @@ impl<'a> GlmModel<'a> {
                     z += *s;
                 }
                 let mut acc = vec![0f32; kl];
-                for (s, r) in sc.iter().zip(cache) {
-                    let p = s / z;
+                for (s, &i) in sc.iter().zip(&rows) {
+                    let (p, r) = (s / z, &cache[i]);
                     for j in 0..kl {
                         acc[j] += p * r[j];
                     }
@@ -427,7 +493,7 @@ impl<'a> GlmModel<'a> {
     /// Layer-major pass over a chunk of prompt tokens (no logits).
     fn prefill_chunk(&mut self, toks: &[u32]) {
         let n = self.cfg.n_embd;
-        assert!(self.toks.len() + toks.len() <= self.cfg.idx_top_k, "GLM context is limited to {} tokens (indexer top-k not implemented)", self.cfg.idx_top_k);
+        assert!(self.toks.len() + toks.len() <= max_ctx(&self.cfg), "GLM context is limited to {} tokens ", max_ctx(&self.cfg));
         self.toks.extend_from_slice(toks);
         let mut xs: Vec<Vec<f32>> = toks
             .iter()
@@ -499,7 +565,7 @@ impl<'a> GlmModel<'a> {
 
     fn step_opt(&mut self, tok: u32, want: bool) -> Vec<f32> {
         let n = self.cfg.n_embd;
-        assert!(self.toks.len() < self.cfg.idx_top_k, "GLM context is limited to {} tokens (indexer top-k not implemented)", self.cfg.idx_top_k);
+        assert!(self.toks.len() < max_ctx(&self.cfg), "GLM context is limited to {} tokens ", max_ctx(&self.cfg));
         self.toks.push(tok);
         let mut emb = vec![0f32; n];
         self.tok_embd.row_into(tok as usize, &mut emb);
