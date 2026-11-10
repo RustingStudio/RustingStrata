@@ -1,7 +1,7 @@
 # RustingStrata
 
 A pure-Rust inference engine for Qwen GGUF models: Qwen3.5/3.6 (`qwen35moe`, `qwen35`), Qwen3-Next (`qwen3next`),
-Qwen3.8-Flash-Next (`qwen4exp`), Qwen3 (`qwen3`, `qwen3moe`) and DeepSeek-V4.1-Flash (`deepseek41`). CUDA kernels are
+Qwen3.8-Flash-Next (`qwen4exp`), Qwen3 (`qwen3`, `qwen3moe`), DeepSeek-V4.1-Flash (`deepseek41`) and GLM-5.3-Flash (`glm5-next`). CUDA kernels are
 compiled at run time with NVRTC through cudarc, and the same kernels also run on Vulkan (`--backend vulkan`): no C++
 build step, no ggml. Experts that do not fit in VRAM run on the CPU at the same time as the GPU work, and the expert
 placement adapts to the routing it sees.
@@ -120,6 +120,28 @@ Decode varies run to run with the page cache, because the experts that miss VRAM
 `STRATA_DS_GPU_EXPERTS=<GB>` changes the VRAM expert budget (10 worked on a 12 GB card). Prefill is one token at a
 time. Prompt plus reply is capped at 16384 tokens (`STRATA_DS_CTX` changes it; only checked up to a 1425-token prompt), decoding is greedy only, and tool calls and sampling are not supported.
 
+## GLM-5.3-Flash (UD-Q2_K_XL, 119 GB)
+
+`chat`, `generate` and `serve` detect the `glm5-next` architecture (Kimi-delta attention, sparse MLA attention, four-stream
+hyper-connections, sigmoid MoE) and run the CPU reference forward, with the dense matvecs and an 11 GB expert cache on the
+CUDA card (`STRATA_DS_GPU_EXPERTS=<GB>` changes the budget; it also counts the non-expert weights). Pass the first shard.
+
+```sh
+M=GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf
+rustingstrata chat     --model $M
+rustingstrata generate --model $M --prompt "The capital of France is" -n 64
+rustingstrata serve    --model $M --addr 127.0.0.1:8080 [--api-key K]
+```
+
+Greedy output equals llama.cpp b12119 (`--cpu-moe`) for 32 tokens on 3 fixed prompts on the CPU path; with the GPU matvecs
+prompts 1 and 2 still match and prompt 3 flips at the first token, a near-tie (logprob -2.65 against -2.73). Tokenizer ids
+match llama.cpp on 29 test strings and the chat template matches `/apply-template` on 2 conversations.
+On an RTX 3060 12 GB with 30 GB RAM decode took about 0.8-1.5 s per token with warm page cache (about 55% VRAM expert-cache
+hits on a short text); llama.cpp reported 0.15-0.57 tok/s on the same box in cold runs. The two were not measured side by side.
+Caveats: prefill is one token at a time; prompt plus reply is capped at 2047 tokens (the sparse-attention indexer is not
+implemented, so every row is attended); the NextN/MTP layer is unused; decoding is greedy only; no tool calls; the reasoning
+text comes back in `content` before `</think>`.
+
 ## Development
 
 ```sh
@@ -130,7 +152,7 @@ python -I tools/parity.py $M --extra "--gpu" --tag gpu   # agreement with llama.
 Source map: `src/gguf.rs` (file reader), `src/quant/` (dequantization), `src/model.rs` (CPU reference forward),
 `src/cuda/` and `src/vulkan/` (GPU kernels, behind `src/backend.rs`), `src/gpu_model.rs` and
 `src/gpu_model/prefill.rs` (GPU forward and chunked prefill), `src/expert_cache.rs` (expert placement),
-`src/cpu_moe.rs` and `src/cpu_worker.rs` (CPU experts), `src/deepseek/` (DeepSeek-V4.1), `src/serve.rs` (HTTP),
+`src/cpu_moe.rs` and `src/cpu_worker.rs` (CPU experts), `src/deepseek/` (DeepSeek-V4.1), `src/glm/` (GLM-5.3), `src/serve.rs` (HTTP),
 `src/chat.rs` (chat templates and tool calls), `src/main.rs` (CLI).
 
 ## License
