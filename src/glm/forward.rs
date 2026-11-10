@@ -270,23 +270,33 @@ impl<'a> GlmModel<'a> {
         let cache = &self.state[il].lat;
         let scale = 1.0 / (kd as f32).sqrt();
         let mut out = vec![0f32; nh * cfg.v_mla];
+        let mut qabs = vec![0f32; nh * kl];
         for h in 0..nh {
-            let mut qabs = vec![0f32; kl];
-            w.k_b.group(h, nh).matvec(&q[h * kd..(h + 1) * kd], &mut qabs);
-            let mut sc: Vec<f32> = cache.iter().map(|r| r.iter().zip(&qabs).map(|(a, b)| a * b).sum::<f32>() * scale).collect();
-            let mx = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut z = 0.0;
-            for s in sc.iter_mut() {
-                *s = (*s - mx).exp();
-                z += *s;
-            }
-            let mut acc = vec![0f32; kl];
-            for (s, r) in sc.iter().zip(cache) {
-                for j in 0..kl {
-                    acc[j] += s / z * r[j];
+            w.k_b.group(h, nh).matvec(&q[h * kd..(h + 1) * kd], &mut qabs[h * kl..(h + 1) * kl]);
+        }
+        let accs: Vec<Vec<f32>> = (0..nh)
+            .into_par_iter()
+            .map(|h| {
+                let qa = &qabs[h * kl..(h + 1) * kl];
+                let mut sc: Vec<f32> = cache.iter().map(|r| r.iter().zip(qa).map(|(a, b)| a * b).sum::<f32>() * scale).collect();
+                let mx = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut z = 0.0;
+                for s in sc.iter_mut() {
+                    *s = (*s - mx).exp();
+                    z += *s;
                 }
-            }
-            w.v_b.group(h, nh).matvec(&acc, &mut out[h * cfg.v_mla..(h + 1) * cfg.v_mla]);
+                let mut acc = vec![0f32; kl];
+                for (s, r) in sc.iter().zip(cache) {
+                    let p = s / z;
+                    for j in 0..kl {
+                        acc[j] += p * r[j];
+                    }
+                }
+                acc
+            })
+            .collect();
+        for h in 0..nh {
+            w.v_b.group(h, nh).matvec(&accs[h], &mut out[h * cfg.v_mla..(h + 1) * cfg.v_mla]);
         }
         let mut res = vec![0f32; cfg.n_embd];
         w.wo.matvec(&out, &mut res);
