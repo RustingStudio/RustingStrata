@@ -2,6 +2,7 @@
 //! Mirrors llama.cpp `src/models/glm5-next.cpp` (hparams and tensor creation).
 
 pub mod forward;
+use crate::chat::{Json, Msg};
 use crate::gguf::Gguf;
 use anyhow::{Context, ensure};
 
@@ -264,19 +265,74 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
 /// GLM-5.3 chat template (default reasoning effort, thinking on). `msgs` = (role, content) with role system|user|assistant.
 /// Matches llama.cpp `/apply-template` for plain text messages (no tools).
 pub fn chat_prompt(msgs: &[(&str, &str)]) -> String {
+    chat_prompt_tools(&msgs.iter().map(|(r, c)| Msg::new(r, c)).collect::<Vec<_>>(), &[])
+}
+
+/// The template with tools (from `chat::tool_def`), assistant `calls` and `tool` messages; matches llama.cpp
+/// `/apply-template` (tools/glm_ref/tpl_tools.json).
+// ponytail: tool results print in message order; the template re-sorts them by tool_call_id to the order of the calls.
+pub fn chat_prompt_tools(msgs: &[Msg], tools: &[Json]) -> String {
     let mut s = String::from("[gMASK]<sop><|system|>Reasoning Effort: Max");
-    for (role, c) in msgs {
-        match *role {
+    if !tools.is_empty() {
+        s += "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>";
+        for t in tools { s += "\n"; s += &t.get("function").dump(); }
+        s += "\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>";
+    }
+    for (i, m) in msgs.iter().enumerate() {
+        let c = m.content.as_str();
+        match m.role.as_str() {
             "user" => s += &format!("<|user|>{c}"),
-            "assistant" => match c.split_once("</think>") {
-                // earlier reasoning is kept (template default clear_thinking=false)
-                Some((r, a)) => s += &format!("<|assistant|><think>{}</think>{}", r.rsplit("<think>").next().unwrap_or(r), a.trim()),
-                None => s += &format!("<|assistant|><think></think>{}", c.trim()),
-            },
+            "assistant" => {
+                let (r, a) = match (&m.reasoning, c.split_once("</think>")) {
+                    // earlier reasoning is kept (template default clear_thinking=false)
+                    (Some(r), _) => (r.as_str(), c),
+                    (None, Some((r, a))) => (r.rsplit("<think>").next().unwrap_or(r), a),
+                    (None, None) => ("", c),
+                };
+                s += &format!("<|assistant|><think>{r}</think>{}", a.trim());
+                for call in &m.calls {
+                    s += &format!("<tool_call>{}", call.name);
+                    if let Json::Obj(o) = &call.args {
+                        for (k, v) in o { s += &format!("<arg_key>{k}</arg_key><arg_value>{}</arg_value>", v.as_str().map_or_else(|| v.dump(), String::from)); }
+                    }
+                    s += "</tool_call>";
+                }
+            }
+            "tool" => {
+                if i == 0 || msgs[i - 1].role != "tool" { s += "<|observation|>"; }
+                s += &format!("<tool_response>{c}</tool_response>");
+            }
             _ => s += &format!("<|system|>{c}"),
         }
     }
     s + "<|assistant|><think>"
+}
+
+/// Tool calls in a reply (after its think block): the text before them and each call's name and JSON arguments.
+/// None when there is no call or one is malformed. A value is a string when the tool's schema says so, else JSON if
+/// it parses, else a string.
+fn parse_calls(text: &str, tools: &[Json]) -> Option<(String, Vec<(String, String)>)> {
+    let from = text.rfind("</think>").map_or(0, |p| p + 8);
+    let start = from + text[from..].find("<tool_call>")?;
+    let (mut rest, mut calls) = (&text[start..], vec![]);
+    while !rest.trim_start().is_empty() {
+        let (inner, r) = rest.trim_start().strip_prefix("<tool_call>")?.split_once("</tool_call>")?;
+        rest = r;
+        let p = inner.find("<arg_key>").unwrap_or(inner.len());
+        let (name, mut a) = (inner[..p].trim(), &inner[p..]);
+        let props = tools.iter().map(|t| t.get("function")).find(|f| f.get("name").as_str() == Some(name)).map_or(&Json::Null, |f| f.get("parameters").get("properties"));
+        let mut args = vec![];
+        while let Some(x) = a.strip_prefix("<arg_key>") {
+            let (k, x) = x.split_once("</arg_key>")?;
+            let (v, x) = x.strip_prefix("<arg_value>")?.split_once("</arg_value>")?;
+            a = x;
+            let string = props.get(k).get("type").as_str() == Some("string");
+            args.push((k.to_string(), if string { Json::Str(v.into()) } else { serde_json::from_str(v).unwrap_or_else(|_| Json::Str(v.into())) }));
+        }
+        if !a.is_empty() { return None; }
+        calls.push((name.to_string(), Json::Obj(args).dump()));
+    }
+    Some((text[..start].trim_end().to_string(), calls))
 }
 
 /// Greedy decode up to `n` tokens from `logits`; `emit` gets each new text piece. Returns (ids, finish reason).
@@ -346,7 +402,7 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize) -> anyhow::Result<()> {
 }
 
 /// `rustingstrata serve` for GLM: one request at a time, OpenAI `/v1/chat/completions` (JSON or SSE), `/v1/models`, `/health`.
-/// ponytail: greedy only, no tools or stop strings; prompt + reply capped at 8192 tokens (STRATA_GLM_CTX); KV reused when the prompt extends it.
+/// ponytail: greedy only, no stop strings; prompt + reply capped at 8192 tokens (STRATA_GLM_CTX); KV reused when the prompt extends it.
 pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow::Result<()> {
     use serde_json::json;
     use std::io::Write;
@@ -382,12 +438,7 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
                     Ok(q) => q,
                     Err(e) => { send(&mut c, "400 Bad Request", "application/json", &json!({"error": {"message": format!("{e:#}"), "type": "invalid_request_error"}}).to_string()); continue }
                 };
-                let view: Vec<(&str, String)> = q.messages.iter().map(|m| (m.role.as_str(), match &m.reasoning {
-                    Some(r) if m.role == "assistant" => format!("{r}</think>{}", m.content),
-                    _ => m.content.clone(),
-                })).collect();
-                let view: Vec<(&str, &str)> = view.iter().map(|(a, b)| (*a, b.as_str())).collect();
-                let ids = match tok.encode(&chat_prompt(&view)) {
+                let ids = match tok.encode(&chat_prompt_tools(&q.messages, &q.tools)) {
                     Ok(i) if !i.is_empty() => i,
                     _ => { send(&mut c, "400 Bad Request", "application/json", r#"{"error":{"message":"cannot encode prompt"}}"#); continue }
                 };
@@ -401,11 +452,32 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
                 if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
                 let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
                 let stream = q.stream;
-                let (out, done) = decode_greedy(&mut m, &tok, &stop, logits, n, &mut |t| !stream || write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok());
-                if stream { let _ = write!(c, "data: {}\n\ndata: [DONE]\n\n", chunk(json!({}), Some(done))); }
-                else {
-                    let text = tok.decode(&out).unwrap_or_default();
-                    let b = json!({"object": "chat.completion", "model": name, "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": done}],
+                let tools = q.tool_calls && !q.tools.is_empty();
+                let mut hold = crate::chat::Hold::new(tools, vec![]);
+                let (out, done) = decode_greedy(&mut m, &tok, &stop, logits, n, &mut |t| {
+                    let t = hold.push(t);
+                    !stream || t.is_empty() || write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok()
+                });
+                let calls = if tools { parse_calls(&hold.text, &q.tools) } else { None };
+                let done = if calls.is_some() { "tool_calls" } else { done };
+                let calls_json = |(content, calls): &(String, Vec<(String, String)>), stream: bool| {
+                    let c: Vec<_> = calls.iter().enumerate().map(|(k, (f, a))| {
+                        let mut c = json!({"id": format!("call_{k}"), "type": "function", "function": {"name": f, "arguments": a}});
+                        if stream { c["index"] = k.into(); }
+                        c
+                    }).collect();
+                    if stream { json!({"tool_calls": c}) } else { json!({"role": "assistant", "content": if content.is_empty() { None } else { Some(content) }, "tool_calls": c}) }
+                };
+                if stream {
+                    match &calls {
+                        Some(x) => { let _ = write!(c, "data: {}\n\n", chunk(calls_json(x, true), None)); }
+                        None if !hold.rest().is_empty() => { let _ = write!(c, "data: {}\n\n", chunk(json!({"content": hold.rest()}), None)); }
+                        None => {}
+                    }
+                    let _ = write!(c, "data: {}\n\ndata: [DONE]\n\n", chunk(json!({}), Some(done)));
+                } else {
+                    let message = match &calls { Some(x) => calls_json(x, false), None => json!({"role": "assistant", "content": hold.text}) };
+                    let b = json!({"object": "chat.completion", "model": name, "choices": [{"index": 0, "message": message, "finish_reason": done}],
                         "usage": {"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len()}});
                     send(&mut c, "200 OK", "application/json", &b.to_string());
                 }
@@ -418,7 +490,7 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
 
 #[cfg(test)]
 mod chat_tests {
-    use super::chat_prompt;
+    use super::{chat_prompt, chat_prompt_tools, parse_calls};
 
     /// Expected strings come from llama.cpp b12119 `/apply-template` (tools/glm_ref/llama_tok.json).
     #[test]
@@ -428,5 +500,26 @@ mod chat_tests {
         assert_eq!(chat_prompt(&[("user", "Hello")]), t[0]["prompt"].as_str().unwrap());
         let m = [("system", "Be brief."), ("user", "Hi"), ("assistant", "Hey"), ("user", "Bye")];
         assert_eq!(chat_prompt(&m), t[1]["prompt"].as_str().unwrap());
+    }
+
+    #[test]
+    fn tools_match_llama() {
+        // crate Json keeps key order; serde_json::Value would sort the tool schemas' keys.
+        let j: crate::chat::Json = serde_json::from_str(include_str!("../../tools/glm_ref/tpl_tools.json")).unwrap();
+        let crate::chat::Json::Arr(cases) = j else { panic!() };
+        for c in &cases {
+            let q = crate::serve::chat_request(c.get("req").dump().as_bytes()).unwrap();
+            assert_eq!(chat_prompt_tools(&q.messages, &q.tools), c.get("prompt").as_str().unwrap());
+        }
+    }
+
+    #[test]
+    fn parses_calls() {
+        let t = r#"[{"type":"function","function":{"name":"f","parameters":{"properties":{"s":{"type":"string"}}}}}]"#;
+        let tools: Vec<crate::chat::Json> = serde_json::from_str(t).unwrap();
+        let (txt, c) = parse_calls("<think>a <tool_call> b</think>ok <tool_call>f<arg_key>s</arg_key><arg_value>12</arg_value><arg_key>n</arg_key><arg_value>[1, 2]</arg_value></tool_call>", &tools).unwrap();
+        assert_eq!(txt, "<think>a <tool_call> b</think>ok");
+        assert_eq!(c, vec![("f".to_string(), r#"{"s": "12", "n": [1, 2]}"#.to_string())]);
+        assert!(parse_calls("plain", &tools).is_none());
     }
 }
