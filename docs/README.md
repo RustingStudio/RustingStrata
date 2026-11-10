@@ -19,3 +19,4 @@ Raw results and methods, newest work last. The headline numbers are in the [READ
 - [m4-results.md](m4-results.md): chunked prefill.
 - [m6-results.md](m6-results.md): v1.0 gate run against llama.cpp.
 - [V100-results.md](V100-results.md): V100 bring-up, parity and benchmarks (long; written by `tools/bench_v100.sh`).
+- [datacenter-nvidia-results.md](datacenter-nvidia-results.md): A100, A30, L40S and H100 test runs and benchmarks.
