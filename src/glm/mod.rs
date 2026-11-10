@@ -223,9 +223,10 @@ impl GlmConfig {
     }
 }
 
-/// `rustingstrata generate` for glm5-next: raw prompt (no template), greedy, prints the continuation. CPU reference only.
+/// `rustingstrata generate` for glm5-next: raw prompt (no template), greedy, prints the continuation. GPU matvecs unless STRATA_GLM_CPU is set.
 pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
     use std::io::Write;
+    gpu_defaults();
     let tok = crate::tokenizer::Tokenizer::from_gguf(g)?;
     let mut m = forward::GlmModel::new(g)?;
     let eos = tok.eos_ids();
@@ -295,6 +296,7 @@ fn stop_ids(g: &Gguf, tok: &crate::tokenizer::Tokenizer) -> Vec<u32> {
 }
 
 fn gpu_defaults() {
+    if std::env::var_os("STRATA_GLM_CPU").is_some() { return; }
     // VRAM budget is absolute (includes the ~non-expert weights): 11.5 GB gave the best hit rate on a 12 GB card.
     for (k, v) in [("STRATA_DS_GPU", "1"), ("STRATA_DS_GPU_EXPERTS", "11")] {
         if std::env::var_os(k).is_none() { unsafe { std::env::set_var(k, v) } }
