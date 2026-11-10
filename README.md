@@ -137,7 +137,7 @@ Greedy output equals llama.cpp b12119 (`--cpu-moe`) for 32 tokens on 3 fixed pro
 prompts 1 and 2 still match for 32 tokens and prompt 3 flips at the first token, a near-tie (logprob -2.65 against -2.73). Fed llama.cpp's own 64 tokens per prompt (teacher-forced), the GPU path picks the same top-1 on 188 of 192 steps; the four misses are llama.cpp near-ties (margins 0.03-0.53 logprob). Tokenizer ids
 match llama.cpp on 29 test strings and the chat template matches `/apply-template` on 2 conversations.
 On an RTX 3060 12 GB with 30 GB RAM decode took about 0.4-0.7 s per token with warm page cache (about 55% VRAM expert-cache
-hits on a short text); llama.cpp reported 0.15-0.57 tok/s on the same box in cold runs. The two were not measured side by side.
+hits on a short text); llama.cpp (`--cpu-moe`, server, 64 greedy tokens per prompt) took 2.3-2.9 s per token (0.34-0.44 tok/s) on the same box in the same session, started right before our runs on the same page cache; both timings move with the page cache and were taken once, not as a repeated benchmark.
 Caveats: prefill runs 128-token chunks layer by layer so each routed expert is read once per chunk (a 398-token prompt prefilled in 110 s, about 0.28 s per token; short prompts cost more per token because the experts stream from SSD once per chunk, `STRATA_GLM_CHUNK` sets the size); prompt plus reply is capped at 8192 tokens by default (`STRATA_GLM_CTX` changes it; the k-pool sparse-attention indexer takes over past 2048 rows and was checked against llama.cpp up to 3.6k tokens: same top-5 sets, same first token); the NextN/MTP layer is unused; decoding is greedy only; no tool calls; the reasoning
 text comes back in `content` before `</think>`.
 
