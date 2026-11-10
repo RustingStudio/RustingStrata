@@ -96,9 +96,9 @@ pub struct GlmModel<'a> {
     pub trace: bool,
 }
 
-/// Context cap. Beyond `idx_top_k` the k-pool indexer selects rows; that path is checked against llama.cpp only up to `STRATA_GLM_CTX`'s default.
+/// Context cap. Beyond `idx_top_k` the k-pool indexer selects rows; that path is checked against llama.cpp up to ~3.6k tokens.
 pub fn max_ctx(cfg: &GlmConfig) -> usize {
-    std::env::var("STRATA_GLM_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(cfg.idx_top_k - 1)
+    std::env::var("STRATA_GLM_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(8192)
 }
 
 fn silu(x: f32) -> f32 {

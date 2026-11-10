@@ -343,7 +343,7 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize) -> anyhow::Result<()> {
 }
 
 /// `rustingstrata serve` for GLM: one request at a time, OpenAI `/v1/chat/completions` (JSON or SSE), `/v1/models`, `/health`.
-/// ponytail: greedy only, no tools or stop strings; prompt + reply capped at 2047 tokens (no indexer); KV reused when the prompt extends it.
+/// ponytail: greedy only, no tools or stop strings; prompt + reply capped at 8192 tokens (STRATA_GLM_CTX); KV reused when the prompt extends it.
 pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow::Result<()> {
     use serde_json::json;
     use std::io::Write;
