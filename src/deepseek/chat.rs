@@ -1,6 +1,6 @@
 //! `rustingstrata chat` for DeepSeek-V4.1: greedy, CUDA for the matvecs and expert staging, KV kept across turns.
 use super::forward::DsModel;
-use crate::{chat::{Msg, Template}, gguf::Gguf, tokenizer::Tokenizer};
+use crate::{chat::{Msg, Template}, gguf::{Gguf, Value}, tokenizer::Tokenizer};
 use std::io::{BufRead, Write};
 
 fn gpu_defaults() {
@@ -80,10 +80,12 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
     Ok(())
 }
 
-/// Prompt plus reply cap per request: `STRATA_DS_CTX` tokens, default 16384.
+/// Prompt plus reply limit per request: the model's trained context, or `STRATA_DS_CTX` tokens.
 /// ponytail: only checked against llama.cpp up to a 1425-token prompt; the candidate-block prune (beyond 4096 compressed rows) is not implemented.
-fn ctx_limit() -> usize {
-    std::env::var("STRATA_DS_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(16384)
+fn ctx_limit(g: &Gguf) -> usize {
+    let arch = g.meta.get("general.architecture").and_then(Value::as_str).unwrap_or_default();
+    std::env::var("STRATA_DS_CTX").ok().and_then(|v| v.parse().ok())
+        .or_else(|| g.meta.get(&format!("{arch}.context_length")).and_then(Value::as_u64).map(|v| v as usize)).unwrap_or(usize::MAX)
 }
 
 /// `rustingstrata serve` for DeepSeek: one request at a time, OpenAI `/v1/chat/completions` (JSON or SSE), `/v1/models`, `/health`.
@@ -95,7 +97,7 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
     let tok = Tokenizer::from_gguf(g)?;
     let mut m = DsModel::new(g)?;
     let eos = tok.eos_ids();
-    let ctx = ctx_limit();
+    let ctx = ctx_limit(g);
     let l = std::net::TcpListener::bind(addr)?;
     eprintln!("deepseek serve on http://{addr}/ model {name}");
     for c in l.incoming() {
@@ -125,7 +127,7 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
                     Ok(q) => q,
                     Err(e) => { send(&mut c, "400 Bad Request", "application/json", &json!({"error": {"message": format!("{e:#}"), "type": "invalid_request_error"}}).to_string()); continue }
                 };
-                let ids = match tok.encode(&Template::Ds.render(&q.messages, &[], q.think, q.preserve_thinking.unwrap_or(true), true)) {
+                let ids = match tok.encode(&Template::Ds.render(&q.messages, &q.tools, q.think, q.preserve_thinking.unwrap_or(true), true)) {
                     Ok(i) if !i.is_empty() => i,
                     _ => { send(&mut c, "400 Bad Request", "application/json", r#"{"error":{"message":"cannot encode prompt"}}"#); continue }
                 };
@@ -139,23 +141,44 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
                 let n = q.max_tokens.unwrap_or(256).min(ctx - ids.len());
                 if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
                 let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
+                let tools = q.tool_calls && !q.tools.is_empty();
+                let mut hold = crate::chat::Hold::new(tools, vec![]).tagged(Template::Ds.call_tag());
                 let (mut out, mut shown, mut done) = (vec![], 0, "length");
                 for i in 0..n {
                     let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
                     if eos.contains(&next) { done = "stop"; break; }
                     out.push(next);
                     let s = tok.decode(&out).unwrap_or_default();
-                    if q.stream && !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
-                        let ok = write!(c, "data: {}\n\n", chunk(json!({"content": &s[shown..]}), None)).is_ok();
+                    if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
+                        let t = hold.push(&s[shown..]);
                         shown = s.len();
-                        if !ok { break; }
+                        if q.stream && !t.is_empty() && write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_err() { break; }
                     }
                     if i + 1 < n { logits = m.step(next); }
                 }
-                let text = tok.decode(&out).unwrap_or_default();
-                if q.stream { let _ = write!(c, "data: {}\n\ndata: [DONE]\n\n", chunk(json!({}), Some(done))); }
+                let s = tok.decode(&out).unwrap_or_default();
+                if s.len() > shown && s.is_char_boundary(shown) { hold.push(&s[shown..]); }
+                let calls = if tools { Template::Ds.parse_calls(&hold.text, &q.tools) } else { None };
+                let done = if calls.is_some() { "tool_calls" } else { done };
+                let calls_json = |(content, calls): &(String, Vec<(String, String)>), stream: bool| {
+                    let c: Vec<_> = calls.iter().enumerate().map(|(k, (f, a))| {
+                        let mut c = json!({"id": format!("call_{k}"), "type": "function", "function": {"name": f, "arguments": a}});
+                        if stream { c["index"] = k.into(); }
+                        c
+                    }).collect();
+                    if stream { json!({"tool_calls": c}) } else { json!({"role": "assistant", "content": if content.is_empty() { None } else { Some(content) }, "tool_calls": c}) }
+                };
+                if q.stream {
+                    match &calls {
+                        Some(x) => { let _ = write!(c, "data: {}\n\n", chunk(calls_json(x, true), None)); }
+                        None if !hold.rest().is_empty() => { let _ = write!(c, "data: {}\n\n", chunk(json!({"content": hold.rest()}), None)); }
+                        None => {}
+                    }
+                    let _ = write!(c, "data: {}\n\ndata: [DONE]\n\n", chunk(json!({}), Some(done)));
+                }
                 else {
-                    let b = json!({"object": "chat.completion", "model": name, "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": done}],
+                    let message = match &calls { Some(x) => calls_json(x, false), None => json!({"role": "assistant", "content": hold.text}) };
+                    let b = json!({"object": "chat.completion", "model": name, "choices": [{"index": 0, "message": message, "finish_reason": done}],
                         "usage": {"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len()}});
                     send(&mut c, "200 OK", "application/json", &b.to_string());
                 }
