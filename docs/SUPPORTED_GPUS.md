@@ -16,6 +16,14 @@ row.
 | AMD Radeon VII (Vega 20) | GCN5, wave64 | Vulkan | Runs | masanork (PR #5) | RADV Mesa 26.0.8. Each 64-lane subgroup runs as two logical 32-lane warps. See [AMD.md](AMD.md). |
 | AMD Radeon RX 9070 XT | RDNA 4 | Vulkan | Runs, known issues | user reports | Linux (RADV) and Windows (AMD driver). See [AMD.md](AMD.md) for the issues and what to send. |
 | NVIDIA Turing card | Turing, sm_75 | CUDA | Runs | x-Pepsy (PR #6) | `m16n8k8` tensor cores, no int8 GEMM, 64 KB shared memory (16-key prefill tile at head_dim 256). The GPU model was not recorded in the PR. |
+| NVIDIA A100-SXM4 80 GB | Ampere, sm_80 | CUDA | Full test suite passes | yugt | pp 4096 prefill 6203 tok/s, decode 174 tok/s (MTP off, whole model in VRAM). See [datacenter-nvidia-results.md](datacenter-nvidia-results.md). |
+| NVIDIA A100-SXM4 80 GB | Ampere, sm_80 | Vulkan | Full test suite passes | yugt | Cooperative matrices (f16 and int8). pp 4096 prefill 5589 tok/s, decode 132 tok/s. |
+| NVIDIA A30 24 GB | Ampere, sm_80 | CUDA | Full test suite passes | yugt | pp 4096 prefill 3544 tok/s, decode 132 tok/s. |
+| NVIDIA A30 24 GB | Ampere, sm_80 | Vulkan | Full test suite passes | yugt | Cooperative matrices (f16 and int8). pp 4096 prefill 3326 tok/s, decode 104 tok/s. |
+| NVIDIA L40S 48 GB | Ada, sm_89 | CUDA | Full test suite passes | yugt | pp 4096 prefill 9030 tok/s, decode 213 tok/s. |
+| NVIDIA L40S 48 GB | Ada, sm_89 | Vulkan | Full test suite passes | yugt | Cooperative matrices (f16 and int8). pp 4096 prefill 8571 tok/s, decode 185 tok/s. |
+| NVIDIA H100 NVL 94 GB, H100 80 GB | Hopper, sm_90 | CUDA | Full test suite passes | yugt | pp 4096 prefill 9131 tok/s, decode 246 tok/s (H100 NVL; the 80 GB card ran the tests only). |
+| NVIDIA H100 NVL 94 GB, H100 80 GB | Hopper, sm_90 | Vulkan | Full test suite passes | yugt | Cooperative matrices (f16 and int8). pp 4096 prefill 6428 tok/s, decode 192 tok/s (H100 NVL). |
 
 ## Compiles, not run
 
