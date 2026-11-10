@@ -234,8 +234,10 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
     if std::env::var_os("STRATA_GLM_TRACE").is_some() { eprintln!("prompt ids {ids:?}"); }
     let mut logits = m.prefill(&ids);
     let (mut out, mut shown) = (vec![], 0);
+    // STRATA_GLM_FORCE=<file of comma-separated token ids>: teacher-force those tokens (compare top-5 per step with a reference run).
+    let forced: Vec<u32> = std::env::var("STRATA_GLM_FORCE").ok().and_then(|p| std::fs::read_to_string(p).ok()).map(|t| t.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
     for i in 0..n {
-        let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+        let mut next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
         if std::env::var_os("STRATA_GLM_TOP5").is_some() {
             let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let lz = mx as f64 + logits.iter().map(|&l| ((l - mx) as f64).exp()).sum::<f64>().ln();
@@ -244,6 +246,7 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
             let t: Vec<String> = idx[..5].iter().map(|&k| format!("{k}:{:.4}", logits[k] as f64 - lz)).collect();
             eprintln!("TOP5 {i} {}", t.join(" "));
         }
+        if let Some(&f) = forced.get(i) { next = f; }
         if eos.contains(&next) { break; }
         out.push(next);
         let s = tok.decode(&out)?;
