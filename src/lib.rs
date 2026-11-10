@@ -17,4 +17,5 @@ pub mod serve;
 pub mod chat;
 pub mod hf;
 pub mod deepseek;
+pub mod gemma4;
 pub mod glm;
