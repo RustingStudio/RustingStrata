@@ -559,8 +559,9 @@ enum Cmd {
         vram_margin: usize,
         #[arg(long)]
         backend: Option<String>,
-        #[arg(long, default_value_t = 0)]
-        device: usize,
+        /// GPU index, or several separated by commas (such as 0,1) to calibrate the layer split over those GPUs.
+        #[arg(long, default_value = "0", value_delimiter = ',')]
+        device: Vec<usize>,
         /// Accepted for consistency with the other commands; calibration always uses the base model.
         #[arg(long, value_name = "PATH:SCALE", action = clap::ArgAction::Append)]
         lora: Vec<String>,
@@ -832,7 +833,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Calibrate { model, ctx, vram_margin, backend, device, kv, lora, gpu: _ } => {
             if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
             if !lora.is_empty() { eprintln!("note: --lora is ignored by calibrate; calibration uses the base model"); }
-            calibrate(&model, ctx, vram_margin << 20, backend.as_deref(), device)?
+            calibrate(&model, ctx, vram_margin << 20, backend.as_deref(), &device)?
         }
         Cmd::Check { model, backend, device } => {
             let g = Gguf::open(&model)?;
@@ -1111,7 +1112,7 @@ fn best(f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<f64> {
     Ok(b)
 }
 
-fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device: usize) -> anyhow::Result<()> {
+fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device: &[usize]) -> anyhow::Result<()> {
     let g = Gguf::open(model)?;
     let m = Model::load(&g)?;
     let tok = Tokenizer::from_gguf(&g)?;
@@ -1119,7 +1120,9 @@ fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device
     anyhow::ensure!(n_pf >= 512, "--ctx too small to calibrate");
     let pf = prose(&tok, n_pf)?;
     let load = |chunk: usize| -> anyhow::Result<GpuModel> {
-        let mut gm = GpuModel::load(&m, backend::open(kind, device)?, ctx, chunk, margin, 3).context(LOAD_HINT)?;
+        let bk = device.iter().map(|&d| backend::open(kind, d)).collect::<anyhow::Result<Vec<_>>>()?;
+        // MTP is not available with a layer split (as in serve): no drafts to measure.
+        let mut gm = GpuModel::load_split(&m, bk, ctx, chunk, margin, if device.len() > 1 { 0 } else { 3 }, 1).context(LOAD_HINT)?;
         gm.adapt_every = 0; // fixed placement: steadier timings
         Ok(gm)
     };

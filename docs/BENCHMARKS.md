@@ -17,6 +17,7 @@ Reference machine unless stated: RTX 3060 12 GB, Ryzen 5 7600X, 32 GB RAM.
 |---|---|---|---|---|
 | Qwen3.6-35B-A3B UD-Q2_K_XL | 118.2 tok/s (113.4 after 4K) | 68.4 (66.5) | - | [below](#qwen36-35b-a3b-ud-q2_k_xl) |
 | Qwen3.6-35B-A3B UD-Q3_K_M, 6474-token prompt | 83.0 tok/s (108.0 with MTP) | 67.5 (101.1 with MTP) | PolyStrata 79.2 (113.3 with MTP) | [below](#qwen36-35b-a3b-ud-q3_k_m-vs-polystrata) |
+| Qwen3.8-Flash-Next GSQ-RCO IQ2_XS, 1262-token prompt | 33.0 tok/s (29.3-35.8) | 25.6 (23.2-26.9) | - | [below](#qwen38-flash-next-gsq-rco-iq2_xs) |
 | GLM-5.3-Flash UD-Q2_K_XL (119 GB) | 1.25-1.40 tok/s | 0.47-0.56 | - | [below](#glm-53-flash-ud-q2_k_xl-119-gb) |
 | DeepSeek-V4.1-Flash IQ2_XXS (249 GB) | 2-3.6 tok/s | 0.3-1.5 | - | [below](#deepseek-v41-flash-iq2_xxs-249-gb) |
 
@@ -59,6 +60,45 @@ Not equal:
 - PolyStrata offers three sizes of Qwen3.6 (UD-Q3_K_M, UD-Q2_K_XL, UD-Q4_K_M). RustingStrata and llama.cpp take any GGUF. The Q3_K_M file was used for all three.
 - With MTP, PolyStrata is ahead of RustingStrata here (113.3 against 108.0). It was not checked why; PolyStrata's draft logic and acceptance were not read.
 - PolyStrata's engine for this model is built on llama.cpp's CUDA kernels. What else differs was not checked.
+
+## Qwen3.8-Flash-Next GSQ-RCO IQ2_XS
+
+Two-shard GGUF: shard 1 is 39,225,954,592 B (SHA-256 `92cee27ae5bbadcd732416a0f7a7f0acc092399dbbe8f5a5efa707c2ec0a49d7`), shard 2 is 28,800,138,432 B (SHA-256 `316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113`). Measured 2026-11-10 on the reference machine, but with 30 GiB of RAM (below the model's comfort point), so experts stream from the NVMe.
+
+The prompt is a fixed WikiText-2 raw test passage plus one instruction: 1,262 tokens raw, 1,273 after the chat template. Exact text and token IDs are in `.posts/data/2026-11-10-qwen38-prompt.txt` and `.posts/data/2026-11-10-qwen38-prompt.ids.txt`. Greedy, 128 generated tokens, same OpenAI-compatible request for both engines. One warm request, then three measured requests per session; two sessions per engine with alternating order, so six measured runs each. Decode is the mean of the measured runs; cold prefill is the first request of each session.
+
+| Engine | Decode, no speculative | Cold prefill | Speculative/MTP |
+|---|---:|---:|---|
+| RustingStrata 1.2.1 | 33.0 tok/s (29.3-35.8) | 109.3 tok/s (99.9-118.8) | not available |
+| llama.cpp b12191 | 25.6 tok/s (23.2-26.9) | 30.9 tok/s (29.2-32.6) | not available |
+
+How each was run:
+
+- RustingStrata: `serve --gpu --ctx 4096 --mtp 0`.
+- llama.cpp b12191 (commit `e95426f16`): `-c 4096 -ngl 99 -fa on -b 512 -ub 512 --cpu-moe --moe-cache-mib 4000`. A small sweep (`-ncmoe` 32-48, MoE cache 1500-4000 MiB) put the best decode result at `--cpu-moe --moe-cache-mib 4000`.
+
+No MTP row: RustingStrata prints `--mtp 1: not supported for this model (hyper-connections): decoding without drafts`; llama.cpp b12191 starts with `--spec-type draft-mtp` but fails with `context type MTP requested but model doesn't contain MTP layers`.
+
+### Quality vs llama.cpp (Qwen3.8-Flash-Next IQ2_XS)
+
+Same GGUF, 36 WikiText-2 raw test chunks of 512 tokens (9,180 scored), MTP disabled. RustingStrata wrote the KLD base:
+
+```
+rustingstrata perplexity --model M1 --file CORPUS --ctx-len 512 --chunks 36 --gpu --mtp 0 --kld-base rusting.bin
+llama-perplexity -m M1 -f CORPUS -c 512 --chunks 36 --kl-divergence --kl-divergence-base rusting.bin \
+  --cpu-moe --moe-cache-mib 4000 -ngl 99 -fa on -b 512 -ub 512
+```
+
+| Metric | Result |
+|---|---:|
+| PPL RustingStrata / llama.cpp | 2.9212 / 2.9156 |
+| PPL ratio (llama.cpp / RustingStrata, per chunk) | 0.9987 +- 0.0019 |
+| Mean KLD (median) | 0.0098 (0.0016) |
+| Same top token | 96.78 +- 0.18% |
+| RMS Δp | 3.60 +- 0.09% |
+| Correlation of log-PPL | 99.58% |
+
+Raw logs, server logs and commands: `.posts/data/qwen38-*.{log,txt,err}`, `speed_rs*.jsonl`, `speed_llama*.jsonl`.
 
 ## GLM-5.3-Flash UD-Q2_K_XL (119 GB)
 
@@ -108,8 +148,8 @@ llama.cpp batch vs token-by-token modes differ by about 1.7% in top-token agreem
 
 ## Not yet measured
 
-- Original Strata and other engines on the same files.
-- Qwen3.8-Flash-Next (`qwen4exp`) and Qwen3-Next against llama.cpp in one table.
+- Qwen3-Next against llama.cpp in one table.
+- Speculative/MTP for Qwen3.8-Flash-Next: neither RustingStrata nor llama.cpp has an MTP head for this file.
 - Other GPUs: see [V100-results.md](V100-results.md) and [SUPPORTED_GPUS.md](SUPPORTED_GPUS.md).
 
 ## Adding an entry
