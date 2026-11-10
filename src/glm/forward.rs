@@ -371,16 +371,19 @@ impl<'a> GlmModel<'a> {
         let mut x: Vec<f32> = (0..4).flat_map(|_| emb.iter().cloned()).collect();
         self.tr("hc_init", -1, &x);
         let (mut cur, mut nrm) = (vec![0f32; n], vec![0f32; n]);
+        let (mut prof, tstep) = ([0f64; 2], std::time::Instant::now());
         for il in 0..self.cfg.n_layer {
             let a = self.hc_mix(&self.layers[il].hc_attn, &x);
             hc_collapse(&x, &a.pre, &mut cur);
             self.tr("hc_attn_pre", il as i32, &cur);
             rms_norm_w(&cur, &self.layers[il].attn_norm, self.cfg.eps, &mut nrm);
             self.tr("attn_norm", il as i32, &nrm);
+            let t0 = std::time::Instant::now();
             let att = match self.cfg.kind[il] {
                 LayerKind::Kda => self.kda(il, &nrm),
                 LayerKind::Dsa => self.dsa(il, &nrm),
             };
+            prof[0] += t0.elapsed().as_secs_f64();
             self.tr("attn_out", il as i32, &att);
             let mut x2 = vec![0f32; 4 * n];
             hc_post(&att, &x, &a, &mut x2);
@@ -391,12 +394,19 @@ impl<'a> GlmModel<'a> {
             self.tr("hc_ffn_pre", il as i32, &cur);
             rms_norm_w(&cur, &self.layers[il].ffn_norm, self.cfg.eps, &mut nrm);
             self.tr("ffn_norm", il as i32, &nrm);
+            let t1 = std::time::Instant::now();
             let ff = self.ffn(il, &nrm);
+            prof[1] += t1.elapsed().as_secs_f64();
             self.tr("ffn_out", il as i32, &ff);
             let mut x2 = vec![0f32; 4 * n];
             hc_post(&ff, &x, &f, &mut x2);
             x = x2;
             self.tr("l_out", il as i32, &x);
+        }
+        if std::env::var_os("STRATA_GLM_PROF").is_some() {
+            let l = &crate::deepseek::mat::EX_LOOKUPS;
+            let (h, m) = (l[0].swap(0, std::sync::atomic::Ordering::Relaxed), l[1].swap(0, std::sync::atomic::Ordering::Relaxed));
+            eprintln!("PROF tok{} total {:.0}ms attn {:.0}ms ffn {:.0}ms expert-cache hit {h} miss {m}", self.toks.len(), tstep.elapsed().as_secs_f64() * 1e3, prof[0] * 1e3, prof[1] * 1e3);
         }
         if !want {
             return vec![];
