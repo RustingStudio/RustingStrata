@@ -16,7 +16,7 @@ Reference machine unless stated: RTX 3060 12 GB, Ryzen 5 7600X, 32 GB RAM.
 | Model (file) | Decode, RustingStrata | Decode, llama.cpp | Other engine | Entry |
 |---|---|---|---|---|
 | Qwen3.6-35B-A3B UD-Q2_K_XL | 118.2 tok/s (113.4 after 4K) | 68.4 (66.5) | - | [below](#qwen36-35b-a3b-ud-q2_k_xl) |
-| Qwen3.6-35B-A3B UD-Q3_K_M, 5290-token prompt | 90.9 tok/s (128.4 with MTP) | 53.5 (77.7 with MTP) | PolyStrata 78.5 (97.5-100.4 with MTP) | [below](#qwen36-35b-a3b-ud-q3_k_m-vs-polystrata) |
+| Qwen3.6-35B-A3B UD-Q3_K_M, 6474-token prompt | 83.0 tok/s (108.0 with MTP) | 67.5 (101.1 with MTP) | PolyStrata 79.2 (113.3 with MTP) | [below](#qwen36-35b-a3b-ud-q3_k_m-vs-polystrata) |
 | GLM-5.3-Flash UD-Q2_K_XL (119 GB) | 1.25-1.40 tok/s | 0.47-0.56 | - | [below](#glm-53-flash-ud-q2_k_xl-119-gb) |
 | DeepSeek-V4.1-Flash IQ2_XXS (249 GB) | 2-3.6 tok/s | 0.3-1.5 | - | [below](#deepseek-v41-flash-iq2_xxs-249-gb) |
 
@@ -37,27 +37,28 @@ Method: `rustingstrata bench --gpu --mtp 0 --pp 512,4096,32768 --tg 128 --reps 3
 
 ## Qwen3.6-35B-A3B UD-Q3_K_M vs PolyStrata
 
-`Qwen3.6-35B-A3B-UD-Q3_K_M.gguf` (Unsloth, MTP layer included, 15.9 GiB, does not fit in VRAM). Prompt of 5290 tokens, 128 generated tokens, greedy. llama.cpp b12119.
+`Qwen3.6-35B-A3B-UD-Q3_K_M.gguf` (Unsloth, MTP layer included, 15.9 GiB, does not fit in VRAM). One prompt file for every engine (about 3200 words of repo docs, 6474 tokens in RustingStrata and llama.cpp, 6476 in PolyStrata), chat template with thinking off, greedy, 128 generated tokens, sent through each engine's OpenAI-compatible server by the same script. llama.cpp is b12191 (has `--moe-cache-mib` and `--moe-cache-cpu-share`). Prefill is the first request (cold), decode is the mean of runs 2-4 on the warm server.
 
 | | RustingStrata | PolyStrata | llama.cpp |
 |---|---|---|---|
-| Prefill, 5290-token prompt | 2330 tok/s | 1458-1549 tok/s | 1692 tok/s (`-ncmoe 22`, `-ub 2048`) |
-| Decode, no MTP | 90.9 tok/s | 78.5 tok/s (`--no-draft`, not a clean no-MTP number) | 53.5 tok/s |
-| Decode with MTP drafts | 128.4 tok/s | 97.5-100.4 tok/s | 77.7 tok/s (`--spec-type draft-mtp`, 92 of 102 drafts accepted) |
+| Prefill | 2088 tok/s | 1780 tok/s | 1408-1742 tok/s (depends on `-ncmoe`) |
+| Decode, no MTP | 83.0 tok/s | 79.2 tok/s (`--no-draft --lookup 0 --window 1`) | 67.5 tok/s (`-ncmoe 36 --moe-cache-mib 5000`); 50.4 with `-ncmoe 22`, no cache |
+| Decode with MTP | 108.0 tok/s (90% of drafts accepted) | 113.3 tok/s (defaults; acceptance not read) | 101.1 tok/s (87.5% accepted) |
 
 How each was run:
 
-- RustingStrata: `rustingstrata bench --gpu --mtp 0|1 --pp 5290 --tg 128 --reps 3`, mean of 3.
-- PolyStrata: its own `polystrata.py benchmark --model qwen3.6 --prompt-tokens 4000 --max-tokens 128`, which came to 5290 tokens. Three runs; the first after setup was cold (decode 24.6 tok/s) and is left out. MTP drafts are on by default. For the no-MTP row the engine's `--no-draft` flag was set; it still offered a few drafts afterwards (6 of 16 and 15 of 36 accepted in the log). Prefill in those runs: 1602-1643 tok/s.
-- llama.cpp: `llama-bench -ngl 99 -fa 1 -ub 2048 -b 2048 -p 5290 -n 128 -r 3`, `-ncmoe` swept 18 to 26; 22 was the fastest that fits in 12 GB. The MTP row is `llama-server --spec-type draft-mtp` with `-ncmoe 23` (22 does not fit with the MTP context and drops to 20 tok/s), a 5381-token prompt of repo docs, 3 runs.
+- RustingStrata: `serve --gpu --ctx 8192 --mtp 0|1`.
+- PolyStrata: `serve/server.py --engine strata` with its Q3_K_M config (`--tail-skip 6`, expert profile). No MTP: `--no-draft --lookup 0 --window 1` added, because `--no-draft` alone leaves its n-gram guesses on. With MTP: defaults.
+- llama.cpp: `llama-server -ngl 99 -fa on -ub 2048 -b 2048 -c 8192`, no-MTP rows with `-ncmoe 22`/`26`/`30`/`36` and `--moe-cache-mib` 0-5000, `--moe-cache-cpu-share` 0 or 0.5. The MTP row adds `--spec-type draft-mtp`. `-ncmoe 22` with a cache and MTP did not start.
+- Sweep (decode tok/s, warm): `-ncmoe 22` no cache 50.4; 22 + 1500 MiB 61.9; 26 + 2500 MiB + share 0.5 65.4; 30 + 3000 + 0.5 63.4; 36 + 5000 + share 0 67.5. In `llama-bench` (`-p 5000`) the cache did not help (52.0 at `-ncmoe 22` against 42.9-47.5 with cache), the server runs are what is listed.
 
 Not equal:
 
-- PolyStrata offers three sizes of Qwen3.6 (UD-Q3_K_M, UD-Q2_K_XL, UD-Q4_K_M, all from Unsloth's MTP repo). RustingStrata and llama.cpp take any GGUF. The Q3_K_M file was used for all three.
-- PolyStrata's benchmark prompt is a page of its own docs, RustingStrata's is generated prose, so the two MTP rows are not an exact comparison. The no-MTP row is the clean one for RustingStrata against llama.cpp.
+- Each engine's prefill after the first request is served from its prompt cache, so only the first request is a prefill number.
+- PolyStrata's token count is 2 higher (different tokenizer files).
+- PolyStrata offers three sizes of Qwen3.6 (UD-Q3_K_M, UD-Q2_K_XL, UD-Q4_K_M). RustingStrata and llama.cpp take any GGUF. The Q3_K_M file was used for all three.
+- With MTP, PolyStrata is ahead of RustingStrata here (113.3 against 108.0). It was not checked why; PolyStrata's draft logic and acceptance were not read.
 - PolyStrata's engine for this model is built on llama.cpp's CUDA kernels. What else differs was not checked.
-
-Raw PolyStrata runs: `poly_run*.json`, `poly_nodraft*.json` (kept outside the repo).
 
 ## GLM-5.3-Flash UD-Q2_K_XL (119 GB)
 
