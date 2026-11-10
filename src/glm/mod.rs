@@ -256,11 +256,151 @@ pub fn chat_prompt(msgs: &[(&str, &str)]) -> String {
     for (role, c) in msgs {
         match *role {
             "user" => s += &format!("<|user|>{c}"),
-            "assistant" => s += &format!("<|assistant|><think></think>{}", c.trim()),
+            "assistant" => match c.split_once("</think>") {
+                // earlier reasoning is kept (template default clear_thinking=false)
+                Some((r, a)) => s += &format!("<|assistant|><think>{}</think>{}", r.rsplit("<think>").next().unwrap_or(r), a.trim()),
+                None => s += &format!("<|assistant|><think></think>{}", c.trim()),
+            },
             _ => s += &format!("<|system|>{c}"),
         }
     }
     s + "<|assistant|><think>"
+}
+
+/// Greedy decode up to `n` tokens from `logits`; `emit` gets each new text piece. Returns (ids, finish reason).
+fn decode_greedy(m: &mut forward::GlmModel, tok: &crate::tokenizer::Tokenizer, eos: &[u32], mut logits: Vec<f32>, n: usize, emit: &mut dyn FnMut(&str) -> bool) -> (Vec<u32>, &'static str) {
+    let (mut out, mut shown, mut done) = (vec![], 0, "length");
+    for i in 0..n {
+        let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+        if eos.contains(&next) { done = "stop"; break; }
+        out.push(next);
+        let s = tok.decode(&out).unwrap_or_default();
+        if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
+            let ok = emit(&s[shown..]);
+            shown = s.len();
+            if !ok { break; }
+        }
+        if i + 1 < n { logits = m.step(next); }
+    }
+    (out, done)
+}
+
+/// Stop ids: eos plus the end-of-turn / end-of-message tokens (<|user|>, <|observation|>) that llama.cpp treats as EOG.
+fn stop_ids(g: &Gguf, tok: &crate::tokenizer::Tokenizer) -> Vec<u32> {
+    let mut e = tok.eos_ids();
+    for k in ["tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"] {
+        if let Some(v) = g.meta.get(k).and_then(|v| v.as_u64()) && !e.contains(&(v as u32)) { e.push(v as u32); }
+    }
+    e
+}
+
+fn gpu_defaults() {
+    // VRAM budget is absolute (includes the ~non-expert weights): 11.5 GB gave the best hit rate on a 12 GB card.
+    for (k, v) in [("STRATA_DS_GPU", "1"), ("STRATA_DS_GPU_EXPERTS", "11")] {
+        if std::env::var_os(k).is_none() { unsafe { std::env::set_var(k, v) } }
+    }
+}
+
+/// Context cap per request. The k-pool indexer is not implemented, so attention sees every row: limit is `idx_top_k` (2048).
+fn ctx_limit(m: &forward::GlmModel) -> usize { m.cfg.idx_top_k - 1 }
+
+/// `rustingstrata chat` for GLM: greedy, thinking on, KV kept across turns while the history extends it.
+pub fn chat(g: &Gguf, system: Option<String>, n: usize) -> anyhow::Result<()> {
+    use std::io::{BufRead, Write};
+    gpu_defaults();
+    let tok = crate::tokenizer::Tokenizer::from_gguf(g)?;
+    let mut m = forward::GlmModel::new(g)?;
+    let stop = stop_ids(g, &tok);
+    let mut msgs: Vec<(String, String)> = system.into_iter().map(|s| ("system".to_string(), s)).collect();
+    loop {
+        print!("> ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        if std::io::stdin().lock().read_line(&mut line)? == 0 { break; }
+        if line.trim().is_empty() { continue; }
+        msgs.push(("user".into(), line.trim_end().into()));
+        let view: Vec<(&str, &str)> = msgs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let ids = tok.encode(&chat_prompt(&view))?;
+        if ids.len() >= ctx_limit(&m) { eprintln!("context full ({} tokens)", ids.len()); break; }
+        let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
+        let logits = m.prefill(&ids[keep..]);
+        let room = n.min(ctx_limit(&m) - ids.len());
+        let (out, _) = decode_greedy(&mut m, &tok, &stop, logits, room, &mut |t| { print!("{t}"); let _ = std::io::stdout().flush(); true });
+        println!();
+        msgs.push(("assistant".into(), tok.decode(&out)?));
+    }
+    Ok(())
+}
+
+/// `rustingstrata serve` for GLM: one request at a time, OpenAI `/v1/chat/completions` (JSON or SSE), `/v1/models`, `/health`.
+/// ponytail: greedy only, no tools or stop strings; prompt + reply capped at 2047 tokens (no indexer); KV reused when the prompt extends it.
+pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow::Result<()> {
+    use serde_json::json;
+    use std::io::Write;
+    gpu_defaults();
+    let tok = crate::tokenizer::Tokenizer::from_gguf(g)?;
+    let mut m = forward::GlmModel::new(g)?;
+    let stop = stop_ids(g, &tok);
+    let ctx = ctx_limit(&m);
+    let l = std::net::TcpListener::bind(addr)?;
+    eprintln!("glm serve on http://{addr}/ model {name}");
+    for c in l.incoming() {
+        let Ok(mut c) = c else { continue };
+        let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+        let _ = c.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+        let Ok(r) = crate::serve::read_request(&mut std::io::BufReader::new(&c)) else { continue };
+        let send = |c: &mut std::net::TcpStream, status: &str, ty: &str, b: &str| {
+            let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+        };
+        let path = r.path.split('?').next().unwrap_or("");
+        if path != "/health" && api_key.is_none() && !crate::serve::host_ok(&r.host, addr, &[]) {
+            send(&mut c, "403 Forbidden", "application/json", r#"{"error":{"message":"bad Host header"}}"#);
+            continue;
+        }
+        if path != "/health" && api_key.is_some_and(|k| !crate::serve::key_ok(&r.auth, k)) {
+            send(&mut c, "401 Unauthorized", "application/json", r#"{"error":{"message":"missing or wrong API key","type":"invalid_api_key"}}"#);
+            continue;
+        }
+        match (r.method.as_str(), path) {
+            ("GET", "/health") => send(&mut c, "200 OK", "application/json", r#"{"status":"ok"}"#),
+            ("GET", "/v1/models") => send(&mut c, "200 OK", "application/json", &json!({"object": "list", "data": [{"id": name, "object": "model", "owned_by": "strata"}]}).to_string()),
+            ("POST", "/v1/chat/completions") => {
+                let q = match crate::serve::chat_request(&r.body) {
+                    Ok(q) => q,
+                    Err(e) => { send(&mut c, "400 Bad Request", "application/json", &json!({"error": {"message": format!("{e:#}"), "type": "invalid_request_error"}}).to_string()); continue }
+                };
+                let view: Vec<(&str, String)> = q.messages.iter().map(|m| (m.role.as_str(), match &m.reasoning {
+                    Some(r) if m.role == "assistant" => format!("{r}</think>{}", m.content),
+                    _ => m.content.clone(),
+                })).collect();
+                let view: Vec<(&str, &str)> = view.iter().map(|(a, b)| (*a, b.as_str())).collect();
+                let ids = match tok.encode(&chat_prompt(&view)) {
+                    Ok(i) if !i.is_empty() => i,
+                    _ => { send(&mut c, "400 Bad Request", "application/json", r#"{"error":{"message":"cannot encode prompt"}}"#); continue }
+                };
+                if ids.len() >= ctx {
+                    send(&mut c, "400 Bad Request", "application/json", &json!({"error": {"message": format!("prompt is {} tokens, the limit is {}", ids.len(), ctx - 1), "type": "invalid_request_error"}}).to_string());
+                    continue;
+                }
+                let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
+                let logits = m.prefill(&ids[keep..]);
+                let n = q.max_tokens.unwrap_or(256).min(ctx - ids.len());
+                if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
+                let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
+                let stream = q.stream;
+                let (out, done) = decode_greedy(&mut m, &tok, &stop, logits, n, &mut |t| !stream || write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok());
+                if stream { let _ = write!(c, "data: {}\n\ndata: [DONE]\n\n", chunk(json!({}), Some(done))); }
+                else {
+                    let text = tok.decode(&out).unwrap_or_default();
+                    let b = json!({"object": "chat.completion", "model": name, "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": done}],
+                        "usage": {"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len()}});
+                    send(&mut c, "200 OK", "application/json", &b.to_string());
+                }
+            }
+            _ => send(&mut c, "404 Not Found", "application/json", r#"{"error":{"message":"not found"}}"#),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

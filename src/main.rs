@@ -854,6 +854,9 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Chat { model, system, n, think, mut engine } => {
             let g = Gguf::open(&model)?;
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("glm5-next") {
+                return rusting_strata::glm::chat(&g, system, n);
+            }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
                 return rusting_strata::deepseek::chat::chat(&g, system, n, think);
             }
@@ -880,6 +883,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             r.finish()?;
         }
         Cmd::Serve { model, models_dir, addr, api_key, open, host, mut engine } => {
+            if let Some(mp) = &model && let Ok(g) = Gguf::open(mp) && g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("glm5-next") {
+                let name = mp.file_name().map_or("glm".into(), |n| n.to_string_lossy().into_owned());
+                let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
+                anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
+                return rusting_strata::glm::serve(&g, &name, &addr, key.as_deref());
+            }
             if let Some(mp) = &model && let Ok(g) = Gguf::open(mp) && g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
                 let name = mp.file_name().map_or("deepseek".into(), |n| n.to_string_lossy().into_owned());
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());

@@ -5,7 +5,7 @@ use super::{GlmConfig, LayerKind};
 use crate::deepseek::mat::{Mat, vec_f32};
 use crate::deepseek::ops::*;
 use crate::gguf::Gguf;
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use rayon::prelude::*;
 
 struct Hcw<'a> {
