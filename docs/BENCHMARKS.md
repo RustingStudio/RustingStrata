@@ -86,6 +86,26 @@ Caveats: long-prompt prefill is not a win (llama.cpp's second run had the page c
 
 Not measured side by side: the llama.cpp numbers are its first cold runs, the RustingStrata numbers are later runs. The model files were deleted afterwards, so this entry cannot be repeated until they are downloaded again.
 
+## Quality vs llama.cpp (Qwen3.6-35B-A3B UD-Q3_K_M)
+
+Speed does not come from lost accuracy. Same GGUF, RTX 3060, llama.cpp b12191 `-ngl 99 -ncmoe 22`.
+Corpus: repo docs prose, 36 chunks x 512 tokens (9180 scored), not wikitext.
+
+| Metric | Result |
+|---|---|
+| PPL RustingStrata / llama.cpp | 9.0714 / 9.0587 (ratio 0.9991 +- 0.0013) |
+| Mean KLD (median) | 0.0055 (0.0025) |
+| Same top token | 96.3 +- 0.2% |
+| RMS dp | 1.83% |
+| Correlation of log-PPL | 99.88% |
+
+Reproduce:
+```
+rustingstrata perplexity --model M --file F --ctx-len 512 --gpu --mtp 0 --kld-base base.bin
+llama-perplexity -m M -f F -c 512 --kl-divergence --kl-divergence-base base.bin
+```
+llama.cpp batch vs token-by-token modes differ by about 1.7% in top-token agreement on their own.
+
 ## Not yet measured
 
 - Original Strata and other engines on the same files.

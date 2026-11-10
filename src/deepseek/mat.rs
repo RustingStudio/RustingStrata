@@ -19,7 +19,7 @@ mod dev {
         DEV.get_or_init(|| {
             if std::env::var_os("STRATA_DS_GPU").is_none() { return None; }
             let be = crate::backend::open(Some("cuda"), 0).ok()?;
-            let (x, y) = (be.alloc(4 * 40960).ok()?, be.alloc(4 * 160000).ok()?);
+            let (x, y) = (be.alloc(4 * 40960).ok()?, be.alloc(4 * 262144).ok()?);
             let stage = be.alloc(STAGE).ok()?;
             let gb: f64 = std::env::var("STRATA_DS_GPU_EXPERTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
             Some(Mutex::new(Dev { be, ts: vec![], x, y, bytes: 0, ex: Default::default(), exs: vec![], now: 0, budget: (gb * 1e9) as usize, stage }))
@@ -47,7 +47,7 @@ mod dev {
                 self.exs.push((i, k, now));
                 return Some(i);
             }
-            if self.budget == 0 || data.len() > STAGE { return None; }
+            if self.budget == 0 || data.len() > STAGE || std::env::var_os("STRATA_DS_NOEVICT").is_some() { return None; }
             let ts = &self.ts;
             let victim = self.exs.iter().enumerate()
                 .filter(|(_, e)| e.2 + 24 <= now && { let t = &ts[e.0 as usize]; t.ty == ty && t.rows == rows && t.cols == cols })

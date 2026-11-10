@@ -812,7 +812,7 @@ mod avx2 {
     }
 }
 
-fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
+pub fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
     #[cfg(target_feature = "avx2")]
     if std::env::var_os("STRATA_SCALAR").is_none() {
         return match ty { GgmlType::IQ2XS => Some(avx2::dot_iq2xs), GgmlType::IQ3XXS => Some(avx2::dot_iq3xxs), GgmlType::IQ4XS => Some(avx2::dot_iq4xs), GgmlType::IQ3S => Some(avx2::dot_iq3s), GgmlType::Q6K => Some(avx2::dot_q6k), GgmlType::Q5K => Some(avx2::dot_q5k), GgmlType::Q8_0 => Some(avx2::dot_q8_0), GgmlType::IQ2XXS => Some(avx2::dot_iq2xxs), GgmlType::IQ2S => Some(avx2::dot_iq2s), GgmlType::IQ1S => Some(avx2::dot_iq1s), GgmlType::IQ1M => Some(avx2::dot_iq1m), GgmlType::Q2K => Some(avx2::dot_q2k), GgmlType::Q3K => Some(avx2::dot_q3k), GgmlType::Q4K => Some(avx2::dot_q4k), GgmlType::Q2_0 => Some(avx2::dot_q2_0), GgmlType::Q4_0 => Some(avx2::dot_q4::<2>), GgmlType::Q4_1 => Some(avx2::dot_q4::<3>), GgmlType::Q5_0 => Some(avx2::dot_q4::<6>), GgmlType::Q5_1 => Some(avx2::dot_q4::<7>), _ => None };

@@ -34,6 +34,7 @@ pub struct Tokenizer {
 impl Tokenizer {
     pub fn from_gguf(g: &Gguf) -> anyhow::Result<Tokenizer> {
         let model = g.get("tokenizer.ggml.model")?.as_str().unwrap_or("");
+        if model == "gemma4" { return Self::gemma4(g); }
         if model != "gpt2" { bail!("unsupported tokenizer model '{model}'"); }
         let pre = g.get("tokenizer.ggml.pre")?.as_str().unwrap_or("");
         let res: &[&str] = match pre {
@@ -77,6 +78,41 @@ impl Tokenizer {
         }
         Ok(Tokenizer { inner, eos })
     }
+
+    /// Gemma 4: SPM-style BPE. Spaces become U+2581, merges run over each newline-free run of raw UTF-8, unknown bytes fall back to <0xXX>.
+    fn gemma4(g: &Gguf) -> anyhow::Result<Tokenizer> {
+        use tokenizers::decoders::{byte_fallback::ByteFallback, fuse::Fuse, sequence::Sequence as DSeq, DecoderWrapper};
+        use tokenizers::normalizers::Replace;
+        let tokens: Vec<String> = g.get("tokenizer.ggml.tokens")?.as_arr().context("tokens")?
+            .iter().map(|v| v.as_str().map(str::to_string).context("token")).collect::<anyhow::Result<_>>()?;
+        let merges = g.get("tokenizer.ggml.merges")?.as_arr().context("merges")?.iter()
+            .map(|v| v.as_str().and_then(|m| m.split_once(' ')).map(|(a, b)| (a.to_string(), b.to_string())).context("bad merge"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let vocab: HashMap<String, u32> = tokens.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
+        let bpe = BPE::builder().vocab_and_merges(vocab, merges).byte_fallback(true).unk_token("<unk>".into()).build().map_err(|e| anyhow!("{e}"))?;
+        let mut inner = tokenizers::Tokenizer::new(bpe);
+        inner.with_normalizer(Some(Replace::new(" ", "\u{2581}").map_err(|e| anyhow!("{e}"))?));
+        let split = Split::new(SplitPattern::Regex("[^\\n]+|[\\n]+".into()), SplitDelimiterBehavior::Isolated, false).map_err(|e| anyhow!("{e}"))?;
+        inner.with_pre_tokenizer(Some(split));
+        inner.with_decoder(Some(DSeq::new(vec![
+            DecoderWrapper::Replace(tokenizers::normalizers::replace::Replace::new("\u{2581}", " ").map_err(|e| anyhow!("{e}"))?),
+            DecoderWrapper::ByteFallback(ByteFallback::new()),
+            DecoderWrapper::Fuse(Fuse::new()),
+        ])));
+        let types = g.get("tokenizer.ggml.token_type")?.as_arr().context("token_type")?;
+        let special: Vec<AddedToken> = types.iter().enumerate()
+            .filter(|(_, t)| matches!(t.as_u64(), Some(3 | 4)))
+            .map(|(i, _)| AddedToken::from(tokens[i].clone(), true))
+            .collect();
+        inner.add_special_tokens(&special);
+        let mut eos: Vec<u32> = g.meta.get("tokenizer.ggml.eos_token_id").and_then(|v| v.as_u64()).map(|v| v as u32).into_iter().collect();
+        for t in ["<turn|>", "<eos>"] {
+            if let Some(id) = inner.token_to_id(t) && !eos.contains(&id) { eos.push(id); }
+        }
+        Ok(Tokenizer { inner, eos })
+    }
+
+    pub fn token_id(&self, t: &str) -> Option<u32> { self.inner.token_to_id(t) }
 
     pub fn encode(&self, text: &str) -> anyhow::Result<Vec<u32>> {
         Ok(self.inner.encode(text, false).map_err(|e| anyhow!("{e}"))?.get_ids().to_vec())
