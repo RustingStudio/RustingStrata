@@ -546,7 +546,7 @@ impl<'a> GlmModel<'a> {
 
     /// Feed prompt tokens; only the last one computes logits.
     pub fn prefill(&mut self, toks: &[u32]) -> Vec<f32> {
-        let chunk: usize = std::env::var("STRATA_GLM_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+        let chunk: usize = std::env::var("STRATA_GLM_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
         if toks.is_empty() {
             return vec![];
         }
