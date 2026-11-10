@@ -295,7 +295,8 @@ pub fn shared_bytes(kernel: &str, spec: &[u32], kv_q8: bool) -> Result<u32> {
 pub fn check_shared_memory(kernel: &str, spec: &[u32], kv_q8: bool, limit: u32) -> Result<u32> {
     let bytes = shared_bytes(kernel, spec, kv_q8)?;
     ensure!(bytes <= limit, "vulkan: kernel {kernel} with specialization [[{}]] needs {bytes} bytes of shared memory; \
-        this device allows {limit} (maxComputeSharedMemorySize)", spec.iter().map(u32::to_string).collect::<Vec<_>>().join(", "));
+        this device allows {limit} (maxComputeSharedMemorySize). If the card really has more (the AMD Windows driver reports 32768 on a 9070 XT), \
+        set STRATA_VK_SMEM_LIMIT=49152; no kernel needs more", spec.iter().map(u32::to_string).collect::<Vec<_>>().join(", "));
     Ok(bytes)
 }
 
