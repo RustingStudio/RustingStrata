@@ -16,6 +16,9 @@ const QWEN35_RE: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[d
 /// llama.cpp `LLAMA_VOCAB_PRE_TYPE_QWEN2` pre-tokenizer regex (qwen3, qwen3moe, qwen3next).
 const QWEN2_RE: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// llama.cpp `LLAMA_VOCAB_PRE_TYPE_CHATGLM4` (GLM-4/5): digits in groups of up to 3.
+const GLM4_RE: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 /// llama.cpp `LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM` (DeepSeek-V4): three splits applied one after another.
 const JOYAI_RE: [&str; 3] = [
     r"\p{N}{1,3}",
@@ -35,6 +38,7 @@ impl Tokenizer {
         let pre = g.get("tokenizer.ggml.pre")?.as_str().unwrap_or("");
         let res: &[&str] = match pre {
             "qwen35" => &[QWEN35_RE], "qwen2" => &[QWEN2_RE], "joyai-llm" => &JOYAI_RE,
+            "glm4" | "glm5" | "chatglm-bpe" => &[GLM4_RE],
             _ => bail!("unsupported pre-tokenizer '{pre}'"),
         };
         let strs = |k: &str| -> anyhow::Result<Vec<String>> {
