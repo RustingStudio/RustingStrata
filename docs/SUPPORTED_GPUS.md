@@ -24,6 +24,20 @@ row.
 | NVIDIA L40S 48 GB | Ada, sm_89 | Vulkan | Full test suite passes | yugt | Cooperative matrices (f16 and int8). pp 4096 prefill 8571 tok/s, decode 185 tok/s. Calibrated in a later job: decode 317 tok/s with MTP 2, 197 with `--mtp 0`. |
 | NVIDIA H100 NVL 94 GB, H100 80 GB | Hopper, sm_90 | CUDA | Full test suite passes | yugt | pp 4096 prefill 9131 tok/s, decode 246 tok/s (H100 NVL). Calibrated in a later job on an H100 80 GB: decode 498 tok/s with MTP 2, 265 with `--mtp 0`. |
 | NVIDIA H100 NVL 94 GB, H100 80 GB | Hopper, sm_90 | Vulkan | Full test suite passes | yugt | Cooperative matrices (f16 and int8). pp 4096 prefill 6428 tok/s, decode 192 tok/s (H100 NVL). Calibrated in a later job on an H100 80 GB: decode 363 tok/s with MTP 2, 216 with `--mtp 0`. |
+| NVIDIA GeForce RTX 2080 Ti 11 GB | Turing, sm_75 | CUDA | Full test suite passes | yugt | 8213-8334 of 10240 experts resident (10496 with MTP). pp 4096 prefill 2714 tok/s, decode 140 tok/s with `--mtp 0`; calibrated decode 197 tok/s with MTP 1. See [more-nvidia-results.md](more-nvidia-results.md). |
+| NVIDIA GeForce RTX 2080 Ti 11 GB | Turing, sm_75 | Vulkan | Runs, test suite passes with `STRATA_VK_F16_TRUNC=1` | yugt | Cooperative matrices (f16 and int8). The f16 conversion truncates as on the V100: the variable only tells the kernel tests to expect that, and 4 of them fail without it. pp 4096 prefill 2630 tok/s, decode 126 tok/s with `--mtp 0`; calibrated decode 158 tok/s with MTP 1. |
+| NVIDIA Quadro RTX 6000 24 GB | Turing, sm_75 | CUDA | Full test suite passes | yugt | pp 4096 prefill 2795 tok/s, decode 122 tok/s with `--mtp 0`; calibrated decode 179 tok/s with MTP 1. |
+| NVIDIA Quadro RTX 6000 24 GB | Turing, sm_75 | Vulkan | Runs, test suite passes with `STRATA_VK_F16_TRUNC=1` | yugt | Cooperative matrices (f16 and int8). The f16 conversion truncates as on the V100: the variable only tells the kernel tests to expect that, and 4 of them fail without it. pp 4096 prefill 2719 tok/s, decode 109 tok/s with `--mtp 0`; calibrated decode 143 tok/s with MTP 1. |
+| NVIDIA Tesla V100-SXM2 16 GB and 32 GB | Volta, sm_70 | CUDA | Full test suite passes | yugt | NVRTC 12.6, driver 580.95.05. 16 GB card: pp 4096 prefill 3145 tok/s, decode 128 tok/s with `--mtp 0`; calibrated decode 193 tok/s with MTP 1. See [more-nvidia-results.md](more-nvidia-results.md). |
+| NVIDIA Tesla V100-SXM2 16 GB and 32 GB | Volta, sm_70 | Vulkan | Runs, test suite passes with `STRATA_VK_F16_TRUNC=1` | yugt | No cooperative matrices. The variable only tells the kernel tests to expect the truncating f16 conversion; 4 of them fail without it. 16 GB card: pp 4096 prefill 1676 tok/s, decode 120 tok/s with `--mtp 0`; calibrated decode 170 tok/s with MTP 2. |
+| NVIDIA A100-PCIE 40 GB | Ampere, sm_80 | CUDA | Full test suite passes | yugt | pp 4096 prefill 5877 tok/s, decode 169 tok/s with `--mtp 0`; calibrated decode 275 tok/s with MTP 1. See [more-nvidia-results.md](more-nvidia-results.md). |
+| NVIDIA A100-PCIE 40 GB | Ampere, sm_80 | Vulkan | Full test suite passes | yugt | Cooperative matrices (f16 and int8). pp 4096 prefill 5639 tok/s, decode 136 tok/s with `--mtp 0`; calibrated decode 223 tok/s with MTP 2. |
+| NVIDIA RTX A6000 48 GB | Ampere, sm_86 | CUDA | Full test suite passes | yugt | pp 4096 prefill 5094 tok/s, decode 188 tok/s with `--mtp 0`; calibrated decode 329 tok/s with MTP 2. |
+| NVIDIA RTX A6000 48 GB | Ampere, sm_86 | Vulkan | Full test suite passes | yugt | Cooperative matrices (f16 and int8). pp 4096 prefill 5052 tok/s, decode 165 tok/s with `--mtp 0`; calibrated decode 252 tok/s with MTP 2. |
+| NVIDIA A40 48 GB | Ampere, sm_86 | CUDA | Full test suite passes | yugt | pp 4096 prefill 4805 tok/s, decode 159 tok/s with `--mtp 0`; calibrated decode 289 tok/s with MTP 2. |
+| NVIDIA A40 48 GB | Ampere, sm_86 | Vulkan | Full test suite passes | yugt | Cooperative matrices (f16 and int8). pp 4096 prefill 4796 tok/s, decode 141 tok/s with `--mtp 0`; calibrated decode 222 tok/s with MTP 2. |
+| NVIDIA RTX 4500 Ada 24 GB | Ada, sm_89 | CUDA | Full test suite passes | yugt | pp 4096 prefill 4934 tok/s, decode 153 tok/s with `--mtp 0`; calibrated decode 273 tok/s with MTP 2. |
+| NVIDIA RTX 4500 Ada 24 GB | Ada, sm_89 | Vulkan | Full test suite passes | yugt | Cooperative matrices (f16 and int8). pp 4096 prefill 4979 tok/s, decode 142 tok/s with `--mtp 0`; calibrated decode 221 tok/s with MTP 2. |
 
 ## Compiles, not run
 
@@ -37,7 +51,7 @@ row.
 | GPU | Why |
 | --- | --- |
 | Intel Arc | Vulkan driver has no `shaderFloat64`. |
-| NVIDIA Pascal and older (CUDA) | No tensor cores. Use `--backend vulkan`; not tested. |
+| NVIDIA Pascal and older | CUDA: no tensor cores; on a GTX 1080 Ti (sm_61) the kernels do not compile (`__nanosleep` is undefined). Vulkan: the GTX 1080 Ti on driver 580.95.05 has no `shaderFloat16`, so no device is usable. See [more-nvidia-results.md](more-nvidia-results.md). |
 | GPUs without Vulkan 1.3 and subgroup size 32 or 64 | The Vulkan backend needs both. |
 
 ## Architecture tiers (CUDA)
