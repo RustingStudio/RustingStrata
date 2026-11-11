@@ -111,10 +111,13 @@ fn alloc_saved(g: &dyn Backend, layers: &[Layer]) -> anyhow::Result<Vec<(Buf, Bu
 
 /// A saved conversation state in host memory: its tokens, the PLE tokens before it, the `slot` buffers and the KV
 /// rows of its positions in each attention layer.
-struct Parked { ids: Vec<u32>, owner: u64, ple_prev: [i64; 2], slot: Vec<Vec<u8>>, kv: Vec<Vec<u8>> }
+struct Parked { ids: Vec<u32>, owner: u64, parts: Vec<PartCopy> }
+
+/// One part's share of a parked state: its history ring position, saved slot buffers and KV rows.
+struct PartCopy { ple_prev: [i64; 2], slot: Vec<Vec<u8>>, kv: Vec<Vec<u8>> }
 
 impl Parked {
-    fn bytes(&self) -> usize { self.slot.iter().chain(&self.kv).map(Vec::len).sum() }
+    fn bytes(&self) -> usize { self.parts.iter().flat_map(|p| p.slot.iter().chain(&p.kv)).map(Vec::len).sum() }
 }
 
 struct MtpHead {
@@ -704,14 +707,24 @@ impl<'a> GpuModel<'a> {
     /// least recently parked states go when they exceed `cache_ram`.
     fn park(&mut self) -> anyhow::Result<()> {
         let n = self.saved_ids.len();
-        // ponytail: a split model parks nothing (each part would need its own copy, in step with the others).
-        if n == 0 || self.next.is_some() { return Ok(()) }
-        let kv = self.kv_bufs().iter().map(|b| b.len() / self.ctx * n).sum::<usize>();
-        if kv + self.slot().iter().map(|b| b.len()).sum::<usize>() > self.cache_ram { return Ok(()) }
-        let g = &self.gpu;
-        let slot = self.slot().iter().map(|b| g.get::<u8>(b, 0, b.len())).collect::<anyhow::Result<_>>()?;
-        let kv = self.kv_bufs().iter().map(|b| g.get::<u8>(b, 0, b.len() / self.ctx * n)).collect::<anyhow::Result<_>>()?;
-        self.parked.insert(0, Parked { ids: self.saved_ids.clone(), owner: self.saved_owner, ple_prev: self.saved_ple_prev, slot, kv });
+        if n == 0 { return Ok(()) }
+        let mut size = 0;
+        let mut p = Some(&*self);
+        while let Some(q) = p {
+            size += q.kv_bufs().iter().map(|b| b.len() / q.ctx * n).sum::<usize>() + q.slot().iter().map(|b| b.len()).sum::<usize>();
+            p = q.next.as_deref();
+        }
+        if size > self.cache_ram { return Ok(()) }
+        let mut parts = vec![];
+        let mut p = Some(&*self);
+        while let Some(q) = p {
+            let g = &q.gpu;
+            let slot = q.slot().iter().map(|b| g.get::<u8>(b, 0, b.len())).collect::<anyhow::Result<_>>()?;
+            let kv = q.kv_bufs().iter().map(|b| g.get::<u8>(b, 0, b.len() / q.ctx * n)).collect::<anyhow::Result<_>>()?;
+            parts.push(PartCopy { ple_prev: q.saved_ple_prev, slot, kv });
+            p = q.next.as_deref();
+        }
+        self.parked.insert(0, Parked { ids: self.saved_ids.clone(), owner: self.saved_owner, parts });
         while self.parked.iter().map(Parked::bytes).sum::<usize>() > self.cache_ram { self.parked.pop(); }
         Ok(())
     }
@@ -722,9 +735,14 @@ impl<'a> GpuModel<'a> {
         self.park()?;
         // A slot that never saved has no buffers to take the state yet.
         if self.saved.is_empty() { self.save_state()?; }
-        for (b, d) in self.slot().iter().zip(&p.slot) { self.gpu.put(d, b, 0)?; }
-        for (b, d) in self.kv_bufs().iter().zip(&p.kv) { self.gpu.put(d, b, 0)?; }
-        (self.saved_pos, self.saved_ple_prev, self.saved_ids, self.saved_owner) = (p.ids.len(), p.ple_prev, p.ids, p.owner);
+        let mut q = Some(&mut *self);
+        for c in p.parts {
+            let Some(m) = q else { break };
+            for (b, d) in m.slot().iter().zip(&c.slot) { m.gpu.put(d, b, 0)?; }
+            for (b, d) in m.kv_bufs().iter().zip(&c.kv) { m.gpu.put(d, b, 0)?; }
+            (m.saved_pos, m.saved_ple_prev, m.saved_ids, m.saved_owner) = (p.ids.len(), c.ple_prev, p.ids.clone(), p.owner);
+            q = m.next.as_deref_mut();
+        }
         self.restore_state()
     }
 
