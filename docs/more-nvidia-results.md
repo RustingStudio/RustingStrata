@@ -27,14 +27,15 @@ sit in hosts with different CPUs.
   rest are warnings). `cargo test` reports 185 passed there, but that job had no CUDA toolkit loaded (`SKIP: cuda:
   CUDA init: the NVRTC library (libnvrtc.so) is not installed`) and no usable Vulkan device, so the GPU tests
   skipped; it is not a pass for the card. The suite was not run on this card with NVRTC present.
-- **Four Vulkan kernel tests fail on Turing and Volta unless `STRATA_VK_F16_TRUNC=1` is set.** On the RTX 2080 Ti, the
-  Quadro RTX 6000 and both V100s, `cargo test` is 181 passed, 4 failed, 5 ignored; with `STRATA_VK_F16_TRUNC=1` it is
-  185 passed, 0 failed on all four. The variable changes nothing in the engine: it tells the kernel tests to expect
-  an f16 conversion that truncates (`tests/kernels.rs`). This was known for the V100; the two Turing cards have
-  cooperative matrices (f16 and int8) and driver 615.71.09 and need it too. The Ampere and Ada cards on the same
-  driver pass without it. The variable was passed to those four jobs with `sbatch --export=ALL`; the logs do not
-  echo it. The runs with and without it were on different nodes of the same card type, except for the Quadro RTX
-  6000 (same node). The failures, with the same values on both Turing cards and (in parentheses) on both V100s:
+- **Four Vulkan kernel tests failed on Turing and Volta at `f47e370` unless `STRATA_VK_F16_TRUNC=1` was set.** On the
+  RTX 2080 Ti, the Quadro RTX 6000 and both V100s, `cargo test` was 181 passed, 4 failed, 5 ignored; with
+  `STRATA_VK_F16_TRUNC=1` it was 185 passed, 0 failed on all four. The variable changed nothing in the engine: it told
+  the kernel tests to expect an f16 conversion that truncates (`tests/kernels.rs`). This was known for the V100; the
+  two Turing cards have cooperative matrices (f16 and int8) and driver 615.71.09 and needed it too. The Ampere and
+  Ada cards on the same driver passed without it. The variable was passed to those four jobs with
+  `sbatch --export=ALL`; the logs do not echo it. The runs with and without it were on different nodes of the same
+  card type, except for the Quadro RTX 6000 (same node). The failures, with the same values on both Turing cards and
+  (in parentheses) on both V100s:
 
   | Test | Message |
   | --- | --- |
@@ -43,12 +44,15 @@ sit in hosts with different CPUs.
   | `gemv_partial_superblocks_and_q2_0` | `vulkan Q8_0 cols 320: gemm rel err 0.000534` (0.000533) |
   | `vulkan_type_matrix` | `type matrix failures`, 4 |
 
+  The f16 GEMM now rounds its inputs in software (`rh` in `gemm_f.glsl`), so the variable is gone and all four
+  cards pass 185 tests without it. The rest of this section records the runs at `f47e370`.
+
 ## 2026-11-11 — test suite
 
 `STRATA_MODEL=$M cargo test --release --no-fail-fast -- --test-threads=1 --nocapture`, one job per card (separate from
-the bench job, sometimes on another node of the same card type).
+the bench job, sometimes on another node of the same card type). The second column is the run at `f47e370`.
 
-| GPU | Result | With `STRATA_VK_F16_TRUNC=1` |
+| GPU | Result | With `STRATA_VK_F16_TRUNC=1` (at `f47e370`) |
 | --- | --- | --- |
 | A100 40 GB | 185 passed, 0 failed, 5 ignored | not run |
 | RTX A6000 | 185 passed, 0 failed, 5 ignored | not run |

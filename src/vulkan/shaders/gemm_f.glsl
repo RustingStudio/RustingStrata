@@ -33,7 +33,7 @@ const uint BM = 128, BK = 64, PW = (BK + 8) / 2, XM = SM != 0 ? 32 : BM;  // sme
 #define CI(i) (2 * t + ((i) & 1) + 8 * (((i) >> 1) & 1))
 #endif
 shared uint xs[XM * PW], ws[64 * PW];
-uint h2(float a, float b) { return packFloat2x16(f16vec2(a, b)); }
+uint h2(float a, float b) { return packHalf2x16(vec2(rh(a), rh(b))); }
 shared float ix[512];  // the row and column index matrices
 
 // W step kb as halves: invocation decodes values 8 j .. 8 j + 7 of rows tid / 8 + 32 q (q < 2) into wv[4 q ..].
