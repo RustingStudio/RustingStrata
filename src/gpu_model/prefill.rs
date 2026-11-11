@@ -226,9 +226,9 @@ impl GpuModel<'_> {
         // The draft head runs as one more layer on the chunk while it is in step with the main model.
         let fill = self.mtp_synced();
         let mtp = self.mtp.as_ref().filter(|_| fill);
-        // STRATA_NAN_TRACE: one line per layer with the largest magnitude of each intermediate buffer, and the first
+        // STRATA_NAN_TRACE[=N]: from position N (default 0), one line per layer with the largest magnitude of each intermediate buffer, and the first
         // row of one holding a non-finite value. Each probe waits for the GPU: diagnostic runs only.
-        let trace = std::env::var_os("STRATA_NAN_TRACE").is_some();
+        let trace = std::env::var("STRATA_NAN_TRACE").is_ok_and(|v| self.pos >= v.parse::<usize>().unwrap_or(0));
         let mut tr = String::new();
         let probe = |tr: &mut String, what: &str, b: &Buf, o: u64, w: usize, rows: usize| -> anyhow::Result<()> {
             if !trace { return Ok(()); }
@@ -368,6 +368,12 @@ impl GpuModel<'_> {
                     probe(&mut tr, "router", &pf.slab, at(l.rl), c.n_expert, t)?;
                     probe(&mut tr, "weights", &pf.slab, at(l.wts), k, t)?;
                     let ids = g.get::<i32>(&pf.ints, 0, t * k)?;
+                    // Ids outside 0..n_expert mean the router ran on corrupt logits (issue #25: one prefill past ~128k
+                    // tokens). Fail here with the place, not in the index math below. ponytail: the root cause is still open.
+                    if let Some(&bad) = ids.iter().find(|&&e| e < 0 || e as usize >= c.n_expert) {
+                        anyhow::bail!("prefill: router gave expert id {bad} at layer {il}, chunk of {t} tokens from position {}; \
+                            the hidden state is non-finite (try STRATA_NAN_TRACE=1), or lower --chunk / --ctx", self.pos);
+                    }
                     let cache = self.cache.as_mut().unwrap();
                     cache.record(il, &ids);
                     // Sort (token, j) pairs by expert: slot s holds token xrow[s]; inv maps t * k + j to its slot.
