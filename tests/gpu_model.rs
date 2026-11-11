@@ -398,6 +398,20 @@ fn split_matches_single() {
                     out.push(gm.prefill_cached(&ids, 3, h).unwrap().0);
                     for t in [11u32, 22] { out.push(gm.step(t).unwrap()); }
                 }
+                // Parked states: prompt A, an unrelated prompt B, then A again must come back from host memory.
+                gm.reset().unwrap();
+                gm.cache_ram = 2 << 30;
+                let b: Vec<u32> = ids.iter().rev().copied().collect();
+                let mut last = 0;
+                for q in [&ids, &b, &ids] {
+                    let (l, reused) = gm.prefill_cached(q, 0, q.len() - 2).unwrap();
+                    out.push(l);
+                    for t in [11u32, 22] { out.push(gm.step(t).unwrap()); }
+                    eprintln!("parked run: reused {reused}");
+                    last = reused;
+                }
+                assert_eq!(last, ids.len() - 2, "prompt A did not come back from the parked state");
+                gm.cache_ram = 0;
                 out
             };
             let want = run(&mut GpuModel::load(&m, one, 256, 4, 512 << 20, 0).unwrap());
