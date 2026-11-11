@@ -126,6 +126,8 @@ Caveats: long-prompt prefill is not a win (llama.cpp's second run had the page c
 
 Not measured side by side: the llama.cpp numbers are its first cold runs, the RustingStrata numbers are later runs. The model files were deleted afterwards, so this entry cannot be repeated until they are downloaded again.
 
+On data-center cards (not this machine, RustingStrata only), with the experts in the page cache: end-to-end decode 4.5-4.6 tok/s at the default 9 GB VRAM expert budget on an A100 80 GB and an H100 NVL, and 6.6 (A100) and 8.9 (H100 NVL) tok/s at 60 GB, on one 30-token prompt and 33 decode tokens. See [datacenter-nvidia-results.md](datacenter-nvidia-results.md#2026-11-10--deepseek-v41-flash-1017-iq2_xxs).
+
 ## Quality vs llama.cpp (Qwen3.6-35B-A3B UD-Q3_K_M)
 
 Speed does not come from lost accuracy. Same GGUF, RTX 3060, llama.cpp b12191 `-ngl 99 -ncmoe 22`.
