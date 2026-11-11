@@ -217,10 +217,21 @@ fn arch_support_error(cc: (i32, i32), nvrtc: (i32, i32)) -> Option<String> {
         nvrtc.0, nvrtc.1, cc.0, cc.1))
 }
 
+/// The user-facing error for a device older than Volta, `None` for sm_70 and newer. The kernels need sm_70
+/// instructions (`__nanosleep`, `mma`): without this check NVRTC fails deep in the source on Pascal (sm_6x) and older
+/// (`identifier "__nanosleep" is undefined`). Checked before anything is compiled.
+fn min_arch_error(name: &str, cc: (i32, i32)) -> Option<String> {
+    (cc < (7, 0)).then(|| format!(
+        "{name} is sm_{}{}: the CUDA backend requires sm_70 or newer (Volta, Turing, Ampere and later); \
+         Pascal and older cards have no tensor cores and are not supported",
+        cc.0, cc.1))
+}
+
 /// The startup line for the device: arch always, plus the sm_70 prefill GEMM path (tensor cores vs FMA fallback).
 /// `gemm_fma` is passed explicitly so the log reflects the cubin actually compiled, not the env at print time.
 fn device_log(device: usize, name: &str, arch: &str, cc: (i32, i32), gemm_fma: bool) -> String {
     let path = match (cc, gemm_fma) {
+        (c, _) if c < (7, 0) => " (pre-Volta, not supported)",  // not reached from `Gpu::new`: `min_arch_error`
         (c, false) if c < (7, 5) => " (Volta, m8n8k4)",
         (c, true) if c < (7, 5) => " (Volta fallback)",
         (c, _) if c < (8, 0) => " (Turing, m16n8k8)",
@@ -451,6 +462,10 @@ impl Gpu {
         let ctx = CudaContext::new(device).context("CUDA init")?;
         unsafe { ctx.disable_event_tracking() };
         let (maj, min) = ctx.compute_capability()?;
+        // "CUDA init" so that `backend::open` falls back to Vulkan (naming this error) and the tests skip the backend.
+        if let Some(msg) = min_arch_error(&ctx.name().unwrap_or_default(), (maj, min)) {
+            return Err(anyhow::anyhow!("{msg}")).context("CUDA init");
+        }
         let int8_mma = maj >= 8;
         let max_optin = ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
             .unwrap_or(48 << 10).max(48 << 10) as u32;
@@ -1220,6 +1235,30 @@ mod tests {
     fn device_log_names_turing_not_volta() {
         assert!(super::device_log(0, "x", "sm_75", (7, 5), false).contains("Turing"));
         assert!(super::device_log(0, "x", "sm_70", (7, 0), false).contains("Volta"));
+    }
+
+    #[test]
+    fn min_arch_error_rejects_pascal_and_older() {
+        let msg = super::min_arch_error("NVIDIA GeForce GTX 1080 Ti", (6, 1)).expect("sm_61 is not supported");
+        assert!(msg.contains("GTX 1080 Ti") && msg.contains("sm_61") && msg.contains("sm_70"), "{msg}");
+        for cc in [(3, 5), (5, 2), (6, 0), (6, 2)] {
+            assert!(super::min_arch_error("x", cc).is_some(), "sm_{}{}", cc.0, cc.1);
+        }
+    }
+
+    #[test]
+    fn min_arch_error_allows_volta_and_newer() {
+        for cc in [(7, 0), (7, 2), (7, 5), (8, 0), (8, 6), (8, 9), (9, 0), (12, 0)] {
+            assert_eq!(super::min_arch_error("x", cc), None, "sm_{}{}", cc.0, cc.1);
+        }
+    }
+
+    #[test]
+    fn device_log_does_not_call_pascal_volta() {
+        for fma in [false, true] {
+            let line = super::device_log(0, "NVIDIA GeForce GTX 1080 Ti", "sm_61", (6, 1), fma);
+            assert_eq!(line, "cuda device 0: NVIDIA GeForce GTX 1080 Ti, sm_61 (pre-Volta, not supported)");
+        }
     }
 
     #[test]
