@@ -4,7 +4,7 @@ A second Slurm cluster (not the one in [datacenter-nvidia-results.md](datacenter
 with 8 CPU cores and 48 GB RAM. Rocky Linux 8.10, Rust 1.99.1, `target-cpu=native`, commit `f47e370`. NVRTC 13.0 from
 the CUDA 13.0.1 toolkit, except 12.6 from CUDA 12.6.1 on the V100s and in the GTX 1080 Ti CUDA attempt. Model:
 `Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf` (sha256 `ed7cda7e...f37fb0c`). Numbers are comparable within one job only: the cards
-sit in hosts with different CPUs.
+sit in hosts with different CPUs. The re-run and Q8_0 sections are at `ea4c8a8` and say so.
 
 | GPU | VRAM | Arch | Driver | Host CPU (bench job) |
 | --- | --- | --- | --- | --- |
@@ -17,6 +17,108 @@ sit in hosts with different CPUs.
 | Tesla V100-SXM2-16GB | 16384 MiB | sm_70 | 580.95.05 | Xeon Silver 4114 |
 | Tesla V100-SXM2-32GB | 32768 MiB | sm_70 | 580.95.05 | Xeon Gold 6148 |
 | GeForce GTX 1080 Ti | 11264 MiB | sm_61 | 580.95.05 | Xeon Gold 5120 |
+
+## 2026-11-11 — re-run at `ea4c8a8` without `STRATA_VK_F16_TRUNC`
+
+`ea4c8a8` rounds the f16 GEMM inputs in the shader (`rh` in `gemm_f.glsl`) and removes the variable. The four cards
+that needed it were run again, test suite and bench, with the variable unset.
+
+| GPU | Driver | `cargo test` at `ea4c8a8` |
+| --- | --- | --- |
+| RTX 2080 Ti | 615.71.09 | 185 passed, 0 failed, 5 ignored |
+| Quadro RTX 6000 | 615.71.09 | 185 passed, 0 failed, 5 ignored |
+| V100 16 GB | 580.95.05 | 185 passed, 0 failed, 5 ignored |
+| V100 32 GB | 580.95.05 | 185 passed, 0 failed, 5 ignored |
+
+The bench below is the Q2_K_XL bench of this file, repeated on the node of the `f47e370` run (the nodes hold several
+cards of the type, so it may be another card of that node). Calibrated, `--mtp 0`, mean (min-max) tok/s, `f47e370` ->
+`ea4c8a8`. The V100 32 GB bench had not started when this was written.
+
+| GPU | Backend | pp 512 prefill | pp 4096 prefill | decode after 4096 |
+| --- | --- | --- | --- | --- |
+| RTX 2080 Ti | Vulkan | 1934.8 (1764.2-2051.2) -> 1888.1 (1863.0-1909.8) | 2629.7 (2608.8-2642.7) -> 2498.7 (2477.6-2510.2) | 126.3 -> 126.0 |
+| Quadro RTX 6000 | Vulkan | 1872.6 (1688.9-1977.9) -> 1784.5 (1715.7-1832.6) | 2719.4 (2715.7-2724.0) -> 2669.9 (2659.6-2675.8) | 109.0 -> 108.3 |
+| V100 16 GB | Vulkan | 804.6 (796.3-809.8) -> 756.9 (736.6-767.0) | 1676.3 (1675.2-1678.0) -> 1630.2 (1627.1-1632.7) | 119.7 -> 119.7 |
+| RTX 2080 Ti | CUDA | 2023.3 (2018.7-2030.1) -> 2020.3 (2009.9-2028.2) | 2713.5 (2712.0-2715.0) -> 2713.2 (2709.6-2718.4) | 139.7 -> 139.7 |
+| Quadro RTX 6000 | CUDA | 1978.4 (1889.7-2029.1) -> 1978.1 (1881.1-2032.1) | 2794.6 (2791.2-2798.2) -> 2827.2 (2823.7-2829.7) | 122.3 -> 122.4 |
+| V100 16 GB | CUDA | 2253.3 (2233.9-2275.7) -> 2251.5 (2238.8-2276.5) | 3144.9 (3138.7-3154.1) -> 3147.3 (3140.4-3152.5) | 128.1 -> 128.1 |
+
+- **Vulkan prefill at pp 4096 is 5.0%, 1.8% and 2.8% lower** on the RTX 2080 Ti, the Quadro RTX 6000 and the V100
+  16 GB; the ranges of the two commits do not overlap. CUDA on the same nodes moved by 0.0%, +1.2% and +0.1%. So on
+  the RTX 2080 Ti and the V100 the difference is in the Vulkan path. The Quadro RTX 6000 re-run got another card of
+  its node (bus `D8:00.0`, before `3B:00.0`), and its 1.8% is the size of the CUDA shift there. Decode changed by at
+  most 0.6%.
+- The other numbers in this file for these cards are still the `f47e370` ones.
+
+## 2026-11-11 — Q8_0
+
+`Qwen3.6-35B-A3B-Q8_0.gguf` (`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`, 37.8 GB, sha256 `c1283d8b...9a76131`), the file of
+[datacenter-nvidia-results.md](datacenter-nvidia-results.md). Commit `ea4c8a8`, 16 cores and 88 GB RAM per job, the
+same four steps per backend as [below](#2026-11-11--benchmarks-before-and-after-calibrate). The model is on a shared
+parallel file system (BeeGFS). The RTX A6000 and V100 32 GB jobs had not started when this was written.
+
+| GPU | Host CPU | `calibrate`, CUDA (chunk / MTP drafts / short threshold) | `calibrate`, Vulkan |
+| --- | --- | --- | --- |
+| A100 40 GB | EPYC 7502 | 4096 / 1 / 8 | 4096 / 2 / 8 |
+| A40 | Xeon Gold 6348 | 4096 / 1 / 8 | 4096 / 1 / 8 |
+| RTX 4500 Ada | Xeon Gold 6246 | 4096 / 0 / 32 | 4096 / 0 / 64 |
+| Quadro RTX 6000 | Xeon Gold 6230R | 4096 / 1 / 128 | 4096 / 1 / 64 |
+| RTX 2080 Ti | Xeon Silver 4214 | 4096 / 0 / 128 | 4096 / 0 / 256 |
+| V100 16 GB | Xeon Silver 4114 | 4096 / 1 / 128 | 4096 / 0 / 128 |
+
+- **The A100 40 GB and the A40 hold every expert** (10240, 10496 with MTP). With CUDA the A100 prefills pp 4096 at
+  6480 tok/s and decodes at 187 tok/s with `--mtp 0`, 279 calibrated (MTP 1); the A40 5397, 126 and 180.
+- **The 24 GB cards hold 57-64% of the experts and hit 98-99%.** CUDA with `--mtp 0`: RTX 4500 Ada 1680 tok/s prefill
+  and 96 decode, Quadro RTX 6000 1307 and 88.
+- **The V100 16 GB holds 37-39% (hit rate 89-91%), the RTX 2080 Ti 23% (74-76%).** CUDA with `--mtp 0`: 803 tok/s
+  prefill and 65 decode on the V100, 697 and 57 on the RTX 2080 Ti.
+- **Where experts miss, runs with the same settings differ.** `calibrate` chose MTP 0 on the RTX 4500 Ada (both
+  backends), on the RTX 2080 Ti (both) and on the V100 with Vulkan, so there the "calibrated" and "`--mtp 0`" rows
+  are the same configuration; they still differ by up to 31% at pp 4096 prefill (RTX 4500 Ada Vulkan 1028.0 against
+  1346.5, V100 Vulkan 717.9 against 568.6). The first run on the RTX 4500 Ada (CUDA, uncalibrated) decoded at 4.4
+  tok/s after pp 512 and 11.7 after pp 4096, against 98 and 96 in the CUDA `--mtp 0` run: likely a cold start (2898
+  cache swaps, against 1036 and 1035 in the next two runs).
+
+Mean (min-max) of 3 repetitions, tok/s.
+
+| GPU | Backend | Run | MTP | Resident experts | Hit rate % | pp 512 prefill | decode after 512 | pp 4096 prefill | decode after 4096 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| A100 40 GB | CUDA | uncalibrated | 0 | 10240/10240 | 100.0 | 3341.2 (2338.5-3843.8) | 192.1 (187.3-194.5) | 6506.3 (6498.9-6512.8) | 187.4 (186.9-187.7) |
+| A100 40 GB | CUDA | calibrated | 1 | 10496/10496 | 100.0 | 3317.3 (2581.6-3739.4) | 293.9 (292.0-294.9) | 6027.3 (6019.9-6036.4) | 279.2 (277.3-280.3) |
+| A100 40 GB | CUDA | calibrated, `--mtp 0` | 0 | 10240/10240 | 100.0 | 3362.6 (2457.6-3846.0) | 193.8 (192.5-194.4) | 6479.6 (6467.4-6500.8) | 187.4 (186.9-187.7) |
+| A100 40 GB | Vulkan | uncalibrated | 0 | 10240/10240 | 100.0 | 2212.0 (207.2-3262.2) | 124.4 (90.2-142.1) | 5345.9 (4181.7-5928.6) | 128.1 (110.1-137.3) |
+| A100 40 GB | Vulkan | calibrated | 2 | 10496/10496 | 100.0 | 2942.7 (2597.5-3122.4) | 256.2 (253.3-257.8) | 5480.7 (5400.3-5536.4) | 221.6 (167.6-248.7) |
+| A100 40 GB | Vulkan | calibrated, `--mtp 0` | 0 | 10240/10240 | 100.0 | 2999.0 (2610.5-3203.8) | 143.7 (142.6-144.3) | 5882.3 (5798.3-5925.0) | 139.1 (138.8-139.3) |
+| A40 | CUDA | uncalibrated | 0 | 10240/10240 | 100.0 | 3156.3 (2894.4-3331.7) | 128.7 (127.8-129.2) | 5470.2 (5466.0-5472.4) | 126.0 (125.8-126.1) |
+| A40 | CUDA | calibrated | 1 | 10496/10496 | 100.0 | 3101.0 (2969.2-3218.1) | 183.6 (182.5-184.1) | 5088.4 (5080.3-5093.2) | 179.6 (179.1-179.9) |
+| A40 | CUDA | calibrated, `--mtp 0` | 0 | 10240/10240 | 100.0 | 3236.9 (3106.3-3306.0) | 128.8 (128.1-129.1) | 5396.8 (5393.7-5401.5) | 126.0 (125.8-126.1) |
+| A40 | Vulkan | uncalibrated | 0 | 10240/10240 | 100.0 | 1884.7 (225.0-2750.6) | 99.7 (82.4-108.4) | 4407.4 (3599.7-4811.8) | 100.6 (89.2-106.3) |
+| A40 | Vulkan | calibrated | 1 | 10496/10496 | 100.0 | 2241.3 (1823.3-2459.7) | 145.1 (143.9-145.8) | 4417.7 (4370.9-4476.1) | 135.3 (111.5-147.4) |
+| A40 | Vulkan | calibrated, `--mtp 0` | 0 | 10240/10240 | 100.0 | 2373.9 (1881.0-2641.5) | 107.2 (105.7-108.2) | 4753.7 (4747.4-4763.2) | 105.4 (105.1-105.7) |
+| RTX 4500 Ada | CUDA | uncalibrated | 0 | 6482/10240 | 98.6 | 428.5 (2.8-750.1) | 4.4 (1.6-8.9) | 1204.6 (254.2-1764.2) | 11.7 (10.0-13.5) |
+| RTX 4500 Ada | CUDA | calibrated | 0 | 6482/10240 | 98.9 | 388.3 (297.2-458.7) | 76.3 (32.5-98.5) | 1697.2 (1508.8-1845.2) | 72.3 (26.1-96.2) |
+| RTX 4500 Ada | CUDA | calibrated, `--mtp 0` | 0 | 6482/10240 | 98.9 | 390.2 (303.7-457.9) | 98.0 (97.5-98.4) | 1680.1 (1492.4-1825.5) | 95.8 (94.4-96.8) |
+| RTX 4500 Ada | Vulkan | uncalibrated | 0 | 6530/10240 | 98.9 | 270.7 (140.0-383.2) | 83.9 (71.8-90.2) | 999.9 (834.1-1110.9) | 83.4 (75.8-87.4) |
+| RTX 4500 Ada | Vulkan | calibrated | 0 | 6530/10240 | 98.9 | 298.9 (274.0-332.5) | 89.6 (88.3-90.3) | 1028.0 (970.3-1091.0) | 85.3 (83.6-86.2) |
+| RTX 4500 Ada | Vulkan | calibrated, `--mtp 0` | 0 | 6530/10240 | 98.9 | 345.3 (273.3-424.7) | 90.5 (89.7-91.3) | 1346.5 (1231.5-1422.7) | 87.1 (86.7-87.8) |
+| Quadro RTX 6000 | CUDA | uncalibrated | 0 | 5975/10240 | 97.6 | 243.4 (44.7-362.7) | 87.1 (82.2-90.0) | 1203.9 (931.2-1382.4) | 89.4 (87.1-91.0) |
+| Quadro RTX 6000 | CUDA | calibrated | 1 | 5935/10496 | 97.7 | 283.8 (222.8-328.1) | 130.4 (126.4-135.1) | 1227.6 (1130.8-1306.2) | 127.1 (125.8-127.9) |
+| Quadro RTX 6000 | CUDA | calibrated, `--mtp 0` | 0 | 5975/10240 | 98.0 | 308.1 (243.8-355.9) | 93.8 (93.2-94.4) | 1306.6 (1198.7-1392.2) | 88.3 (86.2-90.8) |
+| Quadro RTX 6000 | Vulkan | uncalibrated | 0 | 6017/10240 | 98.2 | 257.3 (95.7-354.1) | 74.9 (47.7-89.1) | 988.1 (931.9-1028.5) | 79.6 (70.0-84.5) |
+| Quadro RTX 6000 | Vulkan | calibrated | 1 | 5981/10496 | 97.9 | 277.6 (219.7-324.8) | 120.0 (118.0-121.3) | 919.3 (807.2-983.2) | 107.9 (91.7-116.3) |
+| Quadro RTX 6000 | Vulkan | calibrated, `--mtp 0` | 0 | 6017/10240 | 98.2 | 296.8 (241.6-351.0) | 88.2 (87.0-89.4) | 949.3 (910.7-1011.8) | 84.6 (83.6-85.5) |
+| RTX 2080 Ti | CUDA | uncalibrated | 0 | 2313/10240 | 74.2 | 86.3 (20.7-121.3) | 46.9 (44.5-48.5) | 636.7 (499.6-709.9) | 46.2 (45.3-46.6) |
+| RTX 2080 Ti | CUDA | calibrated | 0 | 2313/10240 | 75.5 | 112.5 (95.0-122.1) | 59.1 (56.7-60.5) | 695.8 (669.3-711.8) | 55.7 (55.2-56.0) |
+| RTX 2080 Ti | CUDA | calibrated, `--mtp 0` | 0 | 2313/10240 | 75.4 | 114.1 (98.9-122.2) | 59.9 (58.1-62.2) | 697.4 (673.1-713.2) | 56.7 (55.9-57.5) |
+| RTX 2080 Ti | Vulkan | uncalibrated | 0 | 2354/10240 | 76.1 | 97.9 (57.6-119.4) | 44.7 (33.4-50.5) | 588.8 (563.8-612.4) | 44.7 (41.0-46.6) |
+| RTX 2080 Ti | Vulkan | calibrated | 0 | 2354/10240 | 76.0 | 87.4 (84.4-89.8) | 53.0 (51.8-54.4) | 572.7 (554.2-583.8) | 47.6 (47.3-48.0) |
+| RTX 2080 Ti | Vulkan | calibrated, `--mtp 0` | 0 | 2354/10240 | 76.0 | 110.7 (95.2-118.6) | 56.2 (54.7-59.2) | 688.4 (657.0-705.5) | 54.1 (53.5-54.8) |
+| V100 16 GB | CUDA | uncalibrated | 0 | 3930/10240 | 89.2 | 87.9 (25.9-156.8) | 59.7 (42.6-69.1) | 685.8 (514.0-836.0) | 61.6 (55.7-67.1) |
+| V100 16 GB | CUDA | calibrated | 1 | 3890/10496 | 89.5 | 178.0 (134.7-203.2) | 94.4 (85.4-99.8) | 987.8 (923.5-1035.8) | 75.3 (72.1-77.0) |
+| V100 16 GB | CUDA | calibrated, `--mtp 0` | 0 | 3930/10240 | 90.1 | 140.6 (110.6-157.7) | 75.4 (71.1-81.7) | 803.4 (753.4-837.6) | 65.3 (64.0-66.4) |
+| V100 16 GB | Vulkan | uncalibrated | 0 | 4016/10240 | 90.6 | 121.9 (83.1-143.2) | 67.4 (51.1-75.7) | 677.9 (628.9-708.0) | 61.0 (52.0-66.2) |
+| V100 16 GB | Vulkan | calibrated | 0 | 4016/10240 | 90.8 | 136.3 (107.5-152.4) | 70.9 (66.9-76.3) | 717.9 (669.4-748.1) | 67.9 (64.3-72.3) |
+| V100 16 GB | Vulkan | calibrated, `--mtp 0` | 0 | 4016/10240 | 90.9 | 124.2 (106.9-151.9) | 72.8 (67.0-76.8) | 568.6 (535.3-591.8) | 69.5 (68.9-70.1) |
 
 ## 2026-11-11 — what does not pass
 
