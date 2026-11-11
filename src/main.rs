@@ -233,6 +233,13 @@ impl Runner<'_> {
 }
 
 impl Engine {
+    /// Hand `--backend` and `--device` to the DeepSeek, GLM and Gemma 4 paths, which read them from the environment.
+    fn ds_env(&self) {
+        // SAFETY: called at the start of a command, before any thread reads these variables.
+        if let Some(b) = &self.backend { unsafe { std::env::set_var("STRATA_DS_BACKEND", b) } }
+        if self.device != [0] { unsafe { std::env::set_var("STRATA_DS_DEVICES", self.device.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")) } }
+    }
+
     /// Fills settings not given on the command line from the model's calibration file, else built-in defaults.
     fn ram_cap(&self) -> Option<u64> { memory::ram_cap((self.ram_margin as u64) << 20, (self.max_ram as u64) << 20) }
     fn runner<'a>(&mut self, m: &'a Model<'a>, model: &Path) -> anyhow::Result<Runner<'a>> {
@@ -698,6 +705,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             println!("{}", serde_json::json!({"argmax": argmax, "top5": top5}));
         }
         Cmd::Generate { model, prompt, n, mut engine } => {
+            engine.ds_env();
             let g = Gguf::open(&model)?;
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
@@ -858,6 +866,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             b.preflight(&types, true)?;
         }
         Cmd::Chat { model, system, n, think, mut engine } => {
+            engine.ds_env();
             let g = Gguf::open(&model)?;
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("glm5-next") {
                 return rusting_strata::glm::chat(&g, system, n);
@@ -888,6 +897,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             r.finish()?;
         }
         Cmd::Serve { model, models_dir, addr, api_key, open, host, mut engine } => {
+            engine.ds_env();
             if let Some(mp) = &model && let Ok(g) = Gguf::open(mp) && g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("glm5-next") {
                 let name = mp.file_name().map_or("glm".into(), |n| n.to_string_lossy().into_owned());
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());

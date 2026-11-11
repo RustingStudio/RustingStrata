@@ -4,8 +4,10 @@ use crate::quant::{GgmlType, dequant_row};
 use rayon::prelude::*;
 use std::sync::{Mutex, OnceLock};
 
-/// Optional CUDA offload of the non-expert matvecs (STRATA_DS_GPU=1). Weights stay resident in VRAM; the activation is
+/// Optional GPU offload of the non-expert matvecs (STRATA_DS_GPU=1). Weights stay resident in VRAM; the activation is
 /// copied up and the result down per call, so everything else in the forward stays the CPU reference code.
+/// STRATA_DS_BACKEND (cuda or vulkan, default cuda) and STRATA_DS_DEVICES (such as 0,1) pick the GPUs; with several,
+/// the weights fill them in order and the expert budget is divided in proportion to free VRAM.
 mod dev {
     use super::*;
     use crate::backend::{Backend, Buf, GpuTensor};
@@ -13,26 +15,58 @@ mod dev {
     /// Scratch slot for experts that missed the VRAM cache: copied up per use, so the CPU never dequantises them.
     pub const STAGE: usize = 16 << 20;
     pub const STAGED: u32 = u32::MAX;
-    pub struct Dev { be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, pub bytes: usize, ex: std::collections::HashMap<usize, usize>, exs: Vec<(u32, usize, u64)>, now: u64, budget: usize, stage: Buf }
+    /// A tensor id holds its GPU in the top 8 bits (so STAGED, GPU 255, is never a real id) and its index there below.
+    const SHIFT: u32 = 24;
+    pub fn gpu_of(id: u32) -> usize { (id >> SHIFT) as usize }
+    struct Part { be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, stage: Buf, bytes: usize, budget: usize, room: usize }
+    pub struct Dev { parts: Vec<Part>, ex: std::collections::HashMap<usize, usize>, exs: Vec<(u32, usize, u64)>, now: u64, cur: usize }
     static DEV: OnceLock<Option<Mutex<Dev>>> = OnceLock::new();
     pub fn get() -> Option<&'static Mutex<Dev>> {
         DEV.get_or_init(|| {
             if std::env::var_os("STRATA_DS_GPU").is_none() { return None; }
-            let be = crate::backend::open(Some("cuda"), 0).ok()?;
-            let (x, y) = (be.alloc(4 * 40960).ok()?, be.alloc(4 * 262144).ok()?);
-            let stage = be.alloc(STAGE).ok()?;
+            let kind = std::env::var("STRATA_DS_BACKEND").ok();
+            let ids: Vec<usize> = std::env::var("STRATA_DS_DEVICES").ok()
+                .map(|v| v.split(',').filter_map(|d| d.trim().parse().ok()).collect()).filter(|v: &Vec<usize>| !v.is_empty()).unwrap_or(vec![0]);
             let gb: f64 = std::env::var("STRATA_DS_GPU_EXPERTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-            Some(Mutex::new(Dev { be, ts: vec![], x, y, bytes: 0, ex: Default::default(), exs: vec![], now: 0, budget: (gb * 1e9) as usize, stage }))
+            let mut bes = vec![];
+            for d in ids {
+                match crate::backend::open(kind.as_deref().or(Some("cuda")), d) {
+                    Ok(be) => bes.push(be),
+                    Err(e) => { eprintln!("GPU {d}: {e:#}; running without it"); return None; }
+                }
+            }
+            let free: Vec<usize> = bes.iter().map(|b| b.mem_info().map_or(1, |m| m.0.max(1))).collect();
+            let total: usize = free.iter().sum();
+            let parts = bes.into_iter().zip(&free).map(|(be, &f)| {
+                let (x, y, stage) = (be.alloc(4 * 40960).ok()?, be.alloc(4 * 262144).ok()?, be.alloc(STAGE).ok()?);
+                let budget = (gb * 1e9 * f as f64 / total as f64) as usize;
+                // Room for the plain weights before moving on to the next GPU: what is free, less the expert cache and a margin.
+                let room = f.saturating_sub(budget + (768 << 20));
+                Some(Part { be, ts: vec![], x, y, stage, bytes: 0, budget, room })
+            }).collect::<Option<Vec<_>>>()?;
+            Some(Mutex::new(Dev { parts, ex: Default::default(), exs: vec![], now: 0, cur: 0 }))
         }).as_ref()
     }
     impl Dev {
-        pub fn upload(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize) -> Option<u32> {
-            let t = self.be.upload(&Tensor { ty, cols, rows, data }).ok()?;
-            self.bytes += data.len();
-            self.ts.push(t);
-            Some(self.ts.len() as u32 - 1)
+        pub fn bytes(&self) -> usize { self.parts.iter().map(|p| p.bytes).sum() }
+        /// The GPU that takes `len` more bytes of plain weights: the current one while they fit, then the next; the last takes all.
+        pub fn pick(&mut self, len: usize) -> usize {
+            while self.cur + 1 < self.parts.len() && self.parts[self.cur].bytes + len > self.parts[self.cur].room { self.cur += 1; }
+            self.cur
         }
-        /// VRAM copy of one routed expert: uploaded on first use while under the STRATA_DS_GPU_EXPERTS budget (GB), then the
+        pub fn upload_on(&mut self, d: usize, data: &[u8], ty: GgmlType, rows: usize, cols: usize) -> Option<u32> {
+            let p = &mut self.parts[d];
+            let t = p.be.upload(&Tensor { ty, cols, rows, data }).ok()?;
+            p.bytes += data.len();
+            p.ts.push(t);
+            Some((d as u32) << SHIFT | (p.ts.len() as u32 - 1))
+        }
+        pub fn upload(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize) -> Option<u32> {
+            let d = self.pick(data.len());
+            self.upload_on(d, data, ty, rows, cols)
+        }
+        fn tensor(&self, i: u32) -> &GpuTensor { &self.parts[gpu_of(i)].ts[(i & (1 << SHIFT) - 1) as usize] }
+        /// VRAM copy of one routed expert: uploaded on first use while under a GPU's STRATA_DS_GPU_EXPERTS share (GB), then the
         /// least recently used slot of the same shape is overwritten. Slots touched in the last 24 lookups are kept (one layer's
         /// 18 experts are in flight together). No slot to take: STAGED (copied up per use).
         pub fn expert(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize) -> Option<u32> {
@@ -41,50 +75,54 @@ mod dev {
             let now = self.now;
             if let Some(&p) = self.ex.get(&k) { self.exs[p].2 = now; EX_LOOKUPS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed); return Some(self.exs[p].0); }
             EX_LOOKUPS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if self.bytes + data.len() <= self.budget {
-                let i = self.upload(data, ty, rows, cols)?;
+            let room = |p: &Part| (p.bytes + data.len() <= p.budget).then(|| p.budget - p.bytes);
+            if let Some(d) = (0..self.parts.len()).filter_map(|d| room(&self.parts[d]).map(|r| (r, d))).max().map(|(_, d)| d) {
+                let i = self.upload_on(d, data, ty, rows, cols)?;
                 self.ex.insert(k, self.exs.len());
                 self.exs.push((i, k, now));
                 return Some(i);
             }
-            if self.budget == 0 || data.len() > STAGE || std::env::var_os("STRATA_DS_NOEVICT").is_some() { return None; }
-            let ts = &self.ts;
+            if self.parts.iter().all(|p| p.budget == 0) || data.len() > STAGE || std::env::var_os("STRATA_DS_NOEVICT").is_some() { return None; }
             let victim = self.exs.iter().enumerate()
-                .filter(|(_, e)| e.2 + 24 <= now && { let t = &ts[e.0 as usize]; t.ty == ty && t.rows == rows && t.cols == cols })
+                .filter(|(_, e)| e.2 + 24 <= now && { let t = self.tensor(e.0); t.ty == ty && t.rows == rows && t.cols == cols })
                 .min_by_key(|(_, e)| e.2).map(|(p, _)| p);
             let Some(p) = victim else { return Some(STAGED) };
             let (i, old, _) = self.exs[p];
-            if self.be.htod(data, &Buf::new(self.ts[i as usize].ptr, data.len(), ()), 0).is_err() { return Some(STAGED); }
+            let (be, t) = (&self.parts[gpu_of(i)].be, self.tensor(i));
+            if be.htod(data, &Buf::new(t.ptr, data.len(), ()), 0).is_err() { return Some(STAGED); }
             self.ex.remove(&old);
             self.ex.insert(k, p);
             self.exs[p] = (i, k, now);
             Some(i)
         }
         pub fn gemv(&self, i: u32, x: &[f32], y: &mut [f32], staged: Option<(&[u8], GgmlType, usize, usize)>) {
+            let p = &self.parts[if i == STAGED { 0 } else { gpu_of(i) }];
             let xb: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
-            self.be.htod(&xb, &self.x, 0).unwrap();
+            p.be.htod(&xb, &p.x, 0).unwrap();
             if let Some((d, ty, rows, cols)) = staged {
-                self.be.htod(d, &self.stage, 0).unwrap();
-                let w = GpuTensor::new(ty, rows, cols, Buf::new(self.stage.addr(), d.len(), ()));
-                self.be.gemv(&w, self.x.addr(), self.y.addr()).unwrap();
+                p.be.htod(d, &p.stage, 0).unwrap();
+                let w = GpuTensor::new(ty, rows, cols, Buf::new(p.stage.addr(), d.len(), ()));
+                p.be.gemv(&w, p.x.addr(), p.y.addr()).unwrap();
             } else {
-                self.be.gemv(&self.ts[i as usize], self.x.addr(), self.y.addr()).unwrap();
+                p.be.gemv(self.tensor(i), p.x.addr(), p.y.addr()).unwrap();
             }
             let mut yb = vec![0u8; 4 * y.len()];
-            self.be.dtoh(&self.y, 0, &mut yb).unwrap();
+            p.be.dtoh(&p.y, 0, &mut yb).unwrap();
             for (o, c) in y.iter_mut().zip(yb.chunks_exact(4)) { *o = f32::from_le_bytes(c.try_into().unwrap()); }
         }
-        /// One gemv per tensor, all queued before a single readback. Job i reads x[i*xs..] and writes its rows after job i-1's.
+        /// One gemv per tensor, all queued before a single readback; all tensors sit on one GPU. Job i reads x[i*xs..] and
+        /// writes its rows after job i-1's.
         pub fn batch(&self, ts: &[(u32, usize)], x: &[f32], xs: usize) -> Vec<f32> {
+            let p = &self.parts[gpu_of(ts[0].0)];
             let xb: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
-            self.be.htod(&xb, &self.x, 0).unwrap();
+            p.be.htod(&xb, &p.x, 0).unwrap();
             let mut off = 0;
             for (i, &(t, rows)) in ts.iter().enumerate() {
-                self.be.gemv(&self.ts[t as usize], self.x.addr() + (4 * i * xs) as u64, self.y.addr() + (4 * off) as u64).unwrap();
+                p.be.gemv(self.tensor(t), p.x.addr() + (4 * i * xs) as u64, p.y.addr() + (4 * off) as u64).unwrap();
                 off += rows;
             }
             let mut yb = vec![0u8; 4 * off];
-            self.be.dtoh(&self.y, 0, &mut yb).unwrap();
+            p.be.dtoh(&p.y, 0, &mut yb).unwrap();
             yb.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
         }
     }
@@ -93,6 +131,7 @@ mod dev {
 /// All matrices VRAM-resident: one GPU round trip. Otherwise each runs on its own, as `Mat::matvec`.
 pub fn matvec_many(ms: &[Mat], x: &[f32], xs: usize) -> Vec<f32> {
     let ts: Option<Vec<(u32, usize)>> = ms.iter().map(|m| m.gpu.filter(|&i| i != dev::STAGED).map(|i| (i, m.rows))).collect();
+    let ts = ts.filter(|ts| ts.iter().all(|t| dev::gpu_of(t.0) == dev::gpu_of(ts[0].0)));  // one batch, one GPU
     if let Some(y) = ts.and_then(|ts| Some(dev::get()?.lock().unwrap().batch(&ts, x, xs))) { return y; }
     let mut y = vec![0f32; ms.iter().map(|m| m.rows).sum()];
     let mut off = 0;
@@ -104,7 +143,7 @@ pub fn matvec_many(ms: &[Mat], x: &[f32], xs: usize) -> Vec<f32> {
 }
 /// Expert cache lookups since the last PROF print: [hit, miss].
 pub static EX_LOOKUPS: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
-pub fn gpu_bytes() -> usize { dev::get().map_or(0, |d| d.lock().unwrap().bytes) }
+pub fn gpu_bytes() -> usize { dev::get().map_or(0, |d| d.lock().unwrap().bytes()) }
 
 /// Row-major weight: `rows` rows of `cols` elements (ggml dims[0] = cols, dims[1] = rows).
 /// A 3-D expert tensor is addressed with `expert(e)`.
@@ -139,7 +178,8 @@ impl<'a> Mat<'a> {
         if let Some(d) = dev::get() {
             let (gr, rb) = (m.rows / n, m.ty.row_bytes(m.cols as u64));
             let mut d = d.lock().unwrap();
-            let ids: Vec<_> = (0..n).map(|i| d.upload(&m.data[i * gr * rb..(i + 1) * gr * rb], m.ty, gr, m.cols)).collect();
+            let gpu = d.pick(m.data.len());  // the groups get consecutive ids on one GPU
+            let ids: Vec<_> = (0..n).map(|i| d.upload_on(gpu, &m.data[i * gr * rb..(i + 1) * gr * rb], m.ty, gr, m.cols)).collect();
             if ids.iter().all(|i| i.is_some()) { m.gpu = ids[0]; }
         }
         Ok(m)
