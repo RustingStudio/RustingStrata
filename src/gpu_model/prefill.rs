@@ -372,7 +372,7 @@ impl GpuModel<'_> {
                     // tokens). Fail here with the place, not in the index math below. ponytail: the root cause is still open.
                     if let Some(&bad) = ids.iter().find(|&&e| e < 0 || e as usize >= c.n_expert) {
                         anyhow::bail!("prefill: router gave expert id {bad} at layer {il}, chunk of {t} tokens from position {}; \
-                            the hidden state is non-finite (try STRATA_NAN_TRACE=1), or lower --chunk / --ctx", self.pos);
+                            lower --chunk (for example --chunk 1024) or --ctx, and try STRATA_NAN_TRACE=1 for a non-finite hidden state", self.pos);
                     }
                     let cache = self.cache.as_mut().unwrap();
                     cache.record(il, &ids);
