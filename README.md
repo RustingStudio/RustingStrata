@@ -117,14 +117,15 @@ rustingstrata serve    --model $M --addr 127.0.0.1:8080 [--api-key K]
 The llama.cpp numbers are from the first cold runs on this box and the RustingStrata numbers from the last runs
 before the model was deleted; they were not re-measured side by side, and both move with the page cache.
 Decode varies run to run with the page cache, because the experts that miss VRAM are read from the GGUF.
-`STRATA_DS_GPU_EXPERTS=<GB>` changes the VRAM expert budget (10 worked on a 12 GB card). Prefill is one token at a
-time. Prompt plus reply is limited only by the model's trained context from the GGUF (1,048,576; `STRATA_DS_CTX` lowers it; checked against llama.cpp only up to a 1425-token prompt), decoding is greedy only, and sampling is not supported. Tool calls work in `serve`: the prompt matches the model template (jinja2 render, three cases byte for byte) and the reply's `<｜DSML｜ calls>` block is parsed, but this path has not been run against the model itself.
+`STRATA_DS_GPU_EXPERTS=<GB>` sets the VRAM weight budget; unset, it is 80% of free VRAM (about 9 GB on a 12 GB
+card). Prefill is one token at a time. Prompt plus reply is limited only by the model's trained context from the GGUF (1,048,576; `STRATA_DS_CTX` lowers it; checked against llama.cpp only up to a 1425-token prompt), decoding is greedy only, and sampling is not supported. Tool calls work in `serve`: the prompt matches the model template (jinja2 render, three cases byte for byte) and the reply's `<｜DSML｜ calls>` block is parsed, but this path has not been run against the model itself.
 
 ## GLM-5.3-Flash (UD-Q2_K_XL, 119 GB)
 
 `chat`, `generate` and `serve` detect the `glm5-next` architecture (Kimi-delta attention, sparse MLA attention, four-stream
-hyper-connections, sigmoid MoE) and run the CPU reference forward, with the dense matvecs and an 11 GB expert cache on the
-CUDA card (`STRATA_DS_GPU_EXPERTS=<GB>` changes the budget; it also counts the non-expert weights). Pass the first shard.
+hyper-connections, sigmoid MoE) and run the CPU reference forward, with the dense matvecs and an expert cache on the
+CUDA card (`STRATA_DS_GPU_EXPERTS=<GB>` sets the budget, which also counts the non-expert weights; unset, it is 90% of
+free VRAM, about 10 GB on a 12 GB card). Pass the first shard.
 
 ```sh
 M=GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf
@@ -137,7 +138,9 @@ Greedy output equals llama.cpp b12119 (`--cpu-moe`) for 32 tokens on 3 fixed pro
 prompts 1 and 2 still match for 32 tokens and prompt 3 flips at the first token, a near-tie (logprob -2.65 against -2.73). Fed llama.cpp's own 64 tokens per prompt (teacher-forced), the GPU path picks the same top-1 on 188 of 192 steps; the four misses are llama.cpp near-ties (margins 0.03-0.53 logprob). Tokenizer ids
 match llama.cpp on 29 test strings and the chat template matches `/apply-template` on 2 conversations.
 On an RTX 3060 12 GB with 30 GB RAM decode took about 0.4-0.7 s per token with warm page cache (about 55% VRAM expert-cache
-hits on a short text); llama.cpp (`--cpu-moe`, server, 64 greedy tokens per prompt) took 2.3-2.9 s per token (0.34-0.44 tok/s) on the same box in the same session, started right before our runs on the same page cache; a later paired run (64 greedy tokens through `serve`, llama.cpp, ours, ours, llama.cpp) gave 1.25-1.40 tok/s against 0.47-0.56, a first token after 17-19 s against 40-41 s on a short prompt, load until ready in 4-6 s against 58 s, and, on a 550-token prompt, a first token after 206-209 s against 107-229 s (llama.cpp's second run had the page cache warm); both timings move with the page cache and the pairs were run twice, not as a full benchmark.
+hits on a short text); after the 2026-11-12 batching and prompt-preload changes, `bench --pp 1 --tg 24` measured 2.3-2.6 tok/s
+warm, 32-token runs fell to 1.5-1.8 tok/s as the page cache turned over, and a 128-token prompt with hot-expert preload
+decoded at 1.6 tok/s. llama.cpp (`--cpu-moe`, server, 64 greedy tokens per prompt) took 2.3-2.9 s per token (0.34-0.44 tok/s) on the same box in the same session, started right before our runs on the same page cache; a later paired run (64 greedy tokens through `serve`, llama.cpp, ours, ours, llama.cpp) gave 1.25-1.40 tok/s against 0.47-0.56, a first token after 17-19 s against 40-41 s on a short prompt, load until ready in 4-6 s against 58 s, and, on a 550-token prompt, a first token after 206-209 s against 107-229 s (llama.cpp's second run had the page cache warm); both timings move with the page cache and the pairs were run twice, not as a full benchmark.
 Caveats: prefill runs 512-token chunks layer by layer so each routed expert is read once per chunk (a 380-word, about 550-token prompt prefilled in 209 s with 512-token chunks against 325 s with 128, identical logprobs; short prompts cost more per token because the experts stream from SSD once per chunk, `STRATA_GLM_CHUNK` sets the size); prompt plus reply is limited only by the model's trained context from the GGUF (1,048,576; `STRATA_GLM_CTX` lowers it, and the KV cache grows with the text, so RAM is the real bound; the k-pool sparse-attention indexer takes over past 2048 rows and was checked against llama.cpp up to 3.6k tokens: same top-5 sets, same first token); the NextN/MTP layer is unused; decoding is greedy only; tool calls work in `serve` (the prompt matches llama.cpp's template byte for byte, checked on one tool call and one tool-result round trip); the reasoning
 text comes back in `content` before `</think>`.
 

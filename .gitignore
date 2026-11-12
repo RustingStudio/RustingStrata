@@ -2,6 +2,8 @@
 
 # AI agent notes, plans and logs (kept locally, not published)
 /.claude/
+/AGENTS.md
 /CLAUDE.md
 /docs/LOOP_LOG.md
 /docs/superpowers/
+/DeepSeekAndGLMOptimizePlan.md

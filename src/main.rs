@@ -785,10 +785,20 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Bench { model, pp, tg, reps, json_out, mut engine } => {
             let g = Gguf::open(&model)?;
+            engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
+            if let Some(arch) = g.get("general.architecture").ok().and_then(|v| v.as_str()) {
+                if arch == "deepseek41" || arch == "glm5-next" {
+                    engine.ds_env();
+                    return if arch == "deepseek41" {
+                        bench_deepseek(&g, &model, &pp, tg, reps, json_out, &mut engine)
+                    } else {
+                        bench_glm(&g, &model, &pp, tg, reps, json_out, &mut engine)
+                    };
+                }
+            }
             let mut m = Model::load(&g)?;
             if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
-            engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
             let mut r = engine.runner(&m, &model)?;
             let mut results = Vec::with_capacity(pp.len());
             for n in pp {
@@ -1109,6 +1119,128 @@ fn prose(tok: &Tokenizer, n: usize) -> anyhow::Result<Vec<u32>> {
     let ids: Vec<u32> = tok.encode(&text.repeat(n / 20 + 1))?.into_iter().take(n).collect();
     anyhow::ensure!(ids.len() == n, "prose prompt too short");
     Ok(ids)
+}
+
+/// Expert-cache counters for a DeepSeek/GLM bench run. `tensors_per_expert` is 3 (gate, up, down).
+fn big_expert_stats(layers: usize, n_expert: usize) -> Option<ExpertStats> {
+    let (_backend, resident, _bytes) = rusting_strata::deepseek::mat::dev_info()?;
+    let l = &rusting_strata::deepseek::mat::EX_LOOKUPS;
+    Some(ExpertStats {
+        hits: l[0].swap(0, Relaxed) as usize,
+        misses: l[1].swap(0, Relaxed) as usize,
+        swaps: 0,
+        resident,
+        total: 3 * layers * n_expert,
+        bytes_per_token: 0,
+        cached: true,
+        all_fast: false,
+    })
+}
+
+fn write_bench_json(path: Option<PathBuf>, meta: &BenchMeta, results: &[BenchResult], expert: Option<&ExpertStats>) -> anyhow::Result<()> {
+    let Some(path) = path else { return Ok(()) };
+    let unix_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let record = bench_record(meta, results, expert, unix_time);
+    let mut line = serde_json::to_string(&record)?;
+    line.push('\n');
+    std::fs::write(&path, line).with_context(|| format!("writing the JSON record to {}", path.display()))?;
+    Ok(())
+}
+
+fn decode_greedy_big(m: &mut dyn FnMut(u32) -> Vec<f32>, logits: Vec<f32>, eos: &[u32], tg: usize) -> usize {
+    let mut logits = logits;
+    let mut n = 0;
+    for i in 0..tg {
+        let next = ops::argmax(&logits) as u32;
+        if eos.contains(&next) { break; }
+        n += 1;
+        if i + 1 < tg { logits = m(next); }
+    }
+    n
+}
+
+/// `strata bench` for DeepSeek-V4.1 (token-at-a-time reference forward, GPU matvecs when enabled).
+fn bench_deepseek(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {
+    rusting_strata::deepseek::chat::gpu_defaults();
+    let tok = Tokenizer::from_gguf(g)?;
+    let mut m = rusting_strata::deepseek::forward::DsModel::new(g)?;
+    let eos = tok.eos_ids();
+    let mut results = Vec::with_capacity(pp.len());
+    for &n in pp {
+        let ids = prose(&tok, n)?;
+        let (mut p, mut d) = (Vec::new(), Vec::new());
+        for _ in 0..reps {
+            m.reset();
+            let t = Instant::now();
+            let logits = m.prefill(&ids);
+            p.push(n as f64 / t.elapsed().as_secs_f64());
+            let t = Instant::now();
+            let k = decode_greedy_big(&mut |t| m.step(t), logits, &eos, tg);
+            d.push(k as f64 / t.elapsed().as_secs_f64());
+        }
+        let (prefill, decode_stat) = (Stat::of(&p), Stat::of(&d));
+        println!("pp {n:6}: prefill {} tok/s | tg {tg}: decode {} tok/s", prefill.text(), decode_stat.text());
+        results.push(BenchResult { pp: n, prefill, decode: decode_stat, bytes_per_token: 0, decode_median: 0.0 });
+    }
+    let expert = big_expert_stats(m.cfg.n_layer, m.cfg.n_expert);
+    let backend = rusting_strata::deepseek::mat::dev_info().map_or("cpu", |i| i.0);
+    let meta = BenchMeta {
+        backend,
+        backend_arg: engine.backend.as_deref(),
+        device: if backend == "cpu" { &[] } else { &engine.device },
+        model,
+        ctx: engine.ctx,
+        chunk: 1,
+        kv: &engine.kv,
+        mtp: 0,
+        tg,
+        reps,
+    };
+    write_bench_json(json_out, &meta, &results, expert.as_ref())
+}
+
+/// `strata bench` for GLM-5.3-Flash (chunked reference forward, GPU matvecs when enabled).
+fn bench_glm(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {
+    rusting_strata::glm::gpu_defaults();
+    let tok = Tokenizer::from_gguf(g)?;
+    let mut m = rusting_strata::glm::forward::GlmModel::new(g)?;
+    if engine.ctx > rusting_strata::glm::forward::max_ctx(&m.cfg) {
+        unsafe { std::env::set_var("STRATA_GLM_CTX", engine.ctx.to_string()) }
+    }
+    let eos = tok.eos_ids();
+    let chunk = std::env::var("STRATA_GLM_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+    let mut results = Vec::with_capacity(pp.len());
+    for &n in pp {
+        let ids = prose(&tok, n)?;
+        let (mut p, mut d) = (Vec::new(), Vec::new());
+        for _ in 0..reps {
+            m.reset();
+            let t = Instant::now();
+            let logits = m.prefill(&ids);
+            p.push(n as f64 / t.elapsed().as_secs_f64());
+            let t = Instant::now();
+            let k = decode_greedy_big(&mut |t| m.step(t), logits, &eos, tg);
+            d.push(k as f64 / t.elapsed().as_secs_f64());
+        }
+        let (prefill, decode_stat) = (Stat::of(&p), Stat::of(&d));
+        println!("pp {n:6}: prefill {} tok/s | tg {tg}: decode {} tok/s", prefill.text(), decode_stat.text());
+        results.push(BenchResult { pp: n, prefill, decode: decode_stat, bytes_per_token: 0, decode_median: 0.0 });
+    }
+    let expert = big_expert_stats(m.cfg.n_layer.saturating_sub(m.cfg.n_dense), m.cfg.n_expert);
+    let backend = rusting_strata::deepseek::mat::dev_info().map_or("cpu", |i| i.0);
+    let meta = BenchMeta {
+        backend,
+        backend_arg: engine.backend.as_deref(),
+        device: if backend == "cpu" { &[] } else { &engine.device },
+        model,
+        ctx: engine.ctx,
+        chunk,
+        kv: &engine.kv,
+        mtp: 0,
+        tg,
+        reps,
+    };
+    write_bench_json(json_out, &meta, &results, expert.as_ref())
 }
 
 /// Best (lowest) of three timings of `f`, in seconds.
