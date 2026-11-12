@@ -1,7 +1,7 @@
 //! Slow single-token CPU reference forward for DeepSeek-V4.1 (mirrors llama.cpp deepseek41.cpp).
 //! Not implemented: indexer top-k (only matters beyond 512 visible compressed rows, i.e. >1024 tokens)
 //! and the candidate-block prune (beyond 4096 rows). The window boundary (128) is unverified.
-use super::mat::{Mat, matvec_many, vec_f32};
+use super::mat::{Mat, matvec_many, matvec_many_opt, vec_f32};
 use super::ops::*;
 use super::{AttnKind, DsConfig};
 use crate::gguf::Gguf;
@@ -295,18 +295,18 @@ impl<'a> DsModel<'a> {
             }
         }
         let t1 = std::time::Instant::now();
-        // All selected experts resident in VRAM: 2 GPU round trips per layer instead of 3 per expert.
+        // Every selected expert has a GPU slot (resident or staged): 2 GPU round trips per layer instead of 3 per expert.
         let gu: Vec<_> = sel.iter().map(|s| l.gexps.expert(s.0, cfg.n_expert)).chain(sel.iter().map(|s| l.uexps.expert(s.0, cfg.n_expert))).collect();
         let nf = cfg.n_ff_exp;
-        let fast = gu.iter().all(|m| m.gpu.is_some_and(|i| i != u32::MAX)).then(|| {
-            let gu_y = matvec_many(&gu, cur, 0);
+        let fast = gu.iter().all(|m| m.gpu.is_some()).then(|| {
+            let gu_y = matvec_many_opt(&gu, cur, 0)?;
             let k = sel.len();
             let a: Vec<f32> = (0..k * nf).map(|i| act(gu_y[i], gu_y[k * nf + i], cfg.clamp_exp[il])).collect();
             let dm: Vec<_> = sel.iter().map(|s| l.dexps.expert(s.0, cfg.n_expert)).collect();
-            matvec_many(&dm, &a, nf)
-        });
+            matvec_many_opt(&dm, &a, nf)
+        }).flatten();
         if let Some(dy) = &fast {
-            PROF[3].fetch_add(1000 * sel.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            PROF[3].fetch_add(1000 * gu.iter().filter(|m| m.gpu.is_some_and(|i| i != u32::MAX)).count() as u64, std::sync::atomic::Ordering::Relaxed);
             for (i, &(_, w)) in sel.iter().enumerate() { for j in 0..n { out[j] += w * dy[i * n + j]; } }
         }
         for (e, w) in sel.into_iter().filter(|_| fast.is_none()) {

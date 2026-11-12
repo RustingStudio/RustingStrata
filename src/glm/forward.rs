@@ -2,7 +2,7 @@
 //! Not implemented: the k-pool indexer top-k (it selects everything while the context is <= idx_top_k tokens, so
 //! longer contexts are rejected) and the NextN/MTP block.
 use super::{GlmConfig, LayerKind};
-use crate::deepseek::mat::{Mat, vec_f32};
+use crate::deepseek::mat::{Mat, matvec_many, matvec_rows, vec_f32};
 use crate::deepseek::ops::*;
 use crate::gguf::Gguf;
 use anyhow::Result;
@@ -94,6 +94,10 @@ pub struct GlmModel<'a> {
     state: Vec<State>,
     pub toks: Vec<u32>,
     pub trace: bool,
+    /// Experts routed in the previous token, per layer, to read the next layer's likely pages while this one computes.
+    last_routes: std::cell::RefCell<Vec<Vec<usize>>>,
+    /// Routed-expert counts [layer * n_expert + expert], from the prompt, used to preload the decode hot set.
+    route_counts: std::cell::RefCell<Vec<u32>>,
 }
 
 /// Context limit: the trained context unless `STRATA_GLM_CTX` says otherwise. Beyond `idx_top_k` the k-pool indexer
@@ -152,7 +156,8 @@ impl<'a> GlmModel<'a> {
         let n = cfg.n_layer;
         Ok(GlmModel {
             tok_embd: Mat::load(g, "token_embd.weight")?, out_norm: vec_f32(g, "output_norm.weight")?, out_w: Mat::load(g, "output.weight")?,
-            layers, state: (0..n).map(|_| State::default()).collect(), toks: vec![], trace: std::env::var("STRATA_GLM_TRACE").is_ok(), cfg,
+            layers, state: (0..n).map(|_| State::default()).collect(), toks: vec![], trace: std::env::var("STRATA_GLM_TRACE").is_ok(),
+            last_routes: std::cell::RefCell::new(vec![vec![]; n]), route_counts: std::cell::RefCell::new(vec![0; n * cfg.n_expert]), cfg,
         })
     }
 
@@ -160,6 +165,45 @@ impl<'a> GlmModel<'a> {
     pub fn reset(&mut self) {
         self.state.iter_mut().for_each(|s| *s = State::default());
         self.toks.clear();
+        self.last_routes.borrow_mut().iter_mut().for_each(Vec::clear);
+        self.route_counts.borrow_mut().fill(0);
+    }
+
+    /// Put the prompt's hottest experts in VRAM before decoding. The prompt's routing predicts the reply's; filling
+    /// the cache coldest-first leaves the hottest experts resident when decoding starts.
+    fn preload_hot(&self) {
+        if std::env::var("STRATA_GLM_PRELOAD").ok().as_deref() == Some("0") { return; }
+        let Some(Ffn::Moe { g, u, d, .. }) = self.layers.iter().find_map(|l| match &l.ffn { Ffn::Moe { .. } => Some(&l.ffn), _ => None }) else { return };
+        let n = self.cfg.n_expert;
+        let slot = (g.data.len() + u.data.len() + d.data.len()) / n;
+        let resident = crate::deepseek::mat::dev_info().map_or(0, |i| i.1) / 3;
+        let cap = (crate::deepseek::mat::budget_left() / slot.max(1)).max(resident).min(4096);
+        if cap == 0 { return; }
+        let host_cap: usize = std::env::var("STRATA_GLM_PRELOAD_HOST").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
+        if std::env::var_os("STRATA_GLM_PROF").is_some() { eprintln!("PRELOAD cap {cap} host {host_cap}"); }
+        let counts = self.route_counts.borrow();
+        let mut hot: Vec<(u32, usize)> = counts.iter().enumerate().filter(|(_, c)| **c > 0).map(|(i, c)| (*c, i)).collect();
+        hot.sort_unstable();
+        let vram_from = hot.len().saturating_sub(cap);
+        let host_from = vram_from.saturating_sub(host_cap);
+        for (idx, (_, i)) in hot.into_iter().enumerate() {
+            if idx < host_from { continue; }
+            let (il, e) = (i / n, i % n);
+            let Some(Ffn::Moe { g, u, d, .. }) = self.layers.get(il).map(|l| &l.ffn) else { continue };
+            if idx >= vram_from {
+                let _ = (g.expert(e, n), u.expert(e, n), d.expert(e, n));
+            } else {
+                for m in [g, u, d] { m.prefetch_expert(e, n); }
+            }
+        }
+    }
+
+    /// Read the file pages of likely next-layer experts while the current layer computes.
+    fn prefetch_experts(&self, il: usize, es: &[usize]) {
+        let Ffn::Moe { g, u, d, .. } = &self.layers[il].ffn else { return };
+        for &e in es {
+            for m in [g, u, d] { m.prefetch_expert(e, self.cfg.n_expert); }
+        }
     }
 
     fn tr(&self, name: &str, il: i32, v: &[f32]) {
@@ -195,22 +239,25 @@ impl<'a> GlmModel<'a> {
             st.conv = vec![0.0; 3 * (ck - 1) * di];
             st.s = vec![0.0; nh * hd * hd];
         }
-        // q/k/v: projection, causal depthwise conv over [ck-1 previous inputs, current], silu
-        let mut qkv = [vec![0f32; di], vec![0f32; di], vec![0f32; di]];
-        for (i, m) in [&w.wq, &w.wk, &w.wv].into_iter().enumerate() {
-            let mut p = vec![0f32; di];
-            m.matvec(cur, &mut p);
+        // All six projections read `cur`: one GPU round trip instead of six.
+        let proj = matvec_many(&[w.wq, w.wk, w.wv, w.f_a, w.g_a, w.beta], cur, 0);
+        let (o_fa, o_ga, o_b) = (3 * di, 3 * di + hd, 3 * di + 2 * hd);
+        let mut qkv = [proj[0..di].to_vec(), proj[di..2 * di].to_vec(), proj[2 * di..3 * di].to_vec()];
+        for (i, p) in qkv.iter_mut().enumerate() {
+            let raw = std::mem::take(p);
+            let mut out = vec![0f32; di];
             let hist = &mut st.conv[i * (ck - 1) * di..(i + 1) * (ck - 1) * di];
             for c in 0..di {
                 let mut acc = 0.0;
                 for t in 0..ck - 1 {
                     acc += w.conv[i][c * ck + t] * hist[t * di + c];
                 }
-                acc += w.conv[i][c * ck + ck - 1] * p[c];
-                qkv[i][c] = silu(acc);
+                acc += w.conv[i][c * ck + ck - 1] * raw[c];
+                out[c] = silu(acc);
             }
             hist.copy_within(di.., 0);
-            hist[(ck - 2) * di..].copy_from_slice(&p);
+            hist[(ck - 2) * di..].copy_from_slice(&raw);
+            *p = out;
         }
         let [mut q, mut k, v] = qkv;
         for h in 0..nh {
@@ -219,16 +266,13 @@ impl<'a> GlmModel<'a> {
         }
         self.tr("kda_q_conv", il as i32, &q);
         // decay gate g = lower_bound * sigmoid(-(g1 * A)), per key channel
-        let mut fa = vec![0f32; hd];
-        w.f_a.matvec(cur, &mut fa);
-        let mut g1 = vec![0f32; di];
-        w.f_b.matvec(&fa, &mut g1);
+        let mut fg = matvec_many(&[w.f_b, w.g_b], &[&proj[o_fa..o_fa + hd], &proj[o_ga..o_ga + hd]].concat(), hd);
+        let (g1, g2) = fg.split_at_mut(di);
         let lb = cfg.gate_lower_bound;
         for c in 0..di {
             g1[c] = lb * sigmoid(-((g1[c] + w.dt_b[c]) * w.a[c / hd]));
         }
-        let mut beta = vec![0f32; nh];
-        w.beta.matvec(cur, &mut beta);
+        let mut beta: Vec<f32> = proj[o_b..o_b + nh].to_vec();
         beta.iter_mut().for_each(|b| *b = sigmoid(*b));
         // recurrence per head: S = diag(exp(g)) S; S += k (beta (v - S^T k))^T; o = S^T q / sqrt(hd)
         let scale = 1.0 / (hd as f32).sqrt();
@@ -255,10 +299,6 @@ impl<'a> GlmModel<'a> {
         });
         self.tr("kda_scan_out", il as i32, &o);
         // output gate: rms_norm(o) * sigmoid(g_b(g_a x))
-        let mut ga = vec![0f32; hd];
-        w.g_a.matvec(cur, &mut ga);
-        let mut g2 = vec![0f32; di];
-        w.g_b.matvec(&ga, &mut g2);
         let mut gated = vec![0f32; di];
         for h in 0..nh {
             rms_norm_w(&o[h * hd..(h + 1) * hd], &w.norm, cfg.eps, &mut gated[h * hd..(h + 1) * hd]);
@@ -276,27 +316,26 @@ impl<'a> GlmModel<'a> {
         let cfg = &self.cfg;
         let Mixer::Dsa(w) = &self.layers[il].mixer else { unreachable!() };
         let (nh, kd, kl) = (cfg.n_head, cfg.k_mla, cfg.kv_lora);
-        let mut qa = vec![0f32; cfg.q_lora];
-        w.q_a.matvec(cur, &mut qa);
+        // q_a, kv_a and the two indexer projections all read `cur`: one GPU round trip instead of four.
+        let (hd, nih, kp) = (cfg.idx_head_dim, cfg.idx_n_head, cfg.kpool);
+        let proj = matvec_many(&[w.q_a, w.kv_a, w.ix_k, w.ix_gate], cur, 0);
+        let (o_kv, o_ik, o_ig) = (cfg.q_lora, cfg.q_lora + kl, cfg.q_lora + kl + hd);
+        let qa = &proj[..cfg.q_lora];
         let mut qr = vec![0f32; cfg.q_lora];
-        rms_norm_w(&qa, &w.q_a_norm, cfg.eps, &mut qr);
+        rms_norm_w(qa, &w.q_a_norm, cfg.eps, &mut qr);
         let mut q = vec![0f32; nh * kd];
         w.q_b.matvec(&qr, &mut q);
-        let mut kv = vec![0f32; kl];
-        w.kv_a.matvec(cur, &mut kv);
+        let kv = &proj[o_kv..o_kv + kl];
         let mut lat = vec![0f32; kl];
-        rms_norm_w(&kv, &w.kv_a_norm, cfg.eps, &mut lat);
+        rms_norm_w(kv, &w.kv_a_norm, cfg.eps, &mut lat);
         self.tr("kv_cmpr", il as i32, &lat);
         // indexer key (layer norm) and pool gate of this position
-        let (hd, nih, kp) = (cfg.idx_head_dim, cfg.idx_n_head, cfg.kpool);
-        let mut ik = vec![0f32; hd];
-        w.ix_k.matvec(cur, &mut ik);
+        let mut ik = proj[o_ik..o_ik + hd].to_vec();
         let mean = ik.iter().sum::<f32>() / hd as f32;
         let var = ik.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / hd as f32;
         let inv = 1.0 / (var + cfg.kda_eps).sqrt();
         ik.iter_mut().enumerate().for_each(|(i, v)| *v = (*v - mean) * inv * w.ix_kn_w[i] + w.ix_kn_b[i]);
-        let mut ig = vec![0f32; hd];
-        w.ix_gate.matvec(cur, &mut ig);
+        let ig = &proj[o_ig..o_ig + hd];
         let st = &mut self.state[il];
         st.lat.push(lat);
         st.ik.extend_from_slice(&ik);
@@ -336,11 +375,8 @@ impl<'a> GlmModel<'a> {
         };
         let cache = &st.lat;
         let scale = 1.0 / (kd as f32).sqrt();
-        let mut out = vec![0f32; nh * cfg.v_mla];
-        let mut qabs = vec![0f32; nh * kl];
-        for h in 0..nh {
-            w.k_b.group(h, nh).matvec(&q[h * kd..(h + 1) * kd], &mut qabs[h * kl..(h + 1) * kl]);
-        }
+        let kb: Vec<Mat> = (0..nh).map(|h| w.k_b.group(h, nh)).collect();
+        let qabs = matvec_many(&kb, &q, kd);
         let accs: Vec<Vec<f32>> = (0..nh)
             .into_par_iter()
             .map(|h| {
@@ -362,9 +398,9 @@ impl<'a> GlmModel<'a> {
                 acc
             })
             .collect();
-        for h in 0..nh {
-            w.v_b.group(h, nh).matvec(&accs[h], &mut out[h * cfg.v_mla..(h + 1) * cfg.v_mla]);
-        }
+        let vb: Vec<Mat> = (0..nh).map(|h| w.v_b.group(h, nh)).collect();
+        let accs_flat: Vec<f32> = accs.iter().flatten().copied().collect();
+        let out = matvec_many(&vb, &accs_flat, kl);
         let mut res = vec![0f32; cfg.n_embd];
         w.wo.matvec(&out, &mut res);
         res
@@ -383,28 +419,49 @@ impl<'a> GlmModel<'a> {
                 down.matvec(&g, &mut out);
             }
             Ffn::Moe { gate_inp, bias, g: ge, u: ue, d: de, gsh, ush, dsh } => {
+                let ahead: usize = std::env::var("STRATA_GLM_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+                if ahead > 0 {
+                    let routes = self.last_routes.borrow();
+                    for j in 1..=ahead {
+                        if let Some(prev) = routes.get(il + j) {
+                            if !prev.is_empty() { self.prefetch_experts(il + j, prev); }
+                        }
+                    }
+                }
                 let mut logits = vec![0f32; cfg.n_expert];
                 gate_inp.matvec(cur, &mut logits);
                 self.tr("ffn_moe_logits", il as i32, &logits);
                 let sel = route_sigmoid(&logits, bias, cfg.n_used, cfg.weights_norm, cfg.weights_scale);
                 let ids: Vec<f32> = sel.iter().map(|s| s.0 as f32).collect();
                 self.tr("ffn_moe_topk", il as i32, &ids);
+                self.last_routes.borrow_mut()[il] = sel.iter().map(|s| s.0).collect();
+                let mut counts = self.route_counts.borrow_mut();
+                for &(e, _) in &sel { counts[il * cfg.n_expert + e] += 1; }
+                if std::env::var_os("STRATA_GLM_ROUTE").is_some() {
+                    let line: Vec<String> = sel.iter().map(|s| s.0.to_string()).collect();
+                    eprintln!("ROUTE {il} {}", line.join(","));
+                }
                 for &(e, _) in &sel {
                     for m in [ge, ue, de] {
                         m.prefetch_expert(e, cfg.n_expert);
                     }
                 }
                 let nf = cfg.n_ff_exp;
-                let (mut g, mut u, mut d) = (vec![0f32; nf], vec![0f32; nf], vec![0f32; n]);
-                for (e, w) in sel {
-                    ge.expert(e, cfg.n_expert).matvec(cur, &mut g);
-                    ue.expert(e, cfg.n_expert).matvec(cur, &mut u);
+                // One GPU round trip for all gate/up experts, one for all down experts, instead of 3 per expert.
+                let gu: Vec<Mat> = sel.iter().flat_map(|&(e, _)| [ge.expert(e, cfg.n_expert), ue.expert(e, cfg.n_expert)]).collect();
+                let dm: Vec<Mat> = sel.iter().map(|&(e, _)| de.expert(e, cfg.n_expert)).collect();
+                let gu_y = matvec_many(&gu, cur, 0);
+                let k = sel.len();
+                let mut acts = vec![0f32; k * nf];
+                for i in 0..k {
                     for j in 0..nf {
-                        g[j] = swiglu_clamp(g[j], u[j], cfg.clamp_exp[il]);
+                        acts[i * nf + j] = swiglu_clamp(gu_y[2 * i * nf + j], gu_y[(2 * i + 1) * nf + j], cfg.clamp_exp[il]);
                     }
-                    de.expert(e, cfg.n_expert).matvec(&g, &mut d);
+                }
+                let dy = matvec_many(&dm, &acts, nf);
+                for (i, &(_, w)) in sel.iter().enumerate() {
                     for j in 0..n {
-                        out[j] += w * d[j];
+                        out[j] += w * dy[i * n + j];
                     }
                 }
                 self.tr("ffn_moe_out", il as i32, &out);
@@ -429,18 +486,41 @@ impl<'a> GlmModel<'a> {
     /// Per-token numerics equal `ffn` (expert outputs summed in the token's own selection order).
     fn ffn_batch(&self, il: usize, curs: &[Vec<f32>]) -> Vec<Vec<f32>> {
         let cfg = &self.cfg;
-        let Ffn::Moe { gate_inp, bias, g: ge, u: ue, d: de, gsh, ush, dsh } = &self.layers[il].ffn else {
-            return curs.iter().map(|c| self.ffn(il, c)).collect();
-        };
+        let batch = std::env::var("STRATA_GLM_BATCH").ok().as_deref() != Some("0");
+        let xs: Vec<&[f32]> = curs.iter().map(|c| c.as_slice()).collect();
+        if let Ffn::Dense { gate, up, down } = &self.layers[il].ffn {
+            if !batch {
+                return curs.iter().map(|c| self.ffn(il, c)).collect();
+            }
+            let (n, nf) = (cfg.n_embd, cfg.n_ff);
+            let gy = matvec_rows(gate, &xs);
+            let uy = matvec_rows(up, &xs);
+            let mut g = vec![0f32; curs.len() * nf];
+            for j in 0..g.len() { g[j] = silu(gy[j]) * uy[j]; }
+            let gs: Vec<&[f32]> = g.chunks_exact(nf).collect();
+            let dy = matvec_rows(down, &gs);
+            return dy.chunks_exact(n).map(|r| r.to_vec()).collect();
+        }
+        let Ffn::Moe { gate_inp, bias, g: ge, u: ue, d: de, gsh, ush, dsh } = &self.layers[il].ffn else { unreachable!() };
         let (n, nf) = (cfg.n_embd, cfg.n_ff_exp);
-        let sels: Vec<Vec<(usize, f32)>> = curs
-            .iter()
-            .map(|c| {
-                let mut logits = vec![0f32; cfg.n_expert];
-                gate_inp.matvec(c, &mut logits);
-                route_sigmoid(&logits, bias, cfg.n_used, cfg.weights_norm, cfg.weights_scale)
-            })
-            .collect();
+        let sels: Vec<Vec<(usize, f32)>> = if batch {
+            let logits = matvec_rows(gate_inp, &xs);
+            logits.chunks_exact(cfg.n_expert)
+                .map(|row| route_sigmoid(row, bias, cfg.n_used, cfg.weights_norm, cfg.weights_scale))
+                .collect()
+        } else {
+            curs.iter()
+                .map(|c| {
+                    let mut logits = vec![0f32; cfg.n_expert];
+                    gate_inp.matvec(c, &mut logits);
+                    route_sigmoid(&logits, bias, cfg.n_used, cfg.weights_norm, cfg.weights_scale)
+                })
+                .collect()
+        };
+        {
+            let mut counts = self.route_counts.borrow_mut();
+            for sel in &sels { for &(e, _) in sel { counts[il * cfg.n_expert + e] += 1; } }
+        }
         let mut by_e: std::collections::BTreeMap<usize, Vec<(usize, usize)>> = Default::default();
         for (t, sel) in sels.iter().enumerate() {
             for (k, &(e, _)) in sel.iter().enumerate() {
@@ -453,21 +533,42 @@ impl<'a> GlmModel<'a> {
             }
         }
         let mut ds: Vec<Vec<Vec<f32>>> = sels.iter().map(|s| vec![vec![]; s.len()]).collect();
-        let (mut g, mut u) = (vec![0f32; nf], vec![0f32; nf]);
         for (e, uses) in by_e {
             let (me_g, me_u, me_d) = (ge.expert(e, cfg.n_expert), ue.expert(e, cfg.n_expert), de.expert(e, cfg.n_expert));
-            for (t, k) in uses {
-                me_g.matvec(&curs[t], &mut g);
-                me_u.matvec(&curs[t], &mut u);
-                for j in 0..nf {
-                    g[j] = swiglu_clamp(g[j], u[j], cfg.clamp_exp[il]);
+            if !batch {
+                let (mut g, mut u) = (vec![0f32; nf], vec![0f32; nf]);
+                for (t, k) in uses {
+                    me_g.matvec(&curs[t], &mut g);
+                    me_u.matvec(&curs[t], &mut u);
+                    for j in 0..nf { g[j] = swiglu_clamp(g[j], u[j], cfg.clamp_exp[il]); }
+                    let mut d = vec![0f32; n];
+                    me_d.matvec(&g, &mut d);
+                    ds[t][k] = d;
                 }
-                let mut d = vec![0f32; n];
-                me_d.matvec(&g, &mut d);
-                ds[t][k] = d;
+                continue;
+            }
+            let xs: Vec<&[f32]> = uses.iter().map(|&(t, _)| curs[t].as_slice()).collect();
+            let gy = matvec_rows(&me_g, &xs);
+            let uy = matvec_rows(&me_u, &xs);
+            let mut g = vec![0f32; uses.len() * nf];
+            for j in 0..g.len() {
+                g[j] = swiglu_clamp(gy[j], uy[j], cfg.clamp_exp[il]);
+            }
+            let gs: Vec<&[f32]> = g.chunks_exact(nf).collect();
+            let dy = matvec_rows(&me_d, &gs);
+            for (i, &(t, k)) in uses.iter().enumerate() {
+                ds[t][k] = dy[i * n..(i + 1) * n].to_vec();
             }
         }
         let fs = nf * cfg.n_shared;
+        let shared = if batch {
+            let sg = matvec_rows(gsh, &xs);
+            let su = matvec_rows(ush, &xs);
+            let mut g = vec![0f32; curs.len() * fs];
+            for j in 0..g.len() { g[j] = silu(sg[j]) * su[j]; }
+            let gs: Vec<&[f32]> = g.chunks_exact(fs).collect();
+            matvec_rows(dsh, &gs)
+        } else { vec![] };
         curs.iter()
             .enumerate()
             .map(|(t, c)| {
@@ -477,14 +578,18 @@ impl<'a> GlmModel<'a> {
                         out[j] += w * ds[t][k][j];
                     }
                 }
-                let (mut g, mut u) = (vec![0f32; fs], vec![0f32; fs]);
-                gsh.matvec(c, &mut g);
-                ush.matvec(c, &mut u);
-                g.iter_mut().zip(&u).for_each(|(g, u)| *g = silu(*g) * u);
-                let mut d = vec![0f32; n];
-                dsh.matvec(&g, &mut d);
-                for j in 0..n {
-                    out[j] += d[j];
+                if batch {
+                    for j in 0..n { out[j] += shared[t * n + j]; }
+                } else {
+                    let (mut g, mut u) = (vec![0f32; fs], vec![0f32; fs]);
+                    gsh.matvec(c, &mut g);
+                    ush.matvec(c, &mut u);
+                    g.iter_mut().zip(&u).for_each(|(g, u)| *g = silu(*g) * u);
+                    let mut d = vec![0f32; n];
+                    dsh.matvec(&g, &mut d);
+                    for j in 0..n {
+                        out[j] += d[j];
+                    }
                 }
                 out
             })
@@ -561,7 +666,9 @@ impl<'a> GlmModel<'a> {
                 self.step_opt(t, false);
             }
         }
-        self.step_opt(last[0], true)
+        let out = self.step_opt(last[0], true);
+        self.preload_hot();
+        out
     }
 
     fn step_opt(&mut self, tok: u32, want: bool) -> Vec<f32> {
@@ -608,7 +715,8 @@ impl<'a> GlmModel<'a> {
         if std::env::var_os("STRATA_GLM_PROF").is_some() {
             let l = &crate::deepseek::mat::EX_LOOKUPS;
             let (h, m) = (l[0].swap(0, std::sync::atomic::Ordering::Relaxed), l[1].swap(0, std::sync::atomic::Ordering::Relaxed));
-            eprintln!("PROF tok{} total {:.0}ms attn {:.0}ms ffn {:.0}ms expert-cache hit {h} miss {m}", self.toks.len(), tstep.elapsed().as_secs_f64() * 1e3, prof[0] * 1e3, prof[1] * 1e3);
+            let di = crate::deepseek::mat::dev_info();
+            eprintln!("PROF tok{} total {:.0}ms attn {:.0}ms ffn {:.0}ms expert-cache hit {h} miss {m} gpu {di:?}", self.toks.len(), tstep.elapsed().as_secs_f64() * 1e3, prof[0] * 1e3, prof[1] * 1e3);
         }
         if !want {
             return vec![];

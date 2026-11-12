@@ -3,11 +3,9 @@ use super::forward::DsModel;
 use crate::{chat::{Msg, Template}, gguf::{Gguf, Value}, tokenizer::Tokenizer};
 use std::io::{BufRead, Write};
 
-fn gpu_defaults() {
-    // GPU on by default; VRAM expert cache 8 GB (rest of the experts stream through one staging slot).
-    for (k, v) in [("STRATA_DS_GPU", "1"), ("STRATA_DS_GPU_EXPERTS", "9")] {
-        if std::env::var_os(k).is_none() { unsafe { std::env::set_var(k, v) } }
-    }
+pub fn gpu_defaults() {
+    // GPU on by default. The expert cache is sized from free VRAM unless STRATA_DS_GPU_EXPERTS says otherwise.
+    if std::env::var_os("STRATA_DS_GPU").is_none() { unsafe { std::env::set_var("STRATA_DS_GPU", "1") } }
 }
 
 /// `rustingstrata generate`: raw prompt (no template), greedy, prints the continuation.
