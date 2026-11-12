@@ -239,6 +239,9 @@ struct State {
     /// waits before it), names in order, and per-name totals (ns, calls)
     /// printed on drop.
     prof: Option<(vk::QueryPool, Vec<&'static str>, HashMap<&'static str, (u64, usize)>)>,
+    /// The prefill position last read from a `step` buffer, and that buffer's address. A host copy into the buffer
+    /// clears it, so a chunk reads it once, not once per layer.
+    step_pos: Option<(u64, usize)>,
 }
 
 /// Owner of one `Buf`: the buffer and its memory, freed on drop.
@@ -437,7 +440,7 @@ impl Vk {
         let st = State { pool, spare: vec![], used: vec![], cur: None, cond: None, no_cond: false, stalled: false, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false, beside: false, tpool, tcur: None,
             tspare: vec![], tused: vec![], tbytes: 0, tstart: 0, tring: Default::default(), cstaged: false, cval: 0, tval: 0, bwait: 0, twait: 0, tlag: 0,
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
-            prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
+            prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None }, step_pos: None };
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
         let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, wave64, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), smem_limit, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
@@ -734,6 +737,21 @@ impl Inner {
     }
 }
 
+impl Vk {
+    /// `step[0]` on the host, cached until a host copy writes that step buffer. Prefill reads it once per chunk to
+    /// choose how much attention work one submit may hold.
+    fn step_pos(&self, step: u64) -> anyhow::Result<usize> {
+        let st = self.0.st();
+        if let Some((a, p)) = st.step_pos { if a == step { return Ok(p); } }
+        drop(st);
+        let mut b = [0u8; 4];
+        self.dtoh(&Buf::new(step, 4, ()), 0, &mut b)?;
+        let p = i32::from_le_bytes(b).max(0) as usize;
+        self.0.st().step_pos = Some((step, p));
+        Ok(p)
+    }
+}
+
 /// A push constant argument: pointers are u64, the rest 32-bit, each at its natural alignment (std430).
 trait Arg { fn put(&self, v: &mut Vec<u8>); }
 impl Arg for u64 { fn put(&self, v: &mut Vec<u8>) { v.resize(v.len().next_multiple_of(8), 0); v.extend(self.to_le_bytes()) } }
@@ -900,6 +918,7 @@ impl Backend for Vk {
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
         ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
         let mut st = self.0.st();
+        if st.step_pos.is_some_and(|(a, _)| dst.addr() + off as u64 == a) { st.step_pos = None; }
         // A small copy goes inline into the open command buffer, with no staging round trip and no wait: the next
         // submit (a graph replay or a flush) carries it.
         if !src.is_empty() && src.len() <= 65536 && src.len() % 4 == 0 && st.rec.is_none() {
@@ -1194,24 +1213,47 @@ impl Backend for Vk {
     fn attn_prefill_m(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32, qm: u64, mw: usize) -> anyhow::Result<()> {
         let name = match hd { 64 => "attn_prefill_64", 128 => "attn_prefill_128", 256 => "attn_prefill_256",
             _ => anyhow::bail!("attention prefill: head_dim {hd} unsupported (64, 128 or 256)") };
-        if self.0.llama != 0 {
-            return self.run("attn_prefill_llama", &[0, hd as u32], [t, nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32)]);
-        }
-        if !self.0.coop {
-            if self.0.dp_tile {
-                // One workgroup: 32 (query, head) tasks of one KV head, sharing a 32 KB K/V tile. hper query heads
-                // per KV head, bq queries each; h groups when there are more than 32 heads per KV head.
-                let g = nh / nkv;
-                let hper = g.min(32);
-                let bq = 32 / hper;
-                let hgroups = g.div_ceil(hper);
-                return self.run("attn_prefill_tile", &[0, hd as u32], [t.div_ceil(bq), nkv * hgroups, 1],
-                    &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32),
-                      &(bq as u32), &(hper as u32), &(hgroups as u32)]);
+        if t == 0 { return Ok(()); }
+        // A chunk's prefill attention is t * (pos + t) query-key pairs, which can grow past amdgpu's 10 s job timeout
+        // at a long context. Cut it into query slices, each its own submit, so no one job runs that long. The budget
+        // is query-key pairs per slice; STRATA_VK_ATTN_BUDGET overrides it (0 turns slicing off). 2^30 does not split
+        // the reported chunk 4096 at position 131072, so the default is 2^28: about 0.45 s on the 3060, and about
+        // 3.5 s at the 8x slower AMD pace the report implies.
+        let pos = self.step_pos(step)?;
+        let budget = std::env::var("STRATA_VK_ATTN_BUDGET").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1 << 28);
+        let per_slice = if budget == 0 { t } else { (budget / pos.saturating_add(t).max(1)).max(1).min(t) };
+        let sliced = per_slice < t;
+        let run = |q_off: usize, n: usize| -> anyhow::Result<()> {
+            let q = q + (4 * nh * hd) as u64 * q_off as u64;
+            let out = out + (4 * nh * hd) as u64 * q_off as u64;
+            let qg = if qg != 0 { qg + (4 * nh * 2 * hd) as u64 * q_off as u64 } else { 0 };
+            if self.0.llama != 0 {
+                return self.run("attn_prefill_llama", &[0, hd as u32], [n, nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(n as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32), &(q_off as u32)]);
             }
-            return self.run("attn_prefill_dp", &[0, (hd / 32) as u32], [t.div_ceil(4), nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32)]);
+            if !self.0.coop {
+                if self.0.dp_tile {
+                    // One workgroup: 32 (query, head) tasks of one KV head, sharing a 32 KB K/V tile. hper query heads
+                    // per KV head, bq queries each; h groups when there are more than 32 heads per KV head.
+                    let g = nh / nkv;
+                    let hper = g.min(32);
+                    let bq = 32 / hper;
+                    let hgroups = g.div_ceil(hper);
+                    return self.run("attn_prefill_tile", &[0, hd as u32], [n.div_ceil(bq), nkv * hgroups, 1],
+                        &[&q, &kc, &vc, &qg, &out, &step, &(n as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32),
+                          &(bq as u32), &(hper as u32), &(hgroups as u32), &(q_off as u32)]);
+                }
+                return self.run("attn_prefill_dp", &[0, (hd / 32) as u32], [n.div_ceil(4), nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(n as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32), &(q_off as u32)]);
+            }
+            self.run(name, &[], [n.div_ceil(64), nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(n as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32), &(q_off as u32)])
+        };
+        for q_off in (0..t).step_by(per_slice) {
+            run(q_off, per_slice.min(t - q_off))?;
+            if sliced {
+                let mut st = self.0.st();
+                self.0.submit(&mut st, None, false)?;
+            }
         }
-        self.run(name, &[], [t.div_ceil(64), nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32)])
+        Ok(())
     }
     fn moe_combine_seq(&self, x: u64, ye: u64, wts: u64, inv: u64, k: usize, sh: u64, sg: u64, n: usize, t: usize) -> anyhow::Result<()> {
         self.run("moe_combine_seq", &[], [(t * n).div_ceil(256), 1, 1], &[&x, &ye, &wts, &inv, &sh, &sg, &(k as u32), &(n as u32), &(t as u32)])

@@ -548,13 +548,16 @@ fn gemm_expert_throughput() {
 /// splits empty.
 #[test]
 fn attn_prefill_matches_decode() {
+    // A low budget makes the 64K-position case below take a sliced path; the other cases stay under it.
+    unsafe { std::env::set_var("STRATA_VK_ATTN_BUDGET", "1048576") };
     let (mut first, mut first_pf) = (std::collections::HashMap::new(), std::collections::HashMap::new());
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
         eprintln!("backend {bk}");
         // Long contexts give each split several 32-position chunks.
         for (pos0, t, nh, nkv, hd) in [(5, 100, 4, 2, 64), (5, 100, 4, 2, 128), (5, 100, 4, 2, 256), (5, 100, 16, 2, 256),
-                                       (5, 100, 8, 8, 128), (5, 100, 32, 8, 128), (2100, 3, 32, 8, 128), (1000, 3, 16, 2, 256), (0, 40, 24, 2, 256)] {
+                                       (5, 100, 8, 8, 128), (5, 100, 32, 8, 128), (2100, 3, 32, 8, 128), (1000, 3, 16, 2, 256), (0, 40, 24, 2, 256),
+                                       (65536, 20, 2, 2, 64)] {
             let n = (pos0 + t) * nkv * hd;
             let (kf, vf) = (xs(n), xs(n + 5)[5..].to_vec());
             let (dk, dv) = (gpu.zeros::<u16>(n).unwrap(), gpu.zeros::<u16>(n).unwrap());
@@ -665,10 +668,47 @@ fn attn_prefill_matches_decode() {
             }
         }
     }
+    unsafe { std::env::remove_var("STRATA_VK_ATTN_BUDGET") };
 }
 
-/// A QSA mask with every block selected leaves `attn_prefill_m` equal to `attn_prefill` (the tiled no-coop fallback
-/// uses the same mask rows as the other prefill kernels).
+/// A first key whose score is far below the others: the no-coop online softmax must not start its accumulator at
+/// zero and multiply it by `exp(0 - score)` = inf (issue #25, the `STRATA_VK_NO_COOP=1` non-finite hidden state).
+#[test]
+fn attn_prefill_extreme_first_key() {
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        eprintln!("backend {bk}");
+        let (t, nh, nkv, hd) = (8, 1, 1, 64);
+        let n = t * nkv * hd;
+        // Key 0 is -1 in every dim, the others are 0: query 0 scores 16 * 64 / 8 = 128 below the rest.
+        let mut kf = vec![0.0f32; n];
+        for k in kf.iter_mut().take(hd) { *k = -1.0; }
+        let vf: Vec<f32> = xs(n + 7)[7..].to_vec();
+        let (dk, dv) = (gpu.zeros::<u16>(n).unwrap(), gpu.zeros::<u16>(n).unwrap());
+        let step = up(gpu, &[0i32]);
+        gpu.kv_store(up(gpu, &kf).addr(), up(gpu, &vf).addr(), dk.addr(), dv.addr(), nkv * hd, t, step.addr(), hd).unwrap();
+        let mut q = vec![0.0f32; t * nh * hd];
+        for v in q.iter_mut().take(hd) { *v = 16.0; }
+        let dq = up(gpu, &q);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let dout = gpu.zeros::<f32>(t * nh * hd).unwrap();
+        match gpu.attn_prefill(dq.addr(), dk.addr(), dv.addr(), 0, dout.addr(), step.addr(), t, nh, nkv, hd, scale) {
+            Err(e) if format!("{e}").contains("not implemented") => { eprintln!("attn_prefill: {e}"); continue; }
+            r => r.unwrap(),
+        }
+        let out = down::<f32>(gpu, &dout);
+        assert!(out.iter().all(|x| x.is_finite()), "{bk} attn_prefill extreme first key: non-finite output");
+        // Query 0 sees only key 0, so its output is V[0] as rounded by the f16 cache.
+        for (a, b) in out[..hd].iter().zip(&vf[..hd]) {
+            let e = f16r(*b);
+            assert!((a - e).abs() <= 1e-6 + 1e-6 * e.abs(), "{bk} attn_prefill extreme first key: {a} vs {e}");
+        }
+    }
+}
+
+/// A QSA mask with every block selected leaves `attn_prefill_m` equal to `attn_prefill`, and a nontrivial mask gives
+/// the same rows when attention is sliced (`q_off`; the tiled no-coop fallback uses the same mask rows as the other
+/// prefill kernels).
 #[test]
 fn attn_prefill_qsa_mask_all_ones_matches_unmasked() {
     for (bk, gpu) in common::backends() {
@@ -695,6 +735,25 @@ fn attn_prefill_qsa_mask_all_ones_matches_unmasked() {
             dmask.addr(), mw).unwrap();
         let e = rel_l2(&down::<f32>(gpu, &got_buf), &want);
         assert!(e <= 1e-6, "{bk} attn_prefill all-ones mask: rel err {e}");
+        // A nontrivial mask gives the same rows when attention is sliced: each slice's mask row is q_off + q.
+        let mut pat = vec![0u32; t.next_multiple_of(64) * mw];
+        for r in 0..t {
+            for k in [0, pos0 + r / 2, pos0 + r] {
+                pat[r * mw + k / 128] |= 1 << ((k / 4) & 31);
+            }
+        }
+        let dpat = up(gpu, &pat);
+        let want_buf = gpu.zeros::<f32>(t * nh * hd).unwrap();
+        unsafe { std::env::set_var("STRATA_VK_ATTN_BUDGET", "0") };
+        gpu.attn_prefill_m(dq.addr(), dk.addr(), dv.addr(), 0, want_buf.addr(), step.addr(), t, nh, nkv, hd, scale,
+            dpat.addr(), mw).unwrap();
+        let want = down::<f32>(gpu, &want_buf);
+        let got_buf = gpu.zeros::<f32>(t * nh * hd).unwrap();
+        unsafe { std::env::set_var("STRATA_VK_ATTN_BUDGET", "1000") };
+        gpu.attn_prefill_m(dq.addr(), dk.addr(), dv.addr(), 0, got_buf.addr(), step.addr(), t, nh, nkv, hd, scale,
+            dpat.addr(), mw).unwrap();
+        assert_eq!(down::<f32>(gpu, &got_buf), want, "{bk} attn_prefill sliced mask");
+        unsafe { std::env::remove_var("STRATA_VK_ATTN_BUDGET") };
     }
 }
 
