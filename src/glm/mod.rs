@@ -365,12 +365,15 @@ fn stop_ids(g: &Gguf, tok: &crate::tokenizer::Tokenizer) -> Vec<u32> {
     e
 }
 
-fn gpu_defaults() {
+pub fn gpu_defaults() {
     if std::env::var_os("STRATA_GLM_CPU").is_some() { return; }
-    // VRAM budget is absolute (includes the ~non-expert weights): 11.5 GB gave the best hit rate on a 12 GB card.
-    for (k, v) in [("STRATA_DS_GPU", "1"), ("STRATA_DS_GPU_EXPERTS", "11")] {
-        if std::env::var_os(k).is_none() { unsafe { std::env::set_var(k, v) } }
-    }
+    // The VRAM budget (plain weights plus expert cache) is sized from free VRAM unless STRATA_DS_GPU_EXPERTS says
+    // otherwise. GLM keeps its tuned 90% share (the old 11 GB default on a 12 GB card).
+    if std::env::var_os("STRATA_DS_GPU").is_none() { unsafe { std::env::set_var("STRATA_DS_GPU", "1") } }
+    if std::env::var_os("STRATA_DS_GPU_FRACTION").is_none() { unsafe { std::env::set_var("STRATA_DS_GPU_FRACTION", "0.9") } }
+    // Read the next two layers' predicted expert pages while this one computes (two layers is enough to cover the
+    // SSD latency; farther ahead evicts the pages the current layer needs).
+    if std::env::var_os("STRATA_GLM_PREFETCH").is_none() { unsafe { std::env::set_var("STRATA_GLM_PREFETCH", "2") } }
 }
 
 /// Context limit per request: the model's trained context, or `STRATA_GLM_CTX`.
