@@ -9,7 +9,7 @@ layout(local_size_x = 1024) in;
 layout(constant_id = 1) const uint HD = 128;  // 64, 128 or 256 (host spec constant)
 const uint PER = HD / 32;                     // dimensions per lane
 const uint BK = 8192 / HD;                    // keys per tile: 32, 64 or 128; 32 KB of f16 K plus V
-layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 qg; F32 o; I32 step; uint t; uint nh; uint nkv; float scale; U32 qm; uint mw; uint bq; uint hper; uint hgroups; } p;
+layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 qg; F32 o; I32 step; uint t; uint nh; uint nkv; float scale; U32 qm; uint mw; uint bq; uint hper; uint hgroups; uint q_off; } p;
 // K and V rows of the current key tile, all f16 (also with KV_Q8: ldkv rounds to f16, so this is exact).
 shared float16_t sk[8192], sv[8192];
 
@@ -23,7 +23,7 @@ void main() {
     uint h = kvh * g + head_group * p.hper + head_local, q = q0 + q_local;
     bool live = q < p.t && head_local < p.hper && head_group * p.hper + head_local < g;
     uint qr = min(q, p.t - 1), hr = min(h, p.nh - 1);  // inactive tasks still form a safe address below
-    uint pos0 = uint(p.step.v[0]), last_max = pos0 + min(q0 + p.bq, p.t) - 1, last_q = pos0 + q;
+    uint pos0 = uint(p.step.v[0]), last_max = pos0 + p.q_off + min(q0 + p.bq, p.t) - 1, last_q = pos0 + p.q_off + q;
     uint kvd = p.nkv * HD, kvo = kvh * HD;
     float qv[PER], acc[PER], m = 0.0, l = 0.0;
     bool first = true;
@@ -45,11 +45,11 @@ void main() {
         barrier();
         if (live) for (uint r = 0; r < BK; r++) {
             uint k = k0 + r;
-            if (k > last_q || (uint64_t(p.qm) != 0 && !qsa_bit(p.qm, p.mw, q, k))) continue;
+            if (k > last_q || (uint64_t(p.qm) != 0 && !qsa_bit(p.qm, p.mw, p.q_off + q, k))) continue;
             float s = 0.0;
             [[unroll]] for (uint j = 0; j < PER; j++) s += qv[j] * float(sk[r * HD + lane + 32 * j]);
             s = W64 ? warp_sum(s) : subgroupAdd(s);
-            float mn = first ? s : max(m, s), c = expf_(m - mn), e = expf_(s - mn);
+            float mn = first ? s : max(m, s), c = first ? 0.0 : expf_(m - mn), e = expf_(s - mn);
             l = first ? e : fma(l, c, e);
             first = false;
             [[unroll]] for (uint j = 0; j < PER; j++) acc[j] = fma(e, float(sv[r * HD + lane + 32 * j]), acc[j] * c);
