@@ -16,6 +16,14 @@ pub fn is_default_model(p: &std::path::Path) -> bool {
     d
 }
 
+/// A sibling `mmproj` next to the model (`find_sibling`), or `None` when the directory has none.
+pub fn mmproj_path() -> Option<std::path::PathBuf> {
+    let p = model_path()?;
+    let s = rusting_strata::vision::find_sibling(&p);
+    if s.is_none() { eprintln!("SKIP: no sibling mmproj next to {}", p.display()); }
+    s
+}
+
 /// Held by tests that load the whole model on the GPU: two at once do not fit in 12 GB.
 pub fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

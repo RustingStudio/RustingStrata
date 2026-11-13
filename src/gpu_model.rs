@@ -5,7 +5,7 @@ use crate::config::LayerKind;
 use crate::cpu_worker::{CpuWorker, TMAX};
 use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, Backend, Buf, GpuTensor};
 use crate::expert_cache::ExpertCache;
-use crate::model::Model;
+use crate::model::{LayerState, Model, State};
 use crate::ops::Sampler;
 use crate::quant::GgmlType;
 use anyhow::{bail, ensure, Context};
@@ -163,6 +163,10 @@ pub struct GpuModel<'a> {
     slots: Buf,
     /// [position, CPU worker seq] for the current token, read by kernels so the graph can replay.
     step_buf: Buf,
+    /// [RoPE position, seq] for the current token when the RoPE position differs from the KV row (image prompts).
+    rope_buf: Buf,
+    /// RoPE position minus KV row for the next token (0 for text-only).
+    pub rope_offset: i32,
     /// DeltaNet (conv, s) copies per recurrent layer and the position, for `restore_state`.
     saved: Vec<(Buf, Buf)>,
     saved_pos: usize,
@@ -382,6 +386,7 @@ impl<'a> GpuModel<'a> {
         let (x, logits, ids) = (gpu.zeros::<f32>(TMAX * hcn * c.n_embd)?, gpu.zeros::<f32>(TMAX * c.n_vocab)?, gpu.zeros::<i32>(TMAX * ke)?);
         let amax = gpu.zeros::<i32>(TMAX)?;
         let (slots, step_buf) = (gpu.zeros::<i32>(TMAX * ke)?, gpu.zeros::<i32>(2 * TMAX)?);
+        let rope_buf = gpu.zeros::<i32>(2 * TMAX)?;
         // Hyper-connection prefill scratch is ~4x larger a token, so a large chunk leaves fewer expert slots: qwen4exp at
         // 943 tokens (warm) prefills 447 tok/s with 1024, 347 with 4096. Long prompts gain (each chunk restages the experts
         // not resident: Flash-Next at 4764 tokens 132 -> 158 tok/s on a 3060), so `calibrate` picks per machine.
@@ -443,7 +448,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None,
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None,
                       cur: 0, seqs, rows: vec![], row_tokens: 0 })
     }
 
@@ -462,6 +467,53 @@ impl<'a> GpuModel<'a> {
         self.ple_prev = [-1, -1];
         if let Some(n) = self.next.as_mut() { n.reset()?; }
         Ok(())
+    }
+
+    /// Load a CPU prefill state (image prompts): copy its KV and recurrent state into this part, set the KV row and
+    /// the RoPE offset. The CPU state must come from `vision::feed_prompt` on the same model.
+    pub fn load_state(&mut self, st: &State) -> anyhow::Result<()> {
+        let c = &self.m.cfg;
+        ensure!(c.n_embd_ple == 0, "image input is not supported for PLE models");
+        ensure!(c.idx_top_k == 0, "image input is not supported for QSA models");
+        self.reset()?;
+        self.ple_prev = st.ple_prev;
+        self.pos = st.pos;
+        self.rope_offset = st.rope_pos[0] - st.pos as i32;
+        self.rows.clear();
+        self.parked.clear();
+        // The draft head's cache and position are not carried over; image prompts decode without MTP.
+        self.mtp = None;
+        let (kv, hd) = (c.n_head_kv * c.head_dim, c.head_dim);
+        self.gpu.put(&[0, 0], &self.step_buf, 0)?;
+        let kbuf = self.gpu.alloc(st.pos.max(1) * kv * 4)?;
+        let vbuf = self.gpu.alloc(st.pos.max(1) * kv * 4)?;
+        for (i, l) in self.layers.iter().enumerate() {
+            match (&l.mixer, st.layers.get(self.first + i).context("load_state: layer count")?) {
+                (Mixer::Delta { conv, s, .. }, LayerState::Recurrent { conv: c0, s: s0 }) => {
+                    self.gpu.put(c0, &conv[self.cur], 0)?;
+                    self.gpu.put(s0, &s[self.cur], 0)?;
+                }
+                (Mixer::Attn { kc, vc, qsa, .. }, LayerState::Attn { k, v, .. }) => {
+                    ensure!(qsa.is_none(), "image input is not supported for QSA models");
+                    ensure!(k.len() == st.pos * kv && v.len() == st.pos * kv, "load_state: KV size {}x{}", k.len(), v.len());
+                    self.gpu.put(k, &kbuf, 0)?;
+                    self.gpu.put(v, &vbuf, 0)?;
+                    self.gpu.kv_store(kbuf.addr(), vbuf.addr(), kc[self.cur].addr(), vc[self.cur].addr(), kv, st.pos, self.step_buf.addr(), hd)?;
+                }
+                _ => bail!("load_state: layer {} kind mismatch", self.first + i),
+            }
+        }
+        if let Some(n) = self.next.as_mut() { n.load_state(st)?; }
+        Ok(())
+    }
+
+    /// Run an image prompt on the CPU model, load its state into this part and return its last logits. Decode after
+    /// this on the GPU; `step` uses the RoPE offset for text positions past the image.
+    pub fn prefill_image(&mut self, p: &crate::vision::Prompt, embs: &[Vec<Vec<f32>>]) -> anyhow::Result<Vec<f32>> {
+        let mut st = State::new(&self.m.cfg);
+        let logits = crate::vision::feed_prompt(self.m, &mut st, p, embs)?;
+        self.load_state(&st)?;
+        Ok(logits)
     }
 
     /// Slots (`load_slots`).
@@ -533,6 +585,7 @@ impl<'a> GpuModel<'a> {
         let nt = rows.len();
         let seq = self.begin_seq();
         self.gpu.put(&pos.iter().flat_map(|&p| [p as i32, seq as i32]).collect::<Vec<_>>(), &self.step_buf, 0)?;
+        self.gpu.put(&pos.iter().flat_map(|&p| [p as i32 + self.rope_offset, seq as i32]).collect::<Vec<_>>(), &self.rope_buf, 0)?;
         self.rows = rows.iter().zip(pos).map(|(r, &p)| (r.0, p)).collect();
         const _: () = assert!(TMAX <= 4, "step_rows graph key");
         let mut key = 1 << 63 | nt as u64;
@@ -594,6 +647,7 @@ impl<'a> GpuModel<'a> {
         let seq = self.begin_seq();
         self.put_embed(&[token])?;
         self.gpu.put(&[self.pos as i32, seq as i32], &self.step_buf, 0)?;
+        self.gpu.put(&[self.pos as i32 + self.rope_offset, seq as i32], &self.rope_buf, 0)?;
         self.pass(1)?;
         let t = self.tail();
         let mut logits = t.gpu.get::<f32>(&t.logits, 0, self.m.cfg.n_vocab)?;
@@ -644,7 +698,9 @@ impl<'a> GpuModel<'a> {
         let seq = self.begin_seq();
         self.put_embed(tokens)?;
         let steps: Vec<i32> = (0..nt).flat_map(|t| [(self.pos + t) as i32, seq as i32]).collect();
+        let rope: Vec<i32> = (0..nt).flat_map(|t| [(self.pos + t) as i32 + self.rope_offset, seq as i32]).collect();
         self.gpu.put(&steps, &self.step_buf, 0)?;
+        self.gpu.put(&rope, &self.rope_buf, 0)?;
         self.pass(nt)
     }
 
@@ -1043,6 +1099,7 @@ impl<'a> GpuModel<'a> {
         let c = &self.m.cfg;
         let (g, eps, ne) = (&self.gpu, c.eps, c.n_embd);
         let p = |n: &str| self.bufs[n].addr();
+        let rope = self.rope_buf.addr();
         // Inputs from "h" are quantized once ("hq", after each norm) instead of once per GEMV block.
         let mv = |w: &GpuTensor, x: &str, xs: usize, y: &str, ys: usize|
             if x == "h" { g.gemvq(w, p(x), xs, p("hq"), p(y), ys, nt) } else { self.mv(w, p(x), xs, p(y), ys, nt) };
@@ -1113,8 +1170,16 @@ impl<'a> GpuModel<'a> {
                         let at = |n: &str, r: usize, w: usize| p(n) + (4 * r * w) as u64;
                         g.batch(&mut || {
                             for (r, &(sl, _)) in self.rows.iter().enumerate() {
-                                g.rms_norm_rope_qk(at("qg", r, nh * qs), qs, qn.ptr, at("q", r, nh * hd), nh, nh, at("kraw", r, kv), kn.ptr, at("k", r, kv), nkv, nkv,
-                                                   hd, eps, c.n_rot, step + 8 * r as u64, c.rope_base, at("v", r, kv), kc[sl].addr(), vc[sl].addr())?;
+                                if self.rope_offset == 0 {
+                                    g.rms_norm_rope_qk(at("qg", r, nh * qs), qs, qn.ptr, at("q", r, nh * hd), nh, nh, at("kraw", r, kv), kn.ptr, at("k", r, kv), nkv, nkv,
+                                                       hd, eps, c.n_rot, step + 8 * r as u64, c.rope_base, at("v", r, kv), kc[sl].addr(), vc[sl].addr())?;
+                                } else {
+                                    g.rms_norm(at("qg", r, nh * qs), qs, qn.ptr, at("q", r, nh * hd), hd, hd, nh, eps)?;
+                                    g.rope_neox(at("q", r, nh * hd), hd, nh, nh, c.n_rot, rope + 8 * r as u64, c.rope_base)?;
+                                    g.rms_norm(at("kraw", r, kv), hd, kn.ptr, at("k", r, kv), hd, hd, nkv, eps)?;
+                                    g.rope_neox(at("k", r, kv), hd, nkv, nkv, c.n_rot, rope + 8 * r as u64, c.rope_base)?;
+                                    g.kv_store(at("k", r, kv), at("v", r, kv), kc[sl].addr(), vc[sl].addr(), kv, 1, step + 8 * r as u64, hd)?;
+                                }
                             }
                             Ok(())
                         })?;
@@ -1124,14 +1189,24 @@ impl<'a> GpuModel<'a> {
                         }
                         mv(o, "att", nh * hd, "mix", ne)?;
                     } else {
-                    g.batch(&mut || g.rms_norm_rope_qk(p("qg"), qs, qn.ptr, p("q"), nt * nh, nh, p("kraw"), kn.ptr, p("k"), nt * nkv, nkv,
-                                                       hd, eps, c.n_rot, step, c.rope_base, p("v"), kc[self.cur].addr(), vc[self.cur].addr()))?;
+                    if self.rope_offset == 0 {
+                        g.batch(&mut || g.rms_norm_rope_qk(p("qg"), qs, qn.ptr, p("q"), nt * nh, nh, p("kraw"), kn.ptr, p("k"), nt * nkv, nkv,
+                                                           hd, eps, c.n_rot, step, c.rope_base, p("v"), kc[self.cur].addr(), vc[self.cur].addr()))?;
+                    } else {
+                        g.batch(&mut || {
+                            g.rms_norm(p("qg"), qs, qn.ptr, p("q"), hd, hd, nt * nh, eps)?;
+                            g.rope_neox(p("q"), hd, nt * nh, nh, c.n_rot, rope, c.rope_base)?;
+                            g.rms_norm(p("kraw"), hd, kn.ptr, p("k"), hd, hd, nt * nkv, eps)?;
+                            g.rope_neox(p("k"), hd, nt * nkv, nkv, c.n_rot, rope, c.rope_base)?;
+                            g.kv_store(p("k"), p("v"), kc[self.cur].addr(), vc[self.cur].addr(), kv, nt, step, hd)
+                        })?;
+                    }
                     let (sel, sst) = match (qsa, &self.qsa) {
                         (Some(a), Some(b)) => {
                             mv2(&a.qp, &a.kp, "iq", "ik")?;
                             g.qsa_pool(p("ik"), a.ring, a.pool.addr(), a.kn.ptr, step, nt, c.n_rot, c.rope_base, eps)?;
                             g.rms_norm(p("iq"), QSA_D, a.qn.ptr, p("iqn"), QSA_D, QSA_D, nt * QSA_H, eps)?;
-                            g.rope_neox(p("iqn"), QSA_D, nt * QSA_H, QSA_H, c.n_rot, step, c.rope_base)?;
+                            g.rope_neox(p("iqn"), QSA_D, nt * QSA_H, QSA_H, c.n_rot, rope, c.rope_base)?;
                             g.qsa_select(p("iqn"), a.pool.addr(), b.score.addr(), b.sel.addr(), 0, step, 0, nt, b.nbs, b.top, b.sst, 0)?;
                             (b.sel.addr(), b.sst)
                         }

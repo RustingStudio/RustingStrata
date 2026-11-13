@@ -19,3 +19,14 @@ fn matches_llama_cpp() {
     }
     assert!(!tok.eos_ids().is_empty());
 }
+
+#[test]
+fn vision_special_tokens_are_atomic() {
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let (Some(start), Some(pad), Some(end)) = (
+        tok.token_id("<|vision_start|>"), tok.token_id("<|image_pad|>"), tok.token_id("<|vision_end|>"),
+    ) else { eprintln!("skip: model has no vision tokens"); return };
+    assert_eq!(tok.encode("<|vision_start|><|image_pad|><|vision_end|>").unwrap(), [start, pad, end]);
+}
