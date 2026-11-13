@@ -21,14 +21,14 @@ struct Layer<'a> {
     up: Mat<'a>,
     down: Mat<'a>,
     post_ffw_norm: Vec<f32>,
-    post_ffw_norm_1: Vec<f32>,
-    pre_ffw_norm_2: Vec<f32>,
-    post_ffw_norm_2: Vec<f32>,
-    router: Mat<'a>,
-    router_scale: Vec<f32>,
-    gate_up: Mat<'a>,
-    down_exps: Mat<'a>,
-    down_scale: Vec<f32>,
+    post_ffw_norm_1: Option<Vec<f32>>,
+    pre_ffw_norm_2: Option<Vec<f32>>,
+    post_ffw_norm_2: Option<Vec<f32>>,
+    router: Option<Mat<'a>>,
+    router_scale: Option<Vec<f32>>,
+    gate_up: Option<Mat<'a>>,
+    down_exps: Option<Mat<'a>>,
+    down_scale: Option<Vec<f32>>,
     out_scale: f32,
 }
 
@@ -77,6 +77,8 @@ impl<'a> Gemma4Model<'a> {
         for il in 0..cfg.n_layer {
             let m = |n: &str| Mat::load(g, &format!("blk.{il}.{n}"));
             let v = |n: &str| vec_f32(g, &format!("blk.{il}.{n}"));
+            let om = |n: &str| -> Result<Option<Mat<'a>>> { Ok(if g.tensors.contains_key(&format!("blk.{il}.{n}")) { Some(m(n)?) } else { None }) };
+            let ov = |n: &str| -> Result<Option<Vec<f32>>> { Ok(if g.tensors.contains_key(&format!("blk.{il}.{n}")) { Some(v(n)?) } else { None }) };
             layers.push(Layer {
                 attn_norm: v("attn_norm.weight")?,
                 wq: m("attn_q.weight")?,
@@ -91,14 +93,14 @@ impl<'a> Gemma4Model<'a> {
                 up: m("ffn_up.weight")?,
                 down: m("ffn_down.weight")?,
                 post_ffw_norm: v("post_ffw_norm.weight")?,
-                post_ffw_norm_1: v("post_ffw_norm_1.weight")?,
-                pre_ffw_norm_2: v("pre_ffw_norm_2.weight")?,
-                post_ffw_norm_2: v("post_ffw_norm_2.weight")?,
-                router: m("ffn_gate_inp.weight")?,
-                router_scale: v("ffn_gate_inp.scale")?,
-                gate_up: m("ffn_gate_up_exps.weight")?,
-                down_exps: m("ffn_down_exps.weight")?,
-                down_scale: v("ffn_down_exps.scale")?,
+                post_ffw_norm_1: ov("post_ffw_norm_1.weight")?,
+                pre_ffw_norm_2: ov("pre_ffw_norm_2.weight")?,
+                post_ffw_norm_2: ov("post_ffw_norm_2.weight")?,
+                router: om("ffn_gate_inp.weight")?,
+                router_scale: ov("ffn_gate_inp.scale")?,
+                gate_up: om("ffn_gate_up_exps.weight")?,
+                down_exps: om("ffn_down_exps.weight")?,
+                down_scale: ov("ffn_down_exps.scale")?,
                 out_scale: v("layer_output_scale.weight")?[0],
             });
         }
@@ -203,17 +205,23 @@ impl<'a> Gemma4Model<'a> {
         g.iter_mut().zip(u).for_each(|(g, u)| *g = gelu(*g) * u);
         let mut mlp = vec![0f32; n];
         l.down.matvec(&g, &mut mlp);
+        if cfg.n_expert == 0 {
+            let mut out = vec![0f32; n];
+            rms_norm_w(&mlp, &l.post_ffw_norm, eps, &mut out);
+            self.tr("ffn_out", il as i32, &out);
+            return out;
+        }
         let mut mlp_n = vec![0f32; n];
-        rms_norm_w(&mlp, &l.post_ffw_norm_1, eps, &mut mlp_n);
+        rms_norm_w(&mlp, l.post_ffw_norm_1.as_ref().expect("expert FFN has no post_ffw_norm_1"), eps, &mut mlp_n);
         self.tr("ffn_mlp", il as i32, &mlp_n);
 
         // router sees the unweighted-normed attention output scaled by 1/sqrt(n_embd) and the learned scale
         let mut t = vec![0f32; n];
         rms_norm(x, eps, &mut t);
         let s = 1.0 / (n as f32).sqrt();
-        t.iter_mut().zip(&l.router_scale).for_each(|(t, w)| *t *= s * w);
+        t.iter_mut().zip(l.router_scale.as_ref().expect("expert FFN has no router scale")).for_each(|(t, w)| *t *= s * w);
         let mut logits = vec![0f32; cfg.n_expert];
-        l.router.matvec(&t, &mut logits);
+        l.router.as_ref().expect("expert FFN has no router").matvec(&t, &mut logits);
         self.tr("ffn_moe_logits", il as i32, &logits);
         let sel = route(&logits, cfg.n_used);
         let ids: Vec<f32> = sel.iter().map(|s| s.0 as f32).collect();
@@ -221,15 +229,15 @@ impl<'a> Gemma4Model<'a> {
 
         let mut t1 = std::time::Instant::now();
         let mut moe_in = vec![0f32; n];
-        rms_norm_w(x, &l.pre_ffw_norm_2, eps, &mut moe_in);
+        rms_norm_w(x, l.pre_ffw_norm_2.as_ref().expect("expert FFN has no pre_ffw_norm_2"), eps, &mut moe_in);
         lap(3, &mut t1);
         let nf = cfg.n_ff_exp;
         let mut moe = vec![0f32; n];
         let mut cpu_sel = vec![];
         let mut gpu_sel = vec![];
         for (e, w) in sel {
-            let (gu_m, dn_m) = (l.gate_up.expert(e, cfg.n_expert), l.down_exps.expert(e, cfg.n_expert));
-            let sc = w * l.down_scale[e];
+            let (gu_m, dn_m) = (l.gate_up.as_ref().expect("expert FFN has no gate_up").expert(e, cfg.n_expert), l.down_exps.as_ref().expect("expert FFN has no down_exps").expert(e, cfg.n_expert));
+            let sc = w * l.down_scale.as_ref().expect("expert FFN has no down_scale")[e];
             if gu_m.gpu.is_some() || dn_m.gpu.is_some() { gpu_sel.push((gu_m, dn_m, sc)); } else { cpu_sel.push((gu_m, dn_m, sc)); }
         }
         if !gpu_sel.is_empty() {
@@ -277,7 +285,7 @@ impl<'a> Gemma4Model<'a> {
         lap(5, &mut t1);
         PROF[3].fetch_add(0, std::sync::atomic::Ordering::Relaxed);
         let mut moe_n = vec![0f32; n];
-        rms_norm_w(&moe, &l.post_ffw_norm_2, eps, &mut moe_n);
+        rms_norm_w(&moe, l.post_ffw_norm_2.as_ref().expect("expert FFN has no post_ffw_norm_2"), eps, &mut moe_n);
         self.tr("ffn_moe", il as i32, &moe_n);
         let sum: Vec<f32> = mlp_n.iter().zip(&moe_n).map(|(a, b)| a + b).collect();
         let mut out = vec![0f32; n];
@@ -296,14 +304,32 @@ impl<'a> Gemma4Model<'a> {
         self.step_opt(last[0], true)
     }
 
+    /// Feed one token whose input embedding is supplied by the caller (the vision projector). The token
+    /// id only records the sequence; the embedding is used as-is, as llama.cpp does for embedding batches.
+    pub fn step_embed(&mut self, tok: u32, emb: &[f32]) -> Vec<f32> { self.step_embed_opt(tok, emb, true) }
+
+    /// `step_embed` without the output head unless `want` is set (prompt ingestion).
+    pub fn step_embed_opt(&mut self, tok: u32, emb: &[f32], want: bool) -> Vec<f32> {
+        assert_eq!(emb.len(), self.cfg.n_embd, "step_embed: embedding width");
+        self.forward(tok, emb.to_vec(), want)
+    }
+
+    /// `step` without the output head unless `want` is set (prompt ingestion).
+    pub fn step_opt_pub(&mut self, tok: u32, want: bool) -> Vec<f32> { self.step_opt(tok, want) }
+
     fn step_opt(&mut self, tok: u32, want: bool) -> Vec<f32> {
         let n = self.cfg.n_embd;
-        let pos = self.toks.len();
-        self.toks.push(tok);
         let mut x = vec![0f32; n];
         self.tok_embd.row_into(tok as usize, &mut x);
         let sc = (n as f32).sqrt();
         x.iter_mut().for_each(|v| *v *= sc);
+        self.forward(tok, x, want)
+    }
+
+    fn forward(&mut self, tok: u32, mut x: Vec<f32>, want: bool) -> Vec<f32> {
+        let n = self.cfg.n_embd;
+        let pos = self.toks.len();
+        self.toks.push(tok);
         self.tr("inp_scaled", -1, &x);
         let mut nrm = vec![0f32; n];
         for il in 0..self.cfg.n_layer {

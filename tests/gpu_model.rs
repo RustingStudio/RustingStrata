@@ -590,3 +590,56 @@ fn slots_match_single() {
     }
     unsafe { std::env::remove_var("STRATA_EXPERT_MB") };
 }
+
+/// An image prompt prefilled on the CPU, uploaded into the GPU, and decoded there: the logits match the CPU prefill,
+/// the RoPE position after the image is decoupled from the KV row, and greedy decoding names the image color.
+#[test]
+fn gpu_image_prefill_matches_cpu() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let Some(mm) = common::mmproj_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    if m.cfg.n_embd_ple != 0 || m.cfg.idx_top_k != 0 { eprintln!("SKIP: PLE/QSA model"); return }
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let proj = rusting_strata::vision::VisionProjector::open(&mm).unwrap();
+    let img = image::RgbImage::from_pixel(128, 128, image::Rgb([200, 0, 0]));
+    let pre = proj.preprocess(&img).unwrap();
+    let (nx, ny) = proj.count_tokens(pre.width, pre.height).unwrap();
+    let feats = proj.encode(&pre).unwrap();
+    let prompt = "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>\nWhat is the main color of this image? Answer with one word.<|im_end|>\n<|im_start|>assistant\n";
+    let ids = tok.encode(prompt).unwrap();
+    let (start, end, pad) = (
+        tok.token_id("<|vision_start|>").unwrap(),
+        tok.token_id("<|vision_end|>").unwrap(),
+        tok.token_id("<|image_pad|>").unwrap(),
+    );
+    let p = rusting_strata::vision::expand_images(&ids, start, end, pad, &[(nx, ny)]).unwrap();
+    let mut st = State::new(&m.cfg);
+    let want = rusting_strata::vision::feed_prompt(&m, &mut st, &p, &[feats.clone()]).unwrap();
+    assert_eq!(st.pos, p.ids.len());
+    assert_eq!(st.rope_pos, [p.next_position; 4]);
+
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let mut gm = GpuModel::load(&m, gpu, 256, 0, 512 << 20, 0).unwrap();
+        gm.adapt_every = 0;
+        let got = gm.prefill_image(&p, &[feats.clone()]).unwrap();
+        assert_eq!(gm.pos, p.ids.len(), "backend {bk}: KV rows");
+        let range = want.iter().fold(f32::MIN, |a, &b| a.max(b)) - want.iter().fold(f32::MAX, |a, &b| a.min(b));
+        let diff = got.iter().zip(&want).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+        eprintln!("backend {bk}: argmax {} vs {}, max |dlogit| {diff:.4} (range {range:.2})", ops::argmax(&got), ops::argmax(&want));
+        assert_eq!(ops::argmax(&got), ops::argmax(&want), "backend {bk}");
+        assert!(diff <= 0.05 * range, "backend {bk}: {diff} vs range {range}");
+
+        let mut next = ops::argmax(&got) as u32;
+        let mut text = String::new();
+        for _ in 0..64 {
+            text.push_str(&tok.decode(&[next]).unwrap());
+            if text.to_ascii_lowercase().contains("red") { break; }
+            next = ops::argmax(&gm.step(next).unwrap()) as u32;
+        }
+        eprintln!("backend {bk}: generated {text:?}");
+        assert!(text.to_ascii_lowercase().contains("red"), "backend {bk}: {text:?}");
+    }
+}

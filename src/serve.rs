@@ -160,11 +160,14 @@ pub fn list_models(dir: &Path) -> Vec<(String, PathBuf, u64)> {
     out
 }
 
+/// A projector filename (`mmproj*`, `*-mmproj.gguf`), matching `vision::is_mmproj` without reading the header.
+fn is_mmproj_name(name: &str) -> bool { name.starts_with("mmproj") || name.contains("-mmproj") || name.contains("mmproj-") }
+
 /// The models among files given as (name, bytes): .gguf files, complete split models once by their first shard
-/// with the bytes of their shards, vision projectors (`mmproj*`) left out.
+/// with the bytes of their shards, vision projectors (`mmproj*`, `*-mmproj.gguf`) left out.
 pub fn models(files: &[(String, u64)]) -> Vec<(String, u64)> {
     let sizes: std::collections::HashMap<&str, u64> = files.iter().map(|(name, bytes)| (name.as_str(), *bytes)).collect();
-    files.iter().filter(|(n, _)| n.ends_with(".gguf") && !n.rsplit('/').next().unwrap_or(n).starts_with("mmproj"))
+    files.iter().filter(|(n, _)| n.ends_with(".gguf") && !is_mmproj_name(n.rsplit('/').next().unwrap_or(n)))
         .filter_map(|(n, b)| match shard_parts(n) {
             Some((stem, 1, total)) if total > 0 && total as usize <= files.len() => {
                 (1..=total).try_fold(0u64, |bytes, i| {
@@ -426,10 +429,21 @@ pub fn messages_body(body: &[u8]) -> anyhow::Result<Vec<u8>> {
     for m in ms {
         let role = m.get("role").as_str().context("message without role")?;
         let blocks = match m.get("content") { Json::Str(t) => vec![obj(vec![("type", s("text")), ("text", s(t))])], Json::Arr(a) => a.clone(), _ => bail!("bad content") };
-        let (mut texts, mut calls, mut reasoning) = (vec![], vec![], String::new());
+        let (mut texts, mut calls, mut reasoning, mut images) = (vec![], vec![], String::new(), vec![]);
         for b in &blocks {
             match (role, b.get("type").as_str().unwrap_or("")) {
                 (_, "text") => texts.push(b.get("text").as_str().unwrap_or("").to_string()),
+                (_, "image") => {
+                    let src = b.get("source");
+                    let url = src.get("url").as_str().map(str::to_owned).or_else(|| {
+                        (src.get("type").as_str() == Some("base64")).then(|| {
+                            format!("data:{};base64,{}", src.get("media_type").as_str().unwrap_or("image/png"), src.get("data").as_str().unwrap_or(""))
+                        })
+                    });
+                    if let Some(url) = url.filter(|u| !u.is_empty() && !u.ends_with(";base64,")) {
+                        images.push(obj(vec![("type", s("image_url")), ("image_url", obj(vec![("url", Json::Str(url))]))]));
+                    }
+                }
                 ("assistant", "thinking") => reasoning += b.get("thinking").as_str().unwrap_or(""),
                 ("assistant", "tool_use") => calls.push(obj(vec![("id", b.get("id").clone()), ("type", s("function")),
                     ("function", obj(vec![("name", b.get("name").clone()), ("arguments", b.get("input").clone())]))])),
@@ -446,8 +460,10 @@ pub fn messages_body(body: &[u8]) -> anyhow::Result<Vec<u8>> {
             if !reasoning.is_empty() { a.push(("reasoning_content", Json::Str(reasoning))); }
             if !calls.is_empty() { a.push(("tool_calls", Json::Arr(calls))); }
             msgs.push(obj(a));
-        } else if !texts.is_empty() {
-            msgs.push(obj(vec![("role", s(role)), ("content", Json::Str(texts.join("\n")))]));
+        } else if !texts.is_empty() || !images.is_empty() {
+            let mut content: Vec<Json> = texts.into_iter().map(|t| obj(vec![("type", s("text")), ("text", Json::Str(t))])).collect();
+            content.extend(images);
+            msgs.push(obj(vec![("role", s(role)), ("content", Json::Arr(content))]));
         }
     }
     let mut out = vec![("messages", Json::Arr(msgs))];

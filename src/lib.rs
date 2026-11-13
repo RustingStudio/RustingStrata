@@ -15,6 +15,7 @@ pub mod expert_cache;
 pub mod cpu_worker;
 pub mod serve;
 pub mod chat;
+pub mod vision;
 pub mod hf;
 pub mod deepseek;
 pub mod gemma4;
