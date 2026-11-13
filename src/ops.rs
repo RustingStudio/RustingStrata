@@ -34,6 +34,60 @@ pub fn rope_neox(x: &mut [f32], n_rot: usize, pos: usize, base: f32) {
     }
 }
 
+/// LayerNorm over one row (`ggml_norm`, not RMS): mean/variance over all features, then `w`/`b`.
+pub fn layer_norm(x: &[f32], w: &[f32], b: &[f32], eps: f32, out: &mut [f32]) {
+    let n = x.len();
+    let mean = x.iter().sum::<f32>() / n as f32;
+    let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n as f32;
+    let inv = 1.0 / (var + eps).sqrt();
+    for (((o, &v), &wv), &bv) in out.iter_mut().zip(x).zip(w).zip(b) { *o = (v - mean) * inv * wv + bv; }
+}
+
+/// Quick GELU used by llama.cpp's `ggml_gelu_quick`: `x * sigmoid(1.702 * x)`.
+pub fn gelu_quick(x: f32) -> f32 { x * sigmoid(1.702 * x) }
+
+/// Exact GELU used by llama.cpp's `ggml_gelu` (tanh approximation).
+pub fn gelu(x: f32) -> f32 {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_56;
+    const A: f32 = 0.044_715;
+    0.5 * x * (1.0 + (SQRT_2_OVER_PI * x * (1.0 + A * x * x)).tanh())
+}
+
+/// Vision-encoder M-RoPE: `d_head/2` pairs, first `d_head/4` pairs use `y`, next `d_head/4` use `x`.
+/// The theta exponent resets at each section, matching `ggml_mrope_cache_init(..., indep_sects=true)`.
+pub fn rope_vision(x: &mut [f32], y: i32, x_pos: i32, base: f32) {
+    let d = x.len();
+    let half = d / 2;
+    let section = half / 2;
+    let theta_scale = base.powf(-2.0 / half as f32);
+    for i in 0..half {
+        let (pos, local) = if i < section { (y, i) } else { (x_pos, i - section) };
+        let theta = pos as f32 * theta_scale.powi(local as i32);
+        let (s, c) = (theta.sin(), theta.cos());
+        let (a, b) = (x[i], x[i + half]);
+        x[i] = a * c - b * s;
+        x[i + half] = a * s + b * c;
+    }
+}
+
+/// Text-model M-RoPE: pairs `(i, i + n_rot/2)`, the section only selects the position; the theta exponent is
+/// global `i`, matching `ggml_rope_multi` for `GGML_ROPE_TYPE_MROPE`.
+pub fn rope_mrope(x: &mut [f32], n_rot: usize, pos: [i32; 4], sections: [usize; 4], base: f32) {
+    let half = n_rot / 2;
+    let theta_scale = base.powf(-2.0 / n_rot as f32);
+    let mut ends = [0usize; 4];
+    let mut acc = 0;
+    for i in 0..4 { acc += sections[i]; ends[i] = acc; }
+    for i in 0..half {
+        let sec = if i < ends[0] { 0 } else if i < ends[1] { 1 } else if i < ends[2] { 2 } else { 3 };
+        let theta = pos[sec] as f32 * theta_scale.powi(i as i32);
+        let (s, c) = (theta.sin(), theta.cos());
+        let (a, b) = (x[i], x[i + half]);
+        x[i] = a * c - b * s;
+        x[i + half] = a * s + b * c;
+    }
+}
+
 /// Indices of the `k` largest values, descending; ties go to the lower index.
 pub fn top_k(p: &[f32], k: usize) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..p.len()).collect();
@@ -125,5 +179,24 @@ impl Sampler {
         self.rng ^= self.rng >> 7;
         self.rng ^= self.rng << 17;
         (self.rng >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mrope_matches_neox_for_text_positions() {
+        let (n_rot, base, sections) = (64, 1e7f32, [11, 11, 10, 0]);
+        for pos in [0usize, 1, 7, 123] {
+            let a: Vec<f32> = (0..n_rot).map(|i| (i as f32 * 0.13).sin()).collect();
+            let (mut neox, mut mrope) = (a.clone(), a);
+            rope_neox(&mut neox, n_rot, pos, base);
+            rope_mrope(&mut mrope, n_rot, [pos as i32; 4], sections, base);
+            for (x, y) in neox.iter().zip(&mrope) {
+                assert!((x - y).abs() < 1e-5, "pos {pos}: {x} vs {y}");
+            }
+        }
     }
 }

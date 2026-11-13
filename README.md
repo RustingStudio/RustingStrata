@@ -88,6 +88,9 @@ target/release/rustingstrata calibrate --model $M     # once per model and machi
 target/release/rustingstrata generate --model $M --gpu --prompt "Write a haiku about rivers." -n 128
 target/release/rustingstrata chat --model $M --gpu    # --think for thinking mode, --temp 0.7 to sample
 target/release/rustingstrata bench --model $M --gpu --pp 512,4096 --tg 128
+# Image input (Qwen3-VL or Gemma 4 mmproj; works with or without --gpu, and --mmproj is optional when it is a sibling file).
+# `generate` is raw completion; for chat-tuned models use `chat`, or put the model's chat template in --prompt:
+target/release/rustingstrata chat --model $M --mmproj $MMPROJ --image photo.jpg --gpu
 STRATA_API_KEY=secret target/release/rustingstrata serve --model $M --gpu --addr 127.0.0.1:8080
 ```
 

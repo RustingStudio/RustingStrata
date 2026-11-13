@@ -210,7 +210,9 @@ impl GpuModel<'_> {
         g.put(emb, &pf.slab, 0)?;
         if !pe.is_empty() { g.put(pe, &pf.slab, pf.lay.emb)?; }
         g.put(&[self.pos as i32, 0], &self.step_buf, 0)?;
+        g.put(&[self.pos as i32 + self.rope_offset, 0], &self.rope_buf, 0)?;
         let mut step = self.step_buf.addr();
+        let mut rope = self.rope_buf.addr();
         let base = pf.slab.addr();
         let at = |o: usize| base + 4 * o as u64;
         let l = &pf.lay;
@@ -253,7 +255,9 @@ impl GpuModel<'_> {
                 g.rms_norm(h, ne, mh.hnorm.ptr, at(l.a + ne), 2 * ne, ne, t, eps)?;
                 g.gemm_dense(&mh.eh_proj, t, at(l.a), 2 * ne, x, ne, 0)?;
                 g.put(&[mh.pos as i32, 0], &self.step_buf, 2)?;
+                g.put(&[mh.pos as i32 + self.rope_offset, 0], &self.rope_buf, 2)?;
                 step += 8;
+                rope += 8;
             }
             if let Some(pl) = &ly.ple { self.ple(pl, x, step, t, &ha)?; }
             match (&ly.attn_norm, &ly.hc) {
@@ -296,11 +300,11 @@ impl GpuModel<'_> {
                     let qs = if c.q_gate { 2 * hd } else { hd };
                     g.gemm_dense(q, t, h, ne, at(l.a), nh * qs, 0)?;
                     g.rms_norm(at(l.a), qs, qn.ptr, at(l.b), hd, hd, t * nh, eps)?;
-                    g.rope_neox(at(l.b), hd, t * nh, nh, c.n_rot, step, c.rope_base)?;
+                    g.rope_neox(at(l.b), hd, t * nh, nh, c.n_rot, rope, c.rope_base)?;
                     g.gemm_dense(k, t, h, ne, kraw, kv, SAME_X)?;
                     g.gemm_dense(v, t, h, ne, vv, kv, SAME_X)?;
                     g.rms_norm(kraw, hd, kn.ptr, kk, hd, hd, t * nkv, eps)?;
-                    g.rope_neox(kk, hd, t * nkv, nkv, c.n_rot, step, c.rope_base)?;
+                    g.rope_neox(kk, hd, t * nkv, nkv, c.n_rot, rope, c.rope_base)?;
                     g.kv_store(kk, vv, kc[self.cur].addr(), vc[self.cur].addr(), kv, t, step, hd)?;
                     // QSA: region c (free after kv_store) holds the raw indexer keys, raw queries and normed queries.
                     let (qm, mw) = match (qsa, &self.qsa) {
@@ -313,7 +317,7 @@ impl GpuModel<'_> {
                             // Rows with at most `top` complete blocks attend densely: no mask while all of them do.
                             if self.pos + t >= super::QSA_POOL * (b.top + 1) {
                                 g.rms_norm(iq, dq, a.qn.ptr, iqn, dq, dq, t * super::QSA_H, eps)?;
-                                g.rope_neox(iqn, dq, t * super::QSA_H, super::QSA_H, c.n_rot, step, c.rope_base)?;
+                                g.rope_neox(iqn, dq, t * super::QSA_H, super::QSA_H, c.n_rot, rope, c.rope_base)?;
                                 for r0 in (0..t).step_by(super::QSA_ROWS) {
                                     g.qsa_select(iqn + (4 * r0 * nq) as u64, a.pool.addr(), b.score.addr(), 0, b.mask.addr() + (4 * r0 * b.mw) as u64,
                                                  step, r0, super::QSA_ROWS.min(t - r0), b.nbs, b.top, 0, b.mw)?;

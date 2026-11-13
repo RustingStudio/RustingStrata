@@ -36,6 +36,18 @@ impl<'a> Tensor<'a> {
         });
     }
 
+    /// out[t][r] = row_r · x[t] for all rows and tokens. `x` is `n_tokens * cols`, `out` is `n_tokens * rows`.
+    pub fn matmul(&self, x: &[f32], n_tokens: usize, out: &mut [f32]) {
+        assert_eq!((x.len(), out.len()), (n_tokens * self.cols, n_tokens * self.rows));
+        out.par_chunks_mut(self.rows).enumerate().for_each_init(|| vec![0f32; self.cols], |buf, (t, ys)| {
+            let xt = &x[t * self.cols..(t + 1) * self.cols];
+            for (r, yv) in ys.iter_mut().enumerate() {
+                self.row(r, buf);
+                *yv = buf.iter().zip(xt).map(|(a, b)| a * b).sum();
+            }
+        });
+    }
+
     /// Rows belonging to expert `e` of an [cols, out, n_expert] tensor.
     pub fn expert(&self, e: usize, n_expert: usize) -> Tensor<'a> {
         let rows = self.rows / n_expert;

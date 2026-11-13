@@ -5,6 +5,7 @@ use rusting_strata::model::{Model, State};
 use rusting_strata::{backend, gpu_model::GpuModel};
 use rusting_strata::{config::ModelConfig, gguf::Gguf, hf, ops, ops::Sampler, quant::GgmlType, serve, tokenizer::Tokenizer};
 use rusting_strata::chat::{Hold, Msg, Template};
+use rusting_strata::vision::{self, VisionProjector};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::{collections::BTreeMap, net::{TcpListener, TcpStream}, sync::atomic::Ordering::Relaxed, path::{Path, PathBuf}, time::{Duration, Instant, SystemTime}};
@@ -99,6 +100,9 @@ struct Engine {
     /// Sequences in GPU memory at once (`serve --parallel`).
     #[arg(skip)]
     parallel: usize,
+    /// Multimodal projector (mmproj) GGUF used by `--image`.
+    #[arg(long)]
+    mmproj: Option<PathBuf>,
 }
 
 /// `serve` options for a server that other people use (docs/HOSTING.md).
@@ -163,6 +167,15 @@ impl Runner<'_> {
             _ => { self.reset()?; (self.prefill(&ids)?, 0) }
         };
         Ok((ids, logits, reused))
+    }
+    /// Feed a prompt that contains image embeddings as a fresh sequence. Only the CPU runner carries the model
+    /// state needed to inject embeddings; GPU image prefill is a later milestone.
+    fn chat_image(&mut self, p: &vision::Prompt, embs: &[Vec<Vec<f32>>]) -> anyhow::Result<Vec<f32>> {
+        match self {
+            Runner::Cpu(m, st) => { *st = State::new(&m.cfg); vision::feed_prompt(m, st, p, embs) }
+            Runner::Gpu(g) => g.prefill_image(p, embs),
+            Runner::Slot(_) => anyhow::bail!("image input is not supported on a serve slot"),
+        }
     }
     /// Forget the sequence so far.
     fn reset(&mut self) -> anyhow::Result<()> {
@@ -298,6 +311,45 @@ impl Engine {
     }
     fn chunk(&self) -> usize { self.chunk.unwrap_or(4096) }
     fn mtp(&self) -> usize { self.mtp.unwrap_or(0) }
+}
+
+/// A projector opened once and the images encoded with it.
+struct ImageInput {
+    grids: Vec<(usize, usize)>,
+    embeddings: Vec<Vec<Vec<f32>>>,
+}
+
+/// Decode and encode every `--image` with the projector at `mmproj`.
+fn load_images(mmproj: &Path, images: &[String]) -> anyhow::Result<ImageInput> {
+    let projector = VisionProjector::open(mmproj)?;
+    let mut grids = Vec::with_capacity(images.len());
+    let mut embeddings = Vec::with_capacity(images.len());
+    for src in images {
+        let img = vision::load_image(src)?;
+        let (feats, nx, ny) = vision::encode_image(&projector, &img)?;
+        grids.push((nx, ny));
+        embeddings.push(feats);
+    }
+    Ok(ImageInput { grids, embeddings })
+}
+
+/// Expand `<image>` placeholders into the projector's vision tokens and assign M-RoPE positions.
+fn build_image_prompt(tok: &Tokenizer, input: &ImageInput, images: &[String], prompt: &str) -> anyhow::Result<vision::Prompt> {
+    let (start, end, pad) = (
+        tok.token_id("<|vision_start|>").context("tokenizer has no <vision_start|>")?,
+        tok.token_id("<|vision_end|>").context("tokenizer has no <vision_end|>")?,
+        tok.token_id("<|image_pad|>").context("tokenizer has no <image_pad|>")?,
+    );
+    let tokens = "<|vision_start|><|image_pad|><|vision_end|>";
+    let n_mark = prompt.matches("<image>").count();
+    let text = if n_mark == 0 {
+        format!("{}{}", tokens.repeat(images.len()), prompt)
+    } else {
+        anyhow::ensure!(n_mark == images.len(), "prompt has {n_mark} <image> placeholder(s) for {} --image(s)", images.len());
+        prompt.replace("<image>", tokens)
+    };
+    let ids = tok.encode(&text)?;
+    vision::expand_images(&ids, start, end, pad, &input.grids)
 }
 
 /// The negative log-likelihood of `tok` under `logits`, and in `row` the log-probabilities as llama-perplexity stores
@@ -524,6 +576,10 @@ enum Cmd {
         /// Let the model think before answering (template default; off here).
         #[arg(long)]
         think: bool,
+        /// Image path, data URL or http(s) URL (repeatable), attached to the conversation. Needs --mmproj (or a
+        /// sibling mmproj next to the model).
+        #[arg(long, action = clap::ArgAction::Append)]
+        image: Vec<String>,
         #[command(flatten)]
         engine: Engine,
     },
@@ -637,6 +693,10 @@ enum Cmd {
         prompt: String,
         #[arg(short, default_value_t = 32)]
         n: usize,
+        /// Image path, data URL or http(s) URL (repeatable). Each is inserted where the prompt has `<image>`;
+        /// without placeholders all images are prepended. Needs --mmproj (or a sibling mmproj next to the model).
+        #[arg(long, action = clap::ArgAction::Append)]
+        image: Vec<String>,
         #[command(flatten)]
         engine: Engine,
     },
@@ -704,18 +764,24 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             r.finish()?;
             println!("{}", serde_json::json!({"argmax": argmax, "top5": top5}));
         }
-        Cmd::Generate { model, prompt, n, mut engine } => {
+        Cmd::Generate { model, prompt, n, image, mut engine } => {
             engine.ds_env();
             let g = Gguf::open(&model)?;
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
-                return rusting_strata::gemma4::generate(&g, &prompt, n);
+                if image.is_empty() { return rusting_strata::gemma4::generate(&g, &prompt, n); }
+                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
+                let input = load_images(mmproj, &image)?;
+                return rusting_strata::gemma4::generate_image(&g, &prompt, &input.grids, &input.embeddings, n);
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("glm5-next") {
+                anyhow::ensure!(image.is_empty(), "--image is not supported for glm5-next");
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 return rusting_strata::glm::generate(&g, &prompt, n);
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
+                anyhow::ensure!(image.is_empty(), "--image is not supported for deepseek41");
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 return rusting_strata::deepseek::chat::generate(&g, &prompt, n);
             }
@@ -727,18 +793,29 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 std::io::stdin().read_to_string(&mut s)?;
                 s
             } else { prompt };
+            let vision_prompt = if image.is_empty() {
+                None
+            } else {
+                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
+                let input = load_images(mmproj, &image)?;
+                Some((build_image_prompt(&tok, &input, &image, &prompt)?, input))
+            };
             let ids = tok.encode(&prompt)?;
-            anyhow::ensure!(!ids.is_empty(), "empty prompt");
+            anyhow::ensure!(!ids.is_empty() || vision_prompt.is_some(), "empty prompt");
             let mut r = engine.runner(&m, &model)?;
             let t0 = Instant::now();
-            let logits = r.prefill(&ids)?;
+            let (logits, n_prompt) = match vision_prompt {
+                None => (r.prefill(&ids)?, ids.len()),
+                Some((p, input)) => (r.chat_image(&p, &input.embeddings)?, p.ids.len()),
+            };
             let t1 = Instant::now();
             let (cpu0, split0) = (r.cpu_secs(), r.split_secs());
-            let cap = room(&engine, ids.len(), n);
+            let cap = room(&engine, n_prompt, n);
             let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut engine.sampler(), logits, cap, &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
             let (pp, tg) = ((t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
             if out.len() == cap && cap < n { eprint!("\n(stopped: the context is full at {} tokens; raise --ctx)", engine.ctx); }
-            eprintln!("\nprompt {} tok {:.2} tok/s | gen {} tok {:.2} tok/s", ids.len(), ids.len() as f64 / pp, out.len(), out.len() as f64 / tg);
+            eprintln!("\nprompt {} tok {:.2} tok/s | gen {} tok {:.2} tok/s", n_prompt, n_prompt as f64 / pp, out.len(), out.len() as f64 / tg);
             if engine.gpu { eprintln!("CPU expert compute, share of gen time: {:.1}%", 100.0 * (r.cpu_secs() - cpu0) / tg); }
             let ms = |s: f64| 1e3 * s / out.len().max(1) as f64;
             for (i, ((a, b), (a0, b0))) in r.split_secs().into_iter().zip(split0).enumerate() {
@@ -875,18 +952,36 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             b.preflight(&types, true)?;
         }
-        Cmd::Chat { model, system, n, think, mut engine } => {
+        Cmd::Chat { model, system, n, think, image, mut engine } => {
             engine.ds_env();
             let g = Gguf::open(&model)?;
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
+                let input = if image.is_empty() { None } else {
+                    let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                    let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
+                    Some(load_images(mmproj, &image)?)
+                };
+                return match &input {
+                    Some(i) => rusting_strata::gemma4::chat(&g, system, n, think, Some((&i.grids, &i.embeddings))),
+                    None => rusting_strata::gemma4::chat(&g, system, n, think, None),
+                };
+            }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("glm5-next") {
+                anyhow::ensure!(image.is_empty(), "--image is not supported for glm5-next");
                 return rusting_strata::glm::chat(&g, system, n);
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
+                anyhow::ensure!(image.is_empty(), "--image is not supported for deepseek41");
                 return rusting_strata::deepseek::chat::chat(&g, system, n, think);
             }
             let mut m = Model::load(&g)?;
             if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
+            let image_input = if image.is_empty() { None } else {
+                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
+                Some(load_images(mmproj, &image)?)
+            };
             let mut r = engine.runner(&m, &model)?;
             let mut smp = engine.sampler();
             let tpl = template(&g);
@@ -899,7 +994,19 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 if stdin.lock().read_line(&mut line)? == 0 { break; }
                 if line.trim().is_empty() { continue; }
                 msgs.push(Msg::new("user", line.trim_end()));
-                let (ids, logits, _) = r.chat(&tok, &tpl.render(&msgs, &[], think, engine.preserve_thinking, true), &tpl.render(&msgs, &[], think, engine.preserve_thinking, false), "")?;
+                let prompt = tpl.render(&msgs, &[], think, engine.preserve_thinking, true);
+                let (ids, logits) = match &image_input {
+                    Some(input) => {
+                        let p = build_image_prompt(&tok, input, &image, &prompt)?;
+                        let ids = p.ids.clone();
+                        let logits = r.chat_image(&p, &input.embeddings)?;
+                        (ids, logits)
+                    }
+                    None => {
+                        let (ids, logits, _) = r.chat(&tok, &prompt, &tpl.render(&msgs, &[], think, engine.preserve_thinking, false), "")?;
+                        (ids, logits)
+                    }
+                };
                 let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut smp, logits, room(&engine, ids.len(), n), &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
                 println!();
                 msgs.push(Msg::new("assistant", &answer(&tok.decode(&out)?)));
@@ -908,6 +1015,13 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Serve { model, models_dir, addr, api_key, open, host, mut engine } => {
             engine.ds_env();
+            if let Some(mp) = &model && let Ok(g) = Gguf::open(mp) && g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
+                let name = mp.file_name().map_or("gemma4".into(), |n| n.to_string_lossy().into_owned());
+                let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
+                anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
+                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(mp));
+                return rusting_strata::gemma4::serve(&g, &name, &addr, key.as_deref(), mmproj.as_deref());
+            }
             if let Some(mp) = &model && let Ok(g) = Gguf::open(mp) && g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("glm5-next") {
                 let name = mp.file_name().map_or("glm".into(), |n| n.to_string_lossy().into_owned());
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
@@ -1712,6 +1826,27 @@ fn text_delta(w: &mut impl Write, opened: &mut bool, t: &str) -> anyhow::Result<
     sse(w, json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": t}}))
 }
 
+/// The `timings` block llama-server puts in its responses. llama-swap and other
+/// OpenAI-compatible clients read it for prefill/decode rates. `prompt_n` is the
+/// uncached part of the prompt and `cache_n` the part served from cache, as in
+/// llama-server.
+fn llama_timings(l: &serve::Last) -> serde_json::Value {
+    let prompt_n = l.prompt_tokens.saturating_sub(l.cached_tokens);
+    let per_token_ms = |ms: f64, n: usize| if n == 0 { 0.0 } else { ms / n as f64 };
+    let per_second = |ms: f64, n: usize| if ms > 0.0 { n as f64 * 1e3 / ms } else { 0.0 };
+    json!({
+        "prompt_n": prompt_n,
+        "prompt_ms": l.prefill_ms,
+        "prompt_per_token_ms": per_token_ms(l.prefill_ms, prompt_n),
+        "prompt_per_second": per_second(l.prefill_ms, prompt_n),
+        "predicted_n": l.completion_tokens,
+        "predicted_ms": l.decode_ms,
+        "predicted_per_token_ms": per_token_ms(l.decode_ms, l.completion_tokens),
+        "predicted_per_second": per_second(l.decode_ms, l.completion_tokens),
+        "cache_n": l.cached_tokens,
+    })
+}
+
 /// The chat page, served by the connection threads of `strata serve`.
 const PAGE: &str = include_str!("web/index.html");
 
@@ -1788,7 +1923,14 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             match serve::messages_body(&body).and_then(|b| serve::chat_request(&b)) {
                 Ok(req) => {
                     let prompt = l.tpl.render(&req.messages, &req.tools, req.think, req.preserve_thinking.unwrap_or(e.preserve_thinking), true);
-                    send(&mut w, "200 OK", json!({"input_tokens": l.tok.encode(&prompt)?.len()}))
+                    let images: Vec<String> = req.messages.iter().flat_map(|m| m.images.iter().cloned()).collect();
+                    let n = if images.is_empty() { l.tok.encode(&prompt)?.len() } else {
+                        let mmproj = e.mmproj.clone().or_else(|| vision::find_sibling(&l.path));
+                        let mmproj = mmproj.as_deref().context("image input needs --mmproj")?;
+                        let input = load_images(mmproj, &images)?;
+                        build_image_prompt(l.tok, &input, &images, &prompt)?.ids.len()
+                    };
+                    send(&mut w, "200 OK", json!({"input_tokens": n}))
                 }
                 Err(err) => send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
             }
@@ -1809,7 +1951,17 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             // The system and tools block, which compacted or rewritten conversations keep.
             let n_sys = req.messages.iter().take_while(|m| m.role == "system").count();
             let system = tpl.render(&req.messages[..n_sys], &req.tools, req.think, preserve, false);
-            let ids = tok.encode(&prompt)?;
+            let images: Vec<String> = req.messages.iter().flat_map(|m| m.images.iter().cloned()).collect();
+            let image_input = if images.is_empty() { None } else {
+                let mmproj = e.mmproj.clone().or_else(|| vision::find_sibling(&l.path));
+                let mmproj = mmproj.as_deref().context("image input needs --mmproj")?;
+                Some(load_images(mmproj, &images)?)
+            };
+            let vision_prompt = match &image_input {
+                Some(input) => Some(build_image_prompt(tok, input, &images, &prompt)?),
+                None => None,
+            };
+            let ids = match &vision_prompt { Some(p) => p.ids.clone(), None => tok.encode(&prompt)? };
             // One line per chat request, and one when it finishes (see `log` below).
             let key_name = if who.name.is_empty() { "open" } else { who.name.as_str() };
             eprintln!("request: {method} {p} key={key_name} model={name} prompt={} tok stream={} tools={}",
@@ -1847,7 +1999,11 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let res = (|| -> anyhow::Result<(Vec<u32>, bool)> {
                 let logits;
                 if serve::gone(&w) { anyhow::bail!("client closed the connection"); }
-                (_, logits, cached) = r.chat(tok, &prompt, &tpl.render(&req.messages, &req.tools, req.think, preserve, false), &system)?;
+                let (chat_ids, chat_logits, chat_cached) = match &vision_prompt {
+                    Some(p) => (p.ids.clone(), r.chat_image(p, &image_input.as_ref().unwrap().embeddings)?, 0),
+                    None => r.chat(tok, &prompt, &tpl.render(&req.messages, &req.tools, req.think, preserve, false), &system)?,
+                };
+                (_, logits, cached) = (chat_ids, chat_logits, chat_cached);
                 if let Runner::Slot(c) = &*r && let Some(t) = c.started { t0 = t; start(&mut busy); }
                 prefilled = true;
                 t1 = Instant::now();
@@ -1923,6 +2079,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let calls = if tools { tpl.parse_calls(&hold.text, &req.tools) } else { None };
             last.completion_tokens = out.len();
             last.finish = if calls.is_some() { "tool_calls" } else if stop { "stop" } else { "length" }.into();
+            let timings = llama_timings(&last);
             log(&last);
             s.stats.lock().unwrap().record(last);
             let calls_json = |(content, calls): &(String, Vec<(String, String)>), stream: bool| {
@@ -1943,7 +2100,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     let text = calls.as_ref().map_or(&hold.text, |c| &c.0);
                     let content: Vec<_> = (!text.is_empty()).then(|| json!({"type": "text", "text": text})).into_iter().chain(uses).collect();
                     return send(&mut w, "200 OK", json!({"id": format!("msg_{i}"), "type": "message", "role": "assistant", "model": name, "content": content,
-                        "stop_reason": reason, "stop_sequence": null, "usage": usage}));
+                        "stop_reason": reason, "stop_sequence": null, "usage": usage, "timings": timings}));
                 }
                 if calls.is_none() && !hold.rest().is_empty() { text_delta(&mut w, &mut opened, hold.rest())?; }
                 if opened { sse(&mut w, json!({"type": "content_block_stop", "index": 0}))?; }
@@ -1955,7 +2112,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     sse(&mut w, json!({"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": input}}))?;
                     sse(&mut w, json!({"type": "content_block_stop", "index": index}))?;
                 }
-                sse(&mut w, json!({"type": "message_delta", "delta": {"stop_reason": reason, "stop_sequence": null}, "usage": {"output_tokens": out.len()}}))?;
+                sse(&mut w, json!({"type": "message_delta", "delta": {"stop_reason": reason, "stop_sequence": null}, "usage": {"output_tokens": out.len()}, "timings": timings}))?;
                 return sse(&mut w, json!({"type": "message_stop"}));
             }
             let finish = if calls.is_some() { "tool_calls" } else if stop { "stop" } else { "length" };
@@ -1969,11 +2126,12 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 }
                 let mut last = chunk(json!({}), Some(finish));
                 last["usage"] = usage;
+                last["timings"] = timings;
                 Ok(write!(w, "data: {last}\n\ndata: [DONE]\n\n")?)
             } else {
                 let message = match &calls { Some(c) => calls_json(c, false), None => json!({"role": "assistant", "content": hold.text}) };
                 send(&mut w, "200 OK", json!({"id": id, "object": "chat.completion", "created": created, "model": name,
-                    "choices": [{"index": 0, "message": message, "finish_reason": finish}], "usage": usage}))
+                    "choices": [{"index": 0, "message": message, "finish_reason": finish}], "usage": usage, "timings": timings}))
             }
         }
         _ => send(&mut w, "404 Not Found", json!({"error": {"message": format!("no route {method} {path}"), "type": "not_found"}})),
@@ -2027,6 +2185,28 @@ mod flag_tests {
         }
         assert!(resolve_flags(true, 255, 0, 0, 0, false).is_ok());
         assert_eq!(resolve_flags(true, 1, 0, 0, 0, false).unwrap(), (vec![], 1, 0));
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::{llama_timings, serve::Last};
+
+    #[test]
+    fn timings_match_llama_server() {
+        let last = Last { prompt_tokens: 100, cached_tokens: 40, completion_tokens: 20,
+            prefill_ms: 60.0, decode_ms: 400.0, ..Default::default() };
+        let t = llama_timings(&last);
+        // llama-server counts the uncached prompt in prompt_n and the reused part in cache_n.
+        assert_eq!(t["prompt_n"], 60);
+        assert_eq!(t["cache_n"], 40);
+        assert_eq!(t["prompt_ms"], 60.0);
+        assert_eq!(t["prompt_per_second"], 1000.0);
+        assert_eq!(t["prompt_per_token_ms"], 1.0);
+        assert_eq!(t["predicted_n"], 20);
+        assert_eq!(t["predicted_ms"], 400.0);
+        assert_eq!(t["predicted_per_second"], 50.0);
+        assert_eq!(t["predicted_per_token_ms"], 20.0);
     }
 }
 

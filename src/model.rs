@@ -64,6 +64,8 @@ pub enum LayerState {
 pub struct State {
     pub layers: Vec<LayerState>,
     pub pos: usize,
+    /// M-RoPE positions for the next token: `[t, y, x, z]`. Text tokens use `pos` in all four slots.
+    pub rope_pos: [i32; 4],
     /// qwen4exp PLE: the last PLE_HIST normalized rows (hc * n_embd each, oldest first), and the two previous
     /// tokens (newest first, -1 for none) for the n-gram hash.
     pub ple_hist: Vec<f32>,
@@ -83,7 +85,7 @@ impl State {
             })
             .collect();
         let ple = if c.n_embd_ple > 0 { PLE_HIST * c.hc_n * c.n_embd } else { 0 };
-        State { layers, pos: 0, ple_hist: vec![0.0; ple], ple_prev: [-1, -1] }
+        State { layers, pos: 0, rope_pos: [0; 4], ple_hist: vec![0.0; ple], ple_prev: [-1, -1] }
     }
 }
 
@@ -182,10 +184,22 @@ impl<'a> Model<'a> {
 
     /// Run one token; returns logits and the last hidden state (before output_norm).
     pub fn step_h(&self, st: &mut State, token: u32) -> (Vec<f32>, Vec<f32>) {
-        if self.cfg.hc_n > 0 { return self.step_hc(st, token); }
-        let mut x = self.embed(token);
-        for il in 0..self.cfg.n_layer { self.block(il, &mut x, &mut st.layers[il], st.pos); }
+        let rope_pos = st.rope_pos;
+        self.step_embed_h(st, self.embed(token), rope_pos, token)
+    }
+
+    /// Feed a precomputed input embedding at explicit M-RoPE positions. `token` is used only by qwen4exp's PLE;
+    /// pass the placeholder id for image tokens. The KV row still advances by one.
+    pub fn step_embed(&self, st: &mut State, x: Vec<f32>, rope_pos: [i32; 4], token: u32) -> Vec<f32> {
+        self.step_embed_h(st, x, rope_pos, token).0
+    }
+
+    pub fn step_embed_h(&self, st: &mut State, mut x: Vec<f32>, rope_pos: [i32; 4], token: u32) -> (Vec<f32>, Vec<f32>) {
+        if self.cfg.hc_n > 0 { return self.step_embed_hc(st, x, rope_pos, token); }
+        let kv_pos = st.pos;
+        for il in 0..self.cfg.n_layer { self.block(il, &mut x, &mut st.layers[il], kv_pos, rope_pos); }
         st.pos += 1;
+        st.rope_pos = [rope_pos[0] + 1; 4];
         (self.head(&x, &self.w.get("output_norm.weight").unwrap().to_f32()), x)
     }
 
@@ -193,22 +207,23 @@ impl<'a> Model<'a> {
     /// down to one vector, runs its block and writes the output back into every stream with a per-stream weight.
     /// Layers holding `ple_key` first add the per-layer n-gram embedding (PLE) to the stack. Returns the logits
     /// and the head's mixed vector. Mirrors original Strata's `Engine::enqueue` (llama.cpp qwen4exp.cpp).
-    fn step_hc(&self, st: &mut State, token: u32) -> (Vec<f32>, Vec<f32>) {
+    fn step_embed_hc(&self, st: &mut State, x: Vec<f32>, rope_pos: [i32; 4], token: u32) -> (Vec<f32>, Vec<f32>) {
         let c = &self.cfg;
-        let mut r = self.embed(token).repeat(c.hc_n);
+        let mut r = x.repeat(c.hc_n);
         let emb = self.ple_embed(&mut st.ple_prev, token);
         for il in 0..c.n_layer {
             if self.w.layer(il, "ple_key.weight").is_ok() { self.ple(il, &mut r, &emb, &mut st.ple_hist); }
             let (h, inj) = self.hc_read(&r, &format!("blk.{il}.hc_attn_"));
             let mix = match &mut st.layers[il] {
                 LayerState::Recurrent { conv, s } => self.deltanet(il, &h, conv, s),
-                LayerState::Attn { k, v, ik } => self.attention(il, &h, k, v, ik, st.pos),
+                LayerState::Attn { k, v, ik } => self.attention(il, &h, k, v, ik, st.pos, rope_pos),
             };
             Self::hc_write(&mut r, &mix, &inj);
             let (h, inj) = self.hc_read(&r, &format!("blk.{il}.hc_ffn_"));
             Self::hc_write(&mut r, &self.moe(il, &h), &inj);
         }
         st.pos += 1;
+        st.rope_pos = [rope_pos[0] + 1; 4];
         let (h, _) = self.hc_read(&r, "output_hc_");
         (mv(&self.w.get("output.weight").unwrap(), &h), h)
     }
@@ -306,13 +321,13 @@ impl<'a> Model<'a> {
     }
 
     /// One decoder block (mixer and FFN, each with residual) on x at position `pos`.
-    fn block(&self, il: usize, x: &mut [f32], ls: &mut LayerState, pos: usize) {
+    fn block(&self, il: usize, x: &mut [f32], ls: &mut LayerState, pos: usize, rope_pos: [i32; 4]) {
         let c = &self.cfg;
         let mut h = vec![0f32; c.n_embd];
         ops::rms_norm(x, &self.f(il, "attn_norm.weight"), c.eps, &mut h);
         let mix = match ls {
             LayerState::Recurrent { conv, s } => self.deltanet(il, &h, conv, s),
-            LayerState::Attn { k, v, ik } => self.attention(il, &h, k, v, ik, pos),
+            LayerState::Attn { k, v, ik } => self.attention(il, &h, k, v, ik, pos, rope_pos),
         };
         for (a, b) in x.iter_mut().zip(&mix) { *a += b; }
         ops::rms_norm(x, &self.f(il, "post_attention_norm.weight"), c.eps, &mut h);
@@ -337,7 +352,8 @@ impl<'a> Model<'a> {
         ops::rms_norm(&self.embed(token), &self.f(il, "nextn.enorm.weight"), c.eps, &mut eh[..n]);
         ops::rms_norm(hid, &self.f(il, "nextn.hnorm.weight"), c.eps, &mut eh[n..]);
         let mut x = mv(&self.t(il, "nextn.eh_proj.weight"), &eh);
-        self.block(il, &mut x, &mut ms.kv, ms.pos);
+        let rope_pos = [ms.pos as i32; 4];
+        self.block(il, &mut x, &mut ms.kv, ms.pos, rope_pos);
         ms.pos += 1;
         (self.head(&x, &self.f(il, "nextn.shared_head_norm.weight")), x)
     }
@@ -398,12 +414,20 @@ impl<'a> Model<'a> {
         mv(&self.t(il, "ssm_out.weight"), &out)
     }
 
+    /// RoPE for one head: 1-D when the model has no M-RoPE sections, otherwise `[t, y, x, z]`.
+    fn rope(&self, x: &mut [f32], kv_pos: usize, rope_pos: [i32; 4]) {
+        match self.cfg.mrope_sections {
+            Some(sections) => ops::rope_mrope(x, self.cfg.n_rot, rope_pos, sections, self.cfg.rope_base),
+            None => ops::rope_neox(x, self.cfg.n_rot, kv_pos, self.cfg.rope_base),
+        }
+    }
+
     /// QSA (qwen4exp sparse attention): the cells row `pos` attends to, or None for all of them. Keys are pooled
     /// in blocks of QSA_POOL cells: mean of the raw indexer keys, RMS-normed and rotated to the block's first
     /// position. Each complete block scores sum over heads of relu(q_h . k) / sqrt(head_dim); the top
     /// idx_top_k / QSA_POOL blocks (ties to the lower block) and the incomplete tail block are kept. Dense while
     /// there are no more complete blocks than that. Mirrors llama.cpp qwen4exp.cpp `build_qsa_sel`.
-    fn qsa(&self, il: usize, h: &[f32], ik: &mut Vec<f32>, pos: usize) -> Option<Vec<usize>> {
+    fn qsa(&self, il: usize, h: &[f32], ik: &mut Vec<f32>, pos: usize, rope_pos: [i32; 4]) -> Option<Vec<usize>> {
         let c = &self.cfg;
         let (nh, d) = (c.idx_n_head, c.idx_head_dim);
         if c.idx_top_k == 0 || self.w.layer(il, "indexer.k_proj.weight").is_err() { return None; }
@@ -415,7 +439,7 @@ impl<'a> Model<'a> {
         let mut q = vec![0f32; nh * d];
         for i in 0..nh {
             ops::rms_norm(&qr[i * d..(i + 1) * d], &qn, c.eps, &mut q[i * d..(i + 1) * d]);
-            ops::rope_neox(&mut q[i * d..(i + 1) * d], c.n_rot, pos, c.rope_base);
+            self.rope(&mut q[i * d..(i + 1) * d], pos, rope_pos);
         }
         let mut score = vec![0f32; nb];
         let (mut mean, mut k) = (vec![0f32; d], vec![0f32; d]);
@@ -425,7 +449,7 @@ impl<'a> Model<'a> {
                 for (m, x) in mean.iter_mut().zip(&ik[t * d..(t + 1) * d]) { *m += x / QSA_POOL as f32; }
             }
             ops::rms_norm(&mean, &kn, c.eps, &mut k);
-            ops::rope_neox(&mut k, c.n_rot, b * QSA_POOL, c.rope_base);
+            self.rope(&mut k, b * QSA_POOL, [(b * QSA_POOL) as i32; 4]);
             *s = q.chunks(d).map(|qh| qh.iter().zip(&k).map(|(a, b)| a * b).sum::<f32>().max(0.0)).sum::<f32>()
                 / (d as f32).sqrt();
         }
@@ -434,10 +458,10 @@ impl<'a> Model<'a> {
         Some(blocks.iter().flat_map(|b| b * QSA_POOL..(b + 1) * QSA_POOL).chain(nb * QSA_POOL..pos + 1).collect())
     }
 
-    fn attention(&self, il: usize, h: &[f32], kc: &mut Vec<f32>, vc: &mut Vec<f32>, ik: &mut Vec<f32>, pos: usize)
+    fn attention(&self, il: usize, h: &[f32], kc: &mut Vec<f32>, vc: &mut Vec<f32>, ik: &mut Vec<f32>, pos: usize, rope_pos: [i32; 4])
         -> Vec<f32> {
         let c = &self.cfg;
-        let cells = self.qsa(il, h, ik, pos).unwrap_or_else(|| (0..pos + 1).collect());
+        let cells = self.qsa(il, h, ik, pos, rope_pos).unwrap_or_else(|| (0..pos + 1).collect());
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
         let qs = if c.q_gate { 2 * hd } else { hd };  // per-head row of attn_q: query, then the gate if any
         let qg = mv(&self.t(il, "attn_q.weight"), h);
@@ -446,7 +470,7 @@ impl<'a> Model<'a> {
         for i in 0..nh {
             let qh = &mut q[i * hd..(i + 1) * hd];
             ops::rms_norm(&qg[i * qs..i * qs + hd], &qn, c.eps, qh);
-            ops::rope_neox(qh, c.n_rot, pos, c.rope_base);
+            self.rope(qh, pos, rope_pos);
         }
         let kraw = mv(&self.t(il, "attn_k.weight"), h);
         let v = mv(&self.t(il, "attn_v.weight"), h);
@@ -454,7 +478,7 @@ impl<'a> Model<'a> {
         for i in 0..nkv {
             let kh = &mut k[i * hd..(i + 1) * hd];
             ops::rms_norm(&kraw[i * hd..(i + 1) * hd], &kn, c.eps, kh);
-            ops::rope_neox(kh, c.n_rot, pos, c.rope_base);
+            self.rope(kh, pos, rope_pos);
         }
         kc.extend_from_slice(&k);
         vc.extend_from_slice(&v);

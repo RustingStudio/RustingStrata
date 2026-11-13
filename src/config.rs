@@ -40,6 +40,8 @@ pub struct ModelConfig {
     pub n_head_kv: usize,
     pub head_dim: usize,
     pub n_rot: usize,
+    /// Qwen3-VL/3.5 M-RoPE section sizes (sum = `n_rot/2`); `None` uses 1-D RoPE.
+    pub mrope_sections: Option<[usize; 4]>,
     pub rope_base: f32,
     pub eps: f32,
     pub n_vocab: usize,
@@ -109,6 +111,12 @@ impl ModelConfig {
             n_head_kv: req("attention.head_count_kv")?,
             head_dim,
             n_rot: match opt("rope.dimension_count") { 0 => head_dim, v => v },
+            mrope_sections: g.meta.get(&format!("{arch}.rope.dimension_sections")).and_then(|v| v.as_arr()).and_then(|a| {
+                if a.len() < 4 { return None; }
+                let mut s = [0usize; 4];
+                for (o, v) in s.iter_mut().zip(a) { *o = v.as_u64()? as usize; }
+                Some(s)
+            }),
             rope_base: f("rope.freq_base").unwrap_or(10000.0),
             eps: f("attention.layer_norm_rms_epsilon").context("missing rms epsilon")?,
             n_vocab: emb.dims[1] as usize,

@@ -112,25 +112,58 @@ impl<'de> Deserialize<'de> for Json {
     }
 }
 
-/// One chat message. `content` is already text (content parts joined with newlines, as llama.cpp does).
+/// One chat message. `content` is already text (content parts joined with newlines, as llama.cpp does), with one
+/// `<image>` placeholder per image in `images`.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Msg { pub role: String, pub content: String, pub reasoning: Option<String>, pub calls: Vec<Call> }
+pub struct Msg { pub role: String, pub content: String, pub reasoning: Option<String>, pub calls: Vec<Call>, pub images: Vec<String> }
 
 /// A tool call in an assistant message; `args` is the parsed arguments object.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Call { pub name: String, pub args: Json }
 
 impl Msg {
-    pub fn new(role: &str, content: &str) -> Msg { Msg { role: role.into(), content: content.into(), reasoning: None, calls: vec![] } }
+    pub fn new(role: &str, content: &str) -> Msg { Msg { role: role.into(), content: content.into(), reasoning: None, calls: vec![], images: vec![] } }
 
     /// Parses one OpenAI message. Roles are limited to the ones the templates know, because the role goes into the
     /// prompt verbatim.
     pub fn from_json(m: &Json) -> anyhow::Result<Msg> {
         let role = m.get("role").as_str().context("message without role")?;
         if !["system", "user", "assistant", "tool"].contains(&role) { bail!("unknown role {role:?}"); }
+        let mut images = vec![];
         let content = match m.get("content") {
             Json::Str(s) => s.clone(),
-            Json::Arr(parts) => parts.iter().filter_map(|p| p.get("text").as_str()).collect::<Vec<_>>().join("\n"),
+            Json::Arr(parts) => {
+                let mut text = String::new();
+                let mut first = true;
+                for p in parts {
+                    let piece = match p.get("type").as_str().unwrap_or("") {
+                        "text" => p.get("text").as_str().unwrap_or("").to_string(),
+                        "image_url" => {
+                            let u = p.get("image_url");
+                            let url = u.get("url").as_str().or_else(|| u.as_str()).unwrap_or("");
+                            if url.is_empty() { continue; }
+                            images.push(url.to_string());
+                            "<image>".to_string()
+                        }
+                        "image" => {
+                            let src = p.get("source");
+                            let url = src.get("url").as_str().map(str::to_owned).or_else(|| {
+                                (src.get("type").as_str() == Some("base64")).then(|| {
+                                    format!("data:{};base64,{}", src.get("media_type").as_str().unwrap_or("image/png"), src.get("data").as_str().unwrap_or(""))
+                                })
+                            });
+                            let Some(url) = url.filter(|u| !u.is_empty() && !u.ends_with(";base64,")) else { continue };
+                            images.push(url);
+                            "<image>".to_string()
+                        }
+                        _ => continue,
+                    };
+                    if !first { text.push('\n'); }
+                    text.push_str(&piece);
+                    first = false;
+                }
+                text
+            }
             Json::Null if role == "assistant" => String::new(),
             Json::Null => bail!("{role} message without content"),
             _ => bail!("bad content"),
@@ -150,7 +183,7 @@ impl Msg {
             }).collect::<anyhow::Result<_>>()?,
             _ => bail!("tool_calls must be an array on an assistant message"),
         };
-        Ok(Msg { role: role.into(), content, reasoning: m.get("reasoning_content").as_str().map(Into::into), calls })
+        Ok(Msg { role: role.into(), content, reasoning: m.get("reasoning_content").as_str().map(Into::into), calls, images })
     }
 }
 

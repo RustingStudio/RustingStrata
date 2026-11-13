@@ -229,7 +229,7 @@ fn lists_models_once_per_split() {
     let d = std::env::temp_dir().join(format!("strata-list-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(d.join("org/repo")).unwrap();
-    for (f, n) in [("a.gguf", 3), ("mmproj-a.gguf", 1), ("notes.txt", 1), ("org/repo/big-00001-of-00002.gguf", 5),
+    for (f, n) in [("a.gguf", 3), ("mmproj-a.gguf", 1), ("qwen3.5-2b-mmproj.gguf", 1), ("notes.txt", 1), ("org/repo/big-00001-of-00002.gguf", 5),
         ("org/repo/big-00002-of-00002.gguf", 7)] {
         std::fs::write(d.join(f), vec![0u8; n]).unwrap();
     }

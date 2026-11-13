@@ -103,6 +103,12 @@ details.think div { white-space: pre-wrap; }
 .tools input { width: auto; margin: 0; accent-color: var(--accent); }
 .tools .hint { flex: 1; font-size: 12px; color: var(--muted); text-align: right; }
 #send { border-radius: 10px; min-width: 76px; margin-left: auto; }
+#attach { border-radius: 10px; }
+#preview { display: flex; gap: 8px; flex-wrap: wrap; padding: 0 20px 8px; }
+#preview[hidden] { display: none; }
+.thumb { position: relative; width: 64px; height: 64px; }
+.thumb img { width: 100%; height: 100%; object-fit: cover; border-radius: 8px; }
+.thumb button { position: absolute; top: -7px; right: -7px; width: 20px; height: 20px; padding: 0; border-radius: 50%; line-height: 1; }
 
 /* Server panel */
 #panel { border-left: 1px solid var(--line); background: var(--surface); overflow-y: auto; padding: 4px 18px 24px; font-variant-numeric: tabular-nums; }
@@ -206,7 +212,10 @@ progress { width: 100%; height: 8px; accent-color: var(--accent); margin-top: 12
   <form id="form">
     <div class="box">
       <textarea id="input" rows="1" placeholder="Message" aria-label="Message"></textarea>
+      <div id="preview" hidden></div>
       <div class="tools">
+        <button id="attach" type="button" title="Attach an image">Image</button>
+        <input id="file" type="file" accept="image/*" hidden>
         <label title="The model reasons before it answers. Slower, often better on hard questions."><input id="think" type="checkbox">Think first</label>
         <span class="hint">Enter sends, Shift+Enter adds a line</span>
         <button id="send" class="primary" type="submit">Send</button>
@@ -344,6 +353,41 @@ try { chats = JSON.parse(store.get('chats', '[]')); } catch {}
 let cur = chats.find(c => c.id === store.get('cur', '')) || null;
 let busy = null;   // AbortController of the running reply
 const save = () => { if (!store.set('chats', JSON.stringify(chats))) status('Browser storage is full: delete some chats to keep new ones', true); store.set('cur', cur?.id || ''); };
+let pendingImages = [];
+function renderPreview() {
+  const p = $('preview');
+  p.replaceChildren(...pendingImages.map((url, i) => {
+    const d = el('div', 'thumb');
+    const img = el('img'); img.src = url; img.alt = 'Attached image';
+    const b = el('button', 'ghost', '×'); b.type = 'button'; b.title = 'Remove'; b.onclick = () => { pendingImages.splice(i, 1); renderPreview(); };
+    d.append(img, b);
+    return d;
+  }));
+  p.hidden = !pendingImages.length;
+}
+function addImage(url) {
+  if (pendingImages.length >= 4) { status('At most 4 images per message', true); return; }
+  if (!url.startsWith('data:image/')) return;
+  pendingImages.push(url);
+  renderPreview();
+}
+$('attach').onclick = () => $('file').click();
+$('file').onchange = e => {
+  for (const f of e.target.files || []) {
+    const r = new FileReader();
+    r.onload = () => addImage(r.result);
+    r.readAsDataURL(f);
+  }
+  e.target.value = '';
+};
+document.addEventListener('paste', e => {
+  for (const item of e.clipboardData?.items || []) {
+    if (item.type.startsWith('image/')) {
+      const f = item.getAsFile();
+      if (f) { const r = new FileReader(); r.onload = () => addImage(r.result); r.readAsDataURL(f); e.preventDefault(); }
+    }
+  }
+});
 
 function list() {
   const q = $('find').value.trim().toLowerCase(), today = new Date(new Date().toDateString());
@@ -446,7 +490,11 @@ function show() {
     return;
   }
   cur.msgs.forEach((m, i) => {
-    if (m.role === 'user') { box.append(el('div', 'u', esc(m.content))); return; }
+    if (m.role === 'user') {
+      const d = el('div', 'u'); d.textContent = m.content;
+      for (const url of m.images || []) { const img = el('img', 'thumb'); img.src = url; img.alt = 'Attached image'; d.append(img); }
+      box.append(d); return;
+    }
     const a = el('div', 'a' + (m.error ? ' error' : '')), b = el('div', 'body');
     if (m.error) b.textContent = m.content; else body(b, m, false);
     a.append(b);
@@ -455,11 +503,18 @@ function show() {
   });
   $('chat').scrollTop = $('chat').scrollHeight;
 }
-$('new').onclick = () => { if (busy) busy.abort(); cur = null; save(); show(); $('input').focus(); document.body.classList.remove('showside'); };
+$('new').onclick = () => { if (busy) busy.abort(); cur = null; pendingImages = []; renderPreview(); save(); show(); $('input').focus(); document.body.classList.remove('showside'); };
 
 async function reply() {
   const chat = cur, sys = $('system').value.trim();
-  const history = chat.msgs.filter(m => !m.error).map(m => ({ role: m.role, content: m.content }));
+  const history = chat.msgs.filter(m => !m.error).map(m => {
+    const imgs = m.images || [];
+    if (!imgs.length) return { role: m.role, content: m.content };
+    return { role: m.role, content: [
+      { type: 'text', text: m.content },
+      ...imgs.map(url => ({ type: 'image_url', image_url: { url } })),
+    ] };
+  });
   const m = { role: 'assistant', content: '', think: '' };
   chat.msgs.push(m);
   show();
@@ -525,8 +580,11 @@ async function reply() {
 }
 function send(text) {
   if (busy) return;
-  if (!cur) { cur = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), title: text.slice(0, 60), at: Date.now(), msgs: [] }; chats.push(cur); }
-  cur.msgs.push({ role: 'user', content: text });
+  const images = pendingImages.splice(0);
+  renderPreview();
+  if (!text && !images.length) return;
+  if (!cur) { cur = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), title: text.slice(0, 60) || 'Image', at: Date.now(), msgs: [] }; chats.push(cur); }
+  cur.msgs.push({ role: 'user', content: text, images });
   cur.at = Date.now();
   save();
   reply();
@@ -540,7 +598,7 @@ $('form').onsubmit = e => {
   e.preventDefault();
   if (busy) { busy.abort(); return; }
   const t = $('input').value.trim();
-  if (!t) return;
+  if (!t && !pendingImages.length) return;
   $('input').value = ''; $('input').style.height = '';
   send(t);
 };
