@@ -254,6 +254,34 @@ fn dot_q2_0(row: &[u8], xq: &[Q8K]) -> f32 {
     }).sum()
 }
 
+/// TQ1_0: five base-3 trits per byte in qs, four in qh; values -1, 0, 1 times d.
+fn dot_tq1_0(row: &[u8], xq: &[Q8K]) -> f32 {
+    let mut sumf = 0.0;
+    for (b, y) in row.chunks_exact(54).zip(xq) {
+        let trit = |v: u8, n: usize| { const POW3: [u8; 5] = [1, 3, 9, 27, 81]; ((v.wrapping_mul(POW3[n]) as u16 * 3) >> 8) as i32 - 1 };
+        let mut s = 0i32;
+        for n in 0..5 { for m in 0..32 { s += trit(b[m], n) * y.qs[32 * n + m] as i32; } }
+        for n in 0..5 { for m in 0..16 { s += trit(b[32 + m], n) * y.qs[160 + 16 * n + m] as i32; } }
+        for n in 0..4 { for j in 0..4 { s += trit(b[48 + j], n) * y.qs[240 + 4 * n + j] as i32; } }
+        sumf += d16(&b[52..]) * y.d * s as f32;
+    }
+    sumf
+}
+
+/// TQ2_0: 64 bytes of 2-bit codes (code - 1 in -1..2), then f16 d; 256 values a block.
+fn dot_tq2_0(row: &[u8], xq: &[Q8K]) -> f32 {
+    let mut sumf = 0.0;
+    for (b, y) in row.chunks_exact(66).zip(xq) {
+        let mut s = 0i32;
+        for j in 0..2 { for l in 0..4 { for m in 0..32 {
+            let code = (b[32 * j + m] >> (2 * l)) & 3;
+            s += (code as i32 - 1) * y.qs[128 * j + 32 * l + m] as i32;
+        } } }
+        sumf += d16(&b[64..]) * y.d * s as f32;
+    }
+    sumf
+}
+
 /// Q4_0 (`T` = 2, 18 bytes), Q4_1 (3, 20), Q5_0 (6, 22), Q5_1 (7, 24): block bytes, offset of the 32 high bits
 /// (0 = none) and of the 16 bytes of nibbles.
 const fn q4_layout(t: u8) -> (usize, usize, usize) { match t { 2 => (18, 0, 2), 3 => (20, 0, 4), 6 => (22, 2, 6), _ => (24, 4, 8) } }
@@ -815,9 +843,9 @@ mod avx2 {
 pub fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
     #[cfg(target_feature = "avx2")]
     if std::env::var_os("STRATA_SCALAR").is_none() {
-        return match ty { GgmlType::IQ2XS => Some(avx2::dot_iq2xs), GgmlType::IQ3XXS => Some(avx2::dot_iq3xxs), GgmlType::IQ4XS => Some(avx2::dot_iq4xs), GgmlType::IQ3S => Some(avx2::dot_iq3s), GgmlType::Q6K => Some(avx2::dot_q6k), GgmlType::Q5K => Some(avx2::dot_q5k), GgmlType::Q8_0 => Some(avx2::dot_q8_0), GgmlType::IQ2XXS => Some(avx2::dot_iq2xxs), GgmlType::IQ2S => Some(avx2::dot_iq2s), GgmlType::IQ1S => Some(avx2::dot_iq1s), GgmlType::IQ1M => Some(avx2::dot_iq1m), GgmlType::Q2K => Some(avx2::dot_q2k), GgmlType::Q3K => Some(avx2::dot_q3k), GgmlType::Q4K => Some(avx2::dot_q4k), GgmlType::Q2_0 => Some(avx2::dot_q2_0), GgmlType::Q4_0 => Some(avx2::dot_q4::<2>), GgmlType::Q4_1 => Some(avx2::dot_q4::<3>), GgmlType::Q5_0 => Some(avx2::dot_q4::<6>), GgmlType::Q5_1 => Some(avx2::dot_q4::<7>), _ => None };
+        return match ty { GgmlType::IQ2XS => Some(avx2::dot_iq2xs), GgmlType::IQ3XXS => Some(avx2::dot_iq3xxs), GgmlType::IQ4XS => Some(avx2::dot_iq4xs), GgmlType::IQ3S => Some(avx2::dot_iq3s), GgmlType::Q6K => Some(avx2::dot_q6k), GgmlType::Q5K => Some(avx2::dot_q5k), GgmlType::Q8_0 => Some(avx2::dot_q8_0), GgmlType::IQ2XXS => Some(avx2::dot_iq2xxs), GgmlType::IQ2S => Some(avx2::dot_iq2s), GgmlType::IQ1S => Some(avx2::dot_iq1s), GgmlType::IQ1M => Some(avx2::dot_iq1m), GgmlType::Q2K => Some(avx2::dot_q2k), GgmlType::Q3K => Some(avx2::dot_q3k), GgmlType::Q4K => Some(avx2::dot_q4k), GgmlType::Q2_0 => Some(avx2::dot_q2_0), GgmlType::TQ1_0 => Some(dot_tq1_0), GgmlType::TQ2_0 => Some(dot_tq2_0), GgmlType::Q4_0 => Some(avx2::dot_q4::<2>), GgmlType::Q4_1 => Some(avx2::dot_q4::<3>), GgmlType::Q5_0 => Some(avx2::dot_q4::<6>), GgmlType::Q5_1 => Some(avx2::dot_q4::<7>), _ => None };
     }
-    match ty { GgmlType::IQ2XS => Some(dot_iq2xs), GgmlType::IQ3XXS => Some(dot_iq3xxs), GgmlType::IQ4XS => Some(dot_iq4xs), GgmlType::IQ3S => Some(dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::Q5K => Some(dot_q5k), GgmlType::Q8_0 => Some(dot_q8_0), GgmlType::IQ2XXS => Some(dot_iq2xxs), GgmlType::IQ2S => Some(dot_iq2s), GgmlType::IQ1S => Some(dot_iq1s), GgmlType::IQ1M => Some(dot_iq1m), GgmlType::Q2K => Some(dot_q2k), GgmlType::Q3K => Some(dot_q3k), GgmlType::Q4K => Some(dot_q4k), GgmlType::Q2_0 => Some(dot_q2_0), GgmlType::Q4_0 => Some(dot_q4::<2>), GgmlType::Q4_1 => Some(dot_q4::<3>), GgmlType::Q5_0 => Some(dot_q4::<6>), GgmlType::Q5_1 => Some(dot_q4::<7>), _ => None }
+    match ty { GgmlType::IQ2XS => Some(dot_iq2xs), GgmlType::IQ3XXS => Some(dot_iq3xxs), GgmlType::IQ4XS => Some(dot_iq4xs), GgmlType::IQ3S => Some(dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::Q5K => Some(dot_q5k), GgmlType::Q8_0 => Some(dot_q8_0), GgmlType::IQ2XXS => Some(dot_iq2xxs), GgmlType::IQ2S => Some(dot_iq2s), GgmlType::IQ1S => Some(dot_iq1s), GgmlType::IQ1M => Some(dot_iq1m), GgmlType::Q2K => Some(dot_q2k), GgmlType::Q3K => Some(dot_q3k), GgmlType::Q4K => Some(dot_q4k), GgmlType::Q2_0 => Some(dot_q2_0), GgmlType::TQ1_0 => Some(dot_tq1_0), GgmlType::TQ2_0 => Some(dot_tq2_0), GgmlType::Q4_0 => Some(dot_q4::<2>), GgmlType::Q4_1 => Some(dot_q4::<3>), GgmlType::Q5_0 => Some(dot_q4::<6>), GgmlType::Q5_1 => Some(dot_q4::<7>), _ => None }
 }
 
 /// y = t · x for every row, using the integer kernel when the type has one.

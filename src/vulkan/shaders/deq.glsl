@@ -30,6 +30,9 @@ float ldh(U8 w, uint o) { return h2f(ld16(w, o)); }
 // Bytes of a row of `cols` values (a multiple of the type's block).
 uint rowb(uint cols) { return cols * SBB / 256; }
 int sb(uint x) { return int(x << 24) >> 24; }  // the low byte, signed
+const uint TQ_POW3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+// TQ1_0 trit n of byte v: v * 3^n in u8, then (3 q) >> 8, minus 1 (llama.cpp dequantize_row_tq1_0).
+int tq1_trit(uint v, uint n) { uint q = (v * TQ_POW3[n]) & 255u; return int((q * 3u) >> 8) - 1; }
 
 // IQ1_M (T 29) or IQ1_S (19) sub-block l of block ib: grid index, scale and the sign of the 1/8 offset.
 void iq1_sub(U8 w, uint b, uint ib, uint l, out uint idx, out float dl, out bool neg) {
@@ -215,6 +218,23 @@ void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
         uint p = b + 18 * (sub >> 3), c = ld16(w, p + 2 + 2 * (sub & 7));
         d = ldh(w, p);
         [[unroll]] for (uint i = 0; i < 8; i++) q[i] = int((c >> (2 * i)) & 3) - 1;
+    } else if (T == 34) {  // TQ1_0: qs[48] five trits a byte, qh[4] four, f16 d at 52
+        uint e = sub * 8;
+        d = ldh(w, b + 52);
+        if (e < 160) {
+            uint n = e >> 5, m = e & 31;
+            [[unroll]] for (uint i = 0; i < 8; i++) q[i] = tq1_trit(u8_(w, b + m + i), n);
+        } else if (e < 240) {
+            uint r = e - 160, n = r >> 4, m = r & 15;
+            [[unroll]] for (uint i = 0; i < 8; i++) q[i] = tq1_trit(u8_(w, b + 32 + m + i), n);
+        } else {
+            uint r = e - 240;
+            [[unroll]] for (uint i = 0; i < 8; i++) { uint li = r + i; q[i] = tq1_trit(u8_(w, b + 48 + (li & 3)), li >> 2); }
+        }
+    } else if (T == 35) {  // TQ2_0: 64 bytes of 2-bit codes, f16 d at 64; value (code - 1) d
+        uint e = sub * 8, j = e >> 7, l = (e >> 5) & 3, m = e & 31;
+        d = ldh(w, b + 64);
+        [[unroll]] for (uint i = 0; i < 8; i++) q[i] = int((u8_(w, b + 32 * j + m + i) >> (2 * l)) & 3) - 1;
     } else {  // IQ4_XS (23), IQ4_NL (20, 8 blocks of 18)
         uint r = l * 8, o;
         if (T == 23) {

@@ -22,7 +22,9 @@ fn check(name: &str, ty: GgmlType) {
 #[test] fn q4_k() { check("Q4_K", GgmlType::Q4K) }
 #[test] fn q5_k() { check("Q5_K", GgmlType::Q5K) }
 #[test] fn q6_k() { check("Q6_K", GgmlType::Q6K) }
-#[test] fn rejects_unknown() { assert!(GgmlType::from_u32(34).is_err()); } // TQ1_0 is not supported
+#[test] fn tq1_0() { check("TQ1_0", GgmlType::TQ1_0) }
+#[test] fn tq2_0() { check("TQ2_0", GgmlType::TQ2_0) }
+#[test] fn rejects_unknown() { assert!(GgmlType::from_u32(24).is_err()); } // I8 is not supported
 
 /// One Q4_0 block (value = (q - 8) d) and one Q5_0 block (32 high bits after d; value = (q - 16) d): element j is
 /// the low nibble of byte j, j + 16 the high nibble. Converted to Q8_0 they give the same values.
@@ -77,6 +79,35 @@ fn iq4_nl_block() {
     for j in 0..16 { assert_eq!((y[j], y[j + 16]), (0.5 * K[j], 0.5 * K[15 - j]), "element {j}"); }
 }
 #[test] fn iq2_xs() { check("IQ2_XS", GgmlType::IQ2XS) }
+#[test] fn tq_int_dot_matches_dequant() {
+    use rusting_strata::cpu_moe::{int_dot, quantize_q8k};
+    let mut s = 0x9E37_79B9u32;
+    let mut rnd = move || { s ^= s << 13; s ^= s >> 17; s ^= s << 5; s };
+    // The Q8_K activations the integer dot sees, dequantized back to f32 (256 values a block; max / -127 a block).
+    let seen = |x: &[f32]| -> Vec<f32> {
+        x.chunks(256).flat_map(|b| {
+            let amax = b.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let max = b.iter().copied().find(|v| v.abs() == amax).unwrap_or(0.0);
+            if amax == 0.0 { return vec![0.0; b.len()]; }
+            let is = -127.0 / max;
+            b.iter().map(move |v| ((is * v).round_ties_even() as i32).min(127) as f32 / is).collect::<Vec<_>>()
+        }).collect()
+    };
+    let x: Vec<f32> = (0..256).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+    let seen = seen(&x);
+    let xq = quantize_q8k(&x);
+    for ty in [GgmlType::TQ1_0, GgmlType::TQ2_0] {
+        let (bb, off) = (ty.block_bytes(), if ty == GgmlType::TQ1_0 { 52 } else { 64 });
+        let mut raw: Vec<u8> = (0..bb).map(|_| rnd() as u8).collect();
+        raw[off..off + 2].copy_from_slice(&half::f16::from_f32(0.25).to_le_bytes());
+        let mut w = vec![0f32; 256];
+        dequant_row(ty, &raw, &mut w);
+        let got = int_dot(ty).unwrap()(&raw, &xq);
+        let want: f32 = w.iter().zip(&seen).map(|(a, b)| a * b).sum();
+        assert!((got - want).abs() <= 1e-5 * want.abs().max(1.0), "{}: {got} vs {want}", ty.name());
+    }
+}
+
 #[test] fn iq3_xxs() { check("IQ3_XXS", GgmlType::IQ3XXS) }
 #[test] fn iq4_xs() { check("IQ4_XS", GgmlType::IQ4XS) }
 
