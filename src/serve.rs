@@ -204,7 +204,7 @@ pub struct ChatRequest {
     pub tool_calls: bool,
     pub max_tokens: Option<usize>,
     pub stream: bool,
-    pub think: bool,
+    pub think: Option<bool>,
     /// `chat_template_kwargs.preserve_thinking`; the server's `--preserve-thinking` when absent.
     pub preserve_thinking: Option<bool>,
     pub temperature: Option<f32>,
@@ -252,7 +252,7 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
     }.context("stop must be a string or an array of strings")?.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
     // Hold checks every prefix of every stop string at each token, so both are bounded.
     if stop.len() > 16 || stop.iter().any(|s| s.len() > 256) { bail!("stop takes at most 16 strings of at most 256 bytes"); }
-    let think = v["chat_template_kwargs"]["enable_thinking"].as_bool().unwrap_or(false);
+    let think = v["chat_template_kwargs"]["enable_thinking"].as_bool();
     Ok(ChatRequest { messages, tools, tool_calls, max_tokens, stream: v["stream"].as_bool().unwrap_or(false), think,
         preserve_thinking: v["chat_template_kwargs"]["preserve_thinking"].as_bool(),
         temperature: num("temperature", |f| f >= 0.0, "a number >= 0")?, top_k: int("top_k", 0)?.map(|n| n as usize),
