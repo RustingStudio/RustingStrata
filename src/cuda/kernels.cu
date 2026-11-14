@@ -229,6 +229,38 @@ template <> __device__ __forceinline__ void deq8<42>(const u8* b, int sub, float
     float d; u32 q = q2_0_codes(b, sub, d);
     for (int i = 0; i < 8; i++) o[i] = d * (float)((int)((q >> 2 * i) & 3) - 1);
 }
+// TQ1_0, 54 bytes: qs[48] five base-3 trits a byte (element 32 n + m from trit n of byte m for 0..160, element
+// 160 + 16 n + m from bytes 32..48), qh[4] four trits a byte (element 240 + 4 n + j from trit n of byte 48 + j), d.
+__device__ __forceinline__ int tq1_trit(u8 v, int n) {
+    const u8 pow3[5] = {1, 3, 9, 27, 81};
+    return (int)(((u16)(u8)(v * pow3[n]) * 3) >> 8) - 1;
+}
+__device__ __forceinline__ void tq1_vals(const u8* b, int sub, int* q) {
+    int e = sub * 8;
+    if (e < 160) {
+        int n = e >> 5, m = e & 31;
+        for (int i = 0; i < 8; i++) q[i] = tq1_trit(b[m + i], n);
+    } else if (e < 240) {
+        int r = e - 160, n = r >> 4, m = r & 15;
+        for (int i = 0; i < 8; i++) q[i] = tq1_trit(b[32 + m + i], n);
+    } else {
+        int r = e - 240;
+        for (int i = 0; i < 8; i++) { int li = r + i; q[i] = tq1_trit(b[48 + (li & 3)], li >> 2); }
+    }
+}
+template <> __device__ __forceinline__ void deq8<34>(const u8* b, int sub, float* o) {  // TQ1_0
+    int q[8]; tq1_vals(b, sub, q); float d = ldh(b + 52);
+    for (int i = 0; i < 8; i++) o[i] = d * (float)q[i];
+}
+// TQ2_0, 66 bytes: qs[64] two-bit codes (element 128 j + 32 l + m from bits 2 l of byte 32 j + m), value (code - 1) d.
+__device__ __forceinline__ void tq2_vals(const u8* b, int sub, int* q) {
+    int e = sub * 8, j = e >> 7, l = (e >> 5) & 3, m = e & 31;
+    for (int i = 0; i < 8; i++) q[i] = (int)((b[32 * j + m + i] >> (2 * l)) & 3) - 1;
+}
+template <> __device__ __forceinline__ void deq8<35>(const u8* b, int sub, float* o) {  // TQ2_0
+    int q[8]; tq2_vals(b, sub, q); float d = ldh(b + 64);
+    for (int i = 0; i < 8; i++) o[i] = d * (float)q[i];
+}
 
 // Rows of `cols` values (a multiple of 32, or of the type's block): GEMVs loop over the full super-blocks, then the
 // lanes whose 8 values lie inside a partial last one (cols % 256) read it. Only the `_p` kernels (P = true) have that
@@ -477,6 +509,20 @@ template <> struct QI<42> {  // Q2_0
         u32 a = (q & 3) | ((q << 6) & 0x300) | ((q << 12) & 0x30000) | ((q << 18) & 0x3000000), c = q >> 8;
         c = (c & 3) | ((c << 6) & 0x300) | ((c << 12) & 0x30000) | ((c << 18) & 0x3000000);
         lo = (int)__vsub4(a, 0x01010101u); hi = (int)__vsub4(c, 0x01010101u);
+    }
+};
+template <> struct QI<34> {  // TQ1_0 (54 bytes: rows 2-aligned)
+    static constexpr bool MIN = false;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        int q[8]; tq1_vals(b, sub, q); d = ldh(b + 52); m = 0.0f;
+        lo = pack4(q[0], q[1], q[2], q[3]); hi = pack4(q[4], q[5], q[6], q[7]);
+    }
+};
+template <> struct QI<35> {  // TQ2_0 (66 bytes: rows 2-aligned)
+    static constexpr bool MIN = false;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        int q[8]; tq2_vals(b, sub, q); d = ldh(b + 64); m = 0.0f;
+        lo = pack4(q[0], q[1], q[2], q[3]); hi = pack4(q[4], q[5], q[6], q[7]);
     }
 };
 template <int T> struct QI41 {  // Q4_1 (T = 3, 20 bytes) and Q5_1 (T = 7, 24 bytes): rows 4-aligned
@@ -730,7 +776,7 @@ __device__ __forceinline__ void gemv_row_qn(const u8* __restrict__ w, const sign
 
 #define FTYPES(X) X(0, f32, 1024) X(30, bf16, 512)
 #define ITYPES(X) X(8, q8_0, 272) X(10, q2_k, 84) X(11, q3_k, 110) X(12, q4_k, 144) X(13, q5_k, 176) X(14, q6_k, 210) \
-    X(19, iq1_s, 50) X(29, iq1_m, 56) X(16, iq2_xxs, 66) X(17, iq2_xs, 74) X(22, iq2_s, 82) X(18, iq3_xxs, 98) X(21, iq3_s, 110) X(23, iq4_xs, 136) X(20, iq4_nl, 144) X(42, q2_0, 72) X(2, q4_0, 144) X(6, q5_0, 176) \
+    X(19, iq1_s, 50) X(29, iq1_m, 56) X(16, iq2_xxs, 66) X(17, iq2_xs, 74) X(22, iq2_s, 82) X(18, iq3_xxs, 98) X(21, iq3_s, 110) X(23, iq4_xs, 136) X(20, iq4_nl, 144) X(42, q2_0, 72) X(34, tq1_0, 54) X(35, tq2_0, 66) X(2, q4_0, 144) X(6, q5_0, 176) \
     X(3, q4_1, 160) X(7, q5_1, 192)
 #define QTYPES(X) FTYPES(X) ITYPES(X)
 
@@ -1213,7 +1259,7 @@ __device__ __forceinline__ void mma_s8_16832_b(int* d, u32 a0, u32 a1, u32 a2, u
 }
 #endif  // __CUDA_ARCH__ >= 800
 // Weight types whose scale (and min) is constant over 32 weights: one 32-deep mma per scale.
-template <int T> __host__ __device__ constexpr bool scale32() { return T == 42 || T == 2 || T == 3 || T == 6 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23; }
+template <int T> __host__ __device__ constexpr bool scale32() { return T == 42 || T == 34 || T == 35 || T == 2 || T == 3 || T == 6 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23; }
 // Volta (sm_70) has no cp.async (sm_80+). There the copy is a synchronous typed load/store by the same thread,
 // which is also why the "wait" sites need no thread barrier (see the audit at attn_decode_t / attn_prefill_t).
 // Zero fill: with `ok == false` the source is not read at all (cp.async's size operand 0 contract) and `dst`

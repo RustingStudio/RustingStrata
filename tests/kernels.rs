@@ -1421,6 +1421,8 @@ fn attn_decode_bandwidth() {
 /// | F16 | 2 | one f16 value per element |
 /// | BF16 | 2 | one bf16 value per element |
 /// | Q2_0 | 18 | `d` f16 @0 |
+/// | TQ1_0 | 54 | `d` f16 @52 |
+/// | TQ2_0 | 66 | `d` f16 @64 |
 /// | Q4_0 | 18 | `d` f16 @0 |
 /// | Q5_0 | 22 | `d` f16 @0 |
 /// | Q8_0 | 34 | `d` f16 @0 |
@@ -1459,6 +1461,8 @@ fn random_tensor(ty: GgmlType, rows: usize, cols: usize, seed: u32) -> Vec<u8> {
                     GgmlType::Q3K => b[108..110].copy_from_slice(&scale(&mut rnd)),
                     GgmlType::Q4K | GgmlType::Q5K => { b[0..2].copy_from_slice(&scale(&mut rnd)); b[2..4].copy_from_slice(&scale(&mut rnd)); }
                     GgmlType::Q6K => b[208..210].copy_from_slice(&scale(&mut rnd)),
+                    GgmlType::TQ1_0 => b[52..54].copy_from_slice(&scale(&mut rnd)),
+                    GgmlType::TQ2_0 => b[64..66].copy_from_slice(&scale(&mut rnd)),
                     GgmlType::Q4_1 | GgmlType::Q5_1 => {
                         b[0..2].copy_from_slice(&scale(&mut rnd));
                         b[2..4].copy_from_slice(&half::f16::from_f32(-0.15 + (rnd() % 100) as f32 * 2e-3).to_le_bytes());
@@ -1508,7 +1512,7 @@ fn all_types() -> Vec<GgmlType> {
 fn gemv_partial_superblocks_and_q2_0() {
     for (bk, gpu) in common::backends_except(&[]) {
         let gpu = &*gpu;
-        for ty in [GgmlType::Q2_0, GgmlType::Q8_0, GgmlType::IQ4NL, GgmlType::Q4_0, GgmlType::Q5_0, GgmlType::Q4_1, GgmlType::Q5_1, GgmlType::BF16, GgmlType::F32] {
+        for ty in [GgmlType::Q2_0, GgmlType::TQ1_0, GgmlType::TQ2_0, GgmlType::Q8_0, GgmlType::IQ4NL, GgmlType::Q4_0, GgmlType::Q5_0, GgmlType::Q4_1, GgmlType::Q5_1, GgmlType::BF16, GgmlType::F32] {
             for cols in [640, 320, 2560] {
                 if cols % ty.block_elems() != 0 { continue; }
                 let (rows, nt, ne) = (40, 3, 4);  // ne experts of `rows` rows for moe_gemv
@@ -1588,7 +1592,7 @@ fn gemv_partial_superblocks_and_q2_0() {
     }
 }
 
-/// Per-type Vulkan pass/fail matrix over all 23 `GgmlType` variants: dequant, GEMV/GEMV-N/GEMV-Q, MoE GEMV, dense
+/// Per-type Vulkan pass/fail matrix over all 25 `GgmlType` variants: dequant, GEMV/GEMV-N/GEMV-Q, MoE GEMV, dense
 /// and tiled GEMM, plus each type's largest shared-memory request. Synthetic raw blocks bypass `Backend::upload`, so
 /// native kernels run even for the types the loader converts (F16, Q4_0, Q5_0). Vulkan only: run it with
 /// `STRATA_TEST_BACKENDS=vulkan`. Prints one `MATRIX ty=...` line per type for `docs/V100-results.md`.
@@ -1598,7 +1602,7 @@ fn vulkan_type_matrix() {
     let gpu: &dyn Backend = &g;
     let not_impl = |e: &anyhow::Error| format!("{e:#}").contains("not implemented");
     let types = all_types();
-    assert_eq!(types.len(), 23, "GgmlType variants");
+    assert_eq!(types.len(), 25, "GgmlType variants");
     let (rows, ne, cols, nt) = (40, 4, 256, 3);
     let mut failures = 0;
     for ty in types {
