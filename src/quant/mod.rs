@@ -7,13 +7,13 @@ use half::{bf16, f16};
 use tables::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GgmlType { F32, F16, BF16, Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL }
+pub enum GgmlType { F32, F16, BF16, Q2_0, TQ1_0, TQ2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL }
 use GgmlType::*;
 
 impl GgmlType {
     pub fn from_u32(id: u32) -> anyhow::Result<Self> {
         Ok(match id {
-            0 => F32, 1 => F16, 30 => BF16, 42 => Q2_0, 2 => Q4_0, 3 => Q4_1, 6 => Q5_0, 7 => Q5_1, 8 => Q8_0, 10 => Q2K, 11 => Q3K, 12 => Q4K, 13 => Q5K, 14 => Q6K,
+            0 => F32, 1 => F16, 30 => BF16, 42 => Q2_0, 34 => TQ1_0, 35 => TQ2_0, 2 => Q4_0, 3 => Q4_1, 6 => Q5_0, 7 => Q5_1, 8 => Q8_0, 10 => Q2K, 11 => Q3K, 12 => Q4K, 13 => Q5K, 14 => Q6K,
             16 => IQ2XXS, 17 => IQ2XS, 19 => IQ1S, 29 => IQ1M, 18 => IQ3XXS, 21 => IQ3S, 22 => IQ2S, 23 => IQ4XS, 20 => IQ4NL,
             _ => {
                 const NAMES: [&str; 40] = ["F32", "F16", "Q4_0", "Q4_1", "", "", "Q5_0", "Q5_1", "Q8_0", "Q8_1", "Q2_K",
@@ -21,14 +21,14 @@ impl GgmlType {
                     "IQ2_S", "IQ4_XS", "I8", "I16", "I32", "I64", "F64", "IQ1_M", "BF16", "", "", "", "TQ1_0", "TQ2_0",
                     "", "", "", "MXFP4"];
                 let name = NAMES.get(id as usize).filter(|n| !n.is_empty()).unwrap_or(&"unknown");
-                anyhow::bail!("unsupported quant type {name} (ggml type id {id}); supported: F32 F16 BF16 Q2_0 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K-Q6_K IQ1_S IQ1_M IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_NL IQ4_XS")
+                anyhow::bail!("unsupported quant type {name} (ggml type id {id}); supported: F32 F16 BF16 Q2_0 TQ1_0 TQ2_0 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K-Q6_K IQ1_S IQ1_M IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_NL IQ4_XS")
             }
         })
     }
     pub fn block_elems(self) -> usize { match self { F32 | F16 | BF16 => 1, Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | IQ4NL => 32, Q2_0 => 64, _ => 256 } }
     pub fn block_bytes(self) -> usize {
         match self {
-            F32 => 4, F16 => 2, BF16 => 2, Q2_0 => 18, Q4_0 => 18, Q4_1 => 20, Q5_0 => 22, Q5_1 => 24, Q8_0 => 34, Q2K => 84, Q3K => 110, Q4K => 144, Q5K => 176, Q6K => 210,
+            F32 => 4, F16 => 2, BF16 => 2, Q2_0 => 18, TQ1_0 => 54, TQ2_0 => 66, Q4_0 => 18, Q4_1 => 20, Q5_0 => 22, Q5_1 => 24, Q8_0 => 34, Q2K => 84, Q3K => 110, Q4K => 144, Q5K => 176, Q6K => 210,
             IQ1S => 50, IQ1M => 56, IQ2XXS => 66, IQ2XS => 74, IQ2S => 82, IQ3XXS => 98, IQ3S => 110, IQ4XS => 136, IQ4NL => 18,
         }
     }
@@ -38,7 +38,7 @@ impl GgmlType {
     pub fn row_bytes(self, n: u64) -> usize { n as usize / self.block_elems() * self.block_bytes() }
     pub fn name(self) -> &'static str {
         match self {
-            F32 => "F32", F16 => "F16", BF16 => "BF16", Q2_0 => "Q2_0", Q4_0 => "Q4_0", Q4_1 => "Q4_1", Q5_0 => "Q5_0", Q5_1 => "Q5_1", Q8_0 => "Q8_0", Q2K => "Q2_K", Q3K => "Q3_K", Q4K => "Q4_K",
+            F32 => "F32", F16 => "F16", BF16 => "BF16", Q2_0 => "Q2_0", TQ1_0 => "TQ1_0", TQ2_0 => "TQ2_0", Q4_0 => "Q4_0", Q4_1 => "Q4_1", Q5_0 => "Q5_0", Q5_1 => "Q5_1", Q8_0 => "Q8_0", Q2K => "Q2_K", Q3K => "Q3_K", Q4K => "Q4_K",
             Q5K => "Q5_K", Q6K => "Q6_K", IQ1S => "IQ1_S", IQ1M => "IQ1_M", IQ2XXS => "IQ2_XXS", IQ2XS => "IQ2_XS", IQ2S => "IQ2_S", IQ3XXS => "IQ3_XXS", IQ3S => "IQ3_S", IQ4XS => "IQ4_XS", IQ4NL => "IQ4_NL",
         }
     }
@@ -63,6 +63,7 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) {
             BF16 => y[0] = bf16::from_le_bytes([blk[0], blk[1]]).to_f32(),
             // Q2_0 (Strata/ggml type 42): f16 d, then 2-bit codes, value = (code - 1) * d.
             Q2_0 => { let d = h(blk, 0); for j in 0..64 { y[j] = (((blk[2 + j / 4] >> (2 * (j % 4))) & 3) as f32 - 1.0) * d; } }
+            TQ1_0 => tq1_0(blk, y), TQ2_0 => tq2_0(blk, y),
             Q4_0 | Q5_0 => { let (d, q) = (h(blk, 0), q5_codes(ty, blk)); for j in 0..32 { y[j] = q[j] as f32 * d; } }
             // Q4_1 / Q5_1: f16 d, f16 m, (Q5_1: u32 high bits,) nibbles as in Q4_0; value = d * code + m.
             Q4_1 | Q5_1 => {
@@ -77,6 +78,34 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) {
             IQ1S => iq1s(blk, y), IQ1M => iq1m(blk, y), IQ2XXS => iq2xxs(blk, y), IQ2XS => iq2xs(blk, y), IQ2S => iq2s(blk, y), IQ3XXS => iq3xxs(blk, y), IQ3S => iq3s(blk, y), IQ4XS => iq4xs(blk, y), IQ4NL => iq4nl(blk, y),
         }
     }
+}
+
+/// Value of trit `n` (0 = most significant) packed in a TQ1_0 byte, as llama.cpp's `dequantize_row_tq1_0`:
+/// the byte times 3^n in u8, then (3 q) >> 8. The result is -1, 0 or 1.
+fn tq1_trit(v: u8, n: usize) -> f32 {
+    const POW3: [u8; 5] = [1, 3, 9, 27, 81];
+    let q = v.wrapping_mul(POW3[n]);
+    (((q as u16) * 3) >> 8) as f32 - 1.0
+}
+
+/// TQ1_0 (54 bytes): 48 bytes of five trits, 4 bytes of four trits, then f16 d. Values 0..160 come from the first 32
+/// bytes (trit n of byte m is element 32 n + m), 160..240 from the next 16 (element 160 + 16 n + m), 240..256 from qh
+/// (element 240 + 4 n + j).
+fn tq1_0(b: &[u8], y: &mut [f32]) {
+    let d = h(b, 52);
+    let mut o = 0;
+    for n in 0..5 { for m in 0..32 { y[o] = d * tq1_trit(b[m], n); o += 1; } }
+    for n in 0..5 { for m in 0..16 { y[o] = d * tq1_trit(b[32 + m], n); o += 1; } }
+    for n in 0..4 { for j in 0..4 { y[o] = d * tq1_trit(b[48 + j], n); o += 1; } }
+}
+
+/// TQ2_0 (66 bytes): 64 bytes of 2-bit codes, then f16 d. Element 128 j + 32 l + m is codes byte 32 j + m bits 2 l,
+/// value (code - 1) d.
+fn tq2_0(b: &[u8], y: &mut [f32]) {
+    let d = h(b, 64);
+    for j in 0..2 { for l in 0..4 { for m in 0..32 {
+        y[32 * (4 * j + l) + m] = d * (((b[32 * j + m] >> (2 * l)) & 3) as f32 - 1.0);
+    } } }
 }
 
 fn q2k(b: &[u8], y: &mut [f32]) {

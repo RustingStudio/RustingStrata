@@ -23,6 +23,8 @@ WANT = {
     Q.IQ2_XS,
     Q.IQ3_XXS,
     Q.IQ4_XS,
+    Q.TQ1_0,
+    Q.TQ2_0,
 }
 r = GGUFReader(sys.argv[1])
 out = pathlib.Path(sys.argv[2])
