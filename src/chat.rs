@@ -656,6 +656,59 @@ impl Hold {
     pub fn rest(&self) -> &str { &self.text[self.sent..] }
 }
 
+/// Splits a reply that starts inside an open think block into reasoning and answer at `</think>`,
+/// holding back a tail that could still become the tag.
+pub struct Think { open: bool, lead: bool, buf: String }
+
+impl Think {
+    const TAG: &'static str = "</think>";
+    pub fn new(open: bool) -> Think { Think { open, lead: false, buf: String::new() } }
+    /// (reasoning, answer) that are safe to send after adding `piece`.
+    pub fn feed(&mut self, piece: &str) -> (String, String) {
+        self.buf += piece;
+        if !self.open { let b = std::mem::take(&mut self.buf); return (String::new(), self.answer(b)); }
+        if let Some(p) = self.buf.find(Self::TAG) {
+            self.open = false;
+            self.lead = true;
+            let r = self.buf[..p].trim_end_matches('\n').to_string();
+            let rest = self.buf[p + Self::TAG.len()..].to_string();
+            self.buf.clear();
+            let a = self.answer(rest);
+            return (r, a);
+        }
+        let keep = (1..Self::TAG.len()).rev().find(|&k| self.buf.ends_with(&Self::TAG[..k])).unwrap_or(0);
+        let cut = self.buf.len() - keep;
+        let r = self.buf[..cut].to_string();
+        self.buf.drain(..cut);
+        (r, String::new())
+    }
+    /// The answer without the blank lines after `</think>`.
+    fn answer(&mut self, a: String) -> String {
+        if !self.lead { return a; }
+        let t = a.trim_start_matches('\n');
+        self.lead = t.is_empty();
+        t.to_string()
+    }
+    /// What is still held when the reply ends.
+    pub fn finish(&mut self) -> (String, String) {
+        let b = std::mem::take(&mut self.buf);
+        if self.open { (b, String::new()) } else { (String::new(), self.answer(b)) }
+    }
+}
+
+#[cfg(test)]
+mod think_tests {
+    use super::*;
+    #[test]
+    fn splits_across_tokens() {
+        let mut t = Think::new(true);
+        let mut r = String::new(); let mut a = String::new();
+        for p in ["hm", " ok\n</th", "ink>", "\n\nHi", "!"] { let (x, y) = t.feed(p); r += &x; a += &y; }
+        let (x, y) = t.finish(); r += &x; a += &y;
+        assert_eq!((r.trim_end(), a.as_str()), ("hm ok", "Hi!"));
+    }
+}
+
 #[cfg(test)]
 mod ds_tests {
     use super::*;

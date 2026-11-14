@@ -4,7 +4,7 @@ use rusting_strata::memory;
 use rusting_strata::model::{Model, State};
 use rusting_strata::{backend, gpu_model::GpuModel};
 use rusting_strata::{config::ModelConfig, gguf::Gguf, hf, ops, ops::Sampler, quant::GgmlType, serve, tokenizer::Tokenizer};
-use rusting_strata::chat::{Hold, Msg, Template};
+use rusting_strata::chat::{Hold, Msg, Template, Think};
 use rusting_strata::vision::{self, VisionProjector};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -1564,6 +1564,13 @@ fn template(g: &Gguf) -> Template {
 }
 
 /// Reply text without the thinking part (the template drops it from history too).
+/// Streams one (reasoning, answer) pair as `reasoning_content` and `content` deltas.
+fn send_split(w: &mut impl Write, chunk: &impl Fn(serde_json::Value, Option<&str>) -> serde_json::Value, (r, a): (String, String)) -> anyhow::Result<()> {
+    if !r.is_empty() { write!(w, "data: {}\n\n", chunk(json!({"reasoning_content": r}), None))?; }
+    if !a.is_empty() { write!(w, "data: {}\n\n", chunk(json!({"content": a}), None))?; }
+    Ok(())
+}
+
 fn answer(s: &str) -> String { s.rsplit_once("</think>").map_or(s, |x| x.1).trim().to_string() }
 
 /// A model `serve` has loaded.
@@ -2066,6 +2073,9 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let mut k = 0;  // tokens decoded
             let mut opened = false;  // Messages API stream: the text block has started
             let mut hold = Hold::new(tools, req.stop);
+            // A prompt that ends in an open think block makes the reply start with reasoning, up to `</think>`.
+            let think_open = prompt.trim_end().ends_with("<think>");
+            let mut think = Think::new(think_open);
             let n_system = tok.encode(&system)?.len();
             let (mut t0, mut t1) = (Instant::now(), Instant::now());
             // Under `--parallel` a request is busy (and its prefill timed) from when the model takes it, not while it
@@ -2111,7 +2121,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     let t = hold.push(t);
                     if req.stream {
                         if !t.is_empty() {
-                            if !anth { write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?; } else { text_delta(&mut w, &mut opened, &t)?; }
+                            if !anth { send_split(&mut w, &chunk, think.feed(&t))?; } else { text_delta(&mut w, &mut opened, &t)?; }
                             last_stream_activity = Instant::now();
                         } else if last_stream_activity.elapsed() >= Duration::from_secs(15) {
                             w.write_all(b": keep-alive\n\n")?;
@@ -2205,15 +2215,24 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             if req.stream {
                 match &calls {
                     Some(c) => write!(w, "data: {}\n\n", chunk(calls_json(c, true), None))?,
-                    None if !hold.rest().is_empty() => write!(w, "data: {}\n\n", chunk(json!({"content": hold.rest()}), None))?,
-                    None => {}
+                    None => {
+                        let (r, a) = think.feed(hold.rest());
+                        send_split(&mut w, &chunk, (r, a))?;
+                        send_split(&mut w, &chunk, think.finish())?;
+                    }
                 }
                 let mut last = chunk(json!({}), Some(finish));
                 last["usage"] = usage;
                 last["timings"] = timings;
                 Ok(write!(w, "data: {last}\n\ndata: [DONE]\n\n")?)
             } else {
-                let message = match &calls { Some(c) => calls_json(c, false), None => json!({"role": "assistant", "content": hold.text}) };
+                let message = match &calls { Some(c) => calls_json(c, false), None => {
+                    let mut th = Think::new(think_open);
+                    let (mut r, mut a) = th.feed(&hold.text);
+                    let (r2, a2) = th.finish();
+                    r += &r2; a += &a2;
+                    if r.is_empty() { json!({"role": "assistant", "content": a}) } else { json!({"role": "assistant", "content": a, "reasoning_content": r}) }
+                } };
                 send(&mut w, "200 OK", json!({"id": id, "object": "chat.completion", "created": created, "model": name,
                     "choices": [{"index": 0, "message": message, "finish_reason": finish}], "usage": usage, "timings": timings}))
             }
