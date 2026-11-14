@@ -62,6 +62,6 @@ void main() {
         if (wj != 0.0) y = fma(wj, part[j * RPW + i], y);
     }
     if (miss) y += uintBitsToFloat(p.mb.v[p.y_off + tk * n + r]);
-    if (uint64_t(p.sh) != 0) y = fma(sigmoid(p.sg.v[tk]), p.sh.v[tk * n + r], y);
+    if (uint64_t(p.sh) != 0) y = uint64_t(p.sg) != 0 ? fma(sigmoid(p.sg.v[tk]), p.sh.v[tk * n + r], y) : y + p.sh.v[tk * n + r];
     p.x.v[tk * n + r] += y;
 }

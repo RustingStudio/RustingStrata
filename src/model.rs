@@ -331,7 +331,7 @@ impl<'a> Model<'a> {
         };
         for (a, b) in x.iter_mut().zip(&mix) { *a += b; }
         ops::rms_norm(x, &self.f(il, "post_attention_norm.weight"), c.eps, &mut h);
-        let ffn = if c.is_moe() { self.moe(il, &h) } else { self.dense_ffn(il, &h) };
+        let ffn = if c.is_moe_layer(il) { self.moe(il, &h) } else { self.dense_ffn(il, &h) };
         for (a, b) in x.iter_mut().zip(&ffn) { *a += b; }
     }
 
@@ -461,7 +461,15 @@ impl<'a> Model<'a> {
     fn attention(&self, il: usize, h: &[f32], kc: &mut Vec<f32>, vc: &mut Vec<f32>, ik: &mut Vec<f32>, pos: usize, rope_pos: [i32; 4])
         -> Vec<f32> {
         let c = &self.cfg;
-        let cells = self.qsa(il, h, ik, pos, rope_pos).unwrap_or_else(|| (0..pos + 1).collect());
+        let cells = self.qsa(il, h, ik, pos, rope_pos).unwrap_or_else(|| {
+            if c.swa.get(il).copied().unwrap_or(false) {
+                ((pos + 1).saturating_sub(c.n_swa)..=pos).collect()
+            } else {
+                (0..pos + 1).collect()
+            }
+        });
+        let use_rope = c.rope_layer.get(il).copied().unwrap_or(true);
+        let sinks = if c.attn_sinks { self.f(il, "attn_sinks.weight") } else { Vec::new() };
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
         let qs = if c.q_gate { 2 * hd } else { hd };  // per-head row of attn_q: query, then the gate if any
         let qg = mv(&self.t(il, "attn_q.weight"), h);
@@ -470,7 +478,7 @@ impl<'a> Model<'a> {
         for i in 0..nh {
             let qh = &mut q[i * hd..(i + 1) * hd];
             ops::rms_norm(&qg[i * qs..i * qs + hd], &qn, c.eps, qh);
-            self.rope(qh, pos, rope_pos);
+            if use_rope { self.rope(qh, pos, rope_pos); }
         }
         let kraw = mv(&self.t(il, "attn_k.weight"), h);
         let v = mv(&self.t(il, "attn_v.weight"), h);
@@ -478,7 +486,7 @@ impl<'a> Model<'a> {
         for i in 0..nkv {
             let kh = &mut k[i * hd..(i + 1) * hd];
             ops::rms_norm(&kraw[i * hd..(i + 1) * hd], &kn, c.eps, kh);
-            self.rope(kh, pos, rope_pos);
+            if use_rope { self.rope(kh, pos, rope_pos); }
         }
         kc.extend_from_slice(&k);
         vc.extend_from_slice(&v);
@@ -492,7 +500,7 @@ impl<'a> Model<'a> {
                 let kt = &kc[(t * nkv + g) * hd..(t * nkv + g + 1) * hd];
                 *s = qh.iter().zip(kt).map(|(a, b)| a * b).sum::<f32>() * scale;
             }
-            ops::softmax(&mut sc);
+            ops::softmax_sink(&mut sc, sinks.get(i).copied());
             let oh = &mut out[i * hd..(i + 1) * hd];
             for (&t, p) in cells.iter().zip(&sc) {
                 let vt = &vc[(t * nkv + g) * hd..(t * nkv + g + 1) * hd];
@@ -522,19 +530,27 @@ impl<'a> Model<'a> {
 
     fn moe(&self, il: usize, h: &[f32]) -> Vec<f32> {
         let mut y = self.routed_experts(il, h);
-        if let Ok(sg) = self.w.layer(il, "ffn_gate_inp_shexp.weight") {
-            let s = ops::sigmoid(mv(&sg, h)[0]);
+        if self.w.layer(il, "ffn_up_shexp.weight").is_ok() {
+            // Flint's shared expert is always on; Qwen's has a sigmoid gate.
+            let s = match self.w.layer(il, "ffn_gate_inp_shexp.weight") {
+                Ok(sg) => ops::sigmoid(mv(&sg, h)[0]),
+                Err(_) => 1.0,
+            };
             let o = self.ffn(il, &self.t(il, "ffn_gate_shexp.weight"), &self.t(il, "ffn_up_shexp.weight"), &self.t(il, "ffn_down_shexp.weight"), "ffn_down_shexp.weight", Some(0), h);
             for (a, b) in y.iter_mut().zip(o) { *a += s * b; }
         }
         y
     }
 
-    /// Router softmax, top-k and normalized weights: (expert, weight) pairs.
+    /// Router scores, top-k and normalized weights: (expert, weight) pairs.
     pub fn route(&self, il: usize, h: &[f32]) -> Vec<(usize, f32)> {
         let c = &self.cfg;
         let mut p = mv(&self.t(il, "ffn_gate_inp.weight"), h);
-        ops::softmax(&mut p);
+        if c.router_sigmoid {
+            for v in &mut p { *v = ops::sigmoid(*v); }
+        } else {
+            ops::softmax(&mut p);
+        }
         let top = ops::top_k(&p, c.n_expert_used);
         let sum = top.iter().map(|&e| p[e]).sum::<f32>().max(6.103515625e-5);
         let mut scale = 1.0 / sum;

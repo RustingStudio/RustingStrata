@@ -25,6 +25,8 @@ fn arch(name: &str) -> Option<Arch> {
         // Qwen3.8-Flash-Next: qwen35-style DeltaNet pairing, plus hyper-connections and PLE read from metadata.
         "qwen4exp" => Arch { hybrid: true, q_gate: true, k_interleave: false, aliases: &[] },
         "qwen3next" => Arch { hybrid: true, q_gate: true, k_interleave: true, aliases: &[] },
+        // Recursive Flint: Qwen-style attention with sliding windows, per-head QK norms and attention sinks.
+        "flint" => Arch { hybrid: false, q_gate: false, k_interleave: false, aliases: FFN_NORM },
         "qwen3" | "qwen3moe" => Arch { hybrid: false, q_gate: false, k_interleave: false, aliases: FFN_NORM },
         _ => return None,
     })
@@ -51,8 +53,20 @@ pub struct ModelConfig {
     pub n_expert_used: usize,
     pub n_ff_exp: usize,
     pub n_ff_shexp: usize,
+    /// Leading layers with a dense FFN; the rest are MoE (0 when the whole model is MoE).
+    pub n_dense: usize,
     /// 0 = no extra scale.
     pub expert_weights_scale: f32,
+    /// Router activation is sigmoid (Flint) instead of softmax.
+    pub router_sigmoid: bool,
+    /// Sliding-window width for the layers flagged in `swa` (0 = all layers are dense).
+    pub n_swa: usize,
+    /// Per-layer sliding-window attention (Flint). Empty for architectures without it.
+    pub swa: Vec<bool>,
+    /// Per-layer RoPE; Flint's full-attention layers use no positional encoding.
+    pub rope_layer: Vec<bool>,
+    /// Per-head learned attention sinks (`blk.N.attn_sinks.weight`).
+    pub attn_sinks: bool,
     /// DeltaNet sizes, 0 without DeltaNet layers.
     pub ssm_d_inner: usize,
     pub ssm_d_state: usize,
@@ -80,7 +94,7 @@ impl ModelConfig {
     pub fn from_gguf(g: &Gguf) -> anyhow::Result<ModelConfig> {
         let arch = g.get("general.architecture")?.as_str().context("general.architecture")?.to_string();
         let Some(a) = self::arch(&arch) else {
-            bail!("unsupported architecture '{arch}' (supported: qwen3, qwen3moe, qwen3next, qwen35, qwen35moe, qwen4exp)")
+            bail!("unsupported architecture '{arch}' (supported: qwen3, qwen3moe, qwen3next, qwen35, qwen35moe, qwen4exp, flint)")
         };
         let opt = |k: &str| g.meta.get(&format!("{arch}.{k}")).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let req = |k: &str| -> anyhow::Result<usize> {
@@ -102,6 +116,19 @@ impl ModelConfig {
         let head_dim = match opt("attention.key_length") { 0 => n_embd / n_head, v => v };
         let n_expert = opt("expert_count");
         anyhow::ensure!(n_expert <= 512, "{n_expert} experts (at most 512 supported)");
+        let n_dense = opt("leading_dense_block_count");
+        anyhow::ensure!(n_dense <= n_layer, "{n_dense} leading dense blocks for {n_layer} layers");
+        let flags = |k: &str| -> anyhow::Result<Option<Vec<bool>>> {
+            let key = format!("{arch}.{k}");
+            let Some(v) = g.meta.get(&key) else { return Ok(None) };
+            let a = v.as_arr().with_context(|| format!("{key}: not an array"))?;
+            anyhow::ensure!(a.len() >= n_layer, "{key} has {} entries for {n_layer} layers", a.len());
+            Ok(Some(a[..n_layer].iter().map(|v| v.as_u64().unwrap_or(0) != 0).collect()))
+        };
+        let swa = flags("attention.sliding_window_pattern")?.unwrap_or_else(|| vec![false; n_layer]);
+        let rope_layer = flags("attention.rope_pattern")?.unwrap_or_else(|| vec![true; n_layer]);
+        let n_swa = opt("attention.sliding_window");
+        anyhow::ensure!(!swa.contains(&true) || n_swa > 0, "sliding-window layers without attention.sliding_window");
         let emb = g.tensors.get("token_embd.weight").context("missing tensor token_embd.weight")?;
         let c = ModelConfig {
             n_layer,
@@ -125,7 +152,13 @@ impl ModelConfig {
             n_expert_used: opt("expert_used_count"),
             n_ff_exp: opt("expert_feed_forward_length"),
             n_ff_shexp: opt("expert_shared_feed_forward_length"),
+            n_dense,
             expert_weights_scale: f("expert_weights_scale").unwrap_or(0.0),
+            router_sigmoid: arch == "flint" && opt("expert_gating_func") == 2,
+            n_swa,
+            swa,
+            rope_layer,
+            attn_sinks: g.tensors.contains_key("blk.0.attn_sinks.weight"),
             ssm_d_inner: ssm("ssm.inner_size")?,
             ssm_d_state: ssm("ssm.state_size")?,
             ssm_n_group: ssm("ssm.group_count")?,
@@ -151,6 +184,8 @@ impl ModelConfig {
     }
 
     pub fn is_moe(&self) -> bool { self.n_expert > 0 }
+    /// Layer `il` uses the MoE FFN (dense-lead architectures start with `n_dense` dense layers).
+    pub fn is_moe_layer(&self, il: usize) -> bool { self.n_expert > 0 && il >= self.n_dense }
     /// DeltaNet value head size (0 without DeltaNet layers).
     pub fn ssm_dv(&self) -> usize { self.ssm_d_inner / self.ssm_dt_rank.max(1) }
 }

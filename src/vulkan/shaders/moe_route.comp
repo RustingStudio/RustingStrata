@@ -5,7 +5,7 @@ layout(local_size_x = 256) in;
 #include "common.glsl"
 #include "topk.glsl"
 layout(push_constant) uniform P { F32 p; I32 table; I32 ids; F32 wts; I32 slots; F32 wh; F32 h; MB mb; I32 step; uint n; uint k;
-    float extra_scale; uint nh; uint h_off; uint T; } p;
+    float extra_scale; uint nh; uint h_off; uint T; uint sigmoid; } p;
 
 // Decode routing of T tokens in one workgroup (subgroup i routes tokens i, i + 8, ...): router_topk, the expert cache
 // lookup (slots = table[ids], -1 = not resident; wh = weight of hits, else 0), then the routing (and h, if an expert
@@ -18,7 +18,7 @@ void main() {
     for (uint t = WARP; t < p.T; t += ((gl_WorkGroupSize.x + 31u) / 32u)) {
         int id;
         float w;
-        topk(p.p, t * p.n, p.n, p.k, p.extra_scale, lane, id, w);
+        topk(p.p, t * p.n, p.n, p.k, p.extra_scale, lane, id, w, p.sigmoid);
         if (lane < p.k) {
             uint o = t * p.k + lane;
             int s = p.table.v[id];

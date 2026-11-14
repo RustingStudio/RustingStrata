@@ -211,6 +211,9 @@ pub enum Template {
     /// DeepSeek-V4.1: `<｜User｜>`/`<｜Assistant｜>` turns, think mode with a reasoning-effort line. Plain chat only;
     // ponytail: no DSML tool calls, add when serving DeepSeek tools matters.
     Ds,
+    /// Recursive Flint: `<|system|>`/`<|user|>`/`<|assistant|>`/`<|observation|>` turns and compact
+    /// `<tool_call>name<arg_key>..</arg_key><arg_value>..</arg_value></tool_call>` calls.
+    Flint,
 }
 
 const XML_RULES: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
@@ -291,6 +294,109 @@ fn render_ds(msgs: &[Msg], tools: &[Json], think: bool, preserve: bool, generate
     s
 }
 
+/// Recursive Flint: escape the template's own markers in user text and drop NULs and think tags.
+fn flint_text(s: &str) -> String {
+    let mut t = s.replace('\0', "").replace(" thinking", "").replace("</think>", "");
+    for m in ["<|begin_of_text|>", "<|end_of_text|>", "<|system|>", "<|developer|>", "<|user|>", "<|assistant|>", "<|observation|>"] {
+        t = t.replace(m, &m.replace('<', "&lt;").replace('>', "&gt;"));
+    }
+    t
+}
+
+/// The tool block Flint puts in a system turn before the first non-system message.
+fn flint_preamble(tools: &[Json]) -> String {
+    let mut s = String::from("<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>");
+    for t in tools {
+        s += &t.dump();
+    }
+    s += "</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>";
+    s
+}
+
+/// Flint's chat template: turn markers with no trailing newline, `<tool_call>` calls and an always-on think block.
+fn render_flint(msgs: &[Msg], tools: &[Json], generate: bool) -> String {
+    let preamble = flint_preamble(tools);
+    let mut pending = !tools.is_empty();
+    let mut s = String::new();
+    for m in msgs {
+        if pending && m.role != "system" {
+            s += &preamble;
+            pending = false;
+        }
+        match m.role.as_str() {
+            "system" => { s += "<|system|>"; s += &flint_text(&m.content); }
+            "developer" => { s += "<|developer|>"; s += &flint_text(&m.content); }
+            "user" => { s += "<|user|>"; s += &flint_text(&m.content); }
+            "assistant" => {
+                s += "<|assistant|>";
+                let (r, c) = split_think(m, &m.content);
+                let reasoning = m.reasoning.as_deref().unwrap_or(r);
+                if !reasoning.is_empty() { s += " thinking"; s += reasoning; s += "</think>"; }
+                s += c;
+                for call in &m.calls {
+                    s += "<tool_call>";
+                    s += &call.name;
+                    if let Json::Obj(o) = &call.args {
+                        for (k, v) in o {
+                            s += "<arg_key>";
+                            s += k;
+                            s += "</arg_key><arg_value>";
+                            match v { Json::Str(x) => s += x, _ => s += &v.dump() }
+                            s += "</arg_value>";
+                        }
+                    }
+                    s += "</tool_call>";
+                }
+            }
+            "tool" => { s += "<|observation|><tool_response>"; s += &flint_text(&m.content); s += "</tool_response>"; }
+            _ => {}
+        }
+    }
+    if pending { s += &preamble; }
+    if generate { s += "<|assistant|>"; }
+    s
+}
+
+/// One `<arg_value>` as JSON text. Values that parse as JSON keep their type; anything else is a string.
+fn flint_arg(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw).map_or_else(|_| serde_json::to_string(raw).unwrap(), |v| v.to_string())
+}
+
+/// Flint reply calls: `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`.
+fn flint_calls(text: &str) -> Option<(String, Vec<(String, String)>)> {
+    let from = text.rfind("</think>").map_or(0, |p| p + 8);
+    let start = from + text[from..].find(TAG)?;
+    let mut rest = &text[start..];
+    let mut calls = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() { break; }
+        let (body, tail) = rest.strip_prefix(TAG)?.split_once("</tool_call>")?;
+        rest = tail;
+        let at = body.find("<arg_key>").unwrap_or(body.len());
+        let name = body[..at].trim();
+        if name.is_empty() { return None; }
+        let mut args = String::from("{");
+        let mut b = &body[at..];
+        let mut first = true;
+        while let Some(x) = b.strip_prefix("<arg_key>") {
+            let (k, x) = x.split_once("</arg_key>")?;
+            let x = x.strip_prefix("<arg_value>")?;
+            let (v, x) = x.split_once("</arg_value>")?;
+            b = x;
+            if !first { args.push(','); }
+            first = false;
+            args += &serde_json::to_string(k.trim()).ok()?;
+            args.push(':');
+            args += &flint_arg(v);
+        }
+        if !b.trim().is_empty() { return None; }
+        args.push('}');
+        calls.push((name.to_string(), args));
+    }
+    Some((text[..start].trim_end().to_string(), calls))
+}
+
 /// Index of the last user turn that is not a tool response (the templates' `last_query_index`).
 fn last_query(msgs: &[Msg], trim: bool) -> usize {
     msgs.iter().rposition(|m| {
@@ -312,6 +418,7 @@ impl Template {
     pub fn detect(src: Option<&str>) -> Template {
         match src {
             Some(s) if s.contains("｜DSML｜") => Template::Ds,
+            Some(s) if s.contains("<|observation|>") && s.contains("<|begin_of_text|>") => Template::Flint,
             Some(s) if !s.contains("<function=") && s.contains(TAG) => Template::Json { reasoning: s.contains("reasoning_content") },
             _ => Template::Xml,
         }
@@ -327,6 +434,7 @@ impl Template {
             if i + 1 == msgs.len() || msgs[i + 1].role != "tool" { *s += "<|im_end|>\n"; }
         };
         match *self {
+            Template::Flint => s += &render_flint(msgs, tools, generate),
             Template::Ds => s += &render_ds(msgs, tools, think, preserve, generate),
             Template::Xml => {
                 let (n_sys, sys) = match msgs {
@@ -426,6 +534,7 @@ impl Template {
     // first if thinking with tools matters.
     pub fn parse_calls(&self, text: &str, tools: &[Json]) -> Option<(String, Vec<(String, String)>)> {
         if let Template::Ds = self { return ds_calls(text); }
+        if let Template::Flint = self { return flint_calls(text); }
         let start = text.find(TAG)?;
         let mut rest = &text[start..];
         let mut calls = Vec::new();
@@ -434,7 +543,7 @@ impl Template {
             if rest.is_empty() { break; }
             let inner;
             (inner, rest) = rest.strip_prefix(TAG)?.split_once("</tool_call>")?;
-            calls.push(match self { Template::Ds => unreachable!(), Template::Xml => xml_call(inner, tools)?, Template::Json { .. } => json_call(inner)? });
+            calls.push(match self { Template::Ds | Template::Flint => unreachable!(), Template::Xml => xml_call(inner, tools)?, Template::Json { .. } => json_call(inner)? });
         }
         Some((text[..start].trim_end().to_string(), calls))
     }
@@ -592,5 +701,39 @@ mod ds_tests {
         assert_eq!(c, vec![("f".to_string(), r#"{"s": "12", "n": [1, 2]}"#.to_string()), ("g".to_string(), "{}".to_string())]);
         assert!(Template::Ds.parse_calls("plain", &[]).is_none());
         assert!(Template::Ds.parse_calls("<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">", &[]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod flint_tests {
+    use super::*;
+
+    // Expected strings are llama-server `/apply-template` output for the GGUF's own template.
+    #[test]
+    fn flint_plain_chat() {
+        let t = Template::Flint;
+        let m = [Msg::new("system", "You are helpful."), Msg::new("user", "Hi <|user|>")];
+        assert_eq!(t.render(&m, &[], false, false, true), "<|system|>You are helpful.<|user|>Hi &lt;|user|&gt;<|assistant|>");
+        let mut a = Msg::new("assistant", "Hello");
+        a.reasoning = Some("think".into());
+        let m = [Msg::new("user", "Hi"), a, Msg::new("user", "Bye")];
+        assert_eq!(t.render(&m, &[], false, false, true), "<|user|>Hi<|assistant|> thinkingthink</think>Hello<|user|>Bye<|assistant|>");
+    }
+
+    #[test]
+    fn flint_tools() {
+        let tool: Json = serde_json::from_str(
+            r#"{"name":"calc","description":"do math","parameters":{"type":"object","properties":{"x":{"type":"integer"}}}}"#,
+        ).unwrap();
+        let m = [Msg::new("user", "What is 2+2?")];
+        assert_eq!(Template::Flint.render(&m, &[tool], false, false, true),
+            "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"calc\", \"description\": \"do math\", \"parameters\": {\"type\": \"object\", \"properties\": {\"x\": {\"type\": \"integer\"}}}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call><|user|>What is 2+2?<|assistant|>");
+    }
+
+    #[test]
+    fn flint_parses_calls() {
+        let t = "Hel<tool_call>calc<arg_key>x</arg_key><arg_value>2</arg_value></tool_call>";
+        assert_eq!(Template::Flint.parse_calls(t, &[]).unwrap(), ("Hel".into(), vec![("calc".into(), r#"{"x":2}"#.into())]));
+        assert_eq!(Template::Flint.parse_calls("plain", &[]), None);
     }
 }

@@ -1,7 +1,7 @@
 # RustingStrata
 
 A pure-Rust inference engine for Qwen GGUF models: Qwen3.5/3.6 (`qwen35moe`, `qwen35`), Qwen3-Next (`qwen3next`),
-Qwen3.8-Flash-Next (`qwen4exp`), Qwen3 (`qwen3`, `qwen3moe`), DeepSeek-V4.1-Flash (`deepseek41`) and GLM-5.3-Flash (`glm5-next`). CUDA kernels are
+Qwen3.8-Flash-Next (`qwen4exp`), Qwen3 (`qwen3`, `qwen3moe`), DeepSeek-V4.1-Flash (`deepseek41`), GLM-5.3-Flash (`glm5-next`) and Recursive Flint (`flint`). CUDA kernels are
 compiled at run time with NVRTC through cudarc, and the same kernels also run on Vulkan (`--backend vulkan`): no C++
 build step, no ggml. Experts that do not fit in VRAM run on the CPU at the same time as the GPU work, and the expert
 placement adapts to the routing it sees.
@@ -143,7 +143,7 @@ match llama.cpp on 29 test strings and the chat template matches `/apply-templat
 On an RTX 3060 12 GB with 30 GB RAM decode took about 0.4-0.7 s per token with warm page cache (about 55% VRAM expert-cache
 hits on a short text); after the 2026-11-12 batching and prompt-preload changes, `bench --pp 1 --tg 24` measured 2.3-2.6 tok/s
 warm, 32-token runs fell to 1.5-1.8 tok/s as the page cache turned over, and a 128-token prompt with hot-expert preload
-decoded at 1.6 tok/s. llama.cpp (`--cpu-moe`, server, 64 greedy tokens per prompt) took 2.3-2.9 s per token (0.34-0.44 tok/s) on the same box in the same session, started right before our runs on the same page cache; a later paired run (64 greedy tokens through `serve`, llama.cpp, ours, ours, llama.cpp) gave 1.25-1.40 tok/s against 0.47-0.56, a first token after 17-19 s against 40-41 s on a short prompt, load until ready in 4-6 s against 58 s, and, on a 550-token prompt, a first token after 206-209 s against 107-229 s (llama.cpp's second run had the page cache warm); both timings move with the page cache and the pairs were run twice, not as a full benchmark.
+decoded at 1.6 tok/s. A paired run on 2026-11-13 (64 greedy tokens through `serve`, llama.cpp, ours, ours, llama.cpp; short prompt and `tools/prompts/bench-natural.txt`, 429 tokens) gave 1.35 tok/s decode against 0.62 on the long prompt and 1.57 against 0.57 on the short one, load until ready in 5 s against 66-73 s, and a first token after 84-93 s against 73-76 s on the long prompt; on the short prompt the first token came after 17-19 s with a warm page cache against 6-8 s. Everything moves with the page cache. A fresh teacher-forced check on 3 prompts x 32 tokens matched llama.cpp's top token on 96 of 96 steps (top-5 overlap 91.9%, mean |dlogprob| 0.230).
 Caveats: prefill runs 512-token chunks layer by layer so each routed expert is read once per chunk (a 380-word, about 550-token prompt prefilled in 209 s with 512-token chunks against 325 s with 128, identical logprobs; short prompts cost more per token because the experts stream from SSD once per chunk, `STRATA_GLM_CHUNK` sets the size); prompt plus reply is limited only by the model's trained context from the GGUF (1,048,576; `STRATA_GLM_CTX` lowers it, and the KV cache grows with the text, so RAM is the real bound; the k-pool sparse-attention indexer takes over past 2048 rows and was checked against llama.cpp up to 3.6k tokens: same top-5 sets, same first token); the NextN/MTP layer is unused; decoding is greedy only; tool calls work in `serve` (the prompt matches llama.cpp's template byte for byte, checked on one tool call and one tool-result round trip); the reasoning
 text comes back in `content` before `</think>`.
 

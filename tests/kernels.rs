@@ -628,7 +628,7 @@ fn attn_prefill_matches_decode() {
                     let s = up(gpu, &[(pos0 + i) as i32]);
                     let off = |p: u64, per: usize| p + (i * per * 4) as u64;
                     gpu.attn_decode_gq(off(dq.addr(), nh * hd), dk.addr(), dv.addr(), off(dg.addr(), nh * 2 * hd),
-                                       off(ddec.addr(), nh * hd), part.addr(), s.addr(), nh, nkv, hd, scale, gq_min, 1).unwrap();
+                                       off(ddec.addr(), nh * hd), part.addr(), s.addr(), nh, nkv, hd, scale, gq_min, 1, 0, 0).unwrap();
                 }
                 let want = down::<f32>(gpu, &ddec);
                 let e = rel_l2(&want, &gated(&cpu));
@@ -640,7 +640,7 @@ fn attn_prefill_matches_decode() {
                     let s = up(gpu, &[(pos0 + i) as i32]);
                     let off = |p: u64, per: usize| p + (i * per * 4) as u64;
                     gpu.attn_decode_gq(off(dq.addr(), nh * hd), dk.addr(), dv.addr(), 0,
-                                       off(ddec.addr(), nh * hd), part.addr(), s.addr(), nh, nkv, hd, scale, gq_min, 1).unwrap();
+                                       off(ddec.addr(), nh * hd), part.addr(), s.addr(), nh, nkv, hd, scale, gq_min, 1, 0, 0).unwrap();
                 }
                 let e = rel_l2(&gated(&down::<f32>(gpu, &ddec)), &want);
                 assert!(e <= 1e-6, "attn_decode without gate nh {nh} hd {hd} gq_min {gq_min}: {e}");
@@ -649,12 +649,12 @@ fn attn_prefill_matches_decode() {
                 let ds = up(gpu, &steps);
                 let (dbat, pbat) = (gpu.zeros::<f32>(t * nh * hd).unwrap(), gpu.zeros::<f32>(t * nh * ATT_SPLITS * (hd + 2)).unwrap());
                 gpu.attn_decode_gq(dq.addr(), dk.addr(), dv.addr(), dg.addr(), dbat.addr(), pbat.addr(), ds.addr(),
-                                   nh, nkv, hd, scale, gq_min, t).unwrap();
+                                   nh, nkv, hd, scale, gq_min, t, 0, 0).unwrap();
                 assert_eq!(down::<f32>(gpu, &dbat), want, "attn_decode batched nh {nh} nkv {nkv} hd {hd} gq_min {gq_min}");
                 if gq_min == ATT_GQA_MIN {  // attn_decode_q's xq (where written) is quant_xq of its output
                     let (dxq, wxq) = (gpu.zeros::<u8>(t * nh * hd * 9 / 8).unwrap(), gpu.zeros::<u8>(t * nh * hd * 9 / 8).unwrap());
                     let aq = gpu.attn_decode_q(dq.addr(), dk.addr(), dv.addr(), dg.addr(), dbat.addr(), pbat.addr(), ds.addr(),
-                                               nh, nkv, hd, scale, gq_min, t, dxq.addr(), 0, 0).unwrap();
+                                               nh, nkv, hd, scale, gq_min, t, dxq.addr(), 0, 0, 0, 0).unwrap();
                     assert_eq!(down::<f32>(gpu, &dbat), want, "attn_decode_q nh {nh} nkv {nkv} hd {hd}");
                     if aq != 0 {
                         gpu.quant_xq(dbat.addr(), nh * hd, nh * hd, t, wxq.addr()).unwrap();
@@ -732,7 +732,7 @@ fn attn_prefill_qsa_mask_all_ones_matches_unmasked() {
         let dmask = up(gpu, &vec![u32::MAX; t.next_multiple_of(64) * mw]);
         let got_buf = gpu.zeros::<f32>(t * nh * hd).unwrap();
         gpu.attn_prefill_m(dq.addr(), dk.addr(), dv.addr(), 0, got_buf.addr(), step.addr(), t, nh, nkv, hd, scale,
-            dmask.addr(), mw).unwrap();
+            dmask.addr(), mw, 0, 0).unwrap();
         let e = rel_l2(&down::<f32>(gpu, &got_buf), &want);
         assert!(e <= 1e-6, "{bk} attn_prefill all-ones mask: rel err {e}");
         // A nontrivial mask gives the same rows when attention is sliced: each slice's mask row is q_off + q.
@@ -746,12 +746,12 @@ fn attn_prefill_qsa_mask_all_ones_matches_unmasked() {
         let want_buf = gpu.zeros::<f32>(t * nh * hd).unwrap();
         unsafe { std::env::set_var("STRATA_VK_ATTN_BUDGET", "0") };
         gpu.attn_prefill_m(dq.addr(), dk.addr(), dv.addr(), 0, want_buf.addr(), step.addr(), t, nh, nkv, hd, scale,
-            dpat.addr(), mw).unwrap();
+            dpat.addr(), mw, 0, 0).unwrap();
         let want = down::<f32>(gpu, &want_buf);
         let got_buf = gpu.zeros::<f32>(t * nh * hd).unwrap();
         unsafe { std::env::set_var("STRATA_VK_ATTN_BUDGET", "1000") };
         gpu.attn_prefill_m(dq.addr(), dk.addr(), dv.addr(), 0, got_buf.addr(), step.addr(), t, nh, nkv, hd, scale,
-            dpat.addr(), mw).unwrap();
+            dpat.addr(), mw, 0, 0).unwrap();
         assert_eq!(down::<f32>(gpu, &got_buf), want, "{bk} attn_prefill sliced mask");
         unsafe { std::env::remove_var("STRATA_VK_ATTN_BUDGET") };
     }
@@ -1195,7 +1195,7 @@ fn router_topk_matches_ops_top_k() {
         x[2 * n + 30] = 5.0; x[2 * n + 31] = 5.0; x[2 * n + 255] = 5.0;
         let dx = up(gpu, &x);
         let (dids, dw) = (gpu.zeros::<i32>(k * t).unwrap(), gpu.zeros::<f32>(k * t).unwrap());
-        gpu.router_topk(dx.addr(), n, k, 2.5, dids.addr(), dw.addr(), t).unwrap();
+        gpu.router_topk(dx.addr(), n, k, 2.5, dids.addr(), dw.addr(), t, false).unwrap();
         let (ids, w) = (down::<i32>(gpu, &dids), down::<f32>(gpu, &dw));
         for r in 0..t {
             let mut p = x[r * n..(r + 1) * n].to_vec();
@@ -1219,6 +1219,32 @@ fn router_topk_matches_ops_top_k() {
         let nd = first.as_ref().map_or(0, |f: &(Vec<i32>, Vec<u32>)| f.1.iter().zip(&bits.1).filter(|(a, b)| a != b).count());
         eprintln!("op router_topk {bk} [n {n} k {k} t {t}]: max abs {wmax:.2e}, {nd} of {} differ from the first backend", bits.1.len());
         match &first { None => first = Some(bits), Some(f) => assert!(*f == bits, "{bk} differs from the first backend") }
+    }
+}
+
+/// Decode combine with an always-on shared expert (`sg` null) and more than one token: advancing the null gate pointer
+/// by a token index made CUDA read address 4 for token 1.
+#[test]
+fn moe_combine_ungated_shared_multitoken() {
+    let (k, n, t) = (3usize, 128usize, 3usize);
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        eprintln!("backend {bk}");
+        let x0 = xs(t * n);
+        let (ye, sh, wh) = (xs(t * k * n), xs(t * n), xs(t * k));
+        let dx = up(gpu, &x0);
+        let (dye, dsh, dwh) = (up(gpu, &ye), up(gpu, &sh), up(gpu, &wh));
+        let slots = up(gpu, &[0i32, 1, 2, 0, 1, 2, 0, 1, 2]);
+        let step = up(gpu, &[0i32, 1]);
+        gpu.moe_combine(dx.addr(), dye.addr(), dwh.addr(), k, dsh.addr(), 0, 0, 0, step.addr(), slots.addr(), n, t).unwrap();
+        let got = down::<f32>(gpu, &dx);
+        for tk in 0..t {
+            for i in 0..n {
+                let mut want = x0[tk * n + i] + sh[tk * n + i];
+                for j in 0..k { want += wh[tk * k + j] * ye[(tk * k + j) * n + i]; }
+                assert!((got[tk * n + i] - want).abs() < 1e-5, "{bk} token {tk} {i}: {} vs {want}", got[tk * n + i]);
+            }
+        }
     }
 }
 
@@ -1272,7 +1298,7 @@ fn moe_mailbox_round_trip() {
             unsafe { at(DONE).write_volatile(seq) };
         };
         let ops = |step: &rusting_strata::backend::Buf| {
-            gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), mb.addr(), n, lay.h, step.addr(), t, 0)?;
+            gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), mb.addr(), n, lay.h, step.addr(), t, 0, false)?;
             gpu.moe_combine(dx.addr(), dye.addr(), wh.addr(), k, dsh.addr(), dsg.addr(), mb.addr(), lay.y, step.addr(), slots.addr(), n, t)?;
             gpu.sync()
         };
@@ -1315,7 +1341,7 @@ fn moe_mailbox_round_trip() {
         if bk == "cuda" {
             let before = unsafe { (at(SKIP).read_volatile(), at(REQ).read_volatile()) };
             gpu.put(&[0i32, 6], &step, 0).unwrap();
-            gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), 0, n, lay.h, step.addr(), t, 0).unwrap();
+            gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), 0, n, lay.h, step.addr(), t, 0, false).unwrap();
             gpu.moe_combine(dx.addr(), dye.addr(), wh.addr(), k, dsh.addr(), dsg.addr(), 0, lay.y, step.addr(), slots.addr(), n, t).unwrap();
             gpu.sync().unwrap();
             let (gi, gs) = (down::<i32>(gpu, &dids), down::<i32>(gpu, &slots));
@@ -1329,7 +1355,7 @@ fn moe_mailbox_round_trip() {
             gpu.put(&[0i32, 5], &step, 0).unwrap();
             let t0 = std::time::Instant::now();
             let r = (|| {
-                gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), mb.addr(), n, lay.h, step.addr(), t, 0)?;
+                gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), mb.addr(), n, lay.h, step.addr(), t, 0, false)?;
                 gpu.moe_combine(dx.addr(), dye.addr(), wh.addr(), k, dsh.addr(), dsg.addr(), mb.addr(), lay.y, step.addr(), slots.addr(), n, t)?;
                 gpu.add(dx.addr(), dx.addr(), n)?;
                 gpu.sync()
@@ -1371,7 +1397,7 @@ fn attn_decode_bandwidth() {
                 let (dout, part) = (gpu.zeros::<f32>(nt * nh * hd).unwrap(), gpu.zeros::<f32>(nt * nh * ATT_SPLITS * (hd + 2)).unwrap());
                 for gq_min in [i32::MAX, 0] {
                     let run = || gpu.attn_decode_gq(dq.addr(), dk.addr(), dv.addr(), dg.addr(), dout.addr(), part.addr(), ds.addr(),
-                                                    nh, nkv, hd, 0.0625, gq_min, nt).unwrap();
+                                                    nh, nkv, hd, 0.0625, gq_min, nt, 0, 0).unwrap();
                     let t0 = std::time::Instant::now();  // warm up long enough for the clocks to rise
                     while t0.elapsed().as_millis() < 300 { run(); gpu.sync().unwrap(); }
                     let t0 = std::time::Instant::now();
@@ -1868,5 +1894,125 @@ fn qsa_selection_orders_tied_blocks() {
         let got = down::<i32>(g, &selected);
         assert_eq!(got[0], (4 * top) as i32, "{bk}: count");
         assert_eq!(&got[1..], want.as_slice(), "{bk}: selection");
+    }
+}
+
+/// Decode attention with attention sinks and a sliding window: the sink adds one softmax logit with a zero value,
+/// and the window drops keys before `pos - win + 1`.
+#[test]
+fn attn_decode_sink_and_window_match_cpu() {
+    let (pos0, nh, nkv, hd, win) = (5usize, 4usize, 1usize, 64usize, 2usize);
+    let n = (pos0 + 1) * nkv * hd;
+    let (kf, vf, q, sink) = (xs(n), xs(n + 13)[13..].to_vec(), xs(nh * hd), [0.2f32, -0.4, 0.7, 0.0]);
+    for (bk, gpu) in common::backends() {
+        let g = &*gpu;
+        eprintln!("backend {bk}");
+        let (dk, dv) = (g.zeros::<u16>(n).unwrap(), g.zeros::<u16>(n).unwrap());
+        let store_step = up(g, &[0i32]);
+        g.kv_store(up(g, &kf).addr(), up(g, &vf).addr(), dk.addr(), dv.addr(), nkv * hd, pos0 + 1, store_step.addr(), hd).unwrap();
+        let step = up(g, &[pos0 as i32]);
+        let (dq, dsink) = (up(g, &q), up(g, &sink));
+        let out = g.zeros::<f32>(nh * hd).unwrap();
+        let part = g.zeros::<f32>(nh * ATT_SPLITS * (hd + 2)).unwrap();
+        // F16 cache values, as the kernels read them.
+        let k16: Vec<f32> = kf.iter().map(|&v| f16r(v)).collect();
+        let v16: Vec<f32> = vf.iter().map(|&v| f16r(v)).collect();
+        let scale = 1.0 / (hd as f32).sqrt();
+        let want: Vec<f32> = (0..nh).flat_map(|h| {
+            let g = h / (nh / nkv);
+            let s: Vec<f32> = (pos0 + 1 - win..=pos0).map(|p| {
+                (0..hd).map(|d| q[h * hd + d] * k16[(p * nkv + g) * hd + d]).sum::<f32>() * scale
+            }).chain([sink[h]]).collect();
+            let mx = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let e: Vec<f32> = s.iter().map(|v| (v - mx).exp()).collect();
+            let l: f32 = e.iter().sum();
+            (0..hd).map(|d| {
+                let keys = pos0 + 1 - win;
+                let acc: f32 = (0..win).map(|j| e[j] * v16[((keys + j) * nkv + g) * hd + d]).sum();
+                acc / l
+            }).collect::<Vec<f32>>()
+        }).collect();
+        for gq_min in [ATT_GQA_MIN, 0] {
+            g.attn_decode_gq(dq.addr(), dk.addr(), dv.addr(), 0, out.addr(), part.addr(), step.addr(),
+                             nh, nkv, hd, scale, gq_min, 1, dsink.addr(), win).unwrap();
+            let got = down::<f32>(g, &out);
+            let e = rel_l2(&got, &want);
+            eprintln!("attn_decode sink+win nh {nh} nkv {nkv} hd {hd} gq_min {gq_min}: rel err {e:.2e}");
+            // --llama-numerics rounds q and the V accumulator to f16 (about 2e-4 here).
+            assert!(e <= 1e-3, "attn_decode sink+win gq_min {gq_min}: rel err {e}");
+        }
+    }
+}
+
+/// Prefill attention with sinks and a sliding window, compared to the same softmax computed on the CPU.
+#[test]
+fn attn_prefill_sink_and_window_match_cpu() {
+    let (pos0, t, nh, nkv, hd, win) = (4usize, 4usize, 4usize, 1usize, 64usize, 3usize);
+    let n = (pos0 + t) * nkv * hd;
+    let (kf, vf, q, sink) = (xs(n), xs(n + 17)[17..].to_vec(), xs(t * nh * hd), [0.3f32, -0.2, 0.5, -0.9]);
+    for (bk, gpu) in common::backends() {
+        let g = &*gpu;
+        eprintln!("backend {bk}");
+        let (dk, dv) = (g.zeros::<u16>(n).unwrap(), g.zeros::<u16>(n).unwrap());
+        let store_step = up(g, &[0i32]);
+        g.kv_store(up(g, &kf).addr(), up(g, &vf).addr(), dk.addr(), dv.addr(), nkv * hd, pos0 + t, store_step.addr(), hd).unwrap();
+        let step = up(g, &[pos0 as i32]);
+        let (dq, dsink) = (up(g, &q), up(g, &sink));
+        let out = g.zeros::<f32>(t * nh * hd).unwrap();
+        g.attn_prefill_m(dq.addr(), dk.addr(), dv.addr(), 0, out.addr(), step.addr(), t, nh, nkv, hd,
+                         1.0 / (hd as f32).sqrt(), 0, 0, dsink.addr(), win).unwrap();
+        let k16: Vec<f32> = kf.iter().map(|&v| f16r(v)).collect();
+        let v16: Vec<f32> = vf.iter().map(|&v| f16r(v)).collect();
+        let scale = 1.0 / (hd as f32).sqrt();
+        let want: Vec<f32> = (0..t * nh).flat_map(|r| {
+            let (i, h) = (r / nh, r % nh);
+            let g = h / (nh / nkv);
+            let last = pos0 + i;
+            let first = (last + 1).saturating_sub(win);
+            let s: Vec<f32> = (first..=last).map(|p| {
+                (0..hd).map(|d| q[r * hd + d] * k16[(p * nkv + g) * hd + d]).sum::<f32>() * scale
+            }).chain([sink[h]]).collect();
+            let mx = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let e: Vec<f32> = s.iter().map(|v| (v - mx).exp()).collect();
+            let l: f32 = e.iter().sum();
+            (0..hd).map(|d| {
+                let acc: f32 = (first..=last).enumerate().map(|(j, p)| e[j] * v16[(p * nkv + g) * hd + d]).sum();
+                acc / l
+            }).collect::<Vec<f32>>()
+        }).collect();
+        let got = down::<f32>(g, &out);
+        let e = rel_l2(&got, &want);
+        eprintln!("attn_prefill sink+win nh {nh} nkv {nkv} hd {hd}: rel err {e:.2e}");
+        assert!(e <= 2e-3, "attn_prefill sink+win: rel err {e}");
+    }
+}
+
+/// Sigmoid routing: scores are sigmoid(logit), then the top-k weights are renormalized and scaled.
+#[test]
+fn router_topk_sigmoid_matches_cpu() {
+    let (n, k, t) = (17usize, 4usize, 3usize);
+    let logits = xs(t * n);
+    for (bk, gpu) in common::backends() {
+        let g = &*gpu;
+        eprintln!("backend {bk}");
+        let (dl, ids, w) = (up(g, &logits), g.zeros::<i32>(t * k).unwrap(), g.zeros::<f32>(t * k).unwrap());
+        g.router_topk(dl.addr(), n, k, 1.5, ids.addr(), w.addr(), t, true).unwrap();
+        let (gids, gw) = (down::<i32>(g, &ids), down::<f32>(g, &w));
+        for row in 0..t {
+            let p: Vec<f32> = logits[row * n..(row + 1) * n].iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect();
+            let mut top: Vec<(usize, f32)> = (0..n).map(|i| (i, p[i])).collect();
+            top.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            top.truncate(k);
+            let sum: f32 = top.iter().map(|x| x.1).sum::<f32>().max(6.103515625e-5);
+            let mut want: Vec<(i32, f32)> = top.iter().map(|&(i, v)| (i as i32, v / sum * 1.5)).collect();
+            want.sort_by_key(|x| x.0);
+            let mut got: Vec<(i32, f32)> = (0..k).map(|j| (gids[row * k + j], gw[row * k + j])).collect();
+            got.sort_by_key(|x| x.0);
+            assert_eq!(got.len(), want.len());
+            for ((gi, gv), (wi, wv)) in got.iter().zip(&want) {
+                assert_eq!(gi, wi, "expert ids row {row}");
+                assert!((gv - wv).abs() <= 1e-5, "weight {gv} vs {wv} row {row}");
+            }
+        }
     }
 }

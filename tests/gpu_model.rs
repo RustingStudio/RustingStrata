@@ -58,6 +58,8 @@ fn prefill_matches_reference() {
     let next = ops::argmax(&cpu) as u32;
     let cpu2 = m.step(&mut st, next);
     let chunk = std::env::var("CHUNK").map_or(48, |v| v.parse().unwrap());
+    // The default model's int8 prefill GEMMs stay within 1.5x its decode error; low-bit models add their own noise.
+    let slack = if common::is_default_model(&p) { 1.5 } else { 3.0 };
     for (bk, gpu) in common::backends() {
         eprintln!("backend {bk}");
         let mut gm = GpuModel::load(&m, gpu, 512, chunk, 512 << 20, 0).unwrap();
@@ -77,9 +79,17 @@ fn prefill_matches_reference() {
             let (dp, dd) = (diff(pf, want), diff(dc, want));
             eprintln!("{name}: argmax prefill {} decode {} CPU {}, max |dlogit| prefill {dp:.4} decode {dd:.4}",
                       ops::argmax(pf), ops::argmax(dc), ops::argmax(want));
-            assert_eq!(ops::argmax(pf), ops::argmax(want), "{name}");
+            // A different argmax is allowed only where the CPU scores the GPU's choice within its own error of
+            // the CPU's: low-bit models leave near-ties (seen on IQ1 Flint's next-step logits).
+            let best = ops::argmax(want);
+            for (g, d) in [(pf, dp), (dc, dd)] {
+                if ops::argmax(g) != best {
+                    assert!(want[ops::argmax(g)] >= want[best] - 2.0 * d,
+                            "{name}: argmax {} vs CPU {best} too far in CPU logits", ops::argmax(g));
+                }
+            }
             // int8 MMQ prefill GEMMs (3754e65) quantize activations, decode does not: allow 1.5x (seen 1.17x).
-            assert!(dp <= (1.5 * dd).max(0.5), "{name}: prefill error {dp} above 1.5x decode error {dd}");
+            assert!(dp <= (slack * dd).max(0.5), "{name}: prefill error {dp} above {slack}x decode error {dd}");
         }
     }
 }

@@ -18,7 +18,7 @@ Reference machine unless stated: RTX 3060 12 GB, Ryzen 5 7600X, 32 GB RAM.
 | Qwen3.6-35B-A3B UD-Q2_K_XL | 118.2 tok/s (113.4 after 4K) | 68.4 (66.5) | - | [below](#qwen36-35b-a3b-ud-q2_k_xl) |
 | Qwen3.6-35B-A3B UD-Q3_K_M, 6474-token prompt | 83.0 tok/s (108.0 with MTP) | 67.5 (101.1 with MTP) | PolyStrata 79.2 (113.3 with MTP) | [below](#qwen36-35b-a3b-ud-q3_k_m-vs-polystrata) |
 | Qwen3.8-Flash-Next GSQ-RCO IQ2_XS, 1262-token prompt | 33.0 tok/s (29.3-35.8) | 25.6 (23.2-26.9) | - | [below](#qwen38-flash-next-gsq-rco-iq2_xs) |
-| GLM-5.3-Flash UD-Q2_K_XL (119 GB) | 1.25-1.40 tok/s | 0.47-0.56 | - | [below](#glm-53-flash-ud-q2_k_xl-119-gb) |
+| GLM-5.3-Flash UD-Q2_K_XL (119 GB) | 1.35-1.57 tok/s | 0.57-0.62 | - | [below](#glm-53-flash-ud-q2_k_xl-119-gb) |
 | DeepSeek-V4.1-Flash IQ2_XXS (249 GB) | 2-3.6 tok/s | 0.3-1.5 | - | [below](#deepseek-v41-flash-iq2_xxs-249-gb) |
 
 ## Qwen3.6-35B-A3B UD-Q2_K_XL
@@ -102,19 +102,32 @@ Raw logs, server logs and commands: `.posts/data/qwen38-*.{log,txt,err}`, `speed
 
 ## GLM-5.3-Flash UD-Q2_K_XL (119 GB)
 
-Four shards, 119 GB, 30 GB RAM, so experts stream from SSD through the page cache. llama.cpp b12119 with `-ngl 99 --cpu-moe -c 2048`. Both through `/v1/chat/completions` with streaming, 64 greedy tokens, run in the order llama.cpp, RustingStrata, RustingStrata, llama.cpp (ranges are the two runs).
+Four shards, 119 GB, 30 GB RAM, so experts stream from SSD through the page cache. Measured 2026-11-13 on the reference machine; llama.cpp b12119 with `-ngl 99 --cpu-moe -c 2048`, RustingStrata `serve --gpu` with `STRATA_GLM_CTX=2048`. Both through `/v1/chat/completions` with streaming, 64 greedy tokens, run in the order llama.cpp, RustingStrata, RustingStrata, llama.cpp. The short prompt is "Explain in two sentences why the sky is blue." (23 tokens after the chat template); the long prompt is `tools/prompts/bench-natural.txt` (429 tokens). Each prompt was sent twice per session; decode is the mean of all runs, prefill is the first request of each session (llama.cpp's repeat hits its prompt cache).
 
 | | RustingStrata | llama.cpp |
 |---|---|---|
-| Decode, short prompt | 1.40 tok/s | 0.47-0.56 |
-| Decode, 550-token prompt | 1.25-1.33 tok/s | 0.53 |
-| First token, 12-token prompt | 17-19 s | 40-41 s |
-| First token, 550-token prompt | 206-209 s | 107-229 s |
-| Load until ready | 4-6 s | 58-59 s |
-| Peak resident memory | 27.5 GB | 26.5-27.2 GB |
-| Top-1 agreement (teacher-forced, 3 prompts x 64 tokens) | 188/192 | - |
+| Decode, short prompt | 1.57 tok/s (1.48-1.70) | 0.57 (0.53-0.61) |
+| Decode, 429-token prompt | 1.35 tok/s (1.23-1.46) | 0.62 (0.56-0.67) |
+| First token, short prompt, cold / warm cache | 55 s / 17-19 s | 35-38 s / 6-8 s |
+| First token, 429-token prompt, cold | 84-93 s | 73-76 s |
+| Load until ready | 5 s | 66-73 s |
 
-Caveats: long-prompt prefill is not a win (llama.cpp's second run had the page cache warm); everything moves with the page cache; each pair was run twice, not as a full suite. The four top-1 misses are near-ties in llama.cpp's own logprobs.
+Quality vs llama.cpp, same GGUF and prompts, teacher-forced: llama.cpp b12119's own greedy tokens (32 per prompt on the three `tools/glm_ref/p{1,2,3}` prompts) are fed through RustingStrata's GPU forward, and the top-5 distributions are compared at every step.
+
+| Metric | Result |
+|---|---|
+| Same top token | 96 / 96 |
+| Top-5 overlap | 91.9% |
+| Mean \|dlogprob\| over shared top-5 ids | 0.230 |
+
+How it was run:
+
+- Speed: the raw JSON lines are in `.posts/data/2026-11-13-glm-bench.log` (local benchmark notes).
+- Quality: `STRATA_GLM_FORCE=<ids> STRATA_GLM_TOP5=1 rustingstrata generate -n 32` against the `completion_probabilities` stored in `tools/glm_ref/p{1,2,3}_llama.json`; log in `.posts/data/2026-11-13-glm-quality.log`. `STRATA_GLM_PRELOAD=0` was set for the quality runs to keep memory pressure down.
+
+Caveats: everything moves with the page cache, because the model is four times the size of RAM. llama.cpp's repeated-prompt TTFT (8-14 s on the long prompt) is its prompt cache, not prefill. One repeated 429-token RustingStrata request was OOM-killed under global memory pressure after the earlier runs; it is excluded. The four-shard file, build and prompts match the 2026-11-10 run below.
+
+Previous paired run (2026-11-10, same machine): 1.25-1.40 tok/s against 0.47-0.56 on the short prompt, 1.25-1.33 against 0.53 on a 550-token prompt, first token after 17-19 s against 40-41 s, a 550-token first token after 206-209 s against 107-229 s, and 188/192 top-1 on 3 prompts x 64 tokens.
 
 ## DeepSeek-V4.1-Flash IQ2_XXS (249 GB)
 
