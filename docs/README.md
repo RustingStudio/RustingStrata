@@ -20,3 +20,5 @@ Raw results and methods, newest work last. The headline numbers are in the [READ
 - [m6-results.md](m6-results.md): v1.0 gate run against llama.cpp.
 - [V100-results.md](V100-results.md): V100 bring-up, parity and benchmarks (long; written by `tools/bench_v100.sh`).
 - [datacenter-nvidia-results.md](datacenter-nvidia-results.md): A100, A30, L40S and H100 test runs and benchmarks.
+- [more-nvidia-results.md](more-nvidia-results.md): RTX 2080 Ti, Quadro RTX 6000, V100, A40, RTX A6000, RTX 4500 Ada
+  and A100 40 GB test runs and benchmarks; the GTX 1080 Ti does not run.
