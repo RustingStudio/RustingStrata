@@ -204,6 +204,10 @@ impl ExpertCache {
         }
     }
 
+    /// Forget the short-term routing counts: the prompt's thousands of tokens no longer outweigh the reply's first
+    /// tokens, so `adapt` follows the text being decoded instead of the prompt that produced it.
+    pub fn reset_counts(&mut self) { self.counts.fill(0.0); }
+
     /// Decay counts, then per pool swap up to `max_swaps` cold residents for clearly hotter missed experts.
     pub fn adapt(&mut self, m: &Model, gpu: &dyn Backend, max_swaps: usize) -> anyhow::Result<()> {
         if self.profile.is_none() { return Ok(()); }

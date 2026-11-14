@@ -103,6 +103,11 @@ impl Gguf {
     fn open_one(path: &Path, file: usize) -> anyhow::Result<Gguf> {
         let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
         let mmap = unsafe { Mmap::map(&f)? };
+        // Expert rows are 2 MB apart in a file the page cache reads at random: huge pages save TLB misses.
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("STRATA_HUGEPAGE").is_some() {
+            let _ = mmap.advise(memmap2::Advice::HugePage);
+        }
         let mut c = Cur { b: &mmap, p: 0 };
         if c.take(4)? != b"GGUF" { bail!("{}: not a GGUF file", path.display()); }
         let ver = c.u32()?;
