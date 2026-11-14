@@ -35,8 +35,8 @@ the server.
   RTX 3060, 41 each; see [HOSTING.md](HOSTING.md)).
 - `temperature`, `top_k`, `top_p` and `seed` are honored; decoding is greedy when they are left out.
 - `max_tokens` (or `max_completion_tokens`) and `stop` (up to 16 strings) work as in the OpenAI API; `n` must be 1.
-- Thinking is off unless a request sets `chat_template_kwargs.enable_thinking` (Anthropic: `thinking: {"type":
-  "enabled"}`).
+- Thinking is on by default (`--think false` turns it off). A request overrides it with `chat_template_kwargs.enable_thinking`
+  (Anthropic: `thinking: {"type": "enabled"}`; `enable_thinking: false` turns it off for that request).
 - `tools` and `tool_choice` work as in the OpenAI API: calls come back as `tool_calls` with `finish_reason:
   "tool_calls"`. `tool_choice: "required"` does not force a call.
 - The prompt follows the model's own chat template, rendered like llama.cpp's `--jinja`.
