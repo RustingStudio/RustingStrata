@@ -191,6 +191,11 @@ pub struct GpuModel<'a> {
     pub cache: Option<ExpertCache>,
     /// Swap experts every this many tokens (0 = fixed placement).
     pub adapt_every: usize,
+    /// Experts one `adapt` may swap per pool (default 64; `STRATA_ADAPT_SWAPS`).
+    pub adapt_swaps: usize,
+    /// Serve policy: after a prefill, forget the prompt's short-term routing counts so decode adapts to the reply
+    /// instead of the prompt (`STRATA_RESET_COUNTS`; `serve` turns it on).
+    pub reset_counts_after_prefill: bool,
     pub hits: usize,
     pub misses: usize,
     /// Forwards this part ran (decode tokens): the base of the per-token stats `Runner::finish` prints.
@@ -459,7 +464,10 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None,
+        let adapt_every = std::env::var("STRATA_ADAPT_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        let adapt_swaps = std::env::var("STRATA_ADAPT_SWAPS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+        let reset_counts_after_prefill = std::env::var_os("STRATA_RESET_COUNTS").is_some();
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None,
                       cur: 0, seqs, rows: vec![], row_tokens: 0 })
     }
 
@@ -576,6 +584,8 @@ impl<'a> GpuModel<'a> {
                 .map(|(r, (&(.., want), t_))| Ok((t_ as u32, if want { g.get::<f32>(&t.logits, r * nvoc, nvoc)? } else { vec![] }))).collect()
         });
         let every = self.adapt_every;
+        let swaps = self.adapt_swaps;
+        let reset = self.reset_counts_after_prefill;
         let mut p = Some(&mut *self);
         while let Some(q) = p {
             q.rows.clear();
@@ -583,6 +593,8 @@ impl<'a> GpuModel<'a> {
                 for &(s, ..) in rows { *q.slot_pos(s) += 1; }
                 q.row_tokens += nt;
                 q.adapt_every = every;
+                q.adapt_swaps = swaps;
+                q.reset_counts_after_prefill = reset;
                 q.after_experts(nt, q.row_tokens)?;
             }
             p = q.next.as_deref_mut();
@@ -1346,6 +1358,25 @@ impl<'a> GpuModel<'a> {
         self.cache.as_ref().is_some_and(|c| c.fully_resident()) && self.gpu.moe_mailbox_optional()
     }
 
+    /// Serve policy: follow the reply, not the prompt, in the expert placement after each prefill. `serve` turns it on;
+    /// a split model's other parts follow through `next`.
+    pub fn set_decode_only(&mut self, on: bool) {
+        self.reset_counts_after_prefill = on;
+        // Fewer, larger swaps than a benchmark run: the reply's hot set is learned in a few steps, while 64 swaps
+        // every 8 tokens spend more on uploads and page-cache churn than the extra hits return.
+        if std::env::var_os("STRATA_ADAPT_EVERY").is_none() { self.adapt_every = 16; }
+        if std::env::var_os("STRATA_ADAPT_SWAPS").is_none() { self.adapt_swaps = 16; }
+        if let Some(n) = self.next.as_mut() { n.set_decode_only(on); }
+    }
+
+    fn reset_counts(&mut self) {
+        let mut p = Some(&mut *self);
+        while let Some(q) = p {
+            if let Some(c) = q.cache.as_mut() { c.reset_counts(); }
+            p = q.next.as_deref_mut();
+        }
+    }
+
     /// The worker sequence number to publish in `step_buf`: 0 on the fast path, where the GPU asks the worker nothing.
     fn begin_seq(&mut self) -> u32 {
         let fast = self.expert_fast_path();
@@ -1453,6 +1484,8 @@ impl<'a> GpuModel<'a> {
         self.after_experts(nt, self.pos)?;
         if let Some(n) = self.next.as_mut() {
             n.adapt_every = self.adapt_every;
+            n.adapt_swaps = self.adapt_swaps;
+            n.reset_counts_after_prefill = self.reset_counts_after_prefill;
             n.after_forward(nt)?;
         }
         Ok(())
@@ -1481,7 +1514,7 @@ impl<'a> GpuModel<'a> {
             self.cpu_time = w.busy();
             // No swap can be beneficial with no miss: `adapt` would only scan all 10240 entries (R2).
             if !fast && self.adapt_every > 0 && (count - nt) / self.adapt_every < count / self.adapt_every {
-                cache.adapt(self.m, &*self.gpu, 64)?;
+                cache.adapt(self.m, &*self.gpu, self.adapt_swaps)?;
             }
         }
         Ok(())

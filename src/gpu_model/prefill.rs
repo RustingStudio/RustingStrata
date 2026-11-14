@@ -94,6 +94,8 @@ impl GpuModel<'_> {
         }
         // The prompt's routing predicts the reply's: place its hot experts now instead of 64 per adapt during decode.
         self.adapt_experts()?;
+        // Serve: place the prompt's experts for the prefill, then let decode follow the reply's own routing.
+        if self.reset_counts_after_prefill { self.reset_counts(); }
         let s = self.tail();
         let (g, ne) = (&s.gpu, s.m.cfg.n_embd);
         let h = s.bufs["h"].addr();

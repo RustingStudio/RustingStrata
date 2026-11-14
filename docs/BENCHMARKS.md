@@ -20,6 +20,7 @@ Reference machine unless stated: RTX 3060 12 GB, Ryzen 5 7600X, 32 GB RAM.
 | Qwen3.8-Flash-Next GSQ-RCO IQ2_XS, 1262-token prompt | 33.0 tok/s (29.3-35.8) | 25.6 (23.2-26.9) | - | [below](#qwen38-flash-next-gsq-rco-iq2_xs) |
 | GLM-5.3-Flash UD-Q2_K_XL (119 GB) | 1.35-1.57 tok/s | 0.57-0.62 | - | [below](#glm-53-flash-ud-q2_k_xl-119-gb) |
 | DeepSeek-V4.1-Flash IQ2_XXS (249 GB) | 2-3.6 tok/s | 0.3-1.5 | - | [below](#deepseek-v41-flash-iq2_xxs-249-gb) |
+| Recursive Flint 39.8B UD-Q5_K_XL, 4102-token prompt | 64.6 tok/s (63.8-65.6) | 48.6 (47.5-49.3) | - | [below](#recursive-flint-398b-ud-q5_k_xl) |
 
 ## Qwen3.6-35B-A3B UD-Q2_K_XL
 
@@ -140,6 +141,51 @@ Previous paired run (2026-11-10, same machine): 1.25-1.40 tok/s against 0.47-0.5
 Not measured side by side: the llama.cpp numbers are its first cold runs, the RustingStrata numbers are later runs. The model files were deleted afterwards, so this entry cannot be repeated until they are downloaded again.
 
 On data-center cards (not this machine, RustingStrata only), with the experts in the page cache: end-to-end decode 4.5-4.6 tok/s at the default 9 GB VRAM expert budget on an A100 80 GB and an H100 NVL, and 6.6 (A100) and 8.9 (H100 NVL) tok/s at 60 GB, on one 30-token prompt and 33 decode tokens. See [datacenter-nvidia-results.md](datacenter-nvidia-results.md#2026-11-10--deepseek-v41-flash-1017-iq2_xxs).
+
+## Recursive Flint 39.8B UD-Q5_K_XL
+
+`flint-UD-Q5_K_XL.gguf`, 27.9 GiB, 39.79 B parameters, 49 layers (2 dense, 47 MoE), 256 experts, top-6. Measured
+2026-11-14 on the reference machine. Prompt: `tools/prompts/bench-natural.txt` repeated ten times, 4102 tokens
+(`.posts/data/2026-11-14-flint-prompt.txt`), chat template, greedy, 200 output tokens, the same OpenAI-compatible
+streaming request for both engines. One 4K request thrown away, then three measured; RustingStrata ran first,
+llama.cpp second, so llama.cpp got the warmer page cache.
+
+| | RustingStrata 1.2.2 | llama.cpp b12191 |
+|---|---:|---:|
+| Decode, warm | 64.6 tok/s (63.8-65.6) | 48.6 (47.5-49.3) |
+| Decode, first 4K request after load | 24.3 tok/s | 47.5 |
+| Prefill, new 4K prompt, page cache warm | 1.14-1.30k tok/s | 0.85-1.02k |
+| Expert hit rate | 54.7% | - |
+| Worker busy | 12.98 ms/token | - |
+| Resident experts | 3244 / 12032 (7157 MB VRAM) | - |
+| Expert traffic | 622.1 MB/token | - |
+
+How each was run:
+
+- RustingStrata: `serve --model M --gpu --ctx 8192`; default placement. Raw runs in
+  `.posts/data/2026-11-14-flint-rs-final-server.log` and `2026-11-14-flint-rs-final.jsonl`. The 64.6 warm run used
+  the 1.2.1 build with the same placement code; 1.2.2 is that code with the unused n-gram/one-shot experiments
+  removed.
+- llama.cpp b12191 (commit `e95426f16`): `-ngl 99 -ncmoe 36 -fa on -t 6 -b 2048 -ub 2048 -c 8192`; raw runs in
+  `.posts/data/2026-11-14-flint-llama-final-server.log` and `2026-11-14-flint-llama-final.jsonl`.
+- Both: `.posts/data/bench.py PORT LABEL 3 PROMPT 200`, temperature 0, `enable_thinking: false`.
+- Commands: `.posts/data/2026-11-14-flint-commands.txt`.
+
+Not equal:
+
+- RustingStrata ran before llama.cpp, so llama.cpp had the warmer page cache.
+- The first 4K request depends on the page cache. A second RustingStrata load decoded 55.9 and 58.8 on its first two
+  measured requests and was still climbing (`.posts/data/2026-11-14-flint-rs-repeat*.log`).
+- Prefill: once the expert pages are cached, a new 4106-token prompt prefilled at 1.14-1.30k tok/s on RustingStrata
+  and 0.85-1.02k on llama.cpp (mean 0.96k). The first prefill after a model load ranged 0.07-1.0k for both, and the
+  order (RustingStrata then llama.cpp) changes which pages are cached; raw logs in
+  `.posts/data/2026-11-14-flint-prefill-*.log`. After the first request both use their prompt cache.
+- Decode follows the greedy text: a later RustingStrata run took the "However, they've pasted the same passage..."
+  route and decoded at 41-46 tok/s (51.2% hit) on the current build; raw run in
+  `.posts/data/2026-11-14-flint-rs-current*`. The 64.6 tok/s row is the fast route. A same-continuation comparison
+  (teacher forcing) is still needed before publishing.
+- The file has no MTP/draft head, so neither engine used speculative decoding.
+- Quality (perplexity/KLD) is not measured yet; the post says so and is not ready to publish.
 
 ## Quality vs llama.cpp (Qwen3.6-35B-A3B UD-Q3_K_M)
 

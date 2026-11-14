@@ -885,6 +885,76 @@ pub fn experts(m: &Model, il: usize, h: &[f32], sel: &[(usize, f32)]) -> Vec<f32
     y
 }
 
+/// `matvec` for several inputs: every weight row is read once and dotted with all of them. A verify batch (MTP or
+/// n-gram drafts) then pays one read per expert, not one per drafted token.
+fn rows_multi(t: &Tensor, xs: &[&[f32]]) -> Vec<Vec<f32>> {
+    let (rows, nt, cols) = (t.rows, xs.len(), t.cols);
+    let dot = int_dot(t.ty);
+    let xq: Vec<Vec<Q8K>> = if dot.is_some() { xs.iter().map(|x| quantize_q8k(x)).collect() } else { vec![] };
+    let rb = t.data.len() / rows;
+    let mut tmp = vec![0f32; rows * nt];
+    tmp.par_chunks_mut(16 * nt).enumerate().for_each_init(|| if dot.is_none() { vec![0f32; cols] } else { Vec::new() }, |buf, (ci, chunk)| {
+        for r in 0..chunk.len() / nt {
+            let row = ci * 16 + r;
+            let data = &t.data[row * rb..(row + 1) * rb];
+            for j in 0..nt {
+                chunk[r * nt + j] = match dot {
+                    Some(d) => d(data, &xq[j]),
+                    None => { t.row(row, buf); buf.iter().zip(xs[j]).map(|(a, b)| a * b).sum() }
+                };
+            }
+        }
+    });
+    (0..nt).map(|j| (0..rows).map(|r| tmp[r * nt + j]).collect()).collect()
+}
+
+/// `experts` for several tokens of one layer: each routed expert reads its weights once and applies them to every
+/// token in the batch that routed to it. The per-token sum keeps the router's expert order, so outputs match `experts`.
+pub fn experts_multi(m: &Model, il: usize, hs: &[Vec<f32>], sels: &[Vec<(usize, f32)>]) -> Vec<Vec<f32>> {
+    use std::collections::{BTreeMap, HashMap};
+    let c = &m.cfg;
+    let nt = hs.len();
+    let mut ys = vec![vec![0f32; c.n_embd]; nt];
+    if nt == 0 { return ys; }
+    let t = |s: &str| m.w.layer(il, s).unwrap_or_else(|e| panic!("{e:#}"));
+    let (gate, up, down) = (t("ffn_gate_exps.weight"), t("ffn_up_exps.weight"), t("ffn_down_exps.weight"));
+    let (n, ff) = (c.n_expert, c.n_ff_exp);
+    let mut uses: BTreeMap<usize, Vec<(usize, f32)>> = Default::default();
+    for (ti, sel) in sels.iter().enumerate() {
+        for &(e, w) in sel { uses.entry(e).or_default().push((ti, w)); }
+    }
+    // Gate and up of every expert in one pass over its weights, for all tokens that route to it.
+    let mut acts: HashMap<usize, Vec<(usize, Vec<f32>)>> = Default::default();
+    for (&e, list) in &uses {
+        let xs: Vec<&[f32]> = list.iter().map(|&(ti, _)| hs[ti].as_slice()).collect();
+        let g = rows_multi(&gate.expert(e, n), &xs);
+        let u = rows_multi(&up.expert(e, n), &xs);
+        let a: Vec<Vec<f32>> = g.iter().zip(&u).map(|(g, u)| (0..ff).map(|i| ops::silu(g[i]) * u[i]).collect()).collect();
+        acts.insert(e, list.iter().map(|&(ti, _)| ti).zip(a).collect());
+    }
+    // Down of every expert, over the acts of its tokens.
+    let mut outs: HashMap<usize, Vec<(usize, Vec<f32>)>> = Default::default();
+    for (&e, list) in &uses {
+        let a = &acts[&e];
+        let xs: Vec<&[f32]> = a.iter().map(|(_, v)| v.as_slice()).collect();
+        let o = rows_multi(&down.expert(e, n), &xs);
+        outs.insert(e, list.iter().map(|&(ti, _)| ti).zip(o).collect());
+    }
+    for (ti, sel) in sels.iter().enumerate() {
+        for &(e, w) in sel {
+            let Some(list) = outs.get(&e) else { continue };
+            let (_, o) = list.iter().find(|&&(t, _)| t == ti).unwrap();
+            let mut o = o.clone();
+            if !m.loras.is_empty() {
+                let act = &acts[&e].iter().find(|&&(t, _)| t == ti).unwrap().1;
+                m.lora_delta(&format!("blk.{il}.ffn_down_exps.weight"), act, &mut o, Some(e));
+            }
+            for (yy, oo) in ys[ti].iter_mut().zip(&o) { *yy += w * oo; }
+        }
+    }
+    ys
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,6 +991,39 @@ mod tests {
                     let want = if let Some(d) = dot { d(&t.data[r * rb..(r + 1) * rb], &xq) }
                         else { t.row(r, &mut decoded); decoded.iter().zip(xs[i]).map(|(a, b)| a * b).sum() };
                     assert_eq!(got[i * rows + r], want, "{} matrix {i} row {r}", ty.name());
+                }
+            }
+        }
+    }
+
+    /// `rows_multi` reads a row once for all inputs; each output must equal a single-input `matvec` count of it.
+    #[test]
+    fn rows_multi_matches_individual_matvecs() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let (cols, rows, count) = (640, 257, 3);
+        let inputs: Vec<Vec<f32>> = (0..count).map(|m| (0..cols).map(|i| ((i * 13 + m * 7) % 101) as f32 / 50.0 - 1.0).collect()).collect();
+        for ty in [GgmlType::Q2_0, GgmlType::F32] {
+            let rb = ty.row_bytes(cols as u64);
+            let mut v = vec![0u8; rows * rb];
+            if ty == GgmlType::Q2_0 {
+                for (i, b) in v.chunks_exact_mut(18).enumerate() {
+                    b[..2].copy_from_slice(&f16::from_f32(0.01).to_le_bytes());
+                    for (j, q) in b[2..].iter_mut().enumerate() { *q = ((i * 17 + j * 11) % 256) as u8; }
+                }
+            } else {
+                for (i, b) in v.chunks_exact_mut(4).enumerate() { b.copy_from_slice(&((i % 113) as f32 / 57.0 - 1.0).to_le_bytes()); }
+            }
+            let t = Tensor { ty, cols, rows, data: &v };
+            let xs: Vec<&[f32]> = inputs.iter().map(Vec::as_slice).collect();
+            let got = pool.install(|| rows_multi(&t, &xs));
+            let dot = int_dot(ty);
+            for j in 0..count {
+                let xq = quantize_q8k(xs[j]);
+                let mut decoded = vec![0.0; cols];
+                for r in 0..rows {
+                    let want = if let Some(d) = dot { d(&t.data[r * rb..(r + 1) * rb], &xq) }
+                        else { t.row(r, &mut decoded); decoded.iter().zip(xs[j]).map(|(a, b)| a * b).sum() };
+                    assert_eq!(got[j][r], want, "{} input {j} row {r}", ty.name());
                 }
             }
         }

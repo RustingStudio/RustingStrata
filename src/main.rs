@@ -49,7 +49,7 @@ struct Engine {
     /// Random seed for sampling [default: from the clock].
     #[arg(long)]
     seed: Option<u64>,
-    /// CPU threads for expert work [default: calibrated, else all logical cores].
+    /// CPU threads for expert work [default: calibrated, else physical cores on the GPU, else all logical cores].
     #[arg(long)]
     threads: Option<usize>,
     /// Match llama.cpp's CPU numerics on the GPU (q8_K activations, f32 prefill attention, f16 decode attention
@@ -282,7 +282,12 @@ impl Engine {
         self.mtp.get_or_insert(get("mtp").unwrap_or(0));
         self.short = get("short").unwrap_or(32);
         // The global pool can be built once; a model loaded later by `serve` keeps the first one's threads.
-        if let Some(n) = self.threads.or(get("threads")) { let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global(); }
+        // GPU expert work is memory-bound, so SMT siblings only add contention (6 threads beat 12 on the reference
+        // 6-core/12-thread Ryzen). CPU-only inference keeps every logical core.
+        let gpu_threads = bk.is_some().then(physical_cores).flatten();
+        if let Some(n) = self.threads.or(get("threads")).or(gpu_threads) {
+            let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
+        }
         let Some(bk) = bk else {
             let (notes, _, mtp) = resolve_flags(false, self.parallel, self.mtp(), m.cfg.n_nextn, m.cfg.hc_n, false)?;
             for n in notes { eprintln!("{n}"); }
@@ -357,6 +362,35 @@ fn vram_margins(spec: &[String], devices: &[usize]) -> anyhow::Result<Vec<usize>
 struct ImageInput {
     grids: Vec<(usize, usize)>,
     embeddings: Vec<Vec<Vec<f32>>>,
+}
+
+/// Physical cores, not SMT siblings: the CPU expert workers are memory-bound, and oversubscribing them with the
+/// hyperthreads slows the CPU/GPU token loop. Linux reads the CPU topology; other platforms keep every logical CPU.
+fn physical_cores() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let groups = cpu_topology_groups(std::path::Path::new("/sys/devices/system/cpu"));
+        let avail = std::thread::available_parallelism().map_or(0, |n| n.get());
+        if groups > 0 {
+            return Some(if avail > 0 { groups.min(avail) } else { groups });
+        }
+    }
+    None
+}
+
+/// Distinct `thread_siblings_list` values under `dir` (one per physical core).
+#[cfg(target_os = "linux")]
+fn cpu_topology_groups(dir: &std::path::Path) -> usize {
+    let groups: std::collections::BTreeSet<String> = std::fs::read_dir(dir).into_iter().flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let n = name.to_str()?.strip_prefix("cpu")?;
+            if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) { return None; }
+            std::fs::read_to_string(e.path().join("topology/thread_siblings_list")).ok().map(|s| s.trim().to_string())
+        })
+        .collect();
+    groups.len()
 }
 
 /// Decode and encode every `--image` with the projector at `mmproj`.
@@ -1816,7 +1850,9 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
     let mut m = Model::load(&g)?;
     if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
     let tok = Tokenizer::from_gguf(&g)?;
-    let r = engine.runner(&m, model)?;
+    let mut r = engine.runner(&m, model)?;
+    // Serving decodes one reply after a (usually cached) prompt: follow the reply's routing, not the prompt's.
+    if let Runner::Gpu(g) = &mut r { g.set_decode_only(true); }
     {
         let mut st = s.stats.lock().unwrap();
         st.loading = false;
@@ -2188,6 +2224,8 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
 #[cfg(test)]
 mod flag_tests {
     use super::{resolve_flags, vram_margins};
+    #[cfg(target_os = "linux")]
+    use super::cpu_topology_groups;
 
     #[test]
     fn vram_margins_are_per_device() {
@@ -2207,6 +2245,21 @@ mod flag_tests {
         }
         assert!(vram_margins(&spec(&["2:512"]), &[0, 1]).unwrap_err().to_string().contains("not in --device"));
         assert!(vram_margins(&spec(&["x:512"]), &[0]).unwrap_err().to_string().contains("not a GPU index"));
+    }
+
+    /// SMT siblings share one `thread_siblings_list`: 4 logical CPUs, 2 physical cores.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn physical_cores_count_distinct_sibling_groups() {
+        let d = std::env::temp_dir().join(format!("strata_cpu_topology_{}", std::process::id()));
+        for (cpu, siblings) in [(0, "0,2"), (2, "0,2"), (1, "1,3"), (3, "1,3")] {
+            let p = d.join(format!("cpu{cpu}/topology"));
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("thread_siblings_list"), siblings).unwrap();
+        }
+        std::fs::create_dir_all(d.join("cpufreq")).unwrap();
+        assert_eq!(cpu_topology_groups(&d), 2);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
