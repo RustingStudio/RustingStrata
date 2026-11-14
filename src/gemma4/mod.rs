@@ -329,7 +329,7 @@ pub fn serve(
                 };
                 let view: Vec<(&str, &str)> = q.messages.iter().map(|m| (m.role.as_str(), m.content.as_str())).collect();
                 let images = if grids.is_empty() { None } else { Some((&grids[..], &embs[..])) };
-                let seq = match prompt_seq(&tok, &chat_prompt(&view, q.think), images) {
+                let seq = match prompt_seq(&tok, &chat_prompt(&view, q.think.unwrap_or(false)), images) {
                     Ok(s) => s,
                     Err(e) => { send(&mut c, "400 Bad Request", "application/json", &json!({"error": {"message": format!("{e:#}"), "type": "invalid_request_error"}}).to_string()); continue }
                 };

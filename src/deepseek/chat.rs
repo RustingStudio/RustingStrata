@@ -125,7 +125,7 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
                     Ok(q) => q,
                     Err(e) => { send(&mut c, "400 Bad Request", "application/json", &json!({"error": {"message": format!("{e:#}"), "type": "invalid_request_error"}}).to_string()); continue }
                 };
-                let ids = match tok.encode(&Template::Ds.render(&q.messages, &q.tools, q.think, q.preserve_thinking.unwrap_or(true), true)) {
+                let ids = match tok.encode(&Template::Ds.render(&q.messages, &q.tools, q.think.unwrap_or(false), q.preserve_thinking.unwrap_or(true), true)) {
                     Ok(i) if !i.is_empty() => i,
                     _ => { send(&mut c, "400 Bad Request", "application/json", r#"{"error":{"message":"cannot encode prompt"}}"#); continue }
                 };

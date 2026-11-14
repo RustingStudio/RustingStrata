@@ -81,6 +81,9 @@ struct Engine {
     /// template's default.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     preserve_thinking: bool,
+    /// Let the model think before answering (chat and `serve`); `--think false` turns it off. A request's `chat_template_kwargs.enable_thinking` overrides it in `serve`.
+    #[arg(long = "think", default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    think_default: bool,
     /// KV cache format (GPU): f16, or q8 (q8_0 blocks, half the KV memory; numerics differ slightly from
     /// llama.cpp's default f16 cache).
     #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
@@ -647,9 +650,6 @@ enum Cmd {
         /// Max tokens per reply.
         #[arg(short, default_value_t = 2048)]
         n: usize,
-        /// Let the model think before answering (template default; off here).
-        #[arg(long)]
-        think: bool,
         /// Image path, data URL or http(s) URL (repeatable), attached to the conversation. Needs --mmproj (or a
         /// sibling mmproj next to the model).
         #[arg(long, action = clap::ArgAction::Append)]
@@ -1033,7 +1033,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             b.preflight(&types, true)?;
         }
-        Cmd::Chat { model, system, n, think, image, mut engine } => {
+        Cmd::Chat { model, system, n, image, mut engine } => {
+            let think = engine.think_default;
             engine.ds_env();
             let g = Gguf::open(&model)?;
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
@@ -2005,7 +2006,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
             match serve::messages_body(&body).and_then(|b| serve::chat_request(&b)) {
                 Ok(req) => {
-                    let prompt = l.tpl.render(&req.messages, &req.tools, req.think, req.preserve_thinking.unwrap_or(e.preserve_thinking), true);
+                    let prompt = l.tpl.render(&req.messages, &req.tools, req.think.unwrap_or(e.think_default), req.preserve_thinking.unwrap_or(e.preserve_thinking), true);
                     let images: Vec<String> = req.messages.iter().flat_map(|m| m.images.iter().cloned()).collect();
                     let n = if images.is_empty() { l.tok.encode(&prompt)?.len() } else {
                         let mmproj = e.mmproj.clone().or_else(|| vision::find_sibling(&l.path));
@@ -2030,10 +2031,10 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             };
             // Room is checked on the full prompt before any state changes.
             let preserve = req.preserve_thinking.unwrap_or(e.preserve_thinking);
-            let prompt = tpl.render(&req.messages, &req.tools, req.think, preserve, true);
+            let prompt = tpl.render(&req.messages, &req.tools, req.think.unwrap_or(e.think_default), preserve, true);
             // The system and tools block, which compacted or rewritten conversations keep.
             let n_sys = req.messages.iter().take_while(|m| m.role == "system").count();
-            let system = tpl.render(&req.messages[..n_sys], &req.tools, req.think, preserve, false);
+            let system = tpl.render(&req.messages[..n_sys], &req.tools, req.think.unwrap_or(e.think_default), preserve, false);
             let images: Vec<String> = req.messages.iter().flat_map(|m| m.images.iter().cloned()).collect();
             let image_input = if images.is_empty() { None } else {
                 let mmproj = e.mmproj.clone().or_else(|| vision::find_sibling(&l.path));
@@ -2084,7 +2085,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 if serve::gone(&w) { anyhow::bail!("client closed the connection"); }
                 let (chat_ids, chat_logits, chat_cached) = match &vision_prompt {
                     Some(p) => (p.ids.clone(), r.chat_image(p, &image_input.as_ref().unwrap().embeddings)?, 0),
-                    None => r.chat(tok, &prompt, &tpl.render(&req.messages, &req.tools, req.think, preserve, false), &system)?,
+                    None => r.chat(tok, &prompt, &tpl.render(&req.messages, &req.tools, req.think.unwrap_or(e.think_default), preserve, false), &system)?,
                 };
                 (_, logits, cached) = (chat_ids, chat_logits, chat_cached);
                 if let Runner::Slot(c) = &*r && let Some(t) = c.started { t0 = t; start(&mut busy); }
