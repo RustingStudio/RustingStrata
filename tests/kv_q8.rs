@@ -59,14 +59,14 @@ fn q8_kv_attention_matches_f16() {
                 let ds = up(g, &steps);
                 let (dd, part) = (g.zeros::<f32>(t * nh * hd).unwrap(), g.zeros::<f32>(t * nh * ATT_SPLITS * (hd + 2)).unwrap());
                 g.attn_decode_gq(dq.addr(), kc.addr(), vc.addr(), dg.addr(), dd.addr(), part.addr(), ds.addr(),
-                                 nh, nkv, hd, scale, gq_min, t).unwrap();
+                                 nh, nkv, hd, scale, gq_min, t, 0, 0).unwrap();
                 let batched = down::<f32>(g, &dd);
                 // Last token alone gives the same bits as in the batch.
                 let i = t - 1;
                 let s = up(g, &[(pos0 + i) as i32, 0]);
                 let off = |p: u64, per: usize| p + (i * per * 4) as u64;
                 g.attn_decode_gq(off(dq.addr(), nh * hd), kc.addr(), vc.addr(), off(dg.addr(), nh * 2 * hd),
-                                 off(dd.addr(), nh * hd), part.addr(), s.addr(), nh, nkv, hd, scale, gq_min, 1).unwrap();
+                                 off(dd.addr(), nh * hd), part.addr(), s.addr(), nh, nkv, hd, scale, gq_min, 1, 0, 0).unwrap();
                 assert_eq!(down::<f32>(g, &dd), batched, "batched decode nh {nh} nkv {nkv} hd {hd} gq_min {gq_min}");
                 dec.push(batched);
             }

@@ -88,7 +88,7 @@ fn attn_decode_matches_llama_cpu(base: &dyn Backend, llama: &dyn Backend, vk: Op
         let step = up(gpu, &[n_pos as i32 - 1, 0]);
         let (dout, part) = (up(gpu, &vec![0f32; nh * hd]), up(gpu, &vec![0f32; nh * ATT_SPLITS * (hd + 2)]));
         gpu.attn_decode_gq(dq.addr(), dk.addr(), dv.addr(), dg.addr(), dout.addr(), part.addr(), step.addr(),
-                           nh, nkv, hd, scale, gq_min, 1).unwrap();
+                           nh, nkv, hd, scale, gq_min, 1, 0, 0).unwrap();
         down(gpu, &dout)
     };
     for n_pos in [7, 300, 511, 512, 1400] {

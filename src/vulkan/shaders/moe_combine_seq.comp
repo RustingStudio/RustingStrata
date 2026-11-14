@@ -9,6 +9,6 @@ void main() {
     uint t = i / n, d = i % n;
     precise float y = 0.0;
     for (uint j = 0; j < k; j++) y = fma(p.wts.v[t * k + j], p.ye.v[uint(p.inv.v[t * k + j]) * n + d], y);
-    if (uint64_t(p.sh) != 0) y = fma(sigmoid(p.sg.v[t]), p.sh.v[i], y);
+    if (uint64_t(p.sh) != 0) y = uint64_t(p.sg) != 0 ? fma(sigmoid(p.sg.v[t]), p.sh.v[i], y) : y + p.sh.v[i];
     p.x.v[i] += y;
 }

@@ -30,9 +30,10 @@ struct Engine {
     /// Prefill chunk in tokens (GPU; 0 = token by token) [default: calibrated, else 4096].
     #[arg(long)]
     chunk: Option<usize>,
-    /// VRAM left free after placing expert layers, in MB.
-    #[arg(long, default_value_t = 512)]
-    vram_margin: usize,
+    /// VRAM left free after placing expert layers, in MB. One value applies to every device; `512,256` gives one
+    /// per device in `--device` order, and `0:512,1:256` gives one per GPU index.
+    #[arg(long, default_value = "512", value_delimiter = ',')]
+    vram_margin: Vec<String>,
     /// Speculative decoding with the model's MTP draft head, N drafts per step (GPU; greedy output unchanged, sampling keeps its distribution)
     /// [default: calibrated, else 0].
     #[arg(long, value_name = "N", default_missing_value = "1", num_args = 0..=1)]
@@ -297,10 +298,11 @@ impl Engine {
         // shared memory (Vulkan; a no-op elsewhere). No pipeline or model buffer exists yet.
         let types = rusting_strata::gpu_model::gpu_weight_types(&m.w.g);
         for b in &bk { b.preflight(&types, false)?; }
+        let margins = vram_margins(&self.vram_margin, &self.device)?.into_iter().map(|mb| mb << 20).collect::<Vec<_>>();
         let mut g = if self.parallel > 1 {
-            GpuModel::load_split(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, 0, self.parallel).context(LOAD_HINT)?
+            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, 0, self.parallel).context(LOAD_HINT)?
         } else {
-            GpuModel::load_split(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp(), 1).context(LOAD_HINT)?
+            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, self.mtp(), 1).context(LOAD_HINT)?
         };
         g.short = self.short;
         g.cache_ram = self.cache_ram << 20;
@@ -311,6 +313,44 @@ impl Engine {
     }
     fn chunk(&self) -> usize { self.chunk.unwrap_or(4096) }
     fn mtp(&self) -> usize { self.mtp.unwrap_or(0) }
+}
+
+/// Per-device VRAM margins in MB from `--vram-margin`: one value for every device, one per device like `512,256`,
+/// or one per GPU index like `0:512,1:256`. The result is in the order of `devices`.
+fn vram_margins(spec: &[String], devices: &[usize]) -> anyhow::Result<Vec<usize>> {
+    let parse = |s: &str| -> anyhow::Result<(Option<usize>, usize)> {
+        let (idx, mb) = match s.split_once(':') {
+            Some((i, m)) => (Some(i.trim().parse().with_context(|| format!("--vram-margin {s}: `{}` is not a GPU index", i.trim()))?), m),
+            None => (None, s),
+        };
+        let mb = mb.trim().parse().with_context(|| format!("--vram-margin {s}: `{}` is not a value in MB", mb.trim()))?;
+        Ok((idx, mb))
+    };
+    let vals = spec.iter().map(|s| parse(s)).collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(!vals.is_empty(), "--vram-margin needs at least one value");
+    if vals.len() == 1 && vals[0].0.is_none() {
+        return Ok(vec![vals[0].1; devices.len()]);
+    }
+    if vals.iter().all(|v| v.0.is_none()) {
+        anyhow::ensure!(vals.len() == devices.len(), "--vram-margin {}: {} value(s) for {} device(s) (give one value, \
+            or one per device in --device order)", spec.join(","), vals.len(), devices.len());
+        return Ok(vals.into_iter().map(|v| v.1).collect());
+    }
+    anyhow::ensure!(vals.iter().all(|v| v.0.is_some()), "--vram-margin {}: mixing `IDX:MB` and plain MB values", spec.join(","));
+    let mut out = vec![0; devices.len()];
+    let mut seen = vec![false; devices.len()];
+    for (idx, mb) in vals {
+        let idx = idx.unwrap();
+        let pos = devices.iter().position(|&d| d == idx)
+            .with_context(|| format!("--vram-margin: GPU {idx} is not in --device"))?;
+        anyhow::ensure!(!seen[pos], "--vram-margin: GPU {idx} is given twice");
+        seen[pos] = true;
+        out[pos] = mb;
+    }
+    if let Some(pos) = seen.iter().position(|&s| !s) {
+        anyhow::bail!("--vram-margin: no value for GPU {} (give every device one)", devices[pos]);
+    }
+    Ok(out)
 }
 
 /// A projector opened once and the images encoded with it.
@@ -618,8 +658,9 @@ enum Cmd {
         /// GPU context length used while measuring and assumed for the results.
         #[arg(long, default_value_t = 4096)]
         ctx: usize,
-        #[arg(long, default_value_t = 512)]
-        vram_margin: usize,
+        /// VRAM left free per device, as `--vram-margin`.
+        #[arg(long, default_value = "512", value_delimiter = ',')]
+        vram_margin: Vec<String>,
         #[arg(long)]
         backend: Option<String>,
         /// GPU index, or several separated by commas (such as 0,1) to calibrate the layer split over those GPUs.
@@ -928,7 +969,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Calibrate { model, ctx, vram_margin, backend, device, kv, lora, gpu: _ } => {
             if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
             if !lora.is_empty() { eprintln!("note: --lora is ignored by calibrate; calibration uses the base model"); }
-            calibrate(&model, ctx, vram_margin << 20, backend.as_deref(), &device)?
+            let margins = vram_margins(&vram_margin, &device)?.into_iter().map(|mb| mb << 20).collect::<Vec<_>>();
+            calibrate(&model, ctx, &margins, backend.as_deref(), &device)?
         }
         Cmd::Check { model, backend, device } => {
             let g = Gguf::open(&model)?;
@@ -943,6 +985,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 c.validate(&g)?;
                 println!("check: glm5-next ok: {} layers ({} KDA, {} DSA) + {} NextN, {} experts ({} used), {} tensors, tensor table valid", c.n_layer, c.n_kda(), c.n_dsa(), c.n_nextn, c.n_expert, c.n_used, g.tensors.len());
                 return Ok(());
+            }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("flint") {
+                let c = ModelConfig::from_gguf(&g)?;
+                let n_moe = c.layers.iter().enumerate().filter(|&(il, _)| c.is_moe_layer(il)).count();
+                println!("check: flint ok: {} layers ({} dense, {} MoE), {} experts ({} used), {}/{} sliding-window / no-RoPE layers, {} tensors", c.n_layer, c.n_dense, n_moe, c.n_expert, c.n_expert_used, c.swa.iter().filter(|&&s| s).count(), c.rope_layer.iter().filter(|&&r| !r).count(), g.tensors.len());
             }
             let types = rusting_strata::gpu_model::gpu_weight_types(&g);
             let b = backend::open(backend.as_deref(), device)?;
@@ -1368,7 +1415,7 @@ fn best(f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<f64> {
     Ok(b)
 }
 
-fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device: &[usize]) -> anyhow::Result<()> {
+fn calibrate(model: &Path, ctx: usize, margin: &[usize], kind: Option<&str>, device: &[usize]) -> anyhow::Result<()> {
     let g = Gguf::open(model)?;
     let m = Model::load(&g)?;
     let tok = Tokenizer::from_gguf(&g)?;
@@ -1378,7 +1425,7 @@ fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device
     let load = |chunk: usize| -> anyhow::Result<GpuModel> {
         let bk = device.iter().map(|&d| backend::open(kind, d)).collect::<anyhow::Result<Vec<_>>>()?;
         // MTP is not available with a layer split (as in serve): no drafts to measure.
-        let mut gm = GpuModel::load_split(&m, bk, ctx, chunk, margin, if device.len() > 1 { 0 } else { 3 }, 1).context(LOAD_HINT)?;
+        let mut gm = GpuModel::load_split_margins(&m, bk, ctx, chunk, margin, if device.len() > 1 { 0 } else { 3 }, 1).context(LOAD_HINT)?;
         gm.adapt_every = 0; // fixed placement: steadier timings
         Ok(gm)
     };
@@ -2140,7 +2187,27 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
 
 #[cfg(test)]
 mod flag_tests {
-    use super::resolve_flags;
+    use super::{resolve_flags, vram_margins};
+
+    #[test]
+    fn vram_margins_are_per_device() {
+        let spec = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(vram_margins(&spec(&["512"]), &[0, 1]).unwrap(), [512, 512]);
+        assert_eq!(vram_margins(&spec(&["512", "256"]), &[1, 0]).unwrap(), [512, 256]);
+        assert_eq!(vram_margins(&spec(&["0:512", "1:256"]), &[1, 0]).unwrap(), [256, 512]);
+        assert_eq!(vram_margins(&spec(&["0:512", "1:256"]), &[0, 1]).unwrap(), [512, 256]);
+    }
+
+    #[test]
+    fn vram_margins_reject_bad_specs() {
+        let spec = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for bad in [&["512", "256"][..], &["0:512", "0:256"][..], &["0:512", "256"][..]] {
+            let e = vram_margins(&spec(bad), &[0]).unwrap_err().to_string();
+            assert!(e.starts_with("--vram-margin"), "{bad:?}: {e}");
+        }
+        assert!(vram_margins(&spec(&["2:512"]), &[0, 1]).unwrap_err().to_string().contains("not in --device"));
+        assert!(vram_margins(&spec(&["x:512"]), &[0]).unwrap_err().to_string().contains("not a GPU index"));
+    }
 
     #[test]
     fn parallel_mtp_are_explained() {

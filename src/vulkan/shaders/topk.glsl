@@ -1,15 +1,20 @@
 // One subgroup routes one token: softmax over the n <= 32 * R logits at p[b ..] (lane holds i = lane + 32 r), top-k
 // (ties to the lower index), renormalized weights. Lane j < k gets the j-th expert's id and weight.
 const uint R = 16;
-void topk(F32 p, uint b, uint n, uint k, float extra_scale, uint lane, out int id, out float w) {
+void topk(F32 p, uint b, uint n, uint k, float extra_scale, uint lane, out int id, out float w, uint sigmoid) {
     float v[R];
-    float m = -1.0 / 0.0;
-    for (uint r = 0; r < R; r++) { uint i = lane + 32 * r; v[r] = i < n ? p.v[b + i] : -1.0 / 0.0; m = max(m, v[r]); }
-    m = warp_max(m);
-    float s = 0.0;
-    for (uint r = 0; r < R; r++) if (lane + 32 * r < n) { v[r] = expf_(v[r] - m); s += v[r]; }
-    s = warp_sum(s);
-    for (uint r = 0; r < R; r++) v[r] = fdiv(v[r], s);
+    for (uint r = 0; r < R; r++) { uint i = lane + 32 * r; v[r] = i < n ? p.v[b + i] : -1.0 / 0.0; }
+    if (sigmoid != 0) {
+        for (uint r = 0; r < R; r++) v[r] = fdiv(1.0, 1.0 + expf_(-v[r]));
+    } else {
+        float m = -1.0 / 0.0;
+        for (uint r = 0; r < R; r++) m = max(m, v[r]);
+        m = warp_max(m);
+        float s = 0.0;
+        for (uint r = 0; r < R; r++) if (lane + 32 * r < n) { v[r] = expf_(v[r] - m); s += v[r]; }
+        s = warp_sum(s);
+        for (uint r = 0; r < R; r++) v[r] = fdiv(v[r], s);
+    }
     uint taken = 0;
     float sum = 0.0, mine = 0.0;
     id = 0;

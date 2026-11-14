@@ -252,3 +252,64 @@ fn malformed_metadata_must_not_panic() {
     }
     assert!(failures.is_empty(), "{}", failures.join("; "));
 }
+
+/// Minimal Flint file: the config arrays (sliding-window and RoPE patterns) and the sink tensor that marks it.
+fn kv_u32(b: &mut Vec<u8>, k: &str, v: u32) { w_str(b, k); b.extend(4u32.to_le_bytes()); b.extend(v.to_le_bytes()); }
+fn kv_f32(b: &mut Vec<u8>, k: &str, v: f32) { w_str(b, k); b.extend(6u32.to_le_bytes()); b.extend(v.to_le_bytes()); }
+fn kv_bools(b: &mut Vec<u8>, k: &str, v: &[bool]) {
+    w_str(b, k); b.extend(9u32.to_le_bytes()); b.extend(7u32.to_le_bytes());
+    b.extend((v.len() as u64).to_le_bytes()); for x in v { b.push(*x as u8); }
+}
+fn flint_syn() -> Gguf {
+    let mut b = Vec::new();
+    b.extend(b"GGUF");
+    b.extend(3u32.to_le_bytes());
+    b.extend(2u64.to_le_bytes()); // tensors
+    b.extend(18u64.to_le_bytes()); // kv
+    w_str(&mut b, "general.architecture"); b.extend(8u32.to_le_bytes()); w_str(&mut b, "flint");
+    kv_u32(&mut b, "flint.block_count", 4);
+    kv_u32(&mut b, "flint.embedding_length", 8);
+    kv_u32(&mut b, "flint.attention.head_count", 2);
+    kv_u32(&mut b, "flint.attention.head_count_kv", 1);
+    kv_u32(&mut b, "flint.attention.key_length", 4);
+    kv_u32(&mut b, "flint.feed_forward_length", 16);
+    kv_u32(&mut b, "flint.expert_count", 4);
+    kv_u32(&mut b, "flint.expert_used_count", 2);
+    kv_u32(&mut b, "flint.expert_feed_forward_length", 4);
+    kv_u32(&mut b, "flint.expert_shared_feed_forward_length", 8);
+    kv_u32(&mut b, "flint.leading_dense_block_count", 1);
+    kv_u32(&mut b, "flint.expert_gating_func", 2);
+    kv_u32(&mut b, "flint.attention.sliding_window", 4);
+    kv_f32(&mut b, "flint.attention.layer_norm_rms_epsilon", 1e-6);
+    kv_f32(&mut b, "flint.expert_weights_scale", 1.0);
+    kv_bools(&mut b, "flint.attention.sliding_window_pattern", &[false, true, true, false]);
+    kv_bools(&mut b, "flint.attention.rope_pattern", &[false, true, true, false]);
+    let mut off = 0u64;
+    for (name, dims) in [("token_embd.weight", [8u64, 16]), ("blk.0.attn_sinks.weight", [2, 1])] {
+        w_str(&mut b, name);
+        b.extend(2u32.to_le_bytes());
+        for d in dims { b.extend(d.to_le_bytes()); }
+        b.extend(0u32.to_le_bytes()); // F32
+        b.extend(off.to_le_bytes());
+        off += (dims[0] * dims[1] * 4).next_multiple_of(32);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    b.resize(b.len() + off as usize, 0);
+    let p = std::env::temp_dir().join(format!("strata-{}-flint.gguf", std::process::id()));
+    std::fs::write(&p, &b).unwrap();
+    let g = Gguf::open(&p).unwrap();
+    std::fs::remove_file(&p).ok();
+    g
+}
+
+#[test]
+fn flint_config() {
+    let c = ModelConfig::from_gguf(&flint_syn()).unwrap();
+    assert_eq!(c.arch, "flint");
+    assert_eq!((c.n_layer, c.n_embd, c.n_head, c.n_head_kv, c.head_dim, c.n_vocab), (4, 8, 2, 1, 4, 16));
+    assert_eq!((c.n_dense, c.n_expert, c.n_expert_used, c.n_ff, c.n_ff_exp, c.n_ff_shexp), (1, 4, 2, 16, 4, 8));
+    assert_eq!((c.n_swa, c.swa.clone()), (4, vec![false, true, true, false]));
+    assert_eq!(c.rope_layer, vec![false, true, true, false]);
+    assert!(c.attn_sinks && c.router_sigmoid && !c.q_gate && !c.k_interleave);
+    assert!(!c.is_moe_layer(0) && c.is_moe_layer(1) && c.is_moe());
+}

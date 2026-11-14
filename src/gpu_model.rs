@@ -66,7 +66,7 @@ enum Mixer {
         snap: Option<(Buf, Buf)>,
     },
     /// `kc`, `vc`: the KV cache per slot.
-    Attn { q: GpuTensor, k: GpuTensor, v: GpuTensor, qn: GpuTensor, kn: GpuTensor, o: GpuTensor, kc: Vec<Buf>, vc: Vec<Buf>, qsa: Option<Qsa> },
+    Attn { q: GpuTensor, k: GpuTensor, v: GpuTensor, qn: GpuTensor, kn: GpuTensor, o: GpuTensor, kc: Vec<Buf>, vc: Vec<Buf>, qsa: Option<Qsa>, sink: Option<GpuTensor> },
 }
 
 /// QSA indexer of an attention layer (qwen4exp, see `Model::qsa`): projections and norms, the pooled keys (128 floats
@@ -86,7 +86,7 @@ const QSA_RING: usize = QSA_POOL * QSA_D;
 /// Query rows per `qsa_select` launch in prefill (score rows).
 const QSA_ROWS: usize = 64;
 
-struct Shared { gate_inp: GpuTensor, gate: GpuTensor, up: GpuTensor, down: GpuTensor }
+struct Shared { gate_inp: Option<GpuTensor>, gate: GpuTensor, up: GpuTensor, down: GpuTensor }
 
 enum Ffn {
     Dense { gate: GpuTensor, up: GpuTensor, down: GpuTensor },
@@ -244,13 +244,22 @@ impl<'a> GpuModel<'a> {
         Self::load_part(m, gpu, ctx, chunk, vram_margin, 0, 0..m.cfg.n_layer, n)
     }
 
-    /// `load` with the layers split over `gpus` in proportion to their free VRAM (each device then fills the rest
-    /// of its VRAM with expert slots), and `ns` slots as in `load_slots`. One device: `load` or `load_slots`.
+    /// `load_split` with the same VRAM margin on every device.
     pub fn load_split(m: &'a Model<'a>, gpus: Vec<Box<dyn Backend>>, ctx: usize, chunk: usize, vram_margin: usize, k: usize, ns: usize) -> anyhow::Result<GpuModel<'a>> {
+        let margins = vec![vram_margin; gpus.len()];
+        Self::load_split_margins(m, gpus, ctx, chunk, &margins, k, ns)
+    }
+
+    /// `load` with the layers split over `gpus` in proportion to their free VRAM (each device then fills the rest
+    /// of its VRAM with expert slots, keeping its entry of `vram_margin` free), and `ns` slots as in `load_slots`.
+    /// One device: `load` or `load_slots`.
+    pub fn load_split_margins(m: &'a Model<'a>, gpus: Vec<Box<dyn Backend>>, ctx: usize, chunk: usize, vram_margin: &[usize], k: usize, ns: usize) -> anyhow::Result<GpuModel<'a>> {
+        ensure!(vram_margin.len() == gpus.len(), "{} VRAM margin(s) for {} device(s)", vram_margin.len(), gpus.len());
         let n = m.cfg.n_layer;
         if gpus.len() == 1 {
             let g = gpus.into_iter().next().unwrap();
-            return if ns > 1 { Self::load_slots(m, g, ctx, chunk, vram_margin, ns) } else { Self::load(m, g, ctx, chunk, vram_margin, k) };
+            let margin = vram_margin[0];
+            return if ns > 1 { Self::load_slots(m, g, ctx, chunk, margin, ns) } else { Self::load(m, g, ctx, chunk, margin, k) };
         }
         let free = gpus.iter().map(|g| Ok(g.mem_info()?.0 as f64)).collect::<anyhow::Result<Vec<_>>>()?;
         let total: f64 = free.iter().sum();
@@ -266,7 +275,7 @@ impl<'a> GpuModel<'a> {
             ensure!(ple.iter().all(|il| r.contains(il)) || !ple.iter().any(|il| r.contains(il)), "the PLE layers would be split across devices");
             eprintln!("device {i} ({}): layers {}..{}", gpu.name(), r.start, r.end);
             // ponytail: no MTP draft head on a split model (it reads the last part's hidden rows from the first).
-            parts.push(Self::load_part(m, gpu, ctx, chunk, vram_margin, 0, r, ns)?);
+            parts.push(Self::load_part(m, gpu, ctx, chunk, vram_margin[i], 0, r, ns)?);
         }
         let mut it = parts.into_iter().rev();
         let mut acc = it.next().unwrap();
@@ -317,6 +326,7 @@ impl<'a> GpuModel<'a> {
                 Mixer::Attn {
                     q: lt(il, "attn_q.weight")?, k: lt(il, "attn_k.weight")?, v: lt(il, "attn_v.weight")?,
                     qn: lt(il, "attn_q_norm.weight")?, kn: lt(il, "attn_k_norm.weight")?, o: lt(il, "attn_output.weight")?,
+                    sink: if c.attn_sinks { Some(lt(il, "attn_sinks.weight")?) } else { None },
                     kc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words(ctx * kv))).collect::<anyhow::Result<_>>()?,
                     vc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words(ctx * kv))).collect::<anyhow::Result<_>>()?,
                     qsa: if qsa_on && il < c.n_layer && m.w.layer(il, "indexer.k_proj.weight").is_ok() {
@@ -329,10 +339,10 @@ impl<'a> GpuModel<'a> {
                     } else { None },
                 }
             };
-            let ffn = if c.is_moe() {
-                let shared = if m.w.layer(il, "ffn_gate_inp_shexp.weight").is_ok() {
+            let ffn = if c.is_moe_layer(il) {
+                let shared = if m.w.layer(il, "ffn_up_shexp.weight").is_ok() {
                     Some(Shared {
-                        gate_inp: lt(il, "ffn_gate_inp_shexp.weight")?, gate: lt(il, "ffn_gate_shexp.weight")?,
+                        gate_inp: lt(il, "ffn_gate_inp_shexp.weight").ok(), gate: lt(il, "ffn_gate_shexp.weight")?,
                         up: lt(il, "ffn_up_shexp.weight")?, down: lt(il, "ffn_down_shexp.weight")?,
                     })
                 } else { None };
@@ -417,7 +427,8 @@ impl<'a> GpuModel<'a> {
             let budget = free1.saturating_sub(vram_margin).min(cap);
             Some(ExpertCache::new(m, &*gpu, budget, range.start..range.end + mtp as usize)?)
         } else { None };
-        let worker = if c.is_moe() { Some(CpuWorker::new(m, &*gpu, range.clone().collect())?) } else { None };
+        let moe_layers: Vec<usize> = range.clone().filter(|&il| c.is_moe_layer(il)).collect();
+        let worker = if !moe_layers.is_empty() { Some(CpuWorker::new(m, &*gpu, moe_layers)?) } else { None };
         // R3a: prefetch the next layer's experts predicted by the previous token's routing there. Default off; the GPU
         // window of issue #34 measures it and accepts or rejects it. CUDA has the kernel, Vulkan's `moe_prefetch` is a
         // no-op.
@@ -1113,6 +1124,9 @@ impl<'a> GpuModel<'a> {
         let (dv, channels) = (c.ssm_dv(), c.ssm_d_inner + 2 * nk * dk);
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
         let kv = nkv * hd;
+        let sink_addr = match &l.mixer { Mixer::Attn { sink: Some(s), .. } => s.ptr, _ => 0 };
+        let win = c.swa.get(il).copied().unwrap_or(false).then_some(c.n_swa).unwrap_or(0);
+        let use_rope = c.rope_layer.get(il).copied().unwrap_or(true);
         if !resume {
             let ha = self.hc_at();
             if let Some(pl) = &l.ple { self.ple(pl, x, step, nt, &ha)?; }
@@ -1162,7 +1176,7 @@ impl<'a> GpuModel<'a> {
                              else { g.norm_gate_q(p("o"), norm.ptr, p("z"), dv, nt * nv, eps, p("oq"))? };
                     if oq != 0 { g.gemvq(out, p("o"), c.ssm_d_inner, oq, p("mix"), ne, nt)?; } else { mv(out, "o", c.ssm_d_inner, "mix", ne)?; }
                 }
-                Mixer::Attn { q, k, v, qn, kn, o, kc, vc, qsa } => {
+                Mixer::Attn { q, k, v, qn, kn, o, kc, vc, qsa, .. } => {
                     let qs = if c.q_gate { 2 * hd } else { hd };
                     g.batch(&mut || { mv2(q, k, "qg", "kraw")?; mv(v, "h", ne, "v", kv) })?;
                     if !self.rows.is_empty() {
@@ -1170,36 +1184,57 @@ impl<'a> GpuModel<'a> {
                         let at = |n: &str, r: usize, w: usize| p(n) + (4 * r * w) as u64;
                         g.batch(&mut || {
                             for (r, &(sl, _)) in self.rows.iter().enumerate() {
-                                if self.rope_offset == 0 {
+                                if use_rope && self.rope_offset == 0 {
                                     g.rms_norm_rope_qk(at("qg", r, nh * qs), qs, qn.ptr, at("q", r, nh * hd), nh, nh, at("kraw", r, kv), kn.ptr, at("k", r, kv), nkv, nkv,
                                                        hd, eps, c.n_rot, step + 8 * r as u64, c.rope_base, at("v", r, kv), kc[sl].addr(), vc[sl].addr())?;
                                 } else {
                                     g.rms_norm(at("qg", r, nh * qs), qs, qn.ptr, at("q", r, nh * hd), hd, hd, nh, eps)?;
-                                    g.rope_neox(at("q", r, nh * hd), hd, nh, nh, c.n_rot, rope + 8 * r as u64, c.rope_base)?;
                                     g.rms_norm(at("kraw", r, kv), hd, kn.ptr, at("k", r, kv), hd, hd, nkv, eps)?;
-                                    g.rope_neox(at("k", r, kv), hd, nkv, nkv, c.n_rot, rope + 8 * r as u64, c.rope_base)?;
-                                    g.kv_store(at("k", r, kv), at("v", r, kv), kc[sl].addr(), vc[sl].addr(), kv, 1, step + 8 * r as u64, hd)?;
                                 }
                             }
                             Ok(())
                         })?;
+                        if use_rope && self.rope_offset != 0 {
+                            g.batch(&mut || {
+                                for r in 0..self.rows.len() {
+                                    g.rope_neox(at("q", r, nh * hd), hd, nh, nh, c.n_rot, rope + 8 * r as u64, c.rope_base)?;
+                                    g.rope_neox(at("k", r, kv), hd, nkv, nkv, c.n_rot, rope + 8 * r as u64, c.rope_base)?;
+                                }
+                                Ok(())
+                            })?;
+                        }
+                        if !(use_rope && self.rope_offset == 0) {
+                            g.batch(&mut || {
+                                for (r, &(sl, _)) in self.rows.iter().enumerate() {
+                                    g.kv_store(at("k", r, kv), at("v", r, kv), kc[sl].addr(), vc[sl].addr(), kv, 1, step + 8 * r as u64, hd)?;
+                                }
+                                Ok(())
+                            })?;
+                        }
                         for (r, &(sl, pos)) in self.rows.iter().enumerate() {
                             g.attn_decode_q(at("q", r, nh * hd), kc[sl].addr(), vc[sl].addr(), if c.q_gate { at("qg", r, nh * qs) } else { 0 }, at("att", r, nh * hd),
-                                            p("attp"), step + 8 * r as u64, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), gq_min(pos, 1), 1, 0, 0, 0)?;
+                                            p("attp"), step + 8 * r as u64, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), gq_min(pos, 1), 1, 0, 0, 0,
+                                            sink_addr, win)?;
                         }
                         mv(o, "att", nh * hd, "mix", ne)?;
                     } else {
-                    if self.rope_offset == 0 {
+                    if use_rope && self.rope_offset == 0 {
                         g.batch(&mut || g.rms_norm_rope_qk(p("qg"), qs, qn.ptr, p("q"), nt * nh, nh, p("kraw"), kn.ptr, p("k"), nt * nkv, nkv,
                                                            hd, eps, c.n_rot, step, c.rope_base, p("v"), kc[self.cur].addr(), vc[self.cur].addr()))?;
                     } else {
                         g.batch(&mut || {
                             g.rms_norm(p("qg"), qs, qn.ptr, p("q"), hd, hd, nt * nh, eps)?;
-                            g.rope_neox(p("q"), hd, nt * nh, nh, c.n_rot, rope, c.rope_base)?;
                             g.rms_norm(p("kraw"), hd, kn.ptr, p("k"), hd, hd, nt * nkv, eps)?;
-                            g.rope_neox(p("k"), hd, nt * nkv, nkv, c.n_rot, rope, c.rope_base)?;
-                            g.kv_store(p("k"), p("v"), kc[self.cur].addr(), vc[self.cur].addr(), kv, nt, step, hd)
+                            Ok(())
                         })?;
+                        if use_rope {
+                            g.batch(&mut || {
+                                g.rope_neox(p("q"), hd, nt * nh, nh, c.n_rot, rope, c.rope_base)?;
+                                g.rope_neox(p("k"), hd, nt * nkv, nkv, c.n_rot, rope, c.rope_base)?;
+                                Ok(())
+                            })?;
+                        }
+                        g.kv_store(p("k"), p("v"), kc[self.cur].addr(), vc[self.cur].addr(), kv, nt, step, hd)?;
                     }
                     let (sel, sst) = match (qsa, &self.qsa) {
                         (Some(a), Some(b)) => {
@@ -1213,7 +1248,7 @@ impl<'a> GpuModel<'a> {
                         _ => (0, 0),
                     };
                     let aq = g.attn_decode_q(p("q"), kc[self.cur].addr(), vc[self.cur].addr(), if c.q_gate { p("qg") } else { 0 }, p("att"), p("attp"), step, nh, nkv, hd,
-                                             1.0 / (hd as f32).sqrt(), gq, nt, p("attq"), sel, sst)?;
+                                             1.0 / (hd as f32).sqrt(), gq, nt, p("attq"), sel, sst, sink_addr, win)?;
                     if aq != 0 { g.gemvq(o, p("att"), nh * hd, aq, p("mix"), ne, nt)?; } else { mv(o, "att", nh * hd, "mix", ne)?; }
                     }
                 }
@@ -1265,12 +1300,12 @@ impl<'a> GpuModel<'a> {
                     if !resume {
                     g.batch(&mut || {
                         if let Some(s) = shared {
-                            mv2(router, &s.gate_inp, "rl", "sg")?;
+                            if let Some(gi) = &s.gate_inp { mv2(router, gi, "rl", "sg")?; } else { mv(router, "h", ne, "rl", c.n_expert)?; }
                             mv2(&s.gate, &s.up, "shg", "shu")?;
                         } else { mv(router, "h", ne, "rl", c.n_expert)?; }
                         Ok(())
                     })?;
-                    g.moe_route(p("rl"), c.n_expert, k, c.expert_weights_scale, lx.table_dev.addr(), ids, p("wts"), slots, p("wh"), p("h"), mb, ne, w.layout.h, step, nt, pid)?;
+                    g.moe_route(p("rl"), c.n_expert, k, c.expert_weights_scale, lx.table_dev.addr(), ids, p("wts"), slots, p("wh"), p("h"), mb, ne, w.layout.h, step, nt, pid, c.router_sigmoid)?;
                     g.batch(&mut || {
                         if mg.ty == mu.ty && (mg.rows, mg.cols) == (mu.rows, mu.cols) {
                             let pair = (mu.off as i64 - mg.off as i64, p("ue") as i64 - p("ge") as i64);
@@ -1288,7 +1323,7 @@ impl<'a> GpuModel<'a> {
                         Ok(())
                     })?;
                     }
-                    let (sh, sg) = if shared.is_some() { (p("shy"), p("sg")) } else { (0, 0) };
+                    let (sh, sg) = match shared { Some(s) => (p("shy"), if s.gate_inp.is_some() { p("sg") } else { 0 }), None => (0, 0) };
                     // Hyper-connections: the FFN output collects in "mo" (zero) and goes to the streams from there.
                     let fx = if l.hc.is_some() { p("mo") } else { x };
                     g.moe_down_combine(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, k, p("ge"), p("ye"), dq,

@@ -66,7 +66,7 @@ impl ExpertCache {
         let mut layers: Vec<Option<(usize, [Mat; 3])>> = Vec::new();
         let mut classes = BTreeMap::<usize, usize>::new(); // slot bytes -> experts of that size
         for il in 0..n_layers {
-            if !c.is_moe() || !range.contains(&il) { layers.push(None); continue; }
+            if !c.is_moe_layer(il) || !range.contains(&il) { layers.push(None); continue; }
             let mut off = 0;
             let mut mats = [Mat { ty: GgmlType::F32, rows: 0, cols: 0, off: 0, bytes: 0 }; 3];
             for (i, name) in MATS.iter().enumerate() {

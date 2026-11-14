@@ -26,6 +26,13 @@ const JOYAI_RE: [&str; 3] = [
     "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+",
 ];
 
+/// llama.cpp `LLAMA_VOCAB_PRE_TYPE_FLINT`: digits in groups of three, CJK runs, then Llama-3-style words.
+const FLINT_RE: [&str; 3] = [
+    r"\p{N}{1,3}",
+    "[一-龥぀-ゟ゠-ヿ]+",
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+];
+
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
     eos: Vec<u32>,
@@ -39,6 +46,7 @@ impl Tokenizer {
         let pre = g.get("tokenizer.ggml.pre")?.as_str().unwrap_or("");
         let res: &[&str] = match pre {
             "qwen35" => &[QWEN35_RE], "qwen2" => &[QWEN2_RE], "joyai-llm" => &JOYAI_RE,
+            "flint" => &FLINT_RE,
             "glm4" | "glm5" | "chatglm-bpe" => &[GLM4_RE],
             _ => bail!("unsupported pre-tokenizer '{pre}'"),
         };
@@ -73,8 +81,17 @@ impl Tokenizer {
         inner.add_special_tokens(&special);
 
         let mut eos: Vec<u32> = g.meta.get("tokenizer.ggml.eos_token_id").and_then(|v| v.as_u64()).map(|v| v as u32).into_iter().collect();
+        if let Some(a) = g.meta.get("tokenizer.ggml.eog_token_ids").and_then(|v| v.as_arr()) {
+            for v in a { if let Some(id) = v.as_u64().map(|x| x as u32) && !eos.contains(&id) { eos.push(id); } }
+        }
         for t in ["<|im_end|>", "<|endoftext|>"] {
             if let Some(id) = inner.token_to_id(t) && !eos.contains(&id) { eos.push(id); }
+        }
+        if pre == "flint" {
+            // llama.cpp treats these turn markers as end of generation for Flint.
+            for t in ["<|user|>", "<|observation|>"] {
+                if let Some(id) = inner.token_to_id(t) && !eos.contains(&id) { eos.push(id); }
+            }
         }
         Ok(Tokenizer { inner, eos })
     }

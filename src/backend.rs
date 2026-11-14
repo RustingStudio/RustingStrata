@@ -245,11 +245,12 @@ pub trait Backend: Send {
     fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize, snap: u64, nsnap: usize) -> anyhow::Result<()>;
     /// `qg` 0: no output gate.
     fn attn_prefill(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
-        self.attn_prefill_m(q, kc, vc, qg, out, step, t, nh, nkv, hd, scale, 0, 0)
+        self.attn_prefill_m(q, kc, vc, qg, out, step, t, nh, nkv, hd, scale, 0, 0, 0, 0)
     }
     /// `attn_prefill` where query row i sees only the keys whose 4-cell block has its bit set in row i of `qm` (`mw`
-    /// words a row, rows up to `t` rounded up to 64; see `qsa_select`). `qm` 0: no mask.
-    fn attn_prefill_m(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32, qm: u64, mw: usize) -> anyhow::Result<()>;
+    /// words a row, rows up to `t` rounded up to 64; see `qsa_select`). `qm` 0: no mask. `sink` (0 = none): per-head
+    /// attention-sink logits. `win` (0 = none): sliding-window width.
+    fn attn_prefill_m(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32, qm: u64, mw: usize, sink: u64, win: usize) -> anyhow::Result<()>;
     /// QSA indexer keys (see `Model::qsa`): pool the blocks of 4 positions that the `t` raw keys (rows of 128) at
     /// positions step[0] .. complete into `pool` (rows of 128 per block: mean, rms norm with `w`, NEOX rope at the
     /// block's first position). `ring`: 4 rows of 128, the raw keys of the incomplete block (row = position % 4).
@@ -290,24 +291,25 @@ pub trait Backend: Send {
     /// Decode attention for `nt` query tokens, token t over positions 0 ..= step[2 t] (rows of q, qg, out and step per
     /// token, `part` holds `nh * ATT_SPLITS * (hd + 2)` floats per token). `qg` 0: no output gate.
     fn attn_decode(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize) -> anyhow::Result<()> {
-        self.attn_decode_gq(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, ATT_GQA_MIN, nt)
+        self.attn_decode_gq(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, ATT_GQA_MIN, nt, 0, 0)
     }
     /// `attn_decode_gq`, also writing `out` quantized for `gemvq` into `xq` where supported; returns the xq to use (0: none).
-    /// `sel` not 0: QSA cell lists from `qsa_select` (rows of `sst` ints per token).
-    fn attn_decode_q(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, _xq: u64, sel: u64, _sst: usize) -> anyhow::Result<u64> {
+    /// `sel` not 0: QSA cell lists from `qsa_select` (rows of `sst` ints per token). `sink` (0 = none): per-head
+    /// attention-sink logits. `win` (0 = none): sliding-window width.
+    fn attn_decode_q(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, _xq: u64, sel: u64, _sst: usize, sink: u64, win: usize) -> anyhow::Result<u64> {
         anyhow::ensure!(sel == 0, "{}: QSA sparse attention not implemented", self.name());
-        self.attn_decode_gq(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt)?;
+        self.attn_decode_gq(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, sink, win)?;
         Ok(0)
     }
     /// `attn_decode` that shares K/V loads across a GQA group from `gq_min` positions on (tests use 0 to force it).
-    fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize) -> anyhow::Result<()>;
-    /// Route `t` tokens (logit rows of n, ids / wts rows of k).
-    fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()>;
+    fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, sink: u64, win: usize) -> anyhow::Result<()>;
+    /// Route `t` tokens (logit rows of n, ids / wts rows of k). `sigmoid` selects sigmoid scores instead of softmax.
+    fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize, sigmoid: bool) -> anyhow::Result<()>;
     /// Decode routing: `router_topk`, the expert cache lookup (slots[j] = table[ids[j]], -1 = not resident; wh[j] =
     /// wts[j] on a hit, else 0), then the routing and (on a miss) `h` (rows of nh) written to the layer mailbox at
     /// `mb` and its request flag raised. `mb` = 0 skips every mailbox store where `moe_mailbox_optional` holds. `pid`
     /// (0 = none) receives the last token's ids, the prediction the next token's prefetch uses.
-    fn moe_route(&self, p: u64, n: usize, k: usize, extra_scale: f32, table: u64, ids: u64, wts: u64, slots: u64, wh: u64, h: u64, mb: u64, nh: usize, h_off: usize, step: u64, t: usize, pid: u64) -> anyhow::Result<()>;
+    fn moe_route(&self, p: u64, n: usize, k: usize, extra_scale: f32, table: u64, ids: u64, wts: u64, slots: u64, wh: u64, h: u64, mb: u64, nh: usize, h_off: usize, step: u64, t: usize, pid: u64, sigmoid: bool) -> anyhow::Result<()>;
     /// `mb` = 0: no CPU part. Otherwise adds the CPU result at word `y_off` of the mailbox once its done flag is `seq`.
     fn moe_combine(&self, x: u64, ye: u64, w: u64, k: usize, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, slots: u64, n: usize, t: usize) -> anyhow::Result<()>;
     /// Whether `moe_route`/`moe_combine` accept `mb = 0`, i.e. a fully resident expert cache costs the CPU worker

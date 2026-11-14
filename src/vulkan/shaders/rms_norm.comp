@@ -20,6 +20,7 @@ void main() {
         }
         for (; i < p.n; i += 256) { float a = p.x.v[xo + i] + p.res.v[xo + i]; p.x.v[xo + i] = a; s += a * a; }
         memoryBarrierBuffer();
+        barrier();
     }
     for (; i + 768 < p.n; i += 1024) {
         float a = p.x.v[xo + i], b = p.x.v[xo + i + 256], c = p.x.v[xo + i + 512], e = p.x.v[xo + i + 768];

@@ -22,6 +22,16 @@ pub fn softmax(x: &mut [f32]) {
     for v in x { *v /= s; }
 }
 
+/// Softmax over `x` plus one extra learnable logit (`sink`, the attention sink): the sink takes probability
+/// mass that the visible keys then do not get. `None` is a plain softmax.
+pub fn softmax_sink(x: &mut [f32], sink: Option<f32>) {
+    let Some(sink) = sink else { return softmax(x) };
+    let m = x.iter().cloned().fold(sink, f32::max);
+    let mut s = (sink - m).exp();
+    for v in x.iter_mut() { *v = (*v - m).exp(); s += *v; }
+    for v in x { *v /= s; }
+}
+
 /// NEOX-style rotary embedding on the first `n_rot` dims: pairs (i, i + n_rot/2).
 pub fn rope_neox(x: &mut [f32], n_rot: usize, pos: usize, base: f32) {
     let half = n_rot / 2;

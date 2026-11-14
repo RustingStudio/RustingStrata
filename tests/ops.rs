@@ -34,6 +34,18 @@ fn rope_rotates_pairs() {
 #[test]
 fn topk() { assert_eq!(top_k(&[0.1, 0.5, 0.2, 0.5], 2), vec![1, 3]); }
 #[test]
+fn attention_sink_is_an_extra_softmax_logit() {
+    let mut x = [0f32, 0.0];
+    softmax_sink(&mut x, None);
+    assert_eq!(x, [0.5, 0.5]);
+    let mut x = [0f32, 0.0];
+    softmax_sink(&mut x, Some(0.0));
+    assert!((x[0] - 1.0 / 3.0).abs() < 1e-6 && (x[1] - 1.0 / 3.0).abs() < 1e-6);
+    let mut x = [0f32];
+    softmax_sink(&mut x, Some(-100.0));
+    assert_eq!(x, [1.0]);
+}
+#[test]
 fn softmax_sums_to_one() {
     let mut x = [1.0, 2.0, 3.0];
     softmax(&mut x);

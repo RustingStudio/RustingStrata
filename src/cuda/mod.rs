@@ -701,21 +701,21 @@ impl Gpu {
     }
 
     /// attn_decode_gq; attn_merge also writes `out` quantized into xq when not null.
-    fn attn(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64, sel: u64, sst: usize) -> anyhow::Result<()> {
+    fn attn(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64, sel: u64, sst: usize, sink: u64, win: usize) -> anyhow::Result<()> {
         if ![64, 128, 256, 512].contains(&hd) { bail!("attention head_dim {hd} unsupported (64, 128, 256 or 512)"); }
         let group = nh / nkv;  // query heads per KV head, served by one block (up to 8, G * hd <= 2048)
         let g = [8, 4, 2, 1].into_iter().find(|&g| group % g == 0 && g * hd <= 2048).unwrap();
         let pz = (nh * ATT_SPLITS * (hd + 2)) as i32;
         // gq_min i32::MAX or 0 fixes the regime, so the kernel that would exit at once is not launched.
-        if gq_min != 0 { launch!(self, &format!("attn_decode_{hd}"), cfg(((nh * nt) as u32, ATT_SPLITS_1 as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32); }
+        if gq_min != 0 { launch!(self, &format!("attn_decode_{hd}"), cfg(((nh * nt) as u32, ATT_SPLITS_1 as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32, sink, win as i32); }
         // attn_decode_gqa with the f16 cache at head_dim 128 or 256 also holds 2 chunks of K and V for its cp.async,
         // attn_decode_gqa4_128 one. Turing (sm_75) has 64 KB of shared memory a block: the head_dim 256 chunks do
         // not fit, so it loads them through registers instead (kernels.cu ATT_RUN_CP).
         let cp = !self.kv_q8 && (hd == 128 || (hd == 256 && self.int8_mma));
         let g4 = cp && g == 4 && hd == 128;
         let (name, cp) = if g4 { ("attn_decode_gqa4_128".to_string(), 2 * 32 * hd * 2) } else { (format!("attn_decode_gqa_{hd}"), if cp { 2 * 2 * 32 * hd * 2 } else { 0 }) };
-        if gq_min != i32::MAX { launch!(self, &name, cfg(((nh / g * nt) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4 + cp) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32); }
-        launch!(self, "attn_merge", LaunchConfig { grid_dim: (nh as u32, 1, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, part, qg, out, hd as i32, ATT_SPLITS as i32, step, ATT_SPLITS_1 as i32, gq_min, xq);
+        if gq_min != i32::MAX { launch!(self, &name, cfg(((nh / g * nt) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4 + cp) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32, sink, win as i32); }
+        launch!(self, "attn_merge", LaunchConfig { grid_dim: (nh as u32, 1, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, part, qg, out, hd as i32, ATT_SPLITS as i32, step, ATT_SPLITS_1 as i32, gq_min, xq, sink);
         Ok(())
     }
 
@@ -1021,13 +1021,13 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    fn attn_prefill_m(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32, qm: u64, mw: usize) -> anyhow::Result<()> {
+    fn attn_prefill_m(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32, qm: u64, mw: usize, sink: u64, win: usize) -> anyhow::Result<()> {
         if !matches!(hd, 64 | 128 | 256) { bail!("attention prefill: head_dim {hd} unsupported (64, 128 or 256)"); }
         // Turing keeps 16 keys a tile for head_dim 256 (see FA_BK_FOR in kernels.cu).
         let bk = if self.turing && hd == 256 { 16 } else { FA_BK };
         let smem = attn_prefill_smem_bk(hd, bk) as u32;
         launch!(self, &format!("attn_prefill_{hd}"), cfg((t.div_ceil(64) as u32, nh as u32), 128, smem),
-            q, kc, vc, qg, out, step, t as i32, nh as i32, nkv as i32, scale, qm, mw as i32);
+            q, kc, vc, qg, out, step, t as i32, nh as i32, nkv as i32, scale, qm, mw as i32, sink, win as i32);
         Ok(())
     }
 
@@ -1101,25 +1101,25 @@ impl Backend for Gpu {
     /// One launch serves all tokens, their blocks side by side, so they read the same K/V rows from L2. Below ATT_GQA_MIN positions one block serves one head
     /// (ATT_SPLITS_1 splits), from it on one block serves all query heads of a KV head (ATT_SPLITS splits). Both
     /// kernels are launched (only one when gq_min is 0 or i32::MAX); the step decides which one works.
-    fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize) -> anyhow::Result<()> {
-        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, 0, 0, 0)
+    fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, sink: u64, win: usize) -> anyhow::Result<()> {
+        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, 0, 0, 0, sink, win)
     }
 
-    fn attn_decode_q(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64, sel: u64, sst: usize) -> anyhow::Result<u64> {
+    fn attn_decode_q(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64, sel: u64, sst: usize, sink: u64, win: usize) -> anyhow::Result<u64> {
         let xq = if llama_numerics() { 0 } else { xq };
-        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, xq, sel, sst)?;
+        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, xq, sel, sst, sink, win)?;
         Ok(xq)
     }
 
-    fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize) -> anyhow::Result<()> {
+    fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize, sigmoid: bool) -> anyhow::Result<()> {
         anyhow::ensure!(n <= 512 && k <= 32, "router_topk: {n} experts, top {k}");
-        launch!(self, "router_topk", cfg((t as u32, 1), 32, 0), p, n as i32, k as i32, extra_scale, ids, wts);
+        launch!(self, "router_topk", cfg((t as u32, 1), 32, 0), p, n as i32, k as i32, extra_scale, ids, wts, sigmoid as i32);
         Ok(())
     }
 
-    fn moe_route(&self, p: u64, n: usize, k: usize, extra_scale: f32, table: u64, ids: u64, wts: u64, slots: u64, wh: u64, h: u64, mb: u64, nh: usize, h_off: usize, step: u64, t: usize, pid: u64) -> anyhow::Result<()> {
+    fn moe_route(&self, p: u64, n: usize, k: usize, extra_scale: f32, table: u64, ids: u64, wts: u64, slots: u64, wh: u64, h: u64, mb: u64, nh: usize, h_off: usize, step: u64, t: usize, pid: u64, sigmoid: bool) -> anyhow::Result<()> {
         anyhow::ensure!(n <= 512 && k <= 32, "moe_route: {n} experts, top {k}");
-        launch!(self, "moe_route", cfg((1, 1), 256, 0), p, n as i32, k as i32, extra_scale, table, ids, wts, slots, wh, h, mb, nh as i32, h_off as i32, step, t as i32, pid);
+        launch!(self, "moe_route", cfg((1, 1), 256, 0), p, n as i32, k as i32, extra_scale, table, ids, wts, slots, wh, h, mb, nh as i32, h_off as i32, step, t as i32, pid, sigmoid as i32);
         Ok(())
     }
 

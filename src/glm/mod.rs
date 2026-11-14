@@ -480,11 +480,16 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
                         None if !hold.rest().is_empty() => { let _ = write!(c, "data: {}\n\n", chunk(json!({"content": hold.rest()}), None)); }
                         None => {}
                     }
-                    let _ = write!(c, "data: {}\n\ndata: [DONE]\n\n", chunk(json!({}), Some(done)));
+                    // llama-swap and OpenAI clients read the final chunk's usage.
+                    let mut last = chunk(json!({}), Some(done));
+                    last["usage"] = json!({"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len(),
+                        "prompt_tokens_details": {"cached_tokens": keep}});
+                    let _ = write!(c, "data: {last}\n\ndata: [DONE]\n\n");
                 } else {
                     let message = match &calls { Some(x) => calls_json(x, false), None => json!({"role": "assistant", "content": hold.text}) };
                     let b = json!({"object": "chat.completion", "model": name, "choices": [{"index": 0, "message": message, "finish_reason": done}],
-                        "usage": {"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len()}});
+                        "usage": {"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len(),
+                            "prompt_tokens_details": {"cached_tokens": keep}}});
                     send(&mut c, "200 OK", "application/json", &b.to_string());
                 }
             }
