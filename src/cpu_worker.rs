@@ -111,15 +111,36 @@ impl CpuWorker {
                             .flat_map(|t| missed.iter().map(move |&e| { let d = t.expert(e, m.cfg.n_expert).data; (d.as_ptr() as usize, d.len()) }).collect::<Vec<_>>())
                             .collect());
                     }
-                    for t in 0..nt {
-                        let sel: Vec<(usize, f32)> = (t * k..(t + 1) * k).filter(|&j| (v[2 * kt + j] as i32) < 0)
-                            .map(|j| (v[j] as usize, f32::from_bits(v[kt + j]))).collect();
-                        if sel.is_empty() { continue; }
-                        let mut h = vec![0u32; n];
-                        unsafe { read_wc(at(lay.h + t * n), &mut h) };
-                        let h: Vec<f32> = h.into_iter().map(f32::from_bits).collect();
-                        let y = crate::cpu_moe::experts(m, il, &h, &sel);
-                        unsafe { std::ptr::copy_nonoverlapping(y.as_ptr(), at(lay.y + t * n) as *mut f32, n) };
+                    if nt > 1 {
+                        // A verify batch: one pass over each missed expert's weights for all of its tokens.
+                        let (mut hs, mut sels, mut rows) = (Vec::new(), Vec::new(), Vec::new());
+                        for t in 0..nt {
+                            let sel: Vec<(usize, f32)> = (t * k..(t + 1) * k).filter(|&j| (v[2 * kt + j] as i32) < 0)
+                                .map(|j| (v[j] as usize, f32::from_bits(v[kt + j]))).collect();
+                            if sel.is_empty() { continue; }
+                            let mut h = vec![0u32; n];
+                            unsafe { read_wc(at(lay.h + t * n), &mut h) };
+                            hs.push(h.into_iter().map(f32::from_bits).collect::<Vec<f32>>());
+                            sels.push(sel);
+                            rows.push(t);
+                        }
+                        if !hs.is_empty() {
+                            let ys = crate::cpu_moe::experts_multi(m, il, &hs, &sels);
+                            for (y, &t) in ys.iter().zip(&rows) {
+                                unsafe { std::ptr::copy_nonoverlapping(y.as_ptr(), at(lay.y + t * n) as *mut f32, n) };
+                            }
+                        }
+                    } else {
+                        for t in 0..nt {
+                            let sel: Vec<(usize, f32)> = (t * k..(t + 1) * k).filter(|&j| (v[2 * kt + j] as i32) < 0)
+                                .map(|j| (v[j] as usize, f32::from_bits(v[kt + j]))).collect();
+                            if sel.is_empty() { continue; }
+                            let mut h = vec![0u32; n];
+                            unsafe { read_wc(at(lay.h + t * n), &mut h) };
+                            let h: Vec<f32> = h.into_iter().map(f32::from_bits).collect();
+                            let y = crate::cpu_moe::experts(m, il, &h, &sel);
+                            unsafe { std::ptr::copy_nonoverlapping(y.as_ptr(), at(lay.y + t * n) as *mut f32, n) };
+                        }
                     }
                     // SeqCst fences (mfence on x86) also order and flush write-combining stores (Vulkan maps the
                     // mailbox through the BAR): y before DONE, and DONE out now.

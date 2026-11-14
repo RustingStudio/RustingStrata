@@ -191,11 +191,12 @@ pub fn will_need(p: usize, n: usize) {
     }
 }
 
-/// Marks the whole pages of `b` first to reclaim (MADV_COLD): bytes now on the GPU. Expert files exceed the page
-/// cache, and pages read once at load would otherwise outlive the experts a prompt reads from it.
+/// Drops the whole pages of `b` (MADV_DONTNEED): bytes now on the GPU, whose host copy competes with the experts that
+/// missed VRAM for page cache. Expert files exceed the page cache, so pages read once at load would otherwise outlive
+/// the experts a prompt reads from it. `STRATA_COLD_KEEP` only marks them reclaimable (MADV_COLD) instead.
 pub fn cold(b: &[u8]) {
     let (a, e) = ((b.as_ptr() as usize + 4095) & !4095, (b.as_ptr() as usize + b.len()) & !4095);
-    if e > a { madvise(a, e - a, 20); }
+    if e > a { madvise(a, e - a, if std::env::var_os("STRATA_COLD_KEEP").is_some() { 20 } else { 4 }); }
 }
 
 /// Reads ranges of mapped weights into the page cache from a background thread (`will_need`), in the order sent, so

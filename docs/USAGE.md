@@ -16,8 +16,10 @@ the server.
 - `--ctx` KV cache size in tokens (default 4096).
 - `--mtp [N]` speculative decoding with the model's draft head. Greedy tokens stay the same; sampling keeps its
   distribution.
-- `--chunk`, `--threads` prefill chunk size and CPU threads. `rustingstrata calibrate` measures the best values for a machine
-  and later runs read them from `~/.cache/rusting_strata/strata-<model>.json` unless flags override.
+- `--chunk`, `--threads` prefill chunk size and CPU expert threads. On a GPU `--threads` defaults to the physical
+  core count (SMT siblings only add contention; on the 6-core/12-thread reference machine 6 beats 12 by ~20%).
+  `rustingstrata calibrate` measures the best chunk and later runs read it from
+  `~/.cache/rusting_strata/strata-<model>.json` unless flags override.
 - `--vram-margin` MB of VRAM left free. One value applies to every device; `512,256` gives one per device in
   `--device` order, and `0:512,1:256` gives one per GPU index. On a GPU that drives no display, `--vram-margin 256` keeps more experts
   resident (+1-2% prefill); 128 runs out of memory.
@@ -72,3 +74,8 @@ tok/s in one report.
 Experts that do not fit in VRAM are read from the GGUF through the page cache. A file system that keeps file data out
 of the page cache (ZFS with `primarycache=metadata`) makes every run read them from disk again; load the model from a
 file system that caches data, or from a tmpfs copy.
+
+Bytes copied to VRAM are dropped from the page cache (`MADV_DONTNEED`), so on a model close to the machine's RAM the
+experts that missed VRAM keep their pages; `STRATA_COLD_KEEP=1` only marks them reclaimable instead. `serve` learns
+the placement from the reply (16 swaps every 16 tokens after the prompt); `STRATA_ADAPT_EVERY` and
+`STRATA_ADAPT_SWAPS` override that, and `STRATA_RESET_COUNTS=1` turns on the reply-only placement for other commands.

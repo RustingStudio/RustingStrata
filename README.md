@@ -6,7 +6,7 @@ compiled at run time with NVRTC through cudarc, and the same kernels also run on
 build step, no ggml. Experts that do not fit in VRAM run on the CPU at the same time as the GPU work, and the expert
 placement adapts to the routing it sees.
 
-Version 1.2.1. Docs: [usage and server API](docs/USAGE.md), [hosting for other people](docs/HOSTING.md),
+Version 1.2.2. Docs: [usage and server API](docs/USAGE.md), [hosting for other people](docs/HOSTING.md),
 [supported GPUs](docs/SUPPORTED_GPUS.md), [AMD notes](docs/AMD.md), [LoRA](docs/LORA.md),
 [all benchmarks](docs/BENCHMARKS.md), [benchmark history](docs/README.md).
 
