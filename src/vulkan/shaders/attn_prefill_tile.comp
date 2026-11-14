@@ -9,7 +9,7 @@ layout(local_size_x = 1024) in;
 layout(constant_id = 1) const uint HD = 128;  // 64, 128 or 256 (host spec constant)
 const uint PER = HD / 32;                     // dimensions per lane
 const uint BK = 8192 / HD;                    // keys per tile: 32, 64 or 128; 32 KB of f16 K plus V
-layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 qg; F32 o; I32 step; uint t; uint nh; uint nkv; float scale; U32 qm; uint mw; uint bq; uint hper; uint hgroups; uint q_off; } p;
+layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 qg; F32 o; I32 step; uint t; uint nh; uint nkv; float scale; U32 qm; uint mw; uint bq; uint hper; uint hgroups; uint q_off; F32 sink; int win; } p;
 // K and V rows of the current key tile, all f16 (also with KV_Q8: ldkv rounds to f16, so this is exact).
 shared float16_t sk[8192], sv[8192];
 
@@ -45,7 +45,7 @@ void main() {
         barrier();
         if (live) for (uint r = 0; r < BK; r++) {
             uint k = k0 + r;
-            if (k > last_q || (uint64_t(p.qm) != 0 && !qsa_bit(p.qm, p.mw, p.q_off + q, k))) continue;
+            if (k > last_q || (p.win > 0 && k + uint(p.win) <= last_q) || (uint64_t(p.qm) != 0 && !qsa_bit(p.qm, p.mw, p.q_off + q, k))) continue;
             float s = 0.0;
             [[unroll]] for (uint j = 0; j < PER; j++) s += qv[j] * float(sk[r * HD + lane + 32 * j]);
             s = W64 ? warp_sum(s) : subgroupAdd(s);
@@ -57,9 +57,13 @@ void main() {
         }
     }
     if (!live) return;
+    float sk = uint64_t(p.sink) != 0 ? p.sink.v[h] : uintBitsToFloat(0xff800000u);
+    float M = max(m, sk), sc = m == uintBitsToFloat(0xff800000u) ? 0.0 : expf_(m - M);
+    float den = l * sc + (uint64_t(p.sink) == 0 ? 0.0 : expf_(sk - M));
+    float inv = den > 0.0 ? fdiv(sc, den) : 0.0;
     [[unroll]] for (uint j = 0; j < PER; j++) {
         uint col = lane + 32 * j;
         float gate = uint64_t(p.qg) != 0 ? sigmoid(p.qg.v[q * p.nh * 2 * HD + h * 2 * HD + HD + col]) : 1.0;
-        p.o.v[q * p.nh * HD + h * HD + col] = fdiv(acc[j], l) * gate;
+        p.o.v[q * p.nh * HD + h * HD + col] = acc[j] * inv * gate;
     }
 }

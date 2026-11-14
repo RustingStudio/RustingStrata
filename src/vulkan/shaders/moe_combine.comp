@@ -29,6 +29,6 @@ void main() {
         if (wj != 0.0) y = fma(wj, p.ye.v[(tk * k + j) * n + i], y);
     }
     if (miss) y += uintBitsToFloat(p.mb.v[p.y_off + tk * n + i]);
-    if (uint64_t(p.sh) != 0) y = fma(sigmoid(p.sg.v[tk]), p.sh.v[tk * n + i], y);
+    if (uint64_t(p.sh) != 0) y = uint64_t(p.sg) != 0 ? fma(sigmoid(p.sg.v[tk]), p.sh.v[tk * n + i], y) : y + p.sh.v[tk * n + i];
     p.x.v[tk * n + i] += y;
 }

@@ -18,7 +18,8 @@ the server.
   distribution.
 - `--chunk`, `--threads` prefill chunk size and CPU threads. `rustingstrata calibrate` measures the best values for a machine
   and later runs read them from `~/.cache/rusting_strata/strata-<model>.json` unless flags override.
-- `--vram-margin` MB of VRAM left free. On a GPU that drives no display, `--vram-margin 256` keeps more experts
+- `--vram-margin` MB of VRAM left free. One value applies to every device; `512,256` gives one per device in
+  `--device` order, and `0:512,1:256` gives one per GPU index. On a GPU that drives no display, `--vram-margin 256` keeps more experts
   resident (+1-2% prefill); 128 runs out of memory.
 - `--kv q8` halves the KV cache (345 instead of 650 MB at 32K) at about 6% slower 32K decode and 14% slower 32K prefill.
 - `--allowed-hosts ai-server.lan` (or `STRATA_ALLOWED_HOSTS`) allows a LAN name when `serve` is bound to `0.0.0.0`.

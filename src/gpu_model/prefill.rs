@@ -31,7 +31,7 @@ impl Scratch {
         let c = &m.cfg;
         let mut stage_bytes = 0;
         for il in 0..c.n_layer {
-            if !c.is_moe() { break; }
+            if !c.is_moe_layer(il) { continue; }
             let mut b = 0;
             for name in MATS { b = (b + m.w.layer(il, name)?.expert(0, c.n_expert).data.len()).next_multiple_of(16); }  // as ExpertCache lays out a slot
             stage_bytes = stage_bytes.max(b);
@@ -295,16 +295,17 @@ impl GpuModel<'_> {
                     if ly.hc.is_some() { g.norm_gate_sig(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps, 0)?; } else { g.norm_gate(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps)?; }
                     g.gemm_dense(out, t, at(l.d), c.ssm_d_inner, mx, ne, mact)?;
                 }
-                Mixer::Attn { q, k, v, qn, kn, o, kc, vc, qsa } => {
+                Mixer::Attn { q, k, v, qn, kn, o, kc, vc, qsa, sink } => {
                     let (kraw, kk, vv) = (at(l.c), at(l.c + n * kv), at(l.c + 2 * n * kv));
                     let qs = if c.q_gate { 2 * hd } else { hd };
+                    let use_rope = c.rope_layer.get(il).copied().unwrap_or(true);
                     g.gemm_dense(q, t, h, ne, at(l.a), nh * qs, 0)?;
                     g.rms_norm(at(l.a), qs, qn.ptr, at(l.b), hd, hd, t * nh, eps)?;
-                    g.rope_neox(at(l.b), hd, t * nh, nh, c.n_rot, rope, c.rope_base)?;
+                    if use_rope { g.rope_neox(at(l.b), hd, t * nh, nh, c.n_rot, rope, c.rope_base)?; }
                     g.gemm_dense(k, t, h, ne, kraw, kv, SAME_X)?;
                     g.gemm_dense(v, t, h, ne, vv, kv, SAME_X)?;
                     g.rms_norm(kraw, hd, kn.ptr, kk, hd, hd, t * nkv, eps)?;
-                    g.rope_neox(kk, hd, t * nkv, nkv, c.n_rot, rope, c.rope_base)?;
+                    if use_rope { g.rope_neox(kk, hd, t * nkv, nkv, c.n_rot, rope, c.rope_base)?; }
                     g.kv_store(kk, vv, kc[self.cur].addr(), vc[self.cur].addr(), kv, t, step, hd)?;
                     // QSA: region c (free after kv_store) holds the raw indexer keys, raw queries and normed queries.
                     let (qm, mw) = match (qsa, &self.qsa) {
@@ -327,7 +328,9 @@ impl GpuModel<'_> {
                         }
                         _ => (0, 0),
                     };
-                    g.attn_prefill_m(at(l.b), kc[self.cur].addr(), vc[self.cur].addr(), if c.q_gate { at(l.a) } else { 0 }, at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), qm, mw)?;
+                    let sink_addr = sink.as_ref().map_or(0, |s| s.ptr);
+                    let win = c.swa.get(il).copied().unwrap_or(false).then_some(c.n_swa).unwrap_or(0);
+                    g.attn_prefill_m(at(l.b), kc[self.cur].addr(), vc[self.cur].addr(), if c.q_gate { at(l.a) } else { 0 }, at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), qm, mw, sink_addr, win)?;
                     probe(&mut tr, "q", &pf.slab, at(l.a), nh * qs, t)?;
                     probe(&mut tr, "k", &pf.slab, kk, kv, t)?;
                     probe(&mut tr, "v", &pf.slab, vv, kv, t)?;
@@ -357,15 +360,15 @@ impl GpuModel<'_> {
                     // The 1-row shared gate_inp GEMM runs beside the router GEMM (both float: one launch each).
                     g.batch(&mut || {
                         g.gemm_dense(router, t, h, ne, at(l.rl), c.n_expert, 0)?;
-                        if let Some(s) = shared { g.gemm_dense(&s.gate_inp, t, h, ne, at(l.sg), 1, SAME_X)?; }
+                        if let Some(s) = shared { if let Some(gi) = &s.gate_inp { g.gemm_dense(gi, t, h, ne, at(l.sg), 1, SAME_X)?; } }
                         Ok(())
                     })?;
-                    g.router_topk(at(l.rl), c.n_expert, k, c.expert_weights_scale, ids_d, at(l.wts), t)?;
+                    g.router_topk(at(l.rl), c.n_expert, k, c.expert_weights_scale, ids_d, at(l.wts), t, c.router_sigmoid)?;
                     let (sh, sg) = match shared {
                         Some(s) => {
                             g.gemm_dense(&s.gate, t, h, ne, at(l.shg), c.n_ff_shexp, SAME_X)?;
                             g.gemm_dense(&s.up, t, h, ne, at(l.shg), c.n_ff_shexp, 1 | SAME_X)?;
-                            (at(l.shy), at(l.sg))
+                            (at(l.shy), if s.gate_inp.is_some() { at(l.sg) } else { 0 })
                         }
                         None => (0, 0),
                     };

@@ -1886,10 +1886,11 @@ template <int N, int S = N / 2> __device__ __forceinline__ float warp_sum_scatte
 __device__ __forceinline__ float rh(float x) { return h2f(f2h(x)); }
 template <int HD, int G>
 __device__ void attn_decode_llama(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
-                                  const int* sel, int nh, int nkv, float scale, int bx) {
+                                  const int* sel, int nh, int nkv, float scale, int bx, int win) {
     constexpr int R = (HD + 255) / 256;
     if (sel && sel[0] < 0) sel = nullptr;
-    int n_pos = sel ? sel[0] : step[0] + 1, ns = gridDim.y, n_kv = (n_pos + 255) / 256 * 256;
+    int base = sel ? 0 : (win > 0 ? max(step[0] + 1 - win, 0) : 0);
+    int n_pos = sel ? sel[0] : step[0] + 1 - base, ns = gridDim.y, n_kv = (n_pos + 255) / 256 * 256;
     int nc = n_kv >= 512 ? LLAMA_NTH : 1, cs = (n_kv + nc - 1) / nc;
     int p0 = blockIdx.y * cs, p1 = blockIdx.y < nc ? min(n_pos, p0 + cs) : 0;
     int h0 = bx * G, g = h0 / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
@@ -1902,7 +1903,7 @@ __device__ void attn_decode_llama(const float* q, const u16* kc, const u16* vc, 
     for (int t0 = p0; t0 < p1; t0 += 32) {
         int n = min(32, p1 - t0);
         for (int j = w; j < n; j += nw) {
-            const u16* kr = kc + ((size_t)(sel ? sel[1 + t0 + j] : t0 + j) * nkv + g) * HD;
+            const u16* kr = kc + ((size_t)(sel ? sel[1 + t0 + j] : base + t0 + j) * nkv + g) * HD;
             for (int i = 0; i < G; i++) {
                 float s = 0.0f;
                 for (int d = lane; d < HD; d += 32) s += sqh[i * HD + d] * h2f(kr[d]);
@@ -1912,7 +1913,7 @@ __device__ void attn_decode_llama(const float* q, const u16* kc, const u16* vc, 
         }
         __syncthreads();
         for (int j = 0; j < n; j++) {
-            const u16* vr = vc + ((size_t)(sel ? sel[1 + t0 + j] : t0 + j) * nkv + g) * HD;
+            const u16* vr = vc + ((size_t)(sel ? sel[1 + t0 + j] : base + t0 + j) * nkv + g) * HD;
             for (int i = 0; i < G; i++) {
                 float s = ss[i][j], ms = 1.0f, vs = 1.0f;
                 if (s > m[i]) { ms = expf(m[i] - s); m[i] = s; for (int r = 0; r < R; r++) acc[i][r] = rh(acc[i][r] * ms); }
@@ -1947,15 +1948,16 @@ __device__ void attn_decode_llama(const float* q, const u16* kc, const u16* vc, 
 // sel (QSA): when not null and sel[0] >= 0, the block attends to the sel[0] cells sel[1 ..] instead of 0 ..= step[0].
 template <int PER, int G, bool CP = false, bool KV1 = false>
 __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
-                              const int* sel, int nh, int nkv, float scale, int bx) {
+                              const int* sel, int nh, int nkv, float scale, int bx, int win) {
     constexpr int hd = PER * 32, C = 32, J = C / 8;  // positions per chunk, per warp
 #if LLAMA_Q8
-    return attn_decode_llama<hd, G>(q, kc, vc, part, step, sel, nh, nkv, scale, bx);
+    return attn_decode_llama<hd, G>(q, kc, vc, part, step, sel, nh, nkv, scale, bx, win);
 #endif
     // At least 16 positions per split: short contexts use few blocks instead of many near-empty ones.
     if (sel && sel[0] < 0) sel = nullptr;
-    auto cell = [&](int i) { return sel ? sel[1 + i] : i; };
-    int n_pos = sel ? sel[0] : step[0] + 1, ns = gridDim.y, per_s = max((n_pos + ns - 1) / ns, 16);
+    int base = sel ? 0 : (win > 0 ? max(step[0] + 1 - win, 0) : 0);
+    auto cell = [&](int i) { return sel ? sel[1 + i] : base + i; };
+    int n_pos = sel ? sel[0] : step[0] + 1 - base, ns = gridDim.y, per_s = max((n_pos + ns - 1) / ns, 16);
     int p0 = blockIdx.y * per_s, p1 = min(n_pos, p0 + per_s);
     if (p0 >= n_pos) {  // empty split
         for (int i = 0; i < G; i++)
@@ -2116,10 +2118,10 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
 // so it is a separate entry point to keep attn_decode's occupancy. Both have one entry point per head size
 // (attn_decode_128, ...): a switch over hd would give every size the registers of the largest.
 #define ATT_ARGS const float* q, const u16* kc, const u16* vc, float* part, const int* step, int nh, int nkv, int hd, \
-                 float scale, int gq_min, int pz, int nt, const int* sel, int sst
+                 float scale, int gq_min, int pz, int nt, const int* sel, int sst, const float* sink, int win
 #define ATT_TOK int t = blockIdx.x % nt; q += (size_t)t * nh * hd; part += (size_t)t * pz; step += 2 * t; if (sel) sel += (size_t)t * sst;
-#define ATT_RUN(G) attn_decode_t<PER, G>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt)
-#define ATT_RUN_CP(G) attn_decode_t<PER, G, !KV_Q8 && (PER == 4 || (PER == 8 && __CUDA_ARCH__ >= 800))>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt)
+#define ATT_RUN(G) attn_decode_t<PER, G>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt, win)
+#define ATT_RUN_CP(G) attn_decode_t<PER, G, !KV_Q8 && (PER == 4 || (PER == 8 && __CUDA_ARCH__ >= 800))>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt, win)
 #define DEF_ATT(HD)                                                                                          \
     extern "C" __global__ void attn_decode_##HD(ATT_ARGS) {                                                  \
         constexpr int PER = HD / 32; ATT_TOK                                                                 \
@@ -2143,13 +2145,13 @@ DEF_ATT(64) DEF_ATT(128) DEF_ATT(256) DEF_ATT(512)
 extern "C" __global__ void __launch_bounds__(256, 3) attn_decode_gqa4_128(ATT_ARGS) {
     constexpr int PER = 4; ATT_TOK
     if (step[0] + 1 < gq_min) return;
-    if constexpr (!KV_Q8) attn_decode_t<PER, 4, true, true>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt);
+    if constexpr (!KV_Q8) attn_decode_t<PER, 4, true, true>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt, win);
 }
 
 // grid = query heads: out = (sum of split partials) / (sum of split sums) * sigmoid(gate), gate skipped when qg is null. Split 0 is never empty.
 // xq not null: out is also quantized there as quant_xq does (not under LLAMA_Q8, whose scales span 256 values).
 extern "C" __global__ void attn_merge(const float* part, const float* qg, float* out, int hd, int ns, const int* step,
-                                       int ns1, int gq_min, signed char* xq) {
+                                       int ns1, int gq_min, signed char* xq, const float* sink) {
     int h = blockIdx.x;
     part += (size_t)blockIdx.z * gridDim.x * ns * (hd + 2); step += 2 * blockIdx.z;
     if (qg) qg += (size_t)blockIdx.z * gridDim.x * 2 * hd;
@@ -2161,10 +2163,12 @@ extern "C" __global__ void attn_merge(const float* part, const float* qg, float*
     __syncthreads();
     float M = -INFINITY, L = 0.0f;
     for (int s = 0; s < ns; s++) M = fmaxf(M, ws[s]);
+    if (sink) M = fmaxf(M, sink[h]);
     __syncthreads();
     if (threadIdx.x < ns) ws[threadIdx.x] = expf(ws[threadIdx.x] - M);
     __syncthreads();
     for (int s = 0; s < ns; s++) L += pp[s * (hd + 2) + hd + 1] * ws[s];
+    if (sink) L += expf(sink[h] - M);
     for (int d = threadIdx.x; d < hd; d += blockDim.x) {
         float o = 0.0f;
         for (int s = 0; s < ns; s++) o += pp[s * (hd + 2) + d] * ws[s];
@@ -2185,18 +2189,25 @@ extern "C" __global__ void attn_merge(const float* part, const float* qg, float*
 // j < k gets the j-th expert's id and weight. The n <= 32 * TOPK_R logits stay in registers (lane holds
 // i = lane + 32 r).
 #define TOPK_R 16
-__device__ void topk_warp(const float* p, int n, int k, float extra_scale, int lane, int& id, float& w) {
+__device__ void topk_warp(const float* p, int n, int k, float extra_scale, int lane, int& id, float& w, int sigmoid) {
     float v[TOPK_R];
-    float m = -INFINITY;
 #pragma unroll
-    for (int r = 0; r < TOPK_R; r++) { int i = lane + 32 * r; v[r] = i < n ? p[i] : -INFINITY; m = fmaxf(m, v[r]); }
-    m = warp_max(m);
-    float s = 0.0f;
+    for (int r = 0; r < TOPK_R; r++) { int i = lane + 32 * r; v[r] = i < n ? p[i] : -INFINITY; }
+    if (sigmoid) {
 #pragma unroll
-    for (int r = 0; r < TOPK_R; r++) if (lane + 32 * r < n) { v[r] = expf(v[r] - m); s += v[r]; }
-    s = warp_sum(s);
+        for (int r = 0; r < TOPK_R; r++) v[r] = 1.0f / (1.0f + expf(-v[r]));
+    } else {
+        float m = -INFINITY;
 #pragma unroll
-    for (int r = 0; r < TOPK_R; r++) v[r] /= s;
+        for (int r = 0; r < TOPK_R; r++) m = fmaxf(m, v[r]);
+        m = warp_max(m);
+        float s = 0.0f;
+#pragma unroll
+        for (int r = 0; r < TOPK_R; r++) if (lane + 32 * r < n) { v[r] = expf(v[r] - m); s += v[r]; }
+        s = warp_sum(s);
+#pragma unroll
+        for (int r = 0; r < TOPK_R; r++) v[r] /= s;
+    }
     unsigned taken = 0;
     float sum = 0.0f, mine = 0.0f;
     id = 0;
@@ -2226,10 +2237,10 @@ __device__ void topk_warp(const float* p, int n, int k, float extra_scale, int l
 }
 
 // One warp per token (grid = tokens).
-extern "C" __global__ void router_topk(const float* p, int n, int k, float extra_scale, int* ids, float* wts) {
+extern "C" __global__ void router_topk(const float* p, int n, int k, float extra_scale, int* ids, float* wts, int sigmoid) {
     int id, o = blockIdx.x * k + threadIdx.x;
     float w;
-    topk_warp(p + (size_t)blockIdx.x * n, n, k, extra_scale, threadIdx.x, id, w);
+    topk_warp(p + (size_t)blockIdx.x * n, n, k, extra_scale, threadIdx.x, id, w, sigmoid);
     if (threadIdx.x < k) { ids[o] = id; wts[o] = w; }
 }
 
@@ -2240,7 +2251,7 @@ extern "C" __global__ void router_topk(const float* p, int n, int k, float extra
 // for moe_gemv/moe_combine). `pid` (may be 0): last token's ids, the next token's prefetch prediction.
 extern "C" __global__ void moe_route(const float* p, int n, int k, float extra_scale, const int* table, int* ids,
                                      float* wts, int* slots, float* wh, const float* h, unsigned int* mb, int nh,
-                                     int h_off, const int* step, int T, int* pid) {
+                                     int h_off, const int* step, int T, int* pid, int sigmoid) {
     __shared__ int miss;
     int lane = threadIdx.x & 31, kt = k * T;
     unsigned int seq = step[1];
@@ -2249,7 +2260,7 @@ extern "C" __global__ void moe_route(const float* p, int n, int k, float extra_s
     for (int t = threadIdx.x >> 5; t < T; t += blockDim.x >> 5) {
         int id;
         float w;
-        topk_warp(p + (size_t)t * n, n, k, extra_scale, lane, id, w);
+        topk_warp(p + (size_t)t * n, n, k, extra_scale, lane, id, w, sigmoid);
         if (lane < k) {
             int o = t * k + lane, s = table[id];
             ids[o] = id; wts[o] = w; slots[o] = s; wh[o] = s >= 0 ? w : 0.0f;
@@ -2293,7 +2304,7 @@ extern "C" __global__ void moe_combine(float* x, const float* ye, const float* w
     unsigned int seq = step[1];
     int tk = blockIdx.y;
     x += (size_t)tk * n; ye += (size_t)tk * k * n; w += tk * k; slots += tk * k; y_off += tk * n;
-    if (sh) { sh += (size_t)tk * n; sg += tk; }
+    if (sh) { sh += (size_t)tk * n; if (sg) sg += tk; }
     __shared__ int miss;
     if (threadIdx.x == 0) {
         int m = 0;
@@ -2314,7 +2325,7 @@ extern "C" __global__ void moe_combine(float* x, const float* ye, const float* w
     float y = 0.0f;
     for (int j = 0; j < k; j++) if (w[j] != 0.0f) y += w[j] * ye[(size_t)j * n + i];
     if (miss) y += __uint_as_float(((volatile const unsigned int*)mb)[y_off + i]);
-    if (sh) y += sigmoid(sg[0]) * sh[i];
+    if (sh) y += (sg ? sigmoid(sg[0]) : 1.0f) * sh[i];
     x[i] += y;
 }
 
@@ -2326,7 +2337,7 @@ extern "C" __global__ void moe_combine_seq(float* x, const float* ye, const floa
     int t = i / n, d = i % n;
     float y = 0.0f;
     for (int j = 0; j < k; j++) y += wts[t * k + j] * ye[(size_t)inv[t * k + j] * n + d];
-    if (sh) y += sigmoid(sg[t]) * sh[i];
+    if (sh) y += (sg ? sigmoid(sg[t]) : 1.0f) * sh[i];
     x[i] += y;
 }
 
@@ -2358,7 +2369,8 @@ __device__ __forceinline__ bool qsa_bit(const unsigned* qm, int mw, int t, int k
 }
 template <int HD>
 __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, const u16* vc, const float* qg, float* out,
-                                               const int* step, int T, int nh, int nkv, float scale, const unsigned* qm, int mw) {
+                                               const int* step, int T, int nh, int nkv, float scale, const unsigned* qm, int mw,
+                                               const float* sink, int win) {
     constexpr int PQ = HD + 8;
     constexpr int FA_BKL = FA_BK_FOR(HD);
     extern __shared__ __align__(16) u16 fa_sm[];
@@ -2513,7 +2525,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
                         for (int e = 0; e < 2; e++) {
                             float& v = s2[kg][j][4 * p4 + 2 * p2 + e];
                             int key = k0 + 8 * (4 * kg + c) + (t4 & 2) + 4 * p4 + e;
-                            if (key > qp2[j][p2] || !((vis2[j][p2] >> ((key >> 2) & 7)) & 1)) v = -INFINITY;
+                            if (key > qp2[j][p2] || (win > 0 && key + win <= qp2[j][p2]) || !((vis2[j][p2] >> ((key >> 2) & 7)) & 1)) v = -INFINITY;
                             mx = fmaxf(mx, v);
                         }
                 mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
@@ -2557,7 +2569,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
         for (int nt = 0; nt < FA_BKL / 8; nt++)
             for (int e = 0; e < 4; e++) {
                 int key = k0 + nt * 8 + 2 * t4 + (e & 1), r = e >> 1;
-                if (key > qp[r] || !((vis[r] >> ((key >> 2) & 7)) & 1)) s[nt][e] = -INFINITY;
+                if (key > qp[r] || (win > 0 && key + win <= qp[r]) || !((vis[r] >> ((key >> 2) & 7)) & 1)) s[nt][e] = -INFINITY;
                 mx[r] = fmaxf(mx[r], s[nt][e]);
             }
         float c[2], ms[2];
@@ -2661,12 +2673,17 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
                 if (row >= T) continue;
                 float* orow = out + (size_t)row * nh * HD + h * HD;
                 const float* gate = qg ? qg + (size_t)row * nh * 2 * HD + h * 2 * HD + HD : nullptr;
+                float sk = sink ? sink[h] : -INFINITY;
+                float M = fmaxf(mT[j][p2], sk);
+                float sc = mT[j][p2] == -INFINITY ? 0.0f : expf(mT[j][p2] - M);
+                float den = lT[j][p2] * sc + (sk == -INFINITY ? 0.0f : expf(sk - M));
+                float inv = den > 0.0f ? sc / den : 0.0f;
 #pragma unroll
                 for (int p4 = 0; p4 < 2; p4++)
 #pragma unroll
                     for (int e = 0; e < 2; e++) {
                         int col = 8 * (4 * grp + c) + (t4 & 2) + 4 * p4 + e;
-                        orow[col] = o2[j][grp][4 * p4 + 2 * p2 + e] / lT[j][p2] * (gate ? sigmoid(gate[col]) : 1.0f);
+                        orow[col] = o2[j][grp][4 * p4 + 2 * p2 + e] * inv * (gate ? sigmoid(gate[col]) : 1.0f);
                     }
             }
 #else
@@ -2680,11 +2697,16 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
         if (t >= T) continue;
         float* orow = out + (size_t)t * nh * HD + h * HD;
         const float* gate = qg ? qg + (size_t)t * nh * 2 * HD + h * 2 * HD + HD : nullptr;
+        float sk = sink ? sink[h] : -INFINITY;
+        float M = fmaxf(m[r], sk);
+        float sc = m[r] == -INFINITY ? 0.0f : expf(m[r] - M);
+        float den = l[r] * sc + (sk == -INFINITY ? 0.0f : expf(sk - M));
+        float inv = den > 0.0f ? sc / den : 0.0f;
 #pragma unroll
         for (int d = 0; d < HD / 8; d++)
             for (int e = 0; e < 2; e++) {
                 int col = d * 8 + 2 * t4 + e;
-                orow[col] = o[d][2 * r + e] / l[r] * (gate ? sigmoid(gate[col]) : 1.0f);
+                orow[col] = o[d][2 * r + e] * inv * (gate ? sigmoid(gate[col]) : 1.0f);
             }
     }
 #endif
@@ -2693,7 +2715,8 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
 // rounds q and the softmax weights to f16). One query at a time per block; slow, for parity runs only.
 template <int HD>
 __device__ void attn_prefill_llama(const float* q, const u16* kc, const u16* vc, const float* qg, float* out,
-                                   const int* step, int T, int nh, int nkv, float scale, const unsigned* qm, int mw) {
+                                   const int* step, int T, int nh, int nkv, float scale, const unsigned* qm, int mw,
+                                   const float* sink, int win) {
     constexpr int R = (HD + 127) / 128;
     extern __shared__ __align__(16) u16 fa_sm[];
     float *sq = (float*)fa_sm, *sc = sq + HD;
@@ -2711,7 +2734,7 @@ __device__ void attn_prefill_llama(const float* q, const u16* kc, const u16* vc,
                 float s = 0.0f;
                 for (int d = lane; d < HD; d += 32) s += sq[d] * h2f(kr[d]);
                 s = warp_sum(s);
-                if (lane == 0) sc[j] = qm && !qsa_bit(qm, mw, t, k0 + j) ? -INFINITY : s * scale;
+                if (lane == 0) sc[j] = (qm && !qsa_bit(qm, mw, t, k0 + j)) || (win > 0 && k0 + j + win <= p) ? -INFINITY : s * scale;
             }
             __syncthreads();
             float mn = m;
@@ -2729,17 +2752,23 @@ __device__ void attn_prefill_llama(const float* q, const u16* kc, const u16* vc,
             m = mn;
         }
         const float* gate = qg ? qg + (size_t)t * nh * 2 * HD + h * 2 * HD + HD : nullptr;
+        float sk = sink ? sink[h] : -INFINITY;
+        float M = fmaxf(m, sk);
+        float sc = m == -INFINITY ? 0.0f : expf(m - M);
+        float den = l * sc + (sk == -INFINITY ? 0.0f : expf(sk - M));
+        float inv = den > 0.0f ? sc / den : 0.0f;
         for (int r = 0; r < R; r++) {
             int d = tid + 128 * r;
-            if (d < HD) out[(size_t)t * nh * HD + h * HD + d] = acc[r] / l * (gate ? sigmoid(gate[d]) : 1.0f);
+            if (d < HD) out[(size_t)t * nh * HD + h * HD + d] = acc[r] * inv * (gate ? sigmoid(gate[d]) : 1.0f);
         }
     }
 }
 #define DEF_FA(HD) \
     extern "C" __global__ void __launch_bounds__(128) attn_prefill_##HD(const float* q, const u16* kc, const u16* vc, \
-            const float* qg, float* out, const int* step, int T, int nh, int nkv, float scale, const unsigned* qm, int mw) { \
-        if (LLAMA_Q8) attn_prefill_llama<HD>(q, kc, vc, qg, out, step, T, nh, nkv, scale, qm, mw);                   \
-        else attn_prefill_t<HD>(q, kc, vc, qg, out, step, T, nh, nkv, scale, qm, mw);                               \
+            const float* qg, float* out, const int* step, int T, int nh, int nkv, float scale, const unsigned* qm, int mw, \
+            const float* sink, int win) { \
+        if (LLAMA_Q8) attn_prefill_llama<HD>(q, kc, vc, qg, out, step, T, nh, nkv, scale, qm, mw, sink, win);         \
+        else attn_prefill_t<HD>(q, kc, vc, qg, out, step, T, nh, nkv, scale, qm, mw, sink, win);                       \
     }
 DEF_FA(64) DEF_FA(128) DEF_FA(256)
 

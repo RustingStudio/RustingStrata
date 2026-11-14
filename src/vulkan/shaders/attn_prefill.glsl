@@ -12,7 +12,7 @@ layout(local_size_x = 128) in;
 #include "common.glsl"
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer UV4 { uvec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer FV4 { vec4 v[]; };
-layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 qg; F32 o; I32 step; uint t; uint nh; uint nkv; float scale; U32 qm; uint mw; uint q_off; } p;
+layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 qg; F32 o; I32 step; uint t; uint nh; uint nkv; float scale; U32 qm; uint mw; uint q_off; F32 sink; int win; } p;
 // PQ: tile rows in uvec4 (8 halves).
 const uint BQ = 64, BK = 32, PQ = HD / 8 + 1, PP = BK + 8;
 #define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
@@ -21,6 +21,7 @@ shared uvec4 kvs[BQ * PQ];
 shared float ss[4 * 16 * BK];      // scores of each subgroup; at the start the row and column index matrices
 shared float16_t ps[4 * 16 * PP];  // softmax weights of each subgroup
 shared float rs[4 * 16];           // per row: the rescale factor, at the end the sum l
+shared float rm[4 * 16];           // per row: the final max
 
 void main() {
     uint pos0 = uint(p.step.v[0]), q0 = (gl_NumWorkGroups.x - 1 - gl_WorkGroupID.x) * BQ, h = gl_WorkGroupID.y, kvh = h / (p.nh / p.nkv), kvd = p.nkv * HD;
@@ -116,7 +117,7 @@ void main() {
                 // Rows past the slice (the tile's tail) read the last valid row's mask: their output is discarded.
                 uint mr = min(qp[r] - pos0, p.q_off + p.t - 1);
                 float x = s[nt][e];
-                if (k0 + col > qp[r] || (uint64_t(p.qm) != 0 && !qsa_bit(p.qm, p.mw, mr, k0 + col))) x = ninf;
+                if (k0 + col > qp[r] || (p.win > 0 && k0 + col + uint(p.win) <= qp[r]) || (uint64_t(p.qm) != 0 && !qsa_bit(p.qm, p.mw, mr, k0 + col))) x = ninf;
                 s[nt][e] = x;
                 mx[r] = max(mx[r], x);
             }
@@ -162,14 +163,19 @@ void main() {
         l[r] += subgroupShuffleXor(l[r], 2);
     }
     subgroupBarrier();
-    if (t4 == 0) { rs[rb + g] = l[0]; rs[rb + g + 8] = l[1]; }
+    if (t4 == 0) { rs[rb + g] = l[0]; rs[rb + g + 8] = l[1]; rm[rb + g] = m[0]; rm[rb + g + 8] = m[1]; }
     subgroupMemoryBarrierShared();
     subgroupBarrier();
+    float sk = uint64_t(p.sink) != 0 ? p.sink.v[h] : ninf;
     [[unroll]] for (uint d = 0; d < HD / 16; d++)
         [[unroll]] for (uint i = 0; i < acc[d].length(); i++) {
             uint row = uint(ri[i]), col = d * 16 + uint(ci[i]), t = q0 + w * 16 + row;
             if (t >= p.t) continue;
+            float mx = rm[rb + row];
+            float M = max(mx, sk), sc = mx == ninf ? 0.0 : expf_(mx - M);
+            float den = rs[rb + row] * sc + (sk == ninf ? 0.0 : expf_(sk - M));
+            float inv = den > 0.0 ? fdiv(sc, den) : 0.0;
             float gate = uint64_t(p.qg) != 0 ? sigmoid(p.qg.v[t * p.nh * 2 * HD + h * 2 * HD + HD + col]) : 1.0;
-            p.o.v[t * p.nh * HD + h * HD + col] = fdiv(acc[d][i], rs[rb + row]) * gate;
+            p.o.v[t * p.nh * HD + h * HD + col] = acc[d][i] * inv * gate;
         }
 }

@@ -4,7 +4,7 @@ layout(local_size_x = 256) in;
 // --llama-numerics decode attention, as attn_decode_llama in kernels.cu (see there), one query head per workgroup:
 // workgroup (x, s) = token x % nt, head x / nt, chunk s of NTH. Writes attn_decode's partials for attn_merge.
 layout(constant_id = 1) const uint HD = 128;
-layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 part; I32 step; I32 sel; uint sst; uint nh; uint nkv; float scale; uint pz; uint nt; } p;
+layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 part; I32 step; I32 sel; uint sst; uint nh; uint nkv; float scale; uint pz; uint nt; int win; } p;
 const uint NTH = 6, R = (HD + 255) / 256;
 shared float sq[HD], ss[32];
 
@@ -15,7 +15,8 @@ void main() {
     uint tid = gl_LocalInvocationID.x, w = WARP, lane = LANE, g = h / (p.nh / p.nkv);
     uint so = t * p.sst;
     bool sp = uint64_t(p.sel) != 0 && p.sel.v[so] >= 0;  // QSA cells, as attn_decode
-    uint n_pos = sp ? uint(p.sel.v[so]) : uint(p.step.v[2 * t]) + 1, n_kv = (n_pos + 255) / 256 * 256, nc = n_kv >= 512 ? NTH : 1;
+    uint base = sp ? 0u : (p.win > 0 ? uint(max(int(p.step.v[2 * t]) + 1 - p.win, 0)) : 0u);
+    uint n_pos = sp ? uint(p.sel.v[so]) : uint(p.step.v[2 * t]) + 1 - base, n_kv = (n_pos + 255) / 256 * 256, nc = n_kv >= 512 ? NTH : 1;
     uint cs = (n_kv + nc - 1) / nc, p0 = sy * cs, p1 = sy < nc ? min(n_pos, p0 + cs) : 0;
     for (uint d = tid; d < HD; d += 256) sq[d] = rh(p.q.v[(t * p.nh + h) * HD + d]);
     precise float acc[R], l = 0.0;
@@ -25,7 +26,7 @@ void main() {
     for (uint t0 = p0; t0 < p1; t0 += 32) {
         uint n = min(32, p1 - t0);
         for (uint j = w; j < n; j += 8) {
-            uint kr = ((sp ? uint(p.sel.v[so + 1 + t0 + j]) : t0 + j) * p.nkv + g) * HD;
+            uint kr = ((sp ? uint(p.sel.v[so + 1 + t0 + j]) : base + t0 + j) * p.nkv + g) * HD;
             precise float s = 0.0;
             for (uint d = lane; d < HD; d += 32) s = fma(sq[d], hf(p.kc.v[kr + d]), s);
             s = warp_sum(s);
@@ -33,7 +34,7 @@ void main() {
         }
         barrier();
         for (uint j = 0; j < n; j++) {
-            uint vr = ((sp ? uint(p.sel.v[so + 1 + t0 + j]) : t0 + j) * p.nkv + g) * HD;
+            uint vr = ((sp ? uint(p.sel.v[so + 1 + t0 + j]) : base + t0 + j) * p.nkv + g) * HD;
             float s = ss[j], ms = 1.0, vs = 1.0;
             if (s > m) { ms = expf_(m - s); m = s; [[unroll]] for (uint r = 0; r < R; r++) acc[r] = rh(acc[r] * ms); }
             else vs = expf_(s - m);
