@@ -525,6 +525,16 @@ impl Template {
         s
     }
 
+    /// The prompt that ends inside the last message when it is an assistant message without tool calls, so the
+    /// model continues that reply (prefill, as llama.cpp's server and the Anthropic Messages API do). `None` when
+    /// the last message is not one.
+    pub fn render_open(&self, msgs: &[Msg], tools: &[Json], think: bool, preserve: bool) -> Option<String> {
+        msgs.last().filter(|m| m.role == "assistant" && m.calls.is_empty())?;
+        let s = self.render(msgs, tools, think, preserve, false);
+        let end = match self { Template::Ds => "<｜end▁of▁sentence｜>", Template::Flint => "", _ => "<|im_end|>\n" };
+        Some(s.strip_suffix(end).unwrap_or(&s).to_string())
+    }
+
     /// The text that starts a tool call in a reply.
     pub fn call_tag(&self) -> &'static str { if let Template::Ds = self { DS_CALLS } else { TAG } }
 
