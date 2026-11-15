@@ -147,6 +147,8 @@ struct Inner {
     gfx11: bool,
     /// The device runs fixed 64-lane subgroups, split into logical 32-lane warps.
     wave64: bool,
+    /// Use double-precision quantizer reciprocals (`RCP_D`, spec constant 13) on AMD devices even in wave32.
+    rcp_d: bool,
     /// VK_KHR_cooperative_matrix with the 16 x 16 x 16 f16 / f32 shape is enabled (`gemm_f`, `attn_prefill`).
     coop: bool,
     /// Without cooperative matrices: run the tiled `attn_prefill_tile` (one KV-head tile shared by 32 query/head tasks)
@@ -467,7 +469,8 @@ impl Vk {
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None }, step_pos: None };
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
         let ts_period = limits.timestamp_period;
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, gfx11, wave64, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
+        let rcp_d = dev_props.vendor_id == 0x1002;
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, gfx11, wave64, rcp_d, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -773,8 +776,9 @@ impl Inner {
         let n = spec.len() as u32;
         let entries: Vec<_> = (0..n).map(|i| vk::SpecializationMapEntry::default().constant_id(i).offset(4 * i).size(4))
             .chain([vk::SpecializationMapEntry::default().constant_id(15).offset(4 * n).size(4),
-                    vk::SpecializationMapEntry::default().constant_id(14).offset(4 * n + 4).size(4)]).collect();
-        let data: Vec<u8> = spec.iter().chain([&(self.kv_q8 as u32), &(self.wave64 as u32)]).flat_map(|v| v.to_le_bytes()).collect();
+                    vk::SpecializationMapEntry::default().constant_id(14).offset(4 * n + 4).size(4),
+                    vk::SpecializationMapEntry::default().constant_id(13).offset(4 * n + 8).size(4)]).collect();
+        let data: Vec<u8> = spec.iter().chain([&(self.kv_q8 as u32), &(self.wave64 as u32), &(self.rcp_d as u32)]).flat_map(|v| v.to_le_bytes()).collect();
         let si = vk::SpecializationInfo::default().map_entries(&entries).data(&data);
         let mut sub = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32);
         let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(m).name(c"main").specialization_info(&si);
