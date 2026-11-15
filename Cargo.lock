@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "rusting_strata"
-version = "1.2.2"
+version = "1.2.3"
 dependencies = [
  "anyhow",
  "ash",
