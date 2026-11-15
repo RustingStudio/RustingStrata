@@ -359,6 +359,7 @@ progress { width: 100%; height: 6px; accent-color: var(--accent); margin-top: 10
       <div><label for="emargin">VRAM left free, MB</label><input id="emargin" type="number" min="0" step="64"></div>
       <div><label for="echunk">prefill chunk, tokens</label><input id="echunk" type="number" min="0" step="256"></div>
     </div>
+    <div class="row" id="ecal" hidden style="margin-top:8px;align-items:center"><p class="note" style="flex:1">This model is not calibrated on this computer. Calibration measures the best prefill chunk and MTP drafts once (a few minutes) and later loads use them.</p><button id="ecalb" class="primary" type="button">calibrate</button></div>
     <div class="row" style="margin-top:8px;align-items:center"><p class="note" id="enote" style="flex:1">Changes apply when a model loads and stay until the server restarts.</p><button id="eapply" class="primary" type="button" data-ic="check">apply and reload</button></div>
   </div>
   <div class="tab" id="tab-chat" hidden>
@@ -940,12 +941,14 @@ function showOpts(o) {
   if (o.ctx_train) $('ectx').max = Math.max(o.ctx_train, o.ctx);
   for (const id in EO) if (!$(id).dataset.dirty) setv(id, o[EO[id]] ?? '');
   $('ekv').sync();
+  $('ecal').hidden = o.calibrated !== false;
   $('enote').textContent = (o.gpu ? '' : 'Running on the CPU: only context applies. ') + 'Changes apply when a model loads and stay until the server restarts.';
 }
 $('eapply').onclick = () => {
   const m = known.find(m => m.loaded);
   if (m) { $('dlg').close(); load(m.id); } else $('enote').textContent = 'No model is loaded: load one above and it takes these options.';
 };
+$('ecalb').onclick = () => { const m = known.find(m => m.loaded); if (m) { $('dlg').close(); load(m.id, true); } };
 // The accent colour: by hand, or from the loaded model's family (green when it is not a known one).
 const family = id => { const n = id.split('/').pop().toLowerCase(); return /qwen/.test(n) ? 'purple' : /deepseek/.test(n) ? 'blue' : /gemma/.test(n) ? 'gemma' : /flint|glm/.test(n) ? 'gray' : 'green'; };
 function tint() {
@@ -976,18 +979,19 @@ async function models() {
   }));
   if (!j.models.length) $('local').append(el('p', 'note', 'None yet. Download one above.'));
   $('dir').textContent = `Kept in ${j.dir}. Other .gguf files you put there show up too.`;
-  if (!$('status').classList.contains('bad') && !busy) status(loaded ? '' : j.models.length ? 'Pick a model to start' : '');
+  if (!$('status').classList.contains('bad') && !busy) status(loaded ? (j.options.calibrated === false ? 'Not calibrated on this computer: settings, models, "calibrate" makes this model faster' : '') : j.models.length ? 'Pick a model to start' : '');
   if (!j.models.length && !$('dlg').open) openSettings('models');
   if (!cur || !cur.msgs.length) show();
 }
-async function load(id) {
+async function load(id, calibrate) {
   $('model').value = id;
   $('model').disabled = $('send').disabled = true; $('model').sync();
-  status('Loading ' + id + '… large models take a minute');
+  status(calibrate ? 'Calibrating ' + id + '… a few minutes' : 'Loading ' + id + '… large models take a minute');
   stats();
   try {
-    await api('/api/load', { model: id, options: engineOpts() }); status('');
-    for (const i in EO) delete $(i).dataset.dirty;
+    // Calibration replaces chunk and MTP, so the page's values for them are not sent with it.
+    await api('/api/load', calibrate ? { model: id, calibrate: true } : { model: id, options: engineOpts() }); status('');
+    for (const i in EO) if (!calibrate || i === 'emtp' || i === 'echunk') delete $(i).dataset.dirty;
   } catch (e) { status(e.message, true); }
   $('model').disabled = $('send').disabled = false; $('model').sync();
   models(); stats();
