@@ -9,14 +9,16 @@ layout(constant_id = 2) const uint SBB = 1024;
 #ifdef SHARED_TABLES
 // Sized by T (1 entry for the other types), so only the table in use takes shared memory.
 shared int s_kv[T == 20 || T == 23 ? 16 : 1];
-shared uint s_g3[T == 21 ? 512 : 1];
+shared uint s_g3[T == 21 ? 512 : (T == 18 ? 256 : 1)];
 shared uint64_t s_g2[T == 22 ? 1024 : 1];
 #define KV_IQ4NL s_kv
 #define IQ3S_GRID s_g3
+#define IQ3XXS_GRID s_g3
 #define IQ2S_GRID s_g2
 #else
 #define KV_IQ4NL kvalues_iq4nl
 #define IQ3S_GRID iq3s_grid
+#define IQ3XXS_GRID iq3xxs_grid
 #define IQ2S_GRID iq2s_grid
 void load_tables() {}  // the tables come from the buffer
 #endif
@@ -72,6 +74,7 @@ uvec2 ld8(U8 w, uint o) {
 void load_tables() {
     uint li = gl_LocalInvocationIndex, n = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
     if (T == 20 || T == 23) { if (li < 16) s_kv[li] = kvalues_iq4nl[li]; barrier(); }
+    if (T == 18) { for (uint i = li; i < 256; i += n) s_g3[i] = iq3xxs_grid[i]; barrier(); }
     if (T == 21) { for (uint i = li; i < 512; i += n) s_g3[i] = iq3s_grid[i]; barrier(); }
     if (T == 22) { for (uint i = li; i < 1024; i += n) s_g2[i] = iq2s_grid[i]; barrier(); }
 }
@@ -99,7 +102,7 @@ void qw_k(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out flo
         lo = (v.x >> (2 * j)) & 0x03030303u; hi = (v.y >> (2 * j)) & 0x03030303u;
     } else if (T == 11) {  // Q3_K: value = 2 low bits + 4 * high bit - 4
         uint e = sub * 8, n = e >> 7, r = e & 127, j = r >> 5, i0 = r & 31, is = n * 8 + j * 2 + (i0 >> 4), sc = b + 96;
-        uint low = is < 8 ? u8_(w, sc + is) & 15 : u8_(w, sc + is - 8) >> 4;
+        uint low = (u8_(w, sc + (is & 7)) >> ((is & 8) >> 1)) & 15;
         uint hs = (u8_(w, sc + 8 + (is & 3)) >> (2 * (is >> 2))) & 3, hb = 4 * n + j;
         d = ldh(w, b + 108) * float(int(low | hs << 4) - 32);
         uvec2 h = ld8(w, b + i0);
@@ -181,7 +184,7 @@ void iq_grid(U8 w, uint b, uint ib, uint l, out uint g0, out uint g1, out uint s
             uint aux = ld32(w, b + 66 + 4 * ib);
             d = ldh(w, b) * (0.5 + float(aux >> 28)) * 0.5;
             sg = ksign((aux >> (7 * l)) & 127);
-            g0 = iq3xxs_grid[qq & 255]; g1 = iq3xxs_grid[qq >> 8];
+            g0 = IQ3XXS_GRID[qq & 255]; g1 = IQ3XXS_GRID[qq >> 8];
         } else {
             uint hb = u8_(w, b + 66 + ib);
             sg = u8_(w, b + 74 + 4 * ib + l);
@@ -272,6 +275,71 @@ void qw(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out float
     int q[8];
     qi8(w, b, sub, q, d, m);
     lo = pack4(q[0], q[1], q[2], q[3]); hi = pack4(q[4], q[5], q[6], q[7]);
+}
+
+// Shuffle within a logical 32-lane warp (works on both wave32 and wave64).
+uint shfl32(uint v, uint src) { return subgroupShuffle(v, W64 ? ((gl_SubgroupInvocationID & ~31u) | src) : src); }
+
+// Warp-cooperative super-block dequantization for GEMV (all 32 lanes of the logical warp pass the same w and b, with sub = LANE).
+void qw_sb(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out float m) {
+    if (T == 11) {  // Q3_K (110 bytes = 28 uint32 words from 4-aligned base): 1 coalesced U32 load per lane + register shuffles
+        m = 0.0;
+        uint64_t addr = uint64_t(w) + b, base4 = addr & ~3ul;
+        uint align_sh = uint(addr & 2ul) * 8u;
+        uint raw = U32(base4).v[min(sub, 27u)];
+        uint next_raw = shfl32(raw, min(sub + 1u, 27u));
+        uint w32 = align_sh == 0u ? raw : ((raw >> 16) | (next_raw << 16));
+        uint n = sub >> 4, j = (sub >> 2) & 3u, hw = (sub & 3u) * 2u, is = sub >> 1, hb = 4u * n + j;
+        uint sc_lo_w = shfl32(w32, 24u + ((is >> 2) & 1u)), sc_hi_w = shfl32(w32, 26u);
+        uint low = (sc_lo_w >> (8u * (is & 3u) + ((is & 8u) >> 1))) & 15u;
+        uint hs = (sc_hi_w >> (8u * (is & 3u) + 2u * (is >> 2))) & 3u;
+        d = h2f(shfl32(w32, 27u) & 0xFFFFu) * float(int(low | (hs << 4)) - 32);
+        uvec2 h = uvec2(shfl32(w32, hw), shfl32(w32, hw + 1u));
+        uint vw = 8u + 8u * n + hw;
+        uvec2 v = uvec2(shfl32(w32, vw), shfl32(w32, vw + 1u));
+        lo = vsub4(((v.x >> (2u * j)) & 0x03030303u) | ((h.x >> hb) & 0x01010101u) << 2, 0x04040404u);
+        hi = vsub4(((v.y >> (2u * j)) & 0x03030303u) | ((h.y >> hb) & 0x01010101u) << 2, 0x04040404u);
+        return;
+    }
+    if (T == 14) {  // Q6_K (210 bytes = 53 uint32 words from 4-aligned base): 2 coalesced U32 loads per lane + register shuffles
+        m = 0.0;
+        uint64_t addr = uint64_t(w) + b, base4 = addr & ~3ul;
+        uint align_sh = uint(addr & 2ul) * 8u;
+        uint raw0 = U32(base4).v[sub], raw1 = U32(base4).v[min(sub + 32u, 52u)];
+        uint s0 = shfl32(raw0, min(sub + 1u, 31u)), s1 = shfl32(raw1, 0u);
+        uint next0 = sub < 31u ? s0 : s1;
+        uint next1 = shfl32(raw1, min(sub + 1u, 20u));
+        uint w0 = align_sh == 0u ? raw0 : ((raw0 >> 16) | (next0 << 16));
+        uint w1 = align_sh == 0u ? raw1 : ((raw1 >> 16) | (next1 << 16));
+        uint n = sub >> 4, qt = (sub >> 2) & 3u, kw = (sub & 3u) * 2u, ns = 4u * (qt >> 1), hs = 2u * qt;
+        uint sc_idx = 8u * n + ((sub >> 1) & 1u) + 2u * qt;
+        uint sc_w = shfl32(w1, 16u + (sc_idx >> 2));
+        d = h2f(shfl32(w1, 20u) & 0xFFFFu) * float(sb(sc_w >> (8u * (sc_idx & 3u))));
+        uint lw = 16u * n + (qt & 1u) * 8u + kw, hw = 8u * n + kw;
+        uvec2 l = uvec2(shfl32(w0, lw), shfl32(w0, lw + 1u));
+        uvec2 h = uvec2(shfl32(w1, hw), shfl32(w1, hw + 1u));
+        lo = vsub4(((l.x >> ns) & 0x0F0F0F0Fu) | ((h.x >> hs) & 0x03030303u) << 4, 0x20202020u);
+        hi = vsub4(((l.y >> ns) & 0x0F0F0F0Fu) | ((h.y >> hs) & 0x03030303u) << 4, 0x20202020u);
+        return;
+    }
+    if (T == 18) {  // IQ3_XXS (98 bytes = 25 uint32 words from 4-aligned base): 1 coalesced U32 load per lane + LDS grid
+        m = 0.0;
+        uint64_t addr = uint64_t(w) + b, base4 = addr & ~3ul;
+        uint align_sh = uint(addr & 2ul) * 8u;
+        uint raw = U32(base4).v[min(sub, 24u)];
+        uint next_raw = shfl32(raw, min(sub + 1u, 24u));
+        float d0 = h2f((shfl32(raw, 0u) >> align_sh) & 0xFFFFu);
+        uint w32 = align_sh == 0u ? ((raw >> 16) | (next_raw << 16)) : next_raw;
+        uint ib = sub >> 2, l = sub & 3u;
+        uint qq = (shfl32(w32, sub >> 1) >> ((sub & 1u) * 16u)) & 0xFFFFu;
+        uint aux = shfl32(w32, 16u + ib);
+        d = d0 * (0.5 + float(aux >> 28)) * 0.5;
+        uint sg = ksign((aux >> (7u * l)) & 127u);
+        uint g0 = IQ3XXS_GRID[qq & 255u], g1 = IQ3XXS_GRID[qq >> 8];
+        lo = apply_signs(g0, sg & 15u); hi = apply_signs(g1, sg >> 4);
+        return;
+    }
+    qw(w, b, sub, lo, hi, d, m);
 }
 
 // Values [8 sub, 8 sub + 8) of the super-block at byte b (deq8<T> in kernels.cu; d * q - m is the same float).

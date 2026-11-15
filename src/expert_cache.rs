@@ -5,7 +5,6 @@
 use crate::backend::{Backend, Buf};
 use crate::model::Model;
 use crate::quant::GgmlType;
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Share of each count kept per `adapt` (every 8 tokens by default): `counts` and `long`.
@@ -63,8 +62,9 @@ impl ExpertCache {
         let n_layers = range.end;
         let c = &m.cfg;
         let n = c.n_expert;
+        const MAX_POOL_FULL_BYTES: usize = 8192 << 20;
         let mut layers: Vec<Option<(usize, [Mat; 3])>> = Vec::new();
-        let mut classes = BTreeMap::<usize, usize>::new(); // slot bytes -> experts of that size
+        let mut pool_specs: Vec<(usize, usize)> = Vec::new(); // (slot_bytes, experts in pool)
         for il in 0..n_layers {
             if !c.is_moe_layer(il) || !range.contains(&il) { layers.push(None); continue; }
             let mut off = 0;
@@ -74,10 +74,17 @@ impl ExpertCache {
                 mats[i] = Mat { ty: t.ty, rows: t.rows, cols: t.cols, off, bytes: t.data.len() };
                 off = (off + t.data.len()).next_multiple_of(16);  // GEMV kernels read 8-byte words
             }
-            *classes.entry(off).or_default() += n;
-            layers.push(Some((off, mats)));
+            let pid = pool_specs
+                .iter()
+                .position(|&(sb, cnt)| sb == off && (cnt + n) * off <= MAX_POOL_FULL_BYTES)
+                .unwrap_or_else(|| {
+                    pool_specs.push((off, 0));
+                    pool_specs.len() - 1
+                });
+            pool_specs[pid].1 += n;
+            layers.push(Some((pid, mats)));
         }
-        let total: usize = classes.iter().map(|(b, k)| b * k).sum();
+        let total: usize = pool_specs.iter().map(|(b, k)| b * k).sum();
         let mut frac = (budget as f64 / total.max(1) as f64).min(1.0);
         let profile = std::env::var_os("STRATA_FIXED_EXPERTS").is_none().then(|| profile_path(m));
         let counts = profile.as_ref().and_then(|p| std::fs::read(p).ok())
@@ -94,7 +101,7 @@ impl ExpertCache {
         // The budget comes from the driver's free-memory estimate, which can be more than it will allocate (AMD's
         // Windows driver): on a failed allocation, free the pools and try a tenth less.
         let pools = loop {
-            let r = classes.iter().map(|(&slot_bytes, &k)| {
+            let r = pool_specs.iter().map(|&(slot_bytes, k)| {
                 let slots = (frac * k as f64) as usize;
                 Ok(Pool { buf: gpu.zeros::<u8>(slots * slot_bytes)?, slot_bytes, owner: Vec::with_capacity(slots) })
             }).collect::<anyhow::Result<Vec<_>>>();
@@ -111,8 +118,8 @@ impl ExpertCache {
         for l in &layers {
             out.push(match l {
                 None => None,
-                Some((sb, mats)) => Some(LayerExperts {
-                    pool: classes.keys().position(|k| k == sb).unwrap(), mats: *mats, table: vec![-1; n],
+                Some((pid, mats)) => Some(LayerExperts {
+                    pool: *pid, mats: *mats, table: vec![-1; n],
                     table_dev: { let b = gpu.zeros::<i32>(n)?; gpu.put(&vec![-1i32; n], &b, 0)?; b },
                 }),
             });

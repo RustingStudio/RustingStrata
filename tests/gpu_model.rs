@@ -216,6 +216,59 @@ fn mtp_spec_matches_greedy() {
     }
 }
 
+/// Hybrid speculative decoding (`hybrid_spec_step`, combining N-gram bursts and MTP/EAGLE3 drafting)
+/// matches plain greedy token sequences bit-for-bit across both N-gram hits and MTP fallbacks.
+#[test]
+fn hybrid_spec_matches_greedy() {
+    use rusting_strata::ngram::{NgramConfig, NgramDrafter, SpecType};
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    if m.cfg.n_nextn == 0 { eprintln!("SKIP: no nextn layer"); return }
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let mut gm = GpuModel::load(&m, gpu, 512, 0, 512 << 20, 1).unwrap();
+        gm.adapt_every = 0;
+        let ids = tok.encode(
+            "Repeat verbatim: fn alpha(x: i32) -> i32 { x + 1 }\nRepeat verbatim: fn alpha(x: i32) -> i32 {"
+        ).unwrap();
+        let n = 64;
+        gm.reset().unwrap();
+        let mut t = ops::argmax(&gm.prefill(&ids).unwrap()) as u32;
+        let mut plain = vec![];
+        while plain.len() < n {
+            plain.push(t);
+            t = ops::argmax(&gm.step(t).unwrap()) as u32;
+        }
+        plain.truncate(n);
+
+        gm.ngram = Some(NgramDrafter::new(
+            NgramConfig {
+                types: vec![SpecType::NgramSimple],
+                draft_max: 8,
+                size_n: 4,
+                size_m: 16,
+                n_vocab: m.cfg.n_vocab,
+                ..NgramConfig::default()
+            },
+            Some(&tok),
+        ).unwrap());
+        gm.drafts = (0, 0);
+        gm.reset().unwrap();
+        let mut t = ops::argmax(&gm.prefill(&ids).unwrap()) as u32;
+        let (mut hybrid, mut row) = (vec![], 0);
+        while hybrid.len() < n {
+            let (toks, nx, r) = gm.hybrid_spec_step(t, row, &mut ops::Sampler::greedy()).unwrap();
+            (t, row) = (nx, r);
+            hybrid.extend(toks);
+        }
+        hybrid.truncate(n);
+        assert_eq!(hybrid, plain, "hybrid_spec_step greedy parity ({bk})");
+    }
+}
+
 /// `rollback` to the first token of a 2-token verify leaves the same state as stepping that token alone.
 #[test]
 fn rollback_matches_step() {
@@ -353,7 +406,7 @@ fn qwen4exp_gpu_matches_cpu() {
         let mut gm = GpuModel::load(&m, gpu, 256, 4, 512 << 20, 0).unwrap();
         let mut got: Vec<Vec<f32>> = ids.iter().map(|&t| gm.step(t).unwrap()).collect();
         gm.reset().unwrap();
-        let n = ids.len().min(rusting_strata::cpu_worker::TMAX);
+        let n = ids.len().min(gm.tmax());
         got.extend(gm.verify(&ids[..n]).unwrap());
         gm.reset().unwrap();
         gm.short = 0;
@@ -386,7 +439,6 @@ fn split_matches_single() {
         let m = Model::load(&g).unwrap();
         let tok = Tokenizer::from_gguf(&g).unwrap();
         let ids = tok.encode("The capital of France is Paris, and the capital of Spain is").unwrap();
-        let n = ids.len().min(rusting_strata::cpu_worker::TMAX);
         for bk in ["cuda", "vulkan"] {
             let open = || -> Option<Box<dyn rusting_strata::backend::Backend>> {
                 Some(match bk { "cuda" => Box::new(rusting_strata::cuda::Gpu::new(0).ok()?), _ => Box::new(rusting_strata::vulkan::Vk::new(0).ok()?) })
@@ -394,6 +446,7 @@ fn split_matches_single() {
             let Some(one) = open() else { continue };
             let run = |gm: &mut GpuModel| -> Vec<Vec<f32>> {
                 gm.adapt_every = 0;
+                let n = ids.len().min(gm.tmax());
                 let mut out: Vec<Vec<f32>> = ids.iter().map(|&t| gm.step(t).unwrap()).collect();
                 gm.reset().unwrap();
                 out.extend(gm.verify(&ids[..n]).unwrap());
@@ -654,7 +707,7 @@ fn gpu_image_prefill_matches_cpu() {
     }
 }
 
-/// `step_batch` (decode of more than `TMAX` slots on the GEMM kernels) against each prompt decoded alone through
+/// `step_batch` (decode of more than `STEP_ROWS` slots on the GEMM kernels) against each prompt decoded alone through
 /// `step`, teacher-forced with the tokens of the single run. The two paths round differently, so the logits are
 /// compared with a tolerance and the greedy token only where the single run's top two are apart.
 #[test]
