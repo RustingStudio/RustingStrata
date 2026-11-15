@@ -10,9 +10,10 @@ its own license (most Qwen models are Apache 2.0; check the model card).
 
 ## How much one server does
 
-By default `rustingstrata serve` answers one chat request at a time. Others wait in a queue (`--max-waiting`, 16 by default)
-and run in arrival order. `--max-waiting` counts every open connection (being read, generated or queued, health
-checks included), so with one reply running 15 places are left for the queue. Beyond it a connection gets
+By default `rustingstrata serve` answers one chat request at a time. Others wait in a queue and run in arrival order.
+The queue has no limit unless `--max-waiting N` sets one. `--max-waiting` counts every open connection (being read,
+generated or queued, health checks included), so with `--max-waiting 16` and one reply running 15 places are left
+for the queue. Beyond it a connection gets
 `503 Service Unavailable` with `Retry-After: 2` (`--max-per-key` keeps one customer from taking all the places). One
 request decodes at
 the speed in the README (about 113 tok/s for Qwen3.6-35B-A3B Q2_K_XL on an RTX 3060), so that is also the total for
