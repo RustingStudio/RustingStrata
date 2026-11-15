@@ -100,6 +100,11 @@ struct HcRead { norm: GpuTensor, down: GpuTensor, up: GpuTensor, inject: Option<
 struct Ple { key: GpuTensor, value: GpuTensor, norm_key: GpuTensor, norm_query: GpuTensor, norm_conv: GpuTensor, conv: GpuTensor }
 
 /// `attn_norm` / `post_norm` for a plain residual; `hc` (attention and FFN reads) for hyper-connections.
+/// Buffers of `step_batch`: positions (2 ints a row), the KV cache addresses of each row's slot (2 a row, per
+/// layer) for `rows` rows; logits and argmax for `cap` rows; attention partials for `cap` rows at `ATT_SPLITS`
+/// splits (more rows fit at fewer splits).
+struct Batch { cap: usize, rows: usize, step: Buf, kvt: Buf, logits: Buf, amax: Buf, attp: Buf }
+
 struct Layer { attn_norm: Option<GpuTensor>, post_norm: Option<GpuTensor>, hc: Option<[HcRead; 2]>, ple: Option<Ple>, mixer: Mixer, ffn: Ffn }
 
 /// MTP draft head: the `nextn` block (layer n_layer) with its own KV cache and CPU worker.
@@ -222,6 +227,8 @@ pub struct GpuModel<'a> {
     pub short: usize,
     /// Prefill scratch (None: prompts go through `step`).
     pf: Option<prefill::Scratch>,
+    /// Scratch of `step_batch` (`--parallel` above `TMAX` on a plain dense model).
+    bt: Option<Batch>,
     mtp: Option<MtpHead>,
     /// The layers of this part are `first..first + layers.len()`.
     first: usize,
@@ -418,6 +425,20 @@ impl<'a> GpuModel<'a> {
         let mut seqs: Vec<Seq> = (0..ns).map(|_| Seq::default()).collect();
         if ns > 1 { for q in &mut seqs { q.saved = alloc_saved(&*gpu, &layers)?; } }
         let saved = std::mem::take(&mut seqs[0].saved);
+        // `step_batch` covers plain dense attention models in one part; the rest decode `TMAX` rows a forward.
+        let plain = output_norm.is_some() && output.is_some() && range.start == 0 && !mtp && c.hc_n == 0 && c.n_embd_ple == 0 && !qsa_on
+            && layers.iter().enumerate().all(|(il, l)| l.attn_norm.is_some() && l.post_norm.is_some() && matches!(l.mixer, Mixer::Attn { .. })
+                && matches!(l.ffn, Ffn::Dense { .. }) && c.rope_layer.get(il).copied().unwrap_or(true));
+        let bt = match &pf {
+            Some(p) if ns > TMAX && plain && gpu.kv_rows() => {
+                // ponytail: 64 rows a forward, the size of the backend's argmax scratch; split the argmax to go past it.
+                let cap = ns.min(p.chunk).min(64);
+                let rows = p.chunk;
+                Some(Batch { cap, rows, step: gpu.zeros::<i32>(2 * rows)?, kvt: gpu.zeros::<u64>(layers.len() * 2 * rows)?, logits: gpu.zeros::<f32>(cap * c.n_vocab)?,
+                             amax: gpu.zeros::<i32>(cap)?, attp: gpu.zeros::<f32>(cap * c.n_head * ATT_SPLITS * (c.head_dim + 2))? })
+            }
+            _ => None,
+        };
         let (free1, _) = gpu.mem_info()?;
         // Past the budget the driver spills buffers to system memory: RADV then runs a long prefill slowly enough to
         // hit amdgpu's job timeout and lose the device. A margin above 512 MB only leaves fewer expert slots.
@@ -467,7 +488,7 @@ impl<'a> GpuModel<'a> {
         let adapt_every = std::env::var("STRATA_ADAPT_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
         let adapt_swaps = std::env::var("STRATA_ADAPT_SWAPS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
         let reset_counts_after_prefill = std::env::var_os("STRATA_RESET_COUNTS").is_some();
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None,
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, bt, mtp, first: range.start, next: None,
                       cur: 0, seqs, rows: vec![], row_tokens: 0 })
     }
 
@@ -558,6 +579,12 @@ impl<'a> GpuModel<'a> {
     pub fn slot_saved(&self, s: usize) -> (&[u32], u64) {
         if s == self.cur { (&self.saved_ids, self.saved_owner) } else { (&self.seqs[s].saved_ids, self.seqs[s].saved_owner) }
     }
+
+    /// The most rows `step_batch` takes (0: this model has no batched decode).
+    pub fn batch_cap(&self) -> usize { self.bt.as_ref().map_or(0, |b| b.cap) }
+
+    /// Context size in tokens (per slot).
+    pub fn ctx(&self) -> usize { self.ctx }
 
     fn slot_pos(&mut self, s: usize) -> &mut usize { if s == self.cur { &mut self.pos } else { &mut self.seqs[s].pos } }
 

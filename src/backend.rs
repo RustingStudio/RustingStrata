@@ -301,6 +301,21 @@ pub trait Backend: Send {
         self.attn_decode_gq(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, sink, win)?;
         Ok(0)
     }
+    /// Whether `rms_norm_rope_qk_rows` and `attn_rows` exist here (`GpuModel::step_batch` needs them).
+    fn kv_rows(&self) -> bool { false }
+    /// `rms_norm_rope_qk` for `nt` tokens of different sequences: token t is at position `step[2t]` and stores its K
+    /// and V in the caches whose addresses are `kvt[2t]` and `kvt[2t + 1]` (u64 each).
+    fn rms_norm_rope_qk_rows(&self, _q: u64, _q_stride: usize, _qw: u64, _qo: u64, _nh: usize, _k: u64, _kw: u64, _ko: u64, _nkv: usize, _hd: usize, _eps: f32, _n_rot: usize,
+                             _step: u64, _base: f32, _v: u64, _kvt: u64, _nt: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: no per-row KV kernels", self.name())
+    }
+    /// `attn_decode_gq` with `gq_min` 0 for `nt` tokens of different sequences, with the caches of
+    /// `rms_norm_rope_qk_rows`; `part` holds `nt` rows of the split partials. `splits` (1 ..= ATT_SPLITS): blocks a
+    /// head group; many short rows run faster with few.
+    fn attn_rows(&self, _q: u64, _qg: u64, _out: u64, _part: u64, _step: u64, _nh: usize, _nkv: usize, _hd: usize, _scale: f32, _nt: usize, _sink: u64, _win: usize, _kvt: u64,
+                 _splits: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: no per-row KV kernels", self.name())
+    }
     /// `attn_decode` that shares K/V loads across a GQA group from `gq_min` positions on (tests use 0 to force it).
     fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, sink: u64, win: usize) -> anyhow::Result<()>;
     /// Route `t` tokens (logit rows of n, ids / wts rows of k). `sigmoid` selects sigmoid scores instead of softmax.
