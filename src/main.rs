@@ -1845,38 +1845,66 @@ impl Serving {
                 if open && self.stopped() { eprintln!("stopped"); open = false; }
                 if (!open || next.lock().unwrap().is_some()) && live.load(Relaxed) == 0 { break; }
                 s.take(&jobs, s.wait());
-                // One prefill between decode steps, in the free slot whose saved state this prompt extends the
-                // furthest, else the least recently used one.
+                // Prefill between decode steps, in the free slot whose saved state the prompt extends the furthest, else
+                // the least recently used one.
                 s.chats.retain(|j| !matches!(j, Job::Chat { gone, .. } if gone.load(Relaxed)));
-                let first = s.next_chat();
-                if let Some(sl) = (0..n).filter(|&i| !s.held[i]).max_by_key(|&i| {
-                    let reuse = match first.and_then(|j| s.chats.get(j)) {
-                        Some(Job::Chat { ids, keep, owner, .. }) => { let (sv, o) = g.slot_saved(i); if o == *owner && ids[..*keep].starts_with(sv) { sv.len() } else { 0 } }
-                        _ => 0,
-                    };
-                    (reuse, std::cmp::Reverse(s.freed[i]))
-                }) && let Some(Job::Chat { ids, sys, keep, owner, back, .. }) = first.and_then(|j| s.chats.remove(j)) {
-                    g.use_slot(sl);
-                    g.owner = owner;
-                    // Between two prefill chunks the decoding slots run for as long as the chunk before took, so a long
-                    // prompt shares the GPU with them evenly instead of stalling them.
+                // Models with a batched forward prefill the queued prompts together, one free slot each.
+                let lim = g.batch_cap().max(1);
+                let fits = |c: &Job| matches!(c, Job::Chat { ids, .. } if ids.len() <= g.ctx());
+                let mut adm: Vec<(usize, Job)> = vec![];
+                while adm.len() < lim {
+                    let Some(j) = s.next_chat() else { break };
+                    if !adm.is_empty() && !(fits(&s.chats[j]) && fits(&adm[0].1)) { break; }
+                    let Job::Chat { ids, keep, owner, .. } = &s.chats[j] else { break };
+                    let Some(sl) = (0..n).filter(|&i| !s.held[i]).max_by_key(|&i| {
+                        let (sv, o) = g.slot_saved(i);
+                        (if o == *owner && ids[..*keep].starts_with(sv) { sv.len() } else { 0 }, std::cmp::Reverse(s.freed[i]))
+                    }) else { break };
+                    // Held while the rest are chosen, so that `next_chat` counts it against its key.
+                    (s.held[sl], s.who[sl]) = (true, *owner);
+                    adm.push((sl, s.chats.remove(j).unwrap()));
+                }
+                for (sl, _) in &adm { s.held[*sl] = false; }
+                if !adm.is_empty() {
+                    // Between two prefill forwards the decoding slots run for as long as the forward before took, so
+                    // long prompts share the GPU with them evenly instead of stalling them.
                     // ponytail: an even share; weigh it (or cap the prompt's chunk) if first-token time matters more.
                     let (started, mut t0) = (Instant::now(), Instant::now());
-                    let r = g.prefill_cached_with(&ids, sys, keep, &mut |g| {
-                        let end = Instant::now() + t0.elapsed();
-                        while s.decoding() > 0 && Instant::now() < end {
-                            s.take(&jobs, s.wait().min(end.saturating_duration_since(Instant::now())));
-                            if s.ready() { s.run(g); }
+                    let res: Vec<anyhow::Result<(Vec<f32>, usize)>> = {
+                        let mut between = |g: &mut GpuModel| {
+                            let end = Instant::now() + t0.elapsed();
+                            while s.decoding() > 0 && Instant::now() < end {
+                                s.take(&jobs, s.wait().min(end.saturating_duration_since(Instant::now())));
+                                if s.ready() { s.run(g); }
+                            }
+                            t0 = Instant::now();
+                            Ok(())
+                        };
+                        if adm.len() > 1 {
+                            let list: Vec<_> = adm.iter().map(|(sl, c)| {
+                                let Job::Chat { ids, sys, keep, owner, .. } = c else { unreachable!() };
+                                (*sl, *owner, &ids[..], *sys, *keep)
+                            }).collect();
+                            match g.prefill_slots(&list, &mut between) {
+                                Ok(v) => v.into_iter().map(Ok).collect(),
+                                Err(e) => adm.iter().map(|_| Err(anyhow::anyhow!("{e:#}"))).collect(),
+                            }
+                        } else {
+                            let (sl, Job::Chat { ids, sys, keep, owner, .. }) = &adm[0] else { unreachable!() };
+                            g.use_slot(*sl);
+                            g.owner = *owner;
+                            vec![g.prefill_cached_with(ids, *sys, *keep, &mut between)]
                         }
-                        t0 = Instant::now();
-                        Ok(())
-                    });
-                    (s.held[sl], s.who[sl]) = (r.is_ok(), owner);
-                    // A client that left during the prefill takes no slot.
-                    if back.send(r.map(|(l, u)| (l, u, sl, started))).is_err() && s.held[sl] {
-                        s.held[sl] = false;
-                        s.tick += 1;
-                        s.freed[sl] = s.tick;
+                    };
+                    for ((sl, c), r) in adm.into_iter().zip(res) {
+                        let Job::Chat { owner, back, .. } = c else { unreachable!() };
+                        (s.held[sl], s.who[sl]) = (r.is_ok(), owner);
+                        // A client that left during the prefill takes no slot.
+                        if back.send(r.map(|(l, u)| (l, u, sl, started))).is_err() && s.held[sl] {
+                            s.held[sl] = false;
+                            s.tick += 1;
+                            s.freed[sl] = s.tick;
+                        }
                     }
                     gpu_model_stats(g, &mut self.stats.lock().unwrap());
                 }
