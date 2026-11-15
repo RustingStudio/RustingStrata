@@ -38,6 +38,37 @@ struct Engine {
     /// [default: calibrated, else 0].
     #[arg(long, value_name = "N", default_missing_value = "1", num_args = 0..=1)]
     mtp: Option<usize>,
+    /// Standalone MTP draft head GGUF (e.g. ~/models-local/mtp-Q8_0.gguf).
+    #[arg(long)]
+    mtp_model: Option<PathBuf>,
+    /// External speculative draft model GGUF socket (e.g. future DFlash/EAGLE draft).
+    #[arg(long)]
+    draft_model: Option<PathBuf>,
+    /// Speculative context-lookup drafter type(s), comma-separated: none, ngram-simple, ngram-map-k, ngram-map-k4v,
+    /// ngram-mod, ngram-cache (combines with --mtp/--mtp-model in hybrid cascade).
+    #[arg(long, default_value = "none")]
+    spec_type: String,
+    /// Maximum number of speculative draft tokens verified per step (1..=16).
+    #[arg(long, default_value_t = 16)]
+    spec_draft_n_max: usize,
+    /// N-gram lookup key length in tokens (for ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod).
+    #[arg(long, default_value_t = 12)]
+    spec_ngram_size_n: usize,
+    /// N-gram draft window length in tokens (for ngram-simple, ngram-map-k, ngram-map-k4v).
+    #[arg(long, default_value_t = 48)]
+    spec_ngram_size_m: usize,
+    /// Minimum hit count before drafting (for ngram-map-k, ngram-map-k4v).
+    #[arg(long, default_value_t = 1)]
+    spec_ngram_min_hits: u16,
+    /// Static lookup cache file (llama.cpp binary ngram cache or UTF-8 text scaffold corpus).
+    #[arg(long)]
+    lookup_cache_static: Option<PathBuf>,
+    /// Dynamic lookup cache file loaded at startup and updated/saved across requests.
+    #[arg(long)]
+    lookup_cache_dynamic: Option<PathBuf>,
+    /// Persistent disk cache file for KV and recurrent prefix states (Warm Start across requests and restarts).
+    #[arg(long)]
+    prompt_cache: Option<PathBuf>,
     /// Sampling temperature; 0 is greedy.
     #[arg(long, default_value_t = 0.0)]
     temp: f32,
@@ -231,7 +262,10 @@ impl Runner<'_> {
         if let Runner::Gpu(g) = self {
             let sum = |f: &dyn Fn(&GpuModel) -> usize| g.parts().map(f).sum::<usize>();
             let st = self.expert_stats().expect("Runner::Gpu has expert stats");
-            if g.drafts.0 > 0 { eprintln!("MTP drafts accepted {}/{} ({:.1}%)", g.drafts.1, g.drafts.0, 100.0 * g.drafts.1 as f64 / g.drafts.0 as f64); }
+            if g.drafts.0 > 0 {
+                let kind = if g.ngram.is_some() { "speculative ngram" } else { "MTP" };
+                eprintln!("{kind} drafts accepted {}/{} ({:.1}%)", g.drafts.1, g.drafts.0, 100.0 * g.drafts.1 as f64 / g.drafts.0 as f64);
+            }
             eprintln!("expert hit rate {:.1}% ({} misses), cache swaps {}", 100.0 * st.hits as f64 / (st.hits + st.misses).max(1) as f64, st.misses, st.swaps);
             // Issue #34 R1: printed on every run, so a fully resident run reads as a measured 0 in the log instead of
             // an absent line. `tokens` counts the token forwards the worker could have been asked about.
@@ -281,8 +315,20 @@ impl Engine {
         let v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         if !v.is_null() { eprintln!("calibration: {}", path.display()); }
         let get = |k: &str| v[k].as_u64().map(|x| x as usize);
+        if let Some(dp) = &self.draft_model {
+            anyhow::ensure!(dp.exists(), "draft model path does not exist: {}", dp.display());
+            eprintln!("draft model socket: registered candidate {}", dp.display());
+        }
+        let mut ngram_cfg = self.ngram_config()?;
+        ngram_cfg.n_vocab = m.cfg.n_vocab;
         self.chunk.get_or_insert(get("chunk").unwrap_or(4096));
-        self.mtp.get_or_insert(get("mtp").unwrap_or(0));
+        if self.mtp_model.is_some() && self.mtp.is_none() {
+            self.mtp = Some(1);
+        } else if ngram_cfg.is_enabled() && self.mtp.is_none() {
+            self.mtp = Some(0);
+        } else {
+            self.mtp.get_or_insert(get("mtp").unwrap_or(0));
+        }
         self.short = get("short").unwrap_or(32);
         // The global pool can be built once; a model loaded later by `serve` keeps the first one's threads.
         // GPU expert work is memory-bound, so SMT siblings only add contention (6 threads beat 12 on the reference
@@ -307,14 +353,44 @@ impl Engine {
         let types = rusting_strata::gpu_model::gpu_weight_types(&m.w.g);
         for b in &bk { b.preflight(&types, false)?; }
         let margins = vram_margins(&self.vram_margin, &self.device)?.into_iter().map(|mb| mb << 20).collect::<Vec<_>>();
+        let spec_k = if mtp > 0 { mtp } else if ngram_cfg.is_enabled() && self.parallel <= 1 { ngram_cfg.draft_max } else { 0 };
         let mut g = if self.parallel > 1 {
             GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, 0, self.parallel).context(LOAD_HINT)?
         } else {
-            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, self.mtp(), 1).context(LOAD_HINT)?
+            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, spec_k, 1).context(LOAD_HINT)?
         };
+        if ngram_cfg.is_enabled() && self.parallel <= 1 {
+            let tok = Tokenizer::from_gguf(&m.w.g).ok();
+            g.ngram = Some(rusting_strata::ngram::NgramDrafter::new(ngram_cfg, tok.as_ref())?);
+        }
         g.short = self.short;
         g.cache_ram = self.cache_ram << 20;
+        if let Some(p) = &self.prompt_cache {
+            if g.cache_ram == 0 {
+                g.cache_ram = 2048 << 20;
+            }
+            if let Err(e) = g.load_prompt_cache(p) {
+                eprintln!("warning: could not load prompt cache {}: {e:#}", p.display());
+            }
+        }
         Ok(Runner::Gpu(Box::new(g)))
+    }
+    fn ngram_config(&self) -> anyhow::Result<rusting_strata::ngram::NgramConfig> {
+        let types = rusting_strata::ngram::SpecType::parse_list(&self.spec_type)?;
+        anyhow::ensure!((1..=rusting_strata::cpu_worker::TMAX - 1).contains(&self.spec_draft_n_max),
+            "--spec-draft-n-max {}: must be between 1 and {}", self.spec_draft_n_max, rusting_strata::cpu_worker::TMAX - 1);
+        Ok(rusting_strata::ngram::NgramConfig {
+            types,
+            draft_max: self.spec_draft_n_max,
+            size_n: self.spec_ngram_size_n.max(1),
+            size_m: self.spec_ngram_size_m.max(1),
+            min_hits: self.spec_ngram_min_hits.max(1),
+            mod_n_match: self.spec_ngram_size_n.max(1),
+            mod_n_min: 2,
+            lookup_cache_static: self.lookup_cache_static.clone(),
+            lookup_cache_dynamic: self.lookup_cache_dynamic.clone(),
+            n_vocab: 0,
+        })
     }
     fn sampler(&self) -> Sampler {
         Sampler { temp: self.temp, top_k: self.top_k, top_p: self.top_p, rng: seed(self.seed) }
@@ -820,8 +896,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let (prompt, cont) = (ids("prompt")?, ids("continuation")?);
             anyhow::ensure!(!prompt.is_empty() && !cont.is_empty(), "empty prompt or continuation");
             let g = Gguf::open(&model)?;
-            let mut m = Model::load(&g)?;
-            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
+            let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
+            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             if let Some(&t) = prompt.iter().chain(&cont).find(|&&t| t as usize >= m.cfg.n_vocab) {
                 anyhow::bail!("token id {t} out of range (vocabulary has {} tokens)", m.cfg.n_vocab);
             }
@@ -860,8 +936,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 return rusting_strata::deepseek::chat::generate(&g, &prompt, n);
             }
-            let mut m = Model::load(&g)?;
-            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
+            let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
+            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let prompt = if prompt == "-" {
                 let mut s = String::new();
@@ -901,8 +977,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Perplexity { model, file, ctx_len: n, chunks, kld_base, mut engine } => {
             let g = Gguf::open(&model)?;
-            let mut m = Model::load(&g)?;
-            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
+            let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
+            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             // ponytail: no BOS at chunk starts (llama-perplexity adds one where the vocabulary asks for it; Qwen does not)
             let ids = tok.encode(&std::fs::read_to_string(&file)?)?;
@@ -948,8 +1024,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     };
                 }
             }
-            let mut m = Model::load(&g)?;
-            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
+            let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
+            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let mut r = engine.runner(&m, &model)?;
             let mut results = Vec::with_capacity(pp.len());
@@ -1056,8 +1132,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 anyhow::ensure!(image.is_empty(), "--image is not supported for deepseek41");
                 return rusting_strata::deepseek::chat::chat(&g, system, n, think);
             }
-            let mut m = Model::load(&g)?;
-            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
+            let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
+            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let image_input = if image.is_empty() { None } else {
                 let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
@@ -1524,14 +1600,24 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
     let eos = tok.eos_ids();
     // `ahead`: the next token when `spec_step` or `step_greedy` already picked it.
     // `start`: the first token whose text is not emitted yet (the text before it ends on a whole character).
-    let (mut out, mut start, mut row, mut ahead) = (Vec::new(), 0, 0, None);
-    while out.len() < n {
+    let (mut out, mut start, mut row, mut ahead, mut stopped) = (Vec::new(), 0, 0, None, false);
+    'outer: while out.len() < n {
         let next = match ahead.take() { Some(t) => t, None => smp.pick(&logits)? as u32 };
-        if eos.contains(&next) { return Ok((out, true)); }
+        if eos.contains(&next) { stopped = true; break; }
         let toks = match r {
+            Runner::Gpu(g) if mtp && g.ngram.is_some() => {
+                let (toks, nx, rw) = g.hybrid_spec_step(next, row, smp)?;
+                (ahead, row) = (Some(nx), rw);
+                toks
+            }
             Runner::Gpu(g) if mtp => {
                 let (toks, nx, rw) = g.spec_step(next, row, smp)?;
                 (ahead, row) = (Some(nx), rw);
+                toks
+            }
+            Runner::Gpu(g) if g.ngram.is_some() => {
+                let (toks, nx) = g.ngram_spec_step(next, smp)?;
+                ahead = Some(nx);
                 toks
             }
             // Greedy without MTP: the argmax on the GPU, so only the token id is copied back, not the logits.
@@ -1540,17 +1626,20 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
             _ => { logits = r.step(next)?; vec![next] }
         };
         for t in toks {
-            if eos.contains(&t) { return Ok((out, true)); }
+            if eos.contains(&t) { stopped = true; break 'outer; }
             if out.len() == n { break; }
             out.push(t);
             let s = tok.decode(&out[start..])?;
             if !s.ends_with('\u{fffd}') {
-                if emit(&s)? { return Ok((out, true)); }
+                if emit(&s)? { stopped = true; break 'outer; }
                 start = out.len();
             }
         }
     }
-    Ok((out, false))
+    if let Runner::Gpu(g) = r && let Some(ng) = g.ngram.as_mut() {
+        let _ = ng.save_dynamic();
+    }
+    Ok((out, stopped))
 }
 
 /// Tokens left for a reply: `n`, capped by the context after a `used`-token prompt.
@@ -1746,7 +1835,7 @@ impl Sched {
     /// One forward over the oldest steps (with more than `TMAX` slots decoding, each waits its turn), in slot order
     /// (fewer graphs to capture).
     fn run(&mut self, g: &mut GpuModel) {
-        let mut batch: Vec<_> = self.steps.drain(..self.steps.len().min(rusting_strata::cpu_worker::TMAX)).collect();
+        let mut batch: Vec<_> = self.steps.drain(..self.steps.len().min(4)).collect();
         batch.sort_by_key(|s| s.0);
         self.since = if self.steps.is_empty() { None } else { Some(Instant::now() - Self::GATHER) };
         match g.step_rows(&batch.iter().map(|b| (b.0, b.1, b.2)).collect::<Vec<_>>()) {
@@ -1841,6 +1930,37 @@ impl Serving {
     }
 }
 
+/// Resolve `--mtp-model` (`.gguf` file, HF `.safetensors` file, or directory containing either `model.gguf` or
+/// `model.safetensors` + `config.json`) and open it as a companion GGUF. If `.gguf` is missing (or
+/// `STRATA_EAGLE3_RECONVERT` is set) and `.safetensors` + `config.json` are present, converts natively in Rust.
+fn open_mtp_gguf(path: Option<&Path>) -> anyhow::Result<Option<Gguf>> {
+    let Some(p) = path else { return Ok(None) };
+    let reconvert = std::env::var_os("STRATA_EAGLE3_RECONVERT").is_some();
+    let (gguf, st_cfg) = if p.is_dir() {
+        (p.join("model.gguf"), Some((p.join("model.safetensors"), p.join("config.json"))))
+    } else if p.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+        (p.with_extension("gguf"), Some((p.to_path_buf(), p.with_file_name("config.json"))))
+    } else if p.extension().and_then(|e| e.to_str()) == Some("bin") {
+        (p.with_file_name("model.gguf"), None)
+    } else {
+        (p.to_path_buf(), None)
+    };
+    if let Some((st, cfg)) = st_cfg
+        && (!gguf.exists() || reconvert)
+        && st.exists()
+        && cfg.exists()
+    {
+        eprintln!("note: native Rust EAGLE3 conversion {} -> {}", st.display(), gguf.display());
+        rusting_strata::gguf::convert_safetensors_eagle3_to_gguf(&st, &cfg, &gguf, 48)?;
+    }
+    anyhow::ensure!(
+        gguf.exists(),
+        "{}: not found (for PyTorch .bin EAGLE3 checkpoints, convert first via tools/convert_eagle3_to_gguf.py)",
+        gguf.display()
+    );
+    Ok(Some(Gguf::open(&gguf)?))
+}
+
 /// Loads `model`, answers `w` (the /api/load request that asked for it) and serves until another model is asked
 /// for. The model and its GPU memory are freed on return.
 fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<TcpStream>) -> anyhow::Result<Option<(PathBuf, TcpStream)>> {
@@ -1855,7 +1975,8 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
     let g = Gguf::open(model)?;
     let arch = g.get("general.architecture")?.as_str().context("general.architecture")?;
     s.stats.lock().unwrap().ctx_train = g.meta.get(&format!("{arch}.context_length")).and_then(|v| v.as_u64());
-    let mut m = Model::load(&g)?;
+    let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
+    let mut m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
     if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
     let tok = Tokenizer::from_gguf(&g)?;
     let mut r = engine.runner(&m, model)?;

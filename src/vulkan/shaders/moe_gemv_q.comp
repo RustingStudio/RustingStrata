@@ -12,9 +12,13 @@ layout(local_size_x = 256) in;
 
 layout(push_constant) uniform P { U8 w; I32 ids; U32 xq; F32 y; uint64_t stride; uint64_t w2; uint64_t y2; uint rows; uint cols; uint xg; uint ntok; uint rpw; } p;
 
+shared uint s_slots[18];
+shared uint s_nm;
+shared bool s_dup;
+
 void sb_step(U8 w, F32 xd, uint row, uint lane, uint t, uint s, inout precise float acc) {
     uint lo, hi; float d, m;
-    qw(w, row * rowb(p.cols) + s * SBB, lane, lo, hi, d, m);
+    qw_sb(w, row * rowb(p.cols) + s * SBB, lane, lo, hi, d, m);
     uint o = (t * p.cols + s * 256) / 4 + lane * 2, a = p.xq.v[o], c = p.xq.v[o + 1];
     int dot = dotPacked4x8EXT(int(lo), int(a)) + dotPacked4x8EXT(int(hi), int(c));
     int sx = dotPacked4x8EXT(0x01010101, int(a)) + dotPacked4x8EXT(0x01010101, int(c));
@@ -23,23 +27,70 @@ void sb_step(U8 w, F32 xd, uint row, uint lane, uint t, uint s, inout precise fl
     if (MIN) acc = fma(-(m * dx), float(sx), acc);  // types with a min
 }
 
+void sb_step_multi(U8 w, F32 xd, uint row, uint lane, uint nm, uint s, inout precise float acc[17]) {
+    uint lo, hi; float d, m;
+    qw_sb(w, row * rowb(p.cols) + s * SBB, lane, lo, hi, d, m);
+    for (uint u = 0; u < nm; u++) {
+        uint t = s_slots[u] / p.xg;
+        uint o = (t * p.cols + s * 256) / 4 + lane * 2, a = p.xq.v[o], c = p.xq.v[o + 1];
+        int dot = dotPacked4x8EXT(int(lo), int(a)) + dotPacked4x8EXT(int(hi), int(c));
+        int sx = dotPacked4x8EXT(0x01010101, int(a)) + dotPacked4x8EXT(0x01010101, int(c));
+        float dx = xd.v[(t * p.cols + s * 256) / 32 + (lane >> 2)];
+        acc[u] = fma(d * dx, float(dot), acc[u]);
+        if (MIN) acc[u] = fma(-(m * dx), float(sx), acc[u]);
+    }
+}
+
 void main() {
-    uint k = gl_WorkGroupID.y, lane = LANE;
+    uint k = gl_WorkGroupID.y, lane = LANE, nslots = gl_NumWorkGroups.y;
     int e = p.ids.v[k];
     if (e < 0) return;  // the whole workgroup
+    uint nm = 1;
+    if (nslots > 8 && nslots <= 256) {
+        uint tid = gl_LocalInvocationID.x;
+        if (tid == 0) { s_nm = 0; s_dup = false; }
+        barrier();
+        if (tid < nslots && p.ids.v[tid] == e) {
+            if (tid < k) {
+                s_dup = true;
+            } else {
+                uint idx = atomicAdd(s_nm, 1u);
+                if (idx < 17u) s_slots[idx] = tid;
+            }
+        }
+        barrier();
+        if (s_dup) return;
+        nm = min(s_nm, 17u);
+    }
     load_tables();
     U8 w = U8(uint64_t(p.w) + uint64_t(e) * p.stride + gl_WorkGroupID.z * p.w2);
     F32 y = F32(uint64_t(p.y) + gl_WorkGroupID.z * p.y2);
     F32 xd = F32(uint64_t(p.xq) + p.ntok * p.cols);
     uint t = k / p.xg, nsb = p.cols >> 8, r0 = gl_WorkGroupID.x * 8 * p.rpw, r1 = min(p.rows, r0 + 8 * p.rpw);
-    for (uint row = r0 + WARP; row < r1; row += 8) {
-        precise float acc = 0.0;
-        // Four super-blocks per iteration so their loads overlap (kernels.cu: unroll 4); the sums keep their order.
-        uint s = 0;
-        for (; s + 4 <= nsb; s += 4) [[unroll]] for (uint j = 0; j < 4; j++) sb_step(w, xd, row, lane, t, s + j, acc);
-        for (; s < nsb; s++) sb_step(w, xd, row, lane, t, s, acc);
-        if ((p.cols & 255) > lane * 8) sb_step(w, xd, row, lane, t, nsb, acc);  // partial last super-block
-        acc = warp_sum(acc);
-        if (lane == 0) y.v[k * p.rows + row] = acc;
+    if (nm <= 1) {
+        for (uint row = r0 + WARP; row < r1; row += 8) {
+            precise float acc = 0.0;
+            // Four super-blocks per iteration so their loads overlap (kernels.cu: unroll 4); the sums keep their order.
+            uint s = 0;
+            for (; s + 4 <= nsb; s += 4) [[unroll]] for (uint j = 0; j < 4; j++) sb_step(w, xd, row, lane, t, s + j, acc);
+            for (; s + 2 <= nsb; s += 2) [[unroll]] for (uint j = 0; j < 2; j++) sb_step(w, xd, row, lane, t, s + j, acc);
+            for (; s < nsb; s++) sb_step(w, xd, row, lane, t, s, acc);
+            if ((p.cols & 255) > lane * 8) sb_step(w, xd, row, lane, t, nsb, acc);  // partial last super-block
+            acc = warp_sum(acc);
+            if (lane == 0) y.v[k * p.rows + row] = acc;
+        }
+    } else {
+        for (uint row = r0 + WARP; row < r1; row += 8) {
+            precise float acc[17];
+            for (uint u = 0; u < nm; u++) acc[u] = 0.0;
+            uint s = 0;
+            for (; s + 2 <= nsb; s += 2) [[unroll]] for (uint j = 0; j < 2; j++) sb_step_multi(w, xd, row, lane, nm, s + j, acc);
+            for (; s < nsb; s++) sb_step_multi(w, xd, row, lane, nm, s, acc);
+            if ((p.cols & 255) > lane * 8) sb_step_multi(w, xd, row, lane, nm, nsb, acc);
+            for (uint u = 0; u < nm; u++) {
+                float a = warp_sum(acc[u]);
+                if (lane == 0) y.v[s_slots[u] * p.rows + row] = a;
+            }
+        }
     }
 }

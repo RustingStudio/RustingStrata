@@ -15,7 +15,7 @@ fn prompts_match_llama_cpp() {
         for (case, body) in &reqs {
             let q = chat_request(body.dump().as_bytes());
             match want[case].as_str() {
-                Some(w) => { let q = q.unwrap(); assert_eq!(tpl.render(&q.messages, &q.tools, q.think, false, true), w, "{name} {case}") }
+                Some(w) => { let q = q.unwrap(); assert_eq!(tpl.render(&q.messages, &q.tools, q.think.unwrap_or(false), false, true), w, "{name} {case}") }
                 None => assert!(q.is_err(), "{name} {case} should be rejected"),
             }
         }
@@ -134,7 +134,7 @@ fn parses_request() {
     assert_eq!((r.method.as_str(), r.path.as_str(), r.host.as_str(), r.json), ("POST", "/v1/chat/completions", "x", true));
     let q = chat_request(&r.body).unwrap();
     assert_eq!(q.messages, vec![Msg::new("user", "a\nb")]);
-    assert!(q.stream && !q.think);
+    assert!(q.stream && !q.think.unwrap_or(false));
     assert_eq!(q.max_tokens, Some(7));
     assert_eq!((q.temperature, q.top_k, q.top_p, q.seed), (Some(0.7), None, Some(0.8), Some(5)));
     assert!(chat_request(br#"{"messages":[]}"#).is_err());
