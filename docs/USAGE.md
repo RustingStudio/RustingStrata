@@ -27,7 +27,8 @@ built-in checks.
 
 - `--ctx` KV cache size in tokens (default 4096).
 - `--mtp [N]` speculative decoding with the model's draft head. Greedy tokens stay the same; sampling keeps its
-  distribution.
+  distribution. Needs a GGUF with an MTP head on one GPU (for example the Qwen3.6-35B-A3B MTP files). Not available
+  yet for Qwen3.8-Flash-Next (`qwen4exp`, any quant) or with a `--device 0,1` split: those decode without drafts.
 - `--chunk`, `--threads` prefill chunk size and CPU expert threads. On a GPU `--threads` defaults to the physical
   core count (SMT siblings only add contention; on the 6-core/12-thread reference machine 6 beats 12 by ~20%).
   `rustingstrata calibrate` measures the best chunk and later runs read it from

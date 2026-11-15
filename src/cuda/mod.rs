@@ -411,12 +411,19 @@ pub fn cfg(grid: (u32, u32), block: u32, smem: u32) -> LaunchConfig {
 }
 
 /// Launch kernel `$name` with `cfg`; every argument is evaluated into a local so the builder can borrow it.
+/// `STRATA_CUDA_SYNC`: wait for every kernel right after its launch, so a device error (reported at the next sync
+/// otherwise) names the kernel that raised it. Debugging only: no graphs, and every launch pays a stream sync.
+static SYNC_EACH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("STRATA_CUDA_SYNC").is_some());
+
 macro_rules! launch {
     ($g:expr, $name:expr, $cfg:expr, $($a:expr),* $(,)?) => {{
         let f = $g.f($name);
         let mut b = $g.st().launch_builder(f);
         $( let v = $a; b.arg(&v); )*
         unsafe { b.launch($cfg) }.with_context(|| format!("launch {}", $name))?;
+        if *SYNC_EACH {
+            $g.stream.synchronize().and_then(|_| $g.side.synchronize()).with_context(|| format!("kernel {} failed", $name))?;
+        }
     }};
 }
 
@@ -805,7 +812,7 @@ impl Backend for Gpu {
         // Each graph holds device memory, and `step_rows` keys one per combination of slots: past the cap a forward
         // runs uncaptured (16 slots otherwise ran the device out of memory).
         // ponytail: a fixed cap; key the graphs without slot numbers if many slots need the graphs' speed.
-        if std::env::var_os("STRATA_NO_GRAPH").is_some() || self.graphs.lock().unwrap().len() >= GRAPHS_MAX { return f(); }
+        if *SYNC_EACH || std::env::var_os("STRATA_NO_GRAPH").is_some() || self.graphs.lock().unwrap().len() >= GRAPHS_MAX { return f(); }
         self.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
         let r = f();
         let g = self.stream.end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)?;
