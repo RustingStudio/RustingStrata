@@ -37,6 +37,31 @@ impl Vk {
         }
         eprintln!("vulkan: shared-memory preflight: {n} (kernel, specialization) pairs checked, largest {} bytes \
             ({}) of {} allowed, {:.1} ms", worst.0, worst.1, self.0.smem_limit, t0.elapsed().as_secs_f64() * 1e3);
+        if !verbose {
+            let mut st = self.0.st();
+            for &ty in types {
+                let ws = self.wspec(ty);
+                if !matches!(ty, GgmlType::F32 | GgmlType::BF16) {
+                    for nt in [1u32, 3, 5, 9, 17] {
+                        let _ = self.0.pipeline(&mut st, "gemv_q", &[&ws[..], &[nt]].concat());
+                    }
+                    let _ = self.0.pipeline(&mut st, "moe_gemv_q", &ws);
+                    let _ = self.0.pipeline(&mut st, "moe_down_combine", &ws);
+                } else {
+                    for nt in [1u32, 3, 5, 9, 17] {
+                        for wpb in [1u32, 8] {
+                            let _ = self.0.pipeline(&mut st, "gemv_f", &[&ws[..], &[nt, 32 * wpb]].concat());
+                        }
+                    }
+                }
+            }
+            for name in ["moe_combine", "deltanet", "conv_silu", "conv_seq", "conv_state", "l2_norm", "norm_gate", "moe_route", "argmax_rows", "attn_merge"] {
+                let _ = self.0.pipeline(&mut st, name, &[]);
+            }
+            for name in ["rms_norm", "swiglu_q", "quant_xq"] {
+                let _ = self.0.pipeline(&mut st, name, &[self.0.llama]);
+            }
+        }
         Ok(())
     }
 

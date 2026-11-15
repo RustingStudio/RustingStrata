@@ -20,6 +20,8 @@ pub(super) struct Scratch {
     pub chunk: usize,
     lay: Lay,
     slab: Buf,
+    /// `[chunk, 3 * n_embd]` hidden states captured before EAGLE3 `extract_layers`.
+    feat: Option<Buf>,
     /// ids | xrow | inv, `chunk * k` each.
     ints: Buf,
     tiles: Buf,
@@ -63,19 +65,37 @@ impl Scratch {
         let n_tiles = 3 * (chunk * k / GEMM_BM + 2 * c.n_expert);
         Ok(Scratch {
             chunk, lay: Lay { h, a, b, c: c2, d, e, rl, wts, ge, ye, shg, shy, sg, xn, lo, hg, pk, pq, pg, pn, pv, inj, mix, mo, emb },
-            slab: gpu.zeros::<f32>(total)?, ints: gpu.zeros::<i32>(3 * chunk * k)?, tiles: gpu.zeros::<u64>(2 * n_tiles)?,
+            slab: gpu.zeros::<f32>(total)?,
+            feat: if c.eagle3.is_some() { Some(gpu.zeros::<f32>(3 * ne * chunk)?) } else { None },
+            ints: gpu.zeros::<i32>(3 * chunk * k)?, tiles: gpu.zeros::<u64>(2 * n_tiles)?,
             staging: gpu.zeros::<u8>(if c.is_moe() { 3 * STAGE * stage_bytes } else { 0 })?,
         })
     }
 
     /// Bytes of VRAM this scratch takes.
-    pub fn bytes(&self) -> usize { self.slab.len() + self.ints.len() + self.tiles.len() + self.staging.len() }
+    pub fn bytes(&self) -> usize { self.slab.len() + self.feat.as_ref().map_or(0, Buf::len) + self.ints.len() + self.tiles.len() + self.staging.len() }
 }
 
 impl GpuModel<'_> {
     /// Run `tokens` from the current position; returns the logits after the last one. Short prompts (and models
     /// loaded without a prefill chunk) go through the decode step.
-    pub fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> { self.prefill_with(tokens, &mut |_| Ok(())) }
+    pub fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+        if self.prompt_cache_path.is_some() && self.pos == 0 && tokens.len() > 1 {
+            let t0 = std::time::Instant::now();
+            let (logits, reused) = self.prefill_cached(tokens, 0, tokens.len() - 1)?;
+            if reused > 0 {
+                eprintln!(
+                    "warm start: reused {reused}/{} prompt tokens from cache (TTFT {:.1} ms)",
+                    tokens.len(),
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            return Ok(logits);
+        }
+        let r = self.prefill_with(tokens, &mut |_| Ok(()))?;
+        if let Some(ng) = self.ngram.as_mut() { ng.begin(tokens); }
+        Ok(r)
+    }
 
     /// `prefill`, calling `between` between two chunks (`serve --parallel` decodes the other slots there; it must
     /// leave the current slot's state alone).
@@ -148,8 +168,13 @@ impl GpuModel<'_> {
             self.prefill_with(&tokens[from..keep], between)?;
             self.save_state()?;
             (self.saved_ids, self.saved_owner) = (tokens[..keep].to_vec(), self.owner);
+            if let Err(e) = self.sync_saved_to_prompt_cache() {
+                eprintln!("warning: could not save prompt cache: {e:#}");
+            }
         }
-        Ok((self.prefill_with(&tokens[keep..], between)?, reused))
+        let logits = self.prefill_with(&tokens[keep..], between)?;
+        if let Some(ng) = self.ngram.as_mut() { ng.begin(tokens); }
+        Ok((logits, reused))
     }
 
     /// The start of `prefill_cached`: return to the longest state (saved, stashed or parked) that `tokens[..keep]`
@@ -230,7 +255,7 @@ impl GpuModel<'_> {
         let mut logits = Vec::new();
         // Hyper-connection models: TMAX tokens per forward (prompts too short for the chunked GEMM prefill).
         if self.m.cfg.hc_n > 0 {
-            for ch in tokens.chunks(crate::cpu_worker::TMAX) { logits = self.verify(ch)?.pop().unwrap(); }
+            for ch in tokens.chunks(self.tmax()) { logits = self.verify(ch)?.pop().unwrap(); }
             return Ok(logits);
         }
         for &t in tokens {
@@ -279,7 +304,8 @@ impl GpuModel<'_> {
         let kv = nkv * hd;
         // The draft head runs as one more layer on the chunk while it is in step with the main model.
         let fill = self.mtp_synced();
-        let mtp = self.mtp.as_ref().filter(|_| fill);
+        let is_eagle = self.mtp.as_ref().is_some_and(|mh| mh.eagle.is_some());
+        let mtp = self.mtp.as_ref().filter(|mh| fill && mh.eagle.is_none());
         // STRATA_NAN_TRACE[=N]: from position N (default 0), one line per layer with the largest magnitude of each intermediate buffer, and the first
         // row of one holding a non-finite value. Each probe waits for the GPU: diagnostic runs only.
         let trace = std::env::var("STRATA_NAN_TRACE").is_ok_and(|v| self.pos >= v.parse::<usize>().unwrap_or(0));
@@ -293,6 +319,15 @@ impl GpuModel<'_> {
             Ok(())
         };
         for (il, ly) in self.layers.iter().enumerate().map(|(i, ly)| (self.first + i, ly)).chain(mtp.map(|mh| (c.n_layer, &mh.layer))) {
+            if il < c.n_layer {
+                if let (Some(pff), Some(eg)) = (&pf.feat, self.mtp.as_ref().and_then(|mh| mh.eagle.as_ref()).filter(|_| fill)) {
+                    if let Some(idx) = eg.cfg.extract_layers.iter().position(|&el| el == il) {
+                        for r in 0..t {
+                            g.dtod(&pf.slab, 4 * r * ne, pff, 4 * (r * 3 + idx) * ne, 4 * ne)?;
+                        }
+                    }
+                }
+            }
             if let Some(mh) = mtp.filter(|_| il == c.n_layer) {
                 // Its entry for token i pairs the token with the hidden state before it (`mtp_run`): h gets the last
                 // hidden state of the previous chunk, then rows 0..t - 1; the first token of the sequence has none.
@@ -305,7 +340,7 @@ impl GpuModel<'_> {
                 t -= skip;
                 g.rms_norm(x, ne, mh.enorm.ptr, at(l.a), 2 * ne, ne, t, eps)?;
                 g.rms_norm(h, ne, mh.hnorm.ptr, at(l.a + ne), 2 * ne, ne, t, eps)?;
-                g.gemm_dense(&mh.eh_proj, t, at(l.a), 2 * ne, x, ne, 0)?;
+                g.gemm_dense(mh.eh_proj.as_ref().unwrap(), t, at(l.a), 2 * ne, x, ne, 0)?;
                 g.put(&[mh.pos as i32, 0], &self.step_buf, 2)?;
                 g.put(&[mh.pos as i32 + self.rope_offset, 0], &self.rope_buf, 2)?;
                 step += 8;
@@ -567,10 +602,30 @@ impl GpuModel<'_> {
             if trace { eprintln!("nan-trace pos {} layer {il}:{tr}", self.pos); tr.clear(); }
             g.kick()?;
         }
-        match self.mtp.as_mut() {
-            Some(mh) if fill => mh.pos += t,
-            // Row 0 of `x` gets the last hidden state (with the draft head, the copy above did it).
-            _ => g.dtod(&pf.slab, 4 * (t - 1) * d, &self.x, 0, 4 * d)?,
+        if fill && is_eagle {
+            g.dtod(&pf.slab, 4 * (t - 1) * d, &self.x, 0, 4 * d)?;
+            let (lh, slab_h, old_cur_g) = {
+                let pf = self.pf.as_ref().unwrap();
+                let eg = self.mtp.as_ref().unwrap().eagle.as_ref().unwrap();
+                self.gpu.gemm_dense(&eg.fc, t, pf.feat.as_ref().unwrap().addr(), 3 * ne, pf.slab.addr() + 4 * l.h as u64, ne, 0)?;
+                (l.h, pf.slab.addr() + 4 * l.h as u64, eg.cur_g.addr())
+            };
+            if self.pos > 0 {
+                self.mtp_run(&toks[..1], old_cur_g, false)?;
+            }
+            let tm = self.tmax();
+            for (off, ch) in toks[1..].chunks(tm).enumerate() {
+                self.mtp_run(ch, slab_h + 4 * (off * tm * ne) as u64, false)?;
+            }
+            let pf = self.pf.as_ref().unwrap();
+            let eg = self.mtp.as_ref().unwrap().eagle.as_ref().unwrap();
+            self.gpu.dtod(&pf.slab, 4 * (lh + (t - 1) * ne), &eg.cur_g, 0, 4 * ne)?;
+        } else {
+            match self.mtp.as_mut() {
+                Some(mh) if fill => mh.pos += t,
+                // Row 0 of `x` gets the last hidden state (with the draft head, the copy above did it).
+                _ => g.dtod(&pf.slab, 4 * (t - 1) * d, &self.x, 0, 4 * d)?,
+            }
         }
         self.pos += toks.len();
         let Some(nx) = self.next.as_deref_mut() else { return Ok(()) };

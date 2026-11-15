@@ -329,6 +329,8 @@ pub trait Backend: Send {
     fn moe_combine(&self, x: u64, ye: u64, w: u64, k: usize, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, slots: u64, n: usize, t: usize) -> anyhow::Result<()>;
     /// Whether `moe_route`/`moe_combine` accept `mb = 0`, i.e. a fully resident expert cache costs the CPU worker
     /// nothing (no mailbox traffic at all). False where the kernels read the mailbox unconditionally (Vulkan).
+    /// Most tokens of one `gemvn`/verify forward: 4 unless the backend's kernels take `cpu_worker::TMAX`.
+    fn verify_rows(&self) -> usize { 4 }
     fn moe_mailbox_optional(&self) -> bool { false }
 
     /// Whether `moe_prefetch` does anything here (CUDA: yes; Vulkan: no kernel, the knob is ignored).

@@ -6,6 +6,7 @@
 // sums in shared memory, then invocation i combines row r0 + i as moe_combine does (same order, same result).
 layout(local_size_x = 256) in;
 #include "common.glsl"
+#define SHARED_TABLES
 #include "deq.glsl"
 #extension GL_EXT_integer_dot_product : require
 #extension GL_EXT_control_flow_attributes : require
@@ -15,7 +16,7 @@ layout(push_constant) uniform P { U8 w; I32 slots; U32 xq; uint64_t stride; F32 
 
 void sb_step(U8 w, F32 xd, uint row, uint lane, uint t, uint s, inout precise float acc) {
     uint lo, hi; float d, m;
-    qw(w, (row * p.nsb + s) * SBB, lane, lo, hi, d, m);
+    qw_sb(w, (row * p.nsb + s) * SBB, lane, lo, hi, d, m);
     uint o = (t * p.nsb + s) * 64 + lane * 2, a = p.xq.v[o], c = p.xq.v[o + 1];
     int dot = dotPacked4x8EXT(int(lo), int(a)) + dotPacked4x8EXT(int(hi), int(c));
     int sx = dotPacked4x8EXT(0x01010101, int(a)) + dotPacked4x8EXT(0x01010101, int(c));
@@ -24,11 +25,29 @@ void sb_step(U8 w, F32 xd, uint row, uint lane, uint t, uint s, inout precise fl
     if (MIN) acc = fma(-(m * dx), float(sx), acc);  // types with a min
 }
 
+void sb_step2(U8 w, F32 xd, uint row0, uint row1, uint lane, uint t, uint s, inout precise float acc0, inout precise float acc1) {
+    uint lo0, hi0, lo1, hi1; float d0, m0, d1, m1;
+    qw_sb(w, (row0 * p.nsb + s) * SBB, lane, lo0, hi0, d0, m0);
+    qw_sb(w, (row1 * p.nsb + s) * SBB, lane, lo1, hi1, d1, m1);
+    uint o = (t * p.nsb + s) * 64 + lane * 2, a = p.xq.v[o], c = p.xq.v[o + 1];
+    float dx = xd.v[(t * p.nsb + s) * 8 + (lane >> 2)];
+    int dot0 = dotPacked4x8EXT(int(lo0), int(a)) + dotPacked4x8EXT(int(hi0), int(c));
+    int dot1 = dotPacked4x8EXT(int(lo1), int(a)) + dotPacked4x8EXT(int(hi1), int(c));
+    acc0 = fma(d0 * dx, float(dot0), acc0);
+    acc1 = fma(d1 * dx, float(dot1), acc1);
+    if (MIN) {
+        int sx = dotPacked4x8EXT(0x01010101, int(a)) + dotPacked4x8EXT(0x01010101, int(c));
+        acc0 = fma(-(m0 * dx), float(sx), acc0);
+        acc1 = fma(-(m1 * dx), float(sx), acc1);
+    }
+}
+
 #include "mb_wait.glsl"
 const uint RPW = 8;  // rows per workgroup (rpw) at most
 shared float part[32 * RPW];
 shared bool miss, ok;
 void main() {
+    load_tables();
     uint tk = gl_WorkGroupID.y, k = p.k, lane = LANE, n = p.rows;
     uint rpw = p.rpw, r0 = gl_WorkGroupID.x * rpw;
     F32 xd = F32(uint64_t(p.xq) + p.ntok * p.nsb * 256);
@@ -37,10 +56,19 @@ void main() {
         int e = p.slots.v[t];
         if (e < 0) continue;  // a miss: weight 0, the CPU's result is added below
         U8 w = U8(uint64_t(p.w) + uint64_t(e) * p.stride);
-        for (uint i = 0; i < rpw && r0 + i < n; i++) {
+        uint i = 0;
+        for (; i + 1 < rpw && r0 + i + 1 < n; i += 2) {
+            precise float acc0 = 0.0, acc1 = 0.0;
+            uint s = 0;
+            for (; s + 2 <= p.nsb; s += 2) [[unroll]] for (uint q = 0; q < 2; q++) sb_step2(w, xd, r0 + i, r0 + i + 1, lane, t, s + q, acc0, acc1);
+            for (; s < p.nsb; s++) sb_step2(w, xd, r0 + i, r0 + i + 1, lane, t, s, acc0, acc1);
+            acc0 = warp_sum(acc0); acc1 = warp_sum(acc1);
+            if (lane == 0) { part[j * RPW + i] = acc0; part[j * RPW + i + 1] = acc1; }
+        }
+        for (; i < rpw && r0 + i < n; i++) {
             precise float acc = 0.0;
             uint s = 0;
-            for (; s + 4 <= p.nsb; s += 4) [[unroll]] for (uint q = 0; q < 4; q++) sb_step(w, xd, r0 + i, lane, t, s + q, acc);
+            for (; s + 2 <= p.nsb; s += 2) [[unroll]] for (uint q = 0; q < 2; q++) sb_step(w, xd, r0 + i, lane, t, s + q, acc);
             for (; s < p.nsb; s++) sb_step(w, xd, r0 + i, lane, t, s, acc);
             acc = warp_sum(acc);
             if (lane == 0) part[j * RPW + i] = acc;
