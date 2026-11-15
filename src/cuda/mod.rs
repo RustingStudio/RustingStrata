@@ -109,6 +109,9 @@ struct Tune {
     gemv_loadw: usize,
 }
 
+/// Graphs kept by `Gpu::graph`.
+const GRAPHS_MAX: usize = 32;
+
 impl Tune {
     /// The shipped values: `GEMM_BK = 64`, no minimum-block hint, the byte-for-byte `QI` load widths.
     #[cfg(test)]
@@ -829,7 +832,10 @@ impl Backend for Gpu {
     /// CUDA graph captured from the stream. `STRATA_NO_GRAPH` runs `f` every time instead.
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
         if let Some(g) = self.graphs.lock().unwrap().get(&key) { return Ok(g.0.launch()?); }
-        if std::env::var_os("STRATA_NO_GRAPH").is_some() { return f(); }
+        // Each graph holds device memory, and `step_rows` keys one per combination of slots: past the cap a forward
+        // runs uncaptured (16 slots otherwise ran the device out of memory).
+        // ponytail: a fixed cap; key the graphs without slot numbers if many slots need the graphs' speed.
+        if std::env::var_os("STRATA_NO_GRAPH").is_some() || self.graphs.lock().unwrap().len() >= GRAPHS_MAX { return f(); }
         self.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
         let r = f();
         let g = self.stream.end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)?;
