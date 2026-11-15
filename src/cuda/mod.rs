@@ -581,7 +581,8 @@ impl Gpu {
         let grid = (rows.div_ceil(64) as u32, n_tiles as u32);
         // A dense GEMM of few blocks (hc_*_inject: 4 rows, 8 blocks) runs as gemms_*/gemmis_*, 32 positions a block
         // instead of 128: four times the blocks, the same sums.
-        let sm = tiles == 0 && grid.0 * grid.1 < 112;
+        // So does one of at most 32 positions (batched decode): the same blocks, a quarter of the positions in each.
+        let sm = tiles == 0 && (grid.0 * grid.1 < 112 || nd <= 32);
         let grid = if sm { (grid.0, nd.div_ceil(32) as u32) } else { grid };
         let (same, act) = (act & SAME_X != 0, act & !SAME_X);
         let mut q8 = self.q8.lock().unwrap();
