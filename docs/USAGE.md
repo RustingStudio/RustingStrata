@@ -6,10 +6,18 @@ Everything here applies to `rustingstrata chat`, `generate`, `bench` and `serve`
 ## Chat page
 
 `rustingstrata` with no arguments starts the server on http://127.0.0.1:8080 and opens a chat page. The page keeps chats in
-the browser, downloads models from Hugging Face (Models and settings; `HF_TOKEN` for gated repos), switches between the
+the browser, downloads models from Hugging Face (settings; `HF_TOKEN` for gated repos), switches between the
 models in the models folder (`%LOCALAPPDATA%\rusting_strata\models` on Windows, `~/.local/share/rusting_strata/models`
 elsewhere, or `serve --models-dir`), and shows context use, speed, totals, and CPU, memory and graphics memory use of
-the server.
+the server (status bar at the bottom; click it for details).
+
+Messages can be edited and resent, deleted, regenerated, and a reply that stopped at the token limit or was stopped by
+hand can be continued. Settings hold the sampler values (`temperature`, `top_p`, `top_k`, `seed`, stop strings, max
+tokens; empty fields leave the server's flags in effect), named presets, instructions for one chat, and export of chats
+as Markdown or JSON and import of a JSON export. The models tab also holds load options (`--ctx`, `--kv`, `--cache-ram`,
+`--vram-margin`, `--mtp`, `--chunk`): "apply and reload" loads the model again with them, and they stay until the server
+restarts (`POST /api/load` takes them as `options`, admin key only). Open the page with `#selftest` at the end of the address to run its
+built-in checks.
 
 ## Flags
 
@@ -35,6 +43,8 @@ the server.
   RTX 3060, 41 each; see [HOSTING.md](HOSTING.md)).
 - `temperature`, `top_k`, `top_p` and `seed` are honored; decoding is greedy when they are left out.
 - `max_tokens` (or `max_completion_tokens`) and `stop` (up to 16 strings) work as in the OpenAI API; `n` must be 1.
+- A request whose last message has role `assistant` (and no tool calls) continues that message: the reply holds only
+  the new text. The chat page's continue button uses this.
 - Thinking is on by default (`--think false` turns it off). A request overrides it with `chat_template_kwargs.enable_thinking`
   (Anthropic: `thinking: {"type": "enabled"}`; `enable_thinking: false` turns it off for that request).
 - `tools` and `tool_choice` work as in the OpenAI API: calls come back as `tool_calls` with `finish_reason:
