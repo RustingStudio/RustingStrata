@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+mod nvrtc;
+
 const QTYPES: [GgmlType; 24] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, Q4_1, Q5_1, Q4_0, Q5_0]
@@ -199,18 +201,6 @@ fn attn_prefill_smem_bk(hd: usize, bk: usize) -> usize {
     2 * (FA_BQ + 2 * bk) * pq + 2 * FA_BQ * (bk + ATTN_SMEM_PAD)
 }
 
-/// The NVRTC version `libloading` actually resolves, or `None` when the library is absent or `nvrtcVersion` fails.
-/// Device-free: no `libcuda` call, so it also works in a CPU-only test.
-fn nvrtc_version() -> Option<(i32, i32)> {
-    if !unsafe { cudarc::nvrtc::sys::is_culib_present() } { return None; }
-    // A library without `nvrtcVersion` makes cudarc's loader panic: turn that into `None` rather than crash.
-    std::panic::catch_unwind(|| {
-        let (mut major, mut minor) = (0, 0);
-        let r = unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor) };
-        (r == cudarc::nvrtc::sys::nvrtcResult::NVRTC_SUCCESS).then_some((major, minor))
-    }).ok().flatten()
-}
-
 /// The user-facing error for a device `cc` with an NVRTC that cannot target it, `None` when the pair is fine.
 /// CUDA 13 dropped Volta (and older), not Turing, so an sm_70 device must be compiled by NVRTC 12.x; saying it here keeps NVRTC's own
 /// `invalid value for --gpu-architecture` from being the first thing the user sees.
@@ -380,7 +370,7 @@ fn cache_key(src: &str, arch: &str, nvrtc: &str) -> u64 {
 /// covers `(src, arch, NVRTC version)`; when NVRTC cannot be loaded the tag is `"unverified"`, so a cache entry is
 /// no longer reusable and the run reports the missing library instead of silently reusing a cubin.
 fn ptx(src: &str, arch: &'static str, cc: (i32, i32)) -> anyhow::Result<Ptx> {
-    let nvrtc = nvrtc_version();
+    let nvrtc = nvrtc::version();
     // A device/NVRTC mismatch is fatal: no "CUDA init" context, or `backend::open` and the tests swallow it as a skip.
     if let Some(nv) = nvrtc {
         if let Some(msg) = arch_support_error(cc, nv) {
@@ -397,36 +387,13 @@ fn ptx(src: &str, arch: &'static str, cc: (i32, i32)) -> anyhow::Result<Ptx> {
         let _ = std::fs::File::options().append(true).open(&path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
         return Ok(Ptx::from_binary(b));
     }
-    // cudarc panics on a missing library; "CUDA init" lets `backend::open` fall back to Vulkan.
-    if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
-        return Err(anyhow::anyhow!(
-            "the NVRTC library (libnvrtc.so) is not installed; sm_70 needs the CUDA 12.x toolkit/NVRTC (13.x dropped Volta support)"
-        )).context("CUDA init");
-    }
+    // "CUDA init" lets `backend::open` fall back to Vulkan.
+    if !nvrtc::present() { return Err(nvrtc::missing()).context("CUDA init"); }
     prune_ptx(&dir, std::time::Duration::from_secs(7 * 86400));
     eprintln!("compiling CUDA kernels for {arch} with NVRTC {tag} (first run only, ~15 s)");
-    let b = cubin(src, arch)?;
+    let b = nvrtc::cubin(src, arch)?;
     let _ = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &b));
     Ok(Ptx::from_binary(b))
-}
-
-fn cubin(src: &str, arch: &str) -> anyhow::Result<Vec<u8>> {
-    use cudarc::nvrtc::{result as nr, sys as ns};
-    let c = std::ffi::CString::new(src)?;
-    let prog = nr::create_program(&c, None)?;
-    let out = (|| unsafe {
-        if let Err(e) = nr::compile_program(prog, &[format!("--gpu-architecture={arch}"), "-std=c++17".into()]) {
-            let log = nr::get_program_log(prog).map(|l| std::ffi::CStr::from_ptr(l.as_ptr()).to_string_lossy().into_owned());
-            bail!("NVRTC compile of kernels.cu failed: {e}\n{}", log.unwrap_or_default());
-        }
-        let mut n = 0;
-        ns::nvrtcGetCUBINSize(prog, &mut n).result()?;
-        let mut b = vec![0u8; n];
-        ns::nvrtcGetCUBIN(prog, b.as_mut_ptr() as *mut std::ffi::c_char).result()?;
-        Ok(b)
-    })();
-    unsafe { nr::destroy_program(prog) }?;
-    out
 }
 
 /// Delete cached `.ptx`/`.cubin` files in `dir` not used for `age`; every kernel edit leaves a stale file behind.
@@ -460,7 +427,7 @@ impl Gpu {
         let kv_q8 = kv_q8();
         anyhow::ensure!(!(kv_q8 && llama_numerics()), "--kv q8 does not combine with --llama-numerics (its attention reads f16 KV)");
         if !unsafe { sys::is_culib_present() } {
-            return Err(anyhow::anyhow!("no NVIDIA driver (libcuda.so)")).context("CUDA init");
+            return Err(anyhow::anyhow!(if cfg!(windows) { "no NVIDIA driver (nvcuda.dll)" } else { "no NVIDIA driver (libcuda.so)" })).context("CUDA init");
         }
         let ctx = CudaContext::new(device).context("CUDA init")?;
         unsafe { ctx.disable_event_tracking() };
@@ -1188,18 +1155,18 @@ mod tests {
     /// The resolved NVRTC is the host's 12.9; a machine without NVRTC skips (documented, not ignored).
     #[test]
     fn nvrtc_version_is_detected() {
-        if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
+        if !super::nvrtc::present() {
             eprintln!("skipping: NVRTC library not present");
             return;
         }
-        assert!(super::nvrtc_version().is_some_and(|v| v.0 >= 12), "{:?}", super::nvrtc_version());
+        assert!(super::nvrtc::version().is_some_and(|v| v.0 >= 12), "{:?}", super::nvrtc::version());
     }
 
     /// R2/R4 with no device and no model: 12.9 accepts a trivial kernel for sm_70.
     #[test]
     fn nvrtc_compiles_trivial_kernel_for_sm70() {
-        if !unsafe { cudarc::nvrtc::sys::is_culib_present() } || super::nvrtc_version().is_none_or(|v| v.0 != 12) { return; }
-        super::cubin(SRC, "sm_70").expect("NVRTC 12.x must compile for sm_70 without a GPU");
+        if !super::nvrtc::present() || super::nvrtc::version().is_none_or(|v| v.0 != 12) { return; }
+        super::nvrtc::cubin(SRC, "sm_70").expect("NVRTC 12.x must compile for sm_70 without a GPU");
     }
 
     /// M1-T2..M1-T6, CPU-only (no device, no model, no `STRATA_MODEL`): the full generated source must produce a
@@ -1208,11 +1175,11 @@ mod tests {
     /// The sm_80 cubin is the compile-level proof that the `#else` tensor-core path is unaffected.
     #[test]
     fn nvrtc_compiles_full_source_for_sm70() {
-        if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
+        if !super::nvrtc::present() {
             eprintln!("skipping: NVRTC library not present");
             return;
         }
-        match super::nvrtc_version() {
+        match super::nvrtc::version() {
             Some((12, _)) => {}
             v => {
                 eprintln!("skipping: NVRTC {v:?} is not 12.x; CUDA 13.x cannot target sm_70 and its diagnostics differ");
@@ -1220,25 +1187,25 @@ mod tests {
             }
         }
         let src = super::source(false, true);
-        super::cubin(&src, "sm_70").unwrap_or_else(|e| panic!("sm_70 must compile: M1-T4 removed the last blocker: {e:#}"));
-        super::cubin(&src, "sm_80").expect("the sm_80 path must keep compiling (cubin for sm_80)");
+        super::nvrtc::cubin(&src, "sm_70").unwrap_or_else(|e| panic!("sm_70 must compile: M1-T4 removed the last blocker: {e:#}"));
+        super::nvrtc::cubin(&src, "sm_80").expect("the sm_80 path must keep compiling (cubin for sm_80)");
         // Same sm_70 source with the FMA fallback selected: both variants must produce a cubin (M2-T1).
-        super::cubin(&super::source(false, false), "sm_70").expect("the STRATA_GEMM_FMA sm_70 source must compile");
+        super::nvrtc::cubin(&super::source(false, false), "sm_70").expect("the STRATA_GEMM_FMA sm_70 source must compile");
         // M2-T3 candidates C2 (`__launch_bounds__(·, 2)`) and C3 (`GEMM_BK = 32`) must compile before the window.
         let c23 = super::source_with(false, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2, ..super::Tune::def() });
-        super::cubin(&c23, "sm_70").expect("the C2/C3 candidate tiles must compile for sm_70");
+        super::nvrtc::cubin(&c23, "sm_70").expect("the C2/C3 candidate tiles must compile for sm_70");
         // M2-T5 load-width candidate: one 16-byte Q4_K header load in the GEMV path must compile for both arches.
         let lw = super::source_with(false, true, super::Tune { gemv_loadw: 1, ..super::Tune::def() });
-        super::cubin(&lw, "sm_70").expect("the GEMV_LOADW candidate must compile for sm_70");
-        super::cubin(&lw, "sm_80").expect("the GEMV_LOADW candidate must compile for sm_80");
+        super::nvrtc::cubin(&lw, "sm_70").expect("the GEMV_LOADW candidate must compile for sm_70");
+        super::nvrtc::cubin(&lw, "sm_80").expect("the GEMV_LOADW candidate must compile for sm_80");
     }
 
     /// Compile-only check of the Turing (sm_75) source: m16n8k8 `mma16816`, 16-key head_dim 256 prefill tile, no m8n8k4.
     #[test]
     fn nvrtc_compiles_full_source_for_sm75() {
-        if !unsafe { cudarc::nvrtc::sys::is_culib_present() } { return; }
-        super::cubin(&super::source(false, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 must compile: {e:#}"));
-        super::cubin(&super::source(true, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q8 must compile: {e:#}"));
+        if !super::nvrtc::present() { return; }
+        super::nvrtc::cubin(&super::source(false, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 must compile: {e:#}"));
+        super::nvrtc::cubin(&super::source(true, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q8 must compile: {e:#}"));
     }
 
     #[test]

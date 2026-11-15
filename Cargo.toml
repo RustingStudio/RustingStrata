@@ -18,6 +18,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13010"] }
+# Same version cudarc already pulls in; loads NVRTC by our own name list (src/cuda/nvrtc.rs).
+libloading = "0.9"
 ash = "0.38"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
