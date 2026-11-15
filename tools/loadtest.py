@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Load test for `rustingstrata serve --parallel N`.
+"""Load test for `rustingstrata serve --parallel N` (or any OpenAI-compatible server).
 
 Sends C streamed chat requests at once (each with a different prompt, so no request reuses another's cache) and prints
 one line per C: total tok/s, time to first token and per-request decode tok/s.
@@ -14,7 +14,8 @@ TOPICS = ["rivers", "volcanoes", "bridges", "bread", "chess", "tides", "glass", 
 
 def one(url, i, max_tokens, out):
     u = urllib.parse.urlparse(url)
-    body = json.dumps({"stream": True, "max_tokens": max_tokens, "temperature": 0,
+    body = json.dumps({"stream": True, "stream_options": {"include_usage": True}, "max_tokens": max_tokens,
+                       "temperature": 0,
                        "chat_template_kwargs": {"enable_thinking": False},
                        "messages": [{"role": "user", "content":
                                      f"Request {i}. Write a long, detailed essay about {TOPICS[i % len(TOPICS)]}."}]})
