@@ -340,8 +340,11 @@ impl Vk {
         for pd in unsafe { instance.enumerate_physical_devices() }.unwrap_or_default() {
             let p = unsafe { instance.get_physical_device_properties(pd) };
             let name = p.device_name_as_c_str().map_or("?".into(), |s| s.to_string_lossy().into_owned());
-            match unusable(&instance, pd) { None => usable.push((pd, name)), Some(w) => why.push(format!("{name}: {w}")) }
+            match unusable(&instance, pd) { None => usable.push((pd, name, p.device_type)), Some(w) => why.push(format!("{name}: {w}")) }
         }
+        // Discrete GPUs first (stable), so device 0 is the dedicated card, not an integrated GPU that comes first in the driver's list.
+        usable.sort_by_key(|u| match u.2 { vk::PhysicalDeviceType::DISCRETE_GPU => 0, vk::PhysicalDeviceType::INTEGRATED_GPU => 1, _ => 2 });
+        let usable: Vec<_> = usable.into_iter().map(|u| (u.0, u.1)).collect();
         let Some((pd, name)) = usable.get(device).cloned() else {
             unsafe { instance.destroy_instance(None) };
             return Err(anyhow!("no usable Vulkan device {device} ({} usable; {})", usable.len(), why.join("; "))).context("Vulkan init");
