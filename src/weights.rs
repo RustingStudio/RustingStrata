@@ -64,6 +64,7 @@ impl<'a> Tensor<'a> {
 
 pub struct Weights<'a> {
     pub g: &'a Gguf,
+    pub aux_g: Option<&'a Gguf>,
     aliases: &'static [(&'static str, &'static str)],
     /// Loader-owned overrides: synthesized `ssm_beta`/`ssm_alpha` and LoRA-baked tensors.
     pub built: HashMap<String, Tensor<'a>>,
@@ -75,8 +76,12 @@ pub struct Weights<'a> {
 
 impl<'a> Weights<'a> {
     pub fn new(g: &'a Gguf) -> anyhow::Result<Weights<'a>> {
+        Self::new_with_aux(g, None)
+    }
+
+    pub fn new_with_aux(g: &'a Gguf, aux_g: Option<&'a Gguf>) -> anyhow::Result<Weights<'a>> {
         let c = ModelConfig::from_gguf(g)?;
-        let mut w = Weights { g, aliases: c.aliases, built: HashMap::new(), baked: HashMap::new(), lora_baked: std::collections::HashSet::new() };
+        let mut w = Weights { g, aux_g, aliases: c.aliases, built: HashMap::new(), baked: HashMap::new(), lora_baked: std::collections::HashSet::new() };
         // llama.cpp src/models/qwen3next.cpp: per key head group, r = nv / nk beta rows, then r alpha rows.
         for il in 0..c.n_layer {
             let Ok(ba) = w.layer(il, "ssm_ba.weight") else { continue };
@@ -95,21 +100,54 @@ impl<'a> Weights<'a> {
             w.built.insert(format!("blk.{il}.ssm_beta.weight"), Tensor { data: leak(b), ..half });
             w.built.insert(format!("blk.{il}.ssm_alpha.weight"), Tensor { data: leak(a), ..half });
         }
+        // Standalone EAGLE3 draft GGUF: remap layer-0 draft weights onto blk.{n_layer}.* so they never shadow layer 0.
+        if let Some(ag) = aux_g.filter(|ag| ag.tensors.contains_key("fc.weight")) {
+            let nl = c.n_layer;
+            for (name, t) in &ag.tensors {
+                if matches!(name.as_str(), "d2t" | "t2d" | "token_embd.weight") { continue; }
+                let Ok(ty) = GgmlType::from_u32(t.ty) else { continue };
+                let dst = match name.as_str() {
+                    "fc.weight" => format!("blk.{nl}.eagle3.fc.weight"),
+                    "output.weight" => format!("blk.{nl}.eagle3.output.weight"),
+                    "output_norm.weight" => format!("blk.{nl}.nextn.shared_head_norm.weight"),
+                    "blk.0.attn_norm.weight" => format!("blk.{nl}.nextn.enorm.weight"),
+                    "blk.0.attn_norm_2.weight" => format!("blk.{nl}.nextn.hnorm.weight"),
+                    "blk.0.ffn_norm.weight" => format!("blk.{nl}.post_attention_norm.weight"),
+                    _ if name.starts_with("blk.0.") => format!("blk.{nl}.{}", &name["blk.0.".len()..]),
+                    _ => continue,
+                };
+                w.built.insert(dst, Tensor {
+                    ty,
+                    cols: t.dims[0] as usize,
+                    rows: t.dims[1..].iter().product::<u64>() as usize,
+                    data: ag.bytes(t),
+                });
+            }
+        }
         Ok(w)
     }
 
     /// `name` with the architecture's alias for a canonical suffix tried second.
     pub fn get(&self, name: &str) -> anyhow::Result<Tensor<'a>> {
         if let Some(t) = self.built.get(name) { return Ok(*t); }
-        let t = self.g.tensors.get(name)
-            .or_else(|| self.aliases.iter().find_map(|&(c, a)| self.g.tensors.get(&format!("{}{a}", name.strip_suffix(c)?))))
+        let find_t = |g: &'a Gguf| -> Option<(&'a crate::gguf::TensorInfo, &'a Gguf)> {
+            if let Some(t) = g.tensors.get(name) {
+                return Some((t, g));
+            }
+            if let Some(t) = self.aliases.iter().find_map(|&(c, a)| g.tensors.get(&format!("{}{a}", name.strip_suffix(c)?))) {
+                return Some((t, g));
+            }
+            None
+        };
+        let (t, owner_g) = find_t(self.g)
+            .or_else(|| self.aux_g.and_then(find_t))
             .with_context(|| format!("missing tensor {name}"))?;
         let ty = GgmlType::from_u32(t.ty).with_context(|| format!("tensor {name}"))?;
         Ok(Tensor {
             ty,
             cols: t.dims[0] as usize,
             rows: t.dims[1..].iter().product::<u64>() as usize,
-            data: self.g.bytes(t),
+            data: owner_g.bytes(t),
         })
     }
 
@@ -161,7 +199,9 @@ impl<'a> Weights<'a> {
     }
     pub fn validate(&self, n_layer: usize) -> anyhow::Result<bool> {
         let mut nextn = true;
-        for t in self.g.tensors.values() {
+        let iter = self.g.tensors.values().chain(self.aux_g.into_iter().flat_map(|ag| ag.tensors.values()));
+        for t in iter {
+            if matches!(t.name.as_str(), "d2t" | "t2d") { continue; }
             if let Err(e) = GgmlType::from_u32(t.ty) {
                 let il = t.name.strip_prefix("blk.").and_then(|r| r.split('.').next()).and_then(|i| i.parse::<usize>().ok());
                 if il.is_some_and(|il| il >= n_layer) { nextn = false; continue; }

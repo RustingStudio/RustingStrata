@@ -6,6 +6,23 @@ use anyhow::{Context, bail};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayerKind { Delta, Attn }
 
+/// Standalone EAGLE3 1-layer draft head parameters.
+#[derive(Clone, Debug)]
+pub struct Eagle3Config {
+    pub extract_layers: [usize; 3],
+    pub n_ff: usize,
+    pub n_head: usize,
+    pub n_head_kv: usize,
+    pub head_dim: usize,
+    pub n_rot: usize,
+    pub rope_base: f32,
+    pub eps: f32,
+    pub draft_vocab: usize,
+    pub norm_before_residual: bool,
+    pub rope_neox: bool,
+    pub d2t: Vec<i32>,
+}
+
 /// What differs between the supported architectures; everything else comes from GGUF metadata.
 struct Arch {
     /// DeltaNet layers with full attention every `full_attention_interval` layers; otherwise all attention.
@@ -88,6 +105,7 @@ pub struct ModelConfig {
     pub q_gate: bool,
     pub k_interleave: bool,
     pub aliases: &'static [(&'static str, &'static str)],
+    pub eagle3: Option<Eagle3Config>,
 }
 
 impl ModelConfig {
@@ -175,6 +193,7 @@ impl ModelConfig {
             k_interleave: a.k_interleave,
             aliases: a.aliases,
             arch,
+            eagle3: None,
         };
         // Kernels divide by these and index value heads by nv / nk key heads.
         let (nk, nv) = (c.ssm_n_group, c.ssm_dt_rank);

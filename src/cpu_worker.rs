@@ -22,8 +22,8 @@ pub const VERDICT: usize = 8;
 pub const DONE: usize = 16;
 pub const IDS: usize = 32;
 
-/// Most tokens one request may carry.
-pub const TMAX: usize = 4;
+/// Most tokens one request may carry (1 current + up to 16 speculative draft tokens).
+pub const TMAX: usize = 17;
 
 /// Per layer: ids, weights and slots for up to TMAX tokens of `k` entries (token t at t * k; the three arrays are
 /// each NTOK * k long), then TMAX activations of `n` floats at `h` and TMAX results at `y`.
