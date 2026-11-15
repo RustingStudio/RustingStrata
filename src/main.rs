@@ -259,6 +259,24 @@ impl Engine {
 
     /// Fills settings not given on the command line from the model's calibration file, else built-in defaults.
     fn ram_cap(&self) -> Option<u64> { memory::ram_cap((self.ram_margin as u64) << 20, (self.max_ram as u64) << 20) }
+    /// A copy with the load options of an `/api/load` body applied (`ctx`, `kv`, `cache_ram`, `vram_margin`, `mtp`,
+    /// `chunk`); a field that is absent or null keeps its value.
+    fn with(&self, v: &serde_json::Value) -> anyhow::Result<Engine> {
+        let num = |k: &str, lo: u64, hi: u64| -> anyhow::Result<Option<usize>> {
+            if v[k].is_null() { return Ok(None); }
+            let n = v[k].as_u64().filter(|n| (lo..=hi).contains(n)).with_context(|| format!("{k} must be a whole number from {lo} to {hi}"))?;
+            Ok(Some(n as usize))
+        };
+        let mut e = self.clone();
+        if let Some(n) = num("ctx", 256, 1 << 20)? { e.ctx = n; }
+        if let Some(n) = num("cache_ram", 0, 1 << 20)? { e.cache_ram = n; }
+        if let Some(n) = num("vram_margin", 0, 1 << 20)? { e.vram_margin = vec![n.to_string()]; }
+        if let Some(n) = num("mtp", 0, 8)? { e.mtp = Some(n); }
+        if let Some(n) = num("chunk", 0, 1 << 20)? { e.chunk = Some(n); }
+        if !v["kv"].is_null() { e.kv = v["kv"].as_str().filter(|k| ["f16", "q8"].contains(k)).context("kv must be f16 or q8")?.into(); }
+        Ok(e)
+    }
+
     fn runner<'a>(&mut self, m: &'a Model<'a>, model: &Path) -> anyhow::Result<Runner<'a>> {
         if let Some(cap) = self.ram_cap() {
             let used = m.ram_estimate() as u64;
@@ -1279,7 +1297,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 });
             });
             let s = Serving { rx: rx.into(), waiting, stop, addr, allowed_hosts, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(),
-                dl: Default::default(), stats };
+                dl: Default::default(), stats, opts: Default::default() };
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
             eprintln!("listening on {url} (models folder: {})", s.dir.display());
@@ -1290,11 +1308,20 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     Some(x) => x,
                     None => match s.serve(None, &engine) { Some((p, w)) => (p, Some(w)), None => return Ok(()) },
                 };
+                // The page's load options stay for later loads; a load that fails takes the old ones back.
+                let old = engine.clone();
+                let o = s.opts.lock().unwrap().take();
+                if !o.is_null() {
+                    engine = engine.with(&o)?;
+                    // `runner` only sets it.
+                    if engine.kv != "q8" { unsafe { std::env::remove_var("STRATA_KV_Q8") } }
+                }
                 match serve_model(&p, engine.clone(), &s, &mut w) {
                     Ok(Some((p, w))) => next = Some((p, Some(w))),
                     Ok(None) => return Ok(()),
                     Err(e) if w.is_none() => return Err(e),
                     Err(e) => {
+                        engine = old;
                         s.stats.lock().unwrap().unload(None);
                         eprintln!("loading {}: {e:#}", p.display());
                         let b = json!({"error": {"message": format!("{e:#}"), "type": "server_error"}}).to_string();
@@ -1594,6 +1621,8 @@ struct Serving {
     /// The Hugging Face download running on its own thread, or the last one.
     dl: std::sync::Arc<std::sync::Mutex<hf::Progress>>,
     stats: std::sync::Arc<std::sync::Mutex<serve::Stats>>,
+    /// Load options of the last /api/load (`Engine::with`), applied before the next model loads.
+    opts: std::sync::Mutex<serde_json::Value>,
 }
 
 /// A flag that SIGTERM sets (instead of ending the process). Never set on Windows.
@@ -1971,14 +2000,19 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
     }
     match (method.as_str(), route) {
         ("GET", "/api/models") => {
-            let models: Vec<_> = s.models().into_iter().map(|(id, p, n)| json!({"id": id, "bytes": n, "loaded": l.as_ref().is_some_and(|l| l.path == p)})).collect();
-            send(&mut w, "200 OK", json!({"dir": s.dir, "models": models}))
+            let models: Vec<_> = s.models().into_iter().map(|(id, p, n)| json!({"id": id, "bytes": n, "image": e.mmproj.is_some() || vision::find_sibling(&p).is_some(), "loaded": l.as_ref().is_some_and(|l| l.path == p)})).collect();
+            // The values in effect: with a model loaded, `chunk` and `mtp` include its calibration.
+            let options = json!({"ctx": e.ctx, "kv": e.kv, "cache_ram": e.cache_ram, "vram_margin": e.vram_margin.join(","), "mtp": e.mtp, "chunk": e.chunk,
+                "gpu": e.gpu, "ctx_train": s.stats.lock().unwrap().ctx_train});
+            send(&mut w, "200 OK", json!({"dir": s.dir, "models": models, "options": options}))
         }
         // Answered once the model has loaded (or failed to).
         ("POST", "/api/load") => {
-            let id = serde_json::from_slice::<serde_json::Value>(&body).ok().and_then(|v| v["model"].as_str().map(String::from)).unwrap_or_default();
+            let v = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default();
+            let id = v["model"].as_str().unwrap_or_default();
+            if let Err(err) = e.with(&v["options"]) { return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})); }
             match s.models().into_iter().find(|m| m.0 == id) {
-                Some((_, p, _)) => { *next = Some((p, w)); Ok(()) }
+                Some((_, p, _)) => { *s.opts.lock().unwrap() = v["options"].clone(); *next = Some((p, w)); Ok(()) }
                 None => send(&mut w, "404 Not Found", json!({"error": {"message": format!("no model {id:?} in {}", s.dir.display()), "type": "not_found"}})),
             }
         }
@@ -2038,7 +2072,10 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             };
             // Room is checked on the full prompt before any state changes.
             let preserve = req.preserve_thinking.unwrap_or(e.preserve_thinking);
-            let prompt = tpl.render(&req.messages, &req.tools, req.think.unwrap_or(e.think_default), preserve, true);
+            // An assistant message at the end is continued, not answered: the prompt stops inside it.
+            let open = tpl.render_open(&req.messages, &req.tools, req.think.unwrap_or(e.think_default), preserve);
+            let n_hist = req.messages.len() - open.is_some() as usize;
+            let prompt = open.unwrap_or_else(|| tpl.render(&req.messages, &req.tools, req.think.unwrap_or(e.think_default), preserve, true));
             // The system and tools block, which compacted or rewritten conversations keep.
             let n_sys = req.messages.iter().take_while(|m| m.role == "system").count();
             let system = tpl.render(&req.messages[..n_sys], &req.tools, req.think.unwrap_or(e.think_default), preserve, false);
@@ -2095,7 +2132,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 if serve::gone(&w) { anyhow::bail!("client closed the connection"); }
                 let (chat_ids, chat_logits, chat_cached) = match &vision_prompt {
                     Some(p) => (p.ids.clone(), r.chat_image(p, &image_input.as_ref().unwrap().embeddings)?, 0),
-                    None => r.chat(tok, &prompt, &tpl.render(&req.messages, &req.tools, req.think.unwrap_or(e.think_default), preserve, false), &system)?,
+                    None => r.chat(tok, &prompt, &tpl.render(&req.messages[..n_hist], &req.tools, req.think.unwrap_or(e.think_default), preserve, false), &system)?,
                 };
                 (_, logits, cached) = (chat_ids, chat_logits, chat_cached);
                 if let Runner::Slot(c) = &*r && let Some(t) = c.started { t0 = t; start(&mut busy); }
@@ -2246,6 +2283,19 @@ mod flag_tests {
     use super::{resolve_flags, vram_margins};
     #[cfg(target_os = "linux")]
     use super::cpu_topology_groups;
+
+    #[test]
+    fn load_options_apply_and_validate() {
+        #[derive(clap::Parser)]
+        struct T { #[command(flatten)] e: super::Engine }
+        let e = <T as clap::Parser>::parse_from(["t"]).e;
+        let n = e.with(&serde_json::json!({"ctx": 8192, "kv": "q8", "mtp": 2, "vram_margin": 256})).unwrap();
+        assert_eq!((n.ctx, n.kv.as_str(), n.mtp, n.vram_margin, n.cache_ram), (8192, "q8", Some(2), vec!["256".to_string()], e.cache_ram));
+        assert_eq!(e.with(&serde_json::Value::Null).unwrap().ctx, e.ctx);
+        for bad in [serde_json::json!({"ctx": 8}), serde_json::json!({"ctx": "big"}), serde_json::json!({"kv": "q4"}), serde_json::json!({"mtp": -1})] {
+            assert!(e.with(&bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn vram_margins_are_per_device() {

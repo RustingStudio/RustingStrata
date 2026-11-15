@@ -15,7 +15,7 @@ fn prompts_match_llama_cpp() {
         for (case, body) in &reqs {
             let q = chat_request(body.dump().as_bytes());
             match want[case].as_str() {
-                Some(w) => { let q = q.unwrap(); assert_eq!(tpl.render(&q.messages, &q.tools, q.think, false, true), w, "{name} {case}") }
+                Some(w) => { let q = q.unwrap(); assert_eq!(tpl.render(&q.messages, &q.tools, q.think.unwrap_or(false), false, true), w, "{name} {case}") }
                 None => assert!(q.is_err(), "{name} {case} should be rejected"),
             }
         }
@@ -134,7 +134,7 @@ fn parses_request() {
     assert_eq!((r.method.as_str(), r.path.as_str(), r.host.as_str(), r.json), ("POST", "/v1/chat/completions", "x", true));
     let q = chat_request(&r.body).unwrap();
     assert_eq!(q.messages, vec![Msg::new("user", "a\nb")]);
-    assert!(q.stream && !q.think);
+    assert!(q.stream && q.think.is_none());
     assert_eq!(q.max_tokens, Some(7));
     assert_eq!((q.temperature, q.top_k, q.top_p, q.seed), (Some(0.7), None, Some(0.8), Some(5)));
     assert!(chat_request(br#"{"messages":[]}"#).is_err());
@@ -471,4 +471,24 @@ fn serve_parallel_smoke() {
         assert!(r.contains("200 OK"), "{r}");
         assert!(r.contains("\"choices\""), "{r}");
     }
+}
+
+#[test]
+fn assistant_last_message_is_continued() {
+    let m = vec![Msg::new("user", "Count to five."), Msg::new("assistant", "One, two,")];
+    let xml = Template::Xml.render_open(&m, &[], false, false).unwrap();
+    assert!(xml.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\nOne, two,"), "{xml}");
+    let js = Template::Json { reasoning: false }.render_open(&m, &[], false, false).unwrap();
+    assert!(js.ends_with("<|im_start|>assistant\nOne, two,"), "{js}");
+    let ds = Template::Ds.render_open(&m, &[], false, false).unwrap();
+    assert!(ds.ends_with("One, two,"), "{ds}");
+    let flint = Template::Flint.render_open(&m, &[], false, false).unwrap();
+    assert!(flint.ends_with("<|assistant|>One, two,"), "{flint}");
+    // Reasoning of the cut-off reply stays in front of its text.
+    let mut r = m.clone();
+    r[1].reasoning = Some("Easy.".into());
+    let xml = Template::Xml.render_open(&r, &[], true, false).unwrap();
+    assert!(xml.ends_with("<think>\nEasy.\n</think>\n\nOne, two,"), "{xml}");
+    // A user-last request is not a continuation.
+    assert_eq!(Template::Xml.render_open(&m[..1], &[], false, false), None);
 }
