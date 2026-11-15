@@ -704,21 +704,23 @@ impl Gpu {
     }
 
     /// attn_decode_gq; attn_merge also writes `out` quantized into xq when not null.
-    fn attn(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64, sel: u64, sst: usize, sink: u64, win: usize) -> anyhow::Result<()> {
+    fn attn(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64, sel: u64, sst: usize, sink: u64, win: usize, kvt: u64, ns1: usize) -> anyhow::Result<()> {
         if ![64, 128, 256, 512].contains(&hd) { bail!("attention head_dim {hd} unsupported (64, 128, 256 or 512)"); }
         let group = nh / nkv;  // query heads per KV head, served by one block (up to 8, G * hd <= 2048)
         let g = [8, 4, 2, 1].into_iter().find(|&g| group % g == 0 && g * hd <= 2048).unwrap();
-        let pz = (nh * ATT_SPLITS * (hd + 2)) as i32;
+        // Rows of several sequences (kvt, `attn_rows`) run the GQA kernel with the caller's split count.
+        let ns = if kvt != 0 { ns1 } else { ATT_SPLITS };
+        let pz = (nh * ns * (hd + 2)) as i32;  // a token's partials, as attn_merge strides them
         // gq_min i32::MAX or 0 fixes the regime, so the kernel that would exit at once is not launched.
-        if gq_min != 0 { launch!(self, &format!("attn_decode_{hd}"), cfg(((nh * nt) as u32, ATT_SPLITS_1 as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32, sink, win as i32); }
+        if gq_min != 0 { launch!(self, &format!("attn_decode_{hd}"), cfg(((nh * nt) as u32, ns1 as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32, sink, win as i32, kvt); }
         // attn_decode_gqa with the f16 cache at head_dim 128 or 256 also holds 2 chunks of K and V for its cp.async,
         // attn_decode_gqa4_128 one. Turing (sm_75) has 64 KB of shared memory a block: the head_dim 256 chunks do
         // not fit, so it loads them through registers instead (kernels.cu ATT_RUN_CP).
         let cp = !self.kv_q8 && (hd == 128 || (hd == 256 && self.int8_mma));
         let g4 = cp && g == 4 && hd == 128;
         let (name, cp) = if g4 { ("attn_decode_gqa4_128".to_string(), 2 * 32 * hd * 2) } else { (format!("attn_decode_gqa_{hd}"), if cp { 2 * 2 * 32 * hd * 2 } else { 0 }) };
-        if gq_min != i32::MAX { launch!(self, &name, cfg(((nh / g * nt) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4 + cp) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32, sink, win as i32); }
-        launch!(self, "attn_merge", LaunchConfig { grid_dim: (nh as u32, 1, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, part, qg, out, hd as i32, ATT_SPLITS as i32, step, ATT_SPLITS_1 as i32, gq_min, xq, sink);
+        if gq_min != i32::MAX { launch!(self, &name, cfg(((nh / g * nt) as u32, ns as u32), 256, (8 * hd * 4 + cp) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32, sink, win as i32, kvt); }
+        launch!(self, "attn_merge", LaunchConfig { grid_dim: (nh as u32, 1, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, part, qg, out, hd as i32, ns as i32, step, ns1 as i32, gq_min, xq, sink);
         Ok(())
     }
 
@@ -974,7 +976,7 @@ impl Backend for Gpu {
         anyhow::ensure!(n_rot <= n.min(512) && n % 32 == 0, "rms_norm_rope: head of {n}, n_rot {n_rot}");
         let fr = self.rope_fr(base, n_rot)?;
         launch!(self, "rms_norm_rope", cfg((rows as u32, 1), 256, 0), x, x_stride as i32, w, out, n as i32, eps, per as i32, n_rot as i32, step, base, v, kc, vc,
-                0i32, 0u64, 0i32, 0u64, 0u64, 0i32, fr);
+                0i32, 0u64, 0i32, 0u64, 0u64, 0i32, fr, 0u64);
         Ok(())
     }
 
@@ -984,8 +986,23 @@ impl Backend for Gpu {
         anyhow::ensure!(n_rot <= n.min(512) && n % 32 == 0, "rms_norm_rope: head of {n}, n_rot {n_rot}");
         let fr = self.rope_fr(base, n_rot)?;
         launch!(self, "rms_norm_rope", cfg(((qrows + krows) as u32, 1), 256, 0), k, n as i32, kw, ko, n as i32, eps, kper as i32, n_rot as i32, step, base, v, kc, vc,
-                qrows as i32, q, q_stride as i32, qw, qo, qper as i32, fr);
+                qrows as i32, q, q_stride as i32, qw, qo, qper as i32, fr, 0u64);
         Ok(())
+    }
+
+    fn kv_rows(&self) -> bool { true }
+
+    fn rms_norm_rope_qk_rows(&self, q: u64, q_stride: usize, qw: u64, qo: u64, nh: usize, k: u64, kw: u64, ko: u64, nkv: usize, hd: usize, eps: f32, n_rot: usize,
+                             step: u64, base: f32, v: u64, kvt: u64, nt: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(n_rot <= hd.min(512) && hd % 32 == 0, "rms_norm_rope: head of {hd}, n_rot {n_rot}");
+        let fr = self.rope_fr(base, n_rot)?;
+        launch!(self, "rms_norm_rope", cfg(((nt * (nh + nkv)) as u32, 1), 256, 0), k, hd as i32, kw, ko, hd as i32, eps, nkv as i32, n_rot as i32, step, base, v, 0u64, 0u64,
+                (nt * nh) as i32, q, q_stride as i32, qw, qo, nh as i32, fr, kvt);
+        Ok(())
+    }
+
+    fn attn_rows(&self, q: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize, sink: u64, win: usize, kvt: u64, splits: usize) -> anyhow::Result<()> {
+        self.attn(q, 0, 0, qg, out, part, step, nh, nkv, hd, scale, 0, nt, 0, 0, 0, sink, win, kvt, splits)
     }
 
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()> {
@@ -1108,12 +1125,12 @@ impl Backend for Gpu {
     /// (ATT_SPLITS_1 splits), from it on one block serves all query heads of a KV head (ATT_SPLITS splits). Both
     /// kernels are launched (only one when gq_min is 0 or i32::MAX); the step decides which one works.
     fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, sink: u64, win: usize) -> anyhow::Result<()> {
-        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, 0, 0, 0, sink, win)
+        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, 0, 0, 0, sink, win, 0, ATT_SPLITS_1)
     }
 
     fn attn_decode_q(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64, sel: u64, sst: usize, sink: u64, win: usize) -> anyhow::Result<u64> {
         let xq = if llama_numerics() { 0 } else { xq };
-        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, xq, sel, sst, sink, win)?;
+        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, xq, sel, sst, sink, win, 0, ATT_SPLITS_1)?;
         Ok(xq)
     }
 

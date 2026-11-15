@@ -1786,10 +1786,16 @@ impl Sched {
     /// One forward over the oldest steps (with more than `TMAX` slots decoding, each waits its turn), in slot order
     /// (fewer graphs to capture).
     fn run(&mut self, g: &mut GpuModel) {
-        let mut batch: Vec<_> = self.steps.drain(..self.steps.len().min(rusting_strata::cpu_worker::TMAX)).collect();
+        // ponytail: fixed row count from which the GEMM forward (`step_batch`) replaces the matvec one; `calibrate`
+        // should measure it per model and machine. STRATA_BATCH_MIN overrides.
+        let min = std::env::var("STRATA_BATCH_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        let big = g.batch_cap() > 0 && self.steps.len() >= min;
+        let cap = if big { g.batch_cap() } else { rusting_strata::cpu_worker::TMAX };
+        let mut batch: Vec<_> = self.steps.drain(..self.steps.len().min(cap)).collect();
         batch.sort_by_key(|s| s.0);
         self.since = if self.steps.is_empty() { None } else { Some(Instant::now() - Self::GATHER) };
-        match g.step_rows(&batch.iter().map(|b| (b.0, b.1, b.2)).collect::<Vec<_>>()) {
+        let rows: Vec<_> = batch.iter().map(|b| (b.0, b.1, b.2)).collect();
+        match if big { g.step_batch(&rows) } else { g.step_rows(&rows) } {
             Ok(rows) => for (b, l) in batch.into_iter().zip(rows) { let _ = b.3.send(Ok(l)); },
             Err(err) => for b in batch { let _ = b.3.send(Err(anyhow::anyhow!("{err:#}"))); },
         }

@@ -138,6 +138,23 @@ impl GpuModel<'_> {
     pub fn prefill_cached_with(&mut self, tokens: &[u32], sys: usize, keep: usize, between: &mut dyn FnMut(&mut Self) -> anyhow::Result<()>)
         -> anyhow::Result<(Vec<f32>, usize)> {
         anyhow::ensure!(sys <= keep && keep < tokens.len(), "prefill_cached: sys {sys}, keep {keep} of {} tokens", tokens.len());
+        let reused = self.cache_begin(tokens, keep)?;
+        if sys > reused {
+            self.prefill_with(&tokens[reused..sys], between)?;
+            self.stash(&tokens[..sys])?;
+        }
+        let from = reused.max(sys);
+        if keep > from {
+            self.prefill_with(&tokens[from..keep], between)?;
+            self.save_state()?;
+            (self.saved_ids, self.saved_owner) = (tokens[..keep].to_vec(), self.owner);
+        }
+        Ok((self.prefill_with(&tokens[keep..], between)?, reused))
+    }
+
+    /// The start of `prefill_cached`: return to the longest state (saved, stashed or parked) that `tokens[..keep]`
+    /// continues, and return its length.
+    fn cache_begin(&mut self, tokens: &[u32], keep: usize) -> anyhow::Result<usize> {
         let (hit, own) = (self.saved_ids.len(), self.owner);
         let stashed = self.sys.as_ref().filter(|_| self.sys_owner == own).map_or(0, |s| if tokens[..keep].starts_with(&s.3) { s.3.len() } else { 0 });
         let extends = hit > 0 && hit >= stashed && self.saved_owner == own && tokens[..keep].starts_with(&self.saved_ids);
@@ -163,17 +180,7 @@ impl GpuModel<'_> {
         // The stash stays valid while its KV entries do: this prompt rewrites them only past `reused`. A parked state
         // brings its own KV, which may have been computed in other chunks.
         if best.is_some() || stashed == 0 && self.sys.as_ref().is_some_and(|s| reused < s.3.len()) { self.sys = None; }
-        if sys > reused {
-            self.prefill_with(&tokens[reused..sys], between)?;
-            self.stash(&tokens[..sys])?;
-        }
-        let from = reused.max(sys);
-        if keep > from {
-            self.prefill_with(&tokens[from..keep], between)?;
-            self.save_state()?;
-            (self.saved_ids, self.saved_owner) = (tokens[..keep].to_vec(), own);
-        }
-        Ok((self.prefill_with(&tokens[keep..], between)?, reused))
+        Ok(reused)
     }
 
     fn step_all(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
@@ -526,5 +533,70 @@ impl GpuModel<'_> {
         let Some(nx) = self.next.as_deref_mut() else { return Ok(()) };
         let xs = self.gpu.get::<f32>(&self.pf.as_ref().unwrap().slab, 0, toks.len() * d)?;
         nx.prefill_chunk(toks, Some((&xs, pe)))
+    }
+
+    /// `step_rows` for up to `batch_cap` distinct slots, on the GEMM kernels of prefill: one decode step a row, each
+    /// row reading and extending its own slot's KV. Faster than `step_rows` forwards from some row count up; its
+    /// logits differ from theirs in the last bits (as prefill's do), so a greedy token at a near-tie can differ.
+    pub fn step_batch(&mut self, rows: &[(usize, u32, bool)]) -> anyhow::Result<Vec<(u32, Vec<f32>)>> {
+        let t = rows.len();
+        let pos: Vec<usize> = rows.iter().map(|&(s, ..)| *self.slot_pos(s)).collect();
+        let res = {
+            let (Some(bt), Some(pf)) = (&self.bt, &self.pf) else { anyhow::bail!("step_batch: this model decodes with step_rows") };
+            anyhow::ensure!((1..=bt.cap).contains(&t) && self.rope_offset == 0, "step_batch: {t} rows");
+            if pos.iter().any(|&p| p >= self.ctx) { anyhow::bail!("context full ({} tokens; raise --ctx)", self.ctx); }
+            let c = &self.m.cfg;
+            let (g, eps, ne, nvoc) = (&self.gpu, c.eps, c.n_embd, c.n_vocab);
+            let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
+            let (kv, qs) = (nkv * hd, if c.q_gate { 2 * hd } else { hd });
+            g.put(&rows.iter().flat_map(|r| self.m.embed(r.1)).collect::<Vec<f32>>(), &pf.slab, 0)?;
+            g.put(&pos.iter().flat_map(|&p| [p as i32, 0]).collect::<Vec<_>>(), &bt.step, 0)?;
+            let mut table = vec![0u64; self.layers.len() * 2 * bt.cap];
+            for (i, ly) in self.layers.iter().enumerate() {
+                let Mixer::Attn { kc, vc, .. } = &ly.mixer else { unreachable!() };
+                for (r, &(sl, ..)) in rows.iter().enumerate() { table[(i * bt.cap + r) * 2..][..2].copy_from_slice(&[kc[sl].addr(), vc[sl].addr()]); }
+            }
+            g.put(&table, &bt.kvt, 0)?;
+            // The GQA kernel in every regime: with many rows the GPU is full of blocks already, so a head group takes
+            // one block per 256 positions of the longest row (64 rows of 130 positions, 36 layers of Qwen3-4B on a
+            // 3060: 17 ms with the splits of `step_rows`, 3.5 ms so).
+            let splits = (pos.iter().max().unwrap() + 1).div_ceil(256).clamp(1, crate::backend::ATT_SPLITS);
+            let base = pf.slab.addr();
+            let at = |o: usize| base + 4 * o as u64;
+            let (l, n, step) = (&pf.lay, pf.chunk, bt.step.addr());
+            let (x, h) = (at(0), at(l.h));
+            let (kraw, kk, vv) = (at(l.c), at(l.c + n * kv), at(l.c + 2 * n * kv));
+            for (i, ly) in self.layers.iter().enumerate() {
+                let (Mixer::Attn { q, k, v, qn, kn, o, sink, .. }, Ffn::Dense { gate, up, down }) = (&ly.mixer, &ly.ffn) else { unreachable!() };
+                let kvt = bt.kvt.addr() + (8 * i * 2 * bt.cap) as u64;
+                g.rms_norm(x, ne, ly.attn_norm.as_ref().unwrap().ptr, h, ne, ne, t, eps)?;
+                g.gemm_dense(q, t, h, ne, at(l.a), nh * qs, 0)?;
+                g.gemm_dense(k, t, h, ne, kraw, kv, SAME_X)?;
+                g.gemm_dense(v, t, h, ne, vv, kv, SAME_X)?;
+                let win = c.swa.get(self.first + i).copied().unwrap_or(false).then_some(c.n_swa).unwrap_or(0);
+                g.rms_norm_rope_qk_rows(at(l.a), qs, qn.ptr, at(l.b), nh, kraw, kn.ptr, kk, nkv, hd, eps, c.n_rot, step, c.rope_base, vv, kvt, t)?;
+                g.attn_rows(at(l.b), if c.q_gate { at(l.a) } else { 0 }, at(l.d), bt.attp.addr(), step, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), t,
+                            sink.as_ref().map_or(0, |s| s.ptr), win, kvt, splits)?;
+                g.gemm_dense(o, t, at(l.d), nh * hd, x, ne, 2)?;
+                g.rms_norm(x, ne, ly.post_norm.as_ref().unwrap().ptr, h, ne, ne, t, eps)?;
+                g.gemm_dense(gate, t, h, ne, at(l.ge), c.n_ff, 0)?;
+                g.gemm_dense(up, t, h, ne, at(l.ge), c.n_ff, 1 | SAME_X)?;
+                g.gemm_dense(down, t, at(l.ge), c.n_ff, x, ne, 2)?;
+                g.kick()?;
+            }
+            // Region a, not h: the next forward's first GEMM reads h, and the backend may keep the quantized rows of
+            // the last GEMM input by its address.
+            g.rms_norm(x, ne, self.output_norm.as_ref().unwrap().ptr, at(l.a), ne, ne, t, eps)?;
+            g.gemm_dense(self.output.as_ref().unwrap(), t, at(l.a), ne, bt.logits.addr(), nvoc, 0)?;
+            g.argmax_rows(bt.logits.addr(), nvoc, t, bt.amax.addr())?;
+            let am = g.get::<i32>(&bt.amax, 0, t)?;
+            rows.iter().zip(am).enumerate()
+                .map(|(r, (&(.., want), tk))| Ok((tk as u32, if want { g.get::<f32>(&bt.logits, r * nvoc, nvoc)? } else { vec![] })))
+                .collect::<anyhow::Result<Vec<_>>>()?
+        };
+        for &(s, ..) in rows { *self.slot_pos(s) += 1; }
+        self.row_tokens += t;
+        self.after_experts(t, self.row_tokens)?;
+        Ok(res)
     }
 }

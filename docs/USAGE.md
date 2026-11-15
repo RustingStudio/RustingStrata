@@ -44,7 +44,10 @@ built-in checks.
 `serve` speaks the OpenAI chat completions API (`POST /v1/chat/completions`, streamed or not, `GET /v1/models`).
 
 - It runs one request at a time; `--parallel N` (GPU) decodes up to N together (4 requests: 164 tok/s in total on the
-  RTX 3060, 41 each; see [HOSTING.md](HOSTING.md)).
+  RTX 3060, 41 each; see [HOSTING.md](HOSTING.md)). From 8 requests decoding at once (`STRATA_BATCH_MIN` sets the
+  count), a dense model without MTP, LoRA or recurrent layers on CUDA runs them in one batched forward. That forward
+  rounds differently from the single-request one, so greedy output under load can differ at near-ties from the same
+  request run alone.
 - `temperature`, `top_k`, `top_p` and `seed` are honored; decoding is greedy when they are left out.
 - `max_tokens` (or `max_completion_tokens`) and `stop` (up to 16 strings) work as in the OpenAI API; `n` must be 1.
 - A request whose last message has role `assistant` (and no tool calls) continues that message: the reply holds only
