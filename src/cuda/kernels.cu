@@ -1828,9 +1828,12 @@ extern "C" __global__ void rope_freq(double* fr, float base, int n_rot) {
 extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const float* w, float* out, int n, float eps, int per,
                                          int n_rot, const int* step, float base, const float* v, u16* kc, u16* vc,
                                          int qrows, const float* qx, int q_stride, const float* qw, float* qo, int qper,
-                                         const double* fr) {
+                                         const double* fr, const u64* kvt) {
     int b = (int)blockIdx.x - qrows;
-    if (b < 0) { b = blockIdx.x; x = qx; x_stride = q_stride; w = qw; out = qo; per = qper; kc = 0; }
+    bool store = kc || kvt;
+    if (b < 0) { b = blockIdx.x; x = qx; x_stride = q_stride; w = qw; out = qo; per = qper; store = false; }
+    // kvt: token t is a row of its own sequence, at position step[2t], with its caches at kvt[2t] and kvt[2t + 1].
+    int tok = b / per, pos = kvt ? step[2 * tok] : step[0] + tok;
     const float* xr = x + (size_t)b * x_stride;
     float* o = out + (size_t)b * n;
     float s = 0.0f;
@@ -1840,7 +1843,7 @@ extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const flo
     __syncthreads();
     int i = threadIdx.x, half = n_rot / 2;
     if (i < half) {
-        double theta = (double)(step[0] + b / per) * (fr ? fr[i] : rope_f(base, i, n_rot));
+        double theta = (double)pos * (fr ? fr[i] : rope_f(base, i, n_rot));
         double ds, dc;
         sincos(theta, &ds, &dc);
         float sn = (float)ds, c = (float)dc;
@@ -1848,10 +1851,11 @@ extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const flo
         o[i] = a * c - b * sn;
         o[i + half] = a * sn + b * c;
     }
-    if (!kc) return;
+    if (!store) return;
     __syncthreads();
+    if (kvt) { kc = (u16*)kvt[2 * tok]; vc = (u16*)kvt[2 * tok + 1]; }
     const float* vr = v + (size_t)b * n;
-    size_t e = ((size_t)(step[0] + b / per) * per + b % per) * n;
+    size_t e = ((size_t)pos * per + b % per) * n;
     for (int j = threadIdx.x; j < n; j += 256) { kv_put(kc, e + j, n, o[j]); kv_put(vc, e + j, n, vr[j]); }
 }
 
@@ -2164,8 +2168,10 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
 // so it is a separate entry point to keep attn_decode's occupancy. Both have one entry point per head size
 // (attn_decode_128, ...): a switch over hd would give every size the registers of the largest.
 #define ATT_ARGS const float* q, const u16* kc, const u16* vc, float* part, const int* step, int nh, int nkv, int hd, \
-                 float scale, int gq_min, int pz, int nt, const int* sel, int sst, const float* sink, int win
-#define ATT_TOK int t = blockIdx.x % nt; q += (size_t)t * nh * hd; part += (size_t)t * pz; step += 2 * t; if (sel) sel += (size_t)t * sst;
+                 float scale, int gq_min, int pz, int nt, const int* sel, int sst, const float* sink, int win, const u64* kvt
+// kvt: token t reads its own sequence's caches, kvt[2t] and kvt[2t + 1] (see rms_norm_rope).
+#define ATT_TOK int t = blockIdx.x % nt; q += (size_t)t * nh * hd; part += (size_t)t * pz; step += 2 * t; if (sel) sel += (size_t)t * sst; \
+                if (kvt) { kc = (const u16*)kvt[2 * t]; vc = (const u16*)kvt[2 * t + 1]; }
 #define ATT_RUN(G) attn_decode_t<PER, G>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt, win)
 #define ATT_RUN_CP(G) attn_decode_t<PER, G, !KV_Q8 && (PER == 4 || (PER == 8 && __CUDA_ARCH__ >= 800))>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt, win)
 #define DEF_ATT(HD)                                                                                          \

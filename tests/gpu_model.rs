@@ -653,3 +653,53 @@ fn gpu_image_prefill_matches_cpu() {
         assert!(text.to_ascii_lowercase().contains("red"), "backend {bk}: {text:?}");
     }
 }
+
+/// `step_batch` (decode of more than `TMAX` slots on the GEMM kernels) against each prompt decoded alone through
+/// `step`, teacher-forced with the tokens of the single run. The two paths round differently, so the logits are
+/// compared with a tolerance and the greedy token only where the single run's top two are apart.
+#[test]
+fn batch_matches_single() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let prompts: Vec<Vec<u32>> = ["The capital of France is", "def fib(n):\n    return", "Once upon a time, in a small village by the sea, there",
+                                  "2 + 2 =", "The quick brown fox", "import numpy as np\n"].iter().map(|s| tok.encode(s).unwrap()).collect();
+    let Ok(gpu) = rusting_strata::cuda::Gpu::new(0) else { return };
+    let mut gm = GpuModel::load_slots(&m, Box::new(gpu), 256, 64, 512 << 20, prompts.len()).unwrap();
+    if gm.batch_cap() == 0 { eprintln!("batch_matches_single: no step_batch for this model, skipped"); return; }
+    const STEPS: usize = 6;
+    let mut want: Vec<Vec<Vec<f32>>> = vec![];
+    for ids in &prompts {
+        gm.reset().unwrap();
+        let mut l = vec![gm.prefill(ids).unwrap()];
+        for _ in 0..STEPS { let t = ops::argmax(l.last().unwrap()) as u32; l.push(gm.step(t).unwrap()); }
+        want.push(l);
+    }
+    for (s, ids) in prompts.iter().enumerate() {
+        gm.use_slot(s);
+        gm.reset().unwrap();
+        gm.prefill(ids).unwrap();
+    }
+    let mut worst = 0f32;
+    for i in 0..STEPS {
+        // The last step leaves slot 2 out: rows need not be all the slots.
+        let rows: Vec<(usize, u32, bool)> = (0..prompts.len()).filter(|&s| i + 1 < STEPS || s != 2)
+            .map(|s| (s, ops::argmax(&want[s][i]) as u32, s % 2 == 0)).collect();
+        let got = gm.step_batch(&rows).unwrap();
+        for (&(s, _, logits), (t, l)) in rows.iter().zip(&got) {
+            let w = &want[s][i + 1];
+            let top = ops::argmax(w);
+            let second = w.iter().enumerate().filter(|&(j, _)| j != top).map(|(_, &v)| v).fold(f32::MIN, f32::max);
+            assert!(*t as usize == top || w[top] - second < 0.5, "slot {s} step {i}: token {t}, single run {top} (margin {})", w[top] - second);
+            assert_eq!(l.is_empty(), !logits);
+            if logits {
+                let d = l.iter().zip(w).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                worst = worst.max(d);
+                assert!(d < 0.5, "slot {s} step {i}: logits differ by {d}");
+            }
+        }
+    }
+    eprintln!("batch_matches_single: largest logit difference {worst}");
+}
