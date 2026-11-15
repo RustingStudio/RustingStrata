@@ -11,7 +11,8 @@ its own license (most Qwen models are Apache 2.0; check the model card).
 ## How much one server does
 
 By default `rustingstrata serve` answers one chat request at a time. Others wait in a queue and run in arrival order.
-The queue has no limit unless `--max-waiting N` sets one. `--max-waiting` counts every open connection (being read,
+The queue has no limit unless `--max-waiting N` sets one. Set one on a server that strangers can reach: every waiting
+connection holds a socket and a thread. `--max-waiting` counts every open connection (being read,
 generated or queued, health checks included), so with `--max-waiting 16` and one reply running 15 places are left
 for the queue. Beyond it a connection gets
 `503 Service Unavailable` with `Retry-After: 2` (`--max-per-key` keeps one customer from taking all the places). One
@@ -403,7 +404,7 @@ keeps its last conversation. For many users on cards that each fit the model, on
 - [ ] The proxy streams without buffering and has a long read timeout.
 - [ ] `--max-tokens` and `--ctx` fit your price list and your GPU memory (times `--parallel`).
 - [ ] `--parallel` set for the number of users you expect at once (4 for the most total speed).
-- [ ] `--max-per-key` below `--max-waiting`, so one customer cannot fill the queue.
+- [ ] `--max-waiting` set (no limit by default) and `--max-per-key` below it, so one customer cannot fill the queue.
 - [ ] `--usage-log` is on and rotated.
 - [ ] `/health` (or `/metrics`) is monitored, and systemd restarts the server on failure.
 - [ ] `rustingstrata calibrate` ran on this machine as the service user.
