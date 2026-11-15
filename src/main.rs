@@ -120,9 +120,10 @@ struct Hosting {
     /// Append one JSON line per chat request (time, key name, token counts, timings, how it finished) to this file.
     #[arg(long)]
     usage_log: Option<PathBuf>,
-    /// Open connections (being read, generated or queued, health checks included); more get `503` with `Retry-After`.
-    #[arg(long, default_value_t = 16)]
-    max_waiting: usize,
+    /// Open connections (being read, generated or queued, health checks included); more get `503` with `Retry-After`
+    /// [default: no limit, requests wait in the queue].
+    #[arg(long)]
+    max_waiting: Option<usize>,
     /// Requests one customer key may have read, generated or queued at once; more get `429` with `Retry-After`
     /// [default: no limit besides `--max-waiting`].
     #[arg(long)]
@@ -298,6 +299,7 @@ impl Engine {
         let path = calibration_path(model, bk.as_ref().map_or("cuda", |b| b[0].name()));
         let v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         if !v.is_null() { eprintln!("calibration: {}", path.display()); }
+        else if bk.is_some() { eprintln!("not calibrated on this machine: `rustingstrata calibrate --model {}` measures the prefill chunk, MTP drafts and the short-prompt threshold (a few minutes, once per model)", model.display()); }
         let get = |k: &str| v[k].as_u64().map(|x| x as usize);
         self.chunk.get_or_insert(get("chunk").unwrap_or(4096));
         self.mtp.get_or_insert(get("mtp").unwrap_or(0));
@@ -1159,7 +1161,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     .with_context(|| format!("opening {}", f.display()))?)),
                 None => None,
             };
-            let max_waiting = host.max_waiting.max(1);
+            let max_waiting = host.max_waiting.map_or(usize::MAX, |n| n.max(1));
             anyhow::ensure!(host.max_per_key != Some(0), "--max-per-key must be at least 1");
             let url = format!("http://{addr}/");
             let listener = match TcpListener::bind(&addr) {
@@ -1316,7 +1318,16 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     // `runner` only sets it.
                     if engine.kv != "q8" { unsafe { std::env::remove_var("STRATA_KV_Q8") } }
                 }
-                match serve_model(&p, engine.clone(), &s, &mut w) {
+                // The page's calibrate button: measure with no model loaded, then load with the measured chunk and MTP
+                // (they replace `--chunk`/`--mtp` and the page's earlier values).
+                let cal = if o["calibrate"] == true && engine.gpu {
+                    (engine.chunk, engine.mtp) = (None, None);
+                    if engine.kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }
+                    s.stats.lock().unwrap().unload(p.file_stem().and_then(|n| n.to_str()).map(String::from));
+                    vram_margins(&engine.vram_margin, &engine.device)
+                        .and_then(|mb| calibrate(&p, engine.ctx, &mb.into_iter().map(|mb| mb << 20).collect::<Vec<_>>(), engine.backend.as_deref(), &engine.device))
+                } else { Ok(()) };
+                match cal.and_then(|()| serve_model(&p, engine.clone(), &s, &mut w)) {
                     Ok(Some((p, w))) => next = Some((p, Some(w))),
                     Ok(None) => return Ok(()),
                     Err(e) if w.is_none() => return Err(e),
@@ -2003,7 +2014,9 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let models: Vec<_> = s.models().into_iter().map(|(id, p, n)| json!({"id": id, "bytes": n, "image": e.mmproj.is_some() || vision::find_sibling(&p).is_some(), "loaded": l.as_ref().is_some_and(|l| l.path == p)})).collect();
             // The values in effect: with a model loaded, `chunk` and `mtp` include its calibration.
             let options = json!({"ctx": e.ctx, "kv": e.kv, "cache_ram": e.cache_ram, "vram_margin": e.vram_margin.join(","), "mtp": e.mtp, "chunk": e.chunk,
-                "gpu": e.gpu, "ctx_train": s.stats.lock().unwrap().ctx_train});
+                "gpu": e.gpu, "ctx_train": s.stats.lock().unwrap().ctx_train,
+                // false: a GPU model with no calibration file (the page offers to calibrate it).
+                "calibrated": l.as_ref().filter(|_| e.gpu).map(|l| calibration_path(&l.path, &s.stats.lock().unwrap().backend).exists())});
             send(&mut w, "200 OK", json!({"dir": s.dir, "models": models, "options": options}))
         }
         // Answered once the model has loaded (or failed to).
@@ -2012,7 +2025,12 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let id = v["model"].as_str().unwrap_or_default();
             if let Err(err) = e.with(&v["options"]) { return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})); }
             match s.models().into_iter().find(|m| m.0 == id) {
-                Some((_, p, _)) => { *s.opts.lock().unwrap() = v["options"].clone(); *next = Some((p, w)); Ok(()) }
+                Some((_, p, _)) => {
+                    // `calibrate: true` measures the model first; it travels with the options to the load loop.
+                    let mut o = v["options"].clone();
+                    if v["calibrate"] == true { if !o.is_object() { o = json!({}); } o["calibrate"] = true.into(); }
+                    *s.opts.lock().unwrap() = o; *next = Some((p, w)); Ok(())
+                }
                 None => send(&mut w, "404 Not Found", json!({"error": {"message": format!("no model {id:?} in {}", s.dir.display()), "type": "not_found"}})),
             }
         }
