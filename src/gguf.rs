@@ -153,4 +153,249 @@ impl Gguf {
         let o = data_offset + t.offset as usize;
         &mmap[o..o + n]
     }
+
+    /// Raw bytes for auxiliary metadata tensors whose GGML type is not in `GgmlType` (e.g. EAGLE3 `d2t` I32/I64).
+    pub fn raw_bytes(&self, t: &TensorInfo, byte_len: usize) -> anyhow::Result<&[u8]> {
+        let (mmap, data_offset) = &self.files[t.file];
+        let o = data_offset + t.offset as usize;
+        mmap.get(o..o + byte_len).context("GGUF tensor bytes out of range")
+    }
+}
+
+/// Convert a HuggingFace EAGLE3 `.safetensors` checkpoint + `config.json` into a GGUF v3 draft model.
+///
+/// Mirrors `tools/convert_eagle3_to_gguf.py` natively in Rust: 2D linear weights stay in BF16 (or convert from
+/// F32/F16), 1D RMS norms convert to F32, NeoX RoPE is preserved (`eagle3.rope.neox = true`), and `d2t` relative
+/// offsets are stored as absolute target vocabulary IDs (`I32`).
+pub fn convert_safetensors_eagle3_to_gguf(
+    st_path: &Path,
+    cfg_path: &Path,
+    out_gguf: &Path,
+    target_layers_default: usize,
+) -> anyhow::Result<()> {
+    use half::{bf16, f16};
+    use std::borrow::Cow;
+    use std::io::{BufWriter, Write};
+
+    const GGUF_VERSION: u32 = 3;
+    const ALIGNMENT: usize = 32;
+    const GGUF_TYPE_UINT32: u32 = 4;
+    const GGUF_TYPE_INT32: u32 = 5;
+    const GGUF_TYPE_FLOAT32: u32 = 6;
+    const GGUF_TYPE_BOOL: u32 = 7;
+    const GGUF_TYPE_STRING: u32 = 8;
+    const GGUF_TYPE_ARRAY: u32 = 9;
+    const GGML_TYPE_F32: u32 = 0;
+    const GGML_TYPE_I32: u32 = 26;
+    const GGML_TYPE_BF16: u32 = 30;
+
+    const TENSOR_MAP: [(&str, &str, u32); 13] = [
+        ("fc.weight", "fc.weight", GGML_TYPE_BF16),
+        ("midlayer.input_layernorm.weight", "blk.0.attn_norm.weight", GGML_TYPE_F32),
+        ("midlayer.hidden_norm.weight", "blk.0.attn_norm_2.weight", GGML_TYPE_F32),
+        ("midlayer.self_attn.q_proj.weight", "blk.0.attn_q.weight", GGML_TYPE_BF16),
+        ("midlayer.self_attn.k_proj.weight", "blk.0.attn_k.weight", GGML_TYPE_BF16),
+        ("midlayer.self_attn.v_proj.weight", "blk.0.attn_v.weight", GGML_TYPE_BF16),
+        ("midlayer.self_attn.o_proj.weight", "blk.0.attn_output.weight", GGML_TYPE_BF16),
+        ("midlayer.post_attention_layernorm.weight", "blk.0.ffn_norm.weight", GGML_TYPE_F32),
+        ("midlayer.mlp.gate_proj.weight", "blk.0.ffn_gate.weight", GGML_TYPE_BF16),
+        ("midlayer.mlp.up_proj.weight", "blk.0.ffn_up.weight", GGML_TYPE_BF16),
+        ("midlayer.mlp.down_proj.weight", "blk.0.ffn_down.weight", GGML_TYPE_BF16),
+        ("norm.weight", "output_norm.weight", GGML_TYPE_F32),
+        ("lm_head.weight", "output.weight", GGML_TYPE_BF16),
+    ];
+
+    let cfg_str = std::fs::read_to_string(cfg_path).with_context(|| format!("read {}", cfg_path.display()))?;
+    let cfg: serde_json::Value = serde_json::from_str(&cfg_str).with_context(|| format!("parse {}", cfg_path.display()))?;
+    let layer_cfg = cfg.get("transformer_layer_config").unwrap_or(&cfg);
+
+    let req_u64 = |k: &str| -> anyhow::Result<u64> {
+        layer_cfg.get(k).or_else(|| cfg.get(k)).and_then(|v| v.as_u64())
+            .with_context(|| format!("{}: missing integer key {k}", cfg_path.display()))
+    };
+    let n_embd = req_u64("hidden_size")? as u32;
+    let n_ff = req_u64("intermediate_size")? as u32;
+    let n_head = req_u64("num_attention_heads")? as u32;
+    let n_head_kv = req_u64("num_key_value_heads")? as u32;
+    let head_dim = layer_cfg.get("head_dim").or_else(|| cfg.get("head_dim")).and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or_else(|| n_embd / n_head.max(1));
+    let eps = layer_cfg.get("rms_norm_eps").or_else(|| cfg.get("rms_norm_eps")).and_then(|v| v.as_f64()).unwrap_or(1e-6) as f32;
+    let rope_theta = layer_cfg.get("rope_theta").or_else(|| cfg.get("rope_theta")).and_then(|v| v.as_f64()).unwrap_or(1_000_000.0) as f32;
+    let norm_before_residual = cfg.get("norm_before_residual").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let st_file = std::fs::File::open(st_path).with_context(|| format!("open {}", st_path.display()))?;
+    let mmap = unsafe { Mmap::map(&st_file)? };
+    anyhow::ensure!(mmap.len() >= 8, "{}: safetensors file truncated", st_path.display());
+    let hdr_len = usize::try_from(u64::from_le_bytes(mmap[0..8].try_into()?)).context("safetensors header length out of range")?;
+    let data_off = 8usize.checked_add(hdr_len).context("safetensors header overflow")?;
+    anyhow::ensure!(data_off <= mmap.len(), "{}: safetensors header past EOF", st_path.display());
+    let hdr: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&mmap[8..data_off]).with_context(|| format!("parse safetensors header {}", st_path.display()))?;
+
+    struct StTensor<'a> {
+        shape: Vec<u64>,
+        dtype: String,
+        raw: &'a [u8],
+    }
+    let mut tensors: BTreeMap<String, StTensor<'_>> = BTreeMap::new();
+    for (name, val) in hdr {
+        if name == "__metadata__" { continue; }
+        let obj = val.as_object().with_context(|| format!("tensor {name} entry is not an object"))?;
+        let dtype = obj.get("dtype").and_then(|v| v.as_str()).with_context(|| format!("tensor {name} missing dtype"))?.to_string();
+        let shape = obj.get("shape").and_then(|v| v.as_array()).with_context(|| format!("tensor {name} missing shape"))?
+            .iter().map(|d| d.as_u64().context("bad tensor dim")).collect::<anyhow::Result<Vec<_>>>()?;
+        let offs = obj.get("data_offsets").and_then(|v| v.as_array()).with_context(|| format!("tensor {name} missing data_offsets"))?;
+        anyhow::ensure!(offs.len() == 2, "tensor {name}: expected 2 data_offsets");
+        let start = usize::try_from(offs[0].as_u64().context("bad start offset")?)?;
+        let end = usize::try_from(offs[1].as_u64().context("bad end offset")?)?;
+        let raw = mmap.get(data_off + start..data_off + end).with_context(|| format!("tensor {name} offsets out of range"))?;
+        tensors.insert(name, StTensor { shape, dtype, raw });
+    }
+
+    let draft_vocab = cfg.get("draft_vocab_size").and_then(|v| v.as_u64()).map(|v| v as usize)
+        .or_else(|| tensors.get("d2t").and_then(|t| t.shape.first().copied()).map(|v| v as usize))
+        .unwrap_or(32000);
+    let extract_layers: Vec<i32> = match cfg.get("eagle_aux_hidden_state_layer_ids").and_then(|v| v.as_array()) {
+        Some(arr) if !arr.is_empty() => arr.iter().map(|v| v.as_i64().map(|x| x as i32).context("bad extract layer")).collect::<anyhow::Result<_>>()?,
+        _ => {
+            let n = target_layers_default as i32;
+            vec![2, n / 2, (n - 3).max(0)]
+        }
+    };
+    anyhow::ensure!(extract_layers.len() == 3, "expected 3 EAGLE3 extract_layers, got {extract_layers:?}");
+
+    let mut prepared: Vec<(String, Vec<u64>, u32, Cow<'_, [u8]>)> = Vec::with_capacity(TENSOR_MAP.len() + 1);
+    for &(hf_name, gguf_name, dst_ty) in &TENSOR_MAP {
+        let st = tensors.get(hf_name)
+            .or_else(|| hf_name.strip_prefix("midlayer.").and_then(|rest| tensors.get(&format!("layers.0.{rest}"))))
+            .with_context(|| format!("{}: missing EAGLE3 tensor {hf_name}", st_path.display()))?;
+        let gguf_dims: Vec<u64> = st.shape.iter().copied().rev().collect();
+        let bytes: Cow<'_, [u8]> = match (dst_ty, st.dtype.as_str()) {
+            (GGML_TYPE_BF16, "BF16") | (GGML_TYPE_F32, "F32") => Cow::Borrowed(st.raw),
+            (GGML_TYPE_BF16, "F32") => Cow::Owned(
+                st.raw.chunks_exact(4).flat_map(|b| bf16::from_f32(f32::from_le_bytes(b.try_into().unwrap())).to_le_bytes()).collect(),
+            ),
+            (GGML_TYPE_BF16, "F16") => Cow::Owned(
+                st.raw.chunks_exact(2).flat_map(|b| bf16::from_f32(f16::from_le_bytes(b.try_into().unwrap()).to_f32()).to_le_bytes()).collect(),
+            ),
+            (GGML_TYPE_F32, "BF16") => Cow::Owned(
+                st.raw.chunks_exact(2).flat_map(|b| bf16::from_le_bytes(b.try_into().unwrap()).to_f32().to_le_bytes()).collect(),
+            ),
+            (GGML_TYPE_F32, "F16") => Cow::Owned(
+                st.raw.chunks_exact(2).flat_map(|b| f16::from_le_bytes(b.try_into().unwrap()).to_f32().to_le_bytes()).collect(),
+            ),
+            (_, dt) => bail!("{hf_name}: unsupported dtype {dt} for GGUF target type {dst_ty}"),
+        };
+        prepared.push((gguf_name.to_string(), gguf_dims, dst_ty, bytes));
+    }
+
+    let d2t = tensors.get("d2t").with_context(|| format!("{}: missing EAGLE3 d2t tensor", st_path.display()))?;
+    anyhow::ensure!(d2t.shape.len() == 1 && d2t.shape[0] as usize == draft_vocab, "unexpected d2t shape {:?} (draft_vocab={draft_vocab})", d2t.shape);
+    let abs_d2t: Vec<u8> = match d2t.dtype.as_str() {
+        "I64" => d2t.raw.chunks_exact(8).enumerate().flat_map(|(i, b)| ((i as i64 + i64::from_le_bytes(b.try_into().unwrap())) as i32).to_le_bytes()).collect(),
+        "I32" => d2t.raw.chunks_exact(4).enumerate().flat_map(|(i, b)| (i as i32 + i32::from_le_bytes(b.try_into().unwrap())).to_le_bytes()).collect(),
+        dt => bail!("unexpected d2t dtype {dt}"),
+    };
+    prepared.push(("d2t".to_string(), vec![draft_vocab as u64], GGML_TYPE_I32, Cow::Owned(abs_d2t)));
+
+    let w_str = |buf: &mut Vec<u8>, s: &str| {
+        buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    };
+    let w_kv = |buf: &mut Vec<u8>, k: &str, ty: u32, payload: &[u8]| {
+        w_str(buf, k);
+        buf.extend_from_slice(&ty.to_le_bytes());
+        buf.extend_from_slice(payload);
+    };
+
+    let mut kvs = Vec::new();
+    let mut nkv = 0u64;
+    let push_str_kv = |buf: &mut Vec<u8>, n: &mut u64, k: &str, v: &str| {
+        let mut p = Vec::with_capacity(8 + v.len());
+        w_str(&mut p, v);
+        w_kv(buf, k, GGUF_TYPE_STRING, &p);
+        *n += 1;
+    };
+    let push_u32_kv = |buf: &mut Vec<u8>, n: &mut u64, k: &str, v: u32| {
+        w_kv(buf, k, GGUF_TYPE_UINT32, &v.to_le_bytes());
+        *n += 1;
+    };
+    let push_f32_kv = |buf: &mut Vec<u8>, n: &mut u64, k: &str, v: f32| {
+        w_kv(buf, k, GGUF_TYPE_FLOAT32, &v.to_le_bytes());
+        *n += 1;
+    };
+    let push_bool_kv = |buf: &mut Vec<u8>, n: &mut u64, k: &str, v: bool| {
+        w_kv(buf, k, GGUF_TYPE_BOOL, &[u8::from(v)]);
+        *n += 1;
+    };
+
+    push_str_kv(&mut kvs, &mut nkv, "general.architecture", "eagle3");
+    push_u32_kv(&mut kvs, &mut nkv, "general.alignment", ALIGNMENT as u32);
+    push_u32_kv(&mut kvs, &mut nkv, "eagle3.block_count", 1);
+    push_u32_kv(&mut kvs, &mut nkv, "eagle3.embedding_length", n_embd);
+    push_u32_kv(&mut kvs, &mut nkv, "eagle3.feed_forward_length", n_ff);
+    push_u32_kv(&mut kvs, &mut nkv, "eagle3.attention.head_count", n_head);
+    push_u32_kv(&mut kvs, &mut nkv, "eagle3.attention.head_count_kv", n_head_kv);
+    push_u32_kv(&mut kvs, &mut nkv, "eagle3.attention.key_length", head_dim);
+    push_f32_kv(&mut kvs, &mut nkv, "eagle3.attention.layer_norm_rms_epsilon", eps);
+    push_u32_kv(&mut kvs, &mut nkv, "eagle3.rope.dimension_count", head_dim);
+    push_f32_kv(&mut kvs, &mut nkv, "eagle3.rope.freq_base", rope_theta);
+    push_bool_kv(&mut kvs, &mut nkv, "eagle3.rope.neox", true);
+    push_bool_kv(&mut kvs, &mut nkv, "eagle3.norm_before_residual", norm_before_residual);
+    let mut tl_payload = Vec::with_capacity(12 + extract_layers.len() * 4);
+    tl_payload.extend_from_slice(&GGUF_TYPE_INT32.to_le_bytes());
+    tl_payload.extend_from_slice(&(extract_layers.len() as u64).to_le_bytes());
+    for &v in &extract_layers { tl_payload.extend_from_slice(&v.to_le_bytes()); }
+    w_kv(&mut kvs, "eagle3.target_layers", GGUF_TYPE_ARRAY, &tl_payload);
+    nkv += 1;
+
+    let mut tensor_infos = Vec::new();
+    let mut cur_off = 0usize;
+    for (name, dims, ty, data) in &prepared {
+        cur_off = cur_off.next_multiple_of(ALIGNMENT);
+        w_str(&mut tensor_infos, name);
+        tensor_infos.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+        for &d in dims { tensor_infos.extend_from_slice(&d.to_le_bytes()); }
+        tensor_infos.extend_from_slice(&ty.to_le_bytes());
+        tensor_infos.extend_from_slice(&(cur_off as u64).to_le_bytes());
+        cur_off += data.len();
+    }
+
+    let mut meta_block = Vec::with_capacity(24 + kvs.len() + tensor_infos.len());
+    meta_block.extend_from_slice(b"GGUF");
+    meta_block.extend_from_slice(&GGUF_VERSION.to_le_bytes());
+    meta_block.extend_from_slice(&(prepared.len() as u64).to_le_bytes());
+    meta_block.extend_from_slice(&nkv.to_le_bytes());
+    meta_block.extend_from_slice(&kvs);
+    meta_block.extend_from_slice(&tensor_infos);
+    let hdr_pad = (ALIGNMENT - (meta_block.len() % ALIGNMENT)) % ALIGNMENT;
+
+    if let Some(parent) = out_gguf.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_out = out_gguf.with_extension("gguf.tmp");
+    {
+        let f = std::fs::File::create(&tmp_out).with_context(|| format!("create {}", tmp_out.display()))?;
+        let mut w = BufWriter::new(f);
+        w.write_all(&meta_block)?;
+        let zeros = [0u8; ALIGNMENT];
+        if hdr_pad > 0 { w.write_all(&zeros[..hdr_pad])?; }
+        let mut written = 0usize;
+        for (_, _, _, data) in &prepared {
+            let tpad = (ALIGNMENT - (written % ALIGNMENT)) % ALIGNMENT;
+            if tpad > 0 {
+                w.write_all(&zeros[..tpad])?;
+                written += tpad;
+            }
+            w.write_all(data)?;
+            written += data.len();
+        }
+        w.flush()?;
+    }
+    std::fs::rename(&tmp_out, out_gguf).with_context(|| format!("rename {} -> {}", tmp_out.display(), out_gguf.display()))?;
+    eprintln!(
+        "converted EAGLE3 safetensors -> {} ({:.1} MiB, extract_layers={extract_layers:?}, heads={n_head}x{head_dim}, kv={n_head_kv}, ff={n_ff}, draft_vocab={draft_vocab})",
+        out_gguf.display(),
+        std::fs::metadata(out_gguf).map(|m| m.len() as f64 / 1048576.0).unwrap_or(0.0),
+    );
+    Ok(())
 }

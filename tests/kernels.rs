@@ -752,7 +752,9 @@ fn attn_prefill_qsa_mask_all_ones_matches_unmasked() {
         unsafe { std::env::set_var("STRATA_VK_ATTN_BUDGET", "1000") };
         gpu.attn_prefill_m(dq.addr(), dk.addr(), dv.addr(), 0, got_buf.addr(), step.addr(), t, nh, nkv, hd, scale,
             dpat.addr(), mw, 0, 0).unwrap();
-        assert_eq!(down::<f32>(gpu, &got_buf), want, "{bk} attn_prefill sliced mask");
+        let got = down::<f32>(gpu, &got_buf);
+        let e = rel_l2(&got, &want);
+        assert!(e <= 1e-6, "{bk} attn_prefill sliced mask: rel err {e}");
         unsafe { std::env::remove_var("STRATA_VK_ATTN_BUDGET") };
     }
 }

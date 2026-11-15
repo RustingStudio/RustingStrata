@@ -1,7 +1,7 @@
 //! Scalar CPU reference forward for the architectures in `config::arch`, one token at a time.
 //! Mirrors llama.cpp `src/models/qwen35moe.cpp`; this is the correctness oracle, not the fast path.
 
-use crate::config::{LayerKind, ModelConfig};
+use crate::config::{Eagle3Config, LayerKind, ModelConfig};
 use crate::gguf::Gguf;
 use crate::ops;
 use crate::weights::{Tensor, Weights};
@@ -105,13 +105,77 @@ fn mv(t: &Tensor, x: &[f32]) -> Vec<f32> {
 impl<'a> Model<'a> {
     pub fn load(g: &'a Gguf) -> anyhow::Result<Model<'a>> { Self::load_with_lora(g, &[]) }
     pub fn load_with_lora(g: &'a Gguf, loras: &[(String, f32)]) -> anyhow::Result<Model<'a>> {
+        Self::load_with_aux(g, None, loras)
+    }
+    pub fn load_with_aux(g: &'a Gguf, aux: Option<&'a Gguf>, loras: &[(String, f32)]) -> anyhow::Result<Model<'a>> {
         let mut cfg = ModelConfig::from_gguf(g)?;
-        let w = Weights::new(g)?;
+        let w = Weights::new_with_aux(g, aux)?;
+        if cfg.n_nextn == 0 {
+            if let Some(ag) = aux.filter(|_| w.layer(cfg.n_layer, "eagle3.fc.weight").is_ok()) {
+                let il = cfg.n_layer;
+                let wq = w.layer(il, "attn_q.weight")?;
+                let wk = w.layer(il, "attn_k.weight")?;
+                let gate = w.layer(il, "ffn_gate.weight")?;
+                let out = w.layer(il, "eagle3.output.weight")?;
+                let n_head = ag.meta.get("eagle3.attention.head_count").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(cfg.n_head);
+                let head_dim = wq.rows / n_head.max(1);
+                let n_head_kv = (wk.rows / head_dim.max(1)).max(1);
+                let n_ff = gate.rows;
+                let draft_vocab = out.rows;
+                let n_rot = ag.meta.get("eagle3.rope.dimension_count").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(head_dim);
+                let rope_base = ag.meta.get("eagle3.rope.freq_base").and_then(|v| v.as_f32()).unwrap_or(cfg.rope_base);
+                let eps = ag.meta.get("eagle3.attention.layer_norm_rms_epsilon").and_then(|v| v.as_f32()).unwrap_or(cfg.eps);
+                let norm_before_residual = matches!(ag.meta.get("eagle3.norm_before_residual"), Some(crate::gguf::Value::Bool(true)));
+                let rope_neox = !matches!(ag.meta.get("eagle3.rope.neox"), Some(crate::gguf::Value::Bool(false)));
+                let extract_layers = match ag.meta.get("eagle3.target_layers").or_else(|| ag.meta.get("eagle3.extract_layers")).and_then(|v| v.as_arr()) {
+                    Some(arr) if arr.len() == 3 => {
+                        let mut ls = [0usize; 3];
+                        for (i, v) in arr.iter().enumerate() {
+                            ls[i] = v.as_u64().context("bad eagle3 extract layer")? as usize;
+                        }
+                        ls
+                    }
+                    _ => [2, cfg.n_layer / 2, cfg.n_layer.saturating_sub(3)],
+                };
+                let d2t = if let Some(t) = ag.tensors.get("d2t") {
+                    let n = t.dims[0] as usize;
+                    anyhow::ensure!(n == draft_vocab, "d2t len {n} != draft_vocab {draft_vocab}");
+                    let mut ids: Vec<i32> = match t.ty {
+                        26 => ag.raw_bytes(t, 4 * n)?.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect(),
+                        27 => ag.raw_bytes(t, 8 * n)?.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap()) as i32).collect(),
+                        ty => anyhow::bail!("unsupported EAGLE3 d2t tensor type {ty}"),
+                    };
+                    if ids.windows(2).any(|w| w[0] >= w[1]) {
+                        for (i, v) in ids.iter_mut().enumerate() { *v += i as i32; }
+                    }
+                    ids
+                } else {
+                    (0..draft_vocab as i32).collect()
+                };
+                cfg.n_nextn = 1;
+                cfg.eagle3 = Some(Eagle3Config {
+                    extract_layers, n_ff, n_head, n_head_kv, head_dim, n_rot, rope_base, eps,
+                    draft_vocab, norm_before_residual, rope_neox, d2t,
+                });
+                eprintln!(
+                    "note: loaded standalone EAGLE3 draft head (extract_layers={extract_layers:?}, heads={n_head}x{head_dim}, kv={n_head_kv}, ff={n_ff}, draft_vocab={draft_vocab})"
+                );
+            } else if aux.is_some_and(|ag| ag.tensors.contains_key(&format!("blk.{}.nextn.eh_proj.weight", cfg.n_layer))) {
+                cfg.n_nextn = 1;
+                eprintln!("note: loaded standalone MTP draft head from companion GGUF (layer {})", cfg.n_layer);
+            }
+        }
         if !w.validate(cfg.n_layer)? && cfg.n_nextn > 0 {
             eprintln!("note: the MTP (nextn) layer has a quant type this engine does not support; loading without MTP");
             cfg.n_nextn = 0;
         }
-        w.get("token_embd.weight")?;
+        let emb_t = w.get("token_embd.weight")?;
+        // Pre-touch mmap pages of token_embd.weight so decode step put_embed() never stalls on SSD page faults.
+        let mut _touch = 0u8;
+        for off in (0..emb_t.data.len()).step_by(4096) {
+            _touch ^= unsafe { std::ptr::read_volatile(&emb_t.data[off]) };
+        }
+        std::hint::black_box(_touch);
         let ple = if cfg.n_embd_ple > 0 {
             let p = |k: &str| format!("{}.ple.{k}", cfg.arch);
             let arr = |k: &str| -> anyhow::Result<Vec<u64>> {
@@ -175,7 +239,8 @@ impl<'a> Model<'a> {
 
     pub fn embed(&self, token: u32) -> Vec<f32> {
         let mut x = vec![0f32; self.cfg.n_embd];
-        self.w.get("token_embd.weight").unwrap().row(token as usize, &mut x);
+        let idx = (token as usize).min(self.cfg.n_vocab.saturating_sub(1));
+        self.w.get("token_embd.weight").unwrap().row(idx, &mut x);
         x
     }
 
@@ -664,5 +729,216 @@ mod tests {
         assert_eq!((e.rank, e.in_dim, e.out_dim, e.n_expert), (2, 4, 3, 1));
         assert_eq!(e.a[0], (0..8).map(|i| i as f32).collect::<Vec<_>>());
         assert_eq!(e.b[0], (0..6).map(|i| 10.0 + i as f32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn load_eagle3_aux_config() {
+        let (mut hdr, mut off) = (Vec::new(), 0u64);
+        let push_tensor = |h: &mut Vec<u8>, body: &mut Vec<u8>, off: &mut u64, name: &str, dims: &[u64], ty: u32, data: &[u8]| {
+            w_str(h, name);
+            h.extend((dims.len() as u32).to_le_bytes());
+            for &d in dims { h.extend(d.to_le_bytes()); }
+            h.extend(ty.to_le_bytes());
+            h.extend((*off).to_le_bytes());
+            body.extend_from_slice(data);
+            let pad = (32 - data.len() % 32) % 32;
+            body.extend(std::iter::repeat_n(0u8, pad));
+            *off += (data.len() + pad) as u64;
+        };
+        let mut body = Vec::new();
+        let mut kvs = Vec::new();
+        let add_u32 = |b: &mut Vec<u8>, k: &str, v: u32| { w_str(b, k); b.extend(4u32.to_le_bytes()); b.extend(v.to_le_bytes()); };
+        let add_f32 = |b: &mut Vec<u8>, k: &str, v: f32| { w_str(b, k); b.extend(6u32.to_le_bytes()); b.extend(v.to_le_bytes()); };
+        let add_str = |b: &mut Vec<u8>, k: &str, v: &str| { w_str(b, k); b.extend(8u32.to_le_bytes()); w_str(b, v); };
+        // Build tiny target GGUF (`qwen3moe` with 1 layer, embd=4, n_vocab=8, nh=2, nkv=1, hd=2)
+        add_str(&mut kvs, "general.architecture", "qwen3moe");
+        add_u32(&mut kvs, "qwen3moe.block_count", 1);
+        add_u32(&mut kvs, "qwen3moe.embedding_length", 4);
+        add_u32(&mut kvs, "qwen3moe.attention.head_count", 2);
+        add_u32(&mut kvs, "qwen3moe.attention.head_count_kv", 1);
+        add_f32(&mut kvs, "qwen3moe.attention.layer_norm_rms_epsilon", 1e-6);
+        let z4 = vec![0u8; 4 * 4];
+        let z4x8 = vec![0u8; 32 * 4];
+        push_tensor(&mut hdr, &mut body, &mut off, "token_embd.weight", &[4, 8], 0, &z4x8);
+        push_tensor(&mut hdr, &mut body, &mut off, "output_norm.weight", &[4], 0, &z4);
+        push_tensor(&mut hdr, &mut body, &mut off, "blk.0.attn_norm.weight", &[4], 0, &z4);
+        let mut tgt = Vec::new();
+        tgt.extend(b"GGUF");
+        tgt.extend(3u32.to_le_bytes());
+        tgt.extend(3u64.to_le_bytes());
+        tgt.extend(6u64.to_le_bytes());
+        tgt.extend(kvs);
+        tgt.extend(hdr);
+        while tgt.len() % 32 != 0 { tgt.push(0); }
+        tgt.extend(body);
+
+        // Build tiny EAGLE3 aux GGUF (`draft_vocab=3`, draft `heads=2x4`, `kv=1`, `ff=6`, `d2t` relative `[0, 0, 5]` -> abs `[0, 1, 7]`)
+        let (mut ahdr, mut abody, mut aoff) = (Vec::new(), Vec::new(), 0u64);
+        let mut akvs = Vec::new();
+        add_str(&mut akvs, "general.architecture", "eagle3");
+        add_u32(&mut akvs, "eagle3.attention.head_count", 2);
+        add_f32(&mut akvs, "eagle3.rope.freq_base", 1000000.0);
+        w_str(&mut akvs, "eagle3.target_layers");
+        akvs.extend(9u32.to_le_bytes());
+        akvs.extend(5u32.to_le_bytes());
+        akvs.extend(3u64.to_le_bytes());
+        for v in [0i32, 0, 0] { akvs.extend(v.to_le_bytes()); }
+        let fc_d = vec![0u8; 12 * 4 * 4];
+        let norm_d = vec![0u8; 4 * 4];
+        let qk_d = vec![0u8; 8 * 8 * 4];
+        let kv_d = vec![0u8; 8 * 4 * 4];
+        let o_d = vec![0u8; 8 * 4 * 4];
+        let ff_d = vec![0u8; 4 * 6 * 4];
+        let out_d = vec![0u8; 4 * 3 * 4];
+        let d2t_d: Vec<u8> = [0i64, 0, 5].into_iter().flat_map(|v| v.to_le_bytes()).collect();
+        push_tensor(&mut ahdr, &mut abody, &mut aoff, "fc.weight", &[12, 4], 0, &fc_d);
+        push_tensor(&mut ahdr, &mut abody, &mut aoff, "output.weight", &[4, 3], 0, &out_d);
+        push_tensor(&mut ahdr, &mut abody, &mut aoff, "output_norm.weight", &[4], 0, &norm_d);
+        push_tensor(&mut ahdr, &mut abody, &mut aoff, "blk.0.attn_norm.weight", &[4], 0, &norm_d);
+        push_tensor(&mut ahdr, &mut abody, &mut aoff, "blk.0.attn_norm_2.weight", &[4], 0, &norm_d);
+        push_tensor(&mut ahdr, &mut abody, &mut aoff, "blk.0.ffn_norm.weight", &[4], 0, &norm_d);
+        push_tensor(&mut ahdr, &mut abody, &mut aoff, "blk.0.attn_q.weight", &[8, 8], 0, &qk_d);
+        push_tensor(&mut ahdr, &mut abody, &mut aoff, "blk.0.attn_k.weight", &[8, 4], 0, &kv_d);
+        push_tensor(&mut ahdr, &mut abody, &mut aoff, "blk.0.attn_v.weight", &[8, 4], 0, &kv_d);
+        push_tensor(&mut ahdr, &mut abody, &mut aoff, "blk.0.attn_output.weight", &[8, 4], 0, &o_d);
+        push_tensor(&mut ahdr, &mut abody, &mut aoff, "blk.0.ffn_gate.weight", &[4, 6], 0, &ff_d);
+        push_tensor(&mut ahdr, &mut abody, &mut aoff, "blk.0.ffn_up.weight", &[4, 6], 0, &ff_d);
+        push_tensor(&mut ahdr, &mut abody, &mut aoff, "blk.0.ffn_down.weight", &[6, 4], 0, &ff_d);
+        push_tensor(&mut ahdr, &mut abody, &mut aoff, "d2t", &[3], 27, &d2t_d);
+        let mut aux = Vec::new();
+        aux.extend(b"GGUF");
+        aux.extend(3u32.to_le_bytes());
+        aux.extend(14u64.to_le_bytes());
+        aux.extend(4u64.to_le_bytes());
+        aux.extend(akvs);
+        aux.extend(ahdr);
+        while aux.len() % 32 != 0 { aux.push(0); }
+        aux.extend(abody);
+
+        let pt = std::env::temp_dir().join(format!("strata-e3-tgt-{}.gguf", std::process::id()));
+        let pa = std::env::temp_dir().join(format!("strata-e3-aux-{}.gguf", std::process::id()));
+        std::fs::write(&pt, &tgt).unwrap();
+        std::fs::write(&pa, &aux).unwrap();
+        let gt = Gguf::open(&pt).unwrap();
+        let ga = Gguf::open(&pa).unwrap();
+        let m = Model::load_with_aux(&gt, Some(&ga), &[]).unwrap();
+        std::fs::remove_file(&pt).ok();
+        std::fs::remove_file(&pa).ok();
+        let ec = m.cfg.eagle3.as_ref().expect("eagle3 config loaded");
+        assert_eq!(m.cfg.n_nextn, 1);
+        assert_eq!((ec.n_head, ec.head_dim, ec.n_head_kv, ec.n_ff, ec.draft_vocab), (2, 4, 1, 6, 3));
+        assert_eq!(ec.d2t, vec![0, 1, 7]);
+    }
+
+    #[test]
+    fn eagle3_safetensors_auto_converts_and_loads() {
+        let dir = std::env::temp_dir().join(format!("strata-e3-st-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Build tiny target GGUF (`qwen3moe` 1 layer, embd=4, n_vocab=8, nh=2, nkv=1, hd=2)
+        let (mut hdr, mut body, mut off) = (Vec::new(), Vec::new(), 0u64);
+        let push_tensor = |h: &mut Vec<u8>, b: &mut Vec<u8>, o: &mut u64, name: &str, dims: &[u64], ty: u32, data: &[u8]| {
+            w_str(h, name);
+            h.extend((dims.len() as u32).to_le_bytes());
+            for &d in dims { h.extend(d.to_le_bytes()); }
+            h.extend(ty.to_le_bytes());
+            h.extend((*o).to_le_bytes());
+            b.extend_from_slice(data);
+            let pad = (32 - data.len() % 32) % 32;
+            b.extend(std::iter::repeat_n(0u8, pad));
+            *o += (data.len() + pad) as u64;
+        };
+        let mut kvs = Vec::new();
+        let add_u32 = |b: &mut Vec<u8>, k: &str, v: u32| { w_str(b, k); b.extend(4u32.to_le_bytes()); b.extend(v.to_le_bytes()); };
+        let add_f32 = |b: &mut Vec<u8>, k: &str, v: f32| { w_str(b, k); b.extend(6u32.to_le_bytes()); b.extend(v.to_le_bytes()); };
+        let add_str = |b: &mut Vec<u8>, k: &str, v: &str| { w_str(b, k); b.extend(8u32.to_le_bytes()); w_str(b, v); };
+        add_str(&mut kvs, "general.architecture", "qwen3moe");
+        add_u32(&mut kvs, "qwen3moe.block_count", 1);
+        add_u32(&mut kvs, "qwen3moe.embedding_length", 4);
+        add_u32(&mut kvs, "qwen3moe.attention.head_count", 2);
+        add_u32(&mut kvs, "qwen3moe.attention.head_count_kv", 1);
+        add_f32(&mut kvs, "qwen3moe.attention.layer_norm_rms_epsilon", 1e-6);
+        let z4 = vec![0u8; 4 * 4];
+        let z4x8 = vec![0u8; 32 * 4];
+        push_tensor(&mut hdr, &mut body, &mut off, "token_embd.weight", &[4, 8], 0, &z4x8);
+        push_tensor(&mut hdr, &mut body, &mut off, "output_norm.weight", &[4], 0, &z4);
+        push_tensor(&mut hdr, &mut body, &mut off, "blk.0.attn_norm.weight", &[4], 0, &z4);
+        let mut tgt = Vec::new();
+        tgt.extend(b"GGUF");
+        tgt.extend(3u32.to_le_bytes());
+        tgt.extend(3u64.to_le_bytes());
+        tgt.extend(6u64.to_le_bytes());
+        tgt.extend(kvs);
+        tgt.extend(hdr);
+        while tgt.len() % 32 != 0 { tgt.push(0); }
+        tgt.extend(body);
+        let pt = dir.join("target.gguf");
+        std::fs::write(&pt, &tgt).unwrap();
+
+        // Build synthetic HuggingFace EAGLE3 `config.json` + `model.safetensors`
+        let cfg_path = dir.join("config.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{
+                "hidden_size": 4,
+                "intermediate_size": 6,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 1000000.0,
+                "norm_before_residual": false,
+                "draft_vocab_size": 3,
+                "eagle_aux_hidden_state_layer_ids": [0, 0, 0]
+            }"#,
+        ).unwrap();
+
+        let d2t_bytes: Vec<u8> = [0i64, 0, 5].into_iter().flat_map(|v| v.to_le_bytes()).collect();
+        let st_specs: Vec<(&str, &str, Vec<u64>, Vec<u8>)> = vec![
+            ("fc.weight", "BF16", vec![4, 12], vec![0u8; 4 * 12 * 2]),
+            ("midlayer.input_layernorm.weight", "BF16", vec![4], vec![0u8; 4 * 2]),
+            ("midlayer.hidden_norm.weight", "F32", vec![4], vec![0u8; 4 * 4]),
+            ("midlayer.self_attn.q_proj.weight", "BF16", vec![8, 8], vec![0u8; 8 * 8 * 2]),
+            ("midlayer.self_attn.k_proj.weight", "BF16", vec![4, 8], vec![0u8; 4 * 8 * 2]),
+            ("midlayer.self_attn.v_proj.weight", "BF16", vec![4, 8], vec![0u8; 4 * 8 * 2]),
+            ("midlayer.self_attn.o_proj.weight", "BF16", vec![4, 8], vec![0u8; 4 * 8 * 2]),
+            ("midlayer.post_attention_layernorm.weight", "F32", vec![4], vec![0u8; 4 * 4]),
+            ("midlayer.mlp.gate_proj.weight", "BF16", vec![6, 4], vec![0u8; 6 * 4 * 2]),
+            ("midlayer.mlp.up_proj.weight", "BF16", vec![6, 4], vec![0u8; 6 * 4 * 2]),
+            ("midlayer.mlp.down_proj.weight", "BF16", vec![4, 6], vec![0u8; 4 * 6 * 2]),
+            ("norm.weight", "F32", vec![4], vec![0u8; 4 * 4]),
+            ("lm_head.weight", "BF16", vec![3, 4], vec![0u8; 3 * 4 * 2]),
+            ("d2t", "I64", vec![3], d2t_bytes),
+        ];
+        let mut st_hdr = serde_json::Map::new();
+        let mut st_body = Vec::new();
+        for (name, dt, shape, data) in st_specs {
+            let start = st_body.len();
+            st_body.extend_from_slice(&data);
+            let end = st_body.len();
+            st_hdr.insert(
+                name.to_string(),
+                serde_json::json!({"dtype": dt, "shape": shape, "data_offsets": [start, end]}),
+            );
+        }
+        let hdr_bytes = serde_json::to_vec(&st_hdr).unwrap();
+        let mut st_file = Vec::with_capacity(8 + hdr_bytes.len() + st_body.len());
+        st_file.extend_from_slice(&(hdr_bytes.len() as u64).to_le_bytes());
+        st_file.extend_from_slice(&hdr_bytes);
+        st_file.extend_from_slice(&st_body);
+        let st_path = dir.join("model.safetensors");
+        std::fs::write(&st_path, &st_file).unwrap();
+
+        let aux_gguf = dir.join("model.gguf");
+        crate::gguf::convert_safetensors_eagle3_to_gguf(&st_path, &cfg_path, &aux_gguf, 48).unwrap();
+
+        let gt = Gguf::open(&pt).unwrap();
+        let ga = Gguf::open(&aux_gguf).unwrap();
+        let m = Model::load_with_aux(&gt, Some(&ga), &[]).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let ec = m.cfg.eagle3.as_ref().expect("eagle3 config loaded from converted safetensors");
+        assert_eq!(m.cfg.n_nextn, 1);
+        assert_eq!((ec.n_head, ec.head_dim, ec.n_head_kv, ec.n_ff, ec.draft_vocab), (2, 4, 1, 6, 3));
+        assert_eq!(ec.d2t, vec![0, 1, 7]);
     }
 }

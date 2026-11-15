@@ -141,6 +141,10 @@ struct Inner {
     tsem: vk::Semaphore,
     mem: vk::PhysicalDeviceMemoryProperties,
     budget: bool,
+    /// Integrated GPU (APU sharing unified system LPDDR memory between device and host heaps).
+    igpu: bool,
+    /// AMD RDNA3 / RDNA3.5 (gfx11xx) or iGPU whose small L2 cache hurts from next-layer MoE prefetch.
+    gfx11: bool,
     /// The device runs fixed 64-lane subgroups, split into logical 32-lane warps.
     wave64: bool,
     /// VK_KHR_cooperative_matrix with the 16 x 16 x 16 f16 / f32 shape is enabled (`gemm_f`, `attn_prefill`).
@@ -164,6 +168,8 @@ struct Inner {
     /// `maxComputeSharedMemorySize` of the device (or STRATA_VK_SMEM_LIMIT, a test hook): no pipeline may need more
     /// `Workgroup` bytes than this (`Vk::pipeline`), or the driver accepts it and faults at dispatch (Xid 13 on Volta).
     smem_limit: u32,
+    /// Nanoseconds per GPU timestamp tick (`VkPhysicalDeviceLimits::timestampPeriod`).
+    ts_period: f32,
     /// STRATA_VK_STATS: print the driver's statistics (registers, ...) of each pipeline as it is created.
     stats: bool,
     /// The one pipeline layout: a 128-byte push constant range (the Vulkan minimum), no descriptor sets.
@@ -177,12 +183,16 @@ struct State {
     spare: Vec<vk::CommandBuffer>,
     /// Submitted since the last wait.
     used: Vec<vk::CommandBuffer>,
+    /// Closed command buffers and graph replays queued in execution order for the next `submit`.
+    queued: Vec<vk::CommandBuffer>,
     /// The open command buffer.
     cur: Option<vk::CommandBuffer>,
     /// The command buffer with conditional rendering on (`cond_on`), ended before the buffer is.
     cond: Option<vk::CommandBuffer>,
     /// Conditional rendering failed the self-test in `Vk::new`: not used.
     no_cond: bool,
+    /// Set by `skip_rest` when a non-fast-path MoE combine (`mb != 0`) uses conditional rendering.
+    need_cond: bool,
     /// A MoE combine gave up waiting for the CPU worker since the last `stalled` (see `Backend::stalled`).
     stalled: bool,
     /// Work was submitted since the last wait.
@@ -260,9 +270,14 @@ impl Drop for Inner {
     fn drop(&mut self) {
         let st = self.st.get_mut().unwrap_or_else(|e| e.into_inner());
         if let Some((_, _, tot)) = &st.prof {
+            let scale = self.ts_period as f64;
             let mut v: Vec<_> = tot.iter().collect(); v.sort_by_key(|x| std::cmp::Reverse(x.1.0));
-            let all: u64 = v.iter().map(|x| x.1.0).sum();
-            for (n, (ns, c)) in v { eprintln!("prof {n:16} {:9.1} ms {:5.1}% {c:7} calls {:8.2} us", *ns as f64 / 1e6, *ns as f64 * 100.0 / all as f64, *ns as f64 / 1e3 / *c as f64); }
+            let all: f64 = v.iter().filter(|(k, _)| **k != "_barrier_gap").map(|x| x.1.0 as f64 * scale).sum();
+            eprintln!("vulkan prof (timestampPeriod = {:.2} ns, active kernel sum = {:.2} ms):", self.ts_period, all / 1e6);
+            for (n, (ticks, c)) in v {
+                let ns = *ticks as f64 * scale;
+                eprintln!("prof {n:24} {:9.2} ms {:5.1}% {c:7} calls {:8.2} us", ns / 1e6, ns * 100.0 / all.max(1.0), ns / 1e3 / (*c).max(1) as f64);
+            }
         }
         unsafe {
             let _ = self.dev.device_wait_idle();
@@ -369,7 +384,13 @@ impl Vk {
             && std::env::var_os("STRATA_VK_NO_COOP").is_none();  // STRATA_VK_NO_COOP: run the kernels for devices without them
         let coop_i8 = coop && shape(32, vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32);
         // The tiled fallback needs a 1024-thread workgroup and 32 KB of shared memory (see attn_prefill_tile.comp).
-        let limits = unsafe { instance.get_physical_device_properties(pd) }.limits;
+        let dev_props = unsafe { instance.get_physical_device_properties(pd) };
+        let limits = dev_props.limits;
+        let igpu = dev_props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+        let name_up = name.to_ascii_uppercase();
+        let gfx11 = dev_props.vendor_id == 0x1002 && (igpu || (coop && !coop_i8)
+            || ["GFX11", "STRIX", "PHOENIX", "KRACKAN", "NAVI3", "RADEON 8", "RADEON 7", "RX 7"]
+                .iter().any(|k| name_up.contains(k)));
         let dp_tile = !coop && limits.max_compute_work_group_invocations >= 1024 && limits.max_compute_shared_memory_size >= 32 << 10
             && std::env::var_os("STRATA_VK_DP_OLD").is_none();
         if coop { exts.push(ash::khr::cooperative_matrix::NAME.as_ptr()) }
@@ -437,12 +458,13 @@ impl Vk {
         let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None) }?;
         let pc = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(128)];
         let layout = unsafe { dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc), None) }?;
-        let st = State { pool, spare: vec![], used: vec![], cur: None, cond: None, no_cond: false, stalled: false, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false, beside: false, tpool, tcur: None,
+        let st = State { pool, spare: vec![], used: vec![], queued: vec![], cur: None, cond: None, no_cond: false, need_cond: false, stalled: false, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false, beside: false, tpool, tcur: None,
             tspare: vec![], tused: vec![], tbytes: 0, tstart: 0, tring: Default::default(), cstaged: false, cval: 0, tval: 0, bwait: 0, twait: 0, tlag: 0,
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None }, step_pos: None };
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, wave64, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), smem_limit, stats, layout, st: Mutex::new(st) };
+        let ts_period = limits.timestamp_period;
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, gfx11, wave64, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -511,13 +533,31 @@ impl Inner {
         let req = unsafe { self.dev.get_buffer_memory_requirements(buf) };
         // Memory the GPU does not cache (AMD flags 0xc0) only when asked for: it would be slow for anything else.
         let ok = |f: vk::MemoryPropertyFlags, want| f.contains(want) && (f & vk::MemoryPropertyFlags::from_raw(0xc0) & !want).is_empty();
-        let ty = wants.iter().find_map(|&want| (0..self.mem.memory_type_count).find(|&i| req.memory_type_bits & (1 << i) != 0
-            && ok(self.mem.memory_types[i as usize].property_flags, want)));
+        // On an iGPU, device-local and GTT heaps live in the same LPDDR: fall back to HOST if DEVICE heap is full.
+        let candidates: Vec<vk::MemoryPropertyFlags> = if wants == DEVICE && self.igpu {
+            wants.iter().chain(HOST.iter()).copied().collect()
+        } else {
+            wants.to_vec()
+        };
         let mut flags = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-        let r = ty.context("no memory type").and_then(|ty| Ok(unsafe { self.dev.allocate_memory(&vk::MemoryAllocateInfo::default()
-            .allocation_size(req.size).memory_type_index(ty).push_next(&mut flags), None) }
-            .with_context(|| format!("allocate {bytes} bytes"))?));
-        let mem = match r { Ok(m) => m, Err(e) => { unsafe { self.dev.destroy_buffer(buf, None) }; return Err(e) } };
+        let mut last_err = anyhow::anyhow!("no matching memory type for {bytes} bytes");
+        let mut mem_ok = None;
+        'outer: for want in candidates {
+            for i in 0..self.mem.memory_type_count {
+                if req.memory_type_bits & (1 << i) != 0 && ok(self.mem.memory_types[i as usize].property_flags, want) {
+                    match unsafe {
+                        self.dev.allocate_memory(
+                            &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(i).push_next(&mut flags),
+                            None,
+                        )
+                    } {
+                        Ok(m) => { mem_ok = Some(m); break 'outer; }
+                        Err(e) => last_err = anyhow::Error::from(e).context(format!("allocate {bytes} bytes")),
+                    }
+                }
+            }
+        }
+        let mem = match mem_ok { Some(m) => m, None => { unsafe { self.dev.destroy_buffer(buf, None) }; return Err(last_err); } };
         unsafe { self.dev.bind_buffer_memory(buf, mem, 0) }?;
         Ok((buf, mem))
     }
@@ -536,7 +576,7 @@ impl Inner {
         unsafe { self.dev.begin_command_buffer(c, &vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)) }?;
         st.cur = Some(c);
-        self.cond_on(st, c);
+        if st.need_cond { self.cond_on(st, c); }
         Ok(c)
     }
 
@@ -555,6 +595,7 @@ impl Inner {
     /// while the error word is 0, so nothing after a combine that gave up runs until the host has seen it (no-op
     /// without conditional rendering). Every compute command buffer starts this way too, for the submissions after.
     fn skip_rest(&self, st: &mut State) -> anyhow::Result<()> {
+        st.need_cond = true;
         let cb = self.cb(st)?;
         self.end_cond(st, cb);
         self.cond_on(st, cb);
@@ -581,17 +622,23 @@ impl Inner {
         }
     }
 
-    /// Submit the open command buffer, then `graph`; with `wait`, wait for all submitted work.
-    fn submit(&self, st: &mut State, graph: Option<vk::CommandBuffer>, wait: bool) -> anyhow::Result<()> {
-        let mut cbs = vec![];
+    /// Close `st.cur` if open and append it (plus `graph` if given) to `st.queued` in order.
+    fn enqueue_cb(&self, st: &mut State, graph: Option<vk::CommandBuffer>) -> anyhow::Result<()> {
         if let Some(c) = st.cur.take() {
             st.copied.1 = 0;
             self.end_cond(st, c);
             unsafe { self.dev.end_command_buffer(c) }?;
             st.used.push(c);
-            cbs.push(c);
+            st.queued.push(c);
         }
-        cbs.extend(graph);
+        st.queued.extend(graph);
+        Ok(())
+    }
+
+    /// Submit the open command buffer, then `graph`; with `wait`, wait for all submitted work.
+    fn submit(&self, st: &mut State, graph: Option<vk::CommandBuffer>, wait: bool) -> anyhow::Result<()> {
+        self.enqueue_cb(st, graph)?;
+        let cbs = std::mem::take(&mut st.queued);
         if cbs.is_empty() && !(wait && st.busy) { return Ok(()); }
         let fence = if wait { st.fence } else { vk::Fence::null() };
         st.cval += 1;
@@ -634,11 +681,21 @@ impl Inner {
             if let Some((qp, names, tot)) = &mut st.prof { if !names.is_empty() {
                 let mut t = vec![0u64; 2 * names.len()];
                 unsafe { self.dev.get_query_pool_results(*qp, 0, &mut t, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT) }?;
-                for (i, n) in names.drain(..).enumerate() { let e = tot.entry(n).or_default(); e.0 += t[2 * i + 1] - t[2 * i]; e.1 += 1; }
+                for (i, n) in names.drain(..).enumerate() {
+                    let e = tot.entry(n).or_default();
+                    e.0 += t[2 * i + 1].saturating_sub(t[2 * i]);
+                    e.1 += 1;
+                    if i > 0 && t[2 * i] >= t[2 * i - 1] {
+                        let g = tot.entry("_barrier_gap").or_default();
+                        g.0 += t[2 * i] - t[2 * i - 1];
+                        g.1 += 1;
+                    }
+                }
             } }
             let used = std::mem::take(&mut st.used);
             st.spare.extend(used);
             st.busy = false;
+            st.need_cond = false;
             st.staged = 0;
             if !e.is_null() { unsafe { e.add(1).write_volatile(0) }; }
             if !e.is_null() && unsafe { e.read_volatile() } != 0 {
@@ -797,7 +854,19 @@ impl Vk {
         }
         if !st.batch || name == "quant_xq" { self.0.barrier(cb, false); }
         if st.rec.is_none() { if let Some((qp, names, _)) = &mut st.prof { if names.len() < 32767 {
-            unsafe { d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, *qp, 2 * names.len() as u32 + 1) }; names.push(name); } } }
+            let label = match (name, spec.get(1).copied()) {
+                ("gemv_q", Some(11)) => "gemv_q:Q3_K",
+                ("gemv_q", Some(13)) => "gemv_q:Q5_K",
+                ("gemv_q", Some(14)) => "gemv_q:Q6_K",
+                ("gemv_q", Some(8)) => "gemv_q:Q8_0",
+                ("gemv_q", Some(18)) => "gemv_q:IQ3_XXS",
+                ("moe_gemv_q", Some(18)) => "moe_gemv_q:IQ3_XXS",
+                ("moe_gemv_q", Some(11)) => "moe_gemv_q:Q3_K",
+                ("moe_down_combine", Some(18)) => "moe_down_combine:IQ3_XXS",
+                ("moe_down_combine", Some(11)) => "moe_down_combine:Q3_K",
+                _ => name,
+            };
+            unsafe { d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, *qp, 2 * names.len() as u32 + 1) }; names.push(label); } } }
         Ok(())
     }
 
@@ -1073,14 +1142,14 @@ impl Backend for Vk {
     }
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
         let mut st = self.0.st();
-        if let Some(&g) = st.graphs.get(&key) { return self.0.submit(&mut st, Some(g), false); }
+        if let Some(&g) = st.graphs.get(&key) { return self.0.enqueue_cb(&mut st, Some(g)); }
         if std::env::var_os("STRATA_NO_GRAPH").is_some() { drop(st); return f(); }
         let c = unsafe { self.0.dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(st.gpool)
             .command_buffer_count(1)) }?[0];
         unsafe { self.0.dev.begin_command_buffer(c, &vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE)) }?;
         st.rec = Some(c);
-        self.0.cond_on(&mut st, c);
+        if st.need_cond { self.0.cond_on(&mut st, c); }
         drop(st);
         let r = f();
         let mut st = self.0.st();
@@ -1089,8 +1158,10 @@ impl Backend for Vk {
         unsafe { self.0.dev.end_command_buffer(c) }?;
         if let Err(e) = r { unsafe { self.0.dev.free_command_buffers(st.gpool, &[c]) }; return Err(e); }
         st.graphs.insert(key, c);
-        self.0.submit(&mut st, Some(c), false)
+        self.0.enqueue_cb(&mut st, Some(c))
     }
+
+    fn moe_mailbox_optional(&self) -> bool { true }
 
     /// Device memory mapped through the BAR (`BAR`, or `BAR_AMD`).
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)> {
@@ -1118,7 +1189,7 @@ impl Backend for Vk {
         self.gemvq(w, x, x_stride, 0, y, y_stride, nt)
     }
     fn gemvq(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
-        ensure!((1..=4).contains(&nt), "gemvn: {nt} inputs (1 to 4)");
+        ensure!((1..=crate::cpu_worker::TMAX).contains(&nt), "gemvn: {nt} inputs (1 to {})", crate::cpu_worker::TMAX);
         let (nc, spec) = (gemv_cols(self.0.llama, w.ty, w.cols)?, [&self.wspec(w.ty)[..], &[nt as u32]].concat());
         if matches!(w.ty, GgmlType::F32 | GgmlType::BF16) {
             // Rows per workgroup as CUDA gemv_cfg: 8 for tall matrices, else 1 (hc_attn_up 10240 x 320).
@@ -1315,6 +1386,7 @@ impl Backend for Vk {
         ensure!(n <= 512 && k <= 32, "moe_route: {n} experts, top {k}");
         self.run("moe_route", &[], [1, 1, 1], &[&p, &table, &ids, &wts, &slots, &wh, &h, &mb, &step, &(n as u32), &(k as u32), &extra_scale, &(nh as u32), &(h_off as u32), &(t as u32), &(sigmoid as u32)])
     }
+    fn moe_prefetch_supported(&self) -> bool { !self.0.gfx11 && !self.0.igpu }
     fn moe_combine(&self, x: u64, ye: u64, w: u64, k: usize, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, slots: u64, n: usize, t: usize) -> anyhow::Result<()> {
         let err = self.0.st().err.3;
         self.run("moe_combine", &[], [n.div_ceil(256), t, 1], &[&x, &ye, &w, &sh, &sg, &mb, &step, &slots, &err, &(k as u32), &(y_off as u32), &(n as u32)])?;
@@ -1323,7 +1395,7 @@ impl Backend for Vk {
     }
     fn moe_down_combine(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, slots: u64, k: usize, h: u64, ye: u64, xq: u64,
                         x: u64, wh: u64, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, t: usize) -> anyhow::Result<()> {
-        if xq == 0 || cols % 256 != 0 || k > 32 {  // the shader keeps up to 32 slots in shared memory
+        if t > 1 || xq == 0 || cols % 256 != 0 || k > 32 {  // t > 1 deduplicates shared experts across tokens in moe_gemv
             self.moe_gemv(ty, rows, cols, w, stride, slots, t * k, h, cols, 1, ye, None, xq)?;
             return self.moe_combine(x, ye, wh, k, sh, sg, mb, y_off, step, slots, rows, t);
         }

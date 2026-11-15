@@ -29,9 +29,9 @@ float fdiv(float a, float b) {
     // An infinite operand or b = 0 makes the steps inf * 0 = NaN (sigmoid(-100): 1 / inf); a / b is exact there.
     return isinf(a) || isinf(b) || b == 0.0 ? a / b : r;
 }
-// Quantizer reciprocals on wave64: a correctly rounded double division keeps values on a roundEven() tie
-// from moving by one int8 step. Wave32 keeps the fdiv path that its kernels were tuned with.
-float rcp_d(float a, float b) { return W64 ? float(double(a) / double(b)) : fdiv(a, b); }
+// Quantizer reciprocals: a correctly rounded double division keeps values on a roundEven() tie
+// from moving by one int8 step across both wave64 and wave32 devices.
+float rcp_d(float a, float b) { return float(double(a) / double(b)); }
 float sqrt_(float x) { float s = sqrt(x); precise float r = fma(fma(-s, s, x), fdiv(0.5, s), s); return x > 0.0 && !isinf(x) ? r : s; }
 
 // expf as CUDA compiles it (its PTX): x = j ln2 + r with j from a rounded-down fma, then ex2.approx(r) * 2^j.
