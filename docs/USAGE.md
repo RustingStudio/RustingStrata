@@ -45,7 +45,8 @@ built-in checks.
 
 - It runs one request at a time; `--parallel N` (GPU) decodes up to N together (4 requests: 164 tok/s in total on the
   RTX 3060, 41 each; see [HOSTING.md](HOSTING.md)). From 8 requests decoding at once (`STRATA_BATCH_MIN` sets the
-  count), a dense model without MTP, LoRA or recurrent layers on CUDA runs them in one batched forward. That forward
+  count), a dense model without MTP, LoRA or recurrent layers on CUDA runs them in one batched forward, and the
+  prompts of requests that arrive together are prefilled together. That forward
   rounds differently from the single-request one, so greedy output under load can differ at near-ties from the same
   request run alone.
 - `temperature`, `top_k`, `top_p` and `seed` are honored; decoding is greedy when they are left out.

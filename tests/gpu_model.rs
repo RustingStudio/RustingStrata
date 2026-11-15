@@ -703,3 +703,50 @@ fn batch_matches_single() {
     }
     eprintln!("batch_matches_single: largest logit difference {worst}");
 }
+
+/// `prefill_slots` (several prompts in shared forwards, one of them continuing a saved state) against `prefill_cached`
+/// of each prompt alone, with the tolerance of `batch_matches_single`.
+#[test]
+fn prefill_slots_matches_single() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let prompts: Vec<Vec<u32>> = ["The capital of France is", "def fib(n):\n    return", "Once upon a time, in a small village by the sea, there lived",
+                                  "2 + 2 ="].iter().map(|s| tok.encode(s).unwrap()).collect();
+    let Ok(gpu) = rusting_strata::cuda::Gpu::new(0) else { return };
+    // Chunk 16: the 4 prompts take more than one forward.
+    let mut gm = GpuModel::load_slots(&m, Box::new(gpu), 256, 16, 512 << 20, 6).unwrap();
+    if gm.batch_cap() == 0 { eprintln!("prefill_slots_matches_single: no step_batch for this model, skipped"); return; }
+    let want: Vec<Vec<f32>> = prompts.iter().map(|ids| { gm.reset().unwrap(); gm.prefill(ids).unwrap() }).collect();
+    gm.reset().unwrap();
+    // Slot 1 holds the first 3 tokens of prompt 2 as its saved state.
+    gm.use_slot(1);
+    gm.prefill_cached(&prompts[2][..4], 0, 3).unwrap();
+    let jobs: Vec<(usize, u64, &[u32], usize, usize)> = prompts.iter().enumerate()
+        .map(|(i, ids)| ([3, 0, 1, 5][i], 0, &ids[..], if i == 0 { 2 } else { 0 }, ids.len() - 1)).collect();
+    let mut calls = 0;
+    let got = gm.prefill_slots(&jobs, &mut |_| { calls += 1; Ok(()) }).unwrap();
+    assert!(calls > 0, "one forward took every row");
+    let mut worst = 0f32;
+    for (i, ((l, reused), w)) in got.iter().zip(&want).enumerate() {
+        assert_eq!(*reused, if i == 2 { 3 } else { 0 }, "prompt {i}");
+        let d = l.iter().zip(w).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        worst = worst.max(d);
+        assert!(d < 0.5, "prompt {i}: logits differ by {d}");
+    }
+    // Decode goes on from the prefilled slots.
+    let rows: Vec<(usize, u32, bool)> = jobs.iter().zip(&want).map(|(j, w)| (j.0, ops::argmax(w) as u32, true)).collect();
+    let next = gm.step_batch(&rows).unwrap();
+    for (i, ids) in prompts.iter().enumerate() {
+        gm.use_slot(2);
+        gm.reset().unwrap();
+        gm.prefill(ids).unwrap();
+        let w = gm.step(ops::argmax(&want[i]) as u32).unwrap();
+        let d = next[i].1.iter().zip(&w).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        worst = worst.max(d);
+        assert!(d < 0.5, "prompt {i}: logits of the step after differ by {d}");
+    }
+    eprintln!("prefill_slots_matches_single: largest logit difference {worst}");
+}
