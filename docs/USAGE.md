@@ -16,7 +16,9 @@ hand can be continued. Settings hold the sampler values (`temperature`, `top_p`,
 tokens; empty fields leave the server's flags in effect), named presets, instructions for one chat, and export of chats
 as Markdown or JSON and import of a JSON export. The models tab also holds load options (`--ctx`, `--kv`, `--cache-ram`,
 `--vram-margin`, `--mtp`, `--chunk`): "apply and reload" loads the model again with them, and they stay until the server
-restarts (`POST /api/load` takes them as `options`, admin key only). Open the page with `#selftest` at the end of the address to run its
+restarts (`POST /api/load` takes them as `options`, admin key only). The accent color follows the loaded model's
+family (Qwen purple, DeepSeek blue, Gemma multicolor, Flint and GLM gray, anything else green); "color theme" in the
+connection and data tab picks one color by hand instead. Open the page with `#selftest` at the end of the address to run its
 built-in checks.
 
 ## Flags

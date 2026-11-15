@@ -13,6 +13,10 @@
   --l-sys: #6d7c8b; --l-cache: #1d7a34; --l-new: #8a5a00; --l-reply: #3a6ea5;
   --mono: "JetBrains Mono", "Cascadia Code", ui-monospace, Consolas, monospace;
 }
+:root[data-tint=purple] { --accent: #6a3fc0; --accent-soft: #e9e1f8; }
+:root[data-tint=blue] { --accent: #1f5fc4; --accent-soft: #dde8f8; }
+:root[data-tint=gray] { --accent: #4d5560; --accent-soft: #e4e6e9; }
+:root[data-tint=gemma] { --accent: #1a62d0; --accent-soft: #dfe9fa; }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #0b0d0c; --surface: #121514; --sunk: #0b0d0c; --ink: #d6dbd4; --muted: #6f7a72; --line: #1f2623;
@@ -20,6 +24,14 @@
     --l-sys: #8796a5; --l-cache: #7fd18b; --l-new: #d9b36c; --l-reply: #6e9fd6;
   }
 }
+@media (prefers-color-scheme: dark) {
+  :root[data-tint=purple] { --accent: #b79cf5; --accent-ink: #120a24; --accent-soft: #1e1832; }
+  :root[data-tint=blue] { --accent: #7fb2f5; --accent-ink: #07101d; --accent-soft: #14202f; }
+  :root[data-tint=gray] { --accent: #b4bcc4; --accent-ink: #0c0e10; --accent-soft: #1c2024; }
+  :root[data-tint=gemma] { --accent: #8ab4f8; --accent-ink: #07101d; --accent-soft: #14202f; }
+}
+/* Gemma: the four colours as a rule above the status bar. */
+:root[data-tint=gemma] #sbar { border-image: linear-gradient(90deg, #4285f4 25%, #ea4335 25% 50%, #fbbc04 50% 75%, #34a853 75%) 1; }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 html, body { height: 100%; margin: 0; }
@@ -378,6 +390,8 @@ progress { width: 100%; height: 6px; accent-color: var(--accent); margin-top: 10
     <p class="note">top_p and top_k at the left end, and an empty seed, are not sent: the server's own flags apply.</p>
   </div>
   <div class="tab" id="tab-conn" hidden>
+    <label for="tint">color theme</label>
+    <select id="tint"><option value="auto">follow the model</option><option value="green">green</option><option value="purple">purple</option><option value="blue">blue</option><option value="gray">gray</option><option value="gemma">multicolor</option></select>
     <label for="key">API key, only if the server was started with --api-key</label>
     <input id="key" type="password" autocomplete="off">
     <p class="note">Other apps (Open WebUI, Jan, SillyTavern, code editors) can use this server: give them <code id="base"></code> as an OpenAI-compatible address.</p>
@@ -932,11 +946,23 @@ $('eapply').onclick = () => {
   const m = known.find(m => m.loaded);
   if (m) { $('dlg').close(); load(m.id); } else $('enote').textContent = 'No model is loaded: load one above and it takes these options.';
 };
+// The accent colour: by hand, or from the loaded model's family (green when it is not a known one).
+const family = id => { const n = id.split('/').pop().toLowerCase(); return /qwen/.test(n) ? 'purple' : /deepseek/.test(n) ? 'blue' : /gemma/.test(n) ? 'gemma' : /flint|glm/.test(n) ? 'gray' : 'green'; };
+function tint() {
+  // Until the model list arrives, the last colour stays (no green flash on every page load).
+  const m = known.find(m => m.loaded), t = $('tint').value !== 'auto' ? $('tint').value : m ? family(m.id) : listed ? 'green' : store.get('tintnow', 'green');
+  store.set('tintnow', t);
+  if (t === 'green') delete document.documentElement.dataset.tint; else document.documentElement.dataset.tint = t;
+}
+let listed = false;
+drop($('tint'));
+$('tint').value = store.get('tint', 'auto'); $('tint').sync(); tint();
+$('tint').onchange = () => { store.set('tint', $('tint').value); tint(); };
 async function models() {
   let j;
   try { j = await api('/api/models'); } catch (e) { status(e.message === 'Failed to fetch' ? 'Server not reachable' : e.message, true); return; }
   known = j.models;
-  showOpts(j.options);
+  listed = true; showOpts(j.options); tint();
   const loaded = j.models.find(m => m.loaded), top = best(known);
   $('model').replaceChildren(...(loaded ? [] : [opt('', j.models.length ? 'choose a model' : 'no models yet')]),
     ...j.models.map(m => opt(m.id, `${m.id.split('/').pop().replace(/\.gguf$/i, '')}  ${gb(m.bytes)}`)));
@@ -1118,6 +1144,7 @@ function selftest() {
     ['highlight', () => { const h = md('```js\nconst a = "s"; // c\n```'); return h.includes('<span class="k">const</span>') && h.includes('<span class="s">&quot;s&quot;</span>') && h.includes('<span class="c">// c</span>'); }],
     ['hash is a comment only where it is one', () => !hl('#include <x>', 'c').includes('class="c"') && hl('# x', 'python').includes('class="c"')],
     ['plain block untouched', () => md('```\nif x\n```').includes('<code>if x</code>')],
+    ['theme by model', () => ['Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf', '/m/DeepSeek-V4.1-Flash.gguf', 'gemma-4-12b.gguf', 'flint-UD-Q5_K_XL.gguf', 'GLM-5.3-Flash.gguf', 'llama-3.gguf'].map(family).join() === 'purple,blue,gemma,gray,gray,green'],
     ['export round trip', () => swap([], () => merge(pack([{ id: 'x', title: 't', at: 2, msgs: [{ role: 'user', content: 'q' }] }])) === 1 && chats[0].msgs[0].content === 'q')],
     ['import keeps the newer chat', () => swap([{ id: 'x', title: 'new', at: 5, msgs: [] }], () => merge(pack([{ id: 'x', title: 'old', at: 1, msgs: [] }])) === 0 && chats[0].title === 'new')],
     ['import rejects other files', () => { try { merge('{"chats":[{"id":1}]}'); return false; } catch { return true; } }],
