@@ -8,6 +8,8 @@
 
 // 1 on devices whose physical subgroup is 64 lanes, split into two logical 32-lane warps. Set on every pipeline.
 layout(constant_id = 14) const bool W64 = false;
+// 1 on AMD devices (including wave32 RADV) so quantizer reciprocals use exact double division.
+layout(constant_id = 13) const bool RCP_D = false;
 #define LANE (W64 ? (gl_SubgroupInvocationID & 31u) : gl_SubgroupInvocationID)
 #define WARP (W64 ? (gl_SubgroupID * (gl_SubgroupSize / 32u) + gl_SubgroupInvocationID / 32u) : gl_SubgroupID)
 #define NWARPS ((gl_WorkGroupSize.x + 31u) / 32u)
@@ -29,9 +31,9 @@ float fdiv(float a, float b) {
     // An infinite operand or b = 0 makes the steps inf * 0 = NaN (sigmoid(-100): 1 / inf); a / b is exact there.
     return isinf(a) || isinf(b) || b == 0.0 ? a / b : r;
 }
-// Quantizer reciprocals on wave64: a correctly rounded double division keeps values on a roundEven() tie
-// from moving by one int8 step. Wave32 keeps the fdiv path that its kernels were tuned with.
-float rcp_d(float a, float b) { return W64 ? float(double(a) / double(b)) : fdiv(a, b); }
+// Quantizer reciprocals on wave64 and AMD wave32: a correctly rounded double division keeps values on a
+// roundEven() tie from moving by one int8 step. Non-AMD wave32 keeps the fdiv path that its kernels were tuned with.
+float rcp_d(float a, float b) { return (W64 || RCP_D) ? float(double(a) / double(b)) : fdiv(a, b); }
 float sqrt_(float x) { float s = sqrt(x); precise float r = fma(fma(-s, s, x), fdiv(0.5, s), s); return x > 0.0 && !isinf(x) ? r : s; }
 
 // expf as CUDA compiles it (its PTX): x = j ln2 + r with j from a rounded-down fma, then ex2.approx(r) * 2^j.
