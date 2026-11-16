@@ -74,10 +74,10 @@ enum Mixer {
 }
 
 /// QSA indexer of an attention layer (qwen4exp, see `Model::qsa`): projections and norms, the pooled keys (128 floats
-/// per block of 4 positions) and this layer's 4 rows of `QsaBufs::ring`.
+/// per block of 4 positions) and this layer's 32 rows of `QsaBufs::ring`.
 struct Qsa { kp: GpuTensor, qp: GpuTensor, kn: GpuTensor, qn: GpuTensor, pool: Buf, ring: u64 }
 
-/// QSA scratch shared by the layers: raw indexer keys of each layer's incomplete block (`QSA_RING` floats a layer)
+/// QSA scratch shared by the layers: raw indexer keys of each layer's last 32 positions (`QSA_RING` floats a layer)
 /// and their copy at `save_state`, block scores (rows of `nbs`), decode cell lists (rows of `sst`), prefill masks
 /// (rows of `mw` words).
 struct QsaBufs { ring: Buf, saved: Buf, score: Buf, sel: Buf, mask: Buf, top: usize, nbs: usize, sst: usize, mw: usize }
@@ -86,7 +86,7 @@ struct QsaBufs { ring: Buf, saved: Buf, score: Buf, sel: Buf, mask: Buf, top: us
 const QSA_POOL: usize = 4;
 const QSA_D: usize = 128;
 const QSA_H: usize = 4;
-const QSA_RING: usize = QSA_POOL * QSA_D;
+const QSA_RING: usize = 32 * QSA_D;
 /// Query rows per `qsa_select` launch in prefill (score rows).
 const QSA_ROWS: usize = 64;
 
@@ -148,7 +148,10 @@ struct Eagle3Gpu {
 }
 
 struct MtpHead {
-    layer: Layer, eh_proj: Option<GpuTensor>, enorm: GpuTensor, hnorm: GpuTensor, head_norm: GpuTensor,
+    layer: Layer, eh_proj: Option<GpuTensor>, enorm: GpuTensor, hnorm: GpuTensor,
+    /// The head's norm, or with hyper-connections its read (`nextn.hc_head_*`). Rows of `eh` and `x` are then per
+    /// stream: hc_n times as wide.
+    head_norm: Option<GpuTensor>, hc_head: Option<HcRead>,
     worker: Option<CpuWorker>, step_buf: Buf, emb: Buf, eh: Buf, x: Buf, pos: usize,
     eagle: Option<Eagle3Gpu>,
     /// Row 0 of the main model's `x` (or `eagle.cur_g`) at `save_state`.
@@ -189,6 +192,8 @@ pub struct GpuModel<'a> {
     qsa: Option<QsaBufs>,
     ple_prev: [i64; 2],
     saved_ple_prev: [i64; 2],
+    /// `ple_prev` before the last forward and that forward's tokens, for `rollback`.
+    ple_undo: ([i64; 2], Vec<u32>),
     /// Scratch activations by name.
     bufs: HashMap<&'static str, Buf>,
     x: Buf,
@@ -360,8 +365,7 @@ impl<'a> GpuModel<'a> {
         if qsa_on { ensure!(c.idx_head_dim == QSA_D && c.idx_n_head == QSA_H, "QSA indexer: {} heads of {} (the GPU kernels take {QSA_H} of {QSA_D})", c.idx_n_head, c.idx_head_dim); }
         let ring = gpu.zeros::<f32>(if qsa_on { c.n_layer * QSA_RING } else { 1 })?;
 
-        // ponytail: no MTP or batched prefill with hyper-connections yet (their state and row layouts assume one stream).
-        let k = if c.hc_n == 0 { k.min(gpu.verify_rows() - 1) } else { 0 };
+        let k = k.min(gpu.verify_rows() - 1);
         let mtp = k > 0 && c.n_nextn > 0;
         let nsnap = k.min(SNAP_MAX);
         let load_layer = |il: usize, kind: LayerKind| -> anyhow::Result<Layer> {
@@ -464,7 +468,8 @@ impl<'a> GpuModel<'a> {
                     eh_proj: None,
                     enorm: lt(il, "nextn.enorm.weight")?,
                     hnorm: lt(il, "nextn.hnorm.weight")?,
-                    head_norm: lt(il, "nextn.shared_head_norm.weight")?,
+                    head_norm: Some(lt(il, "nextn.shared_head_norm.weight")?),
+                    hc_head: None,
                     worker: None,
                     step_buf: gpu.zeros::<i32>(2 * TMAX)?,
                     emb: gpu.zeros::<f32>(TMAX * c.n_embd)?,
@@ -483,15 +488,16 @@ impl<'a> GpuModel<'a> {
                     eh_proj: Some(lt(il, "nextn.eh_proj.weight")?),
                     enorm: lt(il, "nextn.enorm.weight")?,
                     hnorm: lt(il, "nextn.hnorm.weight")?,
-                    head_norm: lt(il, "nextn.shared_head_norm.weight")?,
+                    head_norm: if c.hc_n > 0 { None } else { Some(lt(il, "nextn.shared_head_norm.weight")?) },
+                    hc_head: if c.hc_n > 0 { Some(hc_read(&format!("blk.{il}.nextn.hc_head_"))?) } else { None },
                     worker: Some(CpuWorker::new(m, &*gpu, vec![c.n_layer])?),
                     step_buf: gpu.zeros::<i32>(2 * TMAX)?,
                     emb: gpu.zeros::<f32>(TMAX * c.n_embd)?,
-                    eh: gpu.zeros::<f32>(TMAX * 2 * c.n_embd)?,
-                    x: gpu.zeros::<f32>(TMAX * c.n_embd)?,
+                    eh: gpu.zeros::<f32>(TMAX * 2 * hcn * c.n_embd)?,
+                    x: gpu.zeros::<f32>(TMAX * hcn * c.n_embd)?,
                     pos: 0,
                     eagle: None,
-                    saved_x: gpu.zeros::<f32>(c.n_embd)?,
+                    saved_x: gpu.zeros::<f32>(hcn * c.n_embd)?,
                     pend: vec![],
                     adapt_window: 0x0FFF,
                     adapt_skip: 0,
@@ -600,7 +606,7 @@ impl<'a> GpuModel<'a> {
         let adapt_every = std::env::var("STRATA_ADAPT_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
         let adapt_swaps = std::env::var("STRATA_ADAPT_SWAPS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
         let reset_counts_after_prefill = std::env::var_os("STRATA_RESET_COUNTS").is_some();
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, prompt_cache_path: None, bt, mtp, ngram: None, first: range.start, next: None,
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], ple_undo: ([-1, -1], vec![]), bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, prompt_cache_path: None, bt, mtp, ngram: None, first: range.start, next: None,
                       cur: 0, seqs, rows: vec![], row_tokens: 0 })
     }
 
@@ -799,6 +805,7 @@ impl<'a> GpuModel<'a> {
         let emb: Vec<f32> = tokens.iter().flat_map(|&t| self.m.embed(t).repeat(hc)).collect();
         self.gpu.put(&emb, &self.x, 0)?;
         if self.ple_ring.is_some() {
+            self.ple_undo = (self.ple_prev, tokens.to_vec());
             let pe: Vec<f32> = tokens.iter().flat_map(|&t| self.m.ple_embed(&mut self.ple_prev, t)).collect();
             self.gpu.put(&pe, &self.bufs["emb"], 0)?;
         }
@@ -855,7 +862,9 @@ impl<'a> GpuModel<'a> {
         let seq = self.begin_seq();
         self.put_embed(tokens)?;
         let steps: Vec<i32> = (0..nt).flat_map(|t| [(self.pos + t) as i32, seq as i32]).collect();
+        let rope: Vec<i32> = (0..nt).flat_map(|t| [(self.pos + t) as i32 + self.rope_offset, seq as i32]).collect();
         self.gpu.put(&steps, &self.step_buf, 0)?;
+        self.gpu.put(&rope, &self.rope_buf, 0)?;
         let t1 = prof.then(std::time::Instant::now);
         self.pass(nt)?;
         let t2 = prof.then(std::time::Instant::now);
@@ -907,7 +916,7 @@ impl<'a> GpuModel<'a> {
         }
         if let Some(h) = &self.mtp {
             let src = h.eagle.as_ref().map_or(&self.x, |e| &e.cur_g);
-            g.dtod(src, 0, &h.saved_x, 0, 4 * self.m.cfg.n_embd)?;
+            g.dtod(src, 0, &h.saved_x, 0, h.saved_x.len())?;
         }
         if let Some((r, sr)) = &self.ple_ring { g.dtod(r, 0, sr, 0, r.len())?; }
         if let Some(q) = &self.qsa { g.dtod(&q.ring, 0, &q.saved, 0, q.ring.len())?; }
@@ -1013,6 +1022,7 @@ impl<'a> GpuModel<'a> {
         self.m.cfg.head_dim.hash(&mut h);
         self.m.cfg.ssm_d_inner.hash(&mut h);
         self.m.cfg.ssm_d_state.hash(&mut h);
+        if let Some(q) = &self.qsa { q.ring.len().hash(&mut h); }
         let mut p = Some(self);
         while let Some(q) = p {
             q.layers.len().hash(&mut h);
@@ -1192,6 +1202,13 @@ impl<'a> GpuModel<'a> {
     /// Keep only the first `keep` tokens of the last `verify`, which started at position `start` (1 <= keep <= `k`):
     /// recurrent states come from the snapshots it wrote, KV entries past them are dropped by rewinding `pos`.
     pub fn rollback(&mut self, start: usize, keep: usize) -> anyhow::Result<()> {
+        // The PLE n-gram context goes back to the kept tokens. Its ring and the QSA ring are indexed by position
+        // with more rows than a verify writes, so the rows a later token reads are still the kept ones.
+        if self.ple_ring.is_some() {
+            self.ple_prev = self.ple_undo.0;
+            let kept: Vec<u32> = self.ple_undo.1.iter().take(keep).copied().collect();
+            for t in kept { self.m.ple_embed(&mut self.ple_prev, t); }
+        }
         if !self.has_delta() {
             ensure!((1..=self.tmax()).contains(&keep) && start + keep <= self.pos, "rollback: keep {keep} of verify at {start}");
             self.pos = start + keep;
@@ -1253,7 +1270,7 @@ impl<'a> GpuModel<'a> {
         // The draft head's entries before the saved position are still the ones its prompt fill wrote (see `mtp_synced`).
         if let Some(h) = self.mtp.as_mut() {
             let dst = h.eagle.as_ref().map_or(&self.x, |e| &e.cur_g);
-            g.dtod(&h.saved_x, 0, dst, 0, 4 * self.m.cfg.n_embd)?;
+            g.dtod(&h.saved_x, 0, dst, 0, h.saved_x.len())?;
             h.pos = self.pos.saturating_sub(1);
             h.pend.clear();
             h.adapt_window = 0x0FFF;
@@ -1368,8 +1385,8 @@ impl<'a> GpuModel<'a> {
         if nt == 1 { self.gpu.gemv(w, x, y) } else { self.gpu.gemvn(w, x, xs, y, ys, nt) }
     }
 
-    /// Last hidden state (before output_norm) of the last `step`.
-    pub fn hidden(&self) -> anyhow::Result<Vec<f32>> { let t = self.tail(); t.gpu.get::<f32>(&t.x, 0, self.m.cfg.n_embd) }
+    /// Last hidden state (before output_norm; the stack with hyper-connections) of the last `step`.
+    pub fn hidden(&self) -> anyhow::Result<Vec<f32>> { let t = self.tail(); t.gpu.get::<f32>(&t.x, 0, self.row_width()) }
 
     /// MTP draft: logits for the token after `token`, from hidden state `row` of the last `step` or `verify` (the
     /// position that predicted `token`). Mirrors `Model::mtp_step`; the draft head keeps its own position and KV cache.
@@ -1416,7 +1433,7 @@ impl<'a> GpuModel<'a> {
         let mut hid = self.row_ptr(row + 1 - nf);
         for i in 0..k_eff {
             let d = if i == 0 { self.mtp_run(&first, hid, true)? } else { self.mtp_run(&toks[i..=i], hid, true)? };
-            hid = self.mtp.as_ref().unwrap().x.addr() + 4 * ((if i == 0 { nf } else { 1 } - 1) * self.m.cfg.n_embd) as u64;
+            hid = self.mtp.as_ref().unwrap().x.addr() + 4 * ((if i == 0 { nf } else { 1 } - 1) * self.row_width()) as u64;
             toks.push(d);
         }
         let start = self.pos;
@@ -1554,8 +1571,11 @@ impl<'a> GpuModel<'a> {
     /// Address of hidden row `row` of the last `step` or `verify`.
     fn row_ptr(&self, row: usize) -> u64 {
         let base = self.mtp.as_ref().and_then(|h| h.eagle.as_ref()).map_or_else(|| self.x.addr(), |e| e.cur_g.addr());
-        base + 4 * (row * self.m.cfg.n_embd) as u64
+        base + 4 * (row * self.row_width()) as u64
     }
+
+    /// Floats per hidden row: n_embd, or the whole stack with hyper-connections.
+    fn row_width(&self) -> usize { self.m.cfg.hc_n.max(1) * self.m.cfg.n_embd }
 
     /// Draft head on `tokens` with hidden states at `hid` (rows of n_embd), as one batch at the next draft positions;
     /// returns the argmax of the last token's logits (left in `logits` row 0), or 0 when `head` = false skips the head.
@@ -1668,7 +1688,7 @@ impl<'a> GpuModel<'a> {
             self.mv(down, eg.ge.addr(), ec.n_ff, self.bufs["ye"].addr(), ne, nt)?;
             g.add(x, self.bufs["ye"].addr(), nt * ne)?;
             if head {
-                g.rms_norm(x + 4 * ((nt - 1) * ne) as u64, 0, h.head_norm.ptr, hp, 0, ne, 1, eps)?;
+                g.rms_norm(x + 4 * ((nt - 1) * ne) as u64, 0, h.head_norm.as_ref().unwrap().ptr, hp, 0, ne, 1, eps)?;
                 g.gemv(&eg.output, hp, self.logits.addr())?;
                 g.argmax_rows(self.logits.addr(), ec.draft_vocab, 1, self.amax.addr())?;
             }
@@ -1676,16 +1696,32 @@ impl<'a> GpuModel<'a> {
         }
         let (eps, ne, hp) = (c.eps, c.n_embd, self.bufs["h"].addr());
         let (eh, x) = (h.eh.addr(), h.x.addr());
+        // Hyper-connections (llama.cpp qwen4exp `graph_mtp`): every stream of the stack at `hid` is projected on its
+        // own from [enorm(embed), hnorm(stream)]; `hnorm` is hc_n gammas. Rows of eh and x are hc times as wide.
+        let hc = c.hc_n.max(1);
+        let (d, e2) = (hc * ne, hc * 2 * ne);
         if !resume {
-            g.rms_norm(h.emb.addr(), ne, h.enorm.ptr, eh, 2 * ne, ne, nt, eps)?;
-            g.rms_norm(hid, ne, h.hnorm.ptr, eh + 4 * ne as u64, 2 * ne, ne, nt, eps)?;
-            self.mv(h.eh_proj.as_ref().unwrap(), eh, 2 * ne, x, ne, nt)?;
+            for s in 0..hc {
+                let (so, eo) = (4 * (s * ne) as u64, eh + 4 * (s * 2 * ne) as u64);
+                g.rms_norm(h.emb.addr(), ne, h.enorm.ptr, eo, e2, ne, nt, eps)?;
+                g.rms_norm(hid + so, d, h.hnorm.ptr + so, eo + 4 * ne as u64, e2, ne, nt, eps)?;
+                self.mv(h.eh_proj.as_ref().unwrap(), eo, e2, x + so, d, nt)?;
+            }
         }
         let res = self.layer(c.n_layer, &h.layer, x, h.step_buf.addr(), h.worker.as_ref(), nt, 0, gq, resume)?;
         if res != 0 { g.add(x, res, nt * ne)?; }
         if head {
-            g.rms_norm(x + 4 * ((nt - 1) * ne) as u64, 0, h.head_norm.ptr, hp, 0, ne, 1, eps)?;
-            g.gemv(self.output.as_ref().unwrap(), hp, self.logits.addr())?;
+            let last = x + 4 * ((nt - 1) * d) as u64;
+            match &h.hc_head {
+                Some(hr) => {
+                    self.hc_read(hr, last, 1, &self.hc_at())?;
+                    g.gemvq(self.output.as_ref().unwrap(), hp, ne, self.bufs["hq"].addr(), self.logits.addr(), c.n_vocab, 1)?;
+                }
+                None => {
+                    g.rms_norm(last, 0, h.head_norm.as_ref().unwrap().ptr, hp, 0, ne, 1, eps)?;
+                    g.gemv(self.output.as_ref().unwrap(), hp, self.logits.addr())?;
+                }
+            }
             g.argmax_rows(self.logits.addr(), c.n_vocab, 1, self.amax.addr())?;
         }
         Ok(())
@@ -1726,7 +1762,8 @@ impl<'a> GpuModel<'a> {
             }
             match &l.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, snap } => {
-                    let (sc, ss, ns) = snap.as_ref().map_or((0, 0, 0), |(a, b)| (a.addr(), b.addr(), self.k.min(SNAP_MAX)));
+                    // Every allocated snapshot, not `self.k` of them: the count is baked into the captured graph.
+                    let (sc, ss, ns) = snap.as_ref().map_or((0, 0, 0), |(a, b)| (a.addr(), b.addr(), b.len() / s[self.cur].len()));
                     g.batch(&mut || {
                         mv2(qkv, gate, "qkv", "z")?;
                         mv2(beta, alpha, "beta", "g")

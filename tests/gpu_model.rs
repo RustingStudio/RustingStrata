@@ -101,16 +101,19 @@ fn prefill_matches_reference() {
 /// less while the first one's context lives), so the hidden states and the near-ties moved between backends and runs.
 #[test]
 fn mtp_draft_matches_reference() {
-    use rusting_strata::model::Mtp;
     let _gpu = common::gpu_lock();
     let Some(p) = common::model_path() else { return };
     let g = Gguf::open(&p).unwrap();
     let m = Model::load(&g).unwrap();
     if m.cfg.n_nextn == 0 { eprintln!("SKIP: no nextn layer"); return }
-    let tok = Tokenizer::from_gguf(&g).unwrap();
+    draft_matches_reference(&m, &Tokenizer::from_gguf(&g).unwrap());
+}
+
+fn draft_matches_reference(m: &Model, tok: &Tokenizer) {
+    use rusting_strata::model::Mtp;
     for (bk, gpu) in common::backends() {
         eprintln!("backend {bk}");
-        let mut gm = GpuModel::load(&m, gpu, 256, 0, usize::MAX / 2, 1).unwrap();
+        let mut gm = GpuModel::load(m, gpu, 256, 0, usize::MAX / 2, 1).unwrap();
         let mut ids = tok.encode("The capital of France is").unwrap();
         let (mut st, mut mtp) = (State::new(&m.cfg), Mtp::default());
         let mut bad = 0;
@@ -180,10 +183,30 @@ fn mtp_spec_matches_greedy() {
     let g = Gguf::open(&p).unwrap();
     let m = Model::load(&g).unwrap();
     if m.cfg.n_nextn == 0 { eprintln!("SKIP: no nextn layer"); return }
+    spec_matches_greedy(&m, &Tokenizer::from_gguf(&g).unwrap());
+}
+
+/// Flash-Next (hyper-connections, PLE, QSA with top_k lowered so that it selects) with its companion draft head: the
+/// GPU draft matches the CPU one, and drafted decode gives the plain greedy tokens (rollback of the PLE context and
+/// the QSA key ring after rejected drafts).
+#[test]
+fn qwen4exp_mtp_matches() {
+    let _gpu = common::gpu_lock();
+    let d = std::path::Path::new("/mnt/ollama/qwen4exp");
+    let (p, a) = (d.join("Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf"), d.join("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"));
+    if !p.exists() || !a.exists() { return }
+    let (g, ag) = (Gguf::open(&p).unwrap(), Gguf::open(&a).unwrap());
+    let mut m = Model::load_with_aux(&g, Some(&ag), &[]).unwrap();
+    m.cfg.idx_top_k = 8;
     let tok = Tokenizer::from_gguf(&g).unwrap();
+    draft_matches_reference(&m, &tok);
+    spec_matches_greedy(&m, &tok);
+}
+
+fn spec_matches_greedy(m: &Model, tok: &Tokenizer) {
     for (bk, gpu) in common::backends() {
         eprintln!("backend {bk}");
-        let mut gm = GpuModel::load(&m, gpu, 512, 0, 512 << 20, 3).unwrap();
+        let mut gm = GpuModel::load(m, gpu, 512, 0, 512 << 20, 3).unwrap();
         assert_eq!(gm.k, 3);
         gm.adapt_every = 0;
         let ids = tok.encode("Write a short story about a dragon.").unwrap();

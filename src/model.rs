@@ -271,7 +271,7 @@ impl<'a> Model<'a> {
     /// qwen4exp: the residual is a stack of hc_n streams (hyper-connections). Every half-layer reads the stack
     /// down to one vector, runs its block and writes the output back into every stream with a per-stream weight.
     /// Layers holding `ple_key` first add the per-layer n-gram embedding (PLE) to the stack. Returns the logits
-    /// and the head's mixed vector. Mirrors original Strata's `Engine::enqueue` (llama.cpp qwen4exp.cpp).
+    /// and the stack before the head's read (the MTP draft input). Mirrors original Strata's `Engine::enqueue` (llama.cpp qwen4exp.cpp).
     fn step_embed_hc(&self, st: &mut State, x: Vec<f32>, rope_pos: [i32; 4], token: u32) -> (Vec<f32>, Vec<f32>) {
         let c = &self.cfg;
         let mut r = x.repeat(c.hc_n);
@@ -290,7 +290,7 @@ impl<'a> Model<'a> {
         st.pos += 1;
         st.rope_pos = [rope_pos[0] + 1; 4];
         let (h, _) = self.hc_read(&r, "output_hc_");
-        (mv(&self.w.get("output.weight").unwrap(), &h), h)
+        (mv(&self.w.get("output.weight").unwrap(), &h), r)
     }
 
     /// Hyper-connection read (`build_hc_mix`) of the stack `r` with the tensors `{p}norm/down/up/inject.weight`:
@@ -413,6 +413,7 @@ impl<'a> Model<'a> {
     pub fn mtp_step(&self, ms: &mut Mtp, hid: &[f32], token: u32) -> (Vec<f32>, Vec<f32>) {
         let (c, il) = (&self.cfg, self.cfg.n_layer);
         let n = c.n_embd;
+        if c.hc_n > 0 { return self.mtp_step_hc(ms, hid, token); }
         let mut eh = vec![0f32; 2 * n];
         ops::rms_norm(&self.embed(token), &self.f(il, "nextn.enorm.weight"), c.eps, &mut eh[..n]);
         ops::rms_norm(hid, &self.f(il, "nextn.hnorm.weight"), c.eps, &mut eh[n..]);
@@ -421,6 +422,28 @@ impl<'a> Model<'a> {
         self.block(il, &mut x, &mut ms.kv, ms.pos, rope_pos);
         ms.pos += 1;
         (self.head(&x, &self.f(il, "nextn.shared_head_norm.weight")), x)
+    }
+
+    /// qwen4exp draft step (llama.cpp `graph_mtp`): `hid` is the hc_n x n_embd stack. Every stream is projected
+    /// on its own from [enorm(embed), hnorm(stream)], then the nextn block runs as a hyper-connection layer with
+    /// plain attention (no PLE, no QSA). Returns the logits and the new stack, which is `hid` of the next draft.
+    fn mtp_step_hc(&self, ms: &mut Mtp, hid: &[f32], token: u32) -> (Vec<f32>, Vec<f32>) {
+        let (c, il) = (&self.cfg, self.cfg.n_layer);
+        let n = c.n_embd;
+        let mut e = vec![0f32; n];
+        ops::rms_norm(&self.embed(token), &self.f(il, "nextn.enorm.weight"), c.eps, &mut e);
+        let mut hn = vec![0f32; hid.len()];
+        self.gnorm(hid, &self.f(il, "nextn.hnorm.weight"), &mut hn);
+        let proj = self.t(il, "nextn.eh_proj.weight");
+        let mut r: Vec<f32> = hn.chunks_exact(n).flat_map(|h| mv(&proj, &[&e, h].concat())).collect();
+        let (h, inj) = self.hc_read(&r, &format!("blk.{il}.hc_attn_"));
+        let LayerState::Attn { k, v, ik } = &mut ms.kv else { unreachable!("the nextn block is an attention layer") };
+        Self::hc_write(&mut r, &self.attention(il, &h, k, v, ik, ms.pos, [ms.pos as i32; 4]), &inj);
+        let (h, inj) = self.hc_read(&r, &format!("blk.{il}.hc_ffn_"));
+        Self::hc_write(&mut r, &self.moe(il, &h), &inj);
+        ms.pos += 1;
+        let (h, _) = self.hc_read(&r, &format!("blk.{il}.nextn.hc_head_"));
+        (mv(&self.w.get("output.weight").unwrap(), &h), r)
     }
 
     fn deltanet(&self, il: usize, h: &[f32], conv: &mut [f32], s: &mut [f32]) -> Vec<f32> {
@@ -495,7 +518,7 @@ impl<'a> Model<'a> {
     fn qsa(&self, il: usize, h: &[f32], ik: &mut Vec<f32>, pos: usize, rope_pos: [i32; 4]) -> Option<Vec<usize>> {
         let c = &self.cfg;
         let (nh, d) = (c.idx_n_head, c.idx_head_dim);
-        if c.idx_top_k == 0 || self.w.layer(il, "indexer.k_proj.weight").is_err() { return None; }
+        if c.idx_top_k == 0 || il >= c.n_layer || self.w.layer(il, "indexer.k_proj.weight").is_err() { return None; }
         ik.extend_from_slice(&mv(&self.t(il, "indexer.k_proj.weight"), h));
         let (nb, top) = ((pos + 1) / QSA_POOL, c.idx_top_k / QSA_POOL);
         if nb <= top { return None; }
