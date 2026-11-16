@@ -734,7 +734,8 @@ fn gpu_image_prefill_matches_cpu() {
         for _ in 0..64 {
             text.push_str(&tok.decode(&[next]).unwrap());
             if text.to_ascii_lowercase().contains("red") { break; }
-            next = ops::argmax(&gm.step(next).unwrap()) as u32;
+            // The image prompt dropped the draft head: drafted decode must fall back to plain steps.
+            next = gm.spec_step(next, 0, &mut ops::Sampler::greedy()).unwrap().1;
         }
         eprintln!("backend {bk}: generated {text:?}");
         assert!(text.to_ascii_lowercase().contains("red"), "backend {bk}: {text:?}");
