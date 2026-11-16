@@ -832,6 +832,10 @@ enum Cmd {
         reps: usize,
         #[arg(long, value_parser = json_out_path)]
         json_out: Option<PathBuf>,
+        /// Prefill this text file instead of the built-in paragraph (repeated when shorter than `--pp`). The built-in
+        /// prose routes few experts; a real prompt shows what a first request costs.
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
         #[command(flatten)]
         engine: Engine,
     },
@@ -1031,7 +1035,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             println!("\nPPL = {:.4} over {n_chunk} chunks of {n} tokens ({count} scored)", (nll / count as f64).exp());
             r.finish()?;
         }
-        Cmd::Bench { model, pp, tg, reps, json_out, mut engine } => {
+        Cmd::Bench { model, pp, tg, reps, json_out, prompt_file, mut engine } => {
+            if let Some(f) = &prompt_file {
+                let text = std::fs::read_to_string(f).with_context(|| format!("--prompt-file {}", f.display()))?;
+                anyhow::ensure!(!text.trim().is_empty(), "--prompt-file {} is empty", f.display());
+                let _ = BENCH_TEXT.set(text);
+            }
             let g = Gguf::open(&model)?;
             engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
             if let Some(arch) = g.get("general.architecture").ok().and_then(|v| v.as_str()) {
@@ -1422,7 +1431,17 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
 }
 
 /// `n` tokens of varied prose, repeated: the prefill prompt for `bench` and `calibrate`.
+/// `bench --prompt-file`: the text `prose` repeats instead of its paragraph.
+static BENCH_TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn prose(tok: &Tokenizer, n: usize) -> anyhow::Result<Vec<u32>> {
+    if let Some(text) = BENCH_TEXT.get() {
+        let mut ids = tok.encode(text)?;
+        anyhow::ensure!(!ids.is_empty(), "--prompt-file gives no tokens");
+        while ids.len() < n { ids.extend_from_within(..); }
+        ids.truncate(n);
+        return Ok(ids);
+    }
     let text = "The river town woke before dawn. Fishermen checked their nets, bakers lit ovens, and a clockmaker \
         argued with his apprentice about gears, tides and the price of brass. In 1874 the bridge washed away; \
         the council voted 7 to 5 to rebuild it in stone. ";
@@ -1754,7 +1773,7 @@ impl Serving {
             let mut next = None;
             let res = handle(c, q, l.as_deref_mut(), e, self, i, &mut next);
             self.waiting.fetch_sub(1, Relaxed);
-            if let Err(e) = res { eprintln!("request {i}: {e:#}"); }
+            if let Err(e) = res { eprintln!("request {i}: {e:#}"); serve::exit_if_gpu_dead(&e); }
             if next.is_some() { return next; }
         }
     }
@@ -1922,7 +1941,7 @@ impl Serving {
                                     .unwrap_or_else(|_| Err(anyhow::anyhow!("panicked")));
                                 drop((l, hold));
                                 self.waiting.fetch_sub(1, Relaxed);
-                                if let Err(e) = res { eprintln!("request {i}: {e:#}"); }
+                                if let Err(e) = res { eprintln!("request {i}: {e:#}"); serve::exit_if_gpu_dead(&e); }
                                 if nx.is_some() { *next.lock().unwrap() = nx; }
                                 live.fetch_sub(1, Relaxed);
                             });
@@ -2374,8 +2393,14 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     // Logged with the tokens decoded so far, which a client that left may have received.
                     let gone = serve::gone(&w);
                     last.finish = if gone { "cut" } else { "error" }.into();
+                    // A request that failed before its prefill ended measured no prefill speed (t1 is still t0).
+                    if !prefilled { last.prefill_ms = 0.0; }
                     if prefilled || !gone { log(&last); }
-                    if !req.stream && !gone { return send(&mut w, "500 Internal Server Error", json!({"error": {"message": format!("{err:#}"), "type": "server_error"}})); }
+                    if !req.stream && !gone {
+                        let sent = send(&mut w, "500 Internal Server Error", json!({"error": {"message": format!("{err:#}"), "type": "server_error"}}));
+                        serve::exit_if_gpu_dead(&err);
+                        return sent;
+                    }
                     return Err(err);
                 }
             };

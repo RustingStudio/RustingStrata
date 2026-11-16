@@ -35,8 +35,9 @@ the output of `vulkaninfo | grep -i coherent`. A few resumed waits on a busy CPU
 
 **The GPU resets during a long prefill.** amdgpu resets a submission that runs for more than 10 s. Prefill submits
 each layer separately, and attention within a chunk is split into smaller submits once its query-key work passes a
-budget (`STRATA_VK_ATTN_BUDGET`, query-key pairs per slice; default 268435456, 0 turns slicing off). If it still
-happens, try a smaller `--chunk`.
+budget (`STRATA_VK_ATTN_BUDGET`, query-key pairs per slice, 0 turns slicing off). The default is 268435456 with
+cooperative matrices and 33554432 without them (RDNA2 and older: the startup line says `prefill attention: tiled`),
+where a pair costs about 8 times more. If it still happens, set a smaller budget (halve it) or try a smaller `--chunk`.
 
 **"the forward pass produced NaN or infinite logits".** Seen once on Qwen3-Next 80B with a 15K prompt. Rerun with
 `STRATA_NAN_TRACE=1`, which prints per-layer magnitudes and the first layer with a non-finite value, and attach the
@@ -55,7 +56,7 @@ be more than it will allocate. Lower `--ctx`, use `--kv q8`, or a smaller `--chu
 Environment variables; set any of them to turn the feature off:
 
 - `STRATA_VK_NO_COOP`: no cooperative matrices.
-- `STRATA_VK_ATTN_BUDGET=N`: query-key pairs of prefill attention per submit (default 268435456; 0 disables slicing).
+- `STRATA_VK_ATTN_BUDGET=N`: query-key pairs of prefill attention per submit (default 268435456 with cooperative matrices, 33554432 without; 0 disables slicing).
 - `STRATA_VK_DP_OLD`: use the old per-query prefill attention fallback instead of the tiled one (A/B and rollback).
 - `STRATA_VK_NO_COND`: no conditional rendering.
 - `STRATA_VK_NO_TQ`: no separate transfer queue for expert uploads.
