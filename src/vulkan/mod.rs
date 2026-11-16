@@ -1297,9 +1297,15 @@ impl Backend for Vk {
         // at a long context. Cut it into query slices, each its own submit, so no one job runs that long. The budget
         // is query-key pairs per slice; STRATA_VK_ATTN_BUDGET overrides it (0 turns slicing off). 2^30 does not split
         // the reported chunk 4096 at position 131072, so the default is 2^28: about 0.45 s on the 3060, and about
-        // 3.5 s at the 8x slower AMD pace the report implies.
+        // 3.5 s at the 8x slower AMD pace the report implies. That is the cooperative-matrix kernel. Without
+        // cooperative matrices (tiled, dp, llama numerics) a pair costs about 8x more: measured 13 ns on the 3060
+        // (attn_prefill_tile, Flash-Next, q8 KV), so 2^28 did not split chunk 4096 below position 61440 while one
+        // job there already ran 2.5 s on the 3060 and past 10 s on RDNA2 (#42). Their default is 2^25, 0.44 s on
+        // the 3060.
+        // ponytail: fixed budgets from one card; time the first slice and adapt if a slower device still resets.
         let pos = self.step_pos(step)?;
-        let budget = std::env::var("STRATA_VK_ATTN_BUDGET").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1 << 28);
+        let default = if self.0.coop && self.0.llama == 0 { 1 << 28 } else { 1 << 25 };
+        let budget = std::env::var("STRATA_VK_ATTN_BUDGET").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(default);
         let per_slice = if budget == 0 { t } else { (budget / pos.saturating_add(t).max(1)).max(1).min(t) };
         let sliced = per_slice < t;
         let run = |q_off: usize, n: usize| -> anyhow::Result<()> {

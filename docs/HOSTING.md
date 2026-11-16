@@ -273,6 +273,9 @@ TimeoutStopSec=300
 WantedBy=multi-user.target
 ```
 
+When the GPU device is lost (a driver reset, a GPU hang), no later request can succeed, so `serve` exits with
+status 1 and `Restart=on-failure` starts it again.
+
 With the user, keys and calibration of the quick start:
 
 ```sh

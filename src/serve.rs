@@ -160,6 +160,24 @@ pub fn list_models(dir: &Path) -> Vec<(String, PathBuf, u64)> {
     out
 }
 
+/// Whether an error message is a GPU failure no later request can recover from: a lost Vulkan device, or a CUDA error
+/// that leaves the context unusable (the CUDA documentation: "the process must be terminated and relaunched").
+pub fn gpu_dead(msg: &str) -> bool {
+    ["device has been lost", "CUDA_ERROR_ILLEGAL_ADDRESS", "CUDA_ERROR_LAUNCH_FAILED", "CUDA_ERROR_ECC_UNCORRECTABLE",
+     "CUDA_ERROR_HARDWARE_STACK_ERROR", "CUDA_ERROR_ILLEGAL_INSTRUCTION", "CUDA_ERROR_MISALIGNED_ADDRESS",
+     "CUDA_ERROR_INVALID_ADDRESS_SPACE", "CUDA_ERROR_INVALID_PC", "CUDA_ERROR_CONTEXT_IS_DESTROYED"].iter().any(|m| msg.contains(m))
+}
+
+/// After `gpu_dead` the server exits with status 1, so a service manager restarts it (`Restart=on-failure`) instead of
+/// every later request failing on a server that looks healthy. The message is matched as text: under `--parallel`
+/// the error crosses a channel.
+pub fn exit_if_gpu_dead(err: &anyhow::Error) {
+    if gpu_dead(&format!("{err:#}")) {
+        eprintln!("the GPU device is lost and this process cannot use it again: exiting with status 1 (restart the server)");
+        std::process::exit(1);
+    }
+}
+
 /// A projector filename (`mmproj*`, `*-mmproj.gguf`), matching `vision::is_mmproj` without reading the header.
 fn is_mmproj_name(name: &str) -> bool { name.starts_with("mmproj") || name.contains("-mmproj") || name.contains("mmproj-") }
 
