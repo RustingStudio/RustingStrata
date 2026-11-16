@@ -2836,8 +2836,9 @@ DEF_FA(64) DEF_FA(128) DEF_FA(256)
 #define QSA_H 4
 
 // grid = t / 4 + 1, block = 128 (thread d owns dim d). t raw keys at positions p0 = step[0] ..; CTA i pools block
-// p0 / 4 + i if this call completes it. Members before p0 come from `ring` (the raw keys of the last incomplete block,
-// slot = position % 4); CTA 0, the only one reading the ring, then stores the keys of this call's incomplete block.
+// p0 / 4 + i if this call completes it. Members before p0 come from `ring` (the raw keys of the last 32 positions,
+// slot = position % 32); CTA 0, the only one reading the ring, then stores this call's keys. 32 rows, more than a
+// verify writes: after a rollback the keys of the kept positions are still there.
 extern "C" __global__ void qsa_pool(const float* ik, float* ring, float* pool, const float* w, const int* step, int t,
                                     int n_rot, float base, float eps) {
     int d = threadIdx.x, p0 = step[0], b = p0 / 4 + blockIdx.x;
@@ -2846,7 +2847,7 @@ extern "C" __global__ void qsa_pool(const float* ik, float* ring, float* pool, c
         float x = 0.0f;
         for (int m = 0; m < 4; m++) {
             int p = 4 * b + m;
-            x += (p >= p0 ? ik[(size_t)(p - p0) * QSA_D + d] : ring[(p & 3) * QSA_D + d]) / 4.0f;
+            x += (p >= p0 ? ik[(size_t)(p - p0) * QSA_D + d] : ring[(p & 31) * QSA_D + d]) / 4.0f;
         }
         float ss = block_sum(x * x);
         sx[d] = x * (1.0f / sqrtf(ss / QSA_D + eps)) * w[d];
@@ -2861,7 +2862,7 @@ extern "C" __global__ void qsa_pool(const float* ik, float* ring, float* pool, c
         pool[(size_t)b * QSA_D + d] = y;
     }
     if (blockIdx.x == 0)
-        for (int p = max(p0, (p0 + t) / 4 * 4); p < p0 + t; p++) ring[(p & 3) * QSA_D + d] = ik[(size_t)(p - p0) * QSA_D + d];
+        for (int p = max(p0, p0 + t - 32); p < p0 + t; p++) ring[(p & 31) * QSA_D + d] = ik[(size_t)(p - p0) * QSA_D + d];
 }
 
 // grid = (64, ceil(rows / 8)), block = 256: warp w of CTA (x, y) scores blocks x * 8 + w, + 512, ... for query rows
