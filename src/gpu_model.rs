@@ -1416,7 +1416,11 @@ impl<'a> GpuModel<'a> {
     /// which runs them with `t` in one batch (their main model rows 0..n precede `t`'s row n).
     pub fn spec_step(&mut self, t: u32, row: usize, smp: &mut Sampler) -> anyhow::Result<(Vec<u32>, u32, usize)> {
         let k = self.k;
-        if self.pos + k + 1 > self.ctx { return Ok((vec![t], smp.pick(&self.step(t)?)? as u32, 0)); }
+        // No draft head (an image prompt dropped it, see `prefill_image`): plain steps.
+        if self.pos + k + 1 > self.ctx || self.tail().mtp.is_none() {
+            let next = if smp.temp <= 0.0 { self.step_greedy(t)? } else { smp.pick(&self.step(t)?)? as u32 };
+            return Ok((vec![t], next, 0));
+        }
         let partial_moe = self.parts().any(|p| p.cache.as_ref().is_some_and(|c| !c.fully_resident()))
             && std::env::var_os("STRATA_MTP_ADAPT").is_none_or(|v| v != "0");
         let h = self.tail_mut().mtp.as_mut().unwrap();
@@ -1493,6 +1497,7 @@ impl<'a> GpuModel<'a> {
             if let Some(ng) = self.ngram.as_mut() { ng.accept(&toks); }
             return Ok((toks, next, rw));
         }
+        if self.tail().mtp.is_none() { let (toks, next) = self.ngram_spec_step(t, smp)?; return Ok((toks, next, 0)); }
         // Advance the draft head over [pend.., t] using previous main hidden states before `verify` overwrites them.
         let h = self.tail_mut().mtp.as_mut().unwrap();
         let mut first = std::mem::take(&mut h.pend);
