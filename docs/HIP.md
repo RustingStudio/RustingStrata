@@ -32,6 +32,28 @@ acceptance. A dense model's prefill is 1.4x ahead and its decode 10% behind (mem
 `serve` works too, checked on Qwen3.5-9B: `GET /v1/models`, non-streaming and streaming (`stream: true`) chat
 completions, and the prompt cache across turns (`prompt_tokens_details.cached_tokens` on a follow-up request).
 
+## Long prompts
+
+Prefill degrades with prompt depth on both backends (attention is the only depth-dependent term), but faster on HIP,
+because the prefill attention still runs on the CUDA cores: only the prefill GEMM has an AMD matrix-core path so far.
+
+Qwen3.6-35B-A3B UD-Q4_K_XL, `--mtp 0 --reps 1 --vram-margin 256`, KV `f16`:
+
+| | HIP | Vulkan |
+|---|---|---|
+| pp 32k / gen at 32k | 670 / 80.8 tok/s | 1584 / 108.8 tok/s |
+| pp 128k / gen at 128k | 173 / 59.2 tok/s | 762 / 83.4 tok/s |
+| pp 8k, `--fixed-experts` | 1748 tok/s | 1938 tok/s |
+| pp 32k, `--fixed-experts` | 720 tok/s | 1629 tok/s |
+| dense Qwen3.8-27B, pp 8k / 32k | 601 / 328 tok/s | 475 / 404 tok/s |
+
+With placement equalised (`--fixed-experts`: same residents, zero swaps) decode is at parity (63.8 vs 66.0 tok/s) and
+prefill loses 10% at 8k and 56% at 32k. Fitting the per-token cost against depth (HIP 572 -> 1389 us from 8k to 32k,
+Vulkan 516 -> 614) gives a depth slope of 33 vs 4 ns per position: HIP's attention costs 8.4x more per position, and
+that same fit predicts the 128k numbers (215 vs 995 tok/s) within the measurement's spread. Porting `attn_prefill_t`
+to the matrix cores the way `gemm_q` was ported is the next step; until then, `--chunk 0`-style token-by-token prefill
+is not the answer, but a shorter `--ctx` and `--kv q8` both buy expert slots back.
+
 ## How it works
 
 - `src/hip/compat.h` is prepended to `kernels.cu`: it supplies the CUDA intrinsics the source uses (`__shfl_*_sync`,
