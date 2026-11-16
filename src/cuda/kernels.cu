@@ -2355,8 +2355,10 @@ extern "C" __global__ void moe_combine(float* x, const float* ye, const float* w
                                        const int* slots, int n) {
     unsigned int seq = step[1];
     int tk = blockIdx.y;
-    x += (size_t)tk * n; ye += (size_t)tk * k * n; w += tk * k; slots += tk * k; y_off += tk * n;
-    if (sh) { sh += (size_t)tk * n; if (sg) sg += tk; }
+    // Every pointer offset is size_t. On sm_120 (NVRTC 13.0) compute-sanitizer showed a read through a pointer cut
+    // to its low 32 bits here (#34); `w` and `sg` were the two with an int offset and one address for all threads.
+    x += (size_t)tk * n; ye += (size_t)tk * k * n; w += (size_t)tk * k; slots += (size_t)tk * k; y_off += tk * n;
+    if (sh) { sh += (size_t)tk * n; if (sg) sg += (size_t)tk; }
     __shared__ int miss;
     if (threadIdx.x == 0) {
         int m = 0;
