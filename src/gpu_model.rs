@@ -659,6 +659,10 @@ impl<'a> GpuModel<'a> {
     /// Run an image prompt on the CPU model, load its state into this part and return its last logits. Decode after
     /// this on the GPU; `step` uses the RoPE offset for text positions past the image.
     pub fn prefill_image(&mut self, p: &crate::vision::Prompt, embs: &[Vec<Vec<f32>>]) -> anyhow::Result<Vec<f32>> {
+        // Checked before the CPU forward, which takes minutes on a large model, not after it in `load_state`.
+        let c = &self.m.cfg;
+        ensure!(c.n_embd_ple == 0 && c.idx_top_k == 0, "image input is not supported for this model yet ({} with PLE or QSA layers)", c.arch);
+        eprintln!("image prompt: {} tokens prefilled on the CPU (there is no GPU image prefill yet), decode on the GPU", p.ids.len());
         let mut st = State::new(&self.m.cfg);
         let logits = crate::vision::feed_prompt(self.m, &mut st, p, embs)?;
         self.load_state(&st)?;
