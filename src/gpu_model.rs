@@ -9,7 +9,7 @@ use crate::cpu_worker::{CpuWorker, TMAX};
 pub const STEP_ROWS: usize = 4;
 use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, Backend, Buf, GpuTensor};
 use crate::expert_cache::ExpertCache;
-use crate::model::{LayerState, Model, State};
+use crate::model::Model;
 use crate::ops::Sampler;
 use crate::quant::GgmlType;
 use anyhow::{bail, ensure, Context};
@@ -204,6 +204,9 @@ pub struct GpuModel<'a> {
     rope_buf: Buf,
     /// RoPE position minus KV row for the next token (0 for text-only).
     pub rope_offset: i32,
+    /// Set during an image token's `step_embed`: its M-RoPE positions [t, y, x, z] are in `mrope_buf`.
+    mrope: bool,
+    mrope_buf: Buf,
     /// DeltaNet (conv, s) copies per recurrent layer and the position, for `restore_state`.
     saved: Vec<(Buf, Buf)>,
     saved_pos: usize,
@@ -521,6 +524,7 @@ impl<'a> GpuModel<'a> {
         let amax = gpu.zeros::<i32>(TMAX)?;
         let (slots, step_buf) = (gpu.zeros::<i32>(TMAX * ke)?, gpu.zeros::<i32>(2 * TMAX)?);
         let rope_buf = gpu.zeros::<i32>(2 * TMAX)?;
+        let gpu_mrope = gpu.zeros::<i32>(8)?;
         // Hyper-connection prefill scratch is ~4x larger a token, so a large chunk leaves fewer expert slots: qwen4exp at
         // 943 tokens (warm) prefills 447 tok/s with 1024, 347 with 4096. Long prompts gain (each chunk restages the experts
         // not resident: Flash-Next at 4764 tokens 132 -> 158 tok/s on a 3060), so `calibrate` picks per machine.
@@ -596,7 +600,7 @@ impl<'a> GpuModel<'a> {
         let adapt_every = std::env::var("STRATA_ADAPT_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
         let adapt_swaps = std::env::var("STRATA_ADAPT_SWAPS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
         let reset_counts_after_prefill = std::env::var_os("STRATA_RESET_COUNTS").is_some();
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, prompt_cache_path: None, bt, mtp, ngram: None, first: range.start, next: None,
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, prompt_cache_path: None, bt, mtp, ngram: None, first: range.start, next: None,
                       cur: 0, seqs, rows: vec![], row_tokens: 0 })
     }
 
@@ -613,59 +617,50 @@ impl<'a> GpuModel<'a> {
             }
         }
         self.pos = 0;
+        self.rope_offset = 0;
         self.ple_prev = [-1, -1];
         if let Some(n) = self.next.as_mut() { n.reset()?; }
         Ok(())
     }
 
-    /// Load a CPU prefill state (image prompts): copy its KV and recurrent state into this part, set the KV row and
-    /// the RoPE offset. The CPU state must come from `vision::feed_prompt` on the same model.
-    pub fn load_state(&mut self, st: &State) -> anyhow::Result<()> {
-        let c = &self.m.cfg;
-        ensure!(c.n_embd_ple == 0, "image input is not supported for PLE models");
-        ensure!(c.idx_top_k == 0, "image input is not supported for QSA models");
-        self.reset()?;
-        self.ple_prev = st.ple_prev;
-        self.pos = st.pos;
-        self.rope_offset = st.rope_pos[0] - st.pos as i32;
-        self.rows.clear();
-        self.parked.clear();
-        // The draft head's cache and position are not carried over; image prompts decode without MTP.
-        self.mtp = None;
-        let (kv, hd) = (c.n_head_kv * c.head_dim, c.head_dim);
-        self.gpu.put(&[0, 0], &self.step_buf, 0)?;
-        let kbuf = self.gpu.alloc(st.pos.max(1) * kv * 4)?;
-        let vbuf = self.gpu.alloc(st.pos.max(1) * kv * 4)?;
-        for (i, l) in self.layers.iter().enumerate() {
-            match (&l.mixer, st.layers.get(self.first + i).context("load_state: layer count")?) {
-                (Mixer::Delta { conv, s, .. }, LayerState::Recurrent { conv: c0, s: s0 }) => {
-                    self.gpu.put(c0, &conv[self.cur], 0)?;
-                    self.gpu.put(s0, &s[self.cur], 0)?;
-                }
-                (Mixer::Attn { kc, vc, qsa, .. }, LayerState::Attn { k, v, .. }) => {
-                    ensure!(qsa.is_none(), "image input is not supported for QSA models");
-                    ensure!(k.len() == st.pos * kv && v.len() == st.pos * kv, "load_state: KV size {}x{}", k.len(), v.len());
-                    self.gpu.put(k, &kbuf, 0)?;
-                    self.gpu.put(v, &vbuf, 0)?;
-                    self.gpu.kv_store(kbuf.addr(), vbuf.addr(), kc[self.cur].addr(), vc[self.cur].addr(), kv, st.pos, self.step_buf.addr(), hd)?;
-                }
-                _ => bail!("load_state: layer {} kind mismatch", self.first + i),
-            }
-        }
-        if let Some(n) = self.next.as_mut() { n.load_state(st)?; }
-        Ok(())
-    }
-
-    /// Run an image prompt on the CPU model, load its state into this part and return its last logits. Decode after
-    /// this on the GPU; `step` uses the RoPE offset for text positions past the image.
+    /// Run an image prompt as a fresh sequence and return its last logits: text tokens through `step`, image tokens
+    /// through `step_embed` with their M-RoPE positions. `step` then uses the RoPE offset for text past the image.
     pub fn prefill_image(&mut self, p: &crate::vision::Prompt, embs: &[Vec<Vec<f32>>]) -> anyhow::Result<Vec<f32>> {
-        // Checked before the CPU forward, which takes minutes on a large model, not after it in `load_state`.
         let c = &self.m.cfg;
         ensure!(c.n_embd_ple == 0 && c.idx_top_k == 0, "image input is not supported for this model yet ({} with PLE or QSA layers)", c.arch);
-        eprintln!("image prompt: {} tokens prefilled on the CPU (there is no GPU image prefill yet), decode on the GPU", p.ids.len());
-        let mut st = State::new(&self.m.cfg);
-        let logits = crate::vision::feed_prompt(self.m, &mut st, p, embs)?;
-        self.load_state(&st)?;
+        self.reset()?;
+        self.rows.clear();
+        self.parked.clear();
+        // The draft head has not seen the image rows; image prompts decode without MTP.
+        self.mtp = None;
+        let mut rows = p.images.iter().zip(embs).flat_map(|(span, e)| (span.start..).zip(e)).peekable();
+        let mut logits = Vec::new();
+        // ponytail: one token per forward (decode speed); a batched prefill needs M-RoPE in the prefill kernels.
+        for (i, &id) in p.ids.iter().enumerate() {
+            logits = match rows.next_if(|r| r.0 == i) {
+                Some((_, x)) => self.step_embed(x, p.positions[i])?,
+                None => { self.rope_offset = p.positions[i][0] - self.pos as i32; self.step(id)? }
+            };
+        }
+        self.rope_offset = p.next_position - self.pos as i32;
+        Ok(logits)
+    }
+
+    /// `step` for an image token: `x` is its embedding (a projector row), `pos` its M-RoPE positions [t, y, x, z].
+    fn step_embed(&mut self, x: &[f32], pos: [i32; 4]) -> anyhow::Result<Vec<f32>> {
+        if self.pos >= self.ctx { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
+        let seq = self.begin_seq();
+        self.gpu.put(&x.repeat(self.m.cfg.hc_n.max(1)), &self.x, 0)?;
+        self.gpu.put(&[self.pos as i32, seq as i32], &self.step_buf, 0)?;
+        self.gpu.put(&pos.map(|p| [p, seq as i32]).concat(), &self.mrope_buf, 0)?;
+        self.mrope = true;
+        let r = self.pass(1);
+        self.mrope = false;
+        r?;
+        let t = self.tail();
+        let mut logits = t.gpu.get::<f32>(&t.logits, 0, self.m.cfg.n_vocab)?;
+        if t.finish(1, gq_min(self.pos, 1), None)? { logits = t.gpu.get::<f32>(&t.logits, 0, self.m.cfg.n_vocab)?; }
+        self.after_forward(1)?;
         Ok(logits)
     }
 
@@ -789,6 +784,10 @@ impl<'a> GpuModel<'a> {
         let seq = nx.begin_seq();
         let steps: Vec<i32> = (0..nt).flat_map(|t| [(nx.pos + t) as i32, seq as i32]).collect();
         nx.gpu.put(&steps, &nx.step_buf, 0)?;
+        nx.rope_offset = self.rope_offset;
+        nx.mrope = self.mrope;
+        if self.mrope { nx.gpu.put(&self.gpu.get::<i32>(&self.mrope_buf, 0, 8)?, &nx.mrope_buf, 0)?; }
+        nx.gpu.put(&(0..nt).flat_map(|t| [(nx.pos + t) as i32 + nx.rope_offset, seq as i32]).collect::<Vec<_>>(), &nx.rope_buf, 0)?;
         self.split_time.0 += t1 - t0;
         self.split_time.1 += t1.elapsed();
         nx.pass(nt)
@@ -1272,7 +1271,9 @@ impl<'a> GpuModel<'a> {
     fn run(&self, nt: usize) -> anyhow::Result<()> {
         let gq = gq_min(self.pos, nt);
         if self.m.loras.is_empty() {
-            self.gpu.graph(nt as u64 | (gq as u32 as u64) << 8 | (self.cur as u64) << 40, &mut || self.forward(nt, gq, None))
+            // The RoPE path (fused, offset positions, M-RoPE) is part of the recorded ops.
+            let rope = if self.mrope { 2 } else { (self.rope_offset != 0) as u64 };
+            self.gpu.graph(nt as u64 | (gq as u32 as u64) << 8 | (self.cur as u64) << 40 | rope << 48, &mut || self.forward(nt, gq, None))
         } else { self.forward(nt, gq, None) }
     }
 
@@ -1806,7 +1807,7 @@ impl<'a> GpuModel<'a> {
                         }
                         mv(o, "att", nh * hd, "mix", ne)?;
                     } else {
-                    if use_rope && self.rope_offset == 0 {
+                    if use_rope && self.rope_offset == 0 && !self.mrope {
                         g.batch(&mut || g.rms_norm_rope_qk(p("qg"), qs, qn.ptr, p("q"), nt * nh, nh, p("kraw"), kn.ptr, p("k"), nt * nkv, nkv,
                                                            hd, eps, c.n_rot, step, c.rope_base, p("v"), kc[self.cur].addr(), vc[self.cur].addr()))?;
                     } else {
@@ -1817,6 +1818,12 @@ impl<'a> GpuModel<'a> {
                         })?;
                         if use_rope {
                             g.batch(&mut || {
+                                // An image token turns each section of pairs by its own position.
+                                if let (true, Some(sec)) = (self.mrope, c.mrope_sections) {
+                                    g.rope_mrope(p("q"), hd, nt * nh, nh, c.n_rot, self.mrope_buf.addr(), c.rope_base, sec)?;
+                                    return g.rope_mrope(p("k"), hd, nt * nkv, nkv, c.n_rot, self.mrope_buf.addr(), c.rope_base, sec);
+                                }
+                                let rope = if self.mrope { self.mrope_buf.addr() } else { rope };
                                 g.rope_neox(p("q"), hd, nt * nh, nh, c.n_rot, rope, c.rope_base)?;
                                 g.rope_neox(p("k"), hd, nt * nkv, nkv, c.n_rot, rope, c.rope_base)?;
                                 Ok(())

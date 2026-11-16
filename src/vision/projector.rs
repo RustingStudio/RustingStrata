@@ -509,13 +509,14 @@ fn attention(q: &[f32], k: &[f32], v: &[f32], n: usize, n_head: usize, d_head: u
             let qh = &q[t * n_head * d_head + h * d_head..t * n_head * d_head + (h + 1) * d_head];
             for s in 0..n {
                 let kh = &k[s * n_head * d_head + h * d_head..s * n_head * d_head + (h + 1) * d_head];
-                scores[s] = qh.iter().zip(kh).map(|(a, b)| a * b).sum::<f32>() * scale;
+                scores[s] = crate::weights::dot(qh, kh) * scale;
             }
             ops::softmax(&mut scores);
-            for d in 0..d_head {
-                let mut acc = 0f32;
-                for s in 0..n { acc += scores[s] * v[s * n_head * d_head + h * d_head + d]; }
-                o[h * d_head + d] = acc;
+            // Token-outer: each V head row is read once, contiguously (the per-element sum order is unchanged).
+            let oh = &mut o[h * d_head..(h + 1) * d_head];
+            for s in 0..n {
+                let vh = &v[s * n_head * d_head + h * d_head..][..d_head];
+                for (a, b) in oh.iter_mut().zip(vh) { *a += scores[s] * b; }
             }
         }
     });

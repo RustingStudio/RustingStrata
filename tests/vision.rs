@@ -1,5 +1,6 @@
 //! Vision projector tests against the local Qwen3.5-2B mmproj. Skipped when the file is absent.
 
+mod common;
 use rusting_strata::gguf::Gguf;
 use rusting_strata::model::{Model, State};
 use rusting_strata::ops;
@@ -105,6 +106,42 @@ fn qwen35_2b_red_image_predicts_red() {
     assert!(text.contains("red"), "generated {text:?}");
 }
 
+
+/// GPU image prefill (embedding rows with M-RoPE positions) against the CPU forward, then one text token past the
+/// image (RoPE offset).
+#[test]
+fn qwen35_2b_gpu_image_prefill_matches_cpu() {
+    let Some(p) = projector() else { return };
+    let Some(model_path) = text_model() else { return };
+    let _l = common::gpu_lock();
+    let g = Gguf::open(&model_path).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    // 8x6 tokens: x and y positions differ.
+    let img = image::RgbImage::from_fn(256, 192, |x, y| image::Rgb([x as u8, y as u8, 90]));
+    let pre = p.preprocess(&img).unwrap();
+    let (nx, ny) = p.count_tokens(pre.width, pre.height).unwrap();
+    let feats = p.encode(&pre).unwrap();
+    let ids = tok.encode("<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>Describe.<|im_end|>\n<|im_start|>assistant\n").unwrap();
+    let id = |t| tok.token_id(t).unwrap();
+    let pr = expand_images(&ids, id("<|vision_start|>"), id("<|vision_end|>"), id("<|image_pad|>"), &[(nx, ny)]).unwrap();
+    let embs = [feats];
+    let mut st = State::new(&m.cfg);
+    let want = rusting_strata::vision::feed_prompt(&m, &mut st, &pr, &embs).unwrap();
+    let next = ops::argmax(&want) as u32;
+    let want2 = m.step(&mut st, next);
+    for (name, gpu) in common::backends() {
+        let mut gm = rusting_strata::gpu_model::GpuModel::load(&m, gpu, 256, 0, 512 << 20, 0).unwrap();
+        for (w, got) in [(&want, gm.prefill_image(&pr, &embs).unwrap()), (&want2, gm.step(next).unwrap())] {
+            let d = w.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let range = w.iter().fold(f32::MIN, |a, &b| a.max(b)) - w.iter().fold(f32::MAX, |a, &b| a.min(b));
+            eprintln!("{name}: max logit diff {d} (range {range})");
+            assert_eq!(ops::argmax(w), ops::argmax(&got), "{name}");
+            // The bound of `gpu_forward_matches_cpu_reference` (int8 activations on the GPU).
+            assert!(d <= 0.05 * range, "{name}: max logit diff {d} vs range {range}");
+        }
+    }
+}
 
 #[test]
 fn gemma4v_preprocess_min_tokens() {
