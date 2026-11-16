@@ -4,9 +4,11 @@
 build step: the kernels are compiled at run time by hiprtc and launched through the HIP runtime, both loaded by name
 (`libamdhip64.so`, `libhiprtc.so`), the way `src/cuda` loads NVRTC. `cargo build --release` is the whole build.
 
-**Status: experimental.** Brought up on Qwen3.6-35B-A3B (RX 9070 XT, gfx1201, ROCm 7.2). Greedy output is identical to
-the Vulkan backend on the prompts tried. Not yet ported: matrix cores (prefill runs the f16 CUDA-core path, not WMMA),
-graph capture (off by default), and the host-side pipeline details of the CUDA backend (ring staging, side stream).
+**Status: experimental.** Brought up on Qwen3.6-35B-A3B (RX 9070 XT, gfx1201, ROCm 7.2.3). Greedy output matches the
+other backends: identical to the Vulkan backend on 3 of 4 prompts, and to its own CUDA-core prefill on 5 of 6, with the
+difference at a near-tie where the f16 tensor-core summation order picks another token (the same class of difference the
+CUDA and Vulkan backends have). Not yet ported: graph capture (off by default) and the host-side pipeline details of the
+CUDA backend (pinned ring staging, side stream).
 
 ## What runs
 
@@ -14,12 +16,13 @@ Everything the Vulkan backend runs, through the same kernels:
 
 | | HIP | Vulkan (same machine, same model) |
 |---|---|---|
-| Greedy tokens, 3 prompts | identical | identical |
-| Prefill, pp 1024 | 492 tok/s | 1458 tok/s |
-| Decode, tg 48, `--mtp 2` | 159 tok/s | 232 tok/s |
+| Prefill, pp 1024, `--mtp 2` | 1569 tok/s | 1428 tok/s |
+| Prefill, pp 4096, `--mtp 2` | 2106 tok/s | (not run) |
+| Decode, tg 48, `--mtp 2` | 173 tok/s | 231 tok/s |
 
-Qwen3.6-35B-A3B UD-Q4_K_XL, `--ctx 4096 --vram-margin 256`, RX 9070 XT, Ryzen 7 5700X. Decode is within 1.5x of
-Vulkan; prefill is 3x behind because the prefill GEMM has no matrix-core path on HIP yet (see below).
+Qwen3.6-35B-A3B UD-Q4_K_XL, `--ctx 4096 --vram-margin 256`, RX 9070 XT, Ryzen 7 5700X, one process each. Prefill runs on
+the card's matrix cores (below) and is at parity with Vulkan; decode is 1.3x behind, which is the host side (no graph
+capture, no side stream) rather than the kernels.
 
 ## How it works
 
@@ -30,6 +33,14 @@ Vulkan; prefill is 3x behind because the prefill GEMM has no matrix-core path on
   instead of `mma.sync`.
 - The kernels compile as **wave32** (lane = `threadIdx.x & 31`), which is the default wavefront size on RDNA and the
   assumption the CUDA source already makes about a warp. The backend refuses a device that reports a 64-wide wave.
+- **Matrix cores**: the prefill GEMM (`gemm_q` in `kernels.cu`) takes an AMD branch under `GEMM_WMMA`: `D[16x16] +=
+  A * B^T` through `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (the gfx11 form on RDNA3). Both operands are rows
+  of 16 halves, which is exactly how the kernel stages X (positions) and W (output rows) in shared memory — no
+  transpose, and the same tile loop and epilogue shape as the CUDA path. A warp owns 32x32 outputs (2x2 tiles) in the
+  big-tile kernel and 16x16 in the small-tile one; a lane supplies 8 halves of its own row of each operand (gfx12
+  splits the k dimension across the two half-waves) and holds 8 results, column `lane & 15`, rows `8*(lane>>4) + i`.
+  `STRATA_HIP_WMMA=0` falls back to the CUDA-core multiplications: 737 -> 1684 tok/s prefill at pp 1024 on the RX 9070
+  XT, and 5 of 6 prompts bit-identical between the two.
 - `src/cuda/kernels.cu` keeps one source for both backends: the few places that cannot be shared are behind
   `#if STRATA_HIP` (f16 conversions, the per-lane fragment loads, `mma884`, the KV f16x2 math, the L2 prefetch hint),
   so the CUDA build's preprocessed source is unchanged.
@@ -50,14 +61,15 @@ Vulkan; prefill is 3x behind because the prefill GEMM has no matrix-core path on
 - `STRATA_HIP_GRAPH=1` turns on graph capture once the forward allocates nothing inside a step (HIP refuses an
   allocation on a capturing stream; CUDA's stream-ordered allocator allows it).
 - `STRATA_NO_GRAPH=1` turns capture off for both GPU backends.
+- `STRATA_HIP_WMMA=0` uses the CUDA-core multiplications in the prefill GEMM instead of the matrices cores.
 
 ## Next
 
-1. gfx12 WMMA (`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` and its int8 form) for the prefill GEMM: the 3x
-   prefill gap is exactly the missing matrix-core path.
-2. Graph capture: move the per-step allocations (q8 cache growth, rope table) out of the captured region.
-3. The CUDA host-side pipeline: a pinned ring for `htod` (expert streaming during prefill) and a side stream for
-   `beside`.
+1. Graph capture: move the per-step allocations (q8 cache growth, rope table) out of the captured region; that and the
+   side stream are where the remaining decode gap is.
+2. The int8 WMMA form (`__builtin_amdgcn_wmma_i32_16x16x16_iu8`) for the integer-weight prefill GEMM, which today takes
+   the f16 path (`GEMM_TC 0`): less shared-memory traffic per output than the sm_80-style int8 `gemmi_*` kernels.
+3. A pinned ring for `htod` so expert streaming during prefill does not sync the stream per tensor.
 
 ## Credits
 

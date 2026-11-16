@@ -85,6 +85,47 @@ template <typename T> __device__ __forceinline__ T shfl_sync(unsigned, T v, int 
 __device__ __forceinline__ unsigned ballot_sync(unsigned, int predicate) { return (unsigned)__ballot(predicate); }
 __device__ __forceinline__ int any_sync(unsigned, int predicate) { return (int)(__ballot(predicate) != 0); }
 
+// ---- matrix cores (gfx11/gfx12 WMMA) ----
+// D[16x16] += A[16x16] * B^T[16x16]: both operands are 16 rows of 16 halves, which is exactly how the prefill GEMM
+// stages X (positions) and W (output rows) in shared memory, so no transpose is needed. Each lane supplies the
+// k-values of its own row of both operands and holds 8 results: rows 8*(lane>>4) + i, column lane & 15.
+// gfx12 splits the k dimension across the two half-waves (each lane gives 8 halves, lanes 16-31 the upper half);
+// gfx11 takes all 16 from one lane.
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || \
+    defined(__gfx1151__) || defined(__gfx1152__)
+#define STRATA_WMMA 1
+#define STRATA_WMMA_K 16
+#elif defined(__gfx1200__) || defined(__gfx1201__)
+#define STRATA_WMMA 1
+#define STRATA_WMMA_K 8
+#else
+#define STRATA_WMMA 0
+#define STRATA_WMMA_K 0
+#endif
+// First k half the lane supplies: gfx12 lanes 16-31 give k 8..15, every lane on gfx11 gives k 0..15.
+#define STRATA_WMMA_K0(lane) (((lane) >> 4) * (16 - STRATA_WMMA_K))
+
+#if STRATA_WMMA
+typedef _Float16 strata_hk __attribute__((ext_vector_type(STRATA_WMMA_K)));
+typedef float strata_f8 __attribute__((ext_vector_type(8)));
+
+__device__ __forceinline__ strata_f8 strata_wmma(strata_hk a, strata_hk b, strata_f8 c) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+#else
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+#endif
+}
+
+/// STRATA_WMMA_K halves at `p` (16-byte aligned); lanes 16-31 read their own upper half of the same row.
+__device__ __forceinline__ strata_hk strata_ld_wmma(const unsigned short* p) {
+    union { uint4 u[STRATA_WMMA_K / 8]; strata_hk h; } c;
+#pragma unroll
+    for (int i = 0; i < STRATA_WMMA_K / 8; i++) c.u[i] = *(const uint4*)(p + 8 * i);
+    return c.h;
+}
+#endif
+
 }  // namespace strata_hip
 
 #define __dp4a(a, b, c) (strata_hip::dp4a((a), (b), (c)))

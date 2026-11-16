@@ -107,7 +107,7 @@ fn source(kv_q8: bool) -> String {
          __device__ const unsigned int iq3s_grid[512] = {{{}}};\n\
          __device__ const unsigned char ksigns_iq2xs[128] = {{{}}};\n\
          __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n\
-         #define LLAMA_Q8 {}\n#define KV_Q8 {}\n#define GEMM_TC 0\n\
+         #define LLAMA_Q8 {}\n#define KV_Q8 {}\n#define GEMM_TC 0\n#define GEMM_WMMA (STRATA_WMMA && {})\n\
          #define GEMM_BM {}\n#define GEMM_BK {}\n#define GEMM_MIN_BLOCKS 1\n#define GEMV_LOADW {}\n\
          #define FA_BQ {}\n#define FA_BK {}\n{}",
         include_str!("compat.h"),
@@ -121,6 +121,9 @@ fn source(kv_q8: bool) -> String {
         join(KVALUES_IQ4NL.iter().map(|v| v.to_string()).collect()),
         crate::cuda::llama_numerics() as u8,
         kv_q8 as u8,
+        // `STRATA_HIP_WMMA=0` falls back to the CUDA-core multiplications (A/B comparison, and a workaround if a
+        // card's matrix cores misbehave).
+        (std::env::var("STRATA_HIP_WMMA").map(|v| v != "0").unwrap_or(true)) as u8,
         GEMM_BM,
         crate::cuda::GEMM_BK,
         tuned(std::env::var("STRATA_GEMV_LOADW").ok().as_deref(), 0, |v| v <= 1),
@@ -835,6 +838,46 @@ mod tests {
         let got: Vec<f32> = g.get(&gx, 0, heads * n).unwrap();
         let worst = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(worst < 2e-5, "max |diff| = {worst}");
+    }
+
+    /// `gemm_dense` against a CPU product, both tile regimes: the 16-position warp tile (`SM`) the small shapes take
+    /// and the 32-position one, which is what the matrix-core path in `gemm_q` computes.
+    #[test]
+    fn gemm_dense_matches_cpu_in_both_tile_regimes() {
+        let Ok(g) = Gpu::new(0) else { eprintln!("skipping: no HIP device"); return };
+        for (rows, n, cols) in [(128usize, 64usize, 64usize), (8192, 128, 64)] {
+            let mut st = 7u32;
+            let mut rnd = || { st = st.wrapping_mul(1664525).wrapping_add(1013904223); (st >> 9) as f32 / 8388608.0 - 0.5 };
+            let w: Vec<f32> = (0..rows * cols).map(|_| rnd()).collect();
+            let x: Vec<f32> = (0..n * cols).map(|_| rnd()).collect();
+            let mut want = vec![0f32; n * rows];
+            for m in 0..n {
+                for r in 0..rows {
+                    let mut a = 0f32;
+                    for k in 0..cols { a += x[m * cols + k] * w[r * cols + k]; }
+                    want[m * rows + r] = a;
+                }
+            }
+            let gw = g.alloc(4 * rows * cols).unwrap();
+            let gx = g.alloc(4 * n * cols).unwrap();
+            let gy = g.alloc(4 * n * rows).unwrap();
+            let g: &dyn Backend = &g;
+            g.put(&w, &gw, 0).unwrap();
+            g.put(&x, &gx, 0).unwrap();
+            let t = GpuTensor::new(GgmlType::F32, rows, cols, gw);
+            g.gemm_dense(&t, n, gx.addr(), cols, gy.addr(), rows, 0).unwrap();
+            g.sync().unwrap();
+            let got: Vec<f32> = g.get(&gy, 0, n * rows).unwrap();
+            let mut worst = 0f32;
+            let mut at = 0;
+            for i in 0..n * rows {
+                let d = (got[i] - want[i]).abs();
+                if d > worst { worst = d; at = i; }
+            }
+            // f32 products summed over 64 terms: a few ulps either way, and f16 inputs quantize harder, so compare by
+            // relative error against the magnitude of the row's terms.
+            assert!(worst < 1e-2 * cols as f32, "rows {rows}: max |diff| = {worst} at {at} (got {}, want {})", got[at], want[at]);
+        }
     }
 
     /// The generated source compiles for this device through hiprtc (the CUDA source with `STRATA_HIP` taken).

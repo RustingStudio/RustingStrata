@@ -1060,6 +1060,10 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
     // Same 32 f32 storage as acc, seen as 4 m8 tiles x 8 D registers: accv[j][i] == &acc[0][0][0][j*8+i].
     float (&accv)[4][8] = reinterpret_cast<float (&)[4][8]>(acc);
 #endif
+#if GEMM_WMMA
+    // The same 32 f32 as 4 WMMA tiles of 8 results: accw[t][i] is tile t, result i of this lane.
+    float (&accw)[4][8] = reinterpret_cast<float (&)[4][8]>(acc);
+#endif
     // W step kb is decoded into registers (as halves) during step kb - 1's mma and stored after it.
     constexpr int WQ = 64 * SUBS / NT;
     static_assert(64 * SUBS % NT == 0, "whole W groups per thread");
@@ -1101,7 +1105,30 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
         if (wm < tl.cnt)
 #pragma unroll
         for (int kk = 0; kk < BK; kk += 16) {
-#if __CUDA_ARCH__ < 800 && GEMM_TC
+#if GEMM_WMMA
+            // AMD matrix cores: the tile in xs (positions, rows = m) and ws (rows = n) is fed straight in as A and B
+            // of D[16x16] += A * B^T. A warp owns MT x NT 16x16 tiles: (32 positions, 32 rows) for the big kernel and
+            // (16 positions, 64 rows) for the small-tile one. Each lane holds 8 results of every tile.
+            const int l16 = lane & 15, w0 = STRATA_WMMA_K0(lane);
+            constexpr int MT = SM ? 1 : 2, NTW = SM ? 1 : 2;
+            strata_hip::strata_hk wa[MT], wb[NTW];
+#pragma unroll
+            for (int mt = 0; mt < MT; mt++) wa[mt] = strata_hip::strata_ld_wmma(xs + (wm + mt * 16 + l16) * P + kk + w0);
+#pragma unroll
+            for (int nt = 0; nt < NTW; nt++) wb[nt] = strata_hip::strata_ld_wmma(ws + (wn + nt * 16 + l16) * P + kk + w0);
+#pragma unroll
+            for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+                for (int nt = 0; nt < NTW; nt++) {
+                    float* t = accw[mt * NTW + nt];
+                    strata_hip::strata_f8 c, r;
+#pragma unroll
+                    for (int i = 0; i < 8; i++) c[i] = t[i];
+                    r = strata_hip::strata_wmma(wa[mt], wb[nt], c);
+#pragma unroll
+                    for (int i = 0; i < 8; i++) t[i] = r[i];
+                }
+#elif __CUDA_ARCH__ < 800 && GEMM_TC
             // Volta: eight m8n8k4 ops replace one m16n8k16 for the same 16-deep k step. The four computations of
             // each instruction are selected by c = g & 3: SM == false maps them to the four n8 tiles (m8 = j, n8 =
             // c, 32 f32 per lane in accv[0..3]); SM == true maps them to the four 8x8 quadrants of the 16x16 warp
@@ -1141,7 +1168,28 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
         __syncthreads();
         if (kb + 1 < nk) stw();
     }
-#if __CUDA_ARCH__ < 800 && GEMM_TC
+#if GEMM_WMMA
+    // D layout of the AMD WMMA: lane 16*(lane>>4) keeps column lane & 15 and rows 8*(lane>>4) .. +7 of each tile.
+    {
+        const int l16 = lane & 15, wl = lane >> 4;
+        constexpr int MT = SM ? 1 : 2, NTW = SM ? 1 : 2;
+#pragma unroll
+        for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+            for (int nt = 0; nt < NTW; nt++) {
+                int n = n0 + wn + nt * 16 + l16;
+                if (n >= rows) continue;
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    int r = wm + mt * 16 + 8 * wl + i;
+                    if (r >= tl.cnt) continue;
+                    float* yr = y + (size_t)(tl.m0 + r) * y_stride;
+                    float v = accw[mt * NTW + nt][i];
+                    yr[n] = act == 0 ? v : act == 1 ? silu(yr[n]) * v : yr[n] + v;
+                }
+            }
+    }
+#elif __CUDA_ARCH__ < 800 && GEMM_TC
     // m8n8k4 D layout (PTX ISA 8.5 §9.7.13.4.1): register i = 4*p4 + 2*p2 + e sits at row (t & 1) + 2*p2 + 4*hi
     // and column (t & 2) + 4*p4 + e of the 8x8 tile. For each fixed c, lanes {4c..4c+3} and {16+4c..19+4c} cover
     // that tile exactly once; the tile itself is picked by c (n8 = c) and j (m8 = j), or by c alone for SM.
