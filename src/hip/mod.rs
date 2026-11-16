@@ -754,11 +754,13 @@ impl Backend for Gpu {
     fn attn_prefill_m(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize,
                       scale: f32, qm: u64, mw: usize, sink: u64, win: usize) -> anyhow::Result<()> {
         if !matches!(hd, 64 | 128 | 256) { bail!("attention prefill: head_dim {hd} unsupported (64, 128 or 256)"); }
-        // A tile of FA_BK keys needs 72 KiB at head_dim 256, more than a 64 KiB block may use on RDNA; 16 keys a
-        // tile (the depth the CUDA build uses on Turing's 64 KB blocks) fits, at the cost of more passes.
-        let bk = [FA_BK, 16, 8].into_iter().find(|&bk| attn_prefill_smem_bk(hd, bk) <= self.max_smem)
-            .with_context(|| format!("attn_prefill_{hd}: no tile depth fits {} B of shared memory", self.max_smem))?;
+        // A tile of FA_BK keys needs 72 KiB at head_dim 256, more than a 64 KiB workgroup may use on RDNA; 16 keys a
+        // tile (the depth the CUDA build uses on Turing's 64 KB blocks) fits, at the cost of more passes. This has to
+        // be the depth the kernel picks for itself (`FA_BK_FOR(HD)`), not a smaller one: the kernel would then address
+        // shared memory past what is allocated.
+        let bk = if hd == 256 { 16 } else { FA_BK };
         let smem = attn_prefill_smem_bk(hd, bk) as u32;
+        anyhow::ensure!(smem as usize <= self.max_smem, "attn_prefill_{hd}: {smem} B of shared memory, {} allowed", self.max_smem);
         launch!(self, &format!("attn_prefill_{hd}"), cfg((t.div_ceil(64) as u32, nh as u32), 128, smem),
                 q, kc, vc, qg, out, step, t as i32, nh as i32, nkv as i32, scale, qm, mw as i32, sink, win as i32);
         Ok(())
@@ -970,6 +972,75 @@ mod tests {
             // f32 products summed over 64 terms: a few ulps either way, and f16 inputs quantize harder, so compare by
             // relative error against the magnitude of the row's terms.
             assert!(worst < 1e-2 * cols as f32, "rows {rows}: max |diff| = {worst} at {at} (got {}, want {})", got[at], want[at]);
+        }
+    }
+
+    /// `attn_prefill_t` end to end (score product, causal softmax, P·V, the epilogue) against a CPU reference, at
+    /// head_dim 128 (32-key tiles) and 256 (the HIP build's 16-key tiles) with a partial last query tile. This is the
+    /// check the matrix-core score path needs on its own: a wrong lane/lane-staging mapping shows up as a large
+    /// per-element difference on a specific query or head, not as the near-tie token flips a parity run sees.
+    #[test]
+    fn attn_prefill_matches_cpu() {
+        use half::f16;
+        let Ok(gpu) = Gpu::new(0) else { eprintln!("skipping: no HIP device"); return };
+        let g: &dyn Backend = &gpu;
+        let (t, nh, nkv) = (40usize, 4usize, 2usize);
+        let scale = 0.088388347;
+        for hd in [128usize, 256] {
+            let mut st = 99u32;
+            let mut rnd = || { st = st.wrapping_mul(1664525).wrapping_add(1013904223); (st >> 9) as f32 / 8388608.0 - 0.5 };
+            let q: Vec<f32> = (0..t * nh * hd).map(|_| rnd()).collect();
+            let kh: Vec<u16> = (0..t * nkv * hd).map(|_| f16::from_f32(rnd()).to_bits()).collect();
+            let vh: Vec<u16> = (0..t * nkv * hd).map(|_| f16::from_f32(rnd()).to_bits()).collect();
+            let half = |h: u16| f16::from_bits(h).to_f32();
+            // Reference: the kernel scales Q before rounding it to f16, sums in f32, rounds the weights to f16 to
+            // feed P·V, and divides by the row sum at the end (`out = o * inv` with `inv = sc / den`).
+            let mut want = vec![0f32; t * nh * hd];
+            for h in 0..nh {
+                let kvh = h / (nh / nkv);
+                for ti in 0..t {
+                    let mut sc = vec![0f32; ti + 1];
+                    for (j, s) in sc.iter_mut().enumerate() {
+                        let mut a = 0f32;
+                        for d in 0..hd {
+                            a += half(f16::from_f32(q[ti * nh * hd + h * hd + d] * scale).to_bits())
+                                * half(kh[(j * nkv + kvh) * hd + d]);
+                        }
+                        *s = a;
+                    }
+                    let mx = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let e: Vec<f32> = sc.iter().map(|s| (s - mx).exp()).collect();
+                    let den: f32 = e.iter().sum();
+                    for d in 0..hd {
+                        let mut a = 0f32;
+                        for (j, w) in e.iter().enumerate() {
+                            a += half(f16::from_f32(w / den).to_bits()) * half(vh[(j * nkv + kvh) * hd + d]);
+                        }
+                        want[ti * nh * hd + h * hd + d] = a;
+                    }
+                }
+            }
+            let gq = g.alloc(4 * q.len()).unwrap();
+            let gk = g.alloc(2 * kh.len()).unwrap();
+            let gv = g.alloc(2 * vh.len()).unwrap();
+            let go = g.alloc(4 * q.len()).unwrap();
+            let gs = g.alloc(4).unwrap();
+            g.put(&q, &gq, 0).unwrap();
+            g.put(&kh, &gk, 0).unwrap();
+            g.put(&vh, &gv, 0).unwrap();
+            g.put(&[0i32], &gs, 0).unwrap();
+            g.attn_prefill_m(gq.addr(), gk.addr(), gv.addr(), 0, go.addr(), gs.addr(), t, nh, nkv, hd, scale, 0, 0, 0, 0).unwrap();
+            g.sync().unwrap();
+            let got: Vec<f32> = g.get(&go, 0, q.len()).unwrap();
+            let mut worst = 0f32;
+            let (mut at, mut gv_) = (0, 0f32);
+            for i in 0..q.len() {
+                let d = (got[i] - want[i]).abs();
+                if d > worst { worst = d; at = i; gv_ = got[i]; }
+            }
+            eprintln!("hd {hd}: max |diff| = {worst:e} at {at} (row {}, head {}, d {}): got {gv_} want {}",
+                      at / (nh * hd), (at / hd) % nh, at % hd, want[at]);
+            assert!(worst < 5e-3, "hd {hd}: max |diff| = {worst} at {at}");
         }
     }
 

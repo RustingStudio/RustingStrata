@@ -956,7 +956,7 @@ __device__ __forceinline__ void ldsm4t(u32* r, const u16* p) {
         int m_row = (RM ? (m & 1) : (m >> 1)) * 8, m_col = (RM ? (m >> 1) : (m & 1)) * 8;
 #if STRATA_HIP
         const u16* a = p + (m_row + row) * PQ + m_col + col;
-        r[m] = (u32)a[0] | ((u32)a[2 * PQ] << 16);
+        r[m] = (u32)a[0] | ((u32)a[PQ] << 16);
 #else
         unsigned a = (unsigned)__cvta_generic_to_shared(p + (m_row + row) * PQ + m_col + col);
         unsigned short lo, hi;
@@ -2483,8 +2483,8 @@ extern "C" __global__ void moe_combine_seq(float* x, const float* ye, const floa
 #endif
 #define FA_BK_DEFAULT FA_BK
 // Turing's 64 KB shared memory cannot hold the HD = 256 tile at 32 keys either: 16 fit (the kernel keeps the same
-// 64 queries a block and four warps).
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 800
+// 64 queries a block and four warps). The HIP build has the same 64 KB a workgroup, so it takes the same 16-key tile.
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 800) || STRATA_HIP
 #define FA_BK_FOR(HD) ((HD) == 256 ? 16 : FA_BK_DEFAULT)
 #else
 #define FA_BK_FOR(HD) FA_BK_DEFAULT
