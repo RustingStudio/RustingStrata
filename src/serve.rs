@@ -160,19 +160,34 @@ pub fn list_models(dir: &Path) -> Vec<(String, PathBuf, u64)> {
     out
 }
 
-/// Whether an error message is a GPU failure no later request can recover from: a lost Vulkan device, or a CUDA error
-/// that leaves the context unusable (the CUDA documentation: "the process must be terminated and relaunched").
-pub fn gpu_dead(msg: &str) -> bool {
-    ["device has been lost", "CUDA_ERROR_ILLEGAL_ADDRESS", "CUDA_ERROR_LAUNCH_FAILED", "CUDA_ERROR_ECC_UNCORRECTABLE",
-     "CUDA_ERROR_HARDWARE_STACK_ERROR", "CUDA_ERROR_ILLEGAL_INSTRUCTION", "CUDA_ERROR_MISALIGNED_ADDRESS",
-     "CUDA_ERROR_INVALID_ADDRESS_SPACE", "CUDA_ERROR_INVALID_PC", "CUDA_ERROR_CONTEXT_IS_DESTROYED"].iter().any(|m| msg.contains(m))
+/// Whether an error is a GPU failure no later request can recover from: a lost Vulkan device, or a CUDA error that
+/// leaves the context unusable (the CUDA documentation: "the process must be terminated and relaunched"). It looks
+/// only at the backend's typed error in the chain, never at message text: an error message can quote request data.
+pub fn gpu_dead(err: &anyhow::Error) -> bool {
+    use cudarc::driver::sys::CUresult as C;
+    err.chain().any(|e| e.is::<GpuLost>() || e.downcast_ref::<ash::vk::Result>() == Some(&ash::vk::Result::ERROR_DEVICE_LOST)
+        || e.downcast_ref::<cudarc::driver::DriverError>().is_some_and(|d| matches!(d.0, C::CUDA_ERROR_ILLEGAL_ADDRESS
+            | C::CUDA_ERROR_LAUNCH_FAILED | C::CUDA_ERROR_ECC_UNCORRECTABLE | C::CUDA_ERROR_HARDWARE_STACK_ERROR
+            | C::CUDA_ERROR_ILLEGAL_INSTRUCTION | C::CUDA_ERROR_MISALIGNED_ADDRESS | C::CUDA_ERROR_INVALID_ADDRESS_SPACE
+            | C::CUDA_ERROR_INVALID_PC | C::CUDA_ERROR_CONTEXT_IS_DESTROYED)))
+}
+
+/// Marks a copy of an error that was `gpu_dead` (`copy_err`).
+#[derive(Debug)]
+pub struct GpuLost;
+impl std::fmt::Display for GpuLost { fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("GPU device lost") } }
+impl std::error::Error for GpuLost {}
+
+/// A copy of `err` for each of several waiting requests (`anyhow::Error` is not `Clone`): its text, and still `gpu_dead`.
+pub fn copy_err(err: &anyhow::Error) -> anyhow::Error {
+    let text = format!("{err:#}");
+    if gpu_dead(err) { anyhow::Error::new(GpuLost).context(text) } else { anyhow::anyhow!(text) }
 }
 
 /// After `gpu_dead` the server exits with status 1, so a service manager restarts it (`Restart=on-failure`) instead of
-/// every later request failing on a server that looks healthy. The message is matched as text: under `--parallel`
-/// the error crosses a channel.
+/// every later request failing on a server that looks healthy.
 pub fn exit_if_gpu_dead(err: &anyhow::Error) {
-    if gpu_dead(&format!("{err:#}")) {
+    if gpu_dead(err) {
         eprintln!("the GPU device is lost and this process cannot use it again: exiting with status 1 (restart the server)");
         std::process::exit(1);
     }

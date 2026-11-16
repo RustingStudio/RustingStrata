@@ -1905,7 +1905,7 @@ impl Sched {
         let rows: Vec<_> = batch.iter().map(|b| (b.0, b.1, b.2)).collect();
         match if big { g.step_batch(&rows) } else { g.step_rows(&rows) } {
             Ok(rows) => for (b, l) in batch.into_iter().zip(rows) { let _ = b.3.send(Ok(l)); },
-            Err(err) => for b in batch { let _ = b.3.send(Err(anyhow::anyhow!("{err:#}"))); },
+            Err(err) => for b in batch { let _ = b.3.send(Err(serve::copy_err(&err))); },
         }
     }
 }
@@ -1995,7 +1995,7 @@ impl Serving {
                             }).collect();
                             match g.prefill_slots(&list, &mut between) {
                                 Ok(v) => v.into_iter().map(Ok).collect(),
-                                Err(e) => adm.iter().map(|_| Err(anyhow::anyhow!("{e:#}"))).collect(),
+                                Err(e) => adm.iter().map(|_| Err(serve::copy_err(&e))).collect(),
                             }
                         } else {
                             let (sl, Job::Chat { ids, sys, keep, owner, .. }) = &adm[0] else { unreachable!() };
