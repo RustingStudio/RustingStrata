@@ -2483,7 +2483,8 @@ extern "C" __global__ void moe_combine_seq(float* x, const float* ye, const floa
 #endif
 #define FA_BK_DEFAULT FA_BK
 // Turing's 64 KB shared memory cannot hold the HD = 256 tile at 32 keys either: 16 fit (the kernel keeps the same
-// 64 queries a block and four warps). The HIP build has the same 64 KB a workgroup, so it takes the same 16-key tile.
+// 64 queries a block and four warps). The HIP build has the same 64 KB a workgroup, and its score staging tile comes
+// on top of the qs/ks/vs/ps sizes, so it takes the same 16-key tile.
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 800) || STRATA_HIP
 #define FA_BK_FOR(HD) ((HD) == 256 ? 16 : FA_BK_DEFAULT)
 #else
@@ -2510,6 +2511,14 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
     // Volta only: warp-private P tile for the PV A fragments (see the staging in the PV step below). Appended after
     // `vs` so the qs/ks/vs offsets above do not move; FA_BQ * (FA_BKL + 8) halves = 5120 B.
     u16* ps = vs + FA_BKL * PQ;
+#endif
+#if GEMM_WMMA
+    // HIP: the P staging tile in halves (the PV A fragments, as on Volta) and, after it, the f32 tile the matrix-core
+    // scores are staged through before they are read in the m16n8k16 layout the softmax below is written for. Both
+    // sit after `vs` so the qs/ks/vs offsets do not move; `hip::Gpu::attn_prefill_m` adds the f32 tile to the block's
+    // dynamic shared memory (FA_BQ * (FA_BKL + 8) floats, 4-8 KiB).
+    u16* ps = vs + FA_BKL * PQ;
+    float* st = (float*)(ps + FA_BQ * (FA_BKL + 8));
 #endif
     // The last query tiles see the most keys: start them first so the short ones fill the tail.
     int pos0 = step[0], q0 = (gridDim.x - 1 - blockIdx.x) * FA_BQ, h = blockIdx.y, kvh = h / (nh / nkv), kvd = nkv * HD;
@@ -2594,7 +2603,34 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
         bool skip = qm && !__any_sync(0xffffffff, (vis[0] | vis[1]) != 0);
 #endif
         float s[FA_BKL / 8][4] = {};
-#if __CUDA_ARCH__ < 800 && GEMM_TC
+#if GEMM_WMMA
+        // Q K^T on the matrix cores: one 16-query x 16-key tile per instruction against the 16-half qs/ks rows, then
+        // staged and read back so the softmax keeps its m16n8k16 lane layout (row g / g + 8, keys 2t / 2t + 1). The
+        // warp writes and reads only its own 16 rows of the tile, so a warp barrier publishes it.
+        if (!skip) {
+            const int l16 = lane & 15, w0 = STRATA_WMMA_K0(lane), PW = FA_BKL + 8;
+            float* sw = st + warp * 16 * PW;
+            const u16* qrow = qs + (warp * 16 + l16) * PQ + w0;
+#pragma unroll
+            for (int kg = 0; kg < FA_BKL / 16; kg++) {
+                strata_hip::strata_f8 acc;
+#pragma unroll
+                for (int i = 0; i < 8; i++) acc[i] = 0.0f;
+                const u16* krow = ks + (kg * 16 + l16) * PQ + w0;
+#pragma unroll
+                for (int kk = 0; kk < HD; kk += 16)
+                    acc = strata_hip::strata_wmma(strata_hip::strata_ld_wmma(qrow + kk), strata_hip::strata_ld_wmma(krow + kk), acc);
+#pragma unroll
+                for (int i = 0; i < 8; i++) sw[(8 * (lane >> 4) + i) * PW + kg * 16 + l16] = acc[i];
+            }
+            __syncwarp();
+#pragma unroll
+            for (int ng = 0; ng < FA_BKL / 8; ng++)
+#pragma unroll
+                for (int i = 0; i < 4; i++)
+                    s[ng][i] = sw[(g + 8 * (i >> 1)) * PW + ng * 8 + 2 * t4 + (i & 1)];
+        }
+#elif __CUDA_ARCH__ < 800 && GEMM_TC
         // Same 16 f32 storage as s, seen as m8n8k4 D registers: s2[ng][j][4*p4 + 2*p2 + e] is S[8*j + (t & 1) +
         // 2*p2 + 4*hi][8*(4*ng + c) + (t & 2) + 4*p4 + e] of the 16 x FA_BKL score tile. Every lane holds the four
         // computations its c selects, so the warp must stay in uniform control flow (`skip` is warp-uniform).

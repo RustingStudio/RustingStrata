@@ -754,12 +754,13 @@ impl Backend for Gpu {
     fn attn_prefill_m(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize,
                       scale: f32, qm: u64, mw: usize, sink: u64, win: usize) -> anyhow::Result<()> {
         if !matches!(hd, 64 | 128 | 256) { bail!("attention prefill: head_dim {hd} unsupported (64, 128 or 256)"); }
-        // A tile of FA_BK keys needs 72 KiB at head_dim 256, more than a 64 KiB workgroup may use on RDNA; 16 keys a
-        // tile (the depth the CUDA build uses on Turing's 64 KB blocks) fits, at the cost of more passes. This has to
-        // be the depth the kernel picks for itself (`FA_BK_FOR(HD)`), not a smaller one: the kernel would then address
-        // shared memory past what is allocated.
+        // The tile depth has to be the one the kernel picks for itself (`FA_BK_FOR(HD)`, which takes 16 keys rather than
+        // 32 at head_dim 256): 32 keys plus the score staging tile need 78 KiB, more than a 64 KiB workgroup may use,
+        // while 16 keys need 58 KiB. A smaller depth here would under-allocate what the kernel addresses.
         let bk = if hd == 256 { 16 } else { FA_BK };
-        let smem = attn_prefill_smem_bk(hd, bk) as u32;
+        // The HIP kernel stages its matrix-core scores through an extra FA_BQ x (bk + 8) f32 tile (see attn_prefill_t);
+        // the qs/ks/vs/ps sizes the shared helper computes are the same as CUDA's.
+        let smem = (attn_prefill_smem_bk(hd, bk) + 4 * crate::cuda::FA_BQ * (bk + 8)) as u32;
         anyhow::ensure!(smem as usize <= self.max_smem, "attn_prefill_{hd}: {smem} B of shared memory, {} allowed", self.max_smem);
         launch!(self, &format!("attn_prefill_{hd}"), cfg((t.div_ceil(64) as u32, nh as u32), 128, smem),
                 q, kc, vc, qg, out, step, t as i32, nh as i32, nkv as i32, scale, qm, mw as i32, sink, win as i32);
