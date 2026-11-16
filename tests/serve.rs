@@ -495,9 +495,16 @@ fn assistant_last_message_is_continued() {
 
 #[test]
 fn gpu_dead_matches_only_unrecoverable_errors() {
+    use anyhow::Context;
+    use cudarc::driver::{DriverError, sys::CUresult};
     use rusting_strata::serve::gpu_dead;
-    assert!(gpu_dead("The logical device has been lost. See <https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#devsandqueues-lost-device>"));
-    assert!(gpu_dead("kernel moe_gemv failed: DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, \"an illegal memory access was encountered\")"));
-    assert!(!gpu_dead("client closed the connection"));
-    assert!(!gpu_dead("DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")"));
+    let wrap = |e: anyhow::Error| Err::<(), _>(e).context("kernel moe_gemv failed").unwrap_err();
+    assert!(gpu_dead(&wrap(ash::vk::Result::ERROR_DEVICE_LOST.into())));
+    assert!(gpu_dead(&wrap(DriverError(CUresult::CUDA_ERROR_ILLEGAL_ADDRESS).into())));
+    assert!(!gpu_dead(&wrap(DriverError(CUresult::CUDA_ERROR_OUT_OF_MEMORY).into())));
+    assert!(!gpu_dead(&wrap(ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY.into())));
+    assert!(gpu_dead(&rusting_strata::serve::copy_err(&wrap(ash::vk::Result::ERROR_DEVICE_LOST.into()))));
+    assert!(!gpu_dead(&rusting_strata::serve::copy_err(&anyhow::anyhow!("device has been lost"))));
+    // Text never counts: a message can quote what the client sent.
+    assert!(!gpu_dead(&anyhow::anyhow!("bad tool name \"device has been lost CUDA_ERROR_ILLEGAL_ADDRESS\"")));
 }
