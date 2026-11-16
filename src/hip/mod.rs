@@ -21,6 +21,10 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 /// `STRATA_HIP_SYNC`: one sync per launch (see `Gpu::launch`).
 static SYNC_EACH: LazyLock<bool> = LazyLock::new(|| std::env::var_os("STRATA_HIP_SYNC").is_some());
+/// `STRATA_NO_GRAPH` / `STRATA_HIP_GRAPH=0`: run the forward every time instead of capturing it.
+static NO_GRAPH: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("STRATA_NO_GRAPH").is_some() || std::env::var("STRATA_HIP_GRAPH").map(|v| v == "0").unwrap_or(false)
+});
 /// `STRATA_HIP_TRACE`: name every launch before it goes out, so a fault that kills the process names the kernel.
 static TRACE: LazyLock<bool> = LazyLock::new(|| std::env::var_os("STRATA_HIP_TRACE").is_some());
 
@@ -271,10 +275,23 @@ impl Gpu {
         (cfg((rows.div_ceil(wpb * rpw) as u32, k as u32), (32 * wpb) as u32, Self::xq_smem(ty, cols)), rpw as i32)
     }
 
+    /// Whether the stream is capturing a graph: no allocation and no synchronous copy may be issued inside one.
+    fn capturing(&self) -> bool {
+        let mut status = 0;
+        unsafe { (self.hip.stream_is_capturing)(self.stream, &mut status) };
+        status != 0
+    }
+
     /// The rope frequencies base^(-2i / n_rot) as `rms_norm_rope` computes them in f64, made once by `rope_freq`.
+    /// While a graph is captured a missing table gives 0 (the kernel computes the frequencies itself) and is made
+    /// after the capture, which `graph` then repeats.
     fn rope_fr(&self, base: f32, n_rot: usize) -> anyhow::Result<u64> {
         let mut fr = self.fr.lock().unwrap();
         if let Some(b) = fr.0.get(&(base.to_bits(), n_rot)) { return Ok(b.addr()) }
+        if self.capturing() {
+            fr.1.push((base, n_rot));
+            return Ok(0);
+        }
         let buf = alloc_raw(&self.hip, 8 * (n_rot / 2).max(1))?;
         let p = buf.addr();
         let (bs, nr) = (base, n_rot as i32);
@@ -406,6 +423,7 @@ impl Backend for Gpu {
     /// drained first so the copy cannot pass kernels already queued that write `dst`.
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
         anyhow::ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
+        anyhow::ensure!(!self.capturing(), "htod inside a captured graph: the caller must copy before the capture");
         self.wait()?;
         let r = unsafe { (self.hip.memcpy)((dst.addr() + off as u64) as *mut c_void, src.as_ptr().cast(), src.len(), ffi::MEMCPY_H2D) };
         self.hip.check(r, "hipMemcpy(htod)")
@@ -439,18 +457,16 @@ impl Backend for Gpu {
     fn sync(&self) -> anyhow::Result<()> { self.wait() }
 
     /// Recorded with `hipStreamBeginCapture`: the same launches, replayed by the driver with no host work.
-    /// Off by default: the forwards allocate inside their step (the q8 cache grows, the rope table is made), and HIP
-    /// refuses an allocation on a capturing stream ("operation not permitted when stream is capturing"), where CUDA's
-    /// stream-ordered allocator allows it. `STRATA_HIP_GRAPH=1` turns capture on once the step allocates nothing.
+    /// HIP refuses an allocation on a capturing stream ("operation not permitted when stream is capturing"), where
+    /// CUDA's stream-ordered allocator allows it, so anything a step allocates has to be made before the capture (the
+    /// rope table defers itself, see `rope_fr`). `STRATA_HIP_GRAPH=0` turns capture off.
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
-        if std::env::var_os("STRATA_NO_GRAPH").is_some() || std::env::var_os("STRATA_HIP_GRAPH").is_none() { return f() }
+        if *NO_GRAPH { return f() }
         if let Some(g) = self.graphs.lock().unwrap().get(&key) {
             let r = unsafe { (self.hip.graph_launch)(g.exec, self.stream) };
             return self.hip.check(r, "hipGraphLaunch");
         }
-        let mut capturing = 0;
-        unsafe { (self.hip.stream_is_capturing)(self.stream, &mut capturing) };
-        if capturing != 0 { return f() }  // never nest captures
+        if self.capturing() { return f() }  // never nest captures
         self.hip.check(unsafe { (self.hip.stream_begin_capture)(self.stream, ffi::CAPTURE_MODE_THREAD_LOCAL) }, "hipStreamBeginCapture")?;
         let r = f();
         let mut graph: ffi::Graph = std::ptr::null_mut();
@@ -461,6 +477,12 @@ impl Backend for Gpu {
         let mut exec: ffi::GraphExec = std::ptr::null_mut();
         self.hip.check(unsafe { (self.hip.graph_instantiate)(&mut exec, graph, 0) }, "hipGraphInstantiate")?;
         self.hip.check(unsafe { (self.hip.graph_launch)(exec, self.stream) }, "hipGraphLaunch")?;
+        // A rope table the capture lacked: make it, and capture again next time (this graph computes it per call).
+        let want = std::mem::take(&mut self.fr.lock().unwrap().1);
+        if !want.is_empty() {
+            for (base, n_rot) in want { self.rope_fr(base, n_rot)?; }
+            return Ok(());
+        }
         self.graphs.lock().unwrap().insert(key, Graph { exec, graph, hip: self.hip.clone() });
         Ok(())
     }

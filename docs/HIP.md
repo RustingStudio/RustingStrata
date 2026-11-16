@@ -4,11 +4,13 @@
 build step: the kernels are compiled at run time by hiprtc and launched through the HIP runtime, both loaded by name
 (`libamdhip64.so`, `libhiprtc.so`), the way `src/cuda` loads NVRTC. `cargo build --release` is the whole build.
 
-**Status: experimental.** Brought up on Qwen3.6-35B-A3B (RX 9070 XT, gfx1201, ROCm 7.2.3). Greedy output matches the
-other backends: identical to the Vulkan backend on 3 of 4 prompts, and to its own CUDA-core prefill on 5 of 6, with the
-difference at a near-tie where the f16 tensor-core summation order picks another token (the same class of difference the
-CUDA and Vulkan backends have). Not yet ported: graph capture (off by default) and the host-side pipeline details of the
-CUDA backend (pinned ring staging, side stream).
+**Status: experimental.** Brought up on an RX 9070 XT (gfx1201, ROCm 7.2.3). With `--fixed-experts` (deterministic
+placement) the greedy output is **bit-identical to the Vulkan backend** on the four local models tried (Qwen3.6-35B-A3B,
+Ornith-1.5-35B-A3B, Qwen3.5-9B dense, Qwen3.8-27B dense) and to its own CUDA-core prefill on 5 of 6 prompts — the odd
+one out differs at a near-tie, where the f16 tensor-core summation order picks another token (the same class of
+difference the CUDA and Vulkan backends have; with adaptive placement, greedy tokens can also change between runs, as
+they do on the other backends). Not yet ported: the host-side pipeline details of the CUDA backend (pinned ring staging
+for `htod`, side stream for `beside`).
 
 ## What runs
 
@@ -16,13 +18,16 @@ Everything the Vulkan backend runs, through the same kernels:
 
 | | HIP | Vulkan (same machine, same model) |
 |---|---|---|
-| Prefill, pp 1024, `--mtp 2` | 1569 tok/s | 1428 tok/s |
+| Prefill, pp 1024, `--mtp 2` | 1530 tok/s | 1602 tok/s |
 | Prefill, pp 4096, `--mtp 2` | 2106 tok/s | (not run) |
-| Decode, tg 48, `--mtp 2` | 173 tok/s | 231 tok/s |
+| Decode, tg 48, `--mtp 2` | 183 tok/s | 236 tok/s |
+| Decode, `--fixed-experts`, same prompt | 73.8 tok/s | 72.3 tok/s |
+| Qwen3.8-27B dense, prefill / decode | 705 / 50.3 tok/s | 497 / 55.5 tok/s |
 
-Qwen3.6-35B-A3B UD-Q4_K_XL, `--ctx 4096 --vram-margin 256`, RX 9070 XT, Ryzen 7 5700X, one process each. Prefill runs on
-the card's matrix cores (below) and is at parity with Vulkan; decode is 1.3x behind, which is the host side (no graph
-capture, no side stream) rather than the kernels.
+Qwen3.6-35B-A3B UD-Q4_K_XL (first rows) and Qwen3.8-27B UD-IQ3_S, `--ctx 4096 --vram-margin 256`, one process each.
+Prefill runs on the card's matrix cores (below); on a dense model it is 1.4x ahead of Vulkan. Decode with fixed
+placement is at parity (the benches above differ because each backend finds its own expert placement, which changes the
+MTP draft acceptance); the dense model's decode is 10% behind, memory-bandwidth bound.
 
 ## How it works
 
@@ -58,18 +63,16 @@ capture, no side stream) rather than the kernels.
 
 - `STRATA_HIP_SYNC=1` waits after every launch, so a hardware exception names the kernel that raised it.
 - `STRATA_HIP_TRACE=1` names every launch before it goes out (grid, block, shared memory).
-- `STRATA_HIP_GRAPH=1` turns on graph capture once the forward allocates nothing inside a step (HIP refuses an
-  allocation on a capturing stream; CUDA's stream-ordered allocator allows it).
+- `STRATA_HIP_GRAPH=0` runs the forward every time instead of capturing it (capture is on by default, +5% decode).
 - `STRATA_NO_GRAPH=1` turns capture off for both GPU backends.
 - `STRATA_HIP_WMMA=0` uses the CUDA-core multiplications in the prefill GEMM instead of the matrices cores.
 
 ## Next
 
-1. Graph capture: move the per-step allocations (q8 cache growth, rope table) out of the captured region; that and the
-   side stream are where the remaining decode gap is.
-2. The int8 WMMA form (`__builtin_amdgcn_wmma_i32_16x16x16_iu8`) for the integer-weight prefill GEMM, which today takes
+1. The int8 WMMA form (`__builtin_amdgcn_wmma_i32_16x16x16_iu8`) for the integer-weight prefill GEMM, which today takes
    the f16 path (`GEMM_TC 0`): less shared-memory traffic per output than the sm_80-style int8 `gemmi_*` kernels.
-3. A pinned ring for `htod` so expert streaming during prefill does not sync the stream per tensor.
+2. A pinned ring for `htod` and a side stream for `beside`, so expert uploads overlap with compute in prefill.
+3. The int8 WMMA form
 
 ## Credits
 
