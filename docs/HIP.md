@@ -72,6 +72,22 @@ acceptance. A dense model's prefill is 1.4x ahead and its decode 10% behind (mem
 - `STRATA_NO_GRAPH=1` turns capture off for both GPU backends.
 - `STRATA_HIP_WMMA=0` uses the CUDA-core multiplications in the prefill GEMM instead of the matrices cores.
 
+## Why the prefill GEMM does not use int8 matrix cores
+
+The CUDA backend runs integer weight types as int8 `mma.sync` because NVIDIA's int8 tensor cores are 2-4x its f16 ones
+and its layout puts each lane's 4 results over 2 rows and 2 columns, so the per-16-weight scale and min the K-quants
+carry cost 2 multiplications a result. On RDNA4 both premises fail:
+
+- `v_wmma_i32_16x16x16_iu8` is only **2x** `v_wmma_f32_16x16x16_f16` (137 vs 57 TMAC/s on gfx1201,
+  `tools/hip/wmma_rate.cpp`).
+- AMD's WMMA layout gives a lane 8 results in 8 *different rows*, so the scale of each result is different and the
+  rescale costs ~8 scalar operations per result — per 16-key group, not once per GEMM.
+
+Measured in the kernel's own inner-loop shape (`tools/hip/wmma_rescale.cpp`): int8 without its epilogue runs in 0.35x
+the time of f16, with a vector-friendly rescale 6.6x *slower*, with the layout the source uses 13-16x slower. The
+integer path cannot pay for itself here, so `GEMM_TC` stays 0 on HIP and the prefill GEMM dequantizes to f16 in shared
+memory and runs on the f16 matrix cores, which is what puts it ahead of the Vulkan backend.
+
 ## Next
 
 1. The int8 WMMA form (`__builtin_amdgcn_wmma_i32_16x16x16_iu8`) for the integer-weight prefill GEMM, which today takes
