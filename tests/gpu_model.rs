@@ -204,10 +204,21 @@ fn qwen4exp_mtp_matches() {
 }
 
 fn spec_matches_greedy(m: &Model, tok: &Tokenizer) {
-    for (bk, gpu) in common::backends() {
-        eprintln!("backend {bk}");
-        let mut gm = GpuModel::load(m, gpu, 512, 0, 512 << 20, 3).unwrap();
-        assert_eq!(gm.k, 3);
+    // One device, then the layers split in two parts (on the same GPU): the draft head is on the last part.
+    for (split, (bk, gpu)) in [false, true].into_iter().flat_map(|sp| common::backends().into_iter().map(move |b| (sp, b))) {
+        eprintln!("backend {bk}, split {split}");
+        let mut gm = if split {
+            let second = common::backends().into_iter().find(|b| b.0 == bk).unwrap().1;
+            // Both parts are on one GPU here: the first must not fill it with experts.
+            // SAFETY: the GPU lock serializes every test that loads a model, the only readers of this variable.
+            unsafe { std::env::set_var("STRATA_EXPERT_MB", "1024") };
+            let gm = GpuModel::load_split(m, vec![gpu, second], 512, 0, 512 << 20, 3, 1);
+            unsafe { std::env::remove_var("STRATA_EXPERT_MB") };
+            gm.unwrap()
+        } else {
+            GpuModel::load(m, gpu, 512, 0, 512 << 20, 3).unwrap()
+        };
+        assert_eq!((gm.k, gm.parts().count()), (3, 1 + split as usize));
         gm.adapt_every = 0;
         let ids = tok.encode("Write a short story about a dragon.").unwrap();
         let n = 64;

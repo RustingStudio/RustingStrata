@@ -357,13 +357,12 @@ impl Engine {
             let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
         }
         let Some(bk) = bk else {
-            let (notes, _, mtp) = resolve_flags(false, self.parallel, self.mtp(), m.cfg.n_nextn, false)?;
+            let (notes, _, mtp) = resolve_flags(false, self.parallel, self.mtp(), m.cfg.n_nextn)?;
             for n in notes { eprintln!("{n}"); }
             self.mtp = Some(mtp);
             return Ok(Runner::Cpu(m, State::new(&m.cfg)));
         };
-        let split = bk.len() > 1;
-        let (notes, parallel, mtp) = resolve_flags(true, self.parallel, self.mtp(), m.cfg.n_nextn, split)?;
+        let (notes, parallel, mtp) = resolve_flags(true, self.parallel, self.mtp(), m.cfg.n_nextn)?;
         for n in notes { eprintln!("{n}"); }
         (self.parallel, self.mtp) = (parallel, Some(mtp));
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
@@ -553,7 +552,7 @@ const LOAD_HINT: &str = "loading the model onto the GPU failed (if VRAM ran out:
 /// error; a feature that cannot run is turned off with one message naming the flag and the reason. `parallel` 0 means
 /// "not set" (commands other than `serve`), treated as one slot. Returns the notices, the slots in effect and the MTP
 /// drafts in effect.
-fn resolve_flags(gpu: bool, parallel: usize, mtp: usize, n_nextn: usize, split: bool) -> anyhow::Result<(Vec<String>, usize, usize)> {
+fn resolve_flags(gpu: bool, parallel: usize, mtp: usize, n_nextn: usize) -> anyhow::Result<(Vec<String>, usize, usize)> {
     let p = parallel.max(1);
     anyhow::ensure!((1..=255).contains(&p), "--parallel {parallel}: 1 to 255 slots");
     let mut notes = vec![];
@@ -567,7 +566,6 @@ fn resolve_flags(gpu: bool, parallel: usize, mtp: usize, n_nextn: usize, split: 
         return Ok((notes, p, 0));
     }
     let why = if mtp == 0 { None }
-        else if split { Some("not available with a multi-GPU layer split") }
         else if n_nextn == 0 { Some("this model has no MTP head") }
         else { None };
     let mut k = mtp;
@@ -1599,8 +1597,7 @@ fn calibrate(model: &Path, ctx: usize, margin: &[usize], kind: Option<&str>, dev
     let pf = prose(&tok, n_pf)?;
     let load = |chunk: usize| -> anyhow::Result<GpuModel> {
         let bk = device.iter().map(|&d| backend::open(kind, d)).collect::<anyhow::Result<Vec<_>>>()?;
-        // MTP is not available with a layer split (as in serve): no drafts to measure.
-        let mut gm = GpuModel::load_split_margins(&m, bk, ctx, chunk, margin, if device.len() > 1 { 0 } else { 3 }, 1).context(LOAD_HINT)?;
+        let mut gm = GpuModel::load_split_margins(&m, bk, ctx, chunk, margin, 3, 1).context(LOAD_HINT)?;
         gm.adapt_every = 0; // fixed placement: steadier timings
         Ok(gm)
     };
@@ -2540,43 +2537,39 @@ mod flag_tests {
     #[test]
     fn parallel_mtp_are_explained() {
         // `--parallel` with MTP: MTP off, one message naming both flags.
-        let (n, p, k) = resolve_flags(true, 4, 1, 1, false).unwrap();
+        let (n, p, k) = resolve_flags(true, 4, 1, 1).unwrap();
         assert_eq!((p, k), (4, 0));
         assert_eq!(n, ["--parallel 4 and --mtp 1: not supported together, decoding without MTP drafts"]);
     }
 
     #[test]
     fn mtp_without_a_head_runs_without_drafts() {
-        let (n, _, k) = resolve_flags(true, 1, 3, 0, false).unwrap();
+        let (n, _, k) = resolve_flags(true, 1, 3, 0).unwrap();
         assert_eq!(k, 0);
         assert_eq!(n, ["--mtp 3: this model has no MTP head: decoding without drafts"]);
         // A model with a head keeps its drafts.
-        let (n, _, k) = resolve_flags(true, 1, 3, 1, false).unwrap();
+        let (n, _, k) = resolve_flags(true, 1, 3, 1).unwrap();
         assert!(n.is_empty() && k == 3);
-        // A layer split explains itself instead.
-        let (n, _, k) = resolve_flags(true, 1, 3, 1, true).unwrap();
-        assert_eq!(k, 0);
-        assert_eq!(n, ["--mtp 3: not available with a multi-GPU layer split: decoding without drafts"]);
     }
 
     #[test]
     fn cpu_requires_the_gpu_for_both() {
-        let (n, _, k) = resolve_flags(false, 2, 1, 1, false).unwrap();
+        let (n, _, k) = resolve_flags(false, 2, 1, 1).unwrap();
         assert_eq!(k, 0);
         assert_eq!(n, ["--parallel 2: requires --gpu (the CPU answers one request at a time)",
                        "--mtp 1: requires --gpu: decoding without drafts"]);
         // No flags set (0 means unset) prints nothing.
-        assert_eq!(resolve_flags(false, 0, 0, 0, false).unwrap(), (vec![], 1, 0));
+        assert_eq!(resolve_flags(false, 0, 0, 0).unwrap(), (vec![], 1, 0));
     }
 
     #[test]
     fn parallel_range_is_rejected() {
         for n in [256, 1000] {
-            let e = resolve_flags(true, n, 0, 0, false).unwrap_err().to_string();
+            let e = resolve_flags(true, n, 0, 0).unwrap_err().to_string();
             assert_eq!(e, format!("--parallel {n}: 1 to 255 slots"));
         }
-        assert!(resolve_flags(true, 255, 0, 0, false).is_ok());
-        assert_eq!(resolve_flags(true, 1, 0, 0, false).unwrap(), (vec![], 1, 0));
+        assert!(resolve_flags(true, 255, 0, 0).is_ok());
+        assert_eq!(resolve_flags(true, 1, 0, 0).unwrap(), (vec![], 1, 0));
     }
 }
 
