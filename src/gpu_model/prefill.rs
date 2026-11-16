@@ -255,7 +255,16 @@ impl GpuModel<'_> {
         let mut logits = Vec::new();
         // Hyper-connection models: TMAX tokens per forward (prompts too short for the chunked GEMM prefill).
         if self.m.cfg.hc_n > 0 {
-            for ch in tokens.chunks(self.tmax()) { logits = self.verify(ch)?.pop().unwrap(); }
+            // The draft head's entry for a token pairs it with the stack of the token before: row 0 of `x` at the
+            // start (as below), then the rows of the chunk.
+            let mut last = 0;
+            for ch in tokens.chunks(self.tmax()) {
+                let fill = self.mtp_synced();
+                if fill && self.pos > 0 { let r = self.row_ptr(last); self.mtp_run(&ch[..1], r, false)?; }
+                logits = self.verify(ch)?.pop().unwrap();
+                if fill && ch.len() > 1 { let r = self.row_ptr(0); self.mtp_run(&ch[1..], r, false)?; }
+                last = ch.len() - 1;
+            }
             return Ok(logits);
         }
         for &t in tokens {
@@ -305,7 +314,9 @@ impl GpuModel<'_> {
         // The draft head runs as one more layer on the chunk while it is in step with the main model.
         let fill = self.mtp_synced();
         let is_eagle = self.mtp.as_ref().is_some_and(|mh| mh.eagle.is_some());
-        let mtp = self.mtp.as_ref().filter(|mh| fill && mh.eagle.is_none());
+        // ponytail: the chunked prefill does not fill a hyper-connection draft head (it starts without the prompt:
+        // lower acceptance at first, same output). Fill it as one more hc layer here if that costs speed.
+        let mtp = self.mtp.as_ref().filter(|mh| fill && mh.eagle.is_none() && c.hc_n == 0);
         // STRATA_NAN_TRACE[=N]: from position N (default 0), one line per layer with the largest magnitude of each intermediate buffer, and the first
         // row of one holding a non-finite value. Each probe waits for the GPU: diagnostic runs only.
         let trace = std::env::var("STRATA_NAN_TRACE").is_ok_and(|v| self.pos >= v.parse::<usize>().unwrap_or(0));
