@@ -29,6 +29,9 @@ cores (below) and is ahead of Vulkan; decode is within a few percent in either d
 is larger than the difference, because each backend finds its own expert placement and that moves the MTP draft
 acceptance. A dense model's prefill is 1.4x ahead and its decode 10% behind (memory-bandwidth bound).
 
+`serve` works too, checked on Qwen3.5-9B: `GET /v1/models`, non-streaming and streaming (`stream: true`) chat
+completions, and the prompt cache across turns (`prompt_tokens_details.cached_tokens` on a follow-up request).
+
 ## How it works
 
 - `src/hip/compat.h` is prepended to `kernels.cu`: it supplies the CUDA intrinsics the source uses (`__shfl_*_sync`,
