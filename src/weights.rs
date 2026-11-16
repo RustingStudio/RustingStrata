@@ -39,12 +39,19 @@ impl<'a> Tensor<'a> {
     /// out[t][r] = row_r · x[t] for all rows and tokens. `x` is `n_tokens * cols`, `out` is `n_tokens * rows`.
     pub fn matmul(&self, x: &[f32], n_tokens: usize, out: &mut [f32]) {
         assert_eq!((x.len(), out.len()), (n_tokens * self.cols, n_tokens * self.rows));
-        out.par_chunks_mut(self.rows).enumerate().for_each_init(|| vec![0f32; self.cols], |buf, (t, ys)| {
-            let xt = &x[t * self.cols..(t + 1) * self.cols];
-            for (r, yv) in ys.iter_mut().enumerate() {
-                self.row(r, buf);
-                *yv = buf.iter().zip(xt).map(|(a, b)| a * b).sum();
+        // Row-outer: each weight row is decoded once, whatever n_tokens is. Blocks of rows that fit the L2 cache stay
+        // there while every token passes over them.
+        let block = (1 << 16) / self.cols.max(1) + 1;
+        let mut by_row = vec![0f32; out.len()];
+        by_row.par_chunks_mut(block * n_tokens).enumerate().for_each_init(|| vec![0f32; block * self.cols], |buf, (b, ys)| {
+            let nr = ys.len() / n_tokens;
+            for (r, w) in buf.chunks_exact_mut(self.cols).take(nr).enumerate() { self.row(b * block + r, w); }
+            for (t, xt) in x.chunks_exact(self.cols).enumerate() {
+                for (r, w) in buf.chunks_exact(self.cols).take(nr).enumerate() { ys[r * n_tokens + t] = dot(w, xt); }
             }
+        });
+        out.par_chunks_mut(self.rows).enumerate().for_each(|(t, ys)| {
+            for (r, yv) in ys.iter_mut().enumerate() { *yv = by_row[r * n_tokens + t]; }
         });
     }
 
@@ -258,4 +265,14 @@ impl Drop for Prefetch {
         self.tx = None;
         if let Some(t) = self.th.take() { let _ = t.join(); }
     }
+}
+
+/// Dot product with 16 independent partial sums, so the compiler vectorizes it (a single running f32 sum cannot
+/// be). 32 and 64 sums measured slower.
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0f32; 16];
+    let (ca, cb) = (a.chunks_exact(16), b.chunks_exact(16));
+    let tail: f32 = ca.remainder().iter().zip(cb.remainder()).map(|(x, y)| x * y).sum();
+    for (x, y) in ca.zip(cb) { for i in 0..16 { acc[i] += x[i] * y[i]; } }
+    acc.iter().sum::<f32>() + tail
 }

@@ -939,8 +939,8 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
-        launch!(self, "rope_neox", cfg(((heads / per) as u32, 1), (n_rot / 2) as u32, 0), x, stride as i32, per as i32, n_rot as i32, step, base);
+    fn rope_pairs(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32, lo: usize, hi: usize) -> anyhow::Result<()> {
+        launch!(self, "rope_neox", cfg(((heads / per) as u32, 1), (n_rot / 2) as u32, 0), x, stride as i32, per as i32, n_rot as i32, step, base, lo as i32, hi as i32);
         Ok(())
     }
 

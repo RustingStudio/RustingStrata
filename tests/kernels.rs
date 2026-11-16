@@ -1081,6 +1081,15 @@ fn norm_rope_and_gate_ops_match_cpu() {
         let got = down::<f32>(gpu, &dx);
         close(&got, &want, "rope_neox");
         report("rope_neox", "hd 128, 64 rotated, pos 30000", &got, &want);
+        // rope_mrope: one token, 2 heads, sections [11, 11, 10, 0] of the 32 pairs at positions [t, y, x, z].
+        let (mpos, sec) = ([40, 7, 13, 5], [11, 11, 10, 0]);
+        let dx = up(gpu, &x[..2 * hd]);
+        let step = up(gpu, &mpos.map(|p| [p, 0]).concat());
+        gpu.rope_mrope(dx.addr(), hd, 2, 2, n_rot, step.addr(), 1e7, sec).unwrap();
+        let mut want = x[..2 * hd].to_vec();
+        for v in want.chunks_mut(hd) { ops::rope_mrope(v, n_rot, mpos, sec, 1e7) }
+        let got = down::<f32>(gpu, &dx);
+        close(&got, &want, "rope_mrope");
         // rms_norm_rope == rms_norm then rope_neox, from rows 160 floats apart.
         let dx = up(gpu, &x[..6 * 160]);
         let (d1, d2) = (gpu.zeros::<f32>(6 * hd).unwrap(), gpu.zeros::<f32>(6 * hd).unwrap());

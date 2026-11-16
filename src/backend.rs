@@ -209,7 +209,22 @@ pub trait Backend: Send {
     /// Row r: vector r % per (n floats) of token r / per, tokens `stride` floats apart.
     fn l2_norm(&self, x: u64, n: usize, per: usize, stride: usize, rows: usize, eps: f32) -> anyhow::Result<()>;
     /// `heads` rows of `stride` floats, `per` per token; token t is at position step[0] + t.
-    fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()>;
+    fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
+        self.rope_pairs(x, stride, heads, per, n_rot, step, base, 0, n_rot / 2)
+    }
+    /// `rope_neox` of pairs `lo..hi` only (M-RoPE: one call per section, each with its own position buffer).
+    fn rope_pairs(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32, lo: usize, hi: usize) -> anyhow::Result<()>;
+    /// M-RoPE (`ops::rope_mrope`): section s of the pairs turns by position `pos[2 * s]` (`pos`: four [position, _]
+    /// i32 pairs); pairs past the sections use the last position.
+    fn rope_mrope(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, pos: u64, base: f32, sections: [usize; 4]) -> anyhow::Result<()> {
+        let (half, mut lo) = (n_rot / 2, 0);
+        for (s, n) in sections.into_iter().enumerate() {
+            let hi = if s == 3 { half } else { (lo + n).min(half) };
+            if hi > lo { self.rope_pairs(x, stride, heads, per, n_rot, pos + 8 * s as u64, base, lo, hi)?; }
+            lo = hi;
+        }
+        Ok(())
+    }
     /// `rms_norm` of `rows` heads of n (output rows of n), then `rope_neox` on them.
     fn rms_norm_rope(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
         self.rms_norm(x, x_stride, w, out, n, n, rows, eps)?;
