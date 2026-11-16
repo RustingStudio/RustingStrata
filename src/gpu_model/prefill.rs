@@ -136,7 +136,7 @@ impl GpuModel<'_> {
         let mut p = Some(&mut *self);
         while let Some(q) = p {
             if let Some(cache) = q.cache.as_mut() {
-                if adapt && !cache.fully_resident() { cache.adapt(q.m, &*q.gpu, usize::MAX)?; }
+                if adapt && !cache.fully_resident() { cache.settle(q.m, &*q.gpu)?; }
             }
             p = q.next.as_deref_mut();
         }
@@ -480,7 +480,7 @@ impl GpuModel<'_> {
                             lower --chunk (for example --chunk 1024) or --ctx, and try STRATA_NAN_TRACE=1 for a non-finite hidden state", self.pos);
                     }
                     let cache = self.cache.as_mut().unwrap();
-                    cache.record(il, &ids);
+                    cache.record_prompt(il, &ids);
                     // Sort (token, j) pairs by expert: slot s holds token xrow[s]; inv maps t * k + j to its slot.
                     let mut off = vec![0usize; c.n_expert + 1];
                     for &e in &ids { off[e as usize + 1] += 1; }
