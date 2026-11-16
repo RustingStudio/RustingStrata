@@ -18,16 +18,16 @@ Everything the Vulkan backend runs, through the same kernels:
 
 | | HIP | Vulkan (same machine, same model) |
 |---|---|---|
-| Prefill, pp 1024, `--mtp 2` | 1530 tok/s | 1602 tok/s |
-| Prefill, pp 4096, `--mtp 2` | 2106 tok/s | (not run) |
-| Decode, tg 48, `--mtp 2` | 183 tok/s | 236 tok/s |
-| Decode, `--fixed-experts`, same prompt | 73.8 tok/s | 72.3 tok/s |
+| Prefill, pp 1024, calibrated | 1577-2072 tok/s | 1344 tok/s |
+| Prefill, pp 4096 | 2106 tok/s | (not run) |
+| Decode, tg 48, calibrated | 188-222 tok/s | 195 tok/s |
 | Qwen3.8-27B dense, prefill / decode | 705 / 50.3 tok/s | 497 / 55.5 tok/s |
 
-Qwen3.6-35B-A3B UD-Q4_K_XL (first rows) and Qwen3.8-27B UD-IQ3_S, `--ctx 4096 --vram-margin 256`, one process each.
-Prefill runs on the card's matrix cores (below); on a dense model it is 1.4x ahead of Vulkan. Decode with fixed
-placement is at parity (the benches above differ because each backend finds its own expert placement, which changes the
-MTP draft acceptance); the dense model's decode is 10% behind, memory-bandwidth bound.
+Qwen3.6-35B-A3B UD-Q4_K_XL (first rows) and Qwen3.8-27B UD-IQ3_S, `--ctx 4096 --vram-margin 256`, one process each,
+`calibrate` run for each backend (chunk 4096; HIP picks `--mtp 3`, Vulkan `--mtp 1`). Prefill runs on the card's matrix
+cores (below) and is ahead of Vulkan; decode is within a few percent in either direction — the spread over repeated runs
+is larger than the difference, because each backend finds its own expert placement and that moves the MTP draft
+acceptance. A dense model's prefill is 1.4x ahead and its decode 10% behind (memory-bandwidth bound).
 
 ## How it works
 
@@ -51,6 +51,11 @@ MTP draft acceptance); the dense model's decode is 10% behind, memory-bandwidth 
   so the CUDA build's preprocessed source is unchanged.
 - The code object is cached in `$XDG_CACHE_HOME/rusting_strata/<hash>.amdgcn`, keyed by the source, the `gfx` target
   and the hiprtc version.
+- `calibrate --backend hip` measures chunk, MTP drafts and the short-prompt threshold on this machine and writes
+  `strata-<model>-hip.json`; later runs read it, as they do for the other backends.
+- Large `htod`s go through a 64 MB pinned ring (the DMA reads it while the host fills the next region), so expert
+  streaming does not stop the CPU side; small copies are queued asynchronously on the same stream, and `memset` is
+  stream-ordered (the null-stream `hipMemset` could land after a copy queued for the same buffer).
 
 ## Requirements
 
@@ -71,8 +76,7 @@ MTP draft acceptance); the dense model's decode is 10% behind, memory-bandwidth 
 
 1. The int8 WMMA form (`__builtin_amdgcn_wmma_i32_16x16x16_iu8`) for the integer-weight prefill GEMM, which today takes
    the f16 path (`GEMM_TC 0`): less shared-memory traffic per output than the sm_80-style int8 `gemmi_*` kernels.
-2. A pinned ring for `htod` and a side stream for `beside`, so expert uploads overlap with compute in prefill.
-3. The int8 WMMA form
+2. A side stream for `beside`, so expert uploads overlap with compute in prefill.
 
 ## Credits
 

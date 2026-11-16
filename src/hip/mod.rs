@@ -15,7 +15,7 @@ use crate::cuda::{AMAX_PARTS, FA_BK, attn_prefill_smem_bk, dyn_shmem_need, kname
 use crate::quant::GgmlType;
 use anyhow::{Context, bail};
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -54,6 +54,9 @@ pub struct Gpu {
     done: ffi::Event,
     /// Rope frequency tables, `base` and `n_rot` to the device buffer that holds them.
     fr: Mutex<(HashMap<(u32, usize), Buf>, Vec<(f32, usize)>)>,
+    /// Pinned staging for large `htod`, used as a ring: the copy returns before its DMA, so the host fills the next
+    /// region while the card reads the previous one (expert streaming in prefill).
+    staging: Mutex<Staging>,
 }
 
 // The HIP handles are raw pointers but the runtime is thread-safe for the calls the backend makes, and `Backend`
@@ -201,10 +204,16 @@ impl Gpu {
         }
         let am_buf = alloc_raw(&hip, 64 * AMAX_PARTS)?;
         let q8_buf = alloc_raw(&hip, 1)?;
+        // Pinned ring for large host-to-device copies.
+        let mut host: *mut c_void = std::ptr::null_mut();
+        hip.check(unsafe { (hip.host_malloc)(&mut host, RING, ffi::HOST_MALLOC_PORTABLE | ffi::HOST_MALLOC_MAPPED) }, "hipHostMalloc(ring)")?;
+        let mut dev: *mut c_void = std::ptr::null_mut();
+        hip.check(unsafe { (hip.host_device_ptr)(&mut dev, host, 0) }, "hipHostGetDevicePointer(ring)")?;
+        let staging = Staging { pin: Buf::new(dev as u64, RING, PinnedHost { hip: hip.clone(), p: host }), host: host.cast(), head: 0, busy: VecDeque::new() };
         let mut done: ffi::Event = std::ptr::null_mut();
         hip.check(unsafe { (hip.event_create)(&mut done, ffi::EVENT_DISABLE_TIMING) }, "hipEventCreate")?;
         Ok(Gpu { hip, device, stream, module, fns, arch, kv_q8, max_smem, am: am_buf, q8: Mutex::new((q8_buf, None)),
-                 graphs: Mutex::new(HashMap::new()), done, fr: Mutex::new((HashMap::new(), Vec::new())) })
+                 graphs: Mutex::new(HashMap::new()), done, fr: Mutex::new((HashMap::new(), Vec::new())), staging: Mutex::new(staging) })
     }
 
     fn h(&self) -> &ffi::Hip { &self.hip }
@@ -378,6 +387,49 @@ impl Gpu {
     fn grid(n: usize) -> LaunchConfig { cfg((n.div_ceil(256) as u32, 1), 256, 0) }
 }
 
+/// Pinned host allocation freed with the runtime that made it.
+struct PinnedHost { hip: Arc<ffi::Hip>, p: *mut c_void }
+
+unsafe impl Send for PinnedHost {}
+unsafe impl Sync for PinnedHost {}
+
+impl Drop for PinnedHost {
+    fn drop(&mut self) { unsafe { (self.hip.host_free)(self.p) }; }
+}
+
+/// Pinned host memory used as a ring for `htod`: a region is free again once the copy that read it has completed.
+struct Staging {
+    pin: Buf,
+    host: *mut u8,
+    head: usize,
+    busy: VecDeque<(usize, usize, Event)>,
+}
+
+/// A `hipEvent_t` that destroys itself; `query` reports completion.
+struct Event { hip: Arc<ffi::Hip>, ev: ffi::Event }
+
+impl Event {
+    fn new(hip: &Arc<ffi::Hip>) -> anyhow::Result<Event> {
+        let mut ev: ffi::Event = std::ptr::null_mut();
+        hip.check(unsafe { (hip.event_create)(&mut ev, ffi::EVENT_DISABLE_TIMING) }, "hipEventCreate")?;
+        Ok(Event { hip: hip.clone(), ev })
+    }
+    fn record(&self, stream: ffi::Stream) -> anyhow::Result<()> {
+        self.hip.check(unsafe { (self.hip.event_record)(self.ev, stream) }, "hipEventRecord")
+    }
+    fn done(&self) -> bool { unsafe { (self.hip.event_query)(self.ev) == ffi::HIP_SUCCESS } }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) { unsafe { (self.hip.event_destroy)(self.ev) }; }
+}
+
+/// Recorded graphs kept before a forward runs uncaptured (CUDA's cap, same reason).
+const GRAPHS_MAX: usize = 32;
+
+const RING: usize = 64 << 20;
+const RING_MIN: usize = 256 << 10;
+
 fn alloc_raw(hip: &Arc<ffi::Hip>, bytes: usize) -> anyhow::Result<Buf> {
     let mut p: *mut c_void = std::ptr::null_mut();
     hip.check(unsafe { (hip.malloc)(&mut p, bytes.max(1)) }, "hipMalloc")?;
@@ -414,19 +466,39 @@ impl Backend for Gpu {
 
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf> {
         let b = alloc_raw(&self.hip, bytes)?;
-        self.hip.check(unsafe { (self.hip.memset)(b.addr() as *mut c_void, 0, b.len()) }, "hipMemset")?;
+        self.memset(&b)?;
         Ok(b)
     }
 
-    /// Synchronous copy: HIP does not promise that an async copy from pageable memory has staged the host buffer when
-    /// the call returns, and a caller that reuses `src` (every caller does) cannot wait for that. The stream is
-    /// drained first so the copy cannot pass kernels already queued that write `dst`.
+    /// Queue a host-to-device copy on the stream and return once `src` may be reused: from pageable memory the
+    /// runtime stages the buffer inside the call, and large copies go through the pinned ring so the DMA does not
+    /// stop the host (expert streaming during prefill).
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
         anyhow::ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
-        anyhow::ensure!(!self.capturing(), "htod inside a captured graph: the caller must copy before the capture");
-        self.wait()?;
-        let r = unsafe { (self.hip.memcpy)((dst.addr() + off as u64) as *mut c_void, src.as_ptr().cast(), src.len(), ffi::MEMCPY_H2D) };
-        self.hip.check(r, "hipMemcpy(htod)")
+        if src.len() < RING_MIN {
+            let r = unsafe { (self.hip.memcpy_async)((dst.addr() + off as u64) as *mut c_void, src.as_ptr().cast(), src.len(),
+                                                     ffi::MEMCPY_H2D, self.stream) };
+            return self.hip.check(r, "hipMemcpyAsync(htod)");
+        }
+        let mut g = self.staging.lock().unwrap();
+        for (i, c) in src.chunks(RING).enumerate() {
+            if g.head + c.len() > RING { g.head = 0; }
+            let (a, b) = (g.head, g.head + c.len());
+            // Regions still being read by an earlier copy have to complete before the host overwrites them.
+            while g.busy.iter().any(|&(s, e, _)| s < b && a < e) {
+                let (_, _, ev) = g.busy.pop_front().unwrap();
+                self.hip.check(unsafe { (self.hip.event_sync)(ev.ev) }, "hipEventSynchronize")?;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), g.host.add(a), c.len()) };
+            let r = unsafe { (self.hip.memcpy_async)((dst.addr() + (off + i * RING) as u64) as *mut c_void,
+                                                     g.host.add(a) as *const c_void, c.len(), ffi::MEMCPY_H2D, self.stream) };
+            self.hip.check(r, "hipMemcpyAsync(htod ring)")?;
+            let ev = Event::new(&self.hip)?;
+            ev.record(self.stream)?;
+            g.busy.push_back((a, b, ev));
+            g.head = b;
+        }
+        Ok(())
     }
 
     fn dtoh(&self, src: &Buf, off: usize, dst: &mut [u8]) -> anyhow::Result<()> {
@@ -444,8 +516,10 @@ impl Backend for Gpu {
         self.hip.check(r, "hipMemcpyAsync(dtod)")
     }
 
+    /// On the stream, so it is ordered against the copies and launches around it (the plain `hipMemset` goes to the
+    /// null stream and can land after a copy that was queued for the same buffer).
     fn memset(&self, dst: &Buf) -> anyhow::Result<()> {
-        self.hip.check(unsafe { (self.hip.memset)(dst.addr() as *mut c_void, 0, dst.len()) }, "hipMemset")
+        self.hip.check(unsafe { (self.hip.memset_async)(dst.addr() as *mut c_void, 0, dst.len(), self.stream) }, "hipMemsetAsync")
     }
 
     fn mem_info(&self) -> anyhow::Result<(usize, usize)> {
@@ -466,6 +540,9 @@ impl Backend for Gpu {
             let r = unsafe { (self.hip.graph_launch)(g.exec, self.stream) };
             return self.hip.check(r, "hipGraphLaunch");
         }
+        // Each graph holds device memory and `step_rows` keys one per combination of sequence slots: past the cap a
+        // forward runs uncaptured (the CUDA backend caps for the same reason).
+        if self.graphs.lock().unwrap().len() >= GRAPHS_MAX { return f() }
         if self.capturing() { return f() }  // never nest captures
         self.hip.check(unsafe { (self.hip.stream_begin_capture)(self.stream, ffi::CAPTURE_MODE_THREAD_LOCAL) }, "hipStreamBeginCapture")?;
         let r = f();
@@ -495,13 +572,7 @@ impl Backend for Gpu {
         let mut dev: *mut c_void = std::ptr::null_mut();
         self.hip.check(unsafe { (self.hip.host_device_ptr)(&mut dev, host, 0) }, "hipHostGetDevicePointer")?;
         unsafe { std::ptr::write_bytes(host as *mut u8, 0, 4 * n) };
-        struct Pinned { hip: Arc<ffi::Hip>, p: *mut c_void }
-        unsafe impl Send for Pinned {}
-        unsafe impl Sync for Pinned {}
-        impl Drop for Pinned {
-            fn drop(&mut self) { unsafe { (self.hip.host_free)(self.p) }; }
-        }
-        let owner = Pinned { hip: self.hip.clone(), p: host };
+        let owner = PinnedHost { hip: self.hip.clone(), p: host };
         Ok((Buf::new(dev as u64, 4 * n, owner), host.cast()))
     }
 
