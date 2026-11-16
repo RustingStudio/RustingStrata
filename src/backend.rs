@@ -54,12 +54,13 @@ unsafe impl Plain for u64 {}
 
 /// Device memory, recorded graphs and kernel ops. Host copies are synchronous; device work runs in queue order.
 /// Pointer arguments are device addresses; strides are in floats unless named otherwise.
-/// The backend `kind` ("cuda" or "vulkan") on GPU `device`; with no kind, CUDA if it loads, else Vulkan.
+/// The backend `kind` ("cuda", "vulkan" or "hip") on GPU `device`; with no kind, CUDA if it loads, else Vulkan.
 pub fn open(kind: Option<&str>, device: usize) -> anyhow::Result<Box<dyn Backend>> {
     match kind {
         Some("cuda") => Ok(Box::new(crate::cuda::Gpu::new(device)?)),
         Some("vulkan") => Ok(Box::new(crate::vulkan::Vk::new(device)?)),
-        Some(k) => anyhow::bail!("unknown backend {k:?} (cuda or vulkan)"),
+        Some("hip") => Ok(Box::new(crate::hip::Gpu::new(device)?)),
+        Some(k) => anyhow::bail!("unknown backend {k:?} (cuda, vulkan or hip)"),
         None => match crate::cuda::Gpu::new(device) {
             Ok(g) => Ok(Box::new(g)),
             Err(c) if format!("{c}") == "CUDA init" => {
@@ -81,7 +82,7 @@ pub const SAME_X: i32 = 4;
 pub fn upload_type(ty: GgmlType) -> GgmlType { match ty { GgmlType::F16 => GgmlType::F32, GgmlType::Q4_0 | GgmlType::Q5_0 => GgmlType::Q8_0, ty => ty } }
 
 pub trait Backend: Send {
-    /// "cuda" or "vulkan".
+    /// "cuda", "vulkan" or "hip".
     fn name(&self) -> &'static str;
     /// The GPU's name as the driver reports it.
     fn device(&self) -> String;

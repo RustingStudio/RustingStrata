@@ -6,8 +6,14 @@ typedef unsigned short u16;
 typedef unsigned int u32;
 typedef unsigned long long u64;
 
+#if STRATA_HIP
+// AMD: the ISA converts f16 in one instruction, the compiler emits it for these.
+__device__ __forceinline__ float h2f(u16 h) { return (float)*(const _Float16*)&h; }
+__device__ __forceinline__ u16 f2h(float f) { _Float16 x = (_Float16)f; return *(const u16*)&x; }
+#else
 __device__ __forceinline__ float h2f(u16 h) { float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f; }
 __device__ __forceinline__ u16 f2h(float f) { u16 h; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f)); return h; }
+#endif
 __device__ __forceinline__ u32 ld16(const u8* p) { return *(const u16*)p; }  // 2-aligned only (every quant field is)
 __device__ __forceinline__ u32 ld32(const u8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((u32)p[3] << 24); }
 __device__ __forceinline__ float ldh(const u8* p) { return h2f((u16)ld16(p)); }
@@ -926,8 +932,12 @@ __device__ __forceinline__ void ldsm4(u32* r, const u16* p) {
 #pragma unroll
     for (int m = 0; m < 4; m++) {
         int m_row = (RM ? (m & 1) : (m >> 1)) * 8, m_col = (RM ? (m >> 1) : (m & 1)) * 8;
+#if STRATA_HIP
+        r[m] = *(const u32*)(p + (m_row + row) * PQ + m_col + col);
+#else
         unsigned a = (unsigned)__cvta_generic_to_shared(p + (m_row + row) * PQ + m_col + col);
         asm("ld.shared.b32 %0, [%1];" : "=r"(r[m]) : "r"(a));
+#endif
     }
 #else
     unsigned a = (unsigned)__cvta_generic_to_shared(p);
@@ -944,11 +954,16 @@ __device__ __forceinline__ void ldsm4t(u32* r, const u16* p) {
 #pragma unroll
     for (int m = 0; m < 4; m++) {
         int m_row = (RM ? (m & 1) : (m >> 1)) * 8, m_col = (RM ? (m >> 1) : (m & 1)) * 8;
+#if STRATA_HIP
+        const u16* a = p + (m_row + row) * PQ + m_col + col;
+        r[m] = (u32)a[0] | ((u32)a[2 * PQ] << 16);
+#else
         unsigned a = (unsigned)__cvta_generic_to_shared(p + (m_row + row) * PQ + m_col + col);
         unsigned short lo, hi;
         asm("ld.shared.u16 %0, [%1];" : "=h"(lo) : "r"(a));
         asm("ld.shared.u16 %0, [%1];" : "=h"(hi) : "r"(a + 2 * PQ));
         r[m] = (u32)lo | ((u32)hi << 16);
+#endif
     }
 #else
     unsigned a = (unsigned)__cvta_generic_to_shared(p);
@@ -1005,7 +1020,7 @@ __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 #endif
 }
-#if __CUDA_ARCH__ < 800
+#if __CUDA_ARCH__ < 800 && !STRATA_HIP
 // D[8,8] += A[8,4] * B[4,8] with the four independent computations of mma.m8n8k4 (Volta, SASS HMMA.884) selected
 // by g & 3. PTX ISA 8.5 §9.7.13.4.1: lane l = 4*g + t owns A row t + 4*(g >= 4) at k 0..3 and D elements by the
 // column/row formulas implemented in gemm_q's sm_70 path. mma.m16n8k16 is sm_80+, so this helper only exists for
@@ -1884,8 +1899,18 @@ template <int PER> __device__ __forceinline__ void ldkv(const u16* c, size_t off
     // q * d rounded once to f16 equals f2h((float)q * d).
     auto deq = [&](unsigned x, unsigned sel) {
         unsigned h = __byte_perm(x ^ 0x80808080u, 0x64646464u, sel), r;
+#if STRATA_HIP
+        // Same two f16 lanes without <hip_fp16.h>: a 2-element _Float16 vector (the ISA's packed f16 sub/mul).
+        typedef _Float16 f16x2 __attribute__((ext_vector_type(2)));
+        unsigned c64 = 0x64806480u;
+        f16x2 hh = *(f16x2*)&h, cc = *(f16x2*)&c64, dd = *(f16x2*)&d, rr;
+        rr[0] = (hh[0] - cc[0]) * dd[0];
+        rr[1] = (hh[1] - cc[1]) * dd[1];
+        r = *(unsigned*)&rr;
+#else
         asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(h) : "r"(h), "r"(0x64806480u));
         asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(h), "r"(d));
+#endif
         return r;
     };
     if (PER % 8 == 0 && hd % 128 == 0) {  // rows 8-byte aligned
@@ -2344,8 +2369,14 @@ extern "C" __global__ void moe_prefetch(const int* ids, int k, const int* table,
     if (s < 0) return;
     const char* p = base + (size_t)((unsigned int)s * (unsigned int)stride);
     int lines = bytes >> 7;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < lines; i += gridDim.x * blockDim.x)
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < lines; i += gridDim.x * blockDim.x) {
+#if STRATA_HIP
+        (void)p;  // no L2 prefetch instruction to give: moe_prefetch is a CUDA-only hint
+        break;
+#else
         asm volatile("prefetch.global.L2 [%0];" ::"l"(p + ((size_t)i << 7)));
+#endif
+    }
 }
 
 // x += sum_j w[j] ye[j] + sigmoid(sg) sh + cpu. If a slot missed, wait for the CPU worker's done flag first.

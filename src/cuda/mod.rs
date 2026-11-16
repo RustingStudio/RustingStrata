@@ -13,11 +13,11 @@ use std::sync::Arc;
 
 mod nvrtc;
 
-const QTYPES: [GgmlType; 24] = {
+pub(crate) const QTYPES: [GgmlType; 24] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, Q4_1, Q5_1, Q4_0, Q5_0]
 };
-const KERNELS: [&str; 36] = [
+pub(crate) const KERNELS: [&str; 36] = [
     "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
@@ -74,7 +74,7 @@ const BESIDE: usize = usize::MAX - 1;
 /// bound (cudarc leaves `CudaGraph` without `Send` only because it holds raw pointers).
 struct Graph(CudaGraph);
 
-const AMAX_PARTS: usize = 64;
+pub(crate) const AMAX_PARTS: usize = 64;
 unsafe impl Send for Graph {}
 
 /// `--llama-numerics`: quantize activations like llama.cpp's CPU q8_K (one scale per 256) for every integer matmul,
@@ -93,11 +93,11 @@ pub fn gemm_fma() -> bool { std::env::var_os("STRATA_GEMM_FMA").is_some() }
 /// Prefill attention query / key tile sizes in positions. `FA_BQ` is one warp's 16 query rows times the four warps
 /// of the 128-thread block; `FA_BK` is the K/V tile depth and must stay a multiple of 32 for the sm_70 `m8n8k4`
 /// and sm_80+ `m16n8k16` fragment loops. Injected into kernels.cu by `source()`, never edited there.
-const FA_BQ: usize = 64;
-const FA_BK: usize = 32;
+pub(crate) const FA_BQ: usize = 64;
+pub(crate) const FA_BK: usize = 32;
 /// Prefill GEMM K tile in halves (default, candidate C3 overrides it with `STRATA_GEMM_BK=32`). `GEMM_BM` lives in
 /// `backend.rs` because the prefill tile-list builder shares it with Vulkan.
-const GEMM_BK: usize = 64;
+pub(crate) const GEMM_BK: usize = 64;
 /// Row padding of the attention shared-memory tiles (`PQ = HD + 8`, `FA_BK + 8` in `attn_prefill_t`).
 const ATTN_SMEM_PAD: usize = 8;
 
@@ -131,13 +131,13 @@ impl Tune {
 }
 
 /// `default` unless `v` parses to a value accepted by `valid`.
-fn tuned(v: Option<&str>, default: usize, valid: impl Fn(usize) -> bool) -> usize {
+pub(crate) fn tuned(v: Option<&str>, default: usize, valid: impl Fn(usize) -> bool) -> usize {
     v.and_then(|s| s.trim().parse::<usize>().ok()).filter(|&x| valid(x)).unwrap_or(default)
 }
 
 /// Rows per warp: the family override (`STRATA_RPW_MOE`/`_DENSE`) first, then `STRATA_RPW`, then the shape default.
 /// 1..=64 keeps a block's row loop bounded; anything else falls back one level, as `tuned` does.
-fn rpw_from(global: Option<&str>, family: Option<&str>, default: usize) -> usize {
+pub(crate) fn rpw_from(global: Option<&str>, family: Option<&str>, default: usize) -> usize {
     let ok = |v: usize| (1..=64).contains(&v);
     family.and_then(|s| s.trim().parse().ok()).filter(|&v| ok(v))
         .or_else(|| global.and_then(|s| s.trim().parse().ok()).filter(|&v| ok(v)))
@@ -146,7 +146,7 @@ fn rpw_from(global: Option<&str>, family: Option<&str>, default: usize) -> usize
 
 /// Threads per block of the integer GEMV: the family override first, then the global value, then 256. Only the
 /// three warp counts the kernel's row mapping can tile are accepted (4/8/16 warps per block).
-fn gemv_block_from(global: Option<&str>, family: Option<&str>) -> u32 {
+pub(crate) fn gemv_block_from(global: Option<&str>, family: Option<&str>) -> u32 {
     let ok = |v: u32| matches!(v, 128 | 256 | 512);
     family.and_then(|s| s.trim().parse::<u32>().ok()).filter(|&v| ok(v))
         .or_else(|| global.and_then(|s| s.trim().parse::<u32>().ok()).filter(|&v| ok(v)))
@@ -196,7 +196,7 @@ fn source_with(kv_q8: bool, gemm_tc: bool, tune: Tune) -> String {
 fn attn_prefill_smem(hd: usize) -> usize { attn_prefill_smem_bk(hd, FA_BK) }
 
 /// `attn_prefill_smem` for a K/V tile depth of `bk` keys (16 on Turing at head_dim 256, else `FA_BK`).
-fn attn_prefill_smem_bk(hd: usize, bk: usize) -> usize {
+pub(crate) fn attn_prefill_smem_bk(hd: usize, bk: usize) -> usize {
     let pq = hd + ATTN_SMEM_PAD;
     2 * (FA_BQ + 2 * bk) * pq + 2 * FA_BQ * (bk + ATTN_SMEM_PAD)
 }
@@ -244,7 +244,7 @@ fn int8_gemm_arch(cc: (i32, i32)) -> bool { cc.0 >= 8 }
 /// decode GQA kernels (8 query slices per head group plus the cp.async K/V chunks at head_dim 128/256, `attn`),
 /// `usize::MAX` for `gemvn_*` whose request depends on the tensor shape (`xq_smem * nt`, `gemv_cfg`), and `None`
 /// for every kernel that never asks for more than the 48 KiB default (`attn_decode_*`, `attn_merge`, the rest).
-fn dyn_shmem_need(name: &str) -> Option<(&'static str, usize)> {
+pub(crate) fn dyn_shmem_need(name: &str) -> Option<(&'static str, usize)> {
     let family = if name.starts_with("attn_prefill") { "attn_prefill_*" }
         else if name.starts_with("attn_decode_gqa") { "attn_decode_gqa*" }
         else if name.starts_with("gemvn") { "gemvn_*" }
@@ -343,7 +343,7 @@ fn smem_log(family: &str, optin: usize, stat: usize, set: Option<usize>, carveou
 /// The kernel names to load from the cubin: the full list on sm_80+, without the int8 prefill GEMM (`gemmi_*` and
 /// `gemmis_*`, 20 non-float types x 2) on a device where that code is not compiled in. Pure so a CPU test can pin
 /// both lists (282 / 242 names).
-fn kernel_names(sm80: bool) -> Vec<String> {
+pub(crate) fn kernel_names(sm80: bool) -> Vec<String> {
     let int8 = move |&&t: &&GgmlType| sm80 && !matches!(t, GgmlType::F32 | GgmlType::BF16);
     KERNELS.iter().map(|s| s.to_string())
         .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm", "gemms"].map(|p| kname(p, t))))
@@ -427,7 +427,7 @@ macro_rules! launch {
     }};
 }
 
-fn kname(prefix: &str, ty: GgmlType) -> String { format!("{prefix}_{}", ty.name().to_lowercase()) }
+pub(crate) fn kname(prefix: &str, ty: GgmlType) -> String { format!("{prefix}_{}", ty.name().to_lowercase()) }
 
 impl Gpu {
     pub fn new(device: usize) -> anyhow::Result<Gpu> {

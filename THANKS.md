@@ -15,6 +15,11 @@ told us what they need. Thank you all.
 - [SugiKi1996](https://github.com/SugiKi1996): found that Turing (sm_75) was rejected on NVRTC 13.x, with the fix and
   RTX 2080 Ti numbers (issue #17).
 
+## Code
+
+- [Niko1221](https://github.com/Niko1221/Strata): the HIP backend's device-side compatibility layer (`src/hip/compat.h`)
+  follows the structure and several implementations of Strata's `include/strata/hip_compat/intrinsics.hpp` (MIT).
+
 ## Ideas
 
 - [FredWalter](https://github.com/FredWalter): multi-GPU and Qwen3.8-Flash-Next support (issue #1).
