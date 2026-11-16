@@ -378,6 +378,7 @@ fn ptx(src: &str, arch: &'static str, cc: (i32, i32)) -> anyhow::Result<Ptx> {
         }
     }
     let tag = nvrtc.map(|(maj, min)| format!("{maj}.{min}")).unwrap_or_else(|| "unverified".to_string());
+    let tag = format!("{tag} {}", nvrtc::extra_opts()).trim_end().to_string();
     let dir = std::env::var_os("XDG_CACHE_HOME").map(Into::into)
         .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"))
         .join("rusting_strata");
