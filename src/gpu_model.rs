@@ -319,6 +319,8 @@ impl<'a> GpuModel<'a> {
         }
         let free = gpus.iter().map(|g| Ok(g.mem_info()?.0 as f64)).collect::<anyhow::Result<Vec<_>>>()?;
         let total: f64 = free.iter().sum();
+        // ponytail: EAGLE3 reads features of three layers into one device's buffers; no drafts when they are split.
+        let k = if gpus.len() > 1 && m.cfg.eagle3.is_some() { eprintln!("EAGLE3 draft head: not available with a multi-GPU layer split, decoding without drafts"); 0 } else { k };
         let mut ends = vec![0];
         let mut acc = 0.0;
         for f in &free { acc += f; ends.push((acc / total * n as f64).round() as usize); }
@@ -330,9 +332,11 @@ impl<'a> GpuModel<'a> {
             ensure!(!r.is_empty(), "device {i} gets no layers (free VRAM {:.0} MB)", free[i] / 1048576.0);
             ensure!(ple.iter().all(|il| r.contains(il)) || !ple.iter().any(|il| r.contains(il)), "the PLE layers would be split across devices");
             eprintln!("device {i} ({}): layers {}..{}", gpu.name(), r.start, r.end);
-            // ponytail: no MTP draft head on a split model (it reads the last part's hidden rows from the first).
-            parts.push(Self::load_part(m, gpu, ctx, chunk, vram_margin[i], 0, r, ns)?);
+            parts.push(Self::load_part(m, gpu, ctx, chunk, vram_margin[i], k, r, ns)?);
         }
+        // One draft length for every part: each caps it by its own backend's verify rows.
+        let k = parts.iter().map(|p| p.k).min().unwrap();
+        for p in &mut parts { p.k = k; }
         let mut it = parts.into_iter().rev();
         let mut acc = it.next().unwrap();
         for mut p in it { p.next = Some(Box::new(acc)); acc = p; }
@@ -366,7 +370,8 @@ impl<'a> GpuModel<'a> {
         let ring = gpu.zeros::<f32>(if qsa_on { c.n_layer * QSA_RING } else { 1 })?;
 
         let k = k.min(gpu.verify_rows() - 1);
-        let mtp = k > 0 && c.n_nextn > 0;
+        // The draft head goes with the last layers (a split model's last part): it reads their hidden rows.
+        let mtp = k > 0 && c.n_nextn > 0 && range.end == c.n_layer;
         let nsnap = k.min(SNAP_MAX);
         let load_layer = |il: usize, kind: LayerKind| -> anyhow::Result<Layer> {
             let mixer = if kind == LayerKind::Delta {
@@ -638,7 +643,7 @@ impl<'a> GpuModel<'a> {
         self.rows.clear();
         self.parked.clear();
         // The draft head has not seen the image rows; image prompts decode without MTP.
-        self.mtp = None;
+        self.tail_mut().mtp = None;
         let mut rows = p.images.iter().zip(embs).flat_map(|(span, e)| (span.start..).zip(e)).peekable();
         let mut logits = Vec::new();
         // ponytail: one token per forward (decode speed); a batched prefill needs M-RoPE in the prefill kernels.
@@ -771,6 +776,12 @@ impl<'a> GpuModel<'a> {
 
     /// The part that computes the logits.
     fn tail(&self) -> &GpuModel<'a> { self.parts().last().unwrap() }
+    /// `tail`, which also holds the MTP draft head.
+    fn tail_mut(&mut self) -> &mut GpuModel<'a> {
+        let mut p = self;
+        while p.next.is_some() { p = p.next.as_deref_mut().unwrap(); }
+        p
+    }
 
     /// Run the forward of `nt` tokens (input in `x`, per-token values in `step_buf`) through this part and the
     /// parts after it. The last part's forward is left running, as `run` leaves it.
@@ -1282,7 +1293,7 @@ impl<'a> GpuModel<'a> {
 
     /// Whether the draft head holds an entry for each token after the first (it is one entry behind the main model):
     /// prefill then extends it with the prompt, so its drafts see the whole context.
-    fn mtp_synced(&self) -> bool { self.mtp.as_ref().is_some_and(|h| h.pend.is_empty() && h.pos + 1 == self.pos.max(1)) }
+    fn mtp_synced(&self) -> bool { let t = self.tail(); t.mtp.as_ref().is_some_and(|h| h.pend.is_empty() && h.pos + 1 == t.pos.max(1)) }
 
     /// Run the forward of `nt` tokens as a recorded graph (graph key `nt` and the attention regime), recorded on first use.
     fn run(&self, nt: usize) -> anyhow::Result<()> {
@@ -1392,7 +1403,8 @@ impl<'a> GpuModel<'a> {
     /// position that predicted `token`). Mirrors `Model::mtp_step`; the draft head keeps its own position and KV cache.
     pub fn mtp_draft(&mut self, token: u32, row: usize) -> anyhow::Result<Vec<f32>> {
         self.mtp_run(&[token], self.row_ptr(row), true)?;
-        Ok(self.gpu.get::<f32>(&self.logits, 0, self.m.cfg.n_vocab)?)
+        let t = self.tail();
+        Ok(t.gpu.get::<f32>(&t.logits, 0, self.m.cfg.n_vocab)?)
     }
 
     /// Speculative decode with MTP. `t` is the next token (picked from the last logits), predicted by hidden row `row`.
@@ -1405,9 +1417,9 @@ impl<'a> GpuModel<'a> {
     pub fn spec_step(&mut self, t: u32, row: usize, smp: &mut Sampler) -> anyhow::Result<(Vec<u32>, u32, usize)> {
         let k = self.k;
         if self.pos + k + 1 > self.ctx { return Ok((vec![t], smp.pick(&self.step(t)?)? as u32, 0)); }
-        let partial_moe = self.cache.as_ref().is_some_and(|c| !c.fully_resident())
+        let partial_moe = self.parts().any(|p| p.cache.as_ref().is_some_and(|c| !c.fully_resident()))
             && std::env::var_os("STRATA_MTP_ADAPT").is_none_or(|v| v != "0");
-        let h = self.mtp.as_mut().unwrap();
+        let h = self.tail_mut().mtp.as_mut().unwrap();
         let mut first = std::mem::take(&mut h.pend);
         if first.len() != row { first.clear(); }
         first.push(t);
@@ -1419,7 +1431,7 @@ impl<'a> GpuModel<'a> {
             h.adapt_skip -= 1;
             let hid = self.row_ptr(row + 1 - nf);
             self.mtp_run(&first, hid, false)?;
-            self.mtp.as_mut().unwrap().pos = hp + 1;
+            self.tail_mut().mtp.as_mut().unwrap().pos = hp + 1;
             let next = if smp.temp <= 0.0 {
                 self.step_greedy(t)?
             } else {
@@ -1433,7 +1445,7 @@ impl<'a> GpuModel<'a> {
         let mut hid = self.row_ptr(row + 1 - nf);
         for i in 0..k_eff {
             let d = if i == 0 { self.mtp_run(&first, hid, true)? } else { self.mtp_run(&toks[i..=i], hid, true)? };
-            hid = self.mtp.as_ref().unwrap().x.addr() + 4 * ((if i == 0 { nf } else { 1 } - 1) * self.row_width()) as u64;
+            hid = self.tail().mtp.as_ref().unwrap().x.addr() + 4 * ((if i == 0 { nf } else { 1 } - 1) * self.row_width()) as u64;
             toks.push(d);
         }
         let start = self.pos;
@@ -1451,7 +1463,7 @@ impl<'a> GpuModel<'a> {
         self.drafts.1 += n;
         if n < k_eff { self.rollback(start, n + 1)?; }
         // Draft head entries past t were made from draft hidden states: the next call redoes them from main rows.
-        let h = self.mtp.as_mut().unwrap();
+        let h = self.tail_mut().mtp.as_mut().unwrap();
         h.pos = hp + 1;
         h.pend = toks[1..=n].to_vec();
         h.adapt_window = ((h.adapt_window << 1) | u16::from(n > 0)) & 0x0FFF;
@@ -1482,7 +1494,7 @@ impl<'a> GpuModel<'a> {
             return Ok((toks, next, rw));
         }
         // Advance the draft head over [pend.., t] using previous main hidden states before `verify` overwrites them.
-        let h = self.mtp.as_mut().unwrap();
+        let h = self.tail_mut().mtp.as_mut().unwrap();
         let mut first = std::mem::take(&mut h.pend);
         if first.len() != row { first.clear(); }
         first.push(t);
@@ -1509,7 +1521,7 @@ impl<'a> GpuModel<'a> {
         self.drafts.0 += m;
         self.drafts.1 += n;
         if n < m { self.rollback(start, n + 1)?; }
-        let h = self.mtp.as_mut().unwrap();
+        let h = self.tail_mut().mtp.as_mut().unwrap();
         h.pos = hp + 1;
         h.pend = toks[1..=n].to_vec();
         if n > 0 {
@@ -1570,7 +1582,8 @@ impl<'a> GpuModel<'a> {
 
     /// Address of hidden row `row` of the last `step` or `verify`.
     fn row_ptr(&self, row: usize) -> u64 {
-        let base = self.mtp.as_ref().and_then(|h| h.eagle.as_ref()).map_or_else(|| self.x.addr(), |e| e.cur_g.addr());
+        let t = self.tail();
+        let base = t.mtp.as_ref().and_then(|h| h.eagle.as_ref()).map_or_else(|| t.x.addr(), |e| e.cur_g.addr());
         base + 4 * (row * self.row_width()) as u64
     }
 
@@ -1580,6 +1593,7 @@ impl<'a> GpuModel<'a> {
     /// Draft head on `tokens` with hidden states at `hid` (rows of n_embd), as one batch at the next draft positions;
     /// returns the argmax of the last token's logits (left in `logits` row 0), or 0 when `head` = false skips the head.
     fn mtp_run(&mut self, tokens: &[u32], hid: u64, head: bool) -> anyhow::Result<u32> {
+        if self.next.is_some() { return self.tail_mut().mtp_run(tokens, hid, head); }
         let nt = tokens.len();
         let c = &self.m.cfg;
         let Some(h) = self.mtp.as_mut() else { bail!("MTP head not loaded") };
