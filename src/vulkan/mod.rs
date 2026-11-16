@@ -1267,9 +1267,9 @@ impl Backend for Vk {
     fn l2_norm(&self, x: u64, n: usize, per: usize, stride: usize, rows: usize, eps: f32) -> anyhow::Result<()> {
         self.run("l2_norm", &[], [rows, 1, 1], &[&x, &(n as u32), &(per as u32), &(stride as u32), &eps])
     }
-    fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
+    fn rope_pairs(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32, lo: usize, hi: usize) -> anyhow::Result<()> {
         let ts = (base as f64).powf(-2.0 / n_rot as f64);
-        self.run("rope_neox", &[], [heads / per, 1, 1], &[&x, &step, &ts, &(stride as u32), &(per as u32), &(n_rot as u32)])
+        self.run("rope_neox", &[], [heads / per, 1, 1], &[&x, &step, &ts, &(stride as u32), &(per as u32), &(n_rot as u32), &(lo as u32), &(hi as u32)])
     }
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()> { self.run("add", &[], [n.div_ceil(256), 1, 1], &[&x, &y, &(n as u32)]) }
     fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()> { self.run("swiglu", &[], [n.div_ceil(256), 1, 1], &[&g, &u, &(n as u32)]) }

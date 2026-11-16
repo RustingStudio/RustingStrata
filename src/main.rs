@@ -204,8 +204,7 @@ impl Runner<'_> {
         };
         Ok((ids, logits, reused))
     }
-    /// Feed a prompt that contains image embeddings as a fresh sequence. Only the CPU runner carries the model
-    /// state needed to inject embeddings; GPU image prefill is a later milestone.
+    /// Feed a prompt that contains image embeddings as a fresh sequence.
     fn chat_image(&mut self, p: &vision::Prompt, embs: &[Vec<Vec<f32>>]) -> anyhow::Result<Vec<f32>> {
         match self {
             Runner::Cpu(m, st) => { *st = State::new(&m.cfg); vision::feed_prompt(m, st, p, embs) }
@@ -499,7 +498,9 @@ fn load_images(mmproj: &Path, images: &[String]) -> anyhow::Result<ImageInput> {
     let mut embeddings = Vec::with_capacity(images.len());
     for src in images {
         let img = vision::load_image(src)?;
+        let t0 = Instant::now();
         let (feats, nx, ny) = vision::encode_image(&projector, &img)?;
+        eprintln!("image: {nx}x{ny} tokens encoded in {:.1} s", t0.elapsed().as_secs_f64());
         grids.push((nx, ny));
         embeddings.push(feats);
     }
