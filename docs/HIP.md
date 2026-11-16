@@ -6,12 +6,16 @@ build step: the kernels are compiled at run time by hiprtc and launched through 
 
 **Status: experimental.** Brought up on an RX 9070 XT (gfx1201, ROCm 7.2.3). With `--fixed-experts --mtp 0`
 (deterministic placement, no speculative verify) the greedy output is **bit-identical to the Vulkan backend** on the
-four local models tried (Qwen3.6-35B-A3B, Ornith-1.5-35B-A3B, Qwen3.5-9B dense, Qwen3.8-27B dense): five long prose
-prompts (64-79 tokens, i.e. through the batched prefill and its attention) and two short ones on the 35B, two long ones
-on the 9B. With the calibrated MTP drafts on (3 on this machine, 1 on Vulkan) the two backends verify different batch
-shapes, so a near-tie can pick another token — 1 of those 7 probes does — and `--mtp 0` on both sides makes it agree.
-HIP's prefill attention is pinned to a CPU f32 reference to 2e-4 by `hip::tests::attn_prefill_matches_cpu`. Not yet
-ported: the host-side pipeline details of the CUDA backend (pinned ring staging for `htod`, side stream for `beside`).
+four local models tried (Qwen3.6-35B-A3B, Ornith-1.5-35B-A3B, Qwen3.5-9B dense, Qwen3.8-27B dense) for the decode
+path, and on the batched prefill path 4 of 5 long prose prompts (64-79 tokens) agree token for token on the 35B
+(head_dim 128), 2 of 2 on the dense 9B and 1 of 2 on the dense 27B: the fifth 35B prompt flips at a near-tie after
+ten tokens, because the matrix cores sum a 16-deep dot product in a different order than Vulkan does (all 5 agree
+with the P·V product left on the CUDA cores), and the 27B flips on its first token with either attention path — at
+head_dim 256 it takes 16-key tiles where Vulkan goes deeper, so its softmax and P·V sum over more steps. With the
+calibrated MTP drafts on (3 on this machine, 1 on Vulkan) the two backends verify different batch shapes, so 1 of
+those 7 probes flips too. HIP's prefill attention is pinned to a CPU f32 reference to 2e-4 by
+`hip::tests::attn_prefill_matches_cpu`. Not yet ported: the host-side pipeline details of the CUDA backend (pinned
+ring staging for `htod`, side stream for `beside`).
 
 ## What runs
 
@@ -19,48 +23,51 @@ Everything the Vulkan backend runs, through the same kernels:
 
 | | HIP | Vulkan (same machine, same model) |
 |---|---|---|
-| Prefill, pp 1024, calibrated | 1577-2072 tok/s | 1344 tok/s |
-| Prefill, pp 4096 | 2106 tok/s | (not run) |
-| Decode, tg 48, calibrated | 188-222 tok/s | 195 tok/s |
-| Qwen3.8-27B dense, prefill / decode | 705 / 50.3 tok/s | 497 / 55.5 tok/s |
+| Prefill, pp 1024 / 4096, calibrated | 1104 / 2993 tok/s | 1097 / 2325 tok/s |
+| Decode, tg 48, calibrated | 209 / 219 tok/s | 199 / 163 tok/s |
+| Qwen3.8-27B dense, pp 1024, prefill / decode | 784 / 39.1 tok/s | 508 / 35.3 tok/s |
 
 Qwen3.6-35B-A3B UD-Q4_K_XL (first rows) and Qwen3.8-27B UD-IQ3_S, `--ctx 4096 --vram-margin 256`, one process each,
-`calibrate` run for each backend (chunk 4096; HIP picks `--mtp 3`, Vulkan `--mtp 1`). Prefill runs on the card's matrix
-cores (below) and is ahead of Vulkan; decode is within a few percent in either direction — the spread over repeated runs
-is larger than the difference, because each backend finds its own expert placement and that moves the MTP draft
-acceptance. A dense model's prefill is 1.4x ahead and its decode 10% behind (memory-bandwidth bound).
+`calibrate` run for each backend (chunk 4096; HIP picks `--mtp 3`, Vulkan `--mtp 1`). Each cell is pp / the decode that
+follows it, so the second value is throughput at that depth. The pp 1024 row runs first in the process, before expert
+placement has settled, so it understates both backends (1577-2072 tok/s was measured for HIP there when it was not the
+first row); pp 4096 is the honest short-prompt number and is 1.29x Vulkan's. Decode is within a few percent in either
+direction — the spread over repeated runs is larger than the difference, because each backend finds its own expert
+placement and that moves the MTP draft acceptance. A dense model's prefill is 1.5x ahead and its decode 11% ahead.
 
 `serve` works too, checked on Qwen3.5-9B: `GET /v1/models`, non-streaming and streaming (`stream: true`) chat
 completions, and the prompt cache across turns (`prompt_tokens_details.cached_tokens` on a follow-up request).
 
 ## Long prompts
 
-Prefill degrades with prompt depth on both backends (attention is the only depth-dependent term). The Q·Kᵀ score
-product of the prefill attention runs on the card's matrix cores (below); the P·V product still runs on the CUDA cores,
-which is where the remaining depth cost sits.
+Prefill degrades with prompt depth on both backends (attention is the only depth-dependent term), and the prefill
+attention now runs both of its products on the card's matrix cores (below). Its per-position cost is now below
+Vulkan's, which is where the depth-dependent deficit used to be.
 
 Qwen3.6-35B-A3B UD-Q4_K_XL, `--mtp 0 --reps 1 --vram-margin 256`, KV `f16`, `--fixed-experts` (two runs where a
 range is given, one process each):
 
-| pp | HIP | Vulkan | HIP, CUDA-core scores (`STRATA_HIP_WMMA=0`) |
+| pp | HIP | Vulkan | HIP, everything on the CUDA cores (`STRATA_HIP_WMMA=0`) |
 |---|---|---|---|
-| 8192 | 2556-2558 tok/s | 2148-2152 tok/s | 1303-1308 tok/s |
-| 32768 | 1502-1677 tok/s | 1661 tok/s | 776-794 tok/s |
-| 131072 | 660 tok/s | 731 tok/s | (not run) |
-| decode at 8k / 32k / 128k | 73-75 / 64-67 / 48 tok/s | 71-72 / 68 / 44 tok/s | 74 / 64-65 / - |
+| 8192 | 2647-2666 tok/s | 2148-2152 tok/s | 1303-1308 tok/s |
+| 32768 | 2026-2029 tok/s | 1661 tok/s | 776-794 tok/s |
+| 131072 | 872 tok/s | 731 tok/s | (not run) |
+| decode at 8k / 32k / 128k | 68-73 / 64 / 48 tok/s | 71-72 / 68 / 44 tok/s | 74 / 64-65 / - |
 
-Fitting the per-token cost against depth gives a slope of 8-11 ns per position over 8k -> 32k (9.2 over 8k -> 128k)
-for HIP and 5.6 over 8k -> 32k (7.3 over 8k -> 128k) for Vulkan, against 20-21 ns per position for HIP with the
-CUDA-core scores — the matrix-core score product is worth **2x on prefill at depth** (pp 32k 794 -> 1677 tok/s,
-pp 8k 1308 -> 2558 tok/s, same placement in the same build). At 128k HIP now does 660 tok/s against Vulkan's 731
-(prefill was 173 against 762) and is ahead on decode (48.3 against 44.2); at 32k the two are level, and at 8k HIP is
-ahead. The earlier numbers in this file (pp 32k 720 tok/s, pp 128k 173, gen 80.8, slope 33 ns) were taken with the
-CUDA-core scores and are the ones to compare against. `--chunk 0`-style token-by-token prefill is still not the
-answer, but a shorter `--ctx` and `--kv q8` both buy expert slots back.
+Fitting the per-token cost against depth gives a slope of 4.7 ns per position over 8k -> 32k (6.3 over 8k -> 128k)
+for HIP against 5.6 (7.3) for Vulkan and 20-21 for HIP with the attention on the CUDA cores: **3.4x on prefill at
+depth** (pp 32k 794 -> 2029 tok/s, pp 8k 1308 -> 2647, same placement in the same build), the score product worth 2x
+of it (pp 32k 794 -> 1677) and the P·V product the rest (1677 -> 2029). HIP is now ahead of Vulkan at every depth
+tried — 1.23x at 8k, 1.22x at 32k, 1.19x at 128k — and at parity or ahead on decode; the earlier numbers in this file
+(pp 32k 720 tok/s, pp 128k 173, gen 80.8, slope 33 ns) were taken on the CUDA cores and are the ones to compare
+against. `--chunk 0`-style token-by-token prefill is still not the answer, but a shorter `--ctx` and `--kv q8` both
+buy expert slots back.
 
 Two caveats on the numbers: `--fixed-experts` only means "same residents, no re-placement during the run", so the
-spread between two runs of the same build (1502 vs 1677 at 32k) is expert placement and host page-cache state, not the
-kernel; and a prompt's depth cost is the fit over the two depths, not either point. A 128k prompt costs more VRAM in
+spread between two runs of the same build was up to 10% before the P·V port (1502 vs 1677 at 32k) — expert placement
+and host page-cache state, not the kernel — and has been under 1% since (2029 vs 2026), which is itself a sign of how
+much of the prefill used to wait on the CPU-side copies; and a prompt's depth cost is the fit over the two depths,
+not either point. A 128k prompt costs more VRAM in
 the KV cache than a 16 GB card has left over for experts, so the run above streams most of them from host memory.
 
 ## How it works
@@ -80,20 +87,24 @@ the KV cache than a 16 GB card has left over for experts, so the run above strea
   splits the k dimension across the two half-waves) and holds 8 results, column `lane & 15`, rows `8*(lane>>4) + i`.
   `STRATA_HIP_WMMA=0` falls back to the CUDA-core multiplications: 737 -> 1684 tok/s prefill at pp 1024 on the RX 9070
   XT, and 5 of 6 prompts bit-identical between the two.
-- **Matrix-core prefill attention** (`attn_prefill_t`): the same WMMA computes the Q·Kᵀ score tile, one 16-query x
-  16-key instruction against the 16-half `qs`/`ks` rows. Its 8 results a lane land in AMD's layout (rows
-  `8*(lane>>4) + i`, column `lane & 15`) rather than the m16n8k16 layout the softmax, the causal mask and the P·V
-  step are written for, so the tile is staged through a warp-private f32 tile (`FA_BQ` x (`FA_BKL` + 8) floats, 4-6
-  KiB on top of `qs`/`ks`/`vs`) and read back as `s[ng][2h + e] == S[warp*16 + g + 8h][ng*8 + 2t + e]`. That tile is
-  why head_dim 256 prefill takes 16 keys a step (`FA_BK_FOR`, as on Turing's 64 KB blocks): 32 keys would need 78 KiB
-  of a block's 64. The CUDA-core scores (`STRATA_HIP_WMMA=0`) and the matrix-core ones give the same greedy output on
-  the model, and the CPU-reference test covers both.
-- The transposed V fragment (`ldsm4t`, the P·V operand) is the one CUDA-core multiplicand left in the attention: on HIP
-  it reads the two halves of a register as *adjacent* keys, which is what the `ldmatrix.trans` fragments mean. An
-  emulation that read them two rows apart (every even key counted twice, every odd one never) shipped with the first
-  HIP commit: it moved no token on the short prompts the parity checks used, and on the batched prefill it made every
-  long prompt disagree with Vulkan. `hip::tests::attn_prefill_matches_cpu` pins it now, and five long prompts agree
-  token for token with Vulkan afterwards.
+- **Matrix-core prefill attention** (`attn_prefill_t`): the same WMMA computes both products. Q·Kᵀ is one 16-query
+  x 16-key instruction against the 16-half `qs`/`ks` rows; P·V takes A = P from a half staging tile (the `ps` tile the
+  Volta path already had, unused on HIP until now, written from the softmax registers as half pairs) and B = Vᵀ read
+  down a column of the `vs` tile (`strata_ld_wmma_t`, one half a key apart, since that operand's rows are head
+  dimensions).
+  Both results land in AMD's layout — 8 a lane, rows `8*(lane>>4) + i`, column `lane & 15` — rather than the m16n8k16
+  layout the softmax, the causal mask and the epilogue are written for, so each 16x16 result tile is staged in f32
+  and read back as `s[ng][2h + e] == S[warp*16 + g + 8h][ng*8 + 2t + e]` (scores) or `o[d][2r + e]` (P·V). One warp
+  staging tile serves both stages (`FA_BQ` x (`FA_BKL` + 8) floats, 4-6 KiB added to the block's dynamic shared
+  memory), and it is why head_dim 256 prefill takes 16 keys a step (`FA_BK_FOR`, as on Turing's 64 KB blocks): 32
+  keys would need 78 KiB of a block's 64. `STRATA_HIP_WMMA=0` runs the same numerics on the CUDA cores; the
+  CPU-reference test covers both.
+- The CUDA-core P·V path (`ldsm4t` + `mma16816`) is still there for `STRATA_HIP_WMMA=0` and for CUDA, and it is
+  worth knowing how it is shaped: on HIP it reads the two halves of a transposed register as *adjacent* keys, which is
+  what the `ldmatrix.trans` fragments mean. An emulation that read them two rows apart (every even key counted twice,
+  every odd one never) shipped with the first HIP commit: it moved no token on the short prompts the parity checks
+  used, and on the batched prefill it made every long prompt disagree with Vulkan. `hip::tests::
+  attn_prefill_matches_cpu` pins it now.
 - `src/cuda/kernels.cu` keeps one source for both backends: the few places that cannot be shared are behind
   `#if STRATA_HIP` (f16 conversions, the per-lane fragment loads, `mma884`, the KV f16x2 math, the L2 prefetch hint),
   so the CUDA build's preprocessed source is unchanged.
@@ -118,8 +129,8 @@ the KV cache than a 16 GB card has left over for experts, so the run above strea
 - `STRATA_HIP_TRACE=1` names every launch before it goes out (grid, block, shared memory).
 - `STRATA_HIP_GRAPH=0` runs the forward every time instead of capturing it (capture is on by default, +5% decode).
 - `STRATA_NO_GRAPH=1` turns capture off for both GPU backends.
-- `STRATA_HIP_WMMA=0` uses the CUDA-core multiplications in the prefill GEMM and the prefill attention instead of the
-  matrix cores.
+- `STRATA_HIP_WMMA=0` uses the CUDA-core multiplications in the prefill GEMM and in both products of the prefill
+  attention instead of the matrix cores.
 
 ## Why the prefill GEMM does not use int8 matrix cores
 
@@ -139,10 +150,11 @@ memory and runs on the f16 matrix cores, which is what puts it ahead of the Vulk
 
 ## Next
 
-1. The P·V product of the prefill attention on the matrix cores (the score product is ported, see above): `A = P` from
-   the staging tile, `B = Vᵀ`, which needs transposed V fragments and an accumulator layout that does not match the
-   softmax's per-row `m`/`l` bookkeeping — stage it like the scores. Worth about the other half of the depth slope.
-2. A side stream for `beside`, so expert uploads overlap with compute in prefill.
+1. A side stream for `beside`, so expert uploads overlap with compute in prefill (the 8k prefill still moves a lot of
+   expert data per chunk, and the run-to-run spread collapsing from 10% to 1% with the faster attention says the
+   copies now wait on the CPU less than they used to).
+2. The decode path: no matrix cores on either backend there (it is memory-bound), but the prefill attention's `FA_BKL`
+   of 16 at head_dim 256 is a shared-memory compromise — a 32-key tile would need 78 KiB. Not worth chasing.
 
 ## Credits
 

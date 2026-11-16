@@ -124,6 +124,16 @@ __device__ __forceinline__ strata_hk strata_ld_wmma(const unsigned short* p) {
     for (int i = 0; i < STRATA_WMMA_K / 8; i++) c.u[i] = *(const uint4*)(p + 8 * i);
     return c.h;
 }
+
+/// The same STRATA_WMMA_K halves one tile row apart from each other: the B operand when the operand's rows are the
+/// transposed side (the prefill attention's V, whose rows are head dimensions and whose k are keys). One load a have
+/// instead of a 16-byte vector load.
+__device__ __forceinline__ strata_hk strata_ld_wmma_t(const unsigned short* p, int stride) {
+    strata_hk r;
+#pragma unroll
+    for (int i = 0; i < STRATA_WMMA_K; i++) r[i] = *(const _Float16*)(p + i * stride);
+    return r;
+}
 #endif
 
 }  // namespace strata_hip

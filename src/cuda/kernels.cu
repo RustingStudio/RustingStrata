@@ -2759,7 +2759,47 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
         cp_async_wait<1>();  // sm_80+: this V tile, the next K tile may still be in flight; sm_70: already copied here
         __syncthreads();
 #endif
-#if __CUDA_ARCH__ < 800 && GEMM_TC
+#if GEMM_WMMA
+        // P * V on the matrix cores, the way the scores are: A = P (this warp's 16 query rows x the tile's keys, in
+        // halves), B = V^T (16 head dimensions x the same keys, one half a tile row apart). The lane's 8 results land
+        // in AMD's layout again (query rows 8*(lane>>4) + i, dim column lane & 15), so each 16 x 16 result tile is
+        // staged in f32 and read back as the two m16n8k16 dim tiles the rescale above, the epilogue below and the
+        // score stage all use (`st` is free again by now: it held the scores of this tile).
+        if (!skip) {
+            const int l16 = lane & 15, w0 = STRATA_WMMA_K0(lane), PW = FA_BKL + 8;
+#pragma unroll
+            for (int ng = 0; ng < FA_BKL / 8; ng++) {
+                // P in halves, one 32-bit store a half pair (keys 2t / 2t+1 are adjacent in this lane's registers)
+                *(u32*)(ps + (warp * 16 + g) * PW + ng * 8 + 2 * t4) = h2pack(s[ng][0], s[ng][1]);
+                *(u32*)(ps + (warp * 16 + g + 8) * PW + ng * 8 + 2 * t4) = h2pack(s[ng][2], s[ng][3]);
+            }
+            __syncwarp();
+            float* sw = st + warp * 256;
+#pragma unroll
+            for (int dt = 0; dt < HD / 16; dt++) {
+                strata_hip::strata_f8 acc;
+#pragma unroll
+                for (int i = 0; i < 8; i++) acc[i] = 0.0f;
+#pragma unroll
+                for (int kg = 0; kg < FA_BKL / 16; kg++) {
+                    const u16* pa = ps + (warp * 16 + l16) * PW + kg * 16 + w0;
+                    const u16* pb = vs + (kg * 16 + w0) * PQ + dt * 16 + l16;
+                    acc = strata_hip::strata_wmma(strata_hip::strata_ld_wmma(pa), strata_hip::strata_ld_wmma_t(pb, PQ), acc);
+                }
+#pragma unroll
+                for (int i = 0; i < 8; i++) sw[(8 * (lane >> 4) + i) * 16 + l16] = acc[i];
+                __syncwarp();
+#pragma unroll
+                for (int r = 0; r < 2; r++)
+#pragma unroll
+                    for (int e = 0; e < 2; e++) {
+                        o[2 * dt][2 * r + e] += sw[(g + 8 * r) * 16 + 2 * t4 + e];
+                        o[2 * dt + 1][2 * r + e] += sw[(g + 8 * r) * 16 + 8 + 2 * t4 + e];
+                    }
+                __syncwarp();
+            }
+        }
+#elif __CUDA_ARCH__ < 800 && GEMM_TC
         // P -> the warp-private staging tile: the m8n8k4 A fragment of the PV product wants row t + 4*hi and four
         // contiguous keys per lane, which the QK^T D layout does not give for free. One 32-bit store per half pair;
         // the __syncwarp() publishes the tile to the mma step below (the next tile's stores follow the loop's

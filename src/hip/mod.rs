@@ -977,17 +977,18 @@ mod tests {
     }
 
     /// `attn_prefill_t` end to end (score product, causal softmax, P·V, the epilogue) against a CPU reference, at
-    /// head_dim 128 (32-key tiles) and 256 (the HIP build's 16-key tiles) with a partial last query tile. This is the
-    /// check the matrix-core score path needs on its own: a wrong lane/lane-staging mapping shows up as a large
-    /// per-element difference on a specific query or head, not as the near-tie token flips a parity run sees.
+    /// head_dim 128 with three query tiles and five key tiles and at head_dim 256 (the HIP build's 16-key tiles).
+    /// A wrong lane/lane-staging mapping, a lost half of a fragment or a missing key shows up as a large per-element
+    /// difference on a specific query or head — which is how the transposed-V bug below was found — rather than as
+    /// the near-tie token flip a parity run sees.
     #[test]
     fn attn_prefill_matches_cpu() {
         use half::f16;
         let Ok(gpu) = Gpu::new(0) else { eprintln!("skipping: no HIP device"); return };
         let g: &dyn Backend = &gpu;
-        let (t, nh, nkv) = (40usize, 4usize, 2usize);
-        let scale = 0.088388347;
-        for hd in [128usize, 256] {
+        let (nh, nkv) = (4usize, 2usize);
+        for (hd, t) in [(128usize, 130usize), (256, 70)] {
+            let scale = 1.0 / (hd as f32).sqrt();
             let mut st = 99u32;
             let mut rnd = || { st = st.wrapping_mul(1664525).wrapping_add(1013904223); (st >> 9) as f32 / 8388608.0 - 0.5 };
             let q: Vec<f32> = (0..t * nh * hd).map(|_| rnd()).collect();
@@ -1039,7 +1040,7 @@ mod tests {
                 let d = (got[i] - want[i]).abs();
                 if d > worst { worst = d; at = i; gv_ = got[i]; }
             }
-            eprintln!("hd {hd}: max |diff| = {worst:e} at {at} (row {}, head {}, d {}): got {gv_} want {}",
+            eprintln!("hd {hd} T {t}: max |diff| = {worst:e} at {at} (row {}, head {}, d {}): got {gv_} want {}",
                       at / (nh * hd), (at / hd) % nh, at % hd, want[at]);
             assert!(worst < 5e-3, "hd {hd}: max |diff| = {worst} at {at}");
         }
