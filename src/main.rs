@@ -893,6 +893,13 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run(cmd: Cmd) -> anyhow::Result<()> {
+    // The CPU kernels are chosen at compile time. A build without AVX2 (RUSTFLAGS in the environment replaces
+    // .cargo/config.toml's target-cpu=native) runs MoE experts that miss the VRAM cache about 10x slower (#44).
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        eprintln!("warning: this binary was built without AVX2 but this CPU has it: CPU work is about 10x slower. Rebuild with \
+                   RUSTFLAGS=\"-C target-cpu=native\" (or x86-64-v3), or use a release binary.");
+    }
     match cmd {
         Cmd::Info { model } => {
             let g = Gguf::open(&model)?;
