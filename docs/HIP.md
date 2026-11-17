@@ -148,13 +148,34 @@ the time of f16, with a vector-friendly rescale 6.6x *slower*, with the layout t
 integer path cannot pay for itself here, so `GEMM_TC` stays 0 on HIP and the prefill GEMM dequantizes to f16 in shared
 memory and runs on the f16 matrix cores, which is what puts it ahead of the Vulkan backend.
 
+## What is left, measured
+
+Profiled on the same 35B prefill (`rocprofv3 --kernel-trace`, pp 4096): 54% of the kernel time is the quantized
+prefill GEMM (already on the matrix cores), 12% the gated delta-rule scan `deltanet_seq`, 10% the prefill attention
+(ported), and nothing else above 3%. Of a decode step's wall time, ~90% is not GPU at all — `moe_combine` spends most
+of its time waiting on the CPU expert worker, which is an expert-tier question, not a kernel one.
+
+`deltanet_seq` is the one kernel left worth a look, and it has now been measured properly rather than guessed at
+(`tools/hip/deltanet.cpp`, which times the scan alone at the 35B's shape):
+
+- its per-token latency (~1750 cycles) is **not** memory: a variant that re-reads token 0's q/k/v every step, so the
+  reads stay in L1, runs just as fast (1.00x), even though the scan as written re-reads them from 128 blocks.
+- no rearrangement of the scan wins: 32 floats a lane instead of 16 (half the blocks, one wave on 60 CUs) is 0.81x,
+  hoisting the loop's `tok * stride` address math into pointer increments is 0.93x, splitting the dot-product
+  accumulators is 0.96x, combinations worse.
+- the parts with headroom are the two dependent warp-reduction rounds (1.33x if both are removed, wrong results) and
+  the per-token `expf(g)` for the decay (1.12x). Both are properties of the *sequential* recurrence: they only go
+  away with the chunked WY/UT-transform form (a small triangular inverse plus a few matmuls over a chunk), which
+  wants f32 for the state and therefore does not get tensor cores.
+
+Since the whole kernel is 12% of prefill, that rewrite's ceiling is ~4% of prefill. Left alone deliberately.
+
 ## Next
 
-1. A side stream for `beside`, so expert uploads overlap with compute in prefill (the 8k prefill still moves a lot of
-   expert data per chunk, and the run-to-run spread collapsing from 10% to 1% with the faster attention says the
-   copies now wait on the CPU less than they used to).
-2. The decode path: no matrix cores on either backend there (it is memory-bound), but the prefill attention's `FA_BKL`
-   of 16 at head_dim 256 is a shared-memory compromise — a 32-key tile would need 78 KiB. Not worth chasing.
+1. A side stream for `beside`, so expert uploads overlap with compute in prefill (the run-to-run spread collapsing
+   from 10% to 1% with the faster attention says the copies now wait on the CPU less than they used to).
+2. Decode on an MoE model: the expert residency policy, not a kernel. That is where the multi-x is (see the reference
+   numbers from Strata in the handoff).
 
 ## Credits
 
