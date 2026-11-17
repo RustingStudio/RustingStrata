@@ -590,3 +590,16 @@ fn keyless_mcp_routes_refuse_a_proxy() {
     let _ = std::fs::remove_dir_all(&dir);
     r.unwrap();
 }
+
+/// A chunked body (#48): sizes in hex with an extension, a trailer, and the 8 MiB cap.
+#[test]
+fn reads_a_chunked_body() {
+    let raw = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n5;a=b\r\n{\"a\":\r\nA\r\n[1,2,3,4]}\r\n0\r\nX-T: 1\r\n\r\n";
+    let r = read_request(&mut raw.as_bytes()).unwrap();
+    assert_eq!(r.body, br#"{"a":[1,2,3,4]}"#);
+    let bad = |body: &str| read_request(&mut format!("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{body}").as_bytes()).is_err();
+    assert!(bad("zz\r\nab\r\n0\r\n\r\n"));
+    assert!(bad("900000\r\n"));
+    assert!(bad("5\r\nab"));
+    assert!(bad("2\r\nabXX\r\n0\r\n\r\n"));
+}
