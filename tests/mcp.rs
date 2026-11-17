@@ -65,3 +65,49 @@ fn a_missing_file_is_an_empty_list() {
     assert_eq!(v["servers"], json!([]));
     assert!(v["path"].as_str().unwrap().ends_with("strata-mcp-no-such-file.json"));
 }
+
+/// The streamable-HTTP transport against a fake server on a local port: a JSON answer, an event-stream answer (with a
+/// server request before the result), the session id sent back on later requests, and 202 for the notification.
+#[test]
+fn http_server_lists_and_calls() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", l.local_addr().unwrap());
+    std::thread::spawn(move || for c in l.incoming() {
+        let mut c = c.unwrap();
+        let mut r = BufReader::new(c.try_clone().unwrap());
+        let (mut len, mut session, mut auth) = (0, false, false);
+        loop {
+            let mut h = String::new();
+            r.read_line(&mut h).unwrap();
+            let h = h.trim().to_ascii_lowercase();
+            if h.is_empty() { break; }
+            if let Some(n) = h.strip_prefix("content-length:") { len = n.trim().parse().unwrap(); }
+            session |= h == "mcp-session-id: s1";
+            auth |= h == "authorization: bearer k";
+        }
+        let mut b = vec![0; len];
+        r.read_exact(&mut b).unwrap();
+        let m: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let (id, method) = (&m["id"], m["method"].as_str().unwrap());
+        let mut answer = |status: &str, head: &str, body: String| write!(c, "HTTP/1.1 {status}\r\n{head}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        let js = "Content-Type: application/json\r\n";
+        match method {
+            _ if !auth => answer("401 Unauthorized", "", String::new()),
+            "initialize" => answer("200 OK", &format!("{js}Mcp-Session-Id: s1\r\n"), json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": "2025-06-18", "capabilities": {}}}).to_string()),
+            _ if !session => answer("400 Bad Request", "", String::new()),
+            "notifications/initialized" => answer("202 Accepted", "", String::new()),
+            "tools/list" => answer("200 OK", js, json!({"jsonrpc": "2.0", "id": id, "result": {"tools": [{"name": "up", "description": "Upper case", "inputSchema": {"type": "object"}}]}}).to_string()),
+            _ => answer("200 OK", "Content-Type: text/event-stream\r\n", format!("event: message\ndata: {}\n\ndata: {}\n\n",
+                json!({"jsonrpc": "2.0", "id": "srv-1", "method": "ping"}),
+                json!({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": m["params"]["arguments"]["text"].as_str().unwrap().to_uppercase()}]}}))),
+        }
+    });
+    let f = std::env::temp_dir().join(format!("strata-mcp-http-{}.json", std::process::id()));
+    std::fs::write(&f, json!({"mcpServers": {"web": {"url": url, "headers": {"Authorization": "Bearer k"}}}}).to_string()).unwrap();
+    let h = Hub::new(f);
+    let v = h.list(false);
+    assert_eq!(v["servers"][0]["error"], json!(null), "{v}");
+    assert_eq!(v["servers"][0]["tools"][0]["name"], "up");
+    assert_eq!(h.call("web", "up", json!({"text": "hi"})).unwrap(), json!({"content": "HI", "is_error": false}));
+}

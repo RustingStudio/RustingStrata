@@ -501,8 +501,8 @@ const headers = () => {
   if ($('key').value) h.Authorization = 'Bearer ' + $('key').value;
   return h;
 };
-async function api(path, body) {
-  const r = await fetch(path, body ? { method: 'POST', headers: headers(), body: JSON.stringify(body) } : { headers: headers() });
+async function api(path, body, signal) {
+  const r = await fetch(path, body ? { method: 'POST', headers: headers(), body: JSON.stringify(body), signal } : { headers: headers() });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error?.message || r.statusText);
   return j;
@@ -975,8 +975,8 @@ async function reply(cont, round = 0) {
           status(`running ${at.server} / ${at.tool}…`);
           try {
             let args = {}; try { args = JSON.parse(c.args || '{}'); } catch {}
-            // ponytail: "stop" does not interrupt a running tool, it ends the loop after it; pass a signal to api() if tools run long.
-            const r = await api('/api/mcp/call', { server: at.server, tool: at.tool, arguments: args });
+            // "stop" ends the wait here; the server still waits for the tool's answer (up to STRATA_MCP_TIMEOUT).
+            const r = await api('/api/mcp/call', { server: at.server, tool: at.tool, arguments: args }, busy.signal);
             content = r.content.length > cap ? r.content.slice(0, cap) + `\n[cut: ${r.content.length - cap} more characters]` : r.content;
             bad = r.is_error;
           } catch (e) { content = 'The tool failed: ' + e.message; }
@@ -1281,6 +1281,12 @@ function selftest() {
       const w = wire([{ role: 'user', content: 'q' }, { role: 'assistant', content: '', think: '', calls: [{ id: 'call_0_0', name: 'a__x', args: '{"k":1}' }] },
         { role: 'tool', id: 'call_0_0', name: 'a__x', content: 'r' }, { role: 'assistant', content: 'done' }]);
       return w[1].tool_calls[0].function.arguments === '{"k":1}' && w[1].tool_calls[0].id === 'call_0_0' && w[2].role === 'tool' && w[2].tool_call_id === 'call_0_0' && w[2].content === 'r' && !w[3].tool_calls;
+    }],
+    ['tool messages export and import', () => {
+      const c = { id: 't1', title: 't', at: 1, msgs: [{ role: 'user', content: 'q' }, { role: 'assistant', content: '', calls: [{ id: 'c1', name: 'a__x', args: '{}' }] }, { role: 'tool', id: 'c1', name: 'a__x', content: 'r' }, { role: 'assistant', content: 'done' }] };
+      const bad = { ...c, msgs: [{ role: 'assistant', content: '', calls: 'x' }] }, md = chatMd(c);
+      return swap([], () => merge(pack([c])) === 1 && chats[0].msgs[2].role === 'tool' && chats[0].msgs[1].calls[0].id === 'c1') && md.includes('**tool a__x:**\n\n~~~\nr\n~~~') && !md.includes('**model:**\n\n\n')
+        && swap([], () => { try { merge(pack([bad])); return false; } catch { return true; } });
     }],
     ['table', () => { const h = md('| a | b |\n|---|---|\n| 1 | 2 |'); return h.includes('<th>a</th>') && h.includes('<td>2</td>'); }],
     ['quote', () => md('> hi').includes('<blockquote><p>hi</p></blockquote>')],
