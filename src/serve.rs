@@ -18,15 +18,15 @@ pub struct Request {
     pub body: Vec<u8>,
 }
 
-/// Reads one request (Content-Length bodies only, no chunked uploads). Headers are capped at 64 KiB and the body at
-/// 8 MiB.
+/// Reads one request, with a `Content-Length` or a chunked body (`Transfer-Encoding: chunked`, which wins when both
+/// are present). Headers are capped at 64 KiB and the body at 8 MiB.
 pub fn read_request(r: &mut impl BufRead) -> anyhow::Result<Request> {
     let mut h = r.take(64 << 10);
     let mut line = String::new();
     h.read_line(&mut line)?;
     let mut it = line.split_whitespace();
     let (method, path) = (it.next().context("empty request")?.to_string(), it.next().context("no path")?.to_string());
-    let (mut len, mut host, mut auth, mut json, mut proxied) = (0, String::new(), String::new(), false, false);
+    let (mut len, mut host, mut auth, mut json, mut proxied, mut chunked) = (0, String::new(), String::new(), false, false, false);
     loop {
         line.clear();
         if h.read_line(&mut line)? == 0 { bail!("headers cut off or too long"); }
@@ -36,6 +36,7 @@ pub fn read_request(r: &mut impl BufRead) -> anyhow::Result<Request> {
         let (k, v) = (k.to_ascii_lowercase(), v.trim());
         match k.as_str() {
             "content-length" => len = v.parse().context("bad Content-Length")?,
+            "transfer-encoding" => chunked = v.to_ascii_lowercase().contains("chunked"),
             "host" => host = v.to_string(),
             "authorization" => auth = v.to_string(),
             // The Anthropic API's key header (Claude Code with ANTHROPIC_API_KEY).
@@ -46,9 +47,34 @@ pub fn read_request(r: &mut impl BufRead) -> anyhow::Result<Request> {
             _ => {}
         }
     }
-    if len > 8 << 20 { bail!("body too large"); }
-    let mut body = vec![0; len];
-    r.read_exact(&mut body)?;
+    const MAX: usize = 8 << 20;
+    let mut body = Vec::new();
+    if chunked {
+        // Each chunk: a hex size (extensions after ';' are ignored), CRLF, the bytes, CRLF. Size 0 ends the body;
+        // trailer lines after it are read and dropped.
+        loop {
+            line.clear();
+            if r.by_ref().take(1 << 10).read_line(&mut line)? == 0 { bail!("chunked body cut off"); }
+            let n = usize::from_str_radix(line.split(';').next().unwrap_or_default().trim(), 16).context("bad chunk size")?;
+            if n == 0 { break; }
+            if n > MAX - body.len() { bail!("body too large"); }
+            let at = body.len();
+            body.resize(at + n, 0);
+            r.read_exact(&mut body[at..])?;
+            line.clear();
+            r.by_ref().take(1 << 10).read_line(&mut line)?;
+            if !line.trim_end().is_empty() { bail!("bad chunk end"); }
+        }
+        let mut t = r.by_ref().take(64 << 10);
+        loop {
+            line.clear();
+            if t.read_line(&mut line)? == 0 || line.trim_end().is_empty() { break; }
+        }
+    } else {
+        if len > MAX { bail!("body too large"); }
+        body.resize(len, 0);
+        r.read_exact(&mut body)?;
+    }
     Ok(Request { method, path, host, auth, json, proxied, body })
 }
 

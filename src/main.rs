@@ -2211,7 +2211,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
     // makes a cross-site POST need a CORS preflight, which is never answered.
     // With a key the check is not needed (a rebinding page has no key) and would refuse a reverse proxy's Host.
     let keys = s.keys.read().unwrap().clone();
-    if !keys.any() && !serve::host_ok(&host, &s.addr, &s.allowed_hosts) { return send(&mut w, "403 Forbidden", json!({"error": {"message": "bad Host header", "type": "forbidden"}})); }
+    if !keys.any() && !serve::host_ok(&host, &s.addr, &s.allowed_hosts) { return send(&mut w, "403 Forbidden", json!({"error": {"message": "bad Host header: name this host with --allowed-hosts, or set --api-key", "type": "forbidden"}})); }
     let Some(who) = keys.who(&auth) else { return send(&mut w, "401 Unauthorized", json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}})) };
     if method == "POST" && !json { return send(&mut w, "415 Unsupported Media Type", json!({"error": {"message": "Content-Type must be application/json", "type": "invalid_request_error"}})); }
     // Claude Code adds `?beta=true`.
