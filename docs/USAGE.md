@@ -42,7 +42,9 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 - Only tools with text results. Resources, prompts, sampling and OAuth sign-in are not supported.
 - Servers come only from the file: the page cannot add a command. The routes (`GET /api/mcp`, `POST /api/mcp/reload`,
   `POST /api/mcp/call`) need the admin key when keys are set; customer keys cannot use them. Without keys they answer
-  only requests from the same computer, so set `--api-key` to use tools from another machine.
+  only requests from the same computer that name it `localhost`, `127.0.0.1` or `[::1]` and carry no proxy header
+  (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`). Set `--api-key` to use tools from another machine, and always set it
+  behind a reverse proxy or a tunnel: a proxy that adds no such header looks like a local browser.
 - Tool definitions are part of the prompt. Many tools cost context and prefill time; switch off what a chat does not
   need.
 - The model needs a chat template with tool calls (the Qwen families have one).

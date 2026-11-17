@@ -558,3 +558,35 @@ fn serve_mcp_routes() {
     let _ = std::fs::remove_dir_all(&dir);
     r.unwrap();
 }
+
+/// Without an API key the MCP routes answer only a loopback peer that names a loopback host and came through no proxy.
+#[test]
+fn keyless_mcp_routes_refuse_a_proxy() {
+    use std::io::{Read, Write};
+    let dir = std::env::temp_dir().join(format!("strata-serve-mcp-keyless-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_rustingstrata"))
+        .args(["serve", "--addr", &addr, "--allowed-hosts", "chat.example.com", "--models-dir"]).arg(&dir).arg("--mcp").arg(dir.join("mcp.json"))
+        .stderr(std::process::Stdio::null()).spawn().unwrap();
+    let get = |headers: &str| -> String {
+        let mut c = (0..100).find_map(|_| std::net::TcpStream::connect(&addr).ok().or_else(|| { std::thread::sleep(std::time::Duration::from_millis(50)); None }))
+            .expect("server up");
+        write!(c, "GET /api/mcp HTTP/1.1\r\n{headers}\r\n\r\n").unwrap();
+        let mut s = String::new();
+        c.read_to_string(&mut s).unwrap();
+        s.lines().next().unwrap_or_default().to_string()
+    };
+    let port = addr.rsplit_once(':').unwrap().1;
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(get(&format!("Host: localhost:{port}")).contains("200"));
+        assert!(get(&format!("Host: {addr}")).contains("200"));
+        assert!(get("Host: chat.example.com").contains("403"));
+        assert!(get(&format!("Host: {addr}\r\nX-Forwarded-For: 203.0.113.9")).contains("403"));
+        assert!(get(&format!("Host: {addr}\r\nForwarded: for=203.0.113.9")).contains("403"));
+    }));
+    let _ = p.kill();
+    let _ = p.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    r.unwrap();
+}

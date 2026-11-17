@@ -12,6 +12,9 @@ pub struct Request {
     pub host: String,
     pub auth: String,
     pub json: bool,
+    /// A reverse proxy's header is present (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`): the peer address is the
+    /// proxy's, not the client's.
+    pub proxied: bool,
     pub body: Vec<u8>,
 }
 
@@ -23,7 +26,7 @@ pub fn read_request(r: &mut impl BufRead) -> anyhow::Result<Request> {
     h.read_line(&mut line)?;
     let mut it = line.split_whitespace();
     let (method, path) = (it.next().context("empty request")?.to_string(), it.next().context("no path")?.to_string());
-    let (mut len, mut host, mut auth, mut json) = (0, String::new(), String::new(), false);
+    let (mut len, mut host, mut auth, mut json, mut proxied) = (0, String::new(), String::new(), false, false);
     loop {
         line.clear();
         if h.read_line(&mut line)? == 0 { bail!("headers cut off or too long"); }
@@ -38,13 +41,15 @@ pub fn read_request(r: &mut impl BufRead) -> anyhow::Result<Request> {
             // The Anthropic API's key header (Claude Code with ANTHROPIC_API_KEY).
             "x-api-key" if auth.is_empty() => auth = format!("Bearer {v}"),
             "content-type" => json = v.starts_with("application/json"),
+            "forwarded" | "x-real-ip" => proxied = true,
+            _ if k.starts_with("x-forwarded-") => proxied = true,
             _ => {}
         }
     }
     if len > 8 << 20 { bail!("body too large"); }
     let mut body = vec![0; len];
     r.read_exact(&mut body)?;
-    Ok(Request { method, path, host, auth, json, body })
+    Ok(Request { method, path, host, auth, json, proxied, body })
 }
 
 /// Host header check against DNS rebinding: a loopback name, the host the server was bound to, or a name the user
