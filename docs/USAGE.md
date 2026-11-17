@@ -23,6 +23,33 @@ family (Qwen purple, DeepSeek blue, Gemma multicolor, Flint and GLM gray, anythi
 connection and data tab picks one color by hand instead. Open the page with `#selftest` at the end of the address to run its
 built-in checks.
 
+### Tools (MCP)
+
+The chat page can call the tools of Model Context Protocol servers. List the servers in a JSON file, in the format
+other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the default is `mcp.json` in the
+`rusting_strata` folder that holds the default models folder):
+
+    {"mcpServers": {
+      "files": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/notes"]},
+      "docs":  {"url": "https://example.com/mcp", "headers": {"Authorization": "Bearer ..."}}
+    }}
+
+- Servers start when the page first asks for them. The tools tab in settings shows each server, its tools and why a
+  server did not start; untick a server or a tool to keep it from the model. The `tools` switch beside `think`
+  turns tools on for the replies.
+- Each call waits for your answer unless "run tools without asking" is on. The same tab sets how many tool rounds one
+  reply may take and how long a tool result may be.
+- Only tools with text results. Resources, prompts, sampling and OAuth sign-in are not supported.
+- Servers come only from the file: the page cannot add a command. The routes (`GET /api/mcp`, `POST /api/mcp/reload`,
+  `POST /api/mcp/call`) need the admin key when keys are set; customer keys cannot use them. Without keys they answer
+  only requests from the same computer, so set `--api-key` to use tools from another machine.
+- Tool definitions are part of the prompt. Many tools cost context and prefill time; switch off what a chat does not
+  need.
+- The model needs a chat template with tool calls (the Qwen families have one).
+- API clients are not affected: `/v1/chat/completions` and `/v1/messages` take the client's own `tools` as before.
+- `STRATA_MCP_TIMEOUT` (seconds, default 120) is how long one answer from a server may take.
+- On Windows a command starts through `cmd /c` (for the `npx`/`uvx` shims); this path is not tested yet.
+
 ## Flags
 
 - `--ctx` KV cache size in tokens (default 4096).
@@ -42,6 +69,8 @@ built-in checks.
 - `--kv q8` halves the KV cache (345 instead of 650 MB at 32K) at about 6% slower 32K decode and 14% slower 32K prefill.
 - `--allowed-hosts ai-server.lan` (or `STRATA_ALLOWED_HOSTS`) allows a LAN name when `serve` is bound to `0.0.0.0`.
 - `--lora PATH:SCALE` applies a LoRA adapter at runtime, see [LORA.md](LORA.md).
+- `--mcp FILE` (`serve` only, or `STRATA_MCP`) lists the MCP servers whose tools the chat page may call, see
+  [Tools (MCP)](#tools-mcp).
 
 ## Server API
 
