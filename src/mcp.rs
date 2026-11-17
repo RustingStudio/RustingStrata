@@ -66,7 +66,8 @@ impl Conn {
                     .stderr(std::process::Stdio::null()).spawn().with_context(|| format!("start {command}"))?;
                 let (stdin, out) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
                 let (tx, rx) = std::sync::mpsc::channel();
-                // Ends when the child closes stdout or the receiver is dropped.
+                // Ends when the child closes stdout or the receiver is dropped. Lines are not capped: the command comes
+                // from the owner's config file and already runs with the owner's rights.
                 std::thread::spawn(move || { for l in BufReader::new(out).lines().map_while(Result::ok) { if tx.send(l).is_err() { break; } } });
                 Conn::Stdio { child, stdin, rx }
             }
@@ -96,13 +97,15 @@ impl Conn {
                 let stream = resp.headers().get("content-type").and_then(|c| c.to_str().ok()).is_some_and(|c| c.starts_with("text/event-stream"));
                 if status >= 400 { bail!("{url} answered HTTP {status}"); }
                 let Some(id) = id else { return Ok(None) };
+                // ponytail: a 16 MB cap on one answer (JSON or event stream), so a remote server cannot fill the
+                // memory; raise it when a tool legitimately returns more.
+                let body = resp.into_body().into_reader().take(16 << 20);
                 if !stream {
                     let mut b = String::new();
-                    // ponytail: a 16 MB answer cap; raise it when a tool legitimately returns more.
-                    resp.into_body().into_reader().take(16 << 20).read_to_string(&mut b)?;
+                    { body }.read_to_string(&mut b)?;
                     return Ok(Some(serde_json::from_str(&b).context("MCP answer is not JSON")?));
                 }
-                for l in BufReader::new(resp.into_body().into_reader()).lines() {
+                for l in BufReader::new(body).lines() {
                     let l = l?;
                     let Some(d) = l.strip_prefix("data:") else { continue };
                     if let Ok(v) = serde_json::from_str::<Value>(d.trim()) && v["id"] == id && v.get("method").is_none() { return Ok(Some(v)); }

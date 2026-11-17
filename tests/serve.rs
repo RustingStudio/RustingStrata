@@ -508,3 +508,53 @@ fn gpu_dead_matches_only_unrecoverable_errors() {
     // Text never counts: a message can quote what the client sent.
     assert!(!gpu_dead(&anyhow::anyhow!("bad tool name \"device has been lost CUDA_ERROR_ILLEGAL_ADDRESS\"")));
 }
+
+/// The MCP routes: admin only, JSON only, and a tool call reaches the server of the config file.
+#[test]
+fn serve_mcp_routes() {
+    use std::io::{Read, Write};
+    if !std::process::Command::new("python3").arg("--version").output().is_ok_and(|o| o.status.success()) { eprintln!("skip: no python3"); return; }
+    let dir = std::env::temp_dir().join(format!("strata-serve-mcp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("keys.txt"), "acme acme-0123456789abcdef\n").unwrap();
+    let echo = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mcp_echo.py");
+    std::fs::write(dir.join("mcp.json"), serde_json::json!({"mcpServers": {"echo": {"command": "python3", "args": [echo]}}}).to_string()).unwrap();
+    let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_rustingstrata"))
+        .args(["serve", "--addr", &addr, "--api-key", "root-0123456789abcdef", "--api-keys"]).arg(dir.join("keys.txt"))
+        .arg("--models-dir").arg(&dir).arg("--mcp").arg(dir.join("mcp.json")).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let req = |method: &str, path: &str, key: &str, ctype: &str, body: &str| -> (String, String) {
+        let mut c = (0..100).find_map(|_| std::net::TcpStream::connect(&addr).ok().or_else(|| { std::thread::sleep(std::time::Duration::from_millis(50)); None }))
+            .expect("server up");
+        write!(c, "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {key}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        let mut s = String::new();
+        c.read_to_string(&mut s).unwrap();
+        let (head, body) = s.split_once("\r\n\r\n").unwrap_or((&s, ""));
+        (head.lines().next().unwrap_or_default().to_string(), body.to_string())
+    };
+    let (root, acme, js) = ("root-0123456789abcdef", "acme-0123456789abcdef", "application/json");
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (st, b) = req("GET", "/api/mcp", root, js, "");
+        assert!(st.contains("200"), "{st} {b}");
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(v["servers"][0]["name"], "echo");
+        assert_eq!(v["servers"][0]["tools"][0]["name"], "echo");
+
+        let call = r#"{"server": "echo", "tool": "echo", "arguments": {"text": "hi"}}"#;
+        let (st, b) = req("POST", "/api/mcp/call", root, js, call);
+        assert!(st.contains("200"), "{st} {b}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&b).unwrap(), serde_json::json!({"content": "hi\n[image]", "is_error": false}));
+
+        // A customer key, a form post (no CORS preflight in a browser) and an unknown server are refused.
+        assert!(req("GET", "/api/mcp", acme, js, "").0.contains("403"));
+        assert!(req("POST", "/api/mcp/call", acme, js, call).0.contains("403"));
+        assert!(req("POST", "/api/mcp/call", root, "text/plain", call).0.contains("415"));
+        assert!(req("POST", "/api/mcp/call", "wrong", js, call).0.contains("401"));
+        assert!(req("POST", "/api/mcp/call", root, js, r#"{"server": "nope", "tool": "x", "arguments": {}}"#).0.contains("502"));
+        assert!(req("POST", "/api/mcp/reload", root, js, "{}").0.contains("200"));
+    }));
+    let _ = p.kill();
+    let _ = p.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    r.unwrap();
+}

@@ -773,6 +773,11 @@ enum Cmd {
         /// of the process list].
         #[arg(long)]
         api_key: Option<String>,
+        /// MCP servers whose tools the chat page may call: a JSON file `{"mcpServers": {"name": {"command": ..,
+        /// "args": [..], "env": {..}} | {"url": .., "headers": {..}}}}` [default: $STRATA_MCP, else mcp.json beside the
+        /// default models folder]. The servers start when the page first asks for them.
+        #[arg(long)]
+        mcp: Option<PathBuf>,
         #[command(flatten)]
         host: Hosting,
         #[command(flatten)]
@@ -878,9 +883,9 @@ enum Cmd {
 fn main() -> anyhow::Result<()> {
     let Some(cmd) = Cli::parse().cmd else {
         // Started without arguments, as by a double click: keep the window open on an error so it can be read.
-        let Some(Cmd::Serve { model, models_dir, addr, api_key, open, host, mut engine }) = Cli::parse_from(["rustingstrata", "serve", "--gpu", "--open"]).cmd else { unreachable!() };
+        let Some(Cmd::Serve { model, models_dir, addr, api_key, mcp, open, host, mut engine }) = Cli::parse_from(["rustingstrata", "serve", "--gpu", "--open"]).cmd else { unreachable!() };
         engine.cpu_fallback = true;
-        let r = run(Cmd::Serve { model, models_dir, addr, api_key, open, host, engine });
+        let r = run(Cmd::Serve { model, models_dir, addr, api_key, mcp, open, host, engine });
         if let Err(e) = &r {
             eprintln!("error: {e:#}\npress Enter to close");
             let _ = std::io::stdin().read_line(&mut String::new());
@@ -1205,7 +1210,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             r.finish()?;
         }
-        Cmd::Serve { model, models_dir, addr, api_key, open, host, mut engine } => {
+        Cmd::Serve { model, models_dir, addr, api_key, mcp, open, host, mut engine } => {
             engine.ds_env();
             if let Some(mp) = &model && let Ok(g) = Gguf::open(mp) && g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
                 let name = mp.file_name().map_or("gemma4".into(), |n| n.to_string_lossy().into_owned());
@@ -1245,6 +1250,9 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             // An empty key file would leave the server open to anyone.
             anyhow::ensure!(host.api_keys.is_none() || !users.is_empty() || api_key.is_some(), "the key file has no keys");
             let keys = std::sync::Arc::new(std::sync::RwLock::new(serve::Keys { admin: api_key, users }));
+            // Beside the default models folder (its parent), whatever --models-dir says.
+            let hub = std::sync::Arc::new(rusting_strata::mcp::Hub::new(mcp.or_else(|| std::env::var_os("STRATA_MCP").map(PathBuf::from))
+                .unwrap_or_else(|| models_dir_default().with_file_name("mcp.json"))));
             let keys_file = host.api_keys.clone();
             let usage = match &host.usage_log {
                 Some(f) => Some(std::sync::Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(f)
@@ -1310,7 +1318,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         Err(e) => eprintln!("{}: {e:#}, keeping the old keys", f.display()),
                     }
                 }
-                let (tx, oc, st, a, k, allowed, held) = (tx.clone(), open_conns.clone(), st.clone(), a.clone(), k.clone(), allowed.clone(), held.clone());
+                let (tx, oc, st, a, k, allowed, held, hub) = (tx.clone(), open_conns.clone(), st.clone(), a.clone(), k.clone(), allowed.clone(), held.clone(), hub.clone());
                 std::thread::spawn(move || {
                     let q = c.set_read_timeout(Some(Duration::from_secs(30))).and_then(|_| c.set_write_timeout(Some(Duration::from_secs(30))))
                         .map_err(Into::into).and_then(|_| serve::read_request(&mut BufReader::new(&c)));
@@ -1339,6 +1347,22 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         let mut v = json!(*st.lock().unwrap());
                         (v["system"], v["uptime_s"]) = (serve::system(), t0.elapsed().as_secs().into());
                         return reply(v, "200 OK");
+                    }
+                    // MCP tools for the page. Answered here: a tool can run for minutes and must not hold the model's
+                    // queue. The checks are those of `handle`: Host (or a key), admin, and JSON for a POST (a form post
+                    // from another site needs no CORS preflight, a JSON one does and gets no answer). A request that
+                    // fails one falls through to `handle`, which refuses it.
+                    if let Ok(r) = &q && let route = r.path.split('?').next().unwrap_or_default() && matches!((r.method.as_str(), route), ("GET", "/api/mcp") | ("POST", "/api/mcp/reload" | "/api/mcp/call"))
+                        && let k = k.read().unwrap().clone() && (k.any() || serve::host_ok(&r.host, &a, &allowed)) && k.who(&r.auth).is_some_and(|w| w.admin)
+                        && (r.method == "GET" || r.json) {
+                        if route != "/api/mcp/call" { return reply(hub.list(r.method == "POST"), "200 OK"); }
+                        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap_or_default();
+                        let (server, tool) = (v["server"].as_str().unwrap_or_default(), v["tool"].as_str().unwrap_or_default());
+                        eprintln!("request {i}: mcp {server} {tool}");
+                        return match hub.call(server, tool, if v["arguments"].is_object() { v["arguments"].clone() } else { json!({}) }) {
+                            Ok(v) => reply(v, "200 OK"),
+                            Err(e) => { eprintln!("request {i}: mcp {server} {tool}: {e:#}"); reply(json!({"error": {"message": format!("{e:#}"), "type": "server_error"}}), "502 Bad Gateway") }
+                        };
                     }
                     // A malformed request, a wrong key, the page and the model list are answered here, not in the queue,
                     // where without `--parallel` they would wait for the reply being generated (`handle` checks the key
@@ -2485,6 +2509,13 @@ mod flag_tests {
     use super::{resolve_flags, vram_margins};
     #[cfg(target_os = "linux")]
     use super::cpu_topology_groups;
+
+    #[test]
+    fn serve_takes_an_mcp_file() {
+        use clap::Parser;
+        let Some(super::Cmd::Serve { mcp, .. }) = super::Cli::try_parse_from(["rustingstrata", "serve", "--mcp", "/tmp/m.json"]).unwrap().cmd else { panic!() };
+        assert_eq!(mcp, Some(std::path::PathBuf::from("/tmp/m.json")));
+    }
 
     #[test]
     fn load_options_apply_and_validate() {
