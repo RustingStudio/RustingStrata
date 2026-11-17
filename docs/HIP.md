@@ -148,6 +148,13 @@ the time of f16, with a vector-friendly rescale 6.6x *slower*, with the layout t
 integer path cannot pay for itself here, so `GEMM_TC` stays 0 on HIP and the prefill GEMM dequantizes to f16 in shared
 memory and runs on the f16 matrix cores, which is what puts it ahead of the Vulkan backend.
 
+That verdict is about GGUF K-quants dequantized on the fly, and there is a known way out of it: **repack the weights**.
+Strata runs int8 matrix cores for prompt experts on gfx12 (its `STRATA_PF_FUSED`, on by default for its own IQ3_S,
+IQ3_XXS and Q2_0 packs) and measures a 4K prompt 1,612 -> 1,353 ms (+19.1%, 8-8.5% at 16K/32K), because a pack can be
+laid out for the fragment (A = 16 weight rows, so a lane's eight results share one token's activation scale) instead
+of the per-16-weight K-quant rescale that kills it here. Doing that in this engine would mean a repack pass and our own
+pack format — a project, not a kernel — but it is the shape of the evidence that would reopen `GEMM_TC`.
+
 ## What is left, measured
 
 Profiled on the same 35B prefill (`rocprofv3 --kernel-trace`, pp 4096): 54% of the kernel time is the quantized
@@ -168,7 +175,11 @@ of its time waiting on the CPU expert worker, which is an expert-tier question, 
   away with the chunked WY/UT-transform form (a small triangular inverse plus a few matmuls over a chunk), which
   wants f32 for the state and therefore does not get tensor cores.
 
-Since the whole kernel is 12% of prefill, that rewrite's ceiling is ~4% of prefill. Left alone deliberately.
+Since the whole kernel is 12% of prefill, that rewrite's ceiling is ~4% of prefill. Left alone deliberately — and
+Strata, which did write it (chunked scans on the gfx11 matrix cores in `gdn_tc.cuh` and the gfx12 ones in
+`gdn_wmma12.inc`, both MIT), measures exactly that: their recurrence is 1.6x faster on an RDNA3 iGPU for a **1.4-2.1%**
+gain in whole-prompt time (docs/DETAILS.md), it is off by default because the rounding differs from the token-by-token
+FP32 scan, and on CUDA it is 0.73-0.87x, i.e. slower.
 
 ## Next
 
@@ -182,3 +193,15 @@ Since the whole kernel is 12% of prefill, that rewrite's ceiling is ~4% of prefi
 The compatibility shim follows the structure and several implementations of Strata's
 `include/strata/hip_compat/intrinsics.hpp` (MIT, (c) 2025 Niko1221, https://github.com/Niko1221/Strata), which runs
 CUDA-shaped kernels on the same wave32 targets. See `THANKS.md`.
+
+The two matrix-core ports in this backend were written independently and turned out to match work already in Strata, in
+a different design:
+
+- **Prompt attention on the matrix cores**: their `src/kernels/cuda/qsa_prompt_attn.cu` has the same instruction for
+  gfx11 and gfx12 with the fragment layout noted here (`A` lane l holds `A[l % 16][(l / 16) * 8 + i]`, gfx11
+  `D[2i + l / 16][l % 16]`), default on gfx12 Linux but tied to an int8 KV cache and to keeping q and p as FP16
+  hi+lo parts; it is 7.2-7.5x their portable kernel and +31% prompt throughput at 8.8K tokens. This backend's version
+  works on an f16 KV cache and reuses the CUDA-era m16n8k16 softmax by staging the scores, at ~2x the prefill
+  attention and +22-35% prefill at depth.
+- **A chunked gated delta-rule scan** (`gdn_chunk.cu`, `gdn_tc.cuh`, `gdn_wmma12.inc`): the rewrite this backend
+  measured and declined, with their own numbers agreeing with the estimate (see "What is left, measured").
