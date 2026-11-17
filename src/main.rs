@@ -1352,6 +1352,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     // queue. The checks are those of `handle`: Host (or a key), admin, and JSON for a POST (a form post
                     // from another site needs no CORS preflight, a JSON one does and gets no answer). A request that
                     // fails one falls through to `handle`, which refuses it.
+                    // Without keys only this computer may use them: on `--addr 0.0.0.0` a tool call from the network
+                    // would otherwise need nothing but a matching Host header.
+                    if let Ok(r) = &q && let route = r.path.split('?').next().unwrap_or_default() && matches!((r.method.as_str(), route), ("GET", "/api/mcp") | ("POST", "/api/mcp/reload" | "/api/mcp/call"))
+                        && !k.read().unwrap().any() && !c.peer_addr().is_ok_and(|p| p.ip().to_canonical().is_loopback()) {
+                        return reply(json!({"error": {"message": "MCP tools need an API key (--api-key) for requests from another computer", "type": "forbidden"}}), "403 Forbidden");
+                    }
                     if let Ok(r) = &q && let route = r.path.split('?').next().unwrap_or_default() && matches!((r.method.as_str(), route), ("GET", "/api/mcp") | ("POST", "/api/mcp/reload" | "/api/mcp/call"))
                         && let k = k.read().unwrap().clone() && (k.any() || serve::host_ok(&r.host, &a, &allowed)) && k.who(&r.auth).is_some_and(|w| w.admin)
                         && (r.method == "GET" || r.json) {
