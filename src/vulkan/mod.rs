@@ -947,10 +947,10 @@ impl Vk {
         let mut q8 = self.3.lock().unwrap();
         let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);  // as on CUDA
         let reuse = same && q8.1 == key;
-        // A SAME_X gemm inside a batch cannot quantize x (the quantize and the gemm would not be ordered): when the
-        // cached q8 rows are not x's, use the f16 kernel (as on CUDA).
+        // A gemm inside a batch cannot quantize x (the quantize and the gemm would not be ordered): when the cached
+        // q8 rows are not x's (or, without SAME_X, may not be), use the f16 kernel (as on CUDA).
         let int8 = crate::cuda::Gpu::mmq(ty) && cols.is_multiple_of(128);
-        let f = !int8 || (same && !reuse && self.0.st().batch);
+        let f = !int8 || (!reuse && self.0.st().batch);
         // A dense GEMM of few workgroups runs as gemm_fs/gemmi_s (cooperative matrices only), 32 positions a
         // workgroup (as on CUDA).
         let sm = tiles == 0 && grid[0] * grid[1] < 112 && if f { self.0.coop } else { self.0.coop_i8 };
@@ -965,6 +965,8 @@ impl Vk {
             if self.0.coop && tiles != 0 { self.run("gemm_fs", &spec, grid, &args)?; }
             return Ok(());
         }
+        // Only SAME_X promises that x still holds what was quantized (as on CUDA).
+        if !same { q8.1 = None; }
         let xq = self.q8_x(&mut q8, ty, cols, n_x, x, x_stride)?.expect("int8 GEMM without a quantized x");
         let args: [&dyn Arg; 10] = [&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2]];
         self.run(if !self.0.coop_i8 { "gemmi_dp" } else if sm { "gemmi_s" } else { "gemmi" }, &spec, grid, &args)?;

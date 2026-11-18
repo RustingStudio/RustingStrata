@@ -153,5 +153,17 @@ fn batched_quantized_gemm_uses_prepared_x() {
         assert!(got.iter().any(|v| v.abs() > 1e-5), "{backend}: empty GEMM result");
         assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             "{backend}: batched result differs from non-batched GEMM");
+
+        // New rows at the same address: a GEMM without SAME_X quantizes them again.
+        let input2: Vec<f32> = input.iter().map(|v| 0.5 - v * v).collect();
+        let gemm = |x: u64| {
+            let y = gpu.zeros::<f32>(n * 64).unwrap();
+            gpu.gemm_dense(&weight, n, x, 256, y.addr(), 64, 0).unwrap();
+            common::down::<f32>(&*gpu, &y).iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        };
+        let want = gemm(common::up(&*gpu, &input2).addr());
+        gemm(x.addr());
+        gpu.put(&input2, &x, 0).unwrap();
+        assert!(gemm(x.addr()) == want, "{backend}: GEMM used the quantization of the rows x held before");
     }
 }

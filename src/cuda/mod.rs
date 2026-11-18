@@ -564,11 +564,11 @@ impl Gpu {
         let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
         let reuse = same && q8.1 == key;
         // The int8 path loads q8 rows 16 bytes at a time: their stride (cols * 11 / 8) is aligned only for cols % 128 == 0.
-        // A SAME_X gemm inside a batch cannot quantize x (the quantize and the gemm would land on different streams):
-        // when the cached q8 rows are not x's, use the f16 kernel. Volta and Turing have no int8 tensor-core mma: there the
+        // A gemm inside a batch cannot quantize x (the quantize and the gemm would land on different streams): when
+        // the cached q8 rows are not x's (or, without SAME_X, may not be), use the f16 kernel. Volta and Turing have no int8 tensor-core mma: there the
         // kernels are not loaded (`i8_gemm`), so this gate must dominate `STRATA_MMQ`; they take the f16 gemm_*/gemms_*.
         let int8 = self.i8_gemm && self.int8_mma && Self::mmq(ty) && cols.is_multiple_of(128);
-        if !int8 || (same && !reuse && self.nb.load(Relaxed) < BESIDE) {
+        if !int8 || (!reuse && self.nb.load(Relaxed) < BESIDE) {
             if !same { q8.1 = None; }
             launch!(self, &kname(if sm { "gemms" } else { "gemm" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
                 tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act);
@@ -579,6 +579,8 @@ impl Gpu {
             }
             return Ok(());
         }
+        // Only SAME_X promises that x still holds what was quantized: the same address can hold new rows.
+        if !same { q8.1 = None; }
         let xq = self.q8_x(&mut q8, ty, cols, n_x, x, x_stride)?.expect("int8 GEMM without a quantized x");
         launch!(self, &kname(if sm { "gemmis" } else { "gemmi" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
             tiles, wd, nd as i32, xq, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act);

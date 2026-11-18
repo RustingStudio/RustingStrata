@@ -202,6 +202,14 @@ impl<'a> Model<'a> {
     pub fn apply_lora(&mut self, specs: &[(String, f32)]) -> anyhow::Result<()> {
         // Load everything before touching the current overlays, so a bad adapter leaves the model unchanged.
         let loras: Vec<Lora> = specs.iter().map(|(path, scale)| load_lora(path, *scale)).collect::<anyhow::Result<_>>()?;
+        // Routed-expert adapters are not baked (`bake_lora` checks the others): they index activations and the
+        // residual row by their own dimensions at inference, so these must be the base tensor's.
+        let ne = self.cfg.n_expert.max(1);
+        for (name, e) in loras.iter().flat_map(|l| &l.entries).filter(|(n, _)| n.ends_with("ffn_down_exps.weight")) {
+            let Ok(base) = self.w.get(name) else { continue };
+            anyhow::ensure!(e.in_dim == base.cols && e.out_dim * ne == base.rows && (e.n_expert == 1 || e.n_expert == ne),
+                "lora: target {name} is {}x{} with {ne} experts, adapter is {}x{} with {}", base.rows / ne, base.cols, e.out_dim, e.in_dim, e.n_expert);
+        }
         self.w.clear_baked();
         self.loras = loras;
         self.w.bake_lora(&self.loras);
@@ -752,6 +760,19 @@ mod tests {
         assert_eq!((e.rank, e.in_dim, e.out_dim, e.n_expert), (2, 4, 3, 1));
         assert_eq!(e.a[0], (0..8).map(|i| i as f32).collect::<Vec<_>>());
         assert_eq!(e.b[0], (0..6).map(|i| 10.0 + i as f32).collect::<Vec<_>>());
+    }
+
+    /// A routed-expert adapter whose dimensions are not the base tensor's is refused (needs `STRATA_MODEL`, a MoE model).
+    #[test]
+    fn routed_expert_lora_dimensions_are_checked() {
+        let Some(m) = std::env::var_os("STRATA_MODEL").filter(|m| Path::new(m).exists()) else { return };
+        let g = Gguf::open(Path::new(&m)).unwrap();
+        if !g.tensors.contains_key("blk.0.ffn_down_exps.weight") { return; }
+        let p = tiny_adapter("dims");
+        let r = Model::load_with_lora(&g, &[(p.to_str().unwrap().to_string(), 1.0)]);
+        std::fs::remove_file(&p).ok();
+        let e = format!("{:#}", r.err().expect("a 3x4 adapter on the expert down matrix must be refused"));
+        assert!(e.contains("blk.0.ffn_down_exps.weight") && e.contains("adapter is 3x4"), "{e}");
     }
 
     #[test]
