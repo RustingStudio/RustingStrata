@@ -24,6 +24,27 @@ fn fast_experts_match_reference() {
     }
 }
 
+/// A verify batch gives every token the bits of its own `experts` call, for tokens that share experts and not.
+#[test]
+fn experts_multi_matches_experts() {
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    if m.cfg.n_expert == 0 { return eprintln!("SKIP: dense model"); }
+    let hs: Vec<Vec<f32>> = (0..3).map(|t| (0..m.cfg.n_embd).map(|i| ((i * 13 + t * 7) % 101) as f32 / 50.0 - 1.0).collect()).collect();
+    for il in [0, m.cfg.n_layer - 1] {
+        // Token 2 routes like token 0; one token with nothing missed.
+        let sels = vec![m.route(il, &hs[0]), m.route(il, &hs[1]), m.route(il, &hs[0])];
+        let want: Vec<Vec<f32>> = hs.iter().zip(&sels).map(|(h, s)| cpu_moe::experts(&m, il, h, s)).collect();
+        assert_eq!(cpu_moe::experts_multi(&m, il, &hs, &sels), want, "layer {il}");
+        let none = vec![sels[0].clone(), vec![], sels[1].clone()];
+        let got = cpu_moe::experts_multi(&m, il, &hs, &none);
+        assert_eq!(got[0], want[0], "layer {il}");
+        assert!(got[1].iter().all(|&v| v == 0.0), "layer {il}");
+        assert_eq!(got[2], cpu_moe::experts(&m, il, &hs[2], &sels[1]), "layer {il}");
+    }
+}
+
 /// Single-thread kernel throughput (prints only).
 #[test]
 fn kernel_throughput() {
