@@ -36,12 +36,15 @@ const SPV: &[(&str, &[u8])] = &[
     ("conv_state", include_bytes!("spv/conv_state.spv")),
     ("deltanet", include_bytes!("spv/deltanet.spv")),
     ("dequant", include_bytes!("spv/dequant.spv")),
+    ("dflash2_conv", include_bytes!("spv/dflash2_conv.spv")),
     ("gemm_f", include_bytes!("spv/gemm_f.spv")),
     ("gemm_f_dp", include_bytes!("spv/gemm_f_dp.spv")),
     ("gemm_fs", include_bytes!("spv/gemm_fs.spv")),
     ("gemmi", include_bytes!("spv/gemmi.spv")),
+    ("gemmi_16", include_bytes!("spv/gemmi_16.spv")),
     ("gemmi_dp", include_bytes!("spv/gemmi_dp.spv")),
     ("gemmi_s", include_bytes!("spv/gemmi_s.spv")),
+    ("gemmi_s_16", include_bytes!("spv/gemmi_s_16.spv")),
     ("gemv_f", include_bytes!("spv/gemv_f.spv")),
     ("gemv_q", include_bytes!("spv/gemv_q.spv")),
     ("hc_mix", include_bytes!("spv/hc_mix.spv")),
@@ -73,8 +76,8 @@ const SPV: &[(&str, &[u8])] = &[
 ];
 
 /// The device, a scratch buffer of XQ bytes for x quantized by `quant_xq` when an op does that itself, the IQ lookup
-/// tables (`iq_tables`), and the q8 rows of x for `gemmi` (grown as needed).
-pub struct Vk(Arc<Inner>, Buf, Buf, Mutex<(Buf, Option<[u64; 4]>)>);
+/// tables (`iq_tables`), the growable q8 rows for `gemmi` prefill, and a fixed q8 buffer for `<= TMAX` graphed forwards.
+pub struct Vk(Arc<Inner>, Buf, Buf, Mutex<(Buf, Option<[u64; 4]>)>, Mutex<(Buf, Option<[u64; 4]>)>);
 
 /// The IQ lookup tables in one buffer, and the `tables.glsl` that names each at its offset from the buffer's address
 /// (spec constants 3 and 4). As GLSL const arrays the tables went to per-thread local memory on NVIDIA, which made
@@ -154,8 +157,8 @@ struct Inner {
     /// Without cooperative matrices: run the tiled `attn_prefill_tile` (one KV-head tile shared by 32 query/head tasks)
     /// when the device allows it. STRATA_VK_DP_OLD=1 keeps the older per-query `attn_prefill_dp`.
     dp_tile: bool,
-    /// The 16 x 16 x 32 int8 / int32 shape is there too (`gemmi`).
-    coop_i8: bool,
+    /// Int8 cooperative matrix K-dimension (`32` for NVIDIA `16x16x32`, `16` for AMD RDNA3/3.5 `16x16x16`, `0` = off).
+    coop_i8: u32,
     /// VK_AMD_device_coherent_memory is enabled (the mailbox uses `BAR_AMD`).
     amd_coherent: bool,
     /// An AMD GPU without it: the CPU expert mailbox cannot work (the GPU caches it), so a timeout names the fix.
@@ -165,8 +168,8 @@ struct Inner {
     cr: Option<ash::ext::conditional_rendering::Device>,
     /// Specialization constant 0 of kernels that quantize x: llama.cpp q8_K numerics (`--llama-numerics`).
     llama: u32,
-    /// Specialization constant 15 of every kernel: q8 KV cache rows (`--kv q8`, KV_Q8 in common.glsl).
-    kv_q8: bool,
+    /// Specialization constant 15 of every kernel: KV cache mode (0 = f16, 1 = q8, 2 = q4).
+    kv_mode: u32,
     /// `maxComputeSharedMemorySize` of the device (or STRATA_VK_SMEM_LIMIT, a test hook): no pipeline may need more
     /// `Workgroup` bytes than this (`Vk::pipeline`), or the driver accepts it and faults at dispatch (Xid 13 on Volta).
     smem_limit: u32,
@@ -343,7 +346,7 @@ fn features<'a>(f11: &'a mut vk::PhysicalDeviceVulkan11Features<'static>, f12: &
 impl Vk {
     /// The `device`-th usable GPU. Fails with "Vulkan init" (and the reasons) when there is none.
     pub fn new(device: usize) -> anyhow::Result<Vk> {
-        ensure!(!(crate::cuda::kv_q8() && crate::cuda::llama_numerics()), "--kv q8 does not combine with --llama-numerics (its attention reads f16 KV)");
+        ensure!(!(crate::cuda::kv_mode() > 0 && crate::cuda::llama_numerics()), "--kv q8/q4 does not combine with --llama-numerics (its attention reads f16 KV)");
         // RADV hides VK_AMD_device_coherent_memory on RDNA4 (RX 9000) unless this driconf option is set, and without
         // it the GPU caches the CPU expert mailbox: MoE combines miss the worker's answer and wait until they give up.
         // Mesa reads the option from the environment when the device is created; other drivers ignore it.
@@ -387,13 +390,16 @@ impl Vk {
             && c.a_type == ab && c.b_type == ab && c.c_type == cr && c.result_type == cr);
         let coop = !wave64 && shape(16, vk::ComponentTypeKHR::FLOAT16, vk::ComponentTypeKHR::FLOAT32)
             && std::env::var_os("STRATA_VK_NO_COOP").is_none();  // STRATA_VK_NO_COOP: run the kernels for devices without them
-        let coop_i8 = coop && shape(32, vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32);
+        let coop_i8 = if !coop || std::env::var_os("STRATA_VK_NO_COOP_I8").is_some() { 0 }
+            else if shape(32, vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32) { 32 }
+            else if shape(16, vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32) { 16 }
+            else { 0 };
         // The tiled fallback needs a 1024-thread workgroup and 32 KB of shared memory (see attn_prefill_tile.comp).
         let dev_props = unsafe { instance.get_physical_device_properties(pd) };
         let limits = dev_props.limits;
         let igpu = dev_props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
         let name_up = name.to_ascii_uppercase();
-        let gfx11 = dev_props.vendor_id == 0x1002 && (igpu || (coop && !coop_i8)
+        let gfx11 = dev_props.vendor_id == 0x1002 && (igpu || (coop && coop_i8 != 32)
             || ["GFX11", "STRIX", "PHOENIX", "KRACKAN", "NAVI3", "RADEON 8", "RADEON 7", "RX 7"]
                 .iter().any(|k| name_up.contains(k)));
         let dp_tile = !coop && limits.max_compute_work_group_invocations >= 1024 && limits.max_compute_shared_memory_size >= 32 << 10
@@ -470,7 +476,7 @@ impl Vk {
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
         let ts_period = limits.timestamp_period;
         let rcp_d = dev_props.vendor_id == 0x1002;
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, gfx11, wave64, rcp_d, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, gfx11, wave64, rcp_d, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_mode: crate::cuda::kv_mode(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -482,8 +488,15 @@ impl Vk {
         unsafe { (p as *mut [u32; 3]).write_volatile([0, 0, 0]) };
         st.err = (b, m, p as usize, unsafe { inner.dev.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(b)) });
         drop(st);
-        let mut v = Vk(Arc::new(inner), Buf::new(0, 0, ()), Buf::new(0, 0, ()), Mutex::new((Buf::new(0, 0, ()), None)));
+        let mut v = Vk(
+            Arc::new(inner),
+            Buf::new(0, 0, ()),
+            Buf::new(0, 0, ()),
+            Mutex::new((Buf::new(0, 0, ()), None)),
+            Mutex::new((Buf::new(0, 0, ()), None)),
+        );
         v.1 = v.buf(XQ, DEVICE)?.0;
+        v.4.lock().unwrap().0 = v.alloc(1 << 20)?;
         let t = iq_tables().0;
         v.2 = v.alloc(t.len())?;
         v.htod(&t, &v.2, 0)?;
@@ -498,8 +511,9 @@ impl Vk {
         let s = |c: &[std::ffi::c_char]| unsafe { std::ffi::CStr::from_ptr(c.as_ptr()) }.to_string_lossy().into_owned();
         let yn = |b: bool| if b { "yes" } else { "no" };
         let amd = if v.0.amd_plain || v.0.amd_coherent { format!(", device-coherent memory {}", yn(v.0.amd_coherent)) } else { String::new() };
-        eprintln!("vulkan: {name} ({} {}){amd}, cooperative matrix f16 {} int8 {}, conditional rendering {}, maxComputeSharedMemorySize {}",
-            s(&drv.driver_name), s(&drv.driver_info), yn(v.0.coop), yn(v.0.coop_i8), yn(v.0.cr.is_some() && !v.0.st().no_cond), v.0.smem_limit);
+        let i8_s = match v.0.coop_i8 { 32 => "yes (16x16x32)", 16 => "yes (16x16x16)", _ => "no" };
+        eprintln!("vulkan: {name} ({} {}){amd}, cooperative matrix f16 {} int8 {i8_s}, conditional rendering {}, maxComputeSharedMemorySize {}",
+            s(&drv.driver_name), s(&drv.driver_info), yn(v.0.coop), yn(v.0.cr.is_some() && !v.0.st().no_cond), v.0.smem_limit);
         if !v.0.coop { eprintln!("vulkan: prefill attention: {} (no cooperative matrices)", if v.0.dp_tile { "tiled" } else { "per-query" }); }
         Ok(v)
     }
@@ -770,7 +784,7 @@ impl Inner {
         if let Some(&p) = st.pipes.get(&(name, spec.to_vec())) { return Ok(p); }
         let code = SPV.iter().find(|s| s.0 == name).with_context(|| format!("no Vulkan kernel {name}"))?.1;
         // One choke point for Workgroup shared memory: the driver creates such a pipeline and faults at dispatch.
-        spv_smem::check_shared_memory(name, spec, self.kv_q8, self.smem_limit)?;
+        spv_smem::check_shared_memory(name, spec, self.kv_mode, self.smem_limit)?;
         let words = ash::util::read_spv(&mut std::io::Cursor::new(code))?;
         let m = unsafe { self.dev.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None) }?;
         let n = spec.len() as u32;
@@ -778,7 +792,7 @@ impl Inner {
             .chain([vk::SpecializationMapEntry::default().constant_id(15).offset(4 * n).size(4),
                     vk::SpecializationMapEntry::default().constant_id(14).offset(4 * n + 4).size(4),
                     vk::SpecializationMapEntry::default().constant_id(13).offset(4 * n + 8).size(4)]).collect();
-        let data: Vec<u8> = spec.iter().chain([&(self.kv_q8 as u32), &(self.wave64 as u32), &(self.rcp_d as u32)]).flat_map(|v| v.to_le_bytes()).collect();
+        let data: Vec<u8> = spec.iter().chain([&self.kv_mode, &(self.wave64 as u32), &(self.rcp_d as u32)]).flat_map(|v| v.to_le_bytes()).collect();
         let si = vk::SpecializationInfo::default().map_entries(&entries).data(&data);
         let mut sub = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32);
         let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(m).name(c"main").specialization_info(&si);
@@ -922,6 +936,11 @@ impl Vk {
 }
 
 impl Vk {
+    fn q8_mutex(&self, n_x: usize, cols: usize) -> &Mutex<(Buf, Option<[u64; 4]>)> {
+        let need = n_x * (cols + cols / 8 + cols / 4);
+        if n_x <= crate::cpu_worker::TMAX && need <= (1 << 20) { &self.4 } else { &self.3 }
+    }
+
     /// Quantize `x` for the int8 GEMM, unless the cache already holds the same rows; `None` when `ty` or `cols`
     /// selects the f16 path. Shared by `gemm_raw` and `prequant_gemm_x`.
     fn q8_x(&self, q8: &mut (Buf, Option<[u64; 4]>), ty: GgmlType, cols: usize, n_x: usize, x: u64, x_stride: usize) -> anyhow::Result<Option<u64>> {
@@ -944,16 +963,17 @@ impl Vk {
         if n_tiles == 0 { return Ok(()); }
         let (spec, grid, nk) = (self.wspec(ty), [rows.div_ceil(64), n_tiles, 1], (cols / 64) as u32);
         let (same, act) = (act & SAME_X != 0, act & !SAME_X);
-        let mut q8 = self.3.lock().unwrap();
+        let mut q8 = self.q8_mutex(n_x, cols).lock().unwrap();
         let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);  // as on CUDA
         let reuse = same && q8.1 == key;
+        if !same { q8.1 = None; }
         // A SAME_X gemm inside a batch cannot quantize x (the quantize and the gemm would not be ordered): when the
         // cached q8 rows are not x's, use the f16 kernel (as on CUDA).
         let int8 = crate::cuda::Gpu::mmq(ty) && cols.is_multiple_of(128);
         let f = !int8 || (same && !reuse && self.0.st().batch);
         // A dense GEMM of few workgroups runs as gemm_fs/gemmi_s (cooperative matrices only), 32 positions a
         // workgroup (as on CUDA).
-        let sm = tiles == 0 && grid[0] * grid[1] < 112 && if f { self.0.coop } else { self.0.coop_i8 };
+        let sm = tiles == 0 && grid[0] * grid[1] < 112 && if f { self.0.coop } else { self.0.coop_i8 != 0 };
         let grid = if sm { [grid[0], nd.div_ceil(32), 1] } else { grid };
         let tail = [&(rows as u32) as &dyn Arg, &nk, &act];
         // gemmi loads q8 rows 16 bytes at a time: their stride (cols * 11 / 8) is aligned only for cols % 128 == 0.
@@ -967,8 +987,9 @@ impl Vk {
         }
         let xq = self.q8_x(&mut q8, ty, cols, n_x, x, x_stride)?.expect("int8 GEMM without a quantized x");
         let args: [&dyn Arg; 10] = [&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2]];
-        self.run(if !self.0.coop_i8 { "gemmi_dp" } else if sm { "gemmi_s" } else { "gemmi" }, &spec, grid, &args)?;
-        if self.0.coop_i8 && tiles != 0 { self.run("gemmi_s", &spec, grid, &args)?; }
+        let (gk, gks) = match self.0.coop_i8 { 32 => ("gemmi", "gemmi_s"), 16 => ("gemmi_16", "gemmi_s_16"), _ => ("gemmi_dp", "gemmi_dp") };
+        self.run(if self.0.coop_i8 == 0 { "gemmi_dp" } else if sm { gks } else { gk }, &spec, grid, &args)?;
+        if self.0.coop_i8 != 0 && tiles != 0 { self.run(gks, &spec, grid, &args)?; }
         Ok(())
     }
 }
@@ -987,6 +1008,17 @@ impl Backend for Vk {
     fn device(&self) -> String {
         let p = unsafe { self.0.instance.get_physical_device_properties(self.0.pd) };
         p.device_name_as_c_str().map_or(String::new(), |s| s.to_string_lossy().into_owned())
+    }
+    fn share(&self) -> anyhow::Result<Box<dyn Backend>> {
+        let v = Vk(
+            self.0.clone(),
+            self.1.clone(),
+            self.2.clone(),
+            Mutex::new((Buf::new(0, 0, ()), None)),
+            Mutex::new((Buf::new(0, 0, ()), None)),
+        );
+        v.4.lock().unwrap().0 = v.alloc(1 << 20)?;
+        Ok(Box::new(v))
     }
 
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf> { Ok(self.buf(bytes, DEVICE)?.0) }
@@ -1074,7 +1106,7 @@ impl Backend for Vk {
         let (d, d_o) = st.find(dst.addr() + dst_off as u64, bytes)?;
         let cb = self.0.cb(&mut st)?;
         unsafe { self.0.dev.cmd_copy_buffer(cb, s, d, &[vk::BufferCopy::default().src_offset(so).dst_offset(d_o).size(bytes as u64)]) };
-        self.0.barrier(cb, false);
+        if !st.batch { self.0.barrier(cb, false); }
         Ok(())
     }
 
@@ -1177,7 +1209,9 @@ impl Backend for Vk {
         Ok((b, p.cast()))
     }
     fn preflight(&self, types: &[GgmlType], verbose: bool) -> anyhow::Result<()> { Vk::preflight(self, types, verbose) }
-    fn kv_words(&self, n: usize) -> usize { if self.0.kv_q8 { n * 17 / 32 } else { n } }
+    fn kv_words(&self, n: usize) -> usize {
+        match self.0.kv_mode { 0 => n, 1 => n * 17 / 32, 2 => n * 9 / 32, 3 => n * 3 / 16, _ => unreachable!() }
+    }
 
     fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
         self.gemm_raw(ty, rows, cols, tiles, n_tiles, 0, 0, x, x_stride, n_x, xrow, y, y_stride, act)
@@ -1188,7 +1222,7 @@ impl Backend for Vk {
     fn int8_gemm(&self, ty: GgmlType) -> bool { crate::cuda::Gpu::mmq(ty) }
 
     fn prequant_gemm_x(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize) -> anyhow::Result<()> {
-        let mut q8 = self.3.lock().unwrap();
+        let mut q8 = self.q8_mutex(n, w.cols).lock().unwrap();
         self.q8_x(&mut q8, w.ty, w.cols, n, x, x_stride)?;
         Ok(())
     }
@@ -1210,27 +1244,40 @@ impl Backend for Vk {
             self.quant_xq(x, x_stride, w.cols, nt, self.1.addr())?;
             self.1.addr()
         };
-        self.run("gemv_q", &spec, [w.rows.div_ceil(8), 1, 1], &[&w.ptr, &xq, &y, &(y_stride as u32), &(w.rows as u32), &nc])
+        self.run("gemv_q", &spec, [w.rows.div_ceil(8), 1, 1], &[&w.ptr, &xq, &y, &0u64, &0u64, &0u64, &(y_stride as u32), &(w.rows as u32), &0u32, &nc])
     }
-    fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()> {
-        ensure!(xg > 0 && k % xg == 0, "moe_gemv: {k} slots in groups of {xg}");
-        let (nc, spec, ntok) = (gemv_cols(self.0.llama, ty, cols)?, self.wspec(ty), k / xg);
-        let (w2, y2) = pair.unwrap_or((0, 0));
-        let z = if pair.is_some() { 2 } else { 1 };
-        if matches!(ty, GgmlType::F32 | GgmlType::BF16) {
-            return self.run("moe_gemv_f", &spec, [rows, k, z], &[&w, &ids, &x, &y, &(stride as u64), &(w2 as u64), &(y2 as u64),
-                &(x_stride as u32), &(rows as u32), &nc, &(xg as u32)]);
+    fn gemvq2(&self, a: &GpuTensor, b: &GpuTensor, x: u64, x_stride: usize, xq: u64, ya: u64, yb: u64, nt: usize) -> anyhow::Result<()> {
+        if a.ty != b.ty || a.cols != b.cols || matches!(a.ty, GgmlType::F32 | GgmlType::BF16) {
+            self.gemvq(a, x, x_stride, xq, ya, a.rows, nt)?;
+            return self.gemvq(b, x, x_stride, xq, yb, b.rows, nt);
         }
+        ensure!((1..=crate::cpu_worker::TMAX).contains(&nt), "gemvq2: {nt} inputs (1 to {})", crate::cpu_worker::TMAX);
+        let (nc, spec) = (gemv_cols(self.0.llama, a.ty, a.cols)?, [&self.wspec(a.ty)[..], &[nt as u32]].concat());
         let xq = if xq != 0 { xq } else {
-            ensure!(ntok * cols * 9 / 8 <= XQ, "moe_gemv: {ntok} x {cols} inputs do not fit the quantized-x buffer");
-            self.quant_xq(x, x_stride, cols, ntok, self.1.addr())?;
+            ensure!(nt * a.cols * 9 / 8 <= XQ, "gemvq2: {nt} x {} inputs do not fit the quantized-x buffer", a.cols);
+            self.quant_xq(x, x_stride, a.cols, nt, self.1.addr())?;
             self.1.addr()
         };
-        // Rows per subgroup as CUDA's moe_gemv, about 8 super-blocks of work each (but no forced 2: with x
-        // pre-quantized, 2 rows of 2048 columns measured 2.5% slower).
-        let rpw = (2048 / cols).max(1);
-        self.run("moe_gemv_q", &spec, [rows.div_ceil(8 * rpw), k, z], &[&w, &ids, &xq, &y, &(stride as u64), &(w2 as u64), &(y2 as u64),
-            &(rows as u32), &nc, &(xg as u32), &(ntok as u32), &(rpw as u32)])
+        self.run("gemv_q", &spec, [(a.rows + b.rows).div_ceil(8), 1, 1],
+            &[&a.ptr, &xq, &ya, &b.ptr, &yb, &0u64, &(a.rows as u32), &(a.rows as u32), &(b.rows as u32), &nc])
+    }
+    fn supports_gemv_rows(&self) -> bool { true }
+    fn gemv_rows(&self, w: &GpuTensor, x: u64, ids: u64, n_rows: usize, y: u64) -> anyhow::Result<()> {
+        self.gemv_rows_n(w, x, w.cols, 0, ids, n_rows, y, 1)
+    }
+    fn gemv_rows_n(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, ids: u64, n_rows: usize, y: u64, nt: usize) -> anyhow::Result<()> {
+        ensure!(!matches!(w.ty, GgmlType::F32 | GgmlType::BF16), "gemv_rows: float weights unsupported");
+        ensure!((1..=crate::cpu_worker::TMAX).contains(&nt), "gemv_rows_n: {nt} inputs (1 to {})", crate::cpu_worker::TMAX);
+        let (nc, spec) = (gemv_cols(self.0.llama, w.ty, w.cols)?, [&self.wspec(w.ty)[..], &[nt as u32]].concat());
+        let xq = if xq != 0 { xq } else {
+            ensure!(nt * w.cols * 9 / 8 <= XQ, "gemv_rows: {nt} x {} do not fit quantized-x buffer", w.cols);
+            self.quant_xq(x, x_stride, w.cols, nt, self.1.addr())?;
+            self.1.addr()
+        };
+        self.run("gemv_q", &spec, [n_rows.div_ceil(8), 1, 1], &[&w.ptr, &xq, &y, &0u64, &0u64, &ids, &(n_rows as u32), &(n_rows as u32), &0u32, &nc])
+    }
+    fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()> {
+        self.moe_gemv_nm(ty, rows, cols, w, stride, ids, k, x, x_stride, xg, y, pair, xq, k / xg.max(1))
     }
     fn dequant(&self, w: &GpuTensor, rows: usize, out: u64) -> anyhow::Result<()> {
         self.run("dequant", &self.wspec(w.ty), [rows, 1, 1], &[&w.ptr, &out, &gemv_cols(0, w.ty, w.cols)?])
@@ -1280,14 +1327,22 @@ impl Backend for Vk {
         self.run("conv_silu", &[], [ch.div_ceil(128), 1, 1], &[&qkv, &state, &w, &y, &(ch as u32), &(kw as u32), &(nn as u32), &eps])
     }
     fn deltanet(&self, y: u64, s: u64, beta: u64, g: u64, dt_bias: u64, a: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> {
+        self.deltanet_strided(y, s, beta, g, dt_bias, a, o, nk, nv, interleave, dk, dv, scale, t, ych, snap, nsnap, 1)
+    }
+    fn delta_snap_stride(&self) -> usize { crate::gpu_model::SNAP_STRIDE }
+    fn deltanet_strided(&self, y: u64, s: u64, beta: u64, g: u64, dt_bias: u64, a: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize, snap_stride: usize) -> anyhow::Result<()> {
         let rows = 512 / dk.max(1);  // state rows per subgroup
         ensure!(matches!(dk, 32 | 64 | 128 | 256) && dv % rows == 0, "deltanet: head dims {dk}/{dv} unsupported");
-        self.run("deltanet", &[], [nv, dv.div_ceil(8 * rows), 1], &[&y, &s, &beta, &g, &o, &snap, &dt_bias, &a, &(nk as u32), &(nv as u32),
+        let spec: &[u32] = if snap_stride > 1 { &[0, snap_stride as u32] } else { &[] };
+        self.run("deltanet", spec, [nv, dv.div_ceil(8 * rows), 1], &[&y, &s, &beta, &g, &o, &snap, &dt_bias, &a, &(nk as u32), &(nv as u32),
             &(interleave as u32), &(dk as u32), &(dv as u32), &scale, &(t as u32), &(ych as u32), &(nsnap as u32)])
     }
     fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> {
         self.run("conv_seq", &[], [(t * ch).div_ceil(256), 1, 1], &[&qkv, &state, &w, &y, &(ch as u32), &(kw as u32), &(t as u32)])?;
         self.run("conv_state", &[], [ch.div_ceil(256), 1, 1], &[&qkv, &state, &snap, &(ch as u32), &(kw as u32), &(t as u32), &(nsnap as u32)])
+    }
+    fn dflash2_conv(&self, x: u64, dyn_w: u64, base: u64, out: u64, h: usize, gs: usize, k: usize, t: usize, part: usize) -> anyhow::Result<()> {
+        self.run("dflash2_conv", &[], [h.div_ceil(256), t, 1], &[&x, &dyn_w, &base, &out, &(h as u32), &(gs as u32), &(k as u32), &(t as u32), &(part as u32)])
     }
     fn attn_prefill_m(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32, qm: u64, mw: usize, sink: u64, win: usize) -> anyhow::Result<()> {
         let name = match hd { 64 => "attn_prefill_64", 128 => "attn_prefill_128", 256 => "attn_prefill_256",
@@ -1371,8 +1426,8 @@ impl Backend for Vk {
         self.run("ple_conv", &[], [d.div_ceil(256), 1, 1], &[&r, &gated, &norm, &kw, &ring, &step, &(d as u32), &(nt as u32)])
     }
     fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()> {
-        // q8: each subgroup quantizes one 32-value block of one row.
-        ensure!(!self.0.kv_q8 || (hd % 32 == 0 && n % hd == 0), "q8 KV cache: head_dim {hd} is not a multiple of 32");
+        // q8/q4: each subgroup quantizes one 32-value block of one row.
+        ensure!(self.0.kv_mode == 0 || (hd % 32 == 0 && n % hd == 0), "quantized KV cache: head_dim {hd} is not a multiple of 32");
         self.run("kv_store", &[], [(n * t).div_ceil(256), 1, 1], &[&k, &v, &kc, &vc, &step, &(n as u32), &((n * t) as u32), &(hd as u32)])
     }
     fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, sink: u64, win: usize) -> anyhow::Result<()> {
@@ -1410,7 +1465,7 @@ impl Backend for Vk {
     fn moe_down_combine(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, slots: u64, k: usize, h: u64, ye: u64, xq: u64,
                         x: u64, wh: u64, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, t: usize) -> anyhow::Result<()> {
         if t > 1 || xq == 0 || cols % 256 != 0 || k > 32 {  // t > 1 deduplicates shared experts across tokens in moe_gemv
-            self.moe_gemv(ty, rows, cols, w, stride, slots, t * k, h, cols, 1, ye, None, xq)?;
+            self.moe_gemv_nm(ty, rows, cols, w, stride, slots, t * k, h, cols, 1, ye, None, xq, t)?;
             return self.moe_combine(x, ye, wh, k, sh, sg, mb, y_off, step, slots, rows, t);
         }
         // Rows per workgroup as moe_gemv's rows per subgroup: each subgroup takes a slot.
@@ -1419,5 +1474,34 @@ impl Backend for Vk {
             &err, &(rows as u32), &((cols / 256) as u32), &((t * k) as u32), &(k as u32), &(y_off as u32), &(rpw as u32)])?;
         if mb != 0 { self.0.skip_rest(&mut self.0.st())?; }
         Ok(())
+    }
+}
+
+impl Vk {
+    fn moe_gemv_nm(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64, max_dup: usize) -> anyhow::Result<()> {
+        ensure!(xg > 0 && k % xg == 0, "moe_gemv: {k} slots in groups of {xg}");
+        let (nc, ws, ntok) = (gemv_cols(self.0.llama, ty, cols)?, self.wspec(ty), k / xg);
+        let (w2, y2) = pair.unwrap_or((0, 0));
+        if matches!(ty, GgmlType::F32 | GgmlType::BF16) {
+            let z = if pair.is_some() { 2 } else { 1 };
+            return self.run("moe_gemv_f", &ws, [rows, k, z], &[&w, &ids, &x, &y, &(stride as u64), &(w2 as u64), &(y2 as u64),
+                &(x_stride as u32), &(rows as u32), &nc, &(xg as u32)]);
+        }
+        let xq = if xq != 0 { xq } else {
+            ensure!(ntok * cols * 9 / 8 <= XQ, "moe_gemv: {ntok} x {cols} inputs do not fit the quantized-x buffer");
+            self.quant_xq(x, x_stride, cols, ntok, self.1.addr())?;
+            self.1.addr()
+        };
+        let max_nm = match max_dup.min(17) {
+            0 | 1 => 1u32,
+            2..=4 => 4,
+            5..=8 => 8,
+            _ => 17,
+        };
+        let spec = [&ws[..], &[max_nm]].concat();
+        let rpw = if max_nm > 1 { 1 } else { (4096 / cols).max(1) };
+        let z = if pair.is_some() { 2 } else { 1 };
+        self.run("moe_gemv_q", &spec, [rows.div_ceil(8 * rpw), k, z], &[&w, &ids, &xq, &y, &(stride as u64), &(w2 as u64), &(y2 as u64),
+            &(rows as u32), &nc, &(xg as u32), &(ntok as u32), &(rpw as u32)])
     }
 }

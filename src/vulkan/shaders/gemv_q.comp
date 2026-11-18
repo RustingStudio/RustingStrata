@@ -2,6 +2,7 @@
 // y[t * ys + row] = W[row] . x[t] for t < nt (at most 4), with x pre-quantized by quant_xq at xq (nt rows of cols
 // int8 values, then their scales, one per 32): one subgroup per row, 8 rows per workgroup (CUDA gemv_row_qn). With
 // cols % 256 != 0 the lanes whose 8 values lie inside the partial last super-block also read it.
+// Supports dual-matrix gemvq2 (rows..rows+rows2 read from w2 into y2) and indexed gemv_rows (I32 ids).
 // nt is specialization constant 5, as CUDA's template NT: a runtime count leaves acc indexed dynamically.
 layout(local_size_x = 256) in;
 #include "common.glsl"
@@ -10,16 +11,16 @@ layout(local_size_x = 256) in;
 #extension GL_EXT_integer_dot_product : require
 #extension GL_EXT_control_flow_attributes : require
 
-layout(push_constant) uniform P { U8 w; U32 xq; F32 y; uint ys; uint rows; uint cols; } p;
+layout(push_constant) uniform P { U8 w; U32 xq; F32 y; uint64_t w2; uint64_t y2; I32 ids; uint ys; uint rows; uint rows2; uint cols; } p;
 layout(constant_id = 5) const uint NT = 1;
 
-void sb_step(F32 xd, uint row, uint lane, uint s, inout precise float acc[NT]) {
+void sb_step(F32 xd, U8 w, uint row, uint lane, uint s, bool full, inout precise float acc[NT]) {
     uint lo, hi; float d, m;
-    qw_sb(p.w, row * rowb(p.cols) + s * SBB, lane, lo, hi, d, m);
+    qw_sb(w, row * rowb(p.cols) + s * SBB, lane, full, lo, hi, d, m);
     [[unroll]] for (uint t = 0; t < NT; t++) {
         uint o = (t * p.cols + s * 256) / 4 + lane * 2, a = p.xq.v[o], c = p.xq.v[o + 1];
         int dot = dotPacked4x8EXT(int(lo), int(a)) + dotPacked4x8EXT(int(hi), int(c));
-        int sx = dotPacked4x8EXT(0x01010101, int(a)) + dotPacked4x8EXT(0x01010101, int(c));
+        int sx = MIN ? (dotPacked4x8EXT(0x01010101, int(a)) + dotPacked4x8EXT(0x01010101, int(c))) : 0;
         float dx = xd.v[(t * p.cols + s * 256) / 32 + (lane >> 2)];
         acc[t] = fma(d * dx, float(dot), acc[t]);
         if (MIN) acc[t] = fma(-(m * dx), float(sx), acc[t]);  // types with a min
@@ -27,9 +28,13 @@ void sb_step(F32 xd, uint row, uint lane, uint s, inout precise float acc[NT]) {
 }
 
 void main() {
-    uint row = gl_WorkGroupID.x * 8 + WARP, lane = LANE;
+    uint row = gl_WorkGroupID.x * 8 + WARP, lane = LANE, tot = p.rows + p.rows2;
     load_tables();
-    if (row >= p.rows) return;
+    if (row >= tot) return;
+    bool sec = row >= p.rows;
+    U8 w = sec ? U8(p.w2) : p.w;
+    uint lr = sec ? (row - p.rows) : row;
+    uint wrow = (!sec && uint64_t(p.ids) != 0) ? uint(p.ids.v[lr]) : lr;
     F32 xd = F32(uint64_t(p.xq) + NT * p.cols);
     uint nsb = p.cols >> 8;
     precise float acc[NT];
@@ -37,13 +42,15 @@ void main() {
     // Four super-blocks per iteration so their loads overlap (kernels.cu: unroll 4); the sums keep their order.
     uint s = 0;
     if (NT <= 4) {
-        for (; s + 4 <= nsb; s += 4) [[unroll]] for (uint j = 0; j < 4; j++) sb_step(xd, row, lane, s + j, acc);
+        for (; s + 4 <= nsb; s += 4) [[unroll]] for (uint j = 0; j < 4; j++) sb_step(xd, w, wrow, lane, s + j, true, acc);
     }
-    for (; s + 2 <= nsb; s += 2) [[unroll]] for (uint j = 0; j < 2; j++) sb_step(xd, row, lane, s + j, acc);
-    for (; s < nsb; s++) sb_step(xd, row, lane, s, acc);
-    if ((p.cols & 255) > lane * 8) sb_step(xd, row, lane, nsb, acc);
+    for (; s + 2 <= nsb; s += 2) [[unroll]] for (uint j = 0; j < 2; j++) sb_step(xd, w, wrow, lane, s + j, true, acc);
+    for (; s < nsb; s++) sb_step(xd, w, wrow, lane, s, true, acc);
+    if ((p.cols & 255) > lane * 8) sb_step(xd, w, wrow, lane, nsb, false, acc);
+    F32 y = sec ? F32(p.y2) : p.y;
+    uint ys = sec ? p.rows2 : p.ys;
     [[unroll]] for (uint t = 0; t < NT; t++) {
         float a = warp_sum(acc[t]);
-        if (lane == 0) p.y.v[t * p.ys + row] = a;
+        if (lane == 0) y.v[t * ys + lr] = a;
     }
 }

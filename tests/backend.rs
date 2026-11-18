@@ -69,10 +69,12 @@ fn host_mailbox_is_shared_with_kernels() {
 fn shared_memory_matches_the_committed_spirv() {
     let q2k = [0, 10, 84, 0, 0];  // T = Q2_K (10), SBB = 84: KS = 16
     let iq3s = [0, 21, 110, 0, 0];  // T = IQ3_S (21), SBB = 110: KS = 32
-    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi_dp", &q2k, false).unwrap(), 49152, "gemmi_dp with Q2_K");
-    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi_dp", &iq3s, false).unwrap(), 40960, "gemmi_dp with IQ3_S");
+    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi_dp", &q2k, 0).unwrap(), 49152, "gemmi_dp with Q2_K");
+    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi_dp", &iq3s, 0).unwrap(), 40960, "gemmi_dp with IQ3_S");
     // The COOP variant reads the IQ tables from the buffer too: a shared copy asked for 49168 bytes (Xid 13 on a V100).
-    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi", &q2k, false).unwrap(), 49152, "gemmi with Q2_K");
+    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi", &q2k, 0).unwrap(), 49152, "gemmi with Q2_K");
+    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi_16", &q2k, 0).unwrap(), 40960, "gemmi_16 with Q2_K");
+    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi_s_16", &q2k, 0).unwrap(), 20992, "gemmi_s_16 with Q2_K");
 }
 
 /// The refusal `Vk::pipeline` raises before it creates anything: kernel, specialization, bytes needed and limit.
@@ -82,12 +84,12 @@ fn shared_memory_matches_the_committed_spirv() {
 fn shared_memory_refusal_names_kernel_spec_bytes_and_limit() {
     use rusting_strata::vulkan::spv_smem::check_shared_memory;
     let spec = [0u32, 10, 84, 0, 0];
-    let e = format!("{:#}", check_shared_memory("gemmi_dp", &spec, false, 40960).unwrap_err());
+    let e = format!("{:#}", check_shared_memory("gemmi_dp", &spec, 0, 40960).unwrap_err());
     for want in ["gemmi_dp", "[0, 10, 84, 0, 0]", "49152", "40960", "maxComputeSharedMemorySize"] {
         assert!(e.contains(want), "{e:?} does not contain {want:?}");
     }
     // Exactly at the limit is accepted: the V100 reports 49152 and `gemmi_dp` with Q2_K needs 49152.
-    assert_eq!(check_shared_memory("gemmi_dp", &spec, false, 49152).unwrap(), 49152);
+    assert_eq!(check_shared_memory("gemmi_dp", &spec, 0, 49152).unwrap(), 49152);
 }
 
 /// The preflight over the reference model's weight types only (no weights uploaded): every pair must fit. Skips

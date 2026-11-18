@@ -24,12 +24,16 @@ layout(push_constant) uniform P { U64 tiles; uint64_t wd; U32 x; I32 xrow; F32 y
 #ifndef SM
 #define SM 0
 #endif
+#ifndef COOP_K
+#define COOP_K 32
+#endif
 // SM 1 (gemmi_s): only the tiles of at most 32 positions, as gemm_fs; X holds XM positions.
 const uint BM = 128, XM = SM != 0 ? 32 : BM;
 const uint KS = T == 42 || T == 34 || T == 35 || T == 2 || T == 3 || T == 6 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23 ? 32 : 16;
-// Rows in words. The int8 products are 32 deep: for KS = 16, w row holds each 16 values followed by 16 zeros (so
-// the 16 x values after each 16 add nothing).
-const uint PX = 20, PW = KS == 32 ? 20 : 36;
+// Rows in words. On NVIDIA (COOP_K 32), KS = 16 pads each 16 weights with 16 zeros (PW = 36).
+// On RDNA 3/3.5 (COOP_K 16), 16x16x16 coopmat consumes KS = 16 directly without padding (PW = 20).
+const uint PX = 20, PW = (COOP != 0 && COOP_K == 16) || KS == 32 ? 20 : 36;
+const uint WS = PW == 20 ? 4 : 8;
 // X and W are double buffered: step kb + 1 is stored while step kb's products run, so one barrier per step.
 shared uint xq[2 * XM * PX], wq[2 * 64 * PW];
 shared float xd[2][XM][2], xsum[2][XM][4], wsc[2][64][4], wmn[2][64][4];
@@ -96,7 +100,7 @@ void main() {
     const uint IX = XM * PX;
     for (uint i = tid; i < 256; i += 256) { xq[IX + i] = i / 16; xq[IX + 256 + i] = i % 16; }
 #endif
-    if (KS == 16) for (uint i = tid; i < 2 * 64 * PW; i += 256) wq[i] = 0;
+    if (PW == 36) for (uint i = tid; i < 2 * 64 * PW; i += 256) wq[i] = 0;
     load_tables();
     barrier();
     // Subgroup w multiplies rows bm .. bm + 31 by columns bn .. bn + 31 of the tile, or with sm (at most 32 positions,
@@ -130,7 +134,7 @@ void main() {
     uvec4 wv; float d, m;
     ldw(wt, wr, wi, wok, n0, 0, wv, d, m);
     if (xr < XM) ldx(xr, xh, xok, xo, cols, 0, 0);
-    [[unroll]] for (uint j = 0; j < 4; j++) wq[wr * PW + wi * 128 / KS + j] = wv[j];
+    [[unroll]] for (uint j = 0; j < 4; j++) wq[wr * PW + wi * WS + j] = wv[j];
     wsc[0][wr][wi] = d; wmn[0][wr][wi] = m;
     for (uint kb = 0; kb < p.nk; kb++) {
         uint xb = kb & 1;
@@ -141,12 +145,25 @@ void main() {
         if (bm < cnt)
         [[unroll]] for (uint h = 0; h < 64 / KS; h++) {
 #if COOP
+#if COOP_K == 16
+            coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a0[2], a1[2];
+            coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b0[2], b1[2];
+            [[unroll]] for (uint i = 0; i < 2; i++) if (!sm || i == 0) {
+                coopMatLoad(a0[i], xq, (xb * XM + bm + 16 * i) * PX + h * (KS / 4), PX, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(b0[i], wq, (xb * 64 + bn + 16 * i) * PW + h * (KS / 4), PW, gl_CooperativeMatrixLayoutColumnMajor);
+                if (KS == 32) {
+                    coopMatLoad(a1[i], xq, (xb * XM + bm + 16 * i) * PX + h * 8 + 4, PX, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(b1[i], wq, (xb * 64 + bn + 16 * i) * PW + h * 8 + 4, PW, gl_CooperativeMatrixLayoutColumnMajor);
+                }
+            }
+#else
             coopmat<int8_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> a[2];
             coopmat<int8_t, gl_ScopeSubgroup, 32, 16, gl_MatrixUseB> b[2];
             [[unroll]] for (uint i = 0; i < 2; i++) if (!sm || i == 0) {
                 coopMatLoad(a[i], xq, (xb * XM + bm + 16 * i) * PX + h * KS / 4, PX, gl_CooperativeMatrixLayoutRowMajor);
                 coopMatLoad(b[i], wq, (xb * 64 + bn + 16 * i) * PW + h * 8, PW, gl_CooperativeMatrixLayoutColumnMajor);
             }
+#endif
 #endif
             // NVIDIA layout: a lane's scales are those of 2 rows per mt and 4 columns per nt, loaded once per h.
             float da[2][2], sa[2][2], db[2][4], mb[2][4];
@@ -167,7 +184,12 @@ void main() {
             [[unroll]] for (uint mt = 0; mt < 2; mt++)
                 [[unroll]] for (uint nt = 0; nt < 2; nt++) if (!sm || mt + nt == 0) {
 #if COOP
+#if COOP_K == 16
+                    IACC c = coopMatMulAdd(a0[mt], b0[nt], IACC(I2F_BIAS));
+                    if (KS == 32) c = coopMatMulAdd(a1[mt], b1[nt], c);
+#else
                     IACC c = coopMatMulAdd(a[mt], b[nt], IACC(I2F_BIAS));
+#endif
 #else
                     // The KS int8 of x rows RI and w rows CI (for KS = 16 the zeros after them add nothing).
                     uint xw[2][KS / 4], ww[4][KS / 4];
@@ -197,7 +219,7 @@ void main() {
                 }
         }
         if (kb + 1 < p.nk) {
-            [[unroll]] for (uint j = 0; j < 4; j++) wq[((xb ^ 1) * 64 + wr) * PW + wi * 128 / KS + j] = wv[j];
+            [[unroll]] for (uint j = 0; j < 4; j++) wq[((xb ^ 1) * 64 + wr) * PW + wi * WS + j] = wv[j];
             wsc[xb ^ 1][wr][wi] = d; wmn[xb ^ 1][wr][wi] = m;
         }
     }

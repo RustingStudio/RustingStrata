@@ -83,3 +83,35 @@ fn sampler_accept_keeps_the_distribution() {
         assert!(n[3] == 0 && (f(0) - 0.5).abs() < 0.015 && (f(1) - 0.25).abs() < 0.015, "d {d}: {n:?}");
     }
 }
+
+#[test]
+fn sampler_accept_dist_keeps_the_distribution() {
+    // Leviathan rejection sampling (`draft_dist` + `accept_dist`) must preserve the exact target distribution
+    // regardless of the draft logit distribution (uniform, aligned, anti-aligned) and under top_k / top_p truncation.
+    let target = [2.0f32.ln(), 1.0f32.ln(), 1.0f32.ln(), -50.0]; // 1/2, 1/4, 1/4, ~0
+    let drafts = [
+        [0.0f32, 0.0, 0.0, 0.0],              // uniform draft
+        [4.0, 2.0, 1.0, -10.0],               // aligned peaked draft
+        [-2.0, 0.0, 3.0, 1.0],                // anti-aligned draft putting mass on low-prob tokens
+    ];
+    for q_logits in drafts {
+        let mut s = Sampler { temp: 1.0, top_k: 0, top_p: 1.0, rng: 17 };
+        let mut n = [0usize; 4];
+        for _ in 0..40000 {
+            let (d, q) = s.draft_dist(&q_logits).unwrap();
+            let out = s.accept_dist(&target, d as usize, &q).unwrap().unwrap_or(d as usize);
+            n[out] += 1;
+        }
+        let f = |i: usize| n[i] as f32 / 40000.0;
+        assert!(
+            n[3] == 0 && (f(0) - 0.5).abs() < 0.018 && (f(1) - 0.25).abs() < 0.018 && (f(2) - 0.25).abs() < 0.018,
+            "draft {q_logits:?}: {n:?}"
+        );
+    }
+    let mut s = Sampler { temp: 1.0, top_k: 2, top_p: 0.9, rng: 9 };
+    for _ in 0..2000 {
+        let (d, q) = s.draft_dist(&[0.0, 0.0, 5.0, 5.0]).unwrap();
+        let out = s.accept_dist(&target, d as usize, &q).unwrap().unwrap_or(d as usize);
+        assert!(out < 2, "top_k=2 violated: {out}");
+    }
+}

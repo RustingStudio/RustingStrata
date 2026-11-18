@@ -42,23 +42,33 @@ void main() {
         ps[i] = float16_t(i / 16); ps[256 + i] = float16_t(i % 16);
     }
     barrier();
-    // Accumulator element i of this invocation is at row ri[i], column ci[i] (the layout is the implementation's).
-    ACC ri, ci;
-    coopMatLoad(ri, ss, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
-    coopMatLoad(ci, ss, 256, 16, gl_CooperativeMatrixLayoutRowMajor);
-    // nv: the layout of mma.sync (element i at row g + 8 (i >> 2), column 2 t4 + (i & 1) + 8 ((i >> 1) & 1)), so
-    // scores and rescales stay in registers as in CUDA.
-    bool nv = ri.length() == 8;
-    [[unroll]] for (uint i = 0; i < ri.length(); i++) nv = nv && uint(ri[i]) == g + 8 * (i >> 2) && uint(ci[i]) == 2 * t4 + (i & 1) + 8 * ((i >> 1) & 1);
-    nv = subgroupAll(nv);
+    // Pack the 8 (row, col) indices in 0..15 of this lane's accumulator elements into 2 uint VGPRs instead of keeping 16 float VGPRs live.
+    uint r_pack = 0u, c_pack = 0u;
+    bool nv;
+    {
+        ACC ri, ci;
+        coopMatLoad(ri, ss, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(ci, ss, 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+        nv = ri.length() == 8;
+        [[unroll]] for (uint i = 0; i < ri.length(); i++) {
+            uint rv = uint(ri[i]), cv = uint(ci[i]);
+            nv = nv && rv == g + 8 * (i >> 2) && cv == 2 * t4 + (i & 1) + 8 * ((i >> 1) & 1);
+            r_pack |= (rv & 15u) << (4u * i);
+            c_pack |= (cv & 15u) << (4u * i);
+        }
+        nv = subgroupAll(nv);
+    }
     // nva: A matrices in mma.sync's layout too (element i at row g + 8 ((i >> 1) & 1), column 2 t4 + (i & 1) +
     // 8 (i >> 2)), so the softmax weights go into the PV products from registers.
-    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ra, ca;
-    coopMatLoad(ra, ps, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
-    coopMatLoad(ca, ps, 256, 16, gl_CooperativeMatrixLayoutRowMajor);
-    bool nva = nv && ra.length() == 8;
-    [[unroll]] for (uint i = 0; i < ra.length(); i++) nva = nva && uint(ra[i]) == g + 8 * ((i >> 1) & 1) && uint(ca[i]) == 2 * t4 + (i & 1) + 8 * (i >> 2);
-    nva = subgroupAll(nva);
+    bool nva;
+    {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ra, ca;
+        coopMatLoad(ra, ps, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(ca, ps, 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+        nva = nv && ra.length() == 8;
+        [[unroll]] for (uint i = 0; i < ra.length(); i++) nva = nva && uint(ra[i]) == g + 8 * ((i >> 1) & 1) && uint(ca[i]) == 2 * t4 + (i & 1) + 8 * (i >> 2);
+        nva = subgroupAll(nva);
+    }
     barrier();  // ps is rewritten below
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> qa[HD / 16];
     [[unroll]] for (uint kk = 0; kk < HD / 16; kk++) coopMatLoad(qa[kk], kvs, w * 16 * PQ + kk * 2, PQ, gl_CooperativeMatrixLayoutRowMajor);
@@ -71,29 +81,41 @@ void main() {
     uint sb = w * 16 * BK, pb = w * 16 * PP, rb = w * 16;
     for (uint k0 = 0; k0 <= last; k0 += BK) {
         barrier();
-        // All of a thread's loads, then its stores, so the loads overlap (#279). Rows past `last` load the row
-        // `last` and store zeros: a select, not a branch around the loads (#276).
+        // All of a thread's loads, then its stores, so the loads overlap (#279) for HD <= 128; at HD > 128 load/store per
+        // iteration to avoid holding 64 VGPRs for kl[N]/vl[N].
         const uint N = BK * HD / 8 / 128;
-        uvec4 kl[N], vl[N];
-        [[unroll]] for (uint n = 0; n < N; n++) {
-            uint i = tid + n * 128, r = i / (HD / 8), c = i % (HD / 8), off = (min(k0 + r, last) * kvd + kvh * HD) / 8 + c, o = off * 8;
-            kl[n] = KV_Q8 ? uvec4(ldkv4(p.kc, o, HD), ldkv4(p.kc, o + 4, HD)) : UV4(uint64_t(p.kc)).v[off];
-            vl[n] = KV_Q8 ? uvec4(ldkv4(p.vc, o, HD), ldkv4(p.vc, o + 4, HD)) : UV4(uint64_t(p.vc)).v[off];
-        }
-        [[unroll]] for (uint n = 0; n < N; n++) {
-            uint i = tid + n * 128, r = i / (HD / 8), c = i % (HD / 8);
-            bool in_ = k0 + r <= last;
-            kvs[r * PQ + c] = in_ ? kl[n] : uvec4(0);
-            kvs[(BK + r) * PQ + c] = in_ ? vl[n] : uvec4(0);
+        if (HD > 128) {
+            for (uint n = 0; n < N; n++) {
+                uint i = tid + n * 128, r = i / (HD / 8), c = i % (HD / 8), off = (min(k0 + r, last) * kvd + kvh * HD) / 8 + c, o = off * 8;
+                bool in_ = k0 + r <= last;
+                uvec4 kl = KV_MODE > 0u ? uvec4(ldkv4(p.kc, o, HD), ldkv4(p.kc, o + 4, HD)) : UV4(uint64_t(p.kc)).v[off];
+                uvec4 vl = KV_MODE > 0u ? uvec4(ldkv4(p.vc, o, HD), ldkv4(p.vc, o + 4, HD)) : UV4(uint64_t(p.vc)).v[off];
+                kvs[r * PQ + c] = in_ ? kl : uvec4(0);
+                kvs[(BK + r) * PQ + c] = in_ ? vl : uvec4(0);
+            }
+        } else {
+            uvec4 kl[N], vl[N];
+            [[unroll]] for (uint n = 0; n < N; n++) {
+                uint i = tid + n * 128, r = i / (HD / 8), c = i % (HD / 8), off = (min(k0 + r, last) * kvd + kvh * HD) / 8 + c, o = off * 8;
+                kl[n] = KV_MODE > 0u ? uvec4(ldkv4(p.kc, o, HD), ldkv4(p.kc, o + 4, HD)) : UV4(uint64_t(p.kc)).v[off];
+                vl[n] = KV_MODE > 0u ? uvec4(ldkv4(p.vc, o, HD), ldkv4(p.vc, o + 4, HD)) : UV4(uint64_t(p.vc)).v[off];
+            }
+            [[unroll]] for (uint n = 0; n < N; n++) {
+                uint i = tid + n * 128, r = i / (HD / 8), c = i % (HD / 8);
+                bool in_ = k0 + r <= last;
+                kvs[r * PQ + c] = in_ ? kl[n] : uvec4(0);
+                kvs[(BK + r) * PQ + c] = in_ ? vl[n] : uvec4(0);
+            }
         }
         barrier();
         ACC s0 = ACC(0.0), s1 = ACC(0.0);
         [[unroll]] for (uint kk = 0; kk < HD / 16; kk++) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b0, b1;  // K^T: dims kk.. by keys 0.. / 16..
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b0, b1;
             coopMatLoad(b0, kvs, kk * 2, PQ, gl_CooperativeMatrixLayoutColumnMajor);
             coopMatLoad(b1, kvs, 16 * PQ + kk * 2, PQ, gl_CooperativeMatrixLayoutColumnMajor);
             s0 = coopMatMulAdd(qa[kk], b0, s0);
             s1 = coopMatMulAdd(qa[kk], b1, s1);
+            if (HD > 128 && (kk & 1u) == 1u) subgroupMemoryBarrierShared();
         }
         // CUDA's lane holds s[nt][e]: row g + 8 (e >> 1), key nt * 8 + 2 t4 + (e & 1).
         float s[4][4], mx[2] = {m[0], m[1]}, c[2];
@@ -145,7 +167,7 @@ void main() {
             subgroupBarrier();
         }
         [[unroll]] for (uint d = 0; d < HD / 16; d++)
-            [[unroll]] for (uint i = 0; i < acc[d].length(); i++) acc[d][i] *= nv ? c[i >> 2] : rs[rb + uint(ri[i])];
+            [[unroll]] for (uint i = 0; i < acc[d].length(); i++) acc[d][i] *= nv ? c[i >> 2] : rs[rb + ((r_pack >> (4u * i)) & 15u)];
         [[unroll]] for (uint kb = 0; kb < BK / 16; kb++) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> pa;
             if (nva) {
@@ -155,6 +177,7 @@ void main() {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> vb;
                 coopMatLoad(vb, kvs, (BK + kb * 16) * PQ + d * 2, PQ, gl_CooperativeMatrixLayoutRowMajor);
                 acc[d] = coopMatMulAdd(pa, vb, acc[d]);
+                if (HD > 128 && (d & 1u) == 1u) subgroupMemoryBarrierShared();
             }
         }
     }
@@ -169,7 +192,7 @@ void main() {
     float sk = uint64_t(p.sink) != 0 ? p.sink.v[h] : ninf;
     [[unroll]] for (uint d = 0; d < HD / 16; d++)
         [[unroll]] for (uint i = 0; i < acc[d].length(); i++) {
-            uint row = uint(ri[i]), col = d * 16 + uint(ci[i]), t = q0 + w * 16 + row;
+            uint row = (r_pack >> (4u * i)) & 15u, col = d * 16 + ((c_pack >> (4u * i)) & 15u), t = q0 + w * 16 + row;
             if (t >= p.t) continue;
             float mx = rm[rb + row];
             float M = max(mx, sk), sc = mx == ninf ? 0.0 : expf_(mx - M);
