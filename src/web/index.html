@@ -362,7 +362,7 @@ progress { width: 100%; height: 6px; accent-color: var(--accent); margin-top: 10
       <div><label for="emtp">MTP drafts <output id="emtp-o"></output></label><input id="emtp" type="range" min="0" max="8" step="1" value="0"></div>
     </div>
     <div class="row">
-      <div><label for="ekv">KV cache format</label><select id="ekv"><option value="f16">f16 (default)</option><option value="q8">q8 (half the memory)</option></select></div>
+      <div><label for="ekv">KV cache format</label><select id="ekv"><option value="f16">f16 (default)</option><option value="q8">q8 (half the memory)</option><option value="q4">q4 (quarter the memory)</option><option value="q2">q2 (5.3x smaller, 512k-1M ctx)</option></select></div>
       <div><label for="ecache">chat cache in RAM, MB</label><input id="ecache" type="number" min="0" step="256"></div>
     </div>
     <div class="row">

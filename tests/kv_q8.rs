@@ -14,20 +14,38 @@ fn rel_l2(a: &[f32], b: &[f32]) -> f32 {
     (num / den.max(1e-30)).sqrt()
 }
 
+fn set_kv_mode(kv: Option<&str>) {
+    match kv {
+        Some("q8") => {
+            unsafe { std::env::set_var("STRATA_KV", "q8") };
+            unsafe { std::env::set_var("STRATA_KV_Q8", "1") };
+        }
+        Some(m) => {
+            unsafe { std::env::set_var("STRATA_KV", m) };
+            unsafe { std::env::remove_var("STRATA_KV_Q8") };
+        }
+        None => {
+            unsafe { std::env::remove_var("STRATA_KV") };
+            unsafe { std::env::remove_var("STRATA_KV_Q8") };
+        }
+    }
+}
+
 /// Prefill and decode attention over a cache filled by kv_store: q8 vs f16 within q8 rounding, q8 prefill vs q8
 /// decode as close as with f16, q8 batched decode bit-identical to single-token decode, and Vulkan q8 bit-identical
 /// to CUDA q8 (cache bytes, decode, and prefill with cooperative matrices).
 #[test]
 fn q8_kv_attention_matches_f16() {
+    let _gpu = common::gpu_lock();
     let mk = |q8: bool| {
-        if q8 { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } } else { unsafe { std::env::remove_var("STRATA_KV_Q8") } }
+        set_kv_mode(q8.then_some("q8"));
         match Gpu::new(0) {
             Ok(g) => Some(g),
             Err(e) if format!("{e}") == "CUDA init" => { eprintln!("SKIP: no GPU: {e:#}"); None }
             Err(e) => panic!("{e:#}"),
         }
     };
-    let Some(g8) = mk(true) else { return };
+    let Some(g8) = mk(true) else { set_kv_mode(None); return };
     let vk8 = match rusting_strata::vulkan::Vk::new(0) {
         Ok(v) => Some(v),
         Err(e) if format!("{e}") == "Vulkan init" => { eprintln!("SKIP: vulkan: {e:#}"); None }
@@ -89,7 +107,97 @@ fn q8_kv_attention_matches_f16() {
             assert!(dv == d8, "vulkan q8 decode nh {nh} nkv {nkv} hd {hd}");
         }
     }
+    set_kv_mode(None);
 }
+
+fn assert_quant_kv(kv: &str, max_rel_l2: f32, want_words_64: usize) {
+    let _gpu = common::gpu_lock();
+    let open_vk = |mode: Option<&str>| {
+        set_kv_mode(mode);
+        match rusting_strata::vulkan::Vk::new(0) {
+            Ok(v) => Some(v),
+            Err(e) if format!("{e}") == "Vulkan init" => { eprintln!("SKIP: vulkan: {e:#}"); None }
+            Err(e) => panic!("{e:#}"),
+        }
+    };
+    let open_cu = |mode: Option<&str>| {
+        set_kv_mode(mode);
+        match Gpu::new(0) {
+            Ok(g) => Some(g),
+            Err(e) if format!("{e}") == "CUDA init" => None,
+            Err(e) => panic!("{e:#}"),
+        }
+    };
+    let mut pairs: Vec<(Box<dyn Backend>, Box<dyn Backend>, &str)> = Vec::new();
+    if let (Some(gq), Some(f16)) = (open_vk(Some(kv)), open_vk(None)) {
+        pairs.push((Box::new(gq), Box::new(f16), "vulkan"));
+    }
+    if let (Some(gq), Some(f16)) = (open_cu(Some(kv)), open_cu(None)) {
+        pairs.push((Box::new(gq), Box::new(f16), "cuda"));
+    }
+    set_kv_mode(None);
+    if pairs.is_empty() { eprintln!("SKIP: no Vulkan or CUDA backend"); return; }
+    let (pos0, t) = (5, 100);
+    for (gq, gf, label) in &pairs {
+        assert_eq!((gq.kv_words(64), gf.kv_words(64)), (want_words_64, 64), "{label}: {kv} kv_words");
+        for (nh, nkv, hd) in [(4, 2, 64), (4, 2, 128), (16, 2, 256), (8, 8, 128)] {
+            let n = (pos0 + t) * nkv * hd;
+            let (k, v) = (xs(n), xs(n + 5)[5..].iter().map(|x| 3.0 * x).collect::<Vec<_>>());
+            let q: Vec<f32> = xs(t * nh * hd + 3)[3..].iter().map(|v| 4.0 * v).collect();
+            let qg = xs(t * nh * 2 * hd);
+            let scale = 1.0 / (hd as f32).sqrt();
+            let run = |g: &dyn Backend| {
+                let cache = g.kv_words(n);
+                let (dk, dv) = (up(g, &k), up(g, &v));
+                let (kc, vc) = (g.zeros::<u16>(cache).unwrap(), g.zeros::<u16>(cache).unwrap());
+                let zero = up(g, &[0i32]);
+                g.kv_store(dk.addr(), dv.addr(), kc.addr(), vc.addr(), nkv * hd, pos0 + t, zero.addr(), hd).unwrap();
+                let (dq, dg) = (up(g, &q), up(g, &qg));
+                let step = up(g, &[pos0 as i32]);
+                let dout = g.zeros::<f32>(t * nh * hd).unwrap();
+                g.attn_prefill(dq.addr(), kc.addr(), vc.addr(), dg.addr(), dout.addr(), step.addr(), t, nh, nkv, hd, scale).unwrap();
+                let mut dec = vec![];
+                for gq_min in [ATT_GQA_MIN, 0] {
+                    let steps: Vec<i32> = (0..t).flat_map(|i| [(pos0 + i) as i32, 0]).collect();
+                    let ds = up(g, &steps);
+                    let (dd, part) = (g.zeros::<f32>(t * nh * hd).unwrap(), g.zeros::<f32>(t * nh * ATT_SPLITS * (hd + 2)).unwrap());
+                    g.attn_decode_gq(dq.addr(), kc.addr(), vc.addr(), dg.addr(), dd.addr(), part.addr(), ds.addr(),
+                                     nh, nkv, hd, scale, gq_min, t, 0, 0).unwrap();
+                    let batched = down::<f32>(g, &dd);
+                    let i = t - 1;
+                    let s = up(g, &[(pos0 + i) as i32, 0]);
+                    let off = |p: u64, per: usize| p + (i * per * 4) as u64;
+                    g.attn_decode_gq(off(dq.addr(), nh * hd), kc.addr(), vc.addr(), off(dg.addr(), nh * 2 * hd),
+                                     off(dd.addr(), nh * hd), part.addr(), s.addr(), nh, nkv, hd, scale, gq_min, 1, 0, 0).unwrap();
+                    assert_eq!(down::<f32>(g, &dd), batched, "{label} {kv} batched decode nh {nh} nkv {nkv} hd {hd} gq_min {gq_min}");
+                    dec.push(batched);
+                }
+                (down::<f32>(g, &dout), dec)
+            };
+            let (pf, df) = run(gf.as_ref());
+            let (pq, dq) = run(gq.as_ref());
+            for (j, (a, b)) in dq.iter().zip(&df).enumerate() {
+                let e = rel_l2(a, b);
+                let pd = rel_l2(&pq, a);
+                eprintln!("{label} nh {nh} nkv {nkv} hd {hd} kernel {j}: {kv} vs f16 decode {e:.2e}, {kv} prefill vs decode {pd:.2e}");
+                assert!(e < max_rel_l2, "{label} {kv} vs f16 decode nh {nh} nkv {nkv} hd {hd}: {e}");
+                assert!(pd <= 5e-4, "{label} {kv} prefill vs decode nh {nh} nkv {nkv} hd {hd}: {pd}");
+            }
+            let pe = rel_l2(&pq, &pf);
+            assert!(pe < max_rel_l2, "{label} {kv} prefill vs f16 prefill nh {nh} nkv {nkv} hd {hd}: {pe}");
+        }
+    }
+}
+
+/// `--kv q4`: q4_0 KV cache on Vulkan (and CUDA when present): quarter memory vs f16 (`kv_words(64) == 18`),
+/// decode/prefill stay within q4_0 quantization error against f16, prefill matches decode, and batched decode is
+/// bit-identical to single-token decode.
+#[test]
+fn q4_kv_attention_matches_f16() { assert_quant_kv("q4", 0.08, 18); }
+
+/// `--kv q2`: 2-bit affine KV cache (`kv_words(64) == 12`, 5.33x smaller than f16 for 512K-1M ctx).
+#[test]
+fn q2_kv_attention_matches_f16() { assert_quant_kv("q2", 0.35, 12); }
 
 /// `serve --parallel` with `--kv q8`: the three slots each get a q8_0-sized KV cache, and one batched decode forward
 /// over all of them gives the same logits, bit for bit, as decoding each slot alone. The per-slot `kc`/`vc` are
@@ -99,12 +207,13 @@ fn q8_multi_slot_matches_single() {
     use rusting_strata::{gguf::Gguf, gpu_model::GpuModel, model::Model, ops, tokenizer::Tokenizer};
     let _gpu = common::gpu_lock();
     let Some(p) = common::model_path() else { return };
-    unsafe { std::env::set_var("STRATA_KV_Q8", "1") };
+    set_kv_mode(Some("q8"));
     let gpu = match Gpu::new(0) {
         Ok(g) => g,
-        Err(e) if format!("{e}") == "CUDA init" => { eprintln!("SKIP: no GPU: {e:#}"); return }
-        Err(e) => panic!("{e:#}"),
+        Err(e) if format!("{e}") == "CUDA init" => { set_kv_mode(None); eprintln!("SKIP: no GPU: {e:#}"); return }
+        Err(e) => { set_kv_mode(None); panic!("{e:#}"); }
     };
+    set_kv_mode(None);
     assert_eq!(gpu.kv_words(64), 34);
     let g = Gguf::open(&p).unwrap();
     let m = Model::load(&g).unwrap();

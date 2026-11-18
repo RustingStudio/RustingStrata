@@ -225,6 +225,23 @@ fn parses_stop_and_n() {
 }
 
 #[test]
+fn parses_thinking_budget() {
+    let q = |extra: &str| chat_request(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{extra}}}"#).as_bytes()).map(|q| q.thinking_budget);
+    assert_eq!(q("").unwrap(), None);
+    assert_eq!(q(r#","thinking_budget":0"#).unwrap(), Some(0));
+    assert_eq!(q(r#","thinking_budget":1024"#).unwrap(), Some(1024));
+    assert_eq!(q(r#","chat_template_kwargs":{"thinking_budget":512}"#).unwrap(), Some(512));
+    assert!(q(r#","thinking_budget":-1"#).is_err());
+    assert!(q(r#","chat_template_kwargs":{"thinking_budget":"bad"}"#).is_err());
+
+    let anth = r#"{"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":768}}"#;
+    let body = messages_body(anth.as_bytes()).unwrap();
+    let parsed = chat_request(&body).unwrap();
+    assert_eq!(parsed.think, Some(true));
+    assert_eq!(parsed.thinking_budget, Some(768));
+}
+
+#[test]
 fn lists_models_once_per_split() {
     let d = std::env::temp_dir().join(format!("strata-list-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);

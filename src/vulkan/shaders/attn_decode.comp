@@ -46,54 +46,45 @@ void main() {
 #define cell(i) (sp ? uint(p.sel.v[so + 1 + (i)]) : (base + (i)))
     barrier();
     for (uint c0 = p0; c0 < p1; c0 += C) {
-        uint kr[J * PER / 2], vr[J * PER / 2];
+        float s_part[J * G];
         [[unroll]] for (uint j = 0; j < J; j++) {
-            // Positions past p1 load the row p1 - 1 and keep zeros: a select, not a branch around the loads (#276).
+            uint kr[PER / 2];
             uint tt = c0 + w * J + j, r = ((cell(min(tt, p1 - 1)) * p.nkv + g) * HD + lane * PER) / 2;
-            if (KV_Q8 && PER % 4 == 0) {  // the lane's PER values in PER / 4 word loads
+            if (KV_MODE > 0u && PER % 4 == 0) {
                 [[unroll]] for (uint d = 0; d < PER / 2; d += 2) {
-                    uvec2 k = ldkv4(U16(uint64_t(p.kc)), 2 * (r + d), HD), v = ldkv4(U16(uint64_t(p.vc)), 2 * (r + d), HD);
-                    if (tt >= p1) { k = uvec2(0); v = uvec2(0); }
-                    kr[j * PER / 2 + d] = k.x; kr[j * PER / 2 + d + 1] = k.y;
-                    vr[j * PER / 2 + d] = v.x; vr[j * PER / 2 + d + 1] = v.y;
+                    uvec2 k = ldkv4(U16(uint64_t(p.kc)), 2 * (r + d), HD);
+                    if (tt >= p1) k = uvec2(0);
+                    kr[d] = k.x; kr[d + 1] = k.y;
                 }
-            } else if (!KV_Q8 && WIDE && PER % 8 == 0) {  // the lane's PER halves in PER / 8 uvec4 loads
+            } else if (KV_MODE == 0u && WIDE && PER % 8 == 0) {
                 [[unroll]] for (uint d = 0; d < PER / 2; d += 4) {
-                    uvec4 k = UV4(uint64_t(p.kc)).v[(r + d) / 4], v = UV4(uint64_t(p.vc)).v[(r + d) / 4];
-                    [[unroll]] for (uint e = 0; e < 4; e++) {
-                        kr[j * PER / 2 + d + e] = tt >= p1 ? 0 : k[e]; vr[j * PER / 2 + d + e] = tt >= p1 ? 0 : v[e];
-                    }
+                    uvec4 k = UV4(uint64_t(p.kc)).v[(r + d) / 4];
+                    [[unroll]] for (uint e = 0; e < 4; e++) kr[d + e] = tt >= p1 ? 0 : k[e];
                 }
             } else {
                 [[unroll]] for (uint d = 0; d < PER / 2; d++) {
-                    uint k = KV_Q8 ? ldkv2(U16(uint64_t(p.kc)), 2 * (r + d), HD) : p.kc.v[r + d];
-                    uint v = KV_Q8 ? ldkv2(U16(uint64_t(p.vc)), 2 * (r + d), HD) : p.vc.v[r + d];
-                    kr[j * PER / 2 + d] = tt >= p1 ? 0 : k; vr[j * PER / 2 + d] = tt >= p1 ? 0 : v;
+                    uint k = KV_MODE > 0u ? ldkv2(U16(uint64_t(p.kc)), 2 * (r + d), HD) : p.kc.v[r + d];
+                    kr[d] = tt >= p1 ? 0 : k;
                 }
             }
-        }
-        float kf[J * PER], sp[J * G];
-        [[unroll]] for (uint j = 0; j < J; j++)
-            [[unroll]] for (uint d = 0; d < PER; d++) kf[j * PER + d] = hraw(kr[j * PER / 2 + d / 2], d);
-        [[unroll]] for (uint i = 0; i < G; i++) {
-            float qv[PER];
-            [[unroll]] for (uint d = 0; d < PER; d++) qv[d] = sq[i * HD + lane * PER + d];
-            [[unroll]] for (uint j = 0; j < J; j++) {
+            float kf[PER];
+            [[unroll]] for (uint d = 0; d < PER; d++) kf[d] = hraw(kr[d / 2], d);
+            [[unroll]] for (uint i = 0; i < G; i++) {
                 precise float s = 0.0;
-                [[unroll]] for (uint d = 0; d < PER; d++) s = fma(qv[d], kf[j * PER + d], s);
-                sp[j * G + i] = s;
+                [[unroll]] for (uint d = 0; d < PER; d++) s = fma(sq[i * HD + lane * PER + d], kf[d], s);
+                s_part[j * G + i] = s;
             }
         }
-        {   // warp_sum_scatter<J * G>: lane l ends with the sum of sp[l / (32 / (J * G))]
+        {   // warp_sum_scatter<J * G>: lane l ends with the sum of s_part[l / (32 / (J * G))]
             const uint N = J * G, L = 32 / N;
             [[unroll]] for (uint S = N / 2; S >= 1; S /= 2) {
                 bool hi = (lane & (S * 32 / N)) != 0;
                 [[unroll]] for (uint i = 0; i < S; i++) {
-                    float keep = hi ? sp[i + S] : sp[i], send = hi ? sp[i] : sp[i + S];
-                    sp[i] = keep + subgroupShuffleXor(send, S * 32 / N);
+                    float keep = hi ? s_part[i + S] : s_part[i], send = hi ? s_part[i] : s_part[i + S];
+                    s_part[i] = keep + subgroupShuffleXor(send, S * 32 / N);
                 }
             }
-            float s = sp[0];
+            float s = s_part[0];
             [[unroll]] for (uint o = 16 / N; o >= 1; o /= 2) s += subgroupShuffleXor(s, o);
             uint k = lane / L, j = k / G;
             if (lane % L == 0) ss[(k % G) * C + w * J + j] = c0 + w * J + j < p1 ? s * p.scale : ninf;
@@ -106,14 +97,35 @@ void main() {
             if (lane == 0) sc[w] = cs;
         }
         barrier();
-        [[unroll]] for (uint j = 0; j < J; j++)
+        [[unroll]] for (uint j = 0; j < J; j++) {
+            uint vr[PER / 2];
+            uint tt = c0 + w * J + j, r = ((cell(min(tt, p1 - 1)) * p.nkv + g) * HD + lane * PER) / 2;
+            if (KV_MODE > 0u && PER % 4 == 0) {
+                [[unroll]] for (uint d = 0; d < PER / 2; d += 2) {
+                    uvec2 v = ldkv4(U16(uint64_t(p.vc)), 2 * (r + d), HD);
+                    if (tt >= p1) v = uvec2(0);
+                    vr[d] = v.x; vr[d + 1] = v.y;
+                }
+            } else if (KV_MODE == 0u && WIDE && PER % 8 == 0) {
+                [[unroll]] for (uint d = 0; d < PER / 2; d += 4) {
+                    uvec4 v = UV4(uint64_t(p.vc)).v[(r + d) / 4];
+                    [[unroll]] for (uint e = 0; e < 4; e++) vr[d + e] = tt >= p1 ? 0 : v[e];
+                }
+            } else {
+                [[unroll]] for (uint d = 0; d < PER / 2; d++) {
+                    uint v = KV_MODE > 0u ? ldkv2(U16(uint64_t(p.vc)), 2 * (r + d), HD) : p.vc.v[r + d];
+                    vr[d] = tt >= p1 ? 0 : v;
+                }
+            }
+            float vf[PER];
+            [[unroll]] for (uint d = 0; d < PER; d++) vf[d] = hraw(vr[d / 2], d);
             [[unroll]] for (uint i = 0; i < G; i++) {
                 float e = ss[i * C + w * J + j];
                 [[unroll]] for (uint d = 0; d < PER; d++) {
-                    float v = hraw(vr[j * PER / 2 + d / 2], d);
-                    acc[i * PER + d] = j == 0 ? fma(acc[i * PER + d], sc[i], e * v) : fma(e, v, acc[i * PER + d]);
+                    acc[i * PER + d] = j == 0 ? fma(acc[i * PER + d], sc[i], e * vf[d]) : fma(e, vf[d], acc[i * PER + d]);
                 }
             }
+        }
         barrier();
     }
     if (w < G && lane == 0) { sm[w] = m; sl[w] = l; }

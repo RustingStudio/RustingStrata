@@ -15,19 +15,21 @@ const _: () = assert!(ATT_SPLITS <= 256); // attn_merge keeps one weight per spl
 /// Positions per GEMM tile. Prefill cuts its tile lists at this size.
 pub const GEMM_BM: usize = 128;
 
-/// `len` bytes of device memory at device address `addr`, freed when the owner drops.
+/// `len` bytes of device memory at device address `addr`, freed when the last clone drops.
+#[derive(Clone)]
 pub struct Buf {
     addr: u64,
     len: usize,
-    _owner: Box<dyn Any + Send + Sync>,
+    _owner: std::sync::Arc<dyn Any + Send + Sync>,
 }
 
 impl Buf {
-    pub fn new(addr: u64, len: usize, owner: impl Any + Send + Sync) -> Buf { Buf { addr, len, _owner: Box::new(owner) } }
+    pub fn new(addr: u64, len: usize, owner: impl Any + Send + Sync) -> Buf { Buf { addr, len, _owner: std::sync::Arc::new(owner) } }
     pub fn addr(&self) -> u64 { self.addr }
     pub fn len(&self) -> usize { self.len }
 }
 
+#[derive(Clone)]
 pub struct GpuTensor {
     pub ty: GgmlType,
     pub rows: usize,
@@ -85,6 +87,10 @@ pub trait Backend: Send {
     fn name(&self) -> &'static str;
     /// The GPU's name as the driver reports it.
     fn device(&self) -> String;
+    /// Create a lightweight handle sharing the same underlying GPU device/context for an auxiliary draft model.
+    fn share(&self) -> anyhow::Result<Box<dyn Backend>> {
+        anyhow::bail!("backend {} does not support device sharing", self.name())
+    }
     /// Zeroed buffer of `bytes` (at least 1).
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf>;
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()>;
@@ -157,6 +163,12 @@ pub trait Backend: Send {
         }
     }
 
+    fn upload_raw(&self, t: &Tensor) -> anyhow::Result<GpuTensor> {
+        let b = self.alloc(t.data.len())?;
+        self.htod(t.data, &b, 0)?;
+        Ok(GpuTensor::new(t.ty, t.rows, t.cols, b))
+    }
+
     /// u16 words of a KV cache for `n` values: f16, or q8 with one f16 scale per 32 values.
     fn kv_words(&self, n: usize) -> usize;
     /// GEMM over a tile list: for each tile, positions m0 .. m0 + cnt get y[m, 0..rows] = W_tile x[xrow[m]] (x row m
@@ -181,6 +193,19 @@ pub trait Backend: Send {
     fn gemvq2(&self, a: &GpuTensor, b: &GpuTensor, x: u64, x_stride: usize, xq: u64, ya: u64, yb: u64, nt: usize) -> anyhow::Result<()> {
         self.gemvq(a, x, x_stride, xq, ya, a.rows, nt)?;
         self.gemvq(b, x, x_stride, xq, yb, b.rows, nt)
+    }
+    /// Whether this backend supports indexed-row GEMV (`gemv_rows`).
+    fn supports_gemv_rows(&self) -> bool { false }
+    /// `y[i] = W[ids[i]] x` for `i < n_rows` (indexed subset of rows of `w`).
+    fn gemv_rows(&self, _w: &GpuTensor, _x: u64, _ids: u64, _n_rows: usize, _y: u64) -> anyhow::Result<()> {
+        anyhow::bail!("gemv_rows unsupported on this backend")
+    }
+    /// `y[t * n_rows + i] = W[ids[i]] x[t]` for `t < nt`, `i < n_rows`.
+    fn gemv_rows_n(&self, w: &GpuTensor, x: u64, x_stride: usize, _xq: u64, ids: u64, n_rows: usize, y: u64, nt: usize) -> anyhow::Result<()> {
+        for t in 0..nt {
+            self.gemv_rows(w, x + (t * x_stride * 4) as u64, ids, n_rows, y + (t * n_rows * 4) as u64)?;
+        }
+        Ok(())
     }
     /// For j < k with ids[j] >= 0: y[j] = W_j x[j / xg], where W_j is the `rows` x `cols` matrix at w + ids[j] * stride
     /// bytes. `pair` = (w2, y2) also computes the same product for the matrices at byte offset w2 into the output at
@@ -256,8 +281,15 @@ pub trait Backend: Send {
     /// `interleave`: value head h reads key head h / (nv / nk), else h % nk.
     /// `dt_bias` not 0: beta and g are raw, and the kernel applies `ssm_gates` (with `dt_bias` and `a`) as it reads them.
     fn deltanet(&self, y: u64, s: u64, beta: u64, g: u64, dt_bias: u64, a: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize) -> anyhow::Result<()>;
+    /// Stride (in tokens) between saved DeltaNet checkpoints in `snap` (`1` saves every token, `4` saves every 4th token).
+    fn delta_snap_stride(&self) -> usize { 1 }
+    fn deltanet_strided(&self, y: u64, s: u64, beta: u64, g: u64, dt_bias: u64, a: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize, _snap_stride: usize) -> anyhow::Result<()> {
+        self.deltanet(y, s, beta, g, dt_bias, a, o, nk, nv, interleave, dk, dv, scale, t, ych, snap, nsnap)
+    }
     /// Causal conv + SiLU over `t` tokens of `ch` channels, then roll the conv state forward (snapshots as in `deltanet`).
     fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize, snap: u64, nsnap: usize) -> anyhow::Result<()>;
+    /// Grouped dynamic causal convolution for DFlash2 (`part = 0` prepare, `part = 1` finish).
+    fn dflash2_conv(&self, x: u64, dyn_w: u64, base: u64, out: u64, h: usize, gs: usize, k: usize, t: usize, part: usize) -> anyhow::Result<()>;
     /// `qg` 0: no output gate.
     fn attn_prefill(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
         self.attn_prefill_m(q, kc, vc, qg, out, step, t, nh, nkv, hd, scale, 0, 0, 0, 0)

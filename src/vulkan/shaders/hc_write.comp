@@ -1,10 +1,81 @@
 #version 460
 layout(local_size_x = 256) in;
 #include "common.glsl"
-// Workgroup y = token t: stream c of r[t] += out[t] * 2 sigmoid(inj[t][c] / hc); clear: out[t] = 0 afterwards.
+// Workgroup y = token t:
+// - qwen4exp (hc < 256): stream c of r[t] += out[t] * 2 sigmoid(inj[t][c] / hc); clear: out[t] = 0 afterwards.
+// - sensenova_loop mHC (hc & 0x100 != 0): streams = hc & 0xFF, out_dim = (hc >> 16) & 0xFF.
+//   * hc & 0x400 != 0 (enter): expand out[t] to r[t][0..streams].
+//   * else (merge): Sinkhorn-Knopp (20 iters) on inj (bias at [0..out_dim], logits at [32 + t*out_dim..]),
+//     r[t][c] = sum_k mix[c][k] r[t][k] + post[c] out[t]; if hc & 0x200 != 0 (leave), out[t] = mean_c r[t][c].
 layout(push_constant) uniform P { F32 r; F32 out_; F32 inj; uint n; uint hc; uint clear; } p;
+shared float s_post[4];
+shared float s_mix[16];
 void main() {
     uint i = gl_GlobalInvocationID.x, t = gl_WorkGroupID.y;
+    if ((p.hc & 0x100u) != 0u) {
+        uint streams = p.hc & 0xFFu;
+        if ((p.hc & 0x400u) != 0u) {
+            if (i >= p.n) return;
+            float o = p.out_.v[t * p.n + i];
+            for (uint c = 0; c < streams; c++) p.r.v[(t * streams + c) * p.n + i] = o;
+            return;
+        }
+        if (gl_LocalInvocationID.x == 0u) {
+            uint out_dim = (p.hc >> 16) & 0xFFu;
+            uint loff = 32u + t * out_dim;
+            for (uint c = 0; c < streams; c++) {
+                s_post[c] = 2.0 * sigmoid(p.inj.v[streams + c] + p.inj.v[loff + streams + c]);
+            }
+            if (out_dim <= 2u * streams) {
+                for (uint r0 = 0; r0 < streams; r0++)
+                    for (uint c0 = 0; c0 < streams; c0++)
+                        s_mix[r0 * streams + c0] = (r0 == c0) ? 1.0 : 0.0;
+            } else {
+                float m[16];
+                uint moff = 2u * streams;
+                for (uint k = 0; k < streams * streams; k++) {
+                    m[k] = p.inj.v[moff + k] + p.inj.v[loff + moff + k];
+                }
+                for (uint it = 0; it < 20u; it++) {
+                    for (uint r0 = 0; r0 < streams; r0++) {
+                        float mx = m[r0 * streams];
+                        for (uint c0 = 1; c0 < streams; c0++) mx = max(mx, m[r0 * streams + c0]);
+                        float se = 0.0;
+                        for (uint c0 = 0; c0 < streams; c0++) se += exp(m[r0 * streams + c0] - mx);
+                        float lse = mx + log(se);
+                        for (uint c0 = 0; c0 < streams; c0++) m[r0 * streams + c0] -= lse;
+                    }
+                    for (uint c0 = 0; c0 < streams; c0++) {
+                        float mx = m[c0];
+                        for (uint r0 = 1; r0 < streams; r0++) mx = max(mx, m[r0 * streams + c0]);
+                        float se = 0.0;
+                        for (uint r0 = 0; r0 < streams; r0++) se += exp(m[r0 * streams + c0] - mx);
+                        float lse = mx + log(se);
+                        for (uint r0 = 0; r0 < streams; r0++) m[r0 * streams + c0] -= lse;
+                    }
+                }
+                for (uint k = 0; k < streams * streams; k++) s_mix[k] = exp(m[k]);
+            }
+        }
+        barrier();
+        if (i >= p.n) return;
+        float o = p.out_.v[t * p.n + i];
+        float old_r[4];
+        for (uint c = 0; c < streams; c++) old_r[c] = p.r.v[(t * streams + c) * p.n + i];
+        float mean_s = 0.0;
+        for (uint r0 = 0; r0 < streams; r0++) {
+            float acc = s_post[r0] * o;
+            for (uint c0 = 0; c0 < streams; c0++) acc += s_mix[r0 * streams + c0] * old_r[c0];
+            p.r.v[(t * streams + r0) * p.n + i] = acc;
+            mean_s += acc;
+        }
+        if ((p.hc & 0x200u) != 0u) {
+            p.out_.v[t * p.n + i] = fdiv(mean_s, float(streams));
+        } else if (p.clear != 0u) {
+            p.out_.v[t * p.n + i] = 0.0;
+        }
+        return;
+    }
     if (i >= p.n) return;
     float o = p.out_.v[t * p.n + i];
     for (uint c = 0; c < p.hc; c++) p.r.v[(t * p.hc + c) * p.n + i] += o * (2.0 * sigmoid(fdiv(p.inj.v[t * p.hc + c], float(p.hc))));

@@ -1,0 +1,5 @@
+#version 460
+#define COOP 1
+#define COOP_K 16
+#define SM 1
+#include "gemmi.glsl"

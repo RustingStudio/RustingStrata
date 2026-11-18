@@ -68,7 +68,7 @@ impl ExpertCache {
         let n_layers = range.end;
         let c = &m.cfg;
         let n = c.n_expert;
-        const MAX_POOL_FULL_BYTES: usize = 8192 << 20;
+        const MAX_POOL_FULL_BYTES: usize = 2048 << 20;
         let mut layers: Vec<Option<(usize, [Mat; 3])>> = Vec::new();
         let mut pool_specs: Vec<(usize, usize)> = Vec::new(); // (slot_bytes, experts in pool)
         for il in 0..n_layers {

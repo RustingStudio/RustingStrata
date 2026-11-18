@@ -251,11 +251,11 @@ impl Module {
         }
     }
 
-    /// Workgroup bytes the module needs with the pipeline's `spec` (constant ids 0 .. n-1) and constant 15 = `kv_q8`.
-    fn shared_bytes(&self, kernel: &str, spec: &[u32], kv_q8: bool) -> Result<u32> {
+    /// Workgroup bytes the module needs with the pipeline's `spec` (constant ids 0 .. n-1) and constant 15 = `kv_mode`.
+    fn shared_bytes(&self, kernel: &str, spec: &[u32], kv_mode: u32) -> Result<u32> {
         let mut map = HashMap::with_capacity(spec.len() + 1);
         for (i, &v) in spec.iter().enumerate() { map.insert(i as u32, v); }
-        map.insert(15, kv_q8 as u32);  // as Vk::pipeline: KV_Q8, common.glsl
+        map.insert(15, kv_mode);  // as Vk::pipeline: KV_MODE, common.glsl
         let mut total = 0u64;
         for &ty in &self.workgroup {
             let (size, align) = self.layout(ty, &map).with_context(|| format!("kernel {kernel}"))?;
@@ -270,8 +270,8 @@ impl Module {
 fn round_up(v: u64, a: u64) -> u64 { v.div_ceil(a.max(1)) * a.max(1) }
 
 /// Bytes of `Workgroup` shared memory kernel `kernel` needs with specialization constants `spec` (ids 0 .. n-1, and
-/// constant 15 = `kv_q8`), computed from the committed SPIR-V in `src/vulkan/spv/`. No GPU and no pipeline.
-pub fn shared_bytes(kernel: &str, spec: &[u32], kv_q8: bool) -> Result<u32> {
+/// constant 15 = `kv_mode`), computed from the committed SPIR-V in `src/vulkan/spv/`. No GPU and no pipeline.
+pub fn shared_bytes(kernel: &str, spec: &[u32], kv_mode: u32) -> Result<u32> {
     let (name, code) = super::SPV.iter().find(|s| s.0 == kernel).map(|s| (s.0, s.1))
         .with_context(|| format!("no Vulkan kernel {kernel}"))?;
     // Parsed modules are immutable and reused: pipelines are created once per specialization, but a preflight
@@ -287,13 +287,13 @@ pub fn shared_bytes(kernel: &str, spec: &[u32], kv_q8: bool) -> Result<u32> {
             m
         }
     };
-    m.shared_bytes(name, spec, kv_q8)
+    m.shared_bytes(name, spec, kv_mode)
 }
 
 /// `shared_bytes`, refusing when it exceeds `limit`: the driver accepts such a pipeline and faults at dispatch
 /// (`Xid 13 SKEDCHECK18_L1_CONFIG_TOO_SMALL` on Volta). Returns the size when it fits.
-pub fn check_shared_memory(kernel: &str, spec: &[u32], kv_q8: bool, limit: u32) -> Result<u32> {
-    let bytes = shared_bytes(kernel, spec, kv_q8)?;
+pub fn check_shared_memory(kernel: &str, spec: &[u32], kv_mode: u32, limit: u32) -> Result<u32> {
+    let bytes = shared_bytes(kernel, spec, kv_mode)?;
     ensure!(bytes <= limit, "vulkan: kernel {kernel} with specialization [[{}]] needs {bytes} bytes of shared memory; \
         this device allows {limit} (maxComputeSharedMemorySize). If the card really has more (the AMD Windows driver reports 32768 on a 9070 XT), \
         set STRATA_VK_SMEM_LIMIT=49152; no kernel needs more", spec.iter().map(u32::to_string).collect::<Vec<_>>().join(", "));
@@ -307,19 +307,21 @@ mod tests {
     /// The measured values of the committed SPIR-V (also asserted by `tests/backend.rs shared_memory`).
     #[test]
     fn shared_memory_matches_the_committed_spirv() {
-        assert_eq!(shared_bytes("gemmi_dp", &[0, 10, 84, 0, 0], false).unwrap(), 49152);  // Q2_K: KS = 16
-        assert_eq!(shared_bytes("gemmi_dp", &[0, 21, 110, 0, 0], false).unwrap(), 40960);  // IQ3_S: KS = 32
+        assert_eq!(shared_bytes("gemmi_dp", &[0, 10, 84, 0, 0], 0).unwrap(), 49152);  // Q2_K: KS = 16
+        assert_eq!(shared_bytes("gemmi_dp", &[0, 21, 110, 0, 0], 0).unwrap(), 40960);  // IQ3_S: KS = 32
         // The COOP variant reads the IQ tables from the buffer too (a shared copy made it ask for 49168, 16 over 48 KB).
-        assert_eq!(shared_bytes("gemmi", &[0, 10, 84, 0, 0], false).unwrap(), 49152);
+        assert_eq!(shared_bytes("gemmi", &[0, 10, 84, 0, 0], 0).unwrap(), 49152);
+        assert_eq!(shared_bytes("gemmi_16", &[0, 10, 84, 0, 0], 0).unwrap(), 40960);
+        assert_eq!(shared_bytes("gemmi_s_16", &[0, 10, 84, 0, 0], 0).unwrap(), 20992);
     }
 
     #[test]
     fn shared_memory_refusal_names_the_kernel_spec_and_both_sizes() {
-        let e = check_shared_memory("gemmi_dp", &[0, 10, 84, 0, 0], false, 40960).unwrap_err().to_string();
+        let e = check_shared_memory("gemmi_dp", &[0, 10, 84, 0, 0], 0, 40960).unwrap_err().to_string();
         for want in ["gemmi_dp", "[0, 10, 84, 0, 0]", "49152", "40960", "maxComputeSharedMemorySize"] {
             assert!(e.contains(want), "{e:?} does not contain {want:?}");
         }
-        assert_eq!(check_shared_memory("gemmi_dp", &[0, 10, 84, 0, 0], false, 49152).unwrap(), 49152);
+        assert_eq!(check_shared_memory("gemmi_dp", &[0, 10, 84, 0, 0], 0, 49152).unwrap(), 49152);
     }
 
     /// Every weight kernel the preflight names has a computable Workgroup size for every GPU weight type: a shader or
@@ -328,7 +330,7 @@ mod tests {
     fn shared_memory_of_every_weight_kernel_and_type() {
         use crate::quant::GgmlType;
         // The kernels `Vk::preflight` reaches, with the extra constants of gemv_q (NT) and gemv_f (NT, 32 * wpb).
-        let kernels = ["gemm_f", "gemm_f_dp", "gemm_fs", "gemmi", "gemmi_dp", "gemmi_s", "gemv_q", "gemv_f", "moe_gemv_q",
+        let kernels = ["gemm_f", "gemm_f_dp", "gemm_fs", "gemmi", "gemmi_dp", "gemmi_s", "gemmi_16", "gemmi_s_16", "gemv_q", "gemv_f", "moe_gemv_q",
             "moe_gemv_f", "dequant"];
         let mut worst = (0u32, String::new(), Vec::new());
         // Kernels a device without cooperative matrices runs (the V100): `gemm_raw` picks the _dp ones.
@@ -349,7 +351,7 @@ mod tests {
                 vec![(k, [&ws[..], extra].concat())]
             }).collect();
             for (k, spec) in specs {
-                let bytes = shared_bytes(k, &spec, false).unwrap_or_else(|e| panic!("{k} with {}: {e:#}", ty.name()));
+                let bytes = shared_bytes(k, &spec, 0).unwrap_or_else(|e| panic!("{k} with {}: {e:#}", ty.name()));
                 if bytes > worst.0 { worst = (bytes, k.to_string(), spec.clone()); }
                 if v100.contains(&k) && bytes > worst_v100.0 { worst_v100 = (bytes, k.to_string(), spec); }
             }

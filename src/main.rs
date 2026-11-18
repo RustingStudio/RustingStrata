@@ -44,8 +44,8 @@ struct Engine {
     /// External speculative draft model GGUF socket (e.g. future DFlash/EAGLE draft).
     #[arg(long)]
     draft_model: Option<PathBuf>,
-    /// Speculative context-lookup drafter type(s), comma-separated: none, ngram-simple, ngram-map-k, ngram-map-k4v,
-    /// ngram-mod, ngram-cache (combines with --mtp/--mtp-model in hybrid cascade).
+    /// Speculative context-lookup drafter type(s), comma-separated: none, suffix, ngram-simple, ngram-map-k,
+    /// ngram-map-k4v, ngram-mod, ngram-cache (combines with --mtp/--mtp-model/--draft-model in hybrid cascade).
     #[arg(long, default_value = "none")]
     spec_type: String,
     /// Maximum number of speculative draft tokens verified per step (1..=16).
@@ -115,9 +115,12 @@ struct Engine {
     /// Let the model think before answering (chat and `serve`); `--think false` turns it off. A request's `chat_template_kwargs.enable_thinking` overrides it in `serve`.
     #[arg(long = "think", default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     think_default: bool,
-    /// KV cache format (GPU): f16, or q8 (q8_0 blocks, half the KV memory; numerics differ slightly from
-    /// llama.cpp's default f16 cache).
-    #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
+    /// Cap tokens inside `<think>` in `chat` and `serve`, then inject `</think>\n\n` so the model answers immediately (0 = unlimited). A request's `thinking_budget` overrides it.
+    #[arg(long, default_value_t = 0)]
+    thinking_budget: usize,
+    /// KV cache format (GPU): f16, q8 (q8_0, half KV memory), q4 (q4_0, quarter KV memory), or q2 (2-bit affine,
+    /// 5.3x smaller KV memory for 512k-1M ctx; numerics differ from f16).
+    #[arg(long, default_value = "f16", value_parser = ["f16", "q8", "q4", "q2"])]
     kv: String,
     /// GPU backend: cuda or vulkan [default: cuda if it loads, else vulkan].
     #[arg(long)]
@@ -126,9 +129,9 @@ struct Engine {
     /// their free VRAM.
     #[arg(long, default_value = "0", value_delimiter = ',')]
     device: Vec<usize>,
-    /// Prompts shorter than this skip the batched prefill (from `strata calibrate`, else 32).
-    #[arg(skip)]
-    short: usize,
+    /// Prompts shorter than this skip the batched prefill [default: from `strata calibrate`, else 32].
+    #[arg(long)]
+    short: Option<usize>,
     /// Run on the CPU when no GPU backend opens (the bare `strata` launch).
     #[arg(skip)]
     cpu_fallback: bool,
@@ -138,6 +141,20 @@ struct Engine {
     /// Multimodal projector (mmproj) GGUF used by `--image`.
     #[arg(long)]
     mmproj: Option<PathBuf>,
+}
+
+fn set_kv_env(kv: &str) {
+    match kv {
+        "q8" | "q4" | "q2" => {
+            unsafe { std::env::set_var("STRATA_KV", kv) };
+            if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") }; }
+            else { unsafe { std::env::remove_var("STRATA_KV_Q8") }; }
+        }
+        _ => {
+            unsafe { std::env::remove_var("STRATA_KV") };
+            unsafe { std::env::remove_var("STRATA_KV_Q8") };
+        }
+    }
 }
 
 /// `serve` options for a server that other people use (docs/HOSTING.md).
@@ -263,7 +280,19 @@ impl Runner<'_> {
             let sum = |f: &dyn Fn(&GpuModel) -> usize| g.parts().map(f).sum::<usize>();
             let st = self.expert_stats().expect("Runner::Gpu has expert stats");
             if g.drafts.0 > 0 {
-                let kind = if g.ngram.is_some() { "speculative ngram" } else { "MTP" };
+                let kind = if g.has_dflash() && g.ngram.is_some() {
+                    "FlashCascade (DFlash + suffix/ngram)"
+                } else if g.has_dflash() {
+                    "DFlash"
+                } else if g.has_ext_draft() && g.ngram.is_some() {
+                    "FlashCascade (external draft + suffix/ngram)"
+                } else if g.has_ext_draft() {
+                    "external draft"
+                } else if g.ngram.is_some() {
+                    "speculative ngram"
+                } else {
+                    "MTP"
+                };
                 eprintln!("{kind} drafts accepted {}/{} ({:.1}%)", g.drafts.1, g.drafts.0, 100.0 * g.drafts.1 as f64 / g.drafts.0 as f64);
             }
             eprintln!("expert hit rate {:.1}% ({} misses), cache swaps {}", 100.0 * st.hits as f64 / (st.hits + st.misses).max(1) as f64, st.misses, st.swaps);
@@ -308,7 +337,7 @@ impl Engine {
         if let Some(n) = num("vram_margin", 0, 1 << 20)? { e.vram_margin = vec![n.to_string()]; }
         if let Some(n) = num("mtp", 0, 8)? { e.mtp = Some(n); }
         if let Some(n) = num("chunk", 0, 1 << 20)? { e.chunk = Some(n); }
-        if !v["kv"].is_null() { e.kv = v["kv"].as_str().filter(|k| ["f16", "q8"].contains(k)).context("kv must be f16 or q8")?.into(); }
+        if !v["kv"].is_null() { e.kv = v["kv"].as_str().filter(|k| ["f16", "q8", "q4", "q2"].contains(k)).context("kv must be f16, q8, q4 or q2")?.into(); }
         Ok(e)
     }
 
@@ -324,7 +353,7 @@ impl Engine {
             }
         }
         if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
-        if self.kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
+        set_kv_env(&self.kv);  // read by Gpu::new and Vk::new
         let open = || self.device.iter().map(|&d| backend::open(self.backend.as_deref(), d)).collect::<anyhow::Result<Vec<_>>>();
         let bk = match self.gpu.then(open).transpose() {
             Err(e) if self.cpu_fallback => { eprintln!("no GPU backend ({e:#}), running on the CPU"); None }
@@ -342,14 +371,20 @@ impl Engine {
         let mut ngram_cfg = self.ngram_config()?;
         ngram_cfg.n_vocab = m.cfg.n_vocab;
         self.chunk.get_or_insert(get("chunk").unwrap_or(4096));
-        if self.mtp_model.is_some() && self.mtp.is_none() {
+        if let Some(df) = &m.cfg.dflash {
+            if self.mtp.is_none() {
+                self.mtp = Some(df.block_size.saturating_sub(1).max(1));
+            }
+        } else if m.draft_model.is_some() && self.mtp.is_none() {
+            self.mtp = Some(4);
+        } else if (self.mtp_model.is_some() || self.draft_model.is_some()) && self.mtp.is_none() {
             self.mtp = Some(1);
         } else if ngram_cfg.is_enabled() && self.mtp.is_none() {
             self.mtp = Some(0);
         } else {
             self.mtp.get_or_insert(get("mtp").unwrap_or(0));
         }
-        self.short = get("short").unwrap_or(32);
+        let short = self.short.unwrap_or_else(|| get("short").unwrap_or(32));
         // The global pool can be built once; a model loaded later by `serve` keeps the first one's threads.
         // GPU expert work is memory-bound, so SMT siblings only add contention (6 threads beat 12 on the reference
         // 6-core/12-thread Ryzen). CPU-only inference keeps every logical core.
@@ -357,32 +392,44 @@ impl Engine {
         if let Some(n) = self.threads.or(get("threads")).or(gpu_threads) {
             let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
         }
+        let aux_heads = m.cfg.n_nextn.max(usize::from(m.cfg.dflash.is_some() || m.draft_model.is_some()));
         let Some(bk) = bk else {
-            let (notes, _, mtp) = resolve_flags(false, self.parallel, self.mtp(), m.cfg.n_nextn)?;
+            let (notes, _, mtp) = resolve_flags(false, self.parallel, self.mtp(), aux_heads)?;
             for n in notes { eprintln!("{n}"); }
             self.mtp = Some(mtp);
             return Ok(Runner::Cpu(m, State::new(&m.cfg)));
         };
-        let (notes, parallel, mtp) = resolve_flags(true, self.parallel, self.mtp(), m.cfg.n_nextn)?;
+        let (notes, parallel, mtp) = resolve_flags(true, self.parallel, self.mtp(), aux_heads)?;
         for n in notes { eprintln!("{n}"); }
         (self.parallel, self.mtp) = (parallel, Some(mtp));
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
         // Before the first weight is uploaded: fail if a pipeline these weight types need does not fit the device's
         // shared memory (Vulkan; a no-op elsewhere). No pipeline or model buffer exists yet.
-        let types = rusting_strata::gpu_model::gpu_weight_types(&m.w.g);
+        let mut types = rusting_strata::gpu_model::gpu_weight_types(&m.w.g);
+        if let Some(dm) = &m.draft_model {
+            for t in rusting_strata::gpu_model::gpu_weight_types(&dm.w.g) {
+                if !types.contains(&t) {
+                    types.push(t);
+                }
+            }
+        }
         for b in &bk { b.preflight(&types, false)?; }
         let margins = vram_margins(&self.vram_margin, &self.device)?.into_iter().map(|mb| mb << 20).collect::<Vec<_>>();
-        let spec_k = if mtp > 0 { mtp } else if ngram_cfg.is_enabled() && self.parallel <= 1 { ngram_cfg.draft_max } else { 0 };
+        if (ngram_cfg.is_enabled() || m.cfg.dflash.is_some() || m.draft_model.is_some()) && self.parallel <= 1 {
+            unsafe { std::env::set_var("STRATA_SPEC_SNAP", "1") };
+        } else {
+            unsafe { std::env::remove_var("STRATA_SPEC_SNAP") };
+        }
         let mut g = if self.parallel > 1 {
             GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, 0, self.parallel).context(LOAD_HINT)?
         } else {
-            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, spec_k, 1).context(LOAD_HINT)?
+            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, mtp, 1).context(LOAD_HINT)?
         };
         if ngram_cfg.is_enabled() && self.parallel <= 1 {
             let tok = Tokenizer::from_gguf(&m.w.g).ok();
             g.ngram = Some(rusting_strata::ngram::NgramDrafter::new(ngram_cfg, tok.as_ref())?);
         }
-        g.short = self.short;
+        g.short = short;
         g.cache_ram = self.cache_ram << 20;
         if let Some(p) = &self.prompt_cache {
             if g.cache_ram == 0 {
@@ -416,6 +463,7 @@ impl Engine {
     }
     fn chunk(&self) -> usize { self.chunk.unwrap_or(4096) }
     fn mtp(&self) -> usize { self.mtp.unwrap_or(0) }
+    fn aux_model_path(&self) -> Option<&Path> { self.draft_model.as_deref().or(self.mtp_model.as_deref()) }
 }
 
 /// Per-device VRAM margins in MB from `--vram-margin`: one value for every device, one per device like `512,256`,
@@ -803,8 +851,8 @@ enum Cmd {
         /// Accepted for consistency with the other commands; calibration always uses the base model.
         #[arg(long, value_name = "PATH:SCALE", action = clap::ArgAction::Append)]
         lora: Vec<String>,
-        /// KV cache format to calibrate with (q8 leaves more VRAM for experts), as `--kv` of the runs that use it.
-        #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
+        /// KV cache format to calibrate with (q8/q4/q2 leave more VRAM for experts), as `--kv` of the runs that use it.
+        #[arg(long, default_value = "f16", value_parser = ["f16", "q8", "q4", "q2"])]
         kv: String,
         /// Accepted for symmetry with the other commands: calibration always runs on the GPU.
         #[arg(long, hide = true)]
@@ -931,7 +979,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let (prompt, cont) = (ids("prompt")?, ids("continuation")?);
             anyhow::ensure!(!prompt.is_empty() && !cont.is_empty(), "empty prompt or continuation");
             let g = Gguf::open(&model)?;
-            let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
+            let aux_g = open_mtp_gguf(engine.aux_model_path())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             if let Some(&t) = prompt.iter().chain(&cont).find(|&&t| t as usize >= m.cfg.n_vocab) {
                 anyhow::bail!("token id {t} out of range (vocabulary has {} tokens)", m.cfg.n_vocab);
@@ -976,7 +1024,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 return rusting_strata::hy4::chat::generate(&g, &prompt, n);
             }
-            let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
+            let aux_g = open_mtp_gguf(engine.aux_model_path())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let prompt = if prompt == "-" {
@@ -1003,7 +1051,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let t1 = Instant::now();
             let (cpu0, split0) = (r.cpu_secs(), r.split_secs());
             let cap = room(&engine, n_prompt, n);
-            let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut engine.sampler(), logits, cap, &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
+            let think_cap = Some((prompt.trim_end().ends_with("<think>"), engine.thinking_budget));
+            let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut engine.sampler(), logits, cap, think_cap, &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
             let (pp, tg) = ((t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
             if out.len() == cap && cap < n { eprint!("\n(stopped: the context is full at {} tokens; raise --ctx)", engine.ctx); }
             eprintln!("\nprompt {} tok {:.2} tok/s | gen {} tok {:.2} tok/s", n_prompt, n_prompt as f64 / pp, out.len(), out.len() as f64 / tg);
@@ -1017,7 +1066,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Perplexity { model, file, ctx_len: n, chunks, kld_base, mut engine } => {
             let g = Gguf::open(&model)?;
-            let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
+            let aux_g = open_mtp_gguf(engine.aux_model_path())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             // ponytail: no BOS at chunk starts (llama-perplexity adds one where the vocabulary asks for it; Qwen does not)
@@ -1071,7 +1120,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     };
                 }
             }
-            let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
+            let aux_g = open_mtp_gguf(engine.aux_model_path())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let mut r = engine.runner(&m, &model)?;
@@ -1085,7 +1134,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     let l = r.prefill(&ids)?;
                     p.push(n as f64 / t.elapsed().as_secs_f64());
                     let t = Instant::now();
-                    let k = decode(&mut r, &tok, engine.mtp() > 0, &mut Sampler::greedy(), l, tg, &mut |_| Ok(false))?.0.len();
+                    let k = decode(&mut r, &tok, engine.mtp() > 0, &mut Sampler::greedy(), l, tg, None, &mut |_| Ok(false))?.0.len();
                     d.push(k as f64 / t.elapsed().as_secs_f64());
                 }
                 let (prefill, decode_stat) = (Stat::of(&p), Stat::of(&d));
@@ -1124,7 +1173,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
         }
         Cmd::Calibrate { model, ctx, vram_margin, backend, device, kv, lora, gpu: _ } => {
-            if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
+            set_kv_env(&kv);  // read by Gpu::new and Vk::new
             if !lora.is_empty() { eprintln!("note: --lora is ignored by calibrate; calibration uses the base model"); }
             let margins = vram_margins(&vram_margin, &device)?.into_iter().map(|mb| mb << 20).collect::<Vec<_>>();
             calibrate(&model, ctx, &margins, backend.as_deref(), &device)?
@@ -1152,6 +1201,13 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let c = ModelConfig::from_gguf(&g)?;
                 let n_moe = c.layers.iter().enumerate().filter(|&(il, _)| c.is_moe_layer(il)).count();
                 println!("check: flint ok: {} layers ({} dense, {} MoE), {} experts ({} used), {}/{} sliding-window / no-RoPE layers, {} tensors", c.n_layer, c.n_dense, n_moe, c.n_expert, c.n_expert_used, c.swa.iter().filter(|&&s| s).count(), c.rope_layer.iter().filter(|&&r| !r).count(), g.tensors.len());
+            }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("sensenova_loop") {
+                let c = ModelConfig::from_gguf(&g)?;
+                let phys_layers = c.phys_layer.iter().copied().collect::<std::collections::BTreeSet<_>>().len();
+                let n_delta = c.layers.iter().filter(|&&k| k == rusting_strata::config::LayerKind::Delta).count();
+                let n_attn = c.layers.len() - n_delta;
+                println!("check: sensenova_loop ok: {} virtual layers ({phys_layers} physical, mhc_streams={}, {} DeltaNet, {} Attn), {} tensors", c.n_layer, c.mhc_streams, n_delta, n_attn, g.tensors.len());
             }
             let types = rusting_strata::gpu_model::gpu_weight_types(&g);
             let b = backend::open(backend.as_deref(), device)?;
@@ -1188,7 +1244,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 anyhow::ensure!(image.is_empty(), "--image is not supported for hy_v4_flash");
                 return rusting_strata::hy4::chat::chat(&g, system, n, think);
             }
-            let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
+            let aux_g = open_mtp_gguf(engine.aux_model_path())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let image_input = if image.is_empty() { None } else {
@@ -1221,7 +1277,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         (ids, logits)
                     }
                 };
-                let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut smp, logits, room(&engine, ids.len(), n), &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
+                let think_cap = Some((prompt.trim_end().ends_with("<think>"), engine.thinking_budget));
+                let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut smp, logits, room(&engine, ids.len(), n), think_cap, &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
                 println!();
                 msgs.push(Msg::new("assistant", &answer(&tok.decode(&out)?)));
             }
@@ -1461,14 +1518,14 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let o = s.opts.lock().unwrap().take();
                 if !o.is_null() {
                     engine = engine.with(&o)?;
-                    // `runner` only sets it.
-                    if engine.kv != "q8" { unsafe { std::env::remove_var("STRATA_KV_Q8") } }
+                    // `runner` also sets it, and calibrate runs before `runner`.
+                    set_kv_env(&engine.kv);
                 }
                 // The page's calibrate button: measure with no model loaded, then load with the measured chunk and MTP
                 // (they replace `--chunk`/`--mtp` and the page's earlier values).
                 let cal = if o["calibrate"] == true && engine.gpu {
                     (engine.chunk, engine.mtp) = (None, None);
-                    if engine.kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }
+                    set_kv_env(&engine.kv);
                     s.stats.lock().unwrap().unload(p.file_stem().and_then(|n| n.to_str()).map(String::from));
                     vram_margins(&engine.vram_margin, &engine.device)
                         .and_then(|mb| calibrate(&p, engine.ctx, &mb.into_iter().map(|mb| mb << 20).collect::<Vec<_>>(), engine.backend.as_deref(), &engine.device))
@@ -1479,6 +1536,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     Err(e) if w.is_none() => return Err(e),
                     Err(e) => {
                         engine = old;
+                        set_kv_env(&engine.kv);
                         s.stats.lock().unwrap().unload(None);
                         eprintln!("loading {}: {e:#}", p.display());
                         let b = json!({"error": {"message": format!("{e:#}"), "type": "server_error"}}).to_string();
@@ -1722,7 +1780,7 @@ fn calibrate(model: &Path, ctx: usize, margin: &[usize], kind: Option<&str>, dev
     if short == usize::MAX { short = 256; }
 
     let dec = tok.encode("Write a long story about a dragon.")?;
-    let kmax = gm.k;
+    let kmax = if m.cfg.n_nextn > 0 { gm.k } else { 0 };
     let mut r = Runner::Gpu(Box::new(gm));
     let mut mtp = (0, 0.0);
     for k in 0..=kmax {
@@ -1731,7 +1789,7 @@ fn calibrate(model: &Path, ctx: usize, margin: &[usize], kind: Option<&str>, dev
         let t = best(&mut || {
             r.reset()?;
             let l = r.prefill(&dec)?;
-            toks = decode(&mut r, &tok, k > 0, &mut Sampler::greedy(), l, 128, &mut |_| Ok(false))?.0.len();
+            toks = decode(&mut r, &tok, k > 0, &mut Sampler::greedy(), l, 128, None, &mut |_| Ok(false))?.0.len();
             Ok(())
         })?;
         // `best` times prefill too; it is the same for every k, so the ranking holds.
@@ -1751,13 +1809,18 @@ fn calibrate(model: &Path, ctx: usize, margin: &[usize], kind: Option<&str>, dev
 }
 
 /// Decoding of up to `n` tokens after `logits`; `emit` gets each new complete piece of text and returns true to stop.
+/// When `think_cap` is `Some((start_open, budget))` with `budget > 0`, forces `</think>\n\n` once `out.len() >= budget`
+/// while still inside a `<think>` block so the model proceeds directly to the answer.
 /// Returns the tokens and whether an end-of-turn token or `emit` stopped it.
 fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut logits: Vec<f32>, n: usize,
+          think_cap: Option<(bool, usize)>,
           emit: &mut dyn FnMut(&str) -> anyhow::Result<bool>) -> anyhow::Result<(Vec<u32>, bool)> {
     let eos = tok.eos_ids();
     // `ahead`: the next token when `spec_step` or `step_greedy` already picked it.
     // `start`: the first token whose text is not emitted yet (the text before it ends on a whole character).
     let (mut out, mut start, mut row, mut ahead, mut stopped) = (Vec::new(), 0, 0, None, false);
+    let (mut in_think, budget) = think_cap.unwrap_or((false, 0));
+    let (mut saw_close, mut tail) = (false, String::new());
     'outer: while out.len() < n {
         let next = match ahead.take() { Some(t) => t, None => smp.pick(&logits)? as u32 };
         if eos.contains(&next) { stopped = true; break; }
@@ -1788,9 +1851,42 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
             out.push(t);
             let s = tok.decode(&out[start..])?;
             if !s.ends_with('\u{fffd}') {
+                if budget > 0 && !saw_close {
+                    tail.push_str(&s);
+                    while tail.len() > 64 {
+                        let c = tail.char_indices().nth(1).map_or(tail.len(), |(i, _)| i);
+                        tail.drain(..c);
+                    }
+                    if !in_think && tail.contains("<think>") { in_think = true; }
+                    if in_think && tail.contains("</think>") { in_think = false; saw_close = true; }
+                }
                 if emit(&s)? { stopped = true; break 'outer; }
                 start = out.len();
             }
+        }
+        if budget > 0 && in_think && !saw_close && out.len() >= budget && out.len() < n {
+            let close_str = if tail.ends_with('\n') { "</think>\n\n" } else { "\n</think>\n\n" };
+            let mut close_ids = tok.encode(close_str)?;
+            close_ids.truncate(n - out.len());
+            if !close_ids.is_empty() {
+                ahead = None;
+                match r {
+                    Runner::Gpu(g) => { logits = g.force_tokens(&close_ids, &mut row)?; }
+                    Runner::Cpu(..) | Runner::Slot(..) => {
+                        for &ct in &close_ids { logits = r.step(ct)?; }
+                    }
+                }
+                for ct in close_ids {
+                    out.push(ct);
+                    let s = tok.decode(&out[start..])?;
+                    if !s.ends_with('\u{fffd}') {
+                        if emit(&s)? { stopped = true; break 'outer; }
+                        start = out.len();
+                    }
+                }
+            }
+            in_think = false;
+            saw_close = true;
         }
     }
     if let Runner::Gpu(g) = r && let Some(ng) = g.ngram.as_mut() {
@@ -2123,28 +2219,63 @@ impl Serving {
     }
 }
 
-/// Resolve `--mtp-model` (`.gguf` file, HF `.safetensors` file, or directory containing either `model.gguf` or
-/// `model.safetensors` + `config.json`) and open it as a companion GGUF. If `.gguf` is missing (or
-/// `STRATA_EAGLE3_RECONVERT` is set) and `.safetensors` + `config.json` are present, converts natively in Rust.
+/// Resolve `--mtp-model` / `--draft-model` (`.gguf` file, HF `.safetensors` file, or directory containing either
+/// `model.gguf`/`model-dflash-q8_0.gguf` or `model.safetensors` + `config.json`) and open it as a companion GGUF.
+/// If `.gguf` is missing (or `STRATA_EAGLE3_RECONVERT` / `STRATA_DFLASH_RECONVERT` is set) and `.safetensors` +
+/// `config.json` are present, converts natively in Rust.
 fn open_mtp_gguf(path: Option<&Path>) -> anyhow::Result<Option<Gguf>> {
     let Some(p) = path else { return Ok(None) };
-    let reconvert = std::env::var_os("STRATA_EAGLE3_RECONVERT").is_some();
-    let (gguf, st_cfg) = if p.is_dir() {
-        (p.join("model.gguf"), Some((p.join("model.safetensors"), p.join("config.json"))))
+    let reconvert = std::env::var_os("STRATA_DFLASH_RECONVERT").is_some()
+        || std::env::var_os("STRATA_EAGLE3_RECONVERT").is_some();
+    let cfg_probe = if p.is_dir() {
+        p.join("config.json")
     } else if p.extension().and_then(|e| e.to_str()) == Some("safetensors") {
-        (p.with_extension("gguf"), Some((p.to_path_buf(), p.with_file_name("config.json"))))
+        p.with_file_name("config.json")
+    } else {
+        PathBuf::new()
+    };
+    let is_dflash = cfg_probe.exists() && rusting_strata::gguf::is_dflash_config(&cfg_probe);
+    let use_q8 = std::env::var_os("STRATA_DFLASH_Q8").is_some_and(|v| v != "0");
+    let gguf_name = if is_dflash {
+        if use_q8 { "model-dflash-q8_0.gguf" } else { "model-dflash-q4_0.gguf" }
+    } else {
+        "model.gguf"
+    };
+    let (mut gguf, st_cfg) = if p.is_dir() {
+        (p.join(gguf_name), Some((p.join("model.safetensors"), p.join("config.json"))))
+    } else if p.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+        let out = if is_dflash { p.with_file_name(gguf_name) } else { p.with_extension("gguf") };
+        (out, Some((p.to_path_buf(), p.with_file_name("config.json"))))
     } else if p.extension().and_then(|e| e.to_str()) == Some("bin") {
         (p.with_file_name("model.gguf"), None)
     } else {
         (p.to_path_buf(), None)
     };
+    if p.is_dir() && !gguf.exists() && !p.join("model.safetensors").exists() {
+        if let Ok(rd) = std::fs::read_dir(p) {
+            let mut found: Vec<PathBuf> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|f| f.extension().and_then(|e| e.to_str()) == Some("gguf"))
+                .collect();
+            found.sort();
+            if let Some(first) = found.into_iter().next() {
+                gguf = first;
+            }
+        }
+    }
     if let Some((st, cfg)) = st_cfg
         && (!gguf.exists() || reconvert)
         && st.exists()
         && cfg.exists()
     {
-        eprintln!("note: native Rust EAGLE3 conversion {} -> {}", st.display(), gguf.display());
-        rusting_strata::gguf::convert_safetensors_eagle3_to_gguf(&st, &cfg, &gguf, 48)?;
+        if is_dflash {
+            eprintln!("note: native Rust DFlash conversion {} -> {}", st.display(), gguf.display());
+            rusting_strata::gguf::convert_safetensors_dflash_to_gguf(&st, &cfg, &gguf, 40)?;
+        } else {
+            eprintln!("note: native Rust EAGLE3 conversion {} -> {}", st.display(), gguf.display());
+            rusting_strata::gguf::convert_safetensors_eagle3_to_gguf(&st, &cfg, &gguf, 48)?;
+        }
     }
     anyhow::ensure!(
         gguf.exists(),
@@ -2168,7 +2299,7 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
     let g = Gguf::open(model)?;
     let arch = g.get("general.architecture")?.as_str().context("general.architecture")?;
     s.stats.lock().unwrap().ctx_train = g.meta.get(&format!("{arch}.context_length")).and_then(|v| v.as_u64());
-    let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
+    let aux_g = open_mtp_gguf(engine.aux_model_path())?;
     let mut m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
     if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
     let tok = Tokenizer::from_gguf(&g)?;
@@ -2442,7 +2573,8 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     }
                 }
                 let mut last_stream_activity = Instant::now();
-                decode(r, tok, e.mtp() > 0, &mut smp, logits, n, &mut |t| {
+                let think_cap = Some((think_open, req.thinking_budget.unwrap_or(e.thinking_budget)));
+                decode(r, tok, e.mtp() > 0, &mut smp, logits, n, think_cap, &mut |t| {
                     s.stats.lock().unwrap().live_tokens += 1;
                     // A client that left stops the reply (a stream notices on the next write; held text writes nothing).
                     k += 1;
@@ -2596,8 +2728,10 @@ mod flag_tests {
         let e = <T as clap::Parser>::parse_from(["t"]).e;
         let n = e.with(&serde_json::json!({"ctx": 8192, "kv": "q8", "mtp": 2, "vram_margin": 256})).unwrap();
         assert_eq!((n.ctx, n.kv.as_str(), n.mtp, n.vram_margin, n.cache_ram), (8192, "q8", Some(2), vec!["256".to_string()], e.cache_ram));
+        assert_eq!(e.with(&serde_json::json!({"kv": "q4"})).unwrap().kv, "q4");
+        assert_eq!(e.with(&serde_json::json!({"kv": "q2"})).unwrap().kv, "q2");
         assert_eq!(e.with(&serde_json::Value::Null).unwrap().ctx, e.ctx);
-        for bad in [serde_json::json!({"ctx": 8}), serde_json::json!({"ctx": "big"}), serde_json::json!({"kv": "q4"}), serde_json::json!({"mtp": -1})] {
+        for bad in [serde_json::json!({"ctx": 8}), serde_json::json!({"ctx": "big"}), serde_json::json!({"kv": "q1"}), serde_json::json!({"mtp": -1})] {
             assert!(e.with(&bad).is_err(), "{bad}");
         }
     }
