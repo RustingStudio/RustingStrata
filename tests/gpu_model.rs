@@ -212,18 +212,19 @@ fn spec_matches_greedy(m: &Model, tok: &Tokenizer) {
             // Both parts are on one GPU here: the first must not fill it with experts.
             // SAFETY: the GPU lock serializes every test that loads a model, the only readers of this variable.
             unsafe { std::env::set_var("STRATA_EXPERT_MB", "1024") };
-            let gm = GpuModel::load_split(m, vec![gpu, second], 512, 0, 512 << 20, 3, 1);
+            let gm = GpuModel::load_split(m, vec![gpu, second], 512, 16, 512 << 20, 3, 1);
             unsafe { std::env::remove_var("STRATA_EXPERT_MB") };
             gm.unwrap()
         } else {
-            GpuModel::load(m, gpu, 512, 0, 512 << 20, 3).unwrap()
+            GpuModel::load(m, gpu, 512, 16, 512 << 20, 3).unwrap()
         };
         assert_eq!((gm.k, gm.parts().count()), (3, 1 + split as usize));
         gm.adapt_every = 0;
         let ids = tok.encode("Write a short story about a dragon.").unwrap();
         let n = 64;
-        let mut run = |k: usize| -> (Vec<u32>, (usize, usize)) {
-            (gm.k, gm.drafts) = (k.max(1), (0, 0));
+        let short = gm.short;
+        let mut run = |k: usize, short: usize| -> (Vec<u32>, (usize, usize)) {
+            (gm.k, gm.drafts, gm.short) = (k.max(1), (0, 0), short);
             gm.reset().unwrap();
             let mut t = ops::argmax(&gm.prefill(&ids).unwrap()) as u32;
             let (mut out, mut row) = (vec![], 0);
@@ -240,12 +241,15 @@ fn spec_matches_greedy(m: &Model, tok: &Tokenizer) {
             out.truncate(n);
             (out, gm.drafts)
         };
-        let plain = run(0).0;
-        for k in [1, 2, 3] {
-            let (spec, (made, ok)) = run(k);
-            eprintln!("k {k}: drafts accepted {ok}/{made}");
-            assert_eq!(spec, plain, "k {k}");
-            if k == 1 { assert!(2 * ok >= made, "acceptance {ok}/{made}"); }
+        // The prompt through `step`, then through the chunked prefill (short = 1).
+        for short in [short, 1] {
+            let plain = run(0, short).0;
+            for k in [1, 2, 3] {
+                let (spec, (made, ok)) = run(k, short);
+                eprintln!("short {short} k {k}: drafts accepted {ok}/{made}");
+                assert_eq!(spec, plain, "short {short} k {k}");
+                if k == 1 && short > 1 { assert!(2 * ok >= made, "acceptance {ok}/{made}"); }
+            }
         }
     }
 }

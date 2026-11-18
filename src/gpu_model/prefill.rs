@@ -632,11 +632,10 @@ impl GpuModel<'_> {
             let eg = self.mtp.as_ref().unwrap().eagle.as_ref().unwrap();
             self.gpu.dtod(&pf.slab, 4 * (lh + (t - 1) * ne), &eg.cur_g, 0, 4 * ne)?;
         } else {
-            match self.mtp.as_mut() {
-                Some(mh) if fill => mh.pos += t,
-                // Row 0 of `x` gets the last hidden state (with the draft head, the copy above did it).
-                _ => g.dtod(&pf.slab, 4 * (t - 1) * d, &self.x, 0, 4 * d)?,
-            }
+            if let Some(mh) = self.mtp.as_mut().filter(|_| fill) { mh.pos += t; }
+            // Row 0 of `x` gets the last hidden state (the draft head's layer above did it when it ran: not with
+            // hyper-connections).
+            if !(fill && c.hc_n == 0) { g.dtod(&pf.slab, 4 * (t - 1) * d, &self.x, 0, 4 * d)?; }
         }
         self.pos += toks.len();
         let Some(nx) = self.next.as_deref_mut() else { return Ok(()) };
