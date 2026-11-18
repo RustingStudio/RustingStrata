@@ -16,7 +16,7 @@ layout(push_constant) uniform P { U8 w; I32 slots; U32 xq; uint64_t stride; F32 
 
 void sb_step(U8 w, F32 xd, uint row, uint lane, uint t, uint s, inout precise float acc) {
     uint lo, hi; float d, m;
-    qw_sb(w, (row * p.nsb + s) * SBB, lane, lo, hi, d, m);
+    qw_sb(w, (row * p.nsb + s) * SBB, lane, true, lo, hi, d, m);
     uint o = (t * p.nsb + s) * 64 + lane * 2, a = p.xq.v[o], c = p.xq.v[o + 1];
     int dot = dotPacked4x8EXT(int(lo), int(a)) + dotPacked4x8EXT(int(hi), int(c));
     int sx = dotPacked4x8EXT(0x01010101, int(a)) + dotPacked4x8EXT(0x01010101, int(c));
@@ -27,8 +27,8 @@ void sb_step(U8 w, F32 xd, uint row, uint lane, uint t, uint s, inout precise fl
 
 void sb_step2(U8 w, F32 xd, uint row0, uint row1, uint lane, uint t, uint s, inout precise float acc0, inout precise float acc1) {
     uint lo0, hi0, lo1, hi1; float d0, m0, d1, m1;
-    qw_sb(w, (row0 * p.nsb + s) * SBB, lane, lo0, hi0, d0, m0);
-    qw_sb(w, (row1 * p.nsb + s) * SBB, lane, lo1, hi1, d1, m1);
+    qw_sb(w, (row0 * p.nsb + s) * SBB, lane, true, lo0, hi0, d0, m0);
+    qw_sb(w, (row1 * p.nsb + s) * SBB, lane, true, lo1, hi1, d1, m1);
     uint o = (t * p.nsb + s) * 64 + lane * 2, a = p.xq.v[o], c = p.xq.v[o + 1];
     float dx = xd.v[(t * p.nsb + s) * 8 + (lane >> 2)];
     int dot0 = dotPacked4x8EXT(int(lo0), int(a)) + dotPacked4x8EXT(int(hi0), int(c));
@@ -40,6 +40,19 @@ void sb_step2(U8 w, F32 xd, uint row0, uint row1, uint lane, uint t, uint s, ino
         acc0 = fma(-(m0 * dx), float(sx), acc0);
         acc1 = fma(-(m1 * dx), float(sx), acc1);
     }
+}
+
+void sb_step_pre(U8 w, uint row, uint lane, uint s, uint a, uint c, float dx, int sx, inout precise float acc) {
+    uint lo, hi; float d, m;
+    qw_sb(w, (row * p.nsb + s) * SBB, lane, true, lo, hi, d, m);
+    int dot = dotPacked4x8EXT(int(lo), int(a)) + dotPacked4x8EXT(int(hi), int(c));
+    acc = fma(d * dx, float(dot), acc);
+    if (MIN) acc = fma(-(m * dx), float(sx), acc);
+}
+
+void sb_step2_pre(U8 w, uint row0, uint row1, uint lane, uint s, uint a, uint c, float dx, int sx, inout precise float acc0, inout precise float acc1) {
+    sb_step_pre(w, row0, lane, s, a, c, dx, sx, acc0);
+    sb_step_pre(w, row1, lane, s, a, c, dx, sx, acc1);
 }
 
 #include "mb_wait.glsl"
@@ -56,6 +69,31 @@ void main() {
         int e = p.slots.v[t];
         if (e < 0) continue;  // a miss: weight 0, the CPU's result is added below
         U8 w = U8(uint64_t(p.w) + uint64_t(e) * p.stride);
+        if (p.nsb == 2u) {
+            uint o0 = t * 2u * 64u + lane * 2u, o1 = o0 + 64u;
+            uint a0 = p.xq.v[o0], c0 = p.xq.v[o0 + 1u];
+            uint a1 = p.xq.v[o1], c1 = p.xq.v[o1 + 1u];
+            float dx0 = xd.v[(t * 2u) * 8u + (lane >> 2u)];
+            float dx1 = xd.v[(t * 2u + 1u) * 8u + (lane >> 2u)];
+            int sx0 = MIN ? (dotPacked4x8EXT(0x01010101, int(a0)) + dotPacked4x8EXT(0x01010101, int(c0))) : 0;
+            int sx1 = MIN ? (dotPacked4x8EXT(0x01010101, int(a1)) + dotPacked4x8EXT(0x01010101, int(c1))) : 0;
+            uint i = 0;
+            for (; i + 1 < rpw && r0 + i + 1 < n; i += 2) {
+                precise float acc0 = 0.0, acc1 = 0.0;
+                sb_step2_pre(w, r0 + i, r0 + i + 1, lane, 0u, a0, c0, dx0, sx0, acc0, acc1);
+                sb_step2_pre(w, r0 + i, r0 + i + 1, lane, 1u, a1, c1, dx1, sx1, acc0, acc1);
+                acc0 = warp_sum(acc0); acc1 = warp_sum(acc1);
+                if (lane == 0) { part[j * RPW + i] = acc0; part[j * RPW + i + 1] = acc1; }
+            }
+            for (; i < rpw && r0 + i < n; i++) {
+                precise float acc = 0.0;
+                sb_step_pre(w, r0 + i, lane, 0u, a0, c0, dx0, sx0, acc);
+                sb_step_pre(w, r0 + i, lane, 1u, a1, c1, dx1, sx1, acc);
+                acc = warp_sum(acc);
+                if (lane == 0) part[j * RPW + i] = acc;
+            }
+            continue;
+        }
         uint i = 0;
         for (; i + 1 < rpw && r0 + i + 1 < n; i += 2) {
             precise float acc0 = 0.0, acc1 = 0.0;

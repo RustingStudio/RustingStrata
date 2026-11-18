@@ -4,19 +4,18 @@
 #include "tables.glsl"
 layout(constant_id = 1) const uint T = 0;
 layout(constant_id = 2) const uint SBB = 1024;
-// With SHARED_TABLES defined, the IQ4 values and IQ3_S / IQ2_S grids come from shared memory, which the shader fills
-// with load_tables (all its invocations) first: the table buffer costs a load per lookup (CUDA QS<T>).
+// With SHARED_TABLES defined, the IQ3_S / IQ3_XXS / IQ2_S grids come from shared memory, which the shader fills
+// with load_tables (all its invocations) first; the IQ4_NL LUT lives directly in register constants.
+const uint IQ4_LUT_W[4] = uint[4](0xbfad9881u, 0xf6eaddcfu, 0x26190d01u, 0x71594535u);
+int iq4_lut(uint nib) { return int(IQ4_LUT_W[nib >> 2u] << (24u - 8u * (nib & 3u))) >> 24; }
 #ifdef SHARED_TABLES
 // Sized by T (1 entry for the other types), so only the table in use takes shared memory.
-shared int s_kv[T == 20 || T == 23 ? 16 : 1];
 shared uint s_g3[T == 21 ? 512 : (T == 18 ? 256 : 1)];
 shared uint64_t s_g2[T == 22 ? 1024 : 1];
-#define KV_IQ4NL s_kv
 #define IQ3S_GRID s_g3
 #define IQ3XXS_GRID s_g3
 #define IQ2S_GRID s_g2
 #else
-#define KV_IQ4NL kvalues_iq4nl
 #define IQ3S_GRID iq3s_grid
 #define IQ3XXS_GRID iq3xxs_grid
 #define IQ2S_GRID iq2s_grid
@@ -73,7 +72,6 @@ uvec2 ld8(U8 w, uint o) {
 #ifdef SHARED_TABLES
 void load_tables() {
     uint li = gl_LocalInvocationIndex, n = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
-    if (T == 20 || T == 23) { if (li < 16) s_kv[li] = kvalues_iq4nl[li]; barrier(); }
     if (T == 18) { for (uint i = li; i < 256; i += n) s_g3[i] = iq3xxs_grid[i]; barrier(); }
     if (T == 21) { for (uint i = li; i < 512; i += n) s_g3[i] = iq3s_grid[i]; barrier(); }
     if (T == 22) { for (uint i = li; i < 1024; i += n) s_g2[i] = iq2s_grid[i]; barrier(); }
@@ -251,7 +249,7 @@ void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
             o = p + 2 + (r & 15);
         }
         uvec2 v = ld8(w, o);
-        [[unroll]] for (uint i = 0; i < 8; i++) q[i] = KV_IQ4NL[((i < 4 ? v.x : v.y) >> (8 * (i & 3) + (r < 16 ? 0 : 4))) & 15];
+        [[unroll]] for (uint i = 0; i < 8; i++) q[i] = iq4_lut(((i < 4 ? v.x : v.y) >> (8 * (i & 3) + (r < 16 ? 0 : 4))) & 15);
     }
 }
 
@@ -281,8 +279,46 @@ void qw(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out float
 uint shfl32(uint v, uint src) { return subgroupShuffle(v, W64 ? ((gl_SubgroupInvocationID & ~31u) | src) : src); }
 
 // Warp-cooperative super-block dequantization for GEMV (all 32 lanes of the logical warp pass the same w and b, with sub = LANE).
-void qw_sb(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out float m) {
-    if (T == 11) {  // Q3_K (110 bytes = 28 uint32 words from 4-aligned base): 1 coalesced U32 load per lane + register shuffles
+// `full` is true for whole 256-element super-blocks; partial tail super-blocks keep the scalar per-lane path.
+void qw_sb(U8 w, uint b, uint sub, bool full, out uint lo, out uint hi, out float d, out float m) {
+    if (full && T == 19) {  // IQ1_S (50 bytes = 13 uint32 words from 4-aligned base)
+        m = 0.0;
+        uint64_t addr = uint64_t(w) + b, base4 = addr & ~3ul;
+        uint align_sh = uint(addr & 2ul) * 8u;
+        uint raw = sub < 13u ? U32(base4).v[sub] : 0u;
+        uint next_raw = shfl32(raw, min(sub + 1u, 12u));
+        float d0 = h2f((shfl32(raw, 0u) >> align_sh) & 0xFFFFu);
+        uint w32 = align_sh == 0u ? ((raw >> 16u) | (next_raw << 16u)) : next_raw;
+        uint ib = sub >> 2u, l = sub & 3u;
+        uint q8 = (shfl32(w32, sub >> 2u) >> (8u * l)) & 255u;
+        uint qh = (shfl32(w32, 8u + (ib >> 1u)) >> (16u * (ib & 1u))) & 0xFFFFu;
+        d = d0 * float(2u * ((qh >> 12u) & 7u) + 1u) * 0.125;
+        uint idx = q8 | (((qh >> (3u * l)) & 7u) << 8u);
+        uint64_t g = iq1s_grid[idx];
+        int delt = (qh & 0x8000u) != 0u ? -1 : 1;
+        lo = pack4(8 * sb(uint(g)) + delt, 8 * sb(uint(g >> 8u)) + delt, 8 * sb(uint(g >> 16u)) + delt, 8 * sb(uint(g >> 24u)) + delt);
+        hi = pack4(8 * sb(uint(g >> 32u)) + delt, 8 * sb(uint(g >> 40u)) + delt, 8 * sb(uint(g >> 48u)) + delt, 8 * sb(uint(g >> 56u)) + delt);
+        return;
+    }
+    if (full && T == 16) {  // IQ2_XXS (66 bytes = 17 uint32 words from 4-aligned base)
+        m = 0.0;
+        uint64_t addr = uint64_t(w) + b, base4 = addr & ~3ul;
+        uint align_sh = uint(addr & 2ul) * 8u;
+        uint raw = sub < 17u ? U32(base4).v[sub] : 0u;
+        uint next_raw = shfl32(raw, min(sub + 1u, 16u));
+        float d0 = h2f((shfl32(raw, 0u) >> align_sh) & 0xFFFFu);
+        uint w32 = align_sh == 0u ? ((raw >> 16u) | (next_raw << 16u)) : next_raw;
+        uint ib = sub >> 2u, l = sub & 3u;
+        uint qs_b = (shfl32(w32, 2u * ib) >> (8u * l)) & 255u;
+        uint aux = shfl32(w32, 2u * ib + 1u);
+        uint64_t g = iq2xxs_grid[qs_b];
+        uint sg = ksign((aux >> (7u * l)) & 127u);
+        d = d0 * (0.5 + float(aux >> 28u)) * 0.25;
+        lo = apply_signs(uint(g), sg & 15u);
+        hi = apply_signs(uint(g >> 32u), sg >> 4u);
+        return;
+    }
+    if (full && T == 11) {  // Q3_K (110 bytes = 28 uint32 words from 4-aligned base): 1 coalesced U32 load per lane + register shuffles
         m = 0.0;
         uint64_t addr = uint64_t(w) + b, base4 = addr & ~3ul;
         uint align_sh = uint(addr & 2ul) * 8u;
@@ -301,7 +337,7 @@ void qw_sb(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out fl
         hi = vsub4(((v.y >> (2u * j)) & 0x03030303u) | ((h.y >> hb) & 0x01010101u) << 2, 0x04040404u);
         return;
     }
-    if (T == 14) {  // Q6_K (210 bytes = 53 uint32 words from 4-aligned base): 2 coalesced U32 loads per lane + register shuffles
+    if (full && T == 14) {  // Q6_K (210 bytes = 53 uint32 words from 4-aligned base): 2 coalesced U32 loads per lane + register shuffles
         m = 0.0;
         uint64_t addr = uint64_t(w) + b, base4 = addr & ~3ul;
         uint align_sh = uint(addr & 2ul) * 8u;
@@ -322,7 +358,7 @@ void qw_sb(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out fl
         hi = vsub4(((l.y >> ns) & 0x0F0F0F0Fu) | ((h.y >> hs) & 0x03030303u) << 4, 0x20202020u);
         return;
     }
-    if (T == 18) {  // IQ3_XXS (98 bytes = 25 uint32 words from 4-aligned base): 1 coalesced U32 load per lane + LDS grid
+    if (full && T == 18) {  // IQ3_XXS (98 bytes = 25 uint32 words from 4-aligned base): 1 coalesced U32 load per lane + LDS grid
         m = 0.0;
         uint64_t addr = uint64_t(w) + b, base4 = addr & ~3ul;
         uint align_sh = uint(addr & 2ul) * 8u;

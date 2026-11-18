@@ -147,6 +147,35 @@ impl Sampler {
         Ok(Some(self.draw(&c.into_iter().filter(|x| x.0 != d).collect::<Vec<_>>())?))
     }
 
+    /// Normalized candidate probabilities `(token_id, prob)` under this sampler (`temp > 0`), sorted descending.
+    pub fn draft_dist(&mut self, logits: &[f32]) -> anyhow::Result<(u32, Vec<(usize, f32)>)> {
+        let c = self.cands(logits);
+        let total: f32 = c.iter().map(|x| x.1).sum();
+        anyhow::ensure!(!c.is_empty() && total > 0.0, NON_FINITE);
+        let probs: Vec<(usize, f32)> = c.into_iter().map(|(id, w)| (id, w / total)).collect();
+        let tok = self.draw(&probs)? as u32;
+        Ok((tok, probs))
+    }
+
+    /// Leviathan lossless speculative rejection sampling using draft distribution `q` and target `logits` (`temp > 0`).
+    /// Keeps `d` (`None`) with probability `min(1, p(d)/q(d))`, otherwise samples from normalized `max(0, p - q)`.
+    pub fn accept_dist(&mut self, logits: &[f32], d: usize, q: &[(usize, f32)]) -> anyhow::Result<Option<usize>> {
+        let c = self.cands(logits);
+        let total: f32 = c.iter().map(|x| x.1).sum();
+        anyhow::ensure!(!c.is_empty() && total > 0.0, NON_FINITE);
+        let qd = q.iter().find(|x| x.0 == d).map_or(0.0, |x| x.1);
+        if qd <= 0.0 { return Ok(Some(self.draw(&c)?)); }
+        let pd = c.iter().find(|x| x.0 == d).map_or(0.0, |x| x.1) / total;
+        if self.rand() * qd < pd { return Ok(None); }
+        let res: Vec<(usize, f32)> = c.iter().filter_map(|&(id, w)| {
+            let p = w / total;
+            let qv = q.iter().find(|x| x.0 == id).map_or(0.0, |x| x.1);
+            let r = p - qv;
+            (r > 0.0).then_some((id, r))
+        }).collect();
+        if res.is_empty() { Ok(Some(self.draw(&c)?)) } else { Ok(Some(self.draw(&res)?)) }
+    }
+
     /// The tokens `pick` draws from, with their weights (exp of the scaled logit, not normalized), most likely first.
     fn cands(&self, logits: &[f32]) -> Vec<(usize, f32)> {
         // The max in 16 lanes, which vectorizes (a scan with `total_cmp` does not): 0.3 ms per token less on a

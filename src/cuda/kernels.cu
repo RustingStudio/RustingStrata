@@ -1662,6 +1662,23 @@ extern "C" __global__ void conv_state(const float* qkv, float* state, int ch, in
     }
 }
 
+extern "C" __global__ void dflash2_conv(const float* x, const float* dyn, const float* base, float* out,
+                                        int H, int gs, int K, int T, int part) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = blockIdx.y;
+    if (i >= H || t >= T) return;
+    int g = i / gs, G = H / gs;
+    float acc = 0.0f;
+    for (int off = 0; off < K; off++) {
+        if (t >= off) {
+            float k_val = base[((size_t)part * K + off) * H + i]
+                        + dyn[((size_t)(t * 2 + part) * K + off) * G + g];
+            acc = fmaf(k_val, x[(size_t)(t - off) * H + i], acc);
+        }
+    }
+    out[(size_t)t * H + i] = acc;
+}
+
 // grid = (value heads, dv / (8 * R)), block = 256. Each state row (dk floats, dk in 32/64/128/256) lives in the
 // registers of L = dk / 16 lanes, 16 floats each (float4 chunks s, s + L, ...), so a warp holds R = 32 / L rows and
 // row dot products reduce over L lanes. The warp scans the T tokens in order.
@@ -1688,7 +1705,11 @@ extern "C" __global__ void deltanet_seq(const float* y, float* S, const float* b
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             float4 v = k4[s + L * i]; nk_[4 * i] = v.x; nk_[4 * i + 1] = v.y; nk_[4 * i + 2] = v.z; nk_[4 * i + 3] = v.w;
-            v = q4[s + L * i]; nq[4 * i] = v.x; nq[4 * i + 1] = v.y; nq[4 * i + 2] = v.z; nq[4 * i + 3] = v.w;
+            if (o) {
+                v = q4[s + L * i]; nq[4 * i] = v.x; nq[4 * i + 1] = v.y; nq[4 * i + 2] = v.z; nq[4 * i + 3] = v.w;
+            } else {
+                nq[4 * i] = 0.0f; nq[4 * i + 1] = 0.0f; nq[4 * i + 2] = 0.0f; nq[4 * i + 3] = 0.0f;
+            }
         }
         ng = g[tok * nv + vh]; nb = beta[tok * nv + vh]; nvv = yt[2 * nk * dk + vh * dv + j];
         if (dtb) { ng = softplus(ng + dtb[vh]) * ga[vh]; nb = sigmoid(nb); }
@@ -1703,10 +1724,15 @@ extern "C" __global__ void deltanet_seq(const float* y, float* S, const float* b
         for (int e = 0; e < 16; e++) { r[e] *= decay; sk += r[e] * kk[e]; }
         for (int off = L >> 1; off; off >>= 1) sk += __shfl_xor_sync(0xffffffff, sk, off);
         float d = bt * (vt - sk);
+        if (o) {
 #pragma unroll
-        for (int e = 0; e < 16; e++) { r[e] += d * kk[e]; oq += r[e] * qv[e]; }
-        for (int off = L >> 1; off; off >>= 1) oq += __shfl_xor_sync(0xffffffff, oq, off);
-        if (s == 0) o[(size_t)tok * nv * dv + vh * dv + j] = oq * scale;
+            for (int e = 0; e < 16; e++) { r[e] += d * kk[e]; oq += r[e] * qv[e]; }
+            for (int off = L >> 1; off; off >>= 1) oq += __shfl_xor_sync(0xffffffff, oq, off);
+            if (s == 0) o[(size_t)tok * nv * dv + vh * dv + j] = oq * scale;
+        } else {
+#pragma unroll
+            for (int e = 0; e < 16; e++) r[e] += d * kk[e];
+        }
         if (tok < min(nsnap, T - 1)) {
             float4* sr = (float4*)(snap + (size_t)tok * nv * dv * dk + ((size_t)vh * dv + j) * dk);
 #pragma unroll
@@ -1744,19 +1770,88 @@ extern "C" __global__ void hc_silu(float* x, float sc, int n) {
     if (i < n) x[i] = silu(x[i] * sc);
 }
 
-// grid.y = tokens: out[t][i] = sum over streams c of xn[t][c n + i] * sigmoid(g[t][c n + i]) / hc.
+// grid.y = tokens: out[t][i] = sum over streams c of xn[t][c n + i] * sigmoid(g[t][c n + i]) / hc (or mHC branch when hc & 0x100).
 extern "C" __global__ void hc_mix(const float* xn, const float* g, float* out, int n, int hc) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (i >= n) return;
-    size_t b = (size_t)blockIdx.y * hc * n + i;
+    if ((hc & 0x100) != 0) {
+        int streams = hc & 0xFF;
+        int out_dim = (hc >> 16) & 0xFF;
+        size_t b = (size_t)t * streams * n + i;
+        int loff = 32 + t * out_dim;
+        float s = 0.0f;
+        for (int c = 0; c < streams; c++) s += sigmoid(g[c] + g[loff + c]) * xn[b + (size_t)c * n];
+        out[(size_t)t * n + i] = s;
+        return;
+    }
+    size_t b = (size_t)t * hc * n + i;
     float s = 0.0f;
     for (int c = 0; c < hc; c++) s += xn[b + (size_t)c * n] * sigmoid(g[b + (size_t)c * n]) / (float)hc;
-    out[(size_t)blockIdx.y * n + i] = s;
+    out[(size_t)t * n + i] = s;
 }
 
-// grid.y = tokens: stream c of r[t] += out[t] * 2 sigmoid(inj[t][c] / hc); clear: out[t] = 0 afterwards.
+// grid.y = tokens: stream c of r[t] += out[t] * 2 sigmoid(inj[t][c] / hc); clear: out[t] = 0 afterwards (or mHC enter/merge/leave when hc & 0x100).
 extern "C" __global__ void hc_write(float* r, float* out, const float* inj, int n, int hc, int clear) {
     int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if ((hc & 0x100) != 0) {
+        int streams = hc & 0xFF;
+        if ((hc & 0x400) != 0) {
+            if (i >= n) return;
+            float o = out[(size_t)t * n + i];
+            for (int c = 0; c < streams; c++) r[((size_t)t * streams + c) * n + i] = o;
+            return;
+        }
+        __shared__ float s_post[4];
+        __shared__ float s_mix[16];
+        if (threadIdx.x == 0) {
+            int out_dim = (hc >> 16) & 0xFF;
+            int loff = 32 + t * out_dim;
+            for (int c = 0; c < streams; c++) s_post[c] = 2.0f * sigmoid(inj[streams + c] + inj[loff + streams + c]);
+            if (out_dim <= 2 * streams) {
+                for (int r0 = 0; r0 < streams; r0++)
+                    for (int c0 = 0; c0 < streams; c0++)
+                        s_mix[r0 * streams + c0] = (r0 == c0) ? 1.0f : 0.0f;
+            } else {
+                float m[16];
+                int moff = 2 * streams;
+                for (int k = 0; k < streams * streams; k++) m[k] = inj[moff + k] + inj[loff + moff + k];
+                for (int it = 0; it < 20; it++) {
+                    for (int r0 = 0; r0 < streams; r0++) {
+                        float mx = m[r0 * streams];
+                        for (int c0 = 1; c0 < streams; c0++) mx = fmaxf(mx, m[r0 * streams + c0]);
+                        float se = 0.0f;
+                        for (int c0 = 0; c0 < streams; c0++) se += expf(m[r0 * streams + c0] - mx);
+                        float lse = mx + logf(se);
+                        for (int c0 = 0; c0 < streams; c0++) m[r0 * streams + c0] -= lse;
+                    }
+                    for (int c0 = 0; c0 < streams; c0++) {
+                        float mx = m[c0];
+                        for (int r0 = 1; r0 < streams; r0++) mx = fmaxf(mx, m[r0 * streams + c0]);
+                        float se = 0.0f;
+                        for (int r0 = 0; r0 < streams; r0++) se += expf(m[r0 * streams + c0] - mx);
+                        float lse = mx + logf(se);
+                        for (int r0 = 0; r0 < streams; r0++) m[r0 * streams + c0] -= lse;
+                    }
+                }
+                for (int k = 0; k < streams * streams; k++) s_mix[k] = expf(m[k]);
+            }
+        }
+        __syncthreads();
+        if (i >= n) return;
+        float o = out[(size_t)t * n + i];
+        float old_r[4];
+        for (int c = 0; c < streams; c++) old_r[c] = r[((size_t)t * streams + c) * n + i];
+        float mean_s = 0.0f;
+        for (int r0 = 0; r0 < streams; r0++) {
+            float acc = s_post[r0] * o;
+            for (int c0 = 0; c0 < streams; c0++) acc += s_mix[r0 * streams + c0] * old_r[c0];
+            r[((size_t)t * streams + r0) * n + i] = acc;
+            mean_s += acc;
+        }
+        if ((hc & 0x200) != 0) out[(size_t)t * n + i] = mean_s / (float)streams;
+        else if (clear) out[(size_t)t * n + i] = 0.0f;
+        return;
+    }
     if (i >= n) return;
     float o = out[(size_t)t * n + i];
     for (int c = 0; c < hc; c++) r[((size_t)t * hc + c) * n + i] += o * (2.0f * sigmoid(inj[t * hc + c] / (float)hc));
@@ -1796,9 +1891,49 @@ extern "C" __global__ void ple_conv(float* r, const float* gated, const float* n
 
 // ---- attention ----
 
-// KV cache rows (one per position and KV head) hold hd f16 values, or with KV_Q8 (`--kv q8`) hd int8 values followed
-// by hd / 32 f16 scales, quantized like ggml's q8_0 (d = amax / 127 per 32 values). Offsets below count values.
-#if KV_Q8
+// KV cache rows (one per position and KV head) hold hd f16 values (KV_MODE 0), hd int8 values followed by hd / 32 f16 scales
+// (KV_MODE 1, `--kv q8`), hd / 2 packed uint4 nibbles + hd / 32 f16 scales (KV_MODE 2, `--kv q4`), or affine 2-bit
+// codes (hd / 4 B) + hd / 32 f16 scales + hd / 32 f16 mins (KV_MODE 3, `--kv q2`). Offsets below count values.
+#if KV_MODE == 3
+__device__ __forceinline__ float warp_min(float v) {
+    for (int o = 16; o > 0; o >>= 1) v = fminf(v, __shfl_xor_sync(0xffffffff, v, o));
+    return v;
+}
+__device__ __forceinline__ void kv_put(u16* c, size_t e, int hd, float x) {
+    u16 mn_h = f2h(warp_min(x));
+    float mn = h2f(mn_h), mx = warp_max(x), dr = fmaxf(0.0f, mx - mn) / 3.0f;
+    u16 d_h = f2h(dr);
+    float d = h2f(d_h), y = d == 0.0f ? 0.0f : (x - mn) / d;
+    int q = (int)roundf(y);
+    q = q < 0 ? 0 : (q > 3 ? 3 : q);
+    unsigned uq = (unsigned)q;
+    unsigned packed = uq
+        | (__shfl_xor_sync(0xffffffff, uq, 1) << 2)
+        | (__shfl_xor_sync(0xffffffff, uq, 2) << 4)
+        | (__shfl_xor_sync(0xffffffff, uq, 3) << 6);
+    int w = e % hd;
+    unsigned char* r = (unsigned char*)c + e / hd * (3 * hd / 8);
+    if ((w & 3) == 0) r[w / 4] = (unsigned char)packed;
+    if ((w & 31) == 0) {
+        *(u16*)(r + hd / 4 + 2 * (w / 32)) = d_h;
+        *(u16*)(r + hd / 4 + hd / 16 + 2 * (w / 32)) = mn_h;
+    }
+}
+#elif KV_MODE == 2
+// Quantize x into the cache at value offset e; the 32 lanes of the warp hold one 32-value block.
+__device__ __forceinline__ void kv_put(u16* c, size_t e, int hd, float x) {
+    float d = warp_max(fabsf(x)) / 7.0f;
+    float y = d == 0.0f ? 0.0f : x / d;
+    int q = (int)roundf(y);
+    q = q < -7 ? -7 : (q > 7 ? 7 : q);
+    unsigned nib = (unsigned)(q + 8);
+    unsigned pair = nib | (__shfl_xor_sync(0xffffffff, nib, 1) << 4);
+    int w = e % hd;
+    unsigned char* r = (unsigned char*)c + e / hd * (hd / 2 + hd / 16);
+    if ((w & 1) == 0) r[w / 2] = (unsigned char)pair;
+    if ((w & 31) == 0) *(u16*)(r + hd / 2 + 2 * (w / 32)) = f2h(d);
+}
+#elif KV_MODE == 1
 // Quantize x into the cache at value offset e; the 32 lanes of the warp hold one 32-value block.
 __device__ __forceinline__ void kv_put(u16* c, size_t e, int hd, float x) {
     float d = warp_max(fabsf(x)) / 127.0f;
@@ -1878,7 +2013,28 @@ template <int PER> __device__ __forceinline__ void ldh_raw(const u16* p, unsigne
 }
 // PER consecutive cache values from value offset off (off a multiple of PER, PER <= 32) as f16 words, like ldh_raw.
 template <int PER> __device__ __forceinline__ void ldkv(const u16* c, size_t off, int hd, unsigned* o) {
-#if KV_Q8
+#if KV_MODE == 3
+    int w = off % hd;
+    const unsigned char* r = (const unsigned char*)c + off / hd * (3 * hd / 8);
+    float d = h2f(*(const u16*)(r + hd / 4 + 2 * (w / 32)));
+    float mn = h2f(*(const u16*)(r + hd / 4 + hd / 16 + 2 * (w / 32)));
+    for (int i = 0; i < PER / 2; i++) {
+        int wi = w + 2 * i;
+        unsigned b = r[wi / 4];
+        int s = (b >> (2 * (wi & 2))) & 15;
+        int q0 = s & 3, q1 = s >> 2;
+        o[i] = (unsigned)f2h(fmaf((float)q0, d, mn)) | ((unsigned)f2h(fmaf((float)q1, d, mn)) << 16);
+    }
+#elif KV_MODE == 2
+    int w = off % hd;
+    const unsigned char* r = (const unsigned char*)c + off / hd * (hd / 2 + hd / 16);
+    float d = h2f(*(const u16*)(r + hd / 2 + 2 * (w / 32)));
+    for (int i = 0; i < PER / 2; i++) {
+        unsigned b = r[w / 2 + i];
+        int q0 = (int)(b & 15u) - 8, q1 = (int)(b >> 4) - 8;
+        o[i] = (unsigned)f2h((float)q0 * d) | ((unsigned)f2h((float)q1 * d) << 16);
+    }
+#elif KV_MODE == 1
     int w = off % hd;
     const char* r = (const char*)c + off / hd * (hd + hd / 16);
     unsigned d = *(const u16*)(r + hd + 2 * (w / 32)) * 0x10001u;  // scale in both halves
@@ -2175,7 +2331,7 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
 #define ATT_TOK int t = blockIdx.x % nt; q += (size_t)t * nh * hd; part += (size_t)t * pz; step += 2 * t; if (sel) sel += (size_t)t * sst; \
                 if (kvt) { kc = (const u16*)kvt[2 * t]; vc = (const u16*)kvt[2 * t + 1]; }
 #define ATT_RUN(G) attn_decode_t<PER, G>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt, win)
-#define ATT_RUN_CP(G) attn_decode_t<PER, G, !KV_Q8 && (PER == 4 || (PER == 8 && __CUDA_ARCH__ >= 800))>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt, win)
+#define ATT_RUN_CP(G) attn_decode_t<PER, G, (KV_MODE == 0) && (PER == 4 || (PER == 8 && __CUDA_ARCH__ >= 800))>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt, win)
 #define DEF_ATT(HD)                                                                                          \
     extern "C" __global__ void attn_decode_##HD(ATT_ARGS) {                                                  \
         constexpr int PER = HD / 32; ATT_TOK                                                                 \
@@ -2199,7 +2355,7 @@ DEF_ATT(64) DEF_ATT(128) DEF_ATT(256) DEF_ATT(512)
 extern "C" __global__ void __launch_bounds__(256, 3) attn_decode_gqa4_128(ATT_ARGS) {
     constexpr int PER = 4; ATT_TOK
     if (step[0] + 1 < gq_min) return;
-    if constexpr (!KV_Q8) attn_decode_t<PER, 4, true, true>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt, win);
+    if constexpr (KV_MODE == 0) attn_decode_t<PER, 4, true, true>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt, win);
 }
 
 // grid = query heads: out = (sum of split partials) / (sum of split sums) * sigmoid(gate), gate skipped when qg is null. Split 0 is never empty.
@@ -2456,7 +2612,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
     float mT[2][2] = {{-INFINITY, -INFINITY}, {-INFINITY, -INFINITY}}, lT[2][2] = {};
 #endif
     constexpr int N = FA_BKL * HD / 8 / 128;
-#if !KV_Q8
+#if KV_MODE == 0
     // f16: copy the V tile while the scores use K, and the next K tile while the sums use V (one block per SM,
     // so nothing else hides the loads); cp.async on sm_80+, a blocking copy at the same program point on sm_70.
     // Rows past `last` are zero-filled (synchronous path: the source is not read at all).
@@ -2472,7 +2628,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
     ld(0, vs, vc);
 #endif
     for (int k0 = 0; k0 <= last; k0 += FA_BKL) {
-#if KV_Q8
+#if KV_MODE > 0
         __syncthreads();
         // All of a thread's loads, then its stores: with q8 the dequant between them kept the compiler from
         // overlapping the loads. Rows past `last` load the row `last` and store zeros.
@@ -2556,7 +2712,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
             }
         }
 #endif
-#if !KV_Q8
+#if KV_MODE == 0
         __syncthreads();
         if (k0 + FA_BKL <= last) ld(k0 + FA_BKL, ks, kc);
         else cp_async_commit();  // keep one group per tile for the waits (sm_80+; nothing to commit on sm_70)
@@ -2644,7 +2800,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
         for (int d = 0; d < HD / 8; d++) { o[d][0] *= c[0]; o[d][1] *= c[0]; o[d][2] *= c[1]; o[d][3] *= c[1]; }
         }
 #endif
-#if !KV_Q8
+#if KV_MODE == 0
         cp_async_wait<1>();  // sm_80+: this V tile, the next K tile may still be in flight; sm_70: already copied here
         __syncthreads();
 #endif
@@ -2700,7 +2856,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
             }
         }
 #endif
-#if !KV_Q8
+#if KV_MODE == 0
         __syncthreads();
         if (k0 + FA_BKL <= last) ld(k0 + FA_BKL, vs, vc);
         else cp_async_commit();  // keep one group per tile for the waits (sm_80+; nothing to commit on sm_70)

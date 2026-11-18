@@ -199,6 +199,13 @@ fn gemvn_matches_gemv() {
             gpu.moe_gemv(t.ty, t.rows, t.cols, dt.ptr, 0, zid.addr(), 1, dx.addr(), t.cols, 1, dy.addr(), Some((0, 4 * t.rows as i64)), xq.addr()).unwrap();
             let got = down::<f32>(gpu, &dy);
             assert!(got[..t.rows] == want[..t.rows] && got[t.rows..] == want[..t.rows], "{} {name} paired moe_gemv", ty.name());
+            if gpu.supports_gemv_rows() && !matches!(t.ty, rusting_strata::quant::GgmlType::F32 | rusting_strata::quant::GgmlType::BF16) && t.rows >= 6 {
+                let subset: Vec<i32> = (0..t.rows as i32).step_by(3).collect();
+                let (dsub, dys) = (up(gpu, &subset), gpu.zeros::<f32>(subset.len()).unwrap());
+                gpu.gemv_rows(&dt, dx.addr(), dsub.addr(), subset.len(), dys.addr()).unwrap();
+                let sub_want: Vec<f32> = subset.iter().map(|&r| want[r as usize]).collect();
+                assert_eq!(down::<f32>(gpu, &dys), sub_want, "{} {name} gemv_rows", ty.name());
+            }
         }
         assert!(seen.len() >= 5 || !common::is_default_model(&p), "types covered: {seen:?}");
     }
@@ -1347,9 +1354,8 @@ fn moe_mailbox_round_trip() {
         assert_eq!(unsafe { (at(SKIP).read_volatile(), at(REQ).read_volatile()) }, want);
         gpu.put(&table, &dtable, 0).unwrap();
         // #34 R2: `mb = 0` (a fully resident cache) still routes, and writes no mailbox word, even with missed
-        // experts in the table: the combine must not wait for a CPU part that does not exist. CUDA only (the Vulkan
-        // kernels read the mailbox unconditionally).
-        if bk == "cuda" {
+        // experts in the table: the combine must not wait for a CPU part that does not exist.
+        {
             let before = unsafe { (at(SKIP).read_volatile(), at(REQ).read_volatile()) };
             gpu.put(&[0i32, 6], &step, 0).unwrap();
             gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), 0, n, lay.h, step.addr(), t, 0, false).unwrap();

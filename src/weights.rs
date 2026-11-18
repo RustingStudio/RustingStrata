@@ -73,6 +73,7 @@ pub struct Weights<'a> {
     pub g: &'a Gguf,
     pub aux_g: Option<&'a Gguf>,
     aliases: &'static [(&'static str, &'static str)],
+    phys_layer: Vec<usize>,
     /// Loader-owned overrides: synthesized `ssm_beta`/`ssm_alpha` and LoRA-baked tensors.
     pub built: HashMap<String, Tensor<'a>>,
     /// Heap storage the baked tensors in `built` point into. Kept beside `built` so a reload frees it instead of
@@ -88,9 +89,37 @@ impl<'a> Weights<'a> {
 
     pub fn new_with_aux(g: &'a Gguf, aux_g: Option<&'a Gguf>) -> anyhow::Result<Weights<'a>> {
         let c = ModelConfig::from_gguf(g)?;
-        let mut w = Weights { g, aux_g, aliases: c.aliases, built: HashMap::new(), baked: HashMap::new(), lora_baked: std::collections::HashSet::new() };
+        let mut w = Weights {
+            g,
+            aux_g,
+            aliases: c.aliases,
+            phys_layer: c.phys_layer.clone(),
+            built: HashMap::new(),
+            baked: HashMap::new(),
+            lora_baked: std::collections::HashSet::new(),
+        };
         // llama.cpp src/models/qwen3next.cpp: per key head group, r = nv / nk beta rows, then r alpha rows.
         for il in 0..c.n_layer {
+            let p = c.phys_layer.get(il).copied().unwrap_or(il);
+            if p != il { continue; }
+            let leak = |v: Vec<u8>| -> &'a [u8] { Box::leak(v.into_boxed_slice()) };
+            if let Ok(qkvg) = w.layer(il, "attn_qkv_gate.weight") {
+                let channels = c.ssm_d_inner + 2 * c.ssm_n_group * c.ssm_d_state;
+                let rb = qkvg.row_bytes();
+                anyhow::ensure!(qkvg.rows == channels + c.ssm_d_inner,
+                    "blk.{il}.attn_qkv_gate: {} rows, expected {}", qkvg.rows, channels + c.ssm_d_inner);
+                let split_at = channels * rb;
+                w.built.insert(format!("blk.{il}.attn_qkv.weight"), Tensor { rows: channels, data: &qkvg.data[..split_at], ..qkvg });
+                w.built.insert(format!("blk.{il}.attn_gate.weight"), Tensor { rows: c.ssm_d_inner, data: &qkvg.data[split_at..], ..qkvg });
+            }
+            if let Ok(ba) = w.layer(il, "ssm_beta_alpha.weight") {
+                let (nv, rb) = (c.ssm_dt_rank, ba.row_bytes());
+                anyhow::ensure!(nv > 0 && ba.rows == 2 * nv, "blk.{il}.ssm_beta_alpha: {} rows for {nv}", ba.rows);
+                let split_at = nv * rb;
+                let half = Tensor { rows: nv, ..ba };
+                w.built.insert(format!("blk.{il}.ssm_beta.weight"), Tensor { data: &ba.data[..split_at], ..half });
+                w.built.insert(format!("blk.{il}.ssm_alpha.weight"), Tensor { data: &ba.data[split_at..], ..half });
+            }
             let Ok(ba) = w.layer(il, "ssm_ba.weight") else { continue };
             let (nk, nv, rb) = (c.ssm_n_group, c.ssm_dt_rank, ba.row_bytes());
             anyhow::ensure!(nk > 0 && nv > 0 && nv % nk == 0 && ba.rows == 2 * nv && ba.data.len() == ba.rows * rb,
@@ -102,7 +131,6 @@ impl<'a> Weights<'a> {
                 a.extend_from_slice(&grp[r * rb..]);
             }
             // ponytail: leaked, a few KB per layer per load; own the bytes in Weights if one process loads many models.
-            let leak = |v: Vec<u8>| -> &'a [u8] { Box::leak(v.into_boxed_slice()) };
             let half = Tensor { rows: ba.rows / 2, ..ba };
             w.built.insert(format!("blk.{il}.ssm_beta.weight"), Tensor { data: leak(b), ..half });
             w.built.insert(format!("blk.{il}.ssm_alpha.weight"), Tensor { data: leak(a), ..half });
@@ -158,7 +186,15 @@ impl<'a> Weights<'a> {
         })
     }
 
-    pub fn layer(&self, il: usize, suffix: &str) -> anyhow::Result<Tensor<'a>> { self.get(&format!("blk.{il}.{suffix}")) }
+    pub fn layer(&self, il: usize, suffix: &str) -> anyhow::Result<Tensor<'a>> {
+        let p = self.phys_layer.get(il).copied().unwrap_or(il);
+        if p != il
+            && let Ok(t) = self.get(&format!("blk.{il}.{suffix}"))
+        {
+            return Ok(t);
+        }
+        self.get(&format!("blk.{p}.{suffix}"))
+    }
 
     /// Refuse files containing quant types this engine does not implement, except in the MTP (nextn) layers, blocks
     /// `n_layer` on: false if one of those has such a type, so that the model loads without MTP.

@@ -269,6 +269,8 @@ pub struct ChatRequest {
     pub max_tokens: Option<usize>,
     pub stream: bool,
     pub think: Option<bool>,
+    /// Maximum tokens allowed inside `<think>` before forcing `</think>\n\n` (0 = unlimited).
+    pub thinking_budget: Option<usize>,
     /// `chat_template_kwargs.preserve_thinking`; the server's `--preserve-thinking` when absent.
     pub preserve_thinking: Option<bool>,
     pub temperature: Option<f32>,
@@ -317,7 +319,14 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
     // Hold checks every prefix of every stop string at each token, so both are bounded.
     if stop.len() > 16 || stop.iter().any(|s| s.len() > 256) { bail!("stop takes at most 16 strings of at most 256 bytes"); }
     let think = v["chat_template_kwargs"]["enable_thinking"].as_bool();
-    Ok(ChatRequest { messages, tools, tool_calls, max_tokens, stream: v["stream"].as_bool().unwrap_or(false), think,
+    let thinking_budget = match int("thinking_budget", 0)? {
+        Some(n) => Some(n as usize),
+        None => match &v["chat_template_kwargs"]["thinking_budget"] {
+            Value::Null => None,
+            x => Some(x.as_u64().context("chat_template_kwargs.thinking_budget must be an integer >= 0")? as usize),
+        },
+    };
+    Ok(ChatRequest { messages, tools, tool_calls, max_tokens, stream: v["stream"].as_bool().unwrap_or(false), think, thinking_budget,
         preserve_thinking: v["chat_template_kwargs"]["preserve_thinking"].as_bool(),
         temperature: num("temperature", |f| f >= 0.0, "a number >= 0")?, top_k: int("top_k", 0)?.map(|n| n as usize),
         top_p: num("top_p", |f| f > 0.0 && f <= 1.0, "a number in (0, 1]")?, seed: int("seed", 0)?, stop })
@@ -546,6 +555,11 @@ pub fn messages_body(body: &[u8]) -> anyhow::Result<Vec<u8>> {
     for (from, to) in [("max_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k"), ("stop_sequences", "stop"), ("stream", "stream")] {
         if !matches!(j.get(from), Json::Null) { out.push((to, j.get(from).clone())); }
     }
-    if j.get("thinking").get("type").as_str() == Some("enabled") { out.push(("chat_template_kwargs", obj(vec![("enable_thinking", Json::Bool(true))]))); }
+    if j.get("thinking").get("type").as_str() == Some("enabled") {
+        out.push(("chat_template_kwargs", obj(vec![("enable_thinking", Json::Bool(true))])));
+        if !matches!(j.get("thinking").get("budget_tokens"), Json::Null) {
+            out.push(("thinking_budget", j.get("thinking").get("budget_tokens").clone()));
+        }
+    }
     Ok(obj(out).dump().into_bytes())
 }
