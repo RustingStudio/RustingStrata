@@ -181,6 +181,10 @@ warm page cache:
 | Vulkan (same card) | 1.3 / 8.5 / 13.5 | 2.0 / 3.6 / 3.7 |
 | CPU only (`STRATA_DS_GPU=0`) | 2.5 / 3.0 / 4.1 | 2.4 / 2.2 / 1.7 |
 
+A 20,000-token prompt of text that does not repeat (this repository's documentation followed by Rust source,
+`bench --prompt-file F --pp 20000 --tg 64 --reps 1`, one run each) prefilled at 11.6 tok/s on CUDA and 10.6 tok/s on
+Vulkan, and the 64 tokens after it decoded at 3.3 and 1.9 tok/s.
+
 A token reads about 2.6 GB of expert weights and the model is larger than this box's RAM, so the numbers move with
 the page cache; the expert cache policy knobs (`STRATA_DS_LFU`, `STRATA_DS_NOEVICT`) changed nothing measurable. A
 CPU-only build of the llama.cpp pull request that adds the model (#32517) decoded at 0.28 tok/s on the same box (one
