@@ -287,6 +287,11 @@ Run `calibrate` as the service user, because the calibration file and the CUDA k
 `~/.cache/rusting_strata`. The first start after an update compiles the CUDA kernels (about 15 s); `/health` answers
 `503` until the model has loaded.
 
+In a container that folder is lost when the container exits, and the next one starts uncalibrated with only the
+`not calibrated on this machine` line to say so. Set `XDG_CACHE_HOME` to a mounted path (the folder is then
+`$XDG_CACHE_HOME/rusting_strata`) for both `calibrate` and `serve`, for example `-v /srv/strata-cache:/cache -e
+XDG_CACHE_HOME=/cache`.
+
 **Stopping and restarting.** On `SIGTERM` (`systemctl stop` or `restart`) the server answers new requests, `/health`
 included, with `503` and `Retry-After: 5`, lets the requests it already accepted finish (the queued ones too), saves
 the routing profile it learned, so that the next start places the experts as well, and then exits.
