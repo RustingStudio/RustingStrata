@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock};
 
 /// Optional GPU offload of the non-expert matvecs (STRATA_DS_GPU=1). Weights stay resident in VRAM; the activation is
 /// copied up and the result down per call, so everything else in the forward stays the CPU reference code.
-/// STRATA_DS_BACKEND (cuda or vulkan, default cuda) and STRATA_DS_DEVICES (such as 0,1) pick the GPUs; with several,
+/// STRATA_DS_BACKEND (cuda or vulkan; unset: CUDA if it loads, else Vulkan) and STRATA_DS_DEVICES (such as 0,1) pick the GPUs; with several,
 /// the weights fill them in order and the expert budget is divided in proportion to free VRAM.
 mod dev {
     use super::*;
@@ -23,7 +23,8 @@ mod dev {
     static DEV: OnceLock<Option<Mutex<Dev>>> = OnceLock::new();
     pub fn get() -> Option<&'static Mutex<Dev>> {
         DEV.get_or_init(|| {
-            if std::env::var_os("STRATA_DS_GPU").is_none() { return None; }
+            // Unset or 0: every matvec runs on the CPU.
+            if std::env::var("STRATA_DS_GPU").map_or(true, |v| v == "0") { return None; }
             let kind = std::env::var("STRATA_DS_BACKEND").ok();
             let ids: Vec<usize> = std::env::var("STRATA_DS_DEVICES").ok()
                 .map(|v| v.split(',').filter_map(|d| d.trim().parse().ok()).collect()).filter(|v: &Vec<usize>| !v.is_empty()).unwrap_or(vec![0]);
@@ -34,7 +35,7 @@ mod dev {
             let frac: f64 = std::env::var("STRATA_DS_GPU_FRACTION").ok().and_then(|v| v.parse().ok()).unwrap_or(0.8);
             let mut bes = vec![];
             for d in ids {
-                match crate::backend::open(kind.as_deref().or(Some("cuda")), d) {
+                match crate::backend::open(kind.as_deref(), d) {
                     Ok(be) => bes.push(be),
                     Err(e) => { eprintln!("GPU {d}: {e:#}; running without it"); return None; }
                 }
@@ -78,9 +79,10 @@ mod dev {
         }
         fn tensor(&self, i: u32) -> &GpuTensor { &self.parts[gpu_of(i)].ts[(i & (1 << SHIFT) - 1) as usize] }
         /// VRAM copy of one routed expert: uploaded on first use while under a GPU's STRATA_DS_GPU_EXPERTS share (GB), then the
-        /// least recently used slot of the same shape is overwritten. Slots touched in the last 24 lookups are kept (one layer's
-        /// 18 experts are in flight together). No slot to take: STAGED (copied up per use).
-        pub fn expert(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize) -> Option<u32> {
+        /// least recently used slot of the same shape is overwritten. Slots touched in the last 96 lookups are kept (the
+        /// matrices of one layer's experts are in flight together). No slot to take: STAGED (copied up per use).
+        /// `evict` false: a miss with no free room returns None, so the caller can run that expert on the CPU.
+        pub fn expert(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize, evict: bool) -> Option<u32> {
             let k = data.as_ptr() as usize;
             self.now += 1;
             self.lookups += 1;
@@ -100,10 +102,10 @@ mod dev {
                 self.exs.push((i, k, now, 1.0));
                 return Some(i);
             }
-            if self.parts.iter().all(|p| p.budget == 0) || data.len() > STAGE || std::env::var_os("STRATA_DS_NOEVICT").is_some() { return None; }
+            if !evict || self.parts.iter().all(|p| p.budget == 0) || data.len() > STAGE || std::env::var_os("STRATA_DS_NOEVICT").is_some() { return None; }
             let lfu = std::env::var_os("STRATA_DS_LFU").is_some();
             let victim = self.exs.iter().enumerate()
-                .filter(|(_, e)| e.2 + 24 <= now && { let t = self.tensor(e.0); t.ty == ty && t.rows == rows && t.cols == cols })
+                .filter(|(_, e)| e.2 + 96 <= now && { let t = self.tensor(e.0); t.ty == ty && t.rows == rows && t.cols == cols })
                 .min_by(|(_, a), (_, b)| if lfu { a.3.total_cmp(&b.3).then(a.2.cmp(&b.2)) } else { a.2.cmp(&b.2) })
                 .map(|(p, _)| p);
             let Some(p) = victim else { return Some(STAGED) };
@@ -129,13 +131,33 @@ mod dev {
             let got: Vec<f32> = p.be.get(&p.y, 0, y.len()).unwrap();
             y.copy_from_slice(&got);
         }
-        /// One gemv per matrix, all queued before a single readback; all matrices sit on one GPU. Job i reads
-        /// x[i*xs..] (xs = 0: every job reads x) and writes its rows after job i-1's. Staged experts are uploaded
-        /// once each into a temporary buffer, so a layer with both resident and staged experts still batches.
+        /// One gemv per matrix, all queued before a single readback per GPU. Job i reads x[i*xs..] (xs = 0: every
+        /// job reads x) and writes its rows after job i-1's. Staged experts are uploaded once each into a temporary
+        /// buffer, so a layer with both resident and staged experts still batches.
         pub fn batch_mats(&self, ms: &[Mat], x: &[f32], xs: usize) -> Option<Vec<f32>> {
-            let first = self.part_of(ms.first()?)?;
-            if ms.iter().any(|m| self.part_of(m) != Some(first)) { return None; }
-            let p = &self.parts[first];
+            let on: Vec<usize> = ms.iter().map(|m| self.part_of(m)).collect::<Option<_>>()?;
+            let first = *on.first()?;
+            if on.iter().all(|&d| d == first) { return self.batch_on(first, ms, x, xs); }
+            // ponytail: the GPUs run their batches one after another; queue all of them before the readbacks if
+            // multi-GPU decode ever waits on this.
+            let mut y = vec![0f32; ms.iter().map(|m| m.rows).sum()];
+            for d in 0..self.parts.len() {
+                let idx: Vec<usize> = (0..ms.len()).filter(|&i| on[i] == d).collect();
+                if idx.is_empty() { continue; }
+                let sub: Vec<Mat> = idx.iter().map(|&i| ms[i]).collect();
+                let subx: Vec<f32> = if xs == 0 { x.to_vec() } else { idx.iter().flat_map(|&i| x[i * xs..(i + 1) * xs].iter().copied()).collect() };
+                let r = self.batch_on(d, &sub, &subx, xs)?;
+                let mut from = 0;
+                for &i in &idx {
+                    let to: usize = ms[..i].iter().map(|m| m.rows).sum();
+                    y[to..to + ms[i].rows].copy_from_slice(&r[from..from + ms[i].rows]);
+                    from += ms[i].rows;
+                }
+            }
+            Some(y)
+        }
+        fn batch_on(&self, d: usize, ms: &[Mat], x: &[f32], xs: usize) -> Option<Vec<f32>> {
+            let p = &self.parts[d];
             let nx = if xs == 0 { x.len() } else { ms.len() * xs };
             if nx > p.x.len() / 4 { return None; }
             let xsrc = &x[..nx];
@@ -292,11 +314,28 @@ impl<'a> Mat<'a> {
 
     /// Slice of a [cols, rows, n_expert] tensor for expert e.
     pub fn expert(&self, e: usize, n_expert: usize) -> Mat<'a> {
+        self.expert_opt(e, n_expert, true)
+    }
+
+    /// `expert` that never overwrites a VRAM slot when `evict` is false: an expert that is not resident and has no
+    /// free room comes back host-only, for the CPU.
+    pub fn expert_opt(&self, e: usize, n_expert: usize, evict: bool) -> Mat<'a> {
+        let mut m = self.expert_host(e, n_expert);
+        m.gpu = dev::get().and_then(|d| d.lock().unwrap().expert(m.data, m.ty, m.rows, m.cols, evict));
+        m
+    }
+
+    /// This matrix copied to the GPU for each use (no VRAM cache slot). Unchanged without a GPU.
+    pub fn staged(mut self) -> Self {
+        if dev::get().is_some() { self.gpu = Some(dev::STAGED); }
+        self
+    }
+
+    /// Expert e read from the mapped file, without a VRAM cache lookup.
+    pub fn expert_host(&self, e: usize, n_expert: usize) -> Mat<'a> {
         let rows = self.rows / n_expert;
         let sz = rows * self.ty.row_bytes(self.cols as u64);
-        let data = &self.data[e * sz..(e + 1) * sz];
-        let gpu = dev::get().and_then(|d| d.lock().unwrap().expert(data, self.ty, rows, self.cols));
-        Mat { data, ty: self.ty, rows, cols: self.cols, cpu: self.cpu, gpu }
+        Mat { data: &self.data[e * sz..(e + 1) * sz], ty: self.ty, rows, cols: self.cols, cpu: self.cpu, gpu: None }
     }
 
     /// Whether this matrix has no VRAM copy and must be read from the mapped file (CPU or staged expert).
@@ -360,7 +399,7 @@ fn q8_roundtrip(ty: GgmlType, cpu: bool, x: &[f32]) -> Vec<f32> {
     use GgmlType::*;
     let mut out = x.to_vec();
     match ty {
-        Q5K | IQ1M | IQ2XXS | IQ2XS if cpu => {
+        Q5K | IQ1M | IQ2XXS | IQ2XS | IQ2S if cpu => {
             for b in out.chunks_exact_mut(256) {
                 let (mut amax, mut max) = (0f32, 0f32);
                 for &v in b.iter() {
@@ -371,7 +410,7 @@ fn q8_roundtrip(ty: GgmlType, cpu: bool, x: &[f32]) -> Vec<f32> {
                 for v in b.iter_mut() { *v = (iscale * *v).round_ties_even().min(127.0) / iscale; }
             }
         }
-        Q5K | IQ1M | IQ2XXS | IQ2XS | Q8_0 | IQ4NL => {
+        Q5K | IQ1M | IQ2XXS | IQ2XS | IQ2S | Q8_0 | IQ4NL => {
             for b in out.chunks_exact_mut(32) {
                 let amax = b.iter().fold(0f32, |m, v| m.max(v.abs()));
                 let d = amax / 127.0;

@@ -289,6 +289,7 @@ impl Engine {
         // SAFETY: called at the start of a command, before any thread reads these variables.
         if let Some(b) = &self.backend { unsafe { std::env::set_var("STRATA_DS_BACKEND", b) } }
         if self.device != [0] { unsafe { std::env::set_var("STRATA_DS_DEVICES", self.device.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")) } }
+        if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // Hy4: every expert on the GPU
     }
 
     /// Fills settings not given on the command line from the model's calibration file, else built-in defaults.
@@ -970,6 +971,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 return rusting_strata::deepseek::chat::generate(&g, &prompt, n);
             }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::hy4::ARCH) {
+                anyhow::ensure!(image.is_empty(), "--image is not supported for hy_v4_flash");
+                let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
+                return rusting_strata::hy4::chat::generate(&g, &prompt, n);
+            }
             let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
@@ -1054,10 +1060,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let g = Gguf::open(&model)?;
             engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
             if let Some(arch) = g.get("general.architecture").ok().and_then(|v| v.as_str()) {
-                if arch == "deepseek41" || arch == "glm5-next" {
+                if arch == "deepseek41" || arch == "glm5-next" || arch == rusting_strata::hy4::ARCH {
                     engine.ds_env();
                     return if arch == "deepseek41" {
                         bench_deepseek(&g, &model, &pp, tg, reps, json_out, &mut engine)
+                    } else if arch == rusting_strata::hy4::ARCH {
+                        bench_hy4(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else {
                         bench_glm(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     };
@@ -1123,6 +1131,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Check { model, backend, device } => {
             let g = Gguf::open(&model)?;
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::hy4::ARCH) {
+                let m = rusting_strata::hy4::forward::Hy4Model::new(&g)?;
+                println!("check: hy_v4_flash ok: {} layers, {} experts ({} used), {} tensors, every tensor of the forward is present", m.cfg.n_layer, m.cfg.n_expert, m.cfg.n_used, g.tensors.len());
+                return Ok(());
+            }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
                 let c = rusting_strata::deepseek::DsConfig::from_gguf(&g)?;
                 c.validate(&g)?;
@@ -1170,6 +1183,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
                 anyhow::ensure!(image.is_empty(), "--image is not supported for deepseek41");
                 return rusting_strata::deepseek::chat::chat(&g, system, n, think);
+            }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::hy4::ARCH) {
+                anyhow::ensure!(image.is_empty(), "--image is not supported for hy_v4_flash");
+                return rusting_strata::hy4::chat::chat(&g, system, n, think);
             }
             let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
@@ -1230,6 +1247,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
                 anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
                 return rusting_strata::deepseek::chat::serve(&g, &name, &addr, key.as_deref());
+            }
+            if let Some(mp) = &model && let Ok(g) = Gguf::open(mp) && g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::hy4::ARCH) {
+                let name = mp.file_name().map_or("hy4".into(), |n| n.to_string_lossy().into_owned());
+                let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
+                anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
+                return rusting_strata::hy4::chat::serve(&g, &name, &addr, key.as_deref());
             }
             engine.parallel = host.parallel;
             // Before the model is loaded: a slot count outside 1..=255 is an invalid request, not a downgrade.
@@ -1531,6 +1554,46 @@ fn bench_deepseek(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, 
     rusting_strata::deepseek::chat::gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
     let mut m = rusting_strata::deepseek::forward::DsModel::new(g)?;
+    let eos = tok.eos_ids();
+    let mut results = Vec::with_capacity(pp.len());
+    for &n in pp {
+        let ids = prose(&tok, n)?;
+        let (mut p, mut d) = (Vec::new(), Vec::new());
+        for _ in 0..reps {
+            m.reset();
+            let t = Instant::now();
+            let logits = m.prefill(&ids);
+            p.push(n as f64 / t.elapsed().as_secs_f64());
+            let t = Instant::now();
+            let k = decode_greedy_big(&mut |t| m.step(t), logits, &eos, tg);
+            d.push(k as f64 / t.elapsed().as_secs_f64());
+        }
+        let (prefill, decode_stat) = (Stat::of(&p), Stat::of(&d));
+        println!("pp {n:6}: prefill {} tok/s | tg {tg}: decode {} tok/s", prefill.text(), decode_stat.text());
+        results.push(BenchResult { pp: n, prefill, decode: decode_stat, bytes_per_token: 0, decode_median: 0.0 });
+    }
+    let expert = big_expert_stats(m.cfg.n_layer, m.cfg.n_expert);
+    let backend = rusting_strata::deepseek::mat::dev_info().map_or("cpu", |i| i.0);
+    let meta = BenchMeta {
+        backend,
+        backend_arg: engine.backend.as_deref(),
+        device: if backend == "cpu" { &[] } else { &engine.device },
+        model,
+        ctx: engine.ctx,
+        chunk: 1,
+        kv: &engine.kv,
+        mtp: 0,
+        tg,
+        reps,
+    };
+    write_bench_json(json_out, &meta, &results, expert.as_ref())
+}
+
+/// `strata bench` for Hy4-flash (token-by-token forward, GPU matvecs when enabled).
+fn bench_hy4(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {
+    rusting_strata::deepseek::chat::gpu_defaults();
+    let tok = Tokenizer::from_gguf(g)?;
+    let mut m = rusting_strata::hy4::forward::Hy4Model::new(g)?;
     let eos = tok.eos_ids();
     let mut results = Vec::with_capacity(pp.len());
     for &n in pp {

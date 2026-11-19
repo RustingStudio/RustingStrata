@@ -45,7 +45,7 @@ impl Tokenizer {
         if model != "gpt2" { bail!("unsupported tokenizer model '{model}'"); }
         let pre = g.get("tokenizer.ggml.pre")?.as_str().unwrap_or("");
         let res: &[&str] = match pre {
-            "qwen35" => &[QWEN35_RE], "qwen2" => &[QWEN2_RE], "joyai-llm" => &JOYAI_RE,
+            "qwen35" => &[QWEN35_RE], "qwen2" => &[QWEN2_RE], "joyai-llm" | "hy_v4" => &JOYAI_RE,
             "flint" => &FLINT_RE,
             "glm4" | "glm5" | "chatglm-bpe" => &[GLM4_RE],
             _ => bail!("unsupported pre-tokenizer '{pre}'"),
