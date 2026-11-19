@@ -77,6 +77,12 @@ struct Engine {
     top_k: usize,
     #[arg(long, default_value_t = 1.0)]
     top_p: f32,
+    /// Default presence penalty (OpenAI `presence_penalty`); needs --temp > 0. Qwen recommends 1.5 against loops.
+    #[arg(long, default_value_t = 0.0)]
+    presence_penalty: f32,
+    /// Default frequency penalty (OpenAI `frequency_penalty`); needs --temp > 0.
+    #[arg(long, default_value_t = 0.0)]
+    frequency_penalty: f32,
     /// Random seed for sampling [default: from the clock].
     #[arg(long)]
     seed: Option<u64>,
@@ -411,7 +417,8 @@ impl Engine {
         })
     }
     fn sampler(&self) -> Sampler {
-        Sampler { temp: self.temp, top_k: self.top_k, top_p: self.top_p, rng: seed(self.seed) }
+        Sampler { temp: self.temp, top_k: self.top_k, top_p: self.top_p, rng: seed(self.seed),
+            presence: self.presence_penalty, frequency: self.frequency_penalty, seen: Default::default() }
     }
     fn chunk(&self) -> usize { self.chunk.unwrap_or(4096) }
     fn mtp(&self) -> usize { self.mtp.unwrap_or(0) }
@@ -2327,6 +2334,9 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             smp.temp = req.temperature.unwrap_or(smp.temp);
             smp.top_k = req.top_k.unwrap_or(smp.top_k);
             smp.top_p = req.top_p.unwrap_or(smp.top_p);
+            smp.presence = req.presence_penalty.unwrap_or(smp.presence);
+            smp.frequency = req.frequency_penalty.unwrap_or(smp.frequency);
+            eprintln!("sampling: temp={} top_k={} top_p={} presence={} frequency={}", smp.temp, smp.top_k, smp.top_p, smp.presence, smp.frequency);
             if req.seed.is_some() { smp.rng = seed(req.seed); }
             let n = room(e, ids.len(), req.max_tokens.unwrap_or(usize::MAX).min(s.max_tokens));
             if n == 0 { return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("prompt of {} tokens fills the context", ids.len()), "type": "invalid_request_error"}})); }
