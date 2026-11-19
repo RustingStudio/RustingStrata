@@ -1,7 +1,7 @@
 # RustingStrata
 
 A pure-Rust inference engine for Qwen GGUF models: Qwen3.5/3.6 (`qwen35moe`, `qwen35`), Qwen3-Next (`qwen3next`),
-Qwen3.8-Flash-Next (`qwen4exp`), Qwen3 (`qwen3`, `qwen3moe`), DeepSeek-V4.1-Flash (`deepseek41`), GLM-5.3-Flash (`glm5-next`) and Recursive Flint (`flint`). CUDA kernels are
+Qwen3.8-Flash-Next (`qwen4exp`), Qwen3 (`qwen3`, `qwen3moe`), DeepSeek-V4.1-Flash (`deepseek41`), GLM-5.3-Flash (`glm5-next`), Hy4-flash (`hy_v4_flash`) and Recursive Flint (`flint`). CUDA kernels are
 compiled at run time with NVRTC through cudarc, and the same kernels also run on Vulkan (`--backend vulkan`): no C++
 build step, no ggml. Experts that do not fit in VRAM run on the CPU at the same time as the GPU work, and the expert
 placement adapts to the routing it sees.
@@ -150,6 +150,54 @@ decoded at 1.6 tok/s. A paired run on 2026-11-13 (64 greedy tokens through `serv
 Caveats: prefill runs 512-token chunks layer by layer so each routed expert is read once per chunk (a 380-word, about 550-token prompt prefilled in 209 s with 512-token chunks against 325 s with 128, identical logprobs; short prompts cost more per token because the experts stream from SSD once per chunk, `STRATA_GLM_CHUNK` sets the size); prompt plus reply is limited only by the model's trained context from the GGUF (1,048,576; `STRATA_GLM_CTX` lowers it, and the KV cache grows with the text, so RAM is the real bound; the k-pool sparse-attention indexer takes over past 2048 rows and was checked against llama.cpp up to 3.6k tokens: same top-5 sets, same first token); the NextN/MTP layer is unused; decoding is greedy only; tool calls work in `serve` (the prompt matches llama.cpp's template byte for byte, checked on one tool call and one tool-result round trip); the reasoning
 text comes back in `content` before `</think>`.
 
+## Hy4-flash (IQ2_S/IQ2_XXS, 85 GB)
+
+`chat`, `generate`, `serve` and `bench` detect the `hy_v4_flash` architecture (four-stream hyper-connections, gated MLA
+attention with sinks, sliding-window and sparse layers, latent MoE, Engram) and run the forward in `src/hy4/`, with
+the matvecs and an expert cache on the GPU (no `--gpu` flag needed). Pass the first shard.
+
+```sh
+M=Hy4-flash-AD-IQ2_S-IQ2_XXS-00001-of-00002.gguf
+rustingstrata chat     --model $M
+rustingstrata generate --model $M --prompt "The capital of France is" -n 64
+rustingstrata serve    --model $M --addr 127.0.0.1:8080 [--api-key K]
+```
+
+The GPU is CUDA when an NVIDIA card and driver are present and Vulkan otherwise (AMD, Intel); `--backend vulkan` or
+`--backend cuda` picks one, `--device 0,1` spreads the expert cache over several cards, and `STRATA_DS_GPU=0` runs
+everything on the CPU. Experts that are not in VRAM are split between the CPU (straight from the mapped file) and the
+GPU (uploaded for the token), and the split follows the measured time of each side. `--fixed-experts` (or
+`STRATA_DS_CPU_SHARE=0`) sends every expert to the GPU, which is slower here but gives the same text on every run.
+The prompt runs layer by layer in chunks of `STRATA_DS_CHUNK` tokens (default 1024), so a routed expert is read once
+for all the tokens of a chunk that picked it. When the files fit in RAM with 4 GiB to spare they are read into the
+page cache in the background from the start (`STRATA_PRELOAD=0` turns that off).
+
+On an RTX 3060 12 GB with 30 GB RAM and a Ryzen 5 7600X, `bench --pp 16,128,512 --tg 32 --reps 2` measured, with a
+warm page cache:
+
+| Backend | Prefill 16 / 128 / 512 tokens (tok/s) | Decode (tok/s) |
+|---|---|---|
+| CUDA | 3.0 / 8.7 / 18.1 | 4.3 / 5.1 / 4.5 |
+| Vulkan (same card) | 1.3 / 8.5 / 13.5 | 2.0 / 3.6 / 3.7 |
+| CPU only (`STRATA_DS_GPU=0`) | 2.5 / 3.0 / 4.1 | 2.4 / 2.2 / 1.7 |
+
+A token reads about 2.6 GB of expert weights and the model is larger than this box's RAM, so the numbers move with
+the page cache; the expert cache policy knobs (`STRATA_DS_LFU`, `STRATA_DS_NOEVICT`) changed nothing measurable. A
+CPU-only build of the llama.cpp pull request that adds the model (#32517) decoded at 0.28 tok/s on the same box (one
+run, not side by side). Not measured: an AMD or Intel card (the Vulkan path was run on the RTX 3060 only), more than
+one card, and a machine whose RAM holds the whole model.
+
+Checked against that llama.cpp build with tensor dumps: the first greedy token matches, and the last layer's output
+differs from llama.cpp's by 14-20%, no more than this engine's integer and f32 paths differ from each other (19%). With
+this IQ2 quant that is enough for greedy text to leave llama.cpp's at flat positions. The k-pool indexer of the sparse layers, which takes over past 2048 tokens, was checked
+on a 2619-token prompt for layers 0 and 1: its tensors are within 0.2% and at least 508 of the 511 kept groups are the
+same at every position (the disputed groups score within 0.1% of the cut).
+Caveats: decoding is greedy only, and prompt plus reply is limited to 32,768 tokens (`MAX_CTX` in
+`src/hy4/forward.rs`; every layer keeps the key rows of all positions). The GPU and CPU kernels round differently, so
+with the adaptive split and with chunked prefill the greedy text can differ from run to run at near-ties; chunked and
+token-by-token prefill give the same logits within 1e-3 on the CPU path. `tests/hy4_forward.rs` runs when
+`STRATA_HY4_MODEL` points at the first shard.
+
 ## Development
 
 ```sh
@@ -160,7 +208,7 @@ python -I tools/parity.py $M --extra "--gpu" --tag gpu   # agreement with llama.
 Source map: `src/gguf.rs` (file reader), `src/quant/` (dequantization), `src/model.rs` (CPU reference forward),
 `src/cuda/` and `src/vulkan/` (GPU kernels, behind `src/backend.rs`), `src/gpu_model.rs` and
 `src/gpu_model/prefill.rs` (GPU forward and chunked prefill), `src/expert_cache.rs` (expert placement),
-`src/cpu_moe.rs` and `src/cpu_worker.rs` (CPU experts), `src/deepseek/` (DeepSeek-V4.1), `src/glm/` (GLM-5.3), `src/serve.rs` (HTTP),
+`src/cpu_moe.rs` and `src/cpu_worker.rs` (CPU experts), `src/deepseek/` (DeepSeek-V4.1), `src/glm/` (GLM-5.3), `src/hy4/` (Hy4-flash), `src/serve.rs` (HTTP),
 `src/chat.rs` (chat templates and tool calls), `src/main.rs` (CLI).
 
 ## License

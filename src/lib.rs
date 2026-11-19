@@ -21,4 +21,5 @@ pub mod mcp;
 pub mod deepseek;
 pub mod gemma4;
 pub mod glm;
+pub mod hy4;
 pub mod ngram;
