@@ -83,6 +83,15 @@ struct Engine {
     /// Default frequency penalty (OpenAI `frequency_penalty`); needs --temp > 0.
     #[arg(long, default_value_t = 0.0)]
     frequency_penalty: f32,
+    /// DRY multiplier (0 = off; 0.8 is the usual value): penalizes a token that would repeat a sequence the reply
+    /// already wrote, more the longer the repeat. Stops paragraph loops that a presence penalty does not. Needs --temp > 0.
+    #[arg(long, default_value_t = 0.0)]
+    dry_multiplier: f32,
+    #[arg(long, default_value_t = 1.75)]
+    dry_base: f32,
+    /// Repeats up to this many tokens long are free.
+    #[arg(long, default_value_t = 2)]
+    dry_allowed_length: usize,
     /// Random seed for sampling [default: from the clock].
     #[arg(long)]
     seed: Option<u64>,
@@ -418,7 +427,8 @@ impl Engine {
     }
     fn sampler(&self) -> Sampler {
         Sampler { temp: self.temp, top_k: self.top_k, top_p: self.top_p, rng: seed(self.seed),
-            presence: self.presence_penalty, frequency: self.frequency_penalty, seen: Default::default() }
+            presence: self.presence_penalty, frequency: self.frequency_penalty, dry_mult: self.dry_multiplier,
+            dry_base: self.dry_base, dry_allowed: self.dry_allowed_length, ..Sampler::greedy() }
     }
     fn chunk(&self) -> usize { self.chunk.unwrap_or(4096) }
     fn mtp(&self) -> usize { self.mtp.unwrap_or(0) }
@@ -1694,6 +1704,19 @@ fn calibrate(model: &Path, ctx: usize, margin: &[usize], kind: Option<&str>, dev
     Ok(())
 }
 
+/// Which tokens end a DRY match: those whose text has a newline, colon, double quote or asterisk (llama.cpp's
+/// default breakers). Built once per model, as decoding the whole vocabulary takes a moment.
+fn dry_breakers(tok: &Tokenizer, model: &str) -> std::sync::Arc<Vec<bool>> {
+    static CACHE: std::sync::Mutex<Option<(String, std::sync::Arc<Vec<bool>>)>> = std::sync::Mutex::new(None);
+    let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((m, b)) = c.as_ref() { if m == model { return b.clone(); } }
+    let b: Vec<bool> = (0..tok.vocab_size() as u32)
+        .map(|i| tok.decode(&[i]).is_ok_and(|s| s.contains(['\n', ':', '"', '*']))).collect();
+    let b = std::sync::Arc::new(b);
+    *c = Some((model.to_owned(), b.clone()));
+    b
+}
+
 /// Decoding of up to `n` tokens after `logits`; `emit` gets each new complete piece of text and returns true to stop.
 /// Returns the tokens and whether an end-of-turn token or `emit` stopped it.
 fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut logits: Vec<f32>, n: usize,
@@ -2336,7 +2359,13 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             smp.top_p = req.top_p.unwrap_or(smp.top_p);
             smp.presence = req.presence_penalty.unwrap_or(smp.presence);
             smp.frequency = req.frequency_penalty.unwrap_or(smp.frequency);
-            eprintln!("sampling: temp={} top_k={} top_p={} presence={} frequency={}", smp.temp, smp.top_k, smp.top_p, smp.presence, smp.frequency);
+            smp.dry_mult = req.dry_multiplier.unwrap_or(smp.dry_mult);
+            smp.dry_base = req.dry_base.unwrap_or(smp.dry_base);
+            smp.dry_allowed = req.dry_allowed_length.unwrap_or(smp.dry_allowed);
+            if smp.dry_mult > 0.0 { smp.dry_breakers = dry_breakers(tok, name); }
+            smp.tool_tags = tok.token_id("<tool_call>").zip(tok.token_id("</tool_call>")).map(|(a, b)| (a as usize, b as usize));
+            eprintln!("sampling: temp={} top_k={} top_p={} presence={} frequency={} dry={}/{}/{}", smp.temp, smp.top_k, smp.top_p,
+                smp.presence, smp.frequency, smp.dry_mult, smp.dry_base, smp.dry_allowed);
             if req.seed.is_some() { smp.rng = seed(req.seed); }
             let n = room(e, ids.len(), req.max_tokens.unwrap_or(usize::MAX).min(s.max_tokens));
             if n == 0 { return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("prompt of {} tokens fills the context", ids.len()), "type": "invalid_request_error"}})); }

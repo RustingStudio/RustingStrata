@@ -140,4 +140,6 @@ impl Tokenizer {
     }
 
     pub fn eos_ids(&self) -> Vec<u32> { self.eos.clone() }
+
+    pub fn vocab_size(&self) -> usize { self.inner.get_vocab_size(true) }
 }

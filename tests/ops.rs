@@ -100,3 +100,36 @@ fn penalties_push_away_from_returned_tokens() {
     assert_eq!(s.accept(&l, 0).unwrap(), Some(1));
     assert_eq!(s.seen.get(&1), Some(&1));
 }
+
+#[test]
+fn dry_penalizes_extending_a_repeat() {
+    // The reply so far is 1 2 3 4 1 2 3: after "1 2 3" came 4 before, so 4 loses 0.8 * 1.75^(3-2).
+    let l = [-10.0f32, -10.0, -10.0, -10.0, 1.0, 0.0];
+    let mut s = Sampler { dry_mult: 0.8, ..Sampler::greedy() };
+    s.hist = vec![1, 2, 3, 4, 1, 2, 3];
+    let p = s.dry_penalties();
+    assert_eq!(p.len(), 1);
+    assert_eq!(p[0].0, 4);
+    assert!((p[0].1 - 1.4).abs() < 1e-5);
+    assert_eq!(s.pick(&l).unwrap(), 5);
+    // A breaker inside the match cuts it to 1 token, below the allowed length: no penalty.
+    let mut s = Sampler { dry_mult: 0.8, dry_breakers: std::sync::Arc::new(vec![false, false, true, false, false, false]), ..Sampler::greedy() };
+    s.hist = vec![1, 2, 3, 4, 1, 2, 3];
+    assert!(s.dry_penalties().is_empty());
+    assert_eq!(s.pick(&l).unwrap(), 4);
+}
+
+#[test]
+fn no_penalties_inside_tool_calls() {
+    let l = [1.0f32, 0.5, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0];
+    let mut s = Sampler { presence: 5.0, tool_tags: Some((8, 9)), ..Sampler::greedy() };
+    assert_eq!(s.pick(&l).unwrap(), 0);
+    assert_eq!(s.pick(&l).unwrap(), 1);  // 0 is penalized outside a tool call
+    s.note(8);
+    assert!(s.in_tool);
+    assert_eq!(s.pick(&l).unwrap(), 0);  // inside: the plain logits
+    s.note(9);
+    assert!(!s.in_tool);
+    assert_eq!(s.seen.get(&0), Some(&1));  // the token inside the tool call was not counted
+    assert_eq!(s.hist, vec![0, 1]);
+}

@@ -128,25 +128,82 @@ pub struct Sampler {
     pub frequency: f32,
     /// How often each token was returned, for the penalties (only the reply, not the prompt).
     pub seen: std::collections::HashMap<usize, u32>,
+    /// DRY ("don't repeat yourself") multiplier; 0 is off. A token that would extend a sequence of `n >=
+    /// dry_allowed` tokens that already appeared in the reply loses `dry_mult * dry_base^(n - dry_allowed)` of logit.
+    pub dry_mult: f32,
+    pub dry_base: f32,
+    pub dry_allowed: usize,
+    /// Tokens a DRY match does not cross (their text has a newline, colon, quote or asterisk); empty for none.
+    pub dry_breakers: std::sync::Arc<Vec<bool>>,
+    /// The ids of `<tool_call>` and `</tool_call>`: no penalty applies between them (and those tokens are not
+    /// counted), so tool arguments may copy paths and names the reply already wrote.
+    pub tool_tags: Option<(usize, usize)>,
+    /// The returned tokens in order (outside tool calls), for DRY.
+    pub hist: Vec<usize>,
+    pub in_tool: bool,
 }
+
+/// DRY looks back this many reply tokens, and matches at most this long.
+const DRY_WINDOW: usize = 4096;
+const DRY_MAX_MATCH: usize = 64;
 
 impl Sampler {
     pub fn greedy() -> Self {
-        Sampler { temp: 0.0, top_k: 0, top_p: 1.0, rng: 1, presence: 0.0, frequency: 0.0, seen: Default::default() }
+        Sampler { temp: 0.0, top_k: 0, top_p: 1.0, rng: 1, presence: 0.0, frequency: 0.0, seen: Default::default(),
+            dry_mult: 0.0, dry_base: 1.75, dry_allowed: 2, dry_breakers: Default::default(), tool_tags: None,
+            hist: Vec::new(), in_tool: false }
     }
 
     /// The logits with the presence and frequency penalties applied, or None when there is nothing to change.
     /// Without them a quantized model that samples greedily (or nearly) falls into loops it never leaves.
     fn penalized(&self, logits: &[f32]) -> Option<Vec<f32>> {
-        if self.seen.is_empty() || (self.presence == 0.0 && self.frequency == 0.0) { return None; }
+        if self.in_tool { return None; }
+        let rep = !self.seen.is_empty() && (self.presence != 0.0 || self.frequency != 0.0);
+        let dry = self.dry_penalties();
+        if !rep && dry.is_empty() { return None; }
         let mut l = logits.to_vec();
-        for (&t, &n) in &self.seen {
-            if let Some(x) = l.get_mut(t) { *x -= self.presence + self.frequency * n as f32; }
+        if rep {
+            for (&t, &n) in &self.seen {
+                if let Some(x) = l.get_mut(t) { *x -= self.presence + self.frequency * n as f32; }
+            }
+        }
+        for (t, p) in dry {
+            if let Some(x) = l.get_mut(t) { *x -= p; }
         }
         Some(l)
     }
 
-    fn note(&mut self, t: usize) { *self.seen.entry(t).or_insert(0) += 1; }
+    /// DRY penalties for the next token: for every earlier place where the reply's last tokens already appeared,
+    /// the token that followed them there, with the longest such match (as llama.cpp's DRY sampler).
+    pub fn dry_penalties(&self) -> Vec<(usize, f32)> {
+        let h = &self.hist[self.hist.len().saturating_sub(DRY_WINDOW)..];
+        let n = h.len();
+        if self.dry_mult <= 0.0 || n < 2 { return vec![]; }
+        let brk = |t: usize| self.dry_breakers.get(t).copied().unwrap_or(false);
+        let last = h[n - 1];
+        if brk(last) { return vec![]; }
+        let mut best: std::collections::HashMap<usize, usize> = Default::default();
+        for i in 0..n - 1 {
+            if h[i] != last { continue; }
+            let mut len = 1;
+            while len < DRY_MAX_MATCH && len <= i && !brk(h[i - len]) && h[i - len] == h[n - 1 - len] { len += 1; }
+            let e = best.entry(h[i + 1]).or_insert(0);
+            *e = (*e).max(len);
+        }
+        best.into_iter().filter(|&(_, len)| len >= self.dry_allowed.max(1))
+            .map(|(t, len)| (t, self.dry_mult * self.dry_base.powi((len - self.dry_allowed.max(1)) as i32))).collect()
+    }
+
+    /// Records a token the reply now has (done by `pick` and `accept` for the tokens they return).
+    pub fn note(&mut self, t: usize) {
+        if let Some((open, close)) = self.tool_tags {
+            if t == open { self.in_tool = true; return; }
+            if t == close { self.in_tool = false; return; }
+        }
+        if self.in_tool { return; }
+        *self.seen.entry(t).or_insert(0) += 1;
+        self.hist.push(t);
+    }
 
     pub fn pick(&mut self, logits: &[f32]) -> anyhow::Result<usize> {
         let pen = self.penalized(logits);
