@@ -110,6 +110,12 @@ impl<'a> Model<'a> {
     }
     pub fn load_with_aux(g: &'a Gguf, aux: Option<&'a Gguf>, loras: &[(String, f32)]) -> anyhow::Result<Model<'a>> {
         let mut cfg = ModelConfig::from_gguf(g)?;
+        // A DFlash draft given on the command line replaces the target's own MTP head; without this the draft was
+        // ignored without a word for a target GGUF that carries one.
+        if cfg.n_nextn > 0 && aux.is_some_and(|ag| ag.tensors.contains_key("dflash.fc.weight")) {
+            eprintln!("note: DFlash draft model given: the target's own MTP head is not used");
+            cfg.n_nextn = 0;
+        }
         let is_standalone_draft = aux.is_some_and(|ag| {
             !ag.tensors.contains_key("fc.weight")
                 && !ag.tensors.contains_key("dflash.fc.weight")
@@ -1277,6 +1283,17 @@ mod tests {
         assert_eq!((df.n_layer, df.block_size, df.mask_token_id, df.n_embd, df.n_ff, df.n_head, df.n_head_kv, df.head_dim, df.sliding_window), (2, 16, 2, 32, 32, 2, 1, 16, 4096));
         assert_eq!(df.target_layer_ids, vec![0]);
         assert_eq!(df.layer_swa, vec![true, false]);
+        // Metadata that disagrees with the tensors is refused before any GPU buffer is sized from it.
+        crate::gpu_model::dflash_check(&m, df).unwrap();
+        for bad in [
+            crate::config::DFlashConfig { n_ff: 16, ..df.clone() },
+            crate::config::DFlashConfig { head_dim: 8, n_rot: 8, ..df.clone() },
+            crate::config::DFlashConfig { n_embd: 16, ..df.clone() },
+            crate::config::DFlashConfig { conv_kernel_size: 3, ..df.clone() },
+            crate::config::DFlashConfig { mask_token_id: u32::MAX, ..df.clone() },
+        ] {
+            assert!(crate::gpu_model::dflash_check(&m, &bad).is_err());
+        }
     }
 
     #[test]
