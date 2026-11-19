@@ -108,6 +108,7 @@ impl Gguf {
         if std::env::var_os("STRATA_HUGEPAGE").is_some() {
             let _ = mmap.advise(memmap2::Advice::HugePage);
         }
+        crate::weights::preload(&mmap);
         let mut c = Cur { b: &mmap, p: 0 };
         if c.take(4)? != b"GGUF" { bail!("{}: not a GGUF file", path.display()); }
         let ver = c.u32()?;
