@@ -61,14 +61,48 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   Drafts only pay when most experts are in VRAM: on the 12 GB reference machine with the IQ2_XS file (CPU experts
   on most tokens) `--mtp 1` decodes slower than no drafts. With a `--device 0,1` split the head runs on the
   last device (EAGLE3 heads excepted: those decode without drafts on a split).
+- `--draft-model PATH` speculative decoding with a separate draft model (needs `--gpu` and one stream, so not with
+  `--parallel`). The target checks every drafted token, so a draft never decides a token; sampling keeps its
+  distribution. As with `--mtp`, the batched check rounds differently from one-token decoding, so greedy output can
+  differ from a run without drafts at a near tie. Two kinds of file work:
+  - a DFlash or DFlash2 draft: a small block-diffusion model trained for one target model. It reads hidden states
+    of the target and predicts a whole block of tokens in one pass; the target then checks the block in one
+    batched pass and keeps the tokens that match. `--mtp N` caps the drafted tokens per step (default: the
+    draft's block size minus one). The draft must be made for this target: its embedding width, its target
+    layers and its tensor shapes are checked at load, and a file that does not fit is refused. When the target
+    GGUF has its own MTP head, the DFlash draft is used instead of that head.
+  - an ordinary smaller model with the same vocabulary as the target (default `--mtp 4`).
+
+  `PATH` is a `.gguf` file, a Hugging Face `.safetensors` file with its `config.json` next to it, or a
+  directory holding either. Safetensors DFlash checkpoints are converted once and written next to the source as
+  `model-dflash-q4_0.gguf` (`STRATA_DFLASH_Q8=1` writes and reads `model-dflash-q8_0.gguf`;
+  `STRATA_DFLASH_RECONVERT=1` converts again). `STRATA_DFLASH_BLOCK=N` fixes the block size instead of adapting
+  it to how many drafts are accepted.
+- `--spec-type LIST` drafts from text that is already in the context, with no draft model: a comma-separated
+  list of `suffix`, `ngram-simple`, `ngram-map-k`, `ngram-map-k4v`, `ngram-mod`, `ngram-cache`. It pays on
+  output that repeats the prompt (code edits, quoting, structured data). It combines with `--mtp`,
+  `--mtp-model` and `--draft-model`: the lookup drafts when it finds a match (next to a DFlash draft, only on a
+  long match) and the model drafts otherwise.
 - `--chunk`, `--threads` prefill chunk size and CPU expert threads. On a GPU `--threads` defaults to the physical
   core count (SMT siblings only add contention; on the 6-core/12-thread reference machine 6 beats 12 by ~20%).
   `rustingstrata calibrate` measures the best chunk and later runs read it from
   `~/.cache/rusting_strata/strata-<model>.json` unless flags override.
+- `STRATA_AVX512=1` uses the AVX-512 kernels for experts that run on the CPU, in a build for a CPU that has
+  AVX-512 VNNI and VBMI (a `target-cpu=native` build on such a machine; the release binaries do not have them). Their
+  results differ from the default kernels in the last bits, so greedy output can change at a near tie.
 - `--vram-margin` MB of VRAM left free. One value applies to every device; `512,256` gives one per device in
   `--device` order, and `0:512,1:256` gives one per GPU index. On a GPU that drives no display, `--vram-margin 256` keeps more experts
   resident (+1-2% prefill); 128 runs out of memory.
 - `--kv q8` halves the KV cache (345 instead of 650 MB at 32K) at about 6% slower 32K decode and 14% slower 32K prefill.
+  `--kv q4` and `--kv q2` store it in 4-bit and 2-bit form (about 28% and 19% of the f16 size) for very long
+  contexts. Attention then reads rounded keys and values, so the output can differ from f16; q2 differs most.
+  The head size must be a multiple of 32, and `--llama-numerics` needs the f16 cache. `calibrate` takes the
+  same `--kv` value as the runs that will use it.
+- `--thinking-budget N` (`chat` and `serve`) ends the thinking block after `N` tokens by inserting `</think>`,
+  so the model goes on to the answer (0, the default, is no limit). A request overrides it with
+  `thinking_budget` or `chat_template_kwargs.thinking_budget` (Anthropic: `thinking.budget_tokens`).
+- `--short N` prompts shorter than `N` tokens skip the batched prefill and go token by token (default: from
+  `rustingstrata calibrate`, else 32).
 - `--allowed-hosts ai-server.lan` (or `STRATA_ALLOWED_HOSTS`) allows a LAN name when `serve` is bound to `0.0.0.0`.
 - `--lora PATH:SCALE` applies a LoRA adapter at runtime, see [LORA.md](LORA.md).
 - `--mcp FILE` (`serve` only, or `STRATA_MCP`) lists the MCP servers whose tools the chat page may call, see

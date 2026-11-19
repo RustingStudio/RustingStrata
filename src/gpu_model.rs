@@ -315,6 +315,42 @@ struct Shortlist {
     in_set: Vec<bool>,
 }
 
+/// The draft file's metadata sizes the DFlash buffers and the kernels write its tensors' outputs through raw
+/// addresses, so the two must agree (and fit the target's shared buffers) before anything is allocated.
+pub(crate) fn dflash_check(m: &Model, dc: &crate::config::DFlashConfig) -> anyhow::Result<()> {
+    let c = &m.cfg;
+    let (ne, q, kv, hd, ff) = (dc.n_embd, dc.n_head * dc.head_dim, dc.n_head_kv * dc.head_dim, dc.head_dim, dc.n_ff);
+    ensure!(dc.n_layer > 0 && ne == c.n_embd && hd > 0 && dc.n_head_kv > 0 && dc.n_head.is_multiple_of(dc.n_head_kv) && dc.n_head > 0
+        && dc.n_rot <= hd && ff > 0 && (dc.mask_token_id as usize) < c.n_vocab,
+        "draft model: bad DFlash metadata (layers {}, embd {ne} for a {} target, heads {}/{}x{hd}, rope {}, ff {ff}, mask token {})",
+        dc.n_layer, c.n_embd, dc.n_head, dc.n_head_kv, dc.n_rot, dc.mask_token_id);
+    let dim = |name: String, rows: usize, cols: usize| -> anyhow::Result<()> {
+        let t = m.w.get(&name)?;
+        ensure!(t.rows == rows && t.cols == cols, "draft model: {name} is {}x{}, its metadata needs {rows}x{cols}", t.rows, t.cols);
+        Ok(())
+    };
+    dim("dflash.fc.weight".into(), ne, dc.target_layer_ids.len() * c.n_embd)?;
+    for n in ["hidden_norm", "norm"] { dim(format!("dflash.{n}.weight"), 1, ne)?; }
+    let (k, g) = (dc.conv_kernel_size, dc.conv_group_size);
+    ensure!(k == 0 || (g > 0 && ne.is_multiple_of(g)), "draft model: conv group size {g} does not divide {ne}");
+    for il in 0..dc.n_layer {
+        let l = |s: &str, rows, cols| dim(format!("dflash.blk.{il}.{s}.weight"), rows, cols);
+        for (s, rows, cols) in [("attn_norm", 1, ne), ("ffn_norm", 1, ne), ("attn_q_norm", 1, hd), ("attn_k_norm", 1, hd), ("attn_q", q, ne),
+            ("attn_k", kv, ne), ("attn_v", kv, ne), ("attn_output", ne, q), ("ffn_gate", ff, ne), ("ffn_up", ff, ne), ("ffn_down", ne, ff)] {
+            l(s, rows, cols)?;
+        }
+        if k > 0 {
+            for s in ["attn_conv", "mlp_conv"] {
+                l(&format!("{s}_proj"), 2 * k * (ne / g), ne)?;
+                let b = m.w.get(&format!("dflash.blk.{il}.{s}_base.weight"))?;  // [2, K, H], indexed flat
+                ensure!(b.rows * b.cols == 2 * k * ne, "draft model: layer {il} {s}_base has {} values, its metadata needs {}", b.rows * b.cols, 2 * k * ne);
+            }
+        }
+    }
+    if dc.selector_rank > 0 { dim("dflash.selector.hidden_proj.weight".into(), dc.selector_rank, ne)?; }
+    Ok(())
+}
+
 fn build_shortlist(m: &Model, gpu: &dyn Backend, output: Option<&GpuTensor>) -> anyhow::Result<Option<Shortlist>> {
     if std::env::var_os("STRATA_MTP_FULL_VOCAB").is_some() { return Ok(None); }
     let c = &m.cfg;
@@ -720,6 +756,7 @@ impl<'a> GpuModel<'a> {
         let output = if last { Some(up("output.weight").or_else(|_| up("token_embd.weight"))?) } else { None };
         let dflash = if k > 0 && last && ns == 1 {
             if let Some(dc) = c.dflash.clone() {
+                dflash_check(m, &dc)?;
                 let df_kv = dc.n_head_kv * dc.head_dim;
                 let df_q = dc.n_head * dc.head_dim;
                 let df_attp = dc.n_head * ATT_SPLITS * (dc.head_dim + 2);
@@ -995,11 +1032,11 @@ impl<'a> GpuModel<'a> {
             margin: lower --ctx or --parallel, use --kv q8 or a smaller --chunk (--vram-margin 0 skips this check)", free1 >> 20, floor >> 20);
 
         let cache = if c.is_moe() {
-            // STRATA_EXPERT_MB sets the expert slot budget explicitly when > 0; otherwise use free VRAM minus margin.
+            // STRATA_EXPERT_MB sets the expert slot budget explicitly (0: no slots, every expert on the CPU, which the
+            // split test relies on); otherwise use free VRAM minus margin.
             let budget = match std::env::var("STRATA_EXPERT_MB")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&v| v > 0)
             {
                 Some(mb) => {
                     eprintln!("note: STRATA_EXPERT_MB={mb} override active (reported free device heap: {} MB)", free1 >> 20);
@@ -2365,7 +2402,7 @@ impl<'a> GpuModel<'a> {
         if ov.is_none()
             && let Some(df) = &self.tail().dflash
         {
-            let cur = df.cur_block.get().clamp(8, df.cfg.block_size);
+            let cur = df.cur_block.get().min(df.cfg.block_size);  // not clamp(8, ..): a block size under 8 would panic
             if cur <= 8 {
                 if n >= 6 || n == k_eff {
                     df.cur_block.set(12.min(df.cfg.block_size));
@@ -3040,12 +3077,11 @@ impl<'a> GpuModel<'a> {
                     if mixer_gemm && !rows {
                         g.gemm_dense(qkv, nt, p("h"), ne, p("qkv"), channels, 0)?;
                         g.prequant_gemm_x(gate, nt, p("h"), ne)?;
+                        // conv_seq is two dependent passes on Vulkan (the second overwrites the state the first reads), and
+                        // a batch has no barrier between its dispatches: it runs before the batch, conv_silu inside it.
+                        if nt > 1 { g.conv_seq(p("qkv"), conv[self.cur].addr(), conv_w.ptr, y_dst, channels, c.ssm_conv, nt, sc, self.nsnap)?; }
                         g.batch(&mut || {
-                            if nt == 1 {
-                                g.conv_silu(p("qkv"), conv[self.cur].addr(), conv_w.ptr, y_dst, channels, c.ssm_conv, nn, eps)?;
-                            } else {
-                                g.conv_seq(p("qkv"), conv[self.cur].addr(), conv_w.ptr, y_dst, channels, c.ssm_conv, nt, sc, self.nsnap)?;
-                            }
+                            if nt == 1 { g.conv_silu(p("qkv"), conv[self.cur].addr(), conv_w.ptr, y_dst, channels, c.ssm_conv, nn, eps)?; }
                             g.gemm_dense(gate, nt, p("h"), ne, p("z"), c.ssm_d_inner, crate::backend::SAME_X)?;
                             g.gemm_dense(beta, nt, p("h"), ne, b_dst, nv, crate::backend::SAME_X)?;
                             g.gemm_dense(alpha, nt, p("h"), ne, g_dst, nv, crate::backend::SAME_X)
@@ -3053,7 +3089,9 @@ impl<'a> GpuModel<'a> {
                     } else {
                         mv(qkv, "h", ne, "qkv", channels)?;
                         // One token with 128-wide heads: conv_silu also does the q and k l2 norms.
-                        // Overlap conv_silu/conv_seq (reads "qkv", writes "y") with gate/beta/alpha GEMVs (read "hq", write "z"/"beta"/"g").
+                        // Overlap conv_silu (reads "qkv", writes "y") with gate/beta/alpha GEMVs (read "hq", write "z"/"beta"/"g").
+                        // conv_seq stays out of the batch (see above).
+                        if nt > 1 && !rows { g.conv_seq(p("qkv"), conv[self.cur].addr(), conv_w.ptr, y_dst, channels, c.ssm_conv, nt, sc, self.nsnap)?; }
                         g.batch(&mut || {
                             if rows {
                                 for (r, &(sl, _)) in self.rows.iter().enumerate() {
@@ -3061,8 +3099,6 @@ impl<'a> GpuModel<'a> {
                                 }
                             } else if nt == 1 {
                                 g.conv_silu(p("qkv"), conv[self.cur].addr(), conv_w.ptr, y_dst, channels, c.ssm_conv, nn, eps)?;
-                            } else {
-                                g.conv_seq(p("qkv"), conv[self.cur].addr(), conv_w.ptr, y_dst, channels, c.ssm_conv, nt, sc, self.nsnap)?;
                             }
                             mv(gate, "h", ne, "z", c.ssm_d_inner)?;
                             g.gemvq2(beta, alpha, p("h"), ne, p("hq"), b_dst, g_dst, nt)
