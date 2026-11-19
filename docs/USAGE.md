@@ -128,7 +128,11 @@ Experts that do not fit in VRAM are read from the GGUF through the page cache. A
 of the page cache (ZFS with `primarycache=metadata`) makes every run read them from disk again; load the model from a
 file system that caches data, or from a tmpfs copy.
 
-Bytes copied to VRAM are dropped from the page cache (`MADV_DONTNEED`), so on a model close to the machine's RAM the
-experts that missed VRAM keep their pages; `STRATA_COLD_KEEP=1` only marks them reclaimable instead. `serve` learns
+When the model files fit in RAM with 4 GiB to spare, they are read into the page cache in the background from the
+start and nothing is dropped, so experts that run on the CPU do not wait for the drive on their first use.
+`STRATA_PRELOAD=1` forces that, `STRATA_PRELOAD=0` turns it off.
+
+Otherwise bytes copied to VRAM are dropped from the page cache (`MADV_DONTNEED`), so on a model close to the machine's
+RAM the experts that missed VRAM keep their pages; `STRATA_COLD_KEEP=1` only marks them reclaimable instead. `serve` learns
 the placement from the reply (16 swaps every 16 tokens after the prompt); `STRATA_ADAPT_EVERY` and
 `STRATA_ADAPT_SWAPS` override that, and `STRATA_RESET_COUNTS=1` turns on the reply-only placement for other commands.

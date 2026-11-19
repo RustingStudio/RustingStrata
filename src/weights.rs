@@ -238,10 +238,36 @@ pub fn will_need(p: usize, n: usize) {
     }
 }
 
+/// Bytes of every GGUF mapped by this process.
+static MAPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the mapped model files fit in RAM with 4 GiB to spare: then their pages stay in the page cache (`cold` is
+/// a no-op) and `preload` reads them. `STRATA_PRELOAD=0`/`1` overrides.
+// ponytail: MemTotal, not what other programs left free, and files of dropped models still count; use
+// MemAvailable and subtract on drop if either one decides wrongly.
+pub fn fits_ram() -> bool {
+    match std::env::var("STRATA_PRELOAD").ok().as_deref() {
+        Some("0") => false,
+        Some(_) => true,
+        None => { static RAM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new(); *RAM.get_or_init(crate::memory::total_ram) }.is_some_and(|t| MAPPED.load(std::sync::atomic::Ordering::Relaxed) + (4 << 30) <= t),
+    }
+}
+
+/// Counts a newly mapped model file; when the files fit in RAM (`fits_ram`), a background thread starts reading it
+/// into the page cache, so experts that run on the CPU do not wait for the drive on their first use (issue #49).
+pub fn preload(b: &[u8]) {
+    MAPPED.fetch_add(b.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let (p, n) = (b.as_ptr() as usize, b.len());
+    // The thread holds no borrow: MADV_WILLNEED on a range unmapped in the meantime fails without a fault.
+    if fits_ram() { std::thread::spawn(move || will_need(p, n)); }
+}
+
 /// Drops the whole pages of `b` (MADV_DONTNEED): bytes now on the GPU, whose host copy competes with the experts that
 /// missed VRAM for page cache. Expert files exceed the page cache, so pages read once at load would otherwise outlive
-/// the experts a prompt reads from it. `STRATA_COLD_KEEP` only marks them reclaimable (MADV_COLD) instead.
+/// the experts a prompt reads from it. `STRATA_COLD_KEEP` only marks them reclaimable (MADV_COLD) instead. Nothing is
+/// dropped when the model fits in RAM (`fits_ram`).
 pub fn cold(b: &[u8]) {
+    if fits_ram() { return; }
     let (a, e) = ((b.as_ptr() as usize + 4095) & !4095, (b.as_ptr() as usize + b.len()) & !4095);
     if e > a { madvise(a, e - a, if std::env::var_os("STRATA_COLD_KEEP").is_some() { 20 } else { 4 }); }
 }
