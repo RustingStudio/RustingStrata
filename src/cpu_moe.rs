@@ -1286,7 +1286,9 @@ mod avx512 {
 
 pub fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vnni", target_feature = "avx512vbmi"))]
-    if std::env::var_os("STRATA_SCALAR").is_none() && std::env::var_os("STRATA_NO_AVX512").is_none() {
+    // Opt-in: these kernels add the block sums in a different order than the AVX2 ones, so their results differ in the
+    // last bits, and that is enough to make a drafted run and a plain greedy run pick different tokens at a near tie.
+    if std::env::var_os("STRATA_SCALAR").is_none() && std::env::var_os("STRATA_AVX512").is_some() {
         match ty {
             GgmlType::Q8_0 => return Some(avx512::dot_q8_0),
             GgmlType::Q4_0 => return Some(avx512::dot_q4::<2>),
