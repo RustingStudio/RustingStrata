@@ -166,8 +166,9 @@ rustingstrata serve    --model $M --addr 127.0.0.1:8080 [--api-key K]
 The GPU is CUDA when an NVIDIA card and driver are present and Vulkan otherwise (AMD, Intel); `--backend vulkan` or
 `--backend cuda` picks one, `--device 0,1` spreads the expert cache over several cards, and `STRATA_DS_GPU=0` runs
 everything on the CPU. Experts that are not in VRAM are split between the CPU (straight from the mapped file) and the
-GPU (uploaded for the token), and the split follows the measured time of each side. `--fixed-experts` (or
-`STRATA_DS_CPU_SHARE=0`) sends every expert to the GPU, which is slower here but gives the same text on every run.
+GPU (during decoding, uploaded into the VRAM cache in place of the least recently used expert), and the split
+follows the measured time of each side. `--fixed-experts` (or `STRATA_DS_CPU_SHARE=0`) sends every expert to the GPU,
+which is slower here but gives the same text on every run.
 The prompt runs layer by layer in chunks of `STRATA_DS_CHUNK` tokens (default 1024), so a routed expert is read once
 for all the tokens of a chunk that picked it. When the files fit in RAM with 4 GiB to spare they are read into the
 page cache in the background from the start (`STRATA_PRELOAD=0` turns that off).
@@ -185,7 +186,7 @@ A 20,000-token prompt of text that does not repeat (this repository's documentat
 `bench --prompt-file F --pp 20000 --tg 64 --reps 1`, one run each) prefilled at 11.6 tok/s on CUDA and 10.6 tok/s on
 Vulkan, and the 64 tokens after it decoded at 3.3 and 1.9 tok/s.
 
-A token reads about 2.6 GB of expert weights and the model is larger than this box's RAM, so the numbers move with
+A token reads about 1.3 GB of expert weights and the model is larger than this box's RAM, so the numbers move with
 the page cache; the expert cache policy knobs (`STRATA_DS_LFU`, `STRATA_DS_NOEVICT`) changed nothing measurable. A
 CPU-only build of the llama.cpp pull request that adds the model (#32517) decoded at 0.28 tok/s on the same box (one
 run, not side by side). Not measured: an AMD or Intel card (the Vulkan path was run on the RTX 3060 only), more than

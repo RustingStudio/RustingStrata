@@ -295,7 +295,20 @@ pub fn preload(b: &[u8]) {
     MAPPED.fetch_add(b.len() as u64, std::sync::atomic::Ordering::Relaxed);
     let (p, n) = (b.as_ptr() as usize, b.len());
     // The thread holds no borrow: MADV_WILLNEED on a range unmapped in the meantime fails without a fault.
-    if fits_ram() { std::thread::spawn(move || will_need(p, n)); }
+    if fits_ram() {
+        PRELOADING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::thread::spawn(move || { will_need(p, n); PRELOADING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); });
+    }
+}
+
+/// `preload` threads still queueing reads.
+static PRELOADING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether every read `preload` asked for is queued: from then on a readahead request for a part of the model adds
+/// nothing. False until then, and always when the model does not fit in RAM.
+pub fn preloaded() -> bool {
+    static FITS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    PRELOADING.load(std::sync::atomic::Ordering::Relaxed) == 0 && *FITS.get_or_init(fits_ram)
 }
 
 /// Drops the whole pages of `b` (MADV_DONTNEED): bytes now on the GPU, whose host copy competes with the experts that

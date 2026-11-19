@@ -583,12 +583,14 @@ impl<'a> Hy4Model<'a> {
                 let ne = cfg.n_expert;
                 let nl = dexps.rows / ne;
                 // Experts resident in VRAM run on the GPU. Of the others, the CPU computes `cpu_share` from the mapped
-                // file while the GPU runs the rest from a staging copy, both at once. The share follows the two
+                // file while the GPU uploads and runs the rest, both at once. The share follows the two
                 // sides' times, so a machine with many cores or the model in RAM leans on the CPU and one with a fast
                 // card on the GPU. `STRATA_DS_CPU_SHARE` fixes it; 0 (also `--fixed-experts`) runs every expert on
                 // the GPU, replacing the least recently used VRAM slots: the same numerics on every run.
                 let (share, fixed) = self.share();
-                let on = |m: &Mat<'a>, e: usize| { let x = m.expert_opt(e, ne, share == 0.0); if x.gpu.is_some() { x } else { x.staged() } };
+                // A miss the GPU takes replaces the least recently used VRAM slot, so the expert is resident the next
+                // time it is picked (`STRATA_DS_NOEVICT`: a copy per use instead). The upload is part of the GPU side.
+                let on = |m: &Mat<'a>, e: usize| { let x = m.expert_opt(e, ne, true); if x.gpu.is_some() { x } else { x.staged() } };
                 let gates: Vec<Mat> = sel.iter().map(|s| gexps.expert_opt(s.0, ne, share == 0.0)).collect();
                 let n_miss = gates.iter().filter(|m| m.gpu.is_none()).count();
                 let mut left = (share * n_miss as f32).round() as usize;
@@ -598,12 +600,17 @@ impl<'a> Hy4Model<'a> {
                         left -= 1;
                         on_cpu.push((g, uexps.expert_host(e, ne), dexps.expert_host(e, ne), w));
                     } else {
-                        on_gpu.push((if g.gpu.is_some() { g } else { g.staged() }, on(uexps, e), on(dexps, e), w));
+                        on_gpu.push((g, e, w));
                     }
                 }
                 let clamp = cfg.clamp_exp[il];
                 let timed = |list: &[(Mat, Mat, Mat, f32)]| { let t = std::time::Instant::now(); (run_experts(list, rin, clamp, nl), t.elapsed().as_secs_f32()) };
-                let ((a, tg), (b, tc)) = rayon::join(|| timed(&on_gpu), || timed(&on_cpu));
+                let gpu_side = || {
+                    let t = std::time::Instant::now();
+                    let list: Vec<_> = on_gpu.iter().map(|&(g, e, w)| (if g.gpu.is_some() { g } else { on(gexps, e) }, on(uexps, e), on(dexps, e), w)).collect();
+                    (run_experts(&list, rin, clamp, nl), t.elapsed().as_secs_f32())
+                };
+                let ((a, tg), (b, tc)) = rayon::join(gpu_side, || timed(&on_cpu));
                 let mix: Vec<f32> = a.iter().zip(&b).map(|(a, b)| a + b).collect();
                 if !fixed && n_miss > 0 { self.balance(tg, tc); }
                 self.tr("ffn_moe_out", il as i32, &mix);

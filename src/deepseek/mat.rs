@@ -82,6 +82,8 @@ mod dev {
         /// least recently used slot of the same shape is overwritten. Slots touched in the last 96 lookups are kept (the
         /// matrices of one layer's experts are in flight together). No slot to take: STAGED (copied up per use).
         /// `evict` false: a miss with no free room returns None, so the caller can run that expert on the CPU.
+        /// Whether the expert that starts at `data` has a VRAM slot (no lookup is counted).
+        pub fn resident(&self, data: &[u8]) -> bool { self.ex.contains_key(&(data.as_ptr() as usize)) }
         pub fn expert(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize, evict: bool) -> Option<u32> {
             let k = data.as_ptr() as usize;
             self.now += 1;
@@ -345,7 +347,13 @@ impl<'a> Mat<'a> {
     #[cfg(target_os = "linux")]
     pub fn prefetch_expert(&self, e: usize, n_expert: usize) {
         unsafe extern "C" { fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32; }
+        // A model that fits in RAM is read into the page cache at start (`weights::preload`) and stays there: once
+        // those reads are queued the call would only cost its page-table walk, about 4 us per expert matrix.
+        if crate::weights::preloaded() { return; }
         let sz = self.rows / n_expert * self.ty.row_bytes(self.cols as u64);
+        // An expert with a VRAM slot runs from there: its host pages are not needed, and reading them would push
+        // other experts out of the page cache.
+        if dev::get().is_some_and(|d| d.lock().unwrap().resident(&self.data[e * sz..])) { return; }
         let a = self.data[e * sz..].as_ptr() as usize;
         let start = a & !4095;
         unsafe { madvise(start as *mut std::ffi::c_void, a + sz - start, 3) };
