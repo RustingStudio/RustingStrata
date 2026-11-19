@@ -89,7 +89,8 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   `~/.cache/rusting_strata/strata-<model>.json` unless flags override.
   `XDG_CACHE_HOME` moves that folder to `$XDG_CACHE_HOME/rusting_strata` (on Windows it is
   `%LOCALAPPDATA%\rusting_strata`). In a container, set it to a mounted path: `docker run --rm` otherwise discards
-  the file on exit, and the next container runs uncalibrated.
+  the file on exit, and the next container runs uncalibrated. The file names the GPU it was measured on, and a file
+  measured on another GPU is ignored with a warning.
 - `STRATA_AVX512=1` uses the AVX-512 kernels for experts that run on the CPU, in a build for a CPU that has
   AVX-512 VNNI and VBMI (a `target-cpu=native` build on such a machine; the release binaries do not have them). Their
   results differ from the default kernels in the last bits, so greedy output can change at a near tie.

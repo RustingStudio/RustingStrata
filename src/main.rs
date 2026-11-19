@@ -360,9 +360,13 @@ impl Engine {
             r => r?,
         };
         let path = calibration_path(model, bk.as_ref().map_or("cuda", |b| b[0].name()));
-        let v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let mut v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        if let Some(gpu) = bk.as_ref().map(|b| b[0].device()).filter(|gpu| !calibration_fits(&v, gpu)) {
+            eprintln!("warning: {} was measured on {}, not on {gpu}: ignored", path.display(), v["gpu"]);
+            v = serde_json::Value::Null;
+        }
         if !v.is_null() { eprintln!("calibration: {}", path.display()); }
-        else if bk.is_some() { eprintln!("not calibrated on this machine: `rustingstrata calibrate --model {}` measures the prefill chunk, MTP drafts and the short-prompt threshold (a few minutes, once per model)", model.display()); }
+        else if bk.is_some() { eprintln!("warning: not calibrated on this machine, so the prefill chunk, MTP drafts and the short-prompt threshold are defaults: run `rustingstrata calibrate --model {}` (a few minutes, once per model)", model.display()); }
         let get = |k: &str| v[k].as_u64().map(|x| x as usize);
         if let Some(dp) = &self.draft_model {
             anyhow::ensure!(dp.exists(), "draft model path does not exist: {}", dp.display());
@@ -627,6 +631,12 @@ fn calibration_path(model: &Path, backend: &str) -> PathBuf {
     let stem = model.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
     let sfx = if backend == "cuda" { String::new() } else { format!("-{backend}") };
     rusting_strata::expert_cache::cache_dir().join(format!("strata-{stem}{sfx}.json"))
+}
+
+/// Whether calibration file `v` may be used on `gpu` (`Backend::device`). A file names the GPU it was measured on;
+/// one without a name (written before that was recorded, or the driver gave none) is accepted.
+fn calibration_fits(v: &serde_json::Value, gpu: &str) -> bool {
+    v["gpu"].as_str().is_none_or(|g| g.is_empty() || gpu.is_empty() || g == gpu)
 }
 
 impl Engine {
@@ -1801,7 +1811,7 @@ fn calibrate(model: &Path, ctx: usize, margin: &[usize], kind: Option<&str>, dev
     let Runner::Gpu(g) = &r else { unreachable!() };
     let path = calibration_path(model, g.gpu.name());
     std::fs::create_dir_all(path.parent().unwrap())?;
-    let v = json!({"chunk": chunk.0, "mtp": mtp.0, "short": short, "ctx": ctx,
+    let v = json!({"chunk": chunk.0, "mtp": mtp.0, "short": short, "ctx": ctx, "gpu": g.gpu.device(),
         "measured": {"prefill_tok_s": chunk.1.round(), "decode_tok_s": (mtp.1 * 10.0).round() / 10.0}});
     std::fs::write(&path, serde_json::to_string_pretty(&v)?)?;
     println!("{v}\nwritten to {}", path.display());
@@ -2711,6 +2721,15 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
 #[cfg(test)]
 mod flag_tests {
     use super::{resolve_flags, vram_margins};
+
+    #[test]
+    fn calibration_from_another_gpu_is_refused() {
+        let v = serde_json::json!({"chunk": 4096, "gpu": "NVIDIA GeForce RTX 5080"});
+        assert!(super::calibration_fits(&v, "NVIDIA GeForce RTX 5080"));
+        assert!(!super::calibration_fits(&v, "NVIDIA GeForce RTX 3060"));
+        assert!(super::calibration_fits(&serde_json::json!({"chunk": 4096}), "NVIDIA GeForce RTX 3060"));  // older file
+        assert!(super::calibration_fits(&v, ""));  // the driver gave no name
+    }
     #[cfg(target_os = "linux")]
     use super::cpu_topology_groups;
 
