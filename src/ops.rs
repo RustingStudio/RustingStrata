@@ -122,29 +122,58 @@ pub struct Sampler {
     pub top_p: f32,
     /// xorshift64 state; must not be 0.
     pub rng: u64,
+    /// OpenAI `presence_penalty`: subtracted once from the logit of every token this sampler already returned.
+    pub presence: f32,
+    /// OpenAI `frequency_penalty`: subtracted from a returned token's logit once per time it was returned.
+    pub frequency: f32,
+    /// How often each token was returned, for the penalties (only the reply, not the prompt).
+    pub seen: std::collections::HashMap<usize, u32>,
 }
 
 impl Sampler {
-    pub fn greedy() -> Self { Sampler { temp: 0.0, top_k: 0, top_p: 1.0, rng: 1 } }
+    pub fn greedy() -> Self {
+        Sampler { temp: 0.0, top_k: 0, top_p: 1.0, rng: 1, presence: 0.0, frequency: 0.0, seen: Default::default() }
+    }
+
+    /// The logits with the presence and frequency penalties applied, or None when there is nothing to change.
+    /// Without them a quantized model that samples greedily (or nearly) falls into loops it never leaves.
+    fn penalized(&self, logits: &[f32]) -> Option<Vec<f32>> {
+        if self.seen.is_empty() || (self.presence == 0.0 && self.frequency == 0.0) { return None; }
+        let mut l = logits.to_vec();
+        for (&t, &n) in &self.seen {
+            if let Some(x) = l.get_mut(t) { *x -= self.presence + self.frequency * n as f32; }
+        }
+        Some(l)
+    }
+
+    fn note(&mut self, t: usize) { *self.seen.entry(t).or_insert(0) += 1; }
 
     pub fn pick(&mut self, logits: &[f32]) -> anyhow::Result<usize> {
-        if self.temp <= 0.0 {
+        let pen = self.penalized(logits);
+        let logits = pen.as_deref().unwrap_or(logits);
+        let i = if self.temp <= 0.0 {
             let i = argmax(logits);
             anyhow::ensure!(logits[i].is_finite(), NON_FINITE);
-            return Ok(i);
-        }
-        let c = self.cands(logits);
-        self.draw(&c)
+            i
+        } else {
+            let c = self.cands(logits);
+            self.draw(&c)?
+        };
+        self.note(i);
+        Ok(i)
     }
 
     /// Speculative sampling with a fixed draft `d`: keeps `d` (None) with its probability under this sampler, else
     /// returns a token drawn from the others, renormalized. The result has the distribution of `pick`. `temp` > 0.
     pub fn accept(&mut self, logits: &[f32], d: usize) -> anyhow::Result<Option<usize>> {
-        let c = self.cands(logits);
+        let pen = self.penalized(logits);
+        let c = self.cands(pen.as_deref().unwrap_or(logits));
         anyhow::ensure!(!c.is_empty(), NON_FINITE);
         let q = c.iter().find(|x| x.0 == d).map_or(0.0, |x| x.1);
-        if self.rand() * c.iter().map(|x| x.1).sum::<f32>() < q { return Ok(None); }
-        Ok(Some(self.draw(&c.into_iter().filter(|x| x.0 != d).collect::<Vec<_>>())?))
+        if self.rand() * c.iter().map(|x| x.1).sum::<f32>() < q { self.note(d); return Ok(None); }
+        let x = self.draw(&c.into_iter().filter(|x| x.0 != d).collect::<Vec<_>>())?;
+        self.note(x);
+        Ok(Some(x))
     }
 
     /// The tokens `pick` draws from, with their weights (exp of the scaled logit, not normalized), most likely first.

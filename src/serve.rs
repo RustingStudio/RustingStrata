@@ -274,6 +274,8 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     pub top_k: Option<usize>,
     pub top_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
     pub seed: Option<u64>,
     /// The reply ends before the first of these strings (`stop`).
     pub stop: Vec<String>,
@@ -320,7 +322,9 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
     Ok(ChatRequest { messages, tools, tool_calls, max_tokens, stream: v["stream"].as_bool().unwrap_or(false), think,
         preserve_thinking: v["chat_template_kwargs"]["preserve_thinking"].as_bool(),
         temperature: num("temperature", |f| f >= 0.0, "a number >= 0")?, top_k: int("top_k", 0)?.map(|n| n as usize),
-        top_p: num("top_p", |f| f > 0.0 && f <= 1.0, "a number in (0, 1]")?, seed: int("seed", 0)?, stop })
+        top_p: num("top_p", |f| f > 0.0 && f <= 1.0, "a number in (0, 1]")?,
+        presence_penalty: num("presence_penalty", |f| (-2.0..=2.0).contains(&f), "a number in [-2, 2]")?,
+        frequency_penalty: num("frequency_penalty", |f| (-2.0..=2.0).contains(&f), "a number in [-2, 2]")?, seed: int("seed", 0)?, stop })
 }
 
 /// What the chat page's side panel shows about the server, kept by the request loop and answered by the reader
