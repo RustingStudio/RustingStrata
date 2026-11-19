@@ -299,6 +299,30 @@ the routing profile it learned, so that the next start places the experts as wel
 sends the new requests to the other servers meanwhile, so restarting one server at a time cuts no reply. `systemd`
 sends `SIGKILL` after `TimeoutStopSec`; Ctrl+C still stops at once. On Windows there is no such drain.
 
+## Docker
+
+The repository has a `Dockerfile` for the server. The image holds the binary, NVRTC for the CUDA kernels and the
+Vulkan loader; the GPU driver comes from the host (for NVIDIA cards through the NVIDIA Container Toolkit).
+
+```sh
+docker build -t rustingstrata .
+docker run -d --name strata --gpus all -p 127.0.0.1:8080:8080 \
+  -v /srv/models:/models -v /srv/strata-cache:/cache rustingstrata
+```
+
+- The default command is `serve --gpu --addr 0.0.0.0:8080 --models-dir /models`: no model is loaded at the start
+  (`/health` answers `503` until one is), and the chat page at http://127.0.0.1:8080 lists the files in `/models`
+  and loads the one you pick. Arguments after the image name replace the command, for example
+  `rustingstrata serve --gpu --addr 0.0.0.0:8080 --model /models/model.gguf` to load a model at the start.
+- `/models` is the folder of GGUF files. `/cache` keeps the calibration, the compiled CUDA kernels and the expert
+  placement; without that mount every new container compiles the kernels again and runs uncalibrated.
+- Calibrate once per model and machine, with the same mounts:
+  `docker run --rm --gpus all -v /srv/models:/models -v /srv/strata-cache:/cache rustingstrata calibrate --model /models/model.gguf`.
+- The example publishes the port on the loopback address only. To reach the chat page through a LAN name, add
+  `-e STRATA_ALLOWED_HOSTS=that-name`; set a key with `-e STRATA_API_KEY=...` before the port faces a network.
+- For a Vulkan card (AMD, Intel) pass the render device in place of `--gpus all`: `--device /dev/dri`, and add
+  `--backend vulkan` to the command. This path has not been run on an AMD or Intel card yet.
+
 ## Health checks
 
 `GET /health` needs no key and is answered at once, also while a reply is generated or a model loads:
