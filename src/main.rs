@@ -83,6 +83,13 @@ struct Engine {
     /// Default frequency penalty (OpenAI `frequency_penalty`); needs --temp > 0.
     #[arg(long, default_value_t = 0.0)]
     frequency_penalty: f32,
+    /// Repeat penalty (llama.cpp `repeat_penalty`; 1 = off, 1.1 is a usual value) on the tokens among the last
+    /// --penalty-last-n of the reply. Needs --temp > 0.
+    #[arg(long, default_value_t = 1.0)]
+    repeat_penalty: f32,
+    /// How many of the reply's last tokens --repeat-penalty looks at (0 = off, -1 = the whole reply).
+    #[arg(long, default_value_t = 64, allow_negative_numbers = true)]
+    penalty_last_n: i32,
     /// DRY multiplier (0 = off; 0.8 is the usual value): penalizes a token that would repeat a sequence the reply
     /// already wrote, more the longer the repeat. Stops paragraph loops that a presence penalty does not. Needs --temp > 0.
     #[arg(long, default_value_t = 0.0)]
@@ -479,7 +486,8 @@ impl Engine {
     }
     fn sampler(&self) -> Sampler {
         Sampler { temp: self.temp, top_k: self.top_k, top_p: self.top_p, rng: seed(self.seed),
-            presence: self.presence_penalty, frequency: self.frequency_penalty, dry_mult: self.dry_multiplier,
+            presence: self.presence_penalty, frequency: self.frequency_penalty, repeat: self.repeat_penalty,
+            last_n: self.penalty_last_n, dry_mult: self.dry_multiplier,
             dry_base: self.dry_base, dry_allowed: self.dry_allowed_length, ..Sampler::greedy() }
     }
     fn chunk(&self) -> usize { self.chunk.unwrap_or(4096) }
@@ -2564,13 +2572,15 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             smp.top_p = req.top_p.unwrap_or(smp.top_p);
             smp.presence = req.presence_penalty.unwrap_or(smp.presence);
             smp.frequency = req.frequency_penalty.unwrap_or(smp.frequency);
+            smp.repeat = req.repeat_penalty.unwrap_or(smp.repeat);
+            smp.last_n = req.penalty_last_n.unwrap_or(smp.last_n);
             smp.dry_mult = req.dry_multiplier.unwrap_or(smp.dry_mult);
             smp.dry_base = req.dry_base.unwrap_or(smp.dry_base);
             smp.dry_allowed = req.dry_allowed_length.unwrap_or(smp.dry_allowed);
             if smp.dry_mult > 0.0 { smp.dry_breakers = dry_breakers(tok, name); }
             smp.tool_tags = tok.token_id("<tool_call>").zip(tok.token_id("</tool_call>")).map(|(a, b)| (a as usize, b as usize));
-            eprintln!("sampling: temp={} top_k={} top_p={} presence={} frequency={} dry={}/{}/{}", smp.temp, smp.top_k, smp.top_p,
-                smp.presence, smp.frequency, smp.dry_mult, smp.dry_base, smp.dry_allowed);
+            eprintln!("sampling: temp={} top_k={} top_p={} presence={} frequency={} repeat={}/{} dry={}/{}/{}", smp.temp, smp.top_k, smp.top_p,
+                smp.presence, smp.frequency, smp.repeat, smp.last_n, smp.dry_mult, smp.dry_base, smp.dry_allowed);
             if req.seed.is_some() { smp.rng = seed(req.seed); }
             let n = room(e, ids.len(), req.max_tokens.unwrap_or(usize::MAX).min(s.max_tokens));
             if n == 0 { return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("prompt of {} tokens fills the context", ids.len()), "type": "invalid_request_error"}})); }

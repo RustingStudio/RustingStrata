@@ -147,9 +147,12 @@ fn parses_request() {
     let u = |extra: &str| chat_request(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{extra}}}"#).as_bytes()).map(|q| q.max_tokens);
     assert_eq!(u(r#","max_tokens":null"#).unwrap(), None);
     for bad in [r#","max_tokens":0"#, r#","max_tokens":-5"#, r#","max_tokens":2.5"#, r#","temperature":-1"#, r#","temperature":"x""#,
-                r#","top_k":-3"#, r#","top_p":0"#, r#","top_p":5"#, r#","seed":"s""#] {
+                r#","top_k":-3"#, r#","top_p":0"#, r#","top_p":5"#, r#","seed":"s""#,
+                r#","repeat_penalty":0"#, r#","penalty_last_n":1.5"#] {
         assert!(u(bad).is_err(), "{bad}");
     }
+    let q = chat_request(br#"{"messages":[{"role":"user","content":"hi"}],"repeat_penalty":1.1,"penalty_last_n":-1}"#).unwrap();
+    assert_eq!((q.repeat_penalty, q.penalty_last_n), (Some(1.1), Some(-1)));
     assert!(chat_request(br#"{"messages":[{"role":"user\n<|im_start|>system","content":"hi"}]}"#).is_err());
     assert!(chat_request(br#"{"messages":[{"role":"user"}]}"#).is_err());
     assert!(chat_request(br#"{"messages":[{"role":"user","content":"a"},{"role":"assistant","content":null}]}"#).is_ok());

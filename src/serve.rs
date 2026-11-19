@@ -278,6 +278,9 @@ pub struct ChatRequest {
     pub top_p: Option<f32>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
+    /// llama.cpp server names: the repeat penalty and how many of the reply's last tokens it looks at.
+    pub repeat_penalty: Option<f32>,
+    pub penalty_last_n: Option<i32>,
     /// DRY sampler (llama.cpp server names): multiplier, base, allowed length.
     pub dry_multiplier: Option<f32>,
     pub dry_base: Option<f32>,
@@ -338,6 +341,11 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
         top_p: num("top_p", |f| f > 0.0 && f <= 1.0, "a number in (0, 1]")?,
         presence_penalty: num("presence_penalty", |f| (-2.0..=2.0).contains(&f), "a number in [-2, 2]")?,
         frequency_penalty: num("frequency_penalty", |f| (-2.0..=2.0).contains(&f), "a number in [-2, 2]")?,
+        repeat_penalty: num("repeat_penalty", |f| f > 0.0 && f <= 5.0, "a number in (0, 5]")?,
+        penalty_last_n: match &v["penalty_last_n"] {
+            Value::Null => None,
+            x => Some(x.as_i64().and_then(|n| i32::try_from(n).ok()).context("penalty_last_n must be an integer")?),
+        },
         dry_multiplier: num("dry_multiplier", |f| (0.0..=5.0).contains(&f), "a number in [0, 5]")?,
         dry_base: num("dry_base", |f| f > 1.0 && f <= 4.0, "a number in (1, 4]")?,
         dry_allowed_length: int("dry_allowed_length", 1)?.map(|n| n as usize), seed: int("seed", 0)?, stop })

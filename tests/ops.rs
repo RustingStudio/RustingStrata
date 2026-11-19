@@ -117,6 +117,27 @@ fn sampler_accept_dist_keeps_the_distribution() {
 }
 
 #[test]
+fn repeat_penalty_looks_at_the_last_tokens_only() {
+    let picks = |s: &mut Sampler, l: &[f32], n: usize| (0..n).map(|_| s.pick(l).unwrap()).collect::<Vec<_>>();
+    // A positive logit in the window is divided by the penalty. With a window of 1, token 0 is free again after
+    // one other token; with 2, the third pick must leave both.
+    let l = [2.0f32, 1.8, 1.5];
+    assert_eq!(picks(&mut Sampler { repeat: 2.0, last_n: 1, ..Sampler::greedy() }, &l, 4), [0, 1, 0, 1]);
+    assert_eq!(picks(&mut Sampler { repeat: 2.0, last_n: 2, ..Sampler::greedy() }, &l, 4), [0, 1, 2, 0]);
+    // A negative logit is multiplied (dividing would raise it).
+    assert_eq!(picks(&mut Sampler { repeat: 2.0, ..Sampler::greedy() }, &[-1.0, -1.5], 2), [0, 1]);
+    // Token 0 is 70 tokens back: outside the default window of 64, inside the whole reply (-1); 0 is off.
+    for (last_n, want) in [(64, 0), (-1, 1), (0, 0)] {
+        let mut s = Sampler { repeat: 2.0, last_n, ..Sampler::greedy() };
+        s.note(0);
+        for _ in 0..70 { s.note(2); }
+        assert_eq!(s.pick(&l).unwrap(), want, "penalty_last_n {last_n}");
+    }
+    // The default (1) changes nothing.
+    assert_eq!(picks(&mut Sampler::greedy(), &l, 3), [0, 0, 0]);
+}
+
+#[test]
 fn penalties_push_away_from_returned_tokens() {
     // Token 0 is a bit more likely; a presence penalty larger than the gap makes the sampler leave it after once.
     let l = [1.0f32, 0.5, -10.0];

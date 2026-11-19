@@ -126,6 +126,11 @@ pub struct Sampler {
     pub presence: f32,
     /// OpenAI `frequency_penalty`: subtracted from a returned token's logit once per time it was returned.
     pub frequency: f32,
+    /// llama.cpp `repeat_penalty`: the logit of a token among the last `last_n` returned ones is divided by it when
+    /// positive, multiplied when not. 1 is off.
+    pub repeat: f32,
+    /// llama.cpp `penalty_last_n`, for `repeat` only: 0 turns it off, a negative value takes the whole reply.
+    pub last_n: i32,
     /// How often each token was returned, for the penalties (only the reply, not the prompt).
     pub seen: std::collections::HashMap<usize, u32>,
     /// DRY ("don't repeat yourself") multiplier; 0 is off. A token that would extend a sequence of `n >=
@@ -149,19 +154,26 @@ const DRY_MAX_MATCH: usize = 64;
 
 impl Sampler {
     pub fn greedy() -> Self {
-        Sampler { temp: 0.0, top_k: 0, top_p: 1.0, rng: 1, presence: 0.0, frequency: 0.0, seen: Default::default(),
+        Sampler { temp: 0.0, top_k: 0, top_p: 1.0, rng: 1, presence: 0.0, frequency: 0.0, repeat: 1.0, last_n: 64,
+            seen: Default::default(),
             dry_mult: 0.0, dry_base: 1.75, dry_allowed: 2, dry_breakers: Default::default(), tool_tags: None,
             hist: Vec::new(), in_tool: false }
     }
 
-    /// The logits with the presence and frequency penalties applied, or None when there is nothing to change.
+    /// The logits with the repeat, presence, frequency and DRY penalties applied, or None when there is nothing to change.
     /// Without them a quantized model that samples greedily (or nearly) falls into loops it never leaves.
     fn penalized(&self, logits: &[f32]) -> Option<Vec<f32>> {
         if self.in_tool { return None; }
         let rep = !self.seen.is_empty() && (self.presence != 0.0 || self.frequency != 0.0);
         let dry = self.dry_penalties();
-        if !rep && dry.is_empty() { return None; }
+        let n = if self.repeat == 1.0 { 0 } else { usize::try_from(self.last_n).unwrap_or(usize::MAX) };
+        let mut last = self.hist[self.hist.len().saturating_sub(n)..].to_vec();
+        if !rep && dry.is_empty() && last.is_empty() { return None; }
         let mut l = logits.to_vec();
+        (last.sort_unstable(), last.dedup());
+        for t in last {
+            if let Some(x) = l.get_mut(t) { *x = if *x > 0.0 { *x / self.repeat } else { *x * self.repeat }; }
+        }
         if rep {
             for (&t, &n) in &self.seen {
                 if let Some(x) = l.get_mut(t) { *x -= self.presence + self.frequency * n as f32; }

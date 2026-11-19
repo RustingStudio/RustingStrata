@@ -128,6 +128,10 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   not the prompt, and do not apply inside a tool call. `--presence-penalty`, `--frequency-penalty`,
   `--dry-multiplier`, `--dry-base` and `--dry-allowed-length` set the values for requests that leave them out. All
   are off by default, and they need a temperature above 0: greedy decoding does not use the sampler.
+- `repeat_penalty` and `penalty_last_n` (llama.cpp server names; `--repeat-penalty`, `--penalty-last-n`) follow the
+  same rules. A repeat penalty above 1 (1.1 is usual; 1 is off, the default) lowers every token among the last
+  `penalty_last_n` tokens of the reply (default 64; 0 turns it off, -1 takes the whole reply). The window is for
+  the repeat penalty only: the presence and frequency penalties count the whole reply.
 - `max_tokens` (or `max_completion_tokens`) and `stop` (up to 16 strings) work as in the OpenAI API; `n` must be 1.
 - A request whose last message has role `assistant` (and no tool calls) continues that message: the reply holds only
   the new text. The chat page's continue button uses this.
