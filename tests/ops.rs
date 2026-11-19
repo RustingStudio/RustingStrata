@@ -55,16 +55,16 @@ fn softmax_sums_to_one() {
 fn sampler_cuts_and_matches_softmax() {
     let l = [2.0f32.ln(), 1.0f32.ln(), 1.0f32.ln(), -50.0]; // probabilities 1/2, 1/4, 1/4, ~0
     assert_eq!(Sampler::greedy().pick(&l).unwrap(), 0);
-    let mut s = Sampler { temp: 1.0, top_k: 0, top_p: 1.0, rng: 7 };
+    let mut s = Sampler { temp: 1.0, top_k: 0, top_p: 1.0, rng: 7, ..Sampler::greedy() };
     let mut n = [0usize; 4];
     for _ in 0..20000 { n[s.pick(&l).unwrap()] += 1; }
     assert!(n[3] == 0 && (n[0] as f32 / 20000.0 - 0.5).abs() < 0.02 && (n[1] as f32 / 20000.0 - 0.25).abs() < 0.02, "{n:?}");
-    let mut s = Sampler { temp: 1.0, top_k: 0, top_p: 0.5, rng: 7 };
+    let mut s = Sampler { temp: 1.0, top_k: 0, top_p: 0.5, rng: 7, ..Sampler::greedy() };
     assert!((0..100).all(|_| s.pick(&l).unwrap() == 0));
-    let mut s = Sampler { temp: 1.0, top_k: 2, top_p: 1.0, rng: 7 };
+    let mut s = Sampler { temp: 1.0, top_k: 2, top_p: 1.0, rng: 7, ..Sampler::greedy() };
     assert!((0..100).all(|_| s.pick(&l).unwrap() < 2));
     // A temperature so small that m - 21 * temp rounds to m must still keep the best token.
-    let mut s = Sampler { temp: 1e-9, top_k: 0, top_p: 1.0, rng: 7 };
+    let mut s = Sampler { temp: 1e-9, top_k: 0, top_p: 1.0, rng: 7, ..Sampler::greedy() };
     assert_eq!(s.pick(&[1.0, 10.0, 3.0]).unwrap(), 1);
     // Logits with no finite value are an error, not a panic, sampled or greedy.
     let bad = [f32::NAN, f32::INFINITY, f32::NAN];
@@ -76,7 +76,7 @@ fn sampler_accept_keeps_the_distribution() {
     // likely draft, an unlikely one and one outside the candidates.
     let l = [2.0f32.ln(), 1.0f32.ln(), 1.0f32.ln(), -50.0]; // 1/2, 1/4, 1/4, ~0
     for d in [0, 1, 3] {
-        let mut s = Sampler { temp: 1.0, top_k: 0, top_p: 1.0, rng: 7 };
+        let mut s = Sampler { temp: 1.0, top_k: 0, top_p: 1.0, rng: 7, ..Sampler::greedy() };
         let mut n = [0usize; 4];
         for _ in 0..40000 { n[s.accept(&l, d).unwrap().unwrap_or(d)] += 1; }
         let f = |i: usize| n[i] as f32 / 40000.0;
@@ -95,7 +95,7 @@ fn sampler_accept_dist_keeps_the_distribution() {
         [-2.0, 0.0, 3.0, 1.0],                // anti-aligned draft putting mass on low-prob tokens
     ];
     for q_logits in drafts {
-        let mut s = Sampler { temp: 1.0, top_k: 0, top_p: 1.0, rng: 17 };
+        let mut s = Sampler { temp: 1.0, rng: 17, ..Sampler::greedy() };
         let mut n = [0usize; 4];
         for _ in 0..40000 {
             let (d, q) = s.draft_dist(&q_logits).unwrap();
@@ -108,10 +108,65 @@ fn sampler_accept_dist_keeps_the_distribution() {
             "draft {q_logits:?}: {n:?}"
         );
     }
-    let mut s = Sampler { temp: 1.0, top_k: 2, top_p: 0.9, rng: 9 };
+    let mut s = Sampler { temp: 1.0, top_k: 2, top_p: 0.9, rng: 9, ..Sampler::greedy() };
     for _ in 0..2000 {
         let (d, q) = s.draft_dist(&[0.0, 0.0, 5.0, 5.0]).unwrap();
         let out = s.accept_dist(&target, d as usize, &q).unwrap().unwrap_or(d as usize);
         assert!(out < 2, "top_k=2 violated: {out}");
     }
+}
+
+#[test]
+fn penalties_push_away_from_returned_tokens() {
+    // Token 0 is a bit more likely; a presence penalty larger than the gap makes the sampler leave it after once.
+    let l = [1.0f32, 0.5, -10.0];
+    let mut s = Sampler { presence: 2.0, ..Sampler::greedy() };
+    assert_eq!(s.pick(&l).unwrap(), 0);
+    assert_eq!(s.pick(&l).unwrap(), 1);
+    let mut s = Sampler { temp: 1e-3, top_k: 0, top_p: 1.0, rng: 7, frequency: 0.3, ..Sampler::greedy() };
+    let picks: Vec<_> = (0..4).map(|_| s.pick(&l).unwrap()).collect();
+    assert_eq!(picks, [0, 0, 1, 0]);
+    // A rejected draft draws from the rest, and that draw counts too.
+    let mut s = Sampler { temp: 1e-3, presence: 5.0, ..Sampler::greedy() };
+    s.seen.insert(0, 1);
+    assert_eq!(s.accept(&l, 0).unwrap(), Some(1));
+    assert_eq!(s.seen.get(&1), Some(&1));
+    // The same with a draft distribution (DFlash and external draft models).
+    let mut s = Sampler { temp: 1e-3, presence: 5.0, ..Sampler::greedy() };
+    s.seen.insert(0, 1);
+    assert_eq!(s.accept_dist(&l, 0, &[(0, 1.0)]).unwrap(), Some(1));
+    assert_eq!(s.seen.get(&1), Some(&1));
+}
+
+#[test]
+fn dry_penalizes_extending_a_repeat() {
+    // The reply so far is 1 2 3 4 1 2 3: after "1 2 3" came 4 before, so 4 loses 0.8 * 1.75^(3-2).
+    let l = [-10.0f32, -10.0, -10.0, -10.0, 1.0, 0.0];
+    let mut s = Sampler { dry_mult: 0.8, ..Sampler::greedy() };
+    s.hist = vec![1, 2, 3, 4, 1, 2, 3];
+    let p = s.dry_penalties();
+    assert_eq!(p.len(), 1);
+    assert_eq!(p[0].0, 4);
+    assert!((p[0].1 - 1.4).abs() < 1e-5);
+    assert_eq!(s.pick(&l).unwrap(), 5);
+    // A breaker inside the match cuts it to 1 token, below the allowed length: no penalty.
+    let mut s = Sampler { dry_mult: 0.8, dry_breakers: std::sync::Arc::new(vec![false, false, true, false, false, false]), ..Sampler::greedy() };
+    s.hist = vec![1, 2, 3, 4, 1, 2, 3];
+    assert!(s.dry_penalties().is_empty());
+    assert_eq!(s.pick(&l).unwrap(), 4);
+}
+
+#[test]
+fn no_penalties_inside_tool_calls() {
+    let l = [1.0f32, 0.5, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0];
+    let mut s = Sampler { presence: 5.0, tool_tags: Some((8, 9)), ..Sampler::greedy() };
+    assert_eq!(s.pick(&l).unwrap(), 0);
+    assert_eq!(s.pick(&l).unwrap(), 1);  // 0 is penalized outside a tool call
+    s.note(8);
+    assert!(s.in_tool);
+    assert_eq!(s.pick(&l).unwrap(), 0);  // inside: the plain logits
+    s.note(9);
+    assert!(!s.in_tool);
+    assert_eq!(s.seen.get(&0), Some(&1));  // the token inside the tool call was not counted
+    assert_eq!(s.hist, vec![0, 1]);
 }
