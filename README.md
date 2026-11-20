@@ -25,7 +25,7 @@ decode of a 9-config sweep over `-ncmoe`, `--moe-cache-mib` and `--moe-cache-cpu
 | Decode after 4K prompt | **80.5 tok/s** (75.1-82.0) | 64.4 (58.8-66.0) |
 | Prefill, 4K prompt | **1530 tok/s** (1451-1596) | 1118-1122 with `-ncmoe 27`, its best prefill flags (2 runs, one load); 793 (367-1063) with the decode flags above |
 
-Measured at commit 3945476 (1.2.5) with `rustingstrata serve --gpu --ctx 8192 --mtp 0` and `llama-server`: the same
+Measured at commit 5a27ed1 (1.2.5) with `rustingstrata serve --gpu --ctx 8192 --mtp 0` and `llama-server`: the same
 4241-token prompt file and the same script for both, greedy, thinking off, 128 tokens, no drafts in either engine.
 Two loads per engine in alternating order; in each load a warm-up and the first 4K request are thrown away. Decode is
 the mean of runs 4-8 of each load (10 runs, range in brackets). Both engines climb for the first runs after a load;
