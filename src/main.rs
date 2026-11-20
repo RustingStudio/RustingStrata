@@ -151,6 +151,10 @@ struct Engine {
     /// their free VRAM.
     #[arg(long, default_value = "0", value_delimiter = ',')]
     device: Vec<usize>,
+    /// Share of the layers per device of a `--device 0,1` split, in `--device` order (such as 30,70 to give a card
+    /// on a slow PCIe link fewer layers) [default: in proportion to free VRAM].
+    #[arg(long)]
+    split: Option<String>,
     /// Prompts shorter than this skip the batched prefill [default: from `strata calibrate`, else 32].
     #[arg(long)]
     short: Option<usize>,
@@ -429,6 +433,7 @@ impl Engine {
         for n in notes { eprintln!("{n}"); }
         (self.parallel, self.mtp) = (parallel, Some(mtp));
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
+        if let Some(s) = &self.split { unsafe { std::env::set_var("STRATA_SPLIT", s) } }  // read by GpuModel::load_split_margins
         // Before the first weight is uploaded: fail if a pipeline these weight types need does not fit the device's
         // shared memory (Vulkan; a no-op elsewhere). No pipeline or model buffer exists yet.
         let mut types = rusting_strata::gpu_model::gpu_weight_types(&m.w.g);

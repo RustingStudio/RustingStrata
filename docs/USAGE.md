@@ -165,7 +165,12 @@ OpenCode and other agents use the OpenAI address.
 
 `--device 0,1` splits the layers over the cards in proportion to their free VRAM, so more experts stay resident. The
 cards run one after the other, so one request gets more memory, not twice the speed of one card. MTP drafting is off on
-a split model. AMD cards clock down in the gaps while the other card works; `echo high >
+a split model.
+
+`--split 30,70` sets the share of the layers per card by hand, in `--device` order (`STRATA_SPLIT=30,70` for
+`calibrate`). A card with fewer layers keeps more of their experts in VRAM, so fewer are uploaded to it during prefill:
+that is the setting to try for a card on a slow PCIe link (x1 riser, x4 slot). The load prints each card's layers and
+its measured host-to-VRAM copy rate. AMD cards clock down in the gaps while the other card works; `echo high >
 /sys/class/drm/cardN/device/power_dpm_force_performance_level` (as root, per card) took a two-card split from 44 to 57
 tok/s in one report.
 

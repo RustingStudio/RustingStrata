@@ -560,6 +560,29 @@ pub struct GpuModel<'a> {
     row_tokens: usize,
 }
 
+/// Layer shares of `--split`: one positive number per device, such as `60,40`.
+fn split_shares(spec: &str, n: usize) -> anyhow::Result<Vec<f64>> {
+    let v = spec.split(',').map(|s| s.trim().parse::<f64>().ok().filter(|x| x.is_finite() && *x > 0.0)
+        .with_context(|| format!("--split {spec}: `{}` is not a positive number", s.trim()))).collect::<anyhow::Result<Vec<_>>>()?;
+    ensure!(v.len() == n, "--split {spec}: {} share(s) for {n} device(s) (give one per device in --device order)", v.len());
+    Ok(v)
+}
+
+/// Host-to-VRAM copy rate of `gpu` in MB/s over the path an expert upload takes (pageable host memory, so a fast
+/// link reads as the host's copy rate). The second of two 64 MB copies is timed: the first pays the set-up.
+fn copy_rate(gpu: &dyn Backend) -> anyhow::Result<f64> {
+    let src = vec![1u8; 64 << 20];
+    let buf = gpu.alloc(src.len())?;
+    let mut secs = 0.0;
+    for _ in 0..2 {
+        let t = std::time::Instant::now();
+        gpu.htod(&src, &buf, 0)?;
+        gpu.sync()?;
+        secs = t.elapsed().as_secs_f64();
+    }
+    Ok(64.0 / secs)
+}
+
 impl<'a> GpuModel<'a> {
     /// `chunk`: prefill batch in tokens (0 = no batched prefill). `mtp`: load the MTP draft head (needs `nextn`).
     pub fn load(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, k: usize) -> anyhow::Result<GpuModel<'a>> {
@@ -578,7 +601,8 @@ impl<'a> GpuModel<'a> {
         Self::load_split_margins(m, gpus, ctx, chunk, &margins, k, ns)
     }
 
-    /// `load` with the layers split over `gpus` in proportion to their free VRAM (each device then fills the rest
+    /// `load` with the layers split over `gpus` in proportion to their free VRAM, or to the shares of `STRATA_SPLIT`
+    /// (`--split`) when it is set (each device then fills the rest
     /// of its VRAM with expert slots, keeping its entry of `vram_margin` free), and `ns` slots as in `load_slots`.
     /// One device: `load` or `load_slots`.
     pub fn load_split_margins(m: &'a Model<'a>, gpus: Vec<Box<dyn Backend>>, ctx: usize, chunk: usize, vram_margin: &[usize], k: usize, ns: usize) -> anyhow::Result<GpuModel<'a>> {
@@ -589,23 +613,26 @@ impl<'a> GpuModel<'a> {
             let margin = vram_margin[0];
             return if ns > 1 { Self::load_slots(m, g, ctx, chunk, margin, ns) } else { Self::load(m, g, ctx, chunk, margin, k) };
         }
+        let rates = gpus.iter().map(|g| copy_rate(g.as_ref())).collect::<anyhow::Result<Vec<_>>>()?;
         let free = gpus.iter().map(|g| Ok(g.mem_info()?.0 as f64)).collect::<anyhow::Result<Vec<_>>>()?;
-        let total: f64 = free.iter().sum();
+        // `--split` (STRATA_SPLIT): layer shares set by hand, such as fewer layers for a card on a slow PCIe link.
+        let share = match std::env::var("STRATA_SPLIT") { Ok(s) if !s.is_empty() => split_shares(&s, gpus.len())?, _ => free.clone() };
+        let total: f64 = share.iter().sum();
         // ponytail: EAGLE3/DFlash read features across multiple layers into one device's buffers; no drafts when split.
         let k = if gpus.len() > 1 && m.cfg.eagle3.is_some() { eprintln!("EAGLE3 draft head: not available with a multi-GPU layer split, decoding without drafts"); 0 }
             else if gpus.len() > 1 && m.cfg.dflash.is_some() { eprintln!("DFlash draft model: not available with a multi-GPU layer split, decoding without drafts"); 0 }
             else { k };
         let mut ends = vec![0];
         let mut acc = 0.0;
-        for f in &free { acc += f; ends.push((acc / total * n as f64).round() as usize); }
+        for f in &share { acc += f; ends.push((acc / total * n as f64).round() as usize); }
         // The PLE layers share one history ring, which lives on one device.
         let ple: Vec<usize> = (0..n).filter(|&il| m.w.layer(il, "ple_key.weight").is_ok()).collect();
         let mut parts = vec![];
         for (i, gpu) in gpus.into_iter().enumerate() {
             let r = ends[i]..ends[i + 1];
-            ensure!(!r.is_empty(), "device {i} gets no layers (free VRAM {:.0} MB)", free[i] / 1048576.0);
+            ensure!(!r.is_empty(), "device {i} gets no layers ({:.0}% of {n}, free VRAM {:.0} MB; see --split)", 100.0 * share[i] / total, free[i] / 1048576.0);
             ensure!(ple.iter().all(|il| r.contains(il)) || !ple.iter().any(|il| r.contains(il)), "the PLE layers would be split across devices");
-            eprintln!("device {i} ({}): layers {}..{}", gpu.name(), r.start, r.end);
+            eprintln!("device {i} ({}): layers {}..{}, host-to-VRAM copy {:.0} MB/s", gpu.name(), r.start, r.end, rates[i]);
             parts.push(Self::load_part(m, gpu, ctx, chunk, vram_margin[i], k, r, ns)?);
         }
         // One draft length for every part: each caps it by its own backend's verify rows.
@@ -3535,7 +3562,16 @@ impl<'a> GpuModel<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GpuModel, tally};
+    use super::{GpuModel, split_shares, tally};
+
+    #[test]
+    fn split_shares_take_one_positive_number_per_device() {
+        assert_eq!(split_shares("30, 70", 2).unwrap(), [30.0, 70.0]);
+        assert_eq!(split_shares("1,2.5,1", 3).unwrap(), [1.0, 2.5, 1.0]);
+        for bad in ["30", "30,70,10", "30,0", "30,-1", "30,x", "30,inf", ""] {
+            assert!(split_shares(bad, 2).unwrap_err().to_string().starts_with("--split"), "{bad:?}");
+        }
+    }
 
     /// R1: a layer's routing gives the hit rate its numbers; a slot < 0 is an expert left on the CPU.
     #[test]
