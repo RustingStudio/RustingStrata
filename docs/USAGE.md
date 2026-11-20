@@ -8,7 +8,9 @@ Everything here applies to `rustingstrata chat`, `generate`, `bench` and `serve`
 `rustingstrata` with no arguments starts the server on http://127.0.0.1:8080 and opens a chat page. The page keeps chats in
 the browser, downloads models from Hugging Face (settings; `HF_TOKEN` for gated repos), switches between the
 models in the models folder (`%LOCALAPPDATA%\rusting_strata\models` on Windows, `~/.local/share/rusting_strata/models`
-elsewhere, or `serve --models-dir`), and shows context use, speed, totals, and CPU, memory and graphics memory use of
+elsewhere, or `serve --models-dir`), loads a `.gguf` file from any other folder by its full path (settings, models;
+`POST /api/load` with `"path"`, admin key only; the path is one the server sees, so in a container it is a path inside
+the container), and shows context use, speed, totals, and CPU, memory and graphics memory use of
 the server (status bar at the bottom; click it for details).
 
 Messages can be edited and resent, deleted, regenerated, and a reply that stopped at the token limit or was stopped by

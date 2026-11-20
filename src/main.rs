@@ -1594,7 +1594,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     let _ = tx.send((c, q, i, hold));
                 });
             });
-            let s = Serving { rx: rx.into(), waiting, stop, addr, allowed_hosts, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(),
+            let s = Serving { rx: rx.into(), waiting, stop, addr, allowed_hosts, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(), extra: Default::default(),
                 dl: Default::default(), stats, opts: Default::default(), idle: host.auto_unload.map(Duration::from_secs), asleep: Default::default(), parked: Default::default() };
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
@@ -2114,6 +2114,8 @@ struct Serving {
     dir: PathBuf,
     /// The --model, offered beside the models folder.
     model: Option<PathBuf>,
+    /// GGUF files outside the models folder that `/api/load` was given as `path`, offered until the server stops.
+    extra: std::sync::Mutex<Vec<PathBuf>>,
     /// The Hugging Face download running on its own thread, or the last one.
     dl: std::sync::Arc<std::sync::Mutex<hf::Progress>>,
     stats: std::sync::Arc<std::sync::Mutex<serve::Stats>>,
@@ -2206,10 +2208,22 @@ impl Serving {
     /// The models the page offers: the models folder, then --model if it is elsewhere.
     fn models(&self) -> Vec<(String, PathBuf, u64)> {
         let mut v = serve::list_models(&self.dir);
-        if let Some(p) = self.model.as_ref().filter(|p| !v.iter().any(|x| &x.1 == *p)) {
-            v.push((p.display().to_string(), p.clone(), std::fs::metadata(p).map_or(0, |m| m.len())));
+        for p in self.model.iter().chain(self.extra.lock().unwrap().iter()) {
+            if !v.iter().any(|x| &x.1 == p) { v.push((p.display().to_string(), p.clone(), std::fs::metadata(p).map_or(0, |m| m.len()))); }
         }
         v
+    }
+
+    /// Adds a GGUF file from anywhere on this computer to the list (`/api/load` with `path`). Only the file's
+    /// first four bytes are read, so the route tells a caller no more than whether a path is a GGUF file.
+    fn add(&self, p: &Path) -> anyhow::Result<()> {
+        anyhow::ensure!(p.is_absolute(), "{}: give the full path of the file", p.display());
+        let mut magic = [0; 4];
+        std::fs::File::open(p).and_then(|mut f| f.read_exact(&mut magic)).with_context(|| p.display().to_string())?;
+        anyhow::ensure!(&magic == b"GGUF", "{}: not a GGUF file", p.display());
+        let mut x = self.extra.lock().unwrap();
+        if !x.iter().any(|q| q == p) { x.push(p.to_path_buf()); }
+        Ok(())
     }
 }
 
@@ -2665,7 +2679,10 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let v = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default();
             let id = v["model"].as_str().unwrap_or_default();
             if let Err(err) = e.with(&v["options"]) { return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})); }
-            match s.models().into_iter().find(|m| m.0 == id) {
+            // `path` names a file outside the models folder; it joins the list.
+            let path = v["path"].as_str().map(PathBuf::from);
+            if let Some(p) = &path && let Err(err) = s.add(p) { return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})); }
+            match s.models().into_iter().find(|m| path.as_ref().map_or(m.0 == id, |p| &m.1 == p)) {
                 Some((_, p, _)) => {
                     // `calibrate: true` measures the model first; it travels with the options to the load loop.
                     let mut o = v["options"].clone();

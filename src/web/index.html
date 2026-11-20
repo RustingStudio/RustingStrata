@@ -356,6 +356,12 @@ progress { width: 100%; height: 6px; accent-color: var(--accent); margin-top: 10
     <label>Models on this computer</label>
     <div id="local"></div>
     <p class="note" id="dir"></p>
+    <label for="path">Load a .gguf file from another folder: its full path on the server</label>
+    <div class="row">
+      <input id="path" list="paths" placeholder="/path/to/model.gguf" autocomplete="off" spellcheck="false">
+      <datalist id="paths"></datalist>
+      <button id="open" type="button">load</button>
+    </div>
     <label>Load options</label>
     <div class="row" style="gap:20px">
       <div><label for="ectx">context <output id="ectx-o"></output></label><input id="ectx" type="range" min="1024" max="262144" step="1024" value="4096"></div>
@@ -1102,7 +1108,7 @@ async function models() {
   listed = true; showOpts(j.options); tint();
   const loaded = j.models.find(m => m.loaded), top = best(known);
   $('model').replaceChildren(...(loaded ? [] : [opt('', j.models.length ? 'choose a model' : 'no models yet')]),
-    ...j.models.map(m => opt(m.id, `${m.id.split('/').pop().replace(/\.gguf$/i, '')}  ${gb(m.bytes)}`)));
+    ...j.models.map(m => opt(m.id, `${m.id.split(/[\\/]/).pop().replace(/\.gguf$/i, '')}  ${gb(m.bytes)}`)));
   $('model').value = loaded ? loaded.id : '';
   $('local').replaceChildren(...j.models.map(m => {
     const d = el('div', '', modelRow(m, m === top));
@@ -1117,20 +1123,28 @@ async function models() {
   if (!j.models.length && !$('dlg').open) openSettings('models');
   if (!cur || !cur.msgs.length) show();
 }
-async function load(id, calibrate) {
+async function load(id, calibrate, path) {
   $('model').value = id;
   $('model').disabled = $('send').disabled = true; $('model').sync();
   status(calibrate ? 'Calibrating ' + id + '… a few minutes' : 'Loading ' + id + '… large models take a minute');
   stats();
   try {
     // Calibration replaces chunk and MTP, so the page's values for them are not sent with it.
-    await api('/api/load', calibrate ? { model: id, calibrate: true } : { model: id, options: engineOpts() }); status('');
+    await api('/api/load', calibrate ? { model: id, calibrate: true } : { model: id, path, options: engineOpts() }); status('');
+    if (path) { store.set('paths', JSON.stringify([path, ...paths().filter(p => p !== path)].slice(0, 8))); $('path').value = ''; showPaths(); }
     for (const i in EO) if (!calibrate || i === 'emtp' || i === 'echunk') delete $(i).dataset.dirty;
   } catch (e) { status(e.message, true); }
   $('model').disabled = $('send').disabled = false; $('model').sync();
   models(); stats();
 }
 $('model').onchange = () => $('model').value && load($('model').value);
+// Files loaded by path: the server lists them only until it stops, so this browser keeps the last few to offer again.
+const paths = () => { try { return JSON.parse(store.get('paths', '[]')); } catch { return []; } };
+const showPaths = () => $('paths').replaceChildren(...paths().map(p => opt(p, p)));
+showPaths();
+// Windows "Copy as path" puts quotes around the path.
+$('open').onclick = () => { const p = $('path').value.trim().replace(/^"(.*)"$/, '$1'); if (p) { $('dlg').close(); load(p, false, p); } };
+$('path').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); $('open').click(); } };
 $('key').addEventListener('change', () => { models(); stats(); mcpLoad(); });
 
 // Hugging Face downloads.

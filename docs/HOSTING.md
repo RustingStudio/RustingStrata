@@ -134,8 +134,9 @@ chunk.
 ## Keys
 
 - **Admin key** (`--api-key`, or `STRATA_API_KEY` to keep it out of the process list). It can use every route: the
-  chat APIs, the chat page's stats, loading another model (`/api/load`) and downloading models (`/api/download`).
-  Keep it for yourself.
+  chat APIs, the chat page's stats, loading another model (`/api/load`, from the models folder
+  or by the path of any GGUF file the server can read) and downloading models (`/api/download`). Keep it for
+  yourself.
 - **Customer keys** (`--api-keys FILE`). One `name key` pair a line, `#` starts a comment (so a key cannot contain
   `#`). Keys must be at least 16 characters, names and keys must not repeat, and the admin key must not be among
   them. A customer key reaches only `POST /v1/chat/completions`,

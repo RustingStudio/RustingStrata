@@ -410,6 +410,25 @@ fn serve_without_a_model() {
     assert!(s.contains("403") && b.contains("permission_error"), "{s} {b}");
     assert!(req("GET", "/metrics", "root-0123456789abcdef").1.contains("strata_up"));
     assert!(get("GARBAGE\r\n\r\n").0.contains("400"));
+    // /api/load with a path: admin only, a full path, and a file that starts with the GGUF magic.
+    let load = |path: &std::path::Path, key: &str| {
+        let body = serde_json::json!({"path": path}).to_string();
+        get(&format!("POST /api/load HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()))
+    };
+    assert!(load(&dir.join("keys.txt"), "acme-0123456789abcdef").0.contains("403"));
+    let (s, b) = load(&dir.join("keys.txt"), "root-0123456789abcdef");
+    assert!(s.contains("400") && b.contains("not a GGUF file"), "{s} {b}");
+    let (s, b) = load("model.gguf".as_ref(), "root-0123456789abcdef");
+    assert!(s.contains("400") && b.contains("full path"), "{s} {b}");
+    assert!(load(&dir.join("none.gguf"), "root-0123456789abcdef").0.contains("400"));
+    // A file outside the models folder that has the magic joins the list, even though this one then fails to load.
+    let far = std::env::temp_dir().join(format!("strata-serve-far-{}.gguf", std::process::id()));
+    std::fs::write(&far, b"GGUFjunk").unwrap();
+    let (s, b) = load(&far, "root-0123456789abcdef");
+    assert!(!s.contains("200"), "{s} {b}");
+    let (s, b) = req("GET", "/api/models", "root-0123456789abcdef");
+    assert!(s.contains("200") && b.contains(far.file_name().unwrap().to_str().unwrap()), "{s} {b}");
+    let _ = std::fs::remove_file(&far);
     #[cfg(unix)]
     {
         std::process::Command::new("kill").args(["-TERM", &p.id().to_string()]).status().unwrap();
