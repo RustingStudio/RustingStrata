@@ -97,6 +97,13 @@ impl Gguf {
                 for (k, t) in s.tensors { anyhow::ensure!(g.tensors.insert(k.clone(), t).is_none(), "tensor {k} in two shards"); }
             }
         }
+        // The reads are queued by `weights::preload`, one call per file. Said here because nothing else shows it: the
+        // pages are not mapped into the process, so its resident size does not grow.
+        #[cfg(target_os = "linux")]
+        if crate::weights::fits_ram() {
+            eprintln!("page cache: reading {} MB of {} in the background (it shows as buff/cache, not as used memory)",
+                g.files.iter().map(|(m, _)| m.len()).sum::<usize>() >> 20, path.file_name().and_then(|s| s.to_str()).unwrap_or("the model"));
+        }
         Ok(g)
     }
 

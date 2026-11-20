@@ -265,10 +265,11 @@ fn madvise(_: usize, _: usize, _: i32) {}
 
 /// Starts reading mapped bytes p..p + n into the page cache without waiting (MADV_WILLNEED).
 pub fn will_need(p: usize, n: usize) {
-    // One call reads at most one readahead window (read_ahead_kb, 128-256 KB on NVMe).
+    // One call reads at most one readahead window and silently skips the rest of its range (16 MB steps on a 4 MB
+    // window read 25% of a file). The window is read_ahead_kb, 128 KB unless the system or the file system raised it.
     let (mut a, end) = (p & !4095, p + n);
     while a < end {
-        let l = (end - a).min(256 << 10);
+        let l = (end - a).min(128 << 10);
         madvise(a, l, 3);
         a += l;
     }
