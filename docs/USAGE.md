@@ -108,6 +108,14 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 - `--short N` prompts shorter than `N` tokens skip the batched prefill and go token by token (default: from
   `rustingstrata calibrate`, else 32).
 - `--allowed-hosts ai-server.lan` (or `STRATA_ALLOWED_HOSTS`) allows a LAN name when `serve` is bound to `0.0.0.0`.
+- `--auto-unload 600` (`serve`) frees the model after 600 seconds without a chat request: the VRAM and the memory of
+  the process go back to the system, so an idle home server does not hold the GPU. The next chat request loads the
+  model again with the same options and is answered after the load; the model stays in `/v1/models` meanwhile, and
+  `/health` answers `200 {"status": "ok", "unloaded": true}`. Only chat requests count as use and load the model:
+  the chat page, the model list, `/health` and the stats do not. The file stays in the page cache (`buff/cache`,
+  which the system takes back when it needs the memory), so the load after an unload is faster than the first one.
+  The saved conversation (prompt cache) goes with the model: the first request after a load prefills its whole
+  prompt. Not available for `gemma4`, `glm5-next`, `deepseek41` and `hy_v4_flash` models.
 - `--lora PATH:SCALE` applies a LoRA adapter at runtime, see [LORA.md](LORA.md).
 - `--mcp FILE` (`serve` only, or `STRATA_MCP`) lists the MCP servers whose tools the chat page may call, see
   [Tools (MCP)](#tools-mcp).

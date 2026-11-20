@@ -215,6 +215,10 @@ struct Hosting {
     /// decode for as long as the chunk took (a smaller `--chunk` gives shorter pauses). MTP drafting is off.
     #[arg(long, default_value_t = 1)]
     parallel: usize,
+    /// Free the model (its VRAM and its memory in this process) after this many seconds without a chat request. The
+    /// next chat request loads it again, with the same options, and is answered after the load.
+    #[arg(long, value_name = "SECONDS")]
+    auto_unload: Option<u64>,
 }
 
 enum Runner<'a> { Cpu(&'a Model<'a>, State), Gpu(Box<GpuModel<'a>>), Slot(Client) }
@@ -1367,6 +1371,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Serve { model, models_dir, addr, api_key, mcp, open, host, mut engine } => {
             engine.ds_env();
+            anyhow::ensure!(host.auto_unload != Some(0), "--auto-unload must be at least 1 second");
+            // The four architectures below have their own servers, which keep the model for as long as they run.
+            if host.auto_unload.is_some() && let Some(mp) = &model && let Ok(g) = Gguf::open(mp) && let Some(a) = g.get("general.architecture").ok().and_then(|v| v.as_str())
+                && ["gemma4", "glm5-next", "deepseek41", rusting_strata::hy4::ARCH].contains(&a) {
+                anyhow::bail!("--auto-unload is not available for {a} models");
+            }
             if let Some(mp) = &model && let Ok(g) = Gguf::open(mp) && g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
                 let name = mp.file_name().map_or("gemma4".into(), |n| n.to_string_lossy().into_owned());
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
@@ -1490,9 +1500,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     };
                     // For load balancers: no key, no Host check, and an answer while a reply is generated.
                     if let Ok(r) = &q && r.method == "GET" && r.path == "/health" {
-                        let (model, loading, slots) = { let g = st.lock().unwrap(); (g.model.is_some() && !g.loading, g.loading, g.slots) };
+                        let (model, loading, slots, unloaded) = { let g = st.lock().unwrap(); (g.model.is_some() && !g.loading, g.loading, g.slots, g.unloaded) };
                         let waiting = oc.load(Relaxed) - 1;
-                        return if model { reply(json!({"status": "ok", "waiting": waiting, "slots": slots}), "200 OK") }
+                        // A model that `--auto-unload` freed still answers chats (after its load), so it is "ok".
+                        return if unloaded { reply(json!({"status": "ok", "unloaded": true, "waiting": waiting}), "200 OK") }
+                            else if model { reply(json!({"status": "ok", "waiting": waiting, "slots": slots}), "200 OK") }
                             else { reply(json!({"status": if loading { "loading" } else { "no model" }}), "503 Service Unavailable") };
                     }
                     // The page's side panel is answered here, so it stays current while a reply is generated or a
@@ -1583,7 +1595,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 });
             });
             let s = Serving { rx: rx.into(), waiting, stop, addr, allowed_hosts, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(),
-                dl: Default::default(), stats, opts: Default::default() };
+                dl: Default::default(), stats, opts: Default::default(), idle: host.auto_unload.map(Duration::from_secs), asleep: Default::default(), parked: Default::default() };
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
             eprintln!("listening on {url} (models folder: {})", s.dir.display());
@@ -1592,7 +1604,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             loop {
                 let (p, mut w) = match next.take() {
                     Some(x) => x,
-                    None => match s.serve(None, &engine) { Some((p, w)) => (p, Some(w)), None => return Ok(()) },
+                    None => match s.serve(None, &engine) {
+                        // Another model replaces the one `--auto-unload` freed.
+                        Next::Load(p, w) => { *s.asleep.lock().unwrap() = None; (p, Some(w)) }
+                        Next::Wake(p) => (p, None),
+                        _ => return Ok(()),
+                    },
                 };
                 // The page's load options stay for later loads; a load that fails takes the old ones back.
                 let old = engine.clone();
@@ -1613,8 +1630,24 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                             split_arg(engine.split.as_deref(), engine.device.len())?))
                 } else { Ok(()) };
                 match cal.and_then(|()| serve_model(&p, engine.clone(), &s, &mut w)) {
-                    Ok(Some((p, w))) => next = Some((p, Some(w))),
-                    Ok(None) => return Ok(()),
+                    Ok(Next::Load(p, w)) => next = Some((p, Some(w))),
+                    // `--auto-unload`: `serve_model` has freed the model. Its name stays in the model list, as a chat
+                    // loads it again.
+                    Ok(Next::Idle) => {
+                        eprintln!("unloaded {} after {} s without a chat request", p.display(), s.idle.map_or(0, |d| d.as_secs()));
+                        s.sleep(p, engine.ctx);
+                    }
+                    Ok(_) => return Ok(()),
+                    // The load after `--auto-unload` failed (another program may hold the VRAM now): the chat that
+                    // asked for it gets the error and the next one tries again.
+                    Err(e) if s.parked.lock().unwrap().is_some() => {
+                        eprintln!("loading {}: {e:#}", p.display());
+                        let (mut c, ..) = s.parked.lock().unwrap().take().unwrap();
+                        s.waiting.fetch_sub(1, Relaxed);
+                        let b = json!({"error": {"message": format!("loading the model again: {e:#}"), "type": "server_error"}}).to_string();
+                        let _ = write!(c, "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 10\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+                        s.sleep(p, engine.ctx);
+                    }
                     Err(e) if w.is_none() => return Err(e),
                     Err(e) => {
                         engine = old;
@@ -2086,6 +2119,26 @@ struct Serving {
     stats: std::sync::Arc<std::sync::Mutex<serve::Stats>>,
     /// Load options of the last /api/load (`Engine::with`), applied before the next model loads.
     opts: std::sync::Mutex<serde_json::Value>,
+    /// `--auto-unload`: the model is freed after this long without a chat request.
+    idle: Option<Duration>,
+    /// The model `--auto-unload` freed, and the chat request that asked for it again (answered once it has loaded).
+    asleep: std::sync::Mutex<Option<PathBuf>>,
+    parked: std::sync::Mutex<Option<Queued>>,
+}
+
+/// A complete request from the queue, with its key's place when `--max-per-key` counts it (freed once answered).
+type Queued = (TcpStream, anyhow::Result<serve::Request>, usize, Option<serve::Hold>);
+
+/// Why `Serving::serve` returned.
+enum Next {
+    /// POST /api/load asked for this model; its connection waits for the outcome.
+    Load(PathBuf, TcpStream),
+    /// `--auto-unload`: no chat request for that long. The caller frees the model.
+    Idle,
+    /// A chat request came for the model that `--auto-unload` freed; it waits in `Serving::parked`.
+    Wake(PathBuf),
+    /// The listener is gone, or SIGTERM came and the accepted requests are answered.
+    Stop,
 }
 
 /// A flag that SIGTERM sets (instead of ending the process). Never set on Windows.
@@ -2102,24 +2155,50 @@ fn on_sigterm() -> &'static std::sync::atomic::AtomicBool {
 }
 
 impl Serving {
-    /// Answers requests until one asks for a model to be loaded; returns its path and connection (None once the
-    /// listener is gone).
-    fn serve(&self, mut l: Option<&mut Loaded>, e: &Engine) -> Option<(PathBuf, TcpStream)> {
+    /// Answers requests until one asks for a model to be loaded, or until the model is to be freed or loaded again
+    /// for `--auto-unload`.
+    fn serve(&self, mut l: Option<&mut Loaded>, e: &Engine) -> Next {
         if let Some(l) = l.as_deref_mut() && matches!(&l.r, Runner::Gpu(g) if g.slots() > 1) { return self.serve_slots(l, e); }
         let rx = self.rx.lock().unwrap();
+        let mut last = Instant::now();
         loop {
-            let (c, q, i, _hold) = match rx.recv_timeout(Duration::from_millis(200)) {
+            // The chat that asked for the freed model comes first.
+            let parked = self.parked.lock().unwrap().take();
+            let (c, q, i, hold) = match parked.map_or_else(|| rx.recv_timeout(Duration::from_millis(200)), Ok) {
                 Ok(x) => x,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if self.stopped() => { eprintln!("stopped"); return None }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if self.stopped() => { eprintln!("stopped"); return Next::Stop }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if l.is_some() && self.idle.is_some_and(|d| last.elapsed() >= d) => return Next::Idle,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Next::Stop,
             };
+            let chat = self.wants_model(&q);
+            if chat && l.is_none() && let Some(p) = self.asleep.lock().unwrap().take() {
+                *self.parked.lock().unwrap() = Some((c, q, i, hold));
+                return Next::Wake(p);
+            }
             let mut next = None;
             let res = handle(c, q, l.as_deref_mut(), e, self, i, &mut next);
             self.waiting.fetch_sub(1, Relaxed);
+            if chat { last = Instant::now(); }
             if let Err(e) = res { eprintln!("request {i}: {e:#}"); serve::exit_if_gpu_dead(&e); }
-            if next.is_some() { return next; }
+            if let Some((p, w)) = next { return Next::Load(p, w); }
         }
+    }
+    /// `--auto-unload` freed `model` (or its load failed after that). It stays in the stats and so in the model list,
+    /// as a chat request loads it again.
+    fn sleep(&self, model: PathBuf, ctx: usize) {
+        let mut st = self.stats.lock().unwrap();
+        st.unload(None);
+        (st.model, st.unloaded, st.ctx) = (model.file_stem().and_then(|n| n.to_str()).map(String::from), true, ctx);
+        *self.asleep.lock().unwrap() = Some(model);
+    }
+    /// A request for the model that `handle` does not refuse for its Host, key or content type. Only these count as
+    /// use for `--auto-unload` and load the freed model again: the page, the stats and the model list do not.
+    fn wants_model(&self, q: &anyhow::Result<serve::Request>) -> bool {
+        let Ok(r) = q else { return false };
+        let keys = self.keys.read().unwrap();
+        r.method == "POST" && r.json && matches!(r.path.split('?').next(), Some("/v1/chat/completions" | "/v1/messages" | "/v1/messages/count_tokens"))
+            && (keys.any() || serve::host_ok(&r.host, &self.addr, &self.allowed_hosts)) && keys.who(&r.auth).is_some()
     }
     /// SIGTERM came and the requests accepted before it are answered: `serve` returns None, so the expert profile
     /// is saved and the server exits.
@@ -2258,12 +2337,14 @@ impl Serving {
     /// `serve` with several slots (`--parallel`): each request runs `handle` on its own thread and sends its model
     /// work here, where prefills run one at a time (the decoding slots run between its chunks) and the decode steps of
     /// up to `TMAX` slots share a forward.
-    fn serve_slots(&self, l: &mut Loaded, e: &Engine) -> Option<(PathBuf, TcpStream)> {
+    fn serve_slots(&self, l: &mut Loaded, e: &Engine) -> Next {
         use std::sync::mpsc::{TryRecvError, channel};
         let Loaded { r, tok, tpl, name, path } = l;
         let Runner::Gpu(g) = r else { unreachable!() };
         let (tx, jobs) = channel::<Job>();
         let (next, live) = (std::sync::Mutex::new(None), std::sync::atomic::AtomicUsize::new(0));
+        // `--auto-unload`: when the last chat request ended, and whether the loop ended for it.
+        let (last, mut idle) = (std::sync::Mutex::new(Instant::now()), false);
         let rx = self.rx.lock().unwrap();
         let n = g.slots();
         std::thread::scope(|sc| {
@@ -2273,11 +2354,13 @@ impl Serving {
             let mut open = true;
             loop {
                 while open && next.lock().unwrap().is_none() {
-                    match rx.try_recv() {
+                    let parked = self.parked.lock().unwrap().take();
+                    match parked.map_or_else(|| rx.try_recv(), Ok) {
                         Ok((c, q, i, hold)) => {
                             live.fetch_add(1, Relaxed);
-                            let (tx, tok, tpl, name, path, next, live) = (tx.clone(), &**tok, *tpl, name.clone(), path.clone(), &next, &live);
+                            let (tx, tok, tpl, name, path, next, live, last) = (tx.clone(), &**tok, *tpl, name.clone(), path.clone(), &next, &live, &last);
                             sc.spawn(move || {
+                                let chat = self.wants_model(&q);
                                 let mut l = Loaded { r: Runner::Slot(Client { tx, slot: None, owner: 0, conn: None, started: None }), tok, tpl, name, path };
                                 let mut nx = None;
                                 // A panic still gives back the counts below, so the model thread can switch models.
@@ -2287,6 +2370,7 @@ impl Serving {
                                 self.waiting.fetch_sub(1, Relaxed);
                                 if let Err(e) = res { eprintln!("request {i}: {e:#}"); serve::exit_if_gpu_dead(&e); }
                                 if nx.is_some() { *next.lock().unwrap() = nx; }
+                                if chat { *last.lock().unwrap() = Instant::now(); }
                                 live.fetch_sub(1, Relaxed);
                             });
                         }
@@ -2296,6 +2380,8 @@ impl Serving {
                 }
                 if open && self.stopped() { eprintln!("stopped"); open = false; }
                 if (!open || next.lock().unwrap().is_some()) && live.load(Relaxed) == 0 { break; }
+                // A request that comes now stays in the queue and loads the model again.
+                if live.load(Relaxed) == 0 && self.idle.is_some_and(|d| last.lock().unwrap().elapsed() >= d) { idle = true; break; }
                 s.take(&jobs, s.wait());
                 // Prefill between decode steps, in the free slot whose saved state the prompt extends the furthest, else
                 // the least recently used one.
@@ -2363,7 +2449,7 @@ impl Serving {
                 if s.ready() { s.run(g); }
             }
         });
-        next.into_inner().unwrap()
+        match next.into_inner().unwrap() { Some((p, w)) => Next::Load(p, w), None if idle => Next::Idle, None => Next::Stop }
     }
 }
 
@@ -2434,8 +2520,8 @@ fn open_mtp_gguf(path: Option<&Path>) -> anyhow::Result<Option<Gguf>> {
 }
 
 /// Loads `model`, answers `w` (the /api/load request that asked for it) and serves until another model is asked
-/// for. The model and its GPU memory are freed on return.
-fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<TcpStream>) -> anyhow::Result<Option<(PathBuf, TcpStream)>> {
+/// for or `--auto-unload` ends it. The model and its GPU memory are freed on return.
+fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<TcpStream>) -> anyhow::Result<Next> {
     eprintln!("loading {}", model.display());
     let name = model.file_stem().and_then(|s| s.to_str()).unwrap_or("strata").to_string();
     {
@@ -2564,7 +2650,9 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
     }
     match (method.as_str(), route) {
         ("GET", "/api/models") => {
-            let models: Vec<_> = s.models().into_iter().map(|(id, p, n)| json!({"id": id, "bytes": n, "image": e.mmproj.is_some() || vision::find_sibling(&p).is_some(), "loaded": l.as_ref().is_some_and(|l| l.path == p)})).collect();
+            // The model `--auto-unload` freed counts as loaded: a chat loads it again.
+            let asleep = s.asleep.lock().unwrap().clone();
+            let models: Vec<_> = s.models().into_iter().map(|(id, p, n)| json!({"id": id, "bytes": n, "image": e.mmproj.is_some() || vision::find_sibling(&p).is_some(), "loaded": l.as_ref().is_some_and(|l| l.path == p) || asleep.as_ref() == Some(&p)})).collect();
             // The values in effect: with a model loaded, `chunk` and `mtp` include its calibration.
             let options = json!({"ctx": e.ctx, "kv": e.kv, "cache_ram": e.cache_ram, "vram_margin": e.vram_margin.join(","), "mtp": e.mtp, "chunk": e.chunk,
                 "gpu": e.gpu, "ctx_train": s.stats.lock().unwrap().ctx_train,

@@ -450,6 +450,7 @@ fn serve_parallel_smoke() {
         eprintln!("SKIP: STRATA_TEST_BACKENDS does not select cuda");
         return
     }
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
     use std::io::{Read, Write};
     let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
     let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_rustingstrata"))
@@ -622,4 +623,61 @@ fn reads_a_chunked_body() {
     assert!(bad("900000\r\n"));
     assert!(bad("5\r\nab"));
     assert!(bad("2\r\nabXX\r\n0\r\n\r\n"));
+}
+
+/// One at a time for the tests that load the whole model on the GPU: two do not fit in 12 GB.
+static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `serve --auto-unload 2` frees the model after two idle seconds (`/health` says `unloaded`) and the next chat request
+/// loads it again and is answered, with one slot and with two (the two serve loops). Model- and GPU-gated like
+/// `serve_parallel_smoke`.
+#[test]
+fn serve_auto_unload_loads_again_on_a_chat() {
+    let Some(model) = std::env::var_os("STRATA_MODEL").filter(|p| std::path::Path::new(p).exists()) else {
+        eprintln!("SKIP: no STRATA_MODEL"); return
+    };
+    if !std::env::var("STRATA_TEST_BACKENDS").is_ok_and(|v| v.split(',').any(|b| b.trim().eq_ignore_ascii_case("cuda"))) {
+        eprintln!("SKIP: STRATA_TEST_BACKENDS does not select cuda");
+        return
+    }
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    use std::io::{Read, Write};
+    for parallel in ["1", "2"] {
+    let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_rustingstrata"))
+        .args(["serve", "--model"]).arg(&model)
+        .args(["--gpu", "--backend", "cuda", "--ctx", "512", "--auto-unload", "2", "--parallel", parallel, "--addr", &addr])
+        .spawn().unwrap();
+    let send = |raw: String| -> String {
+        let Ok(mut c) = std::net::TcpStream::connect(&addr) else { return String::new() };
+        let _ = c.write_all(raw.as_bytes());
+        let mut s = String::new();
+        let _ = c.read_to_string(&mut s);
+        s
+    };
+    let health = || send(format!("GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"));
+    let body = r#"{"messages":[{"role":"user","content":"Reply with one word."}],"max_tokens":4}"#;
+    let chat = || send(format!("POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()));
+    // Polls `/health` (which must not count as use) until `want` holds, for at most 300 s.
+    let mut until = |want: &dyn Fn(&str) -> bool| (0..3000).any(|_| {
+        if want(&health()) { return true; }
+        assert!(p.try_wait().unwrap().is_none(), "server exited");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        false
+    });
+    let result = (|| -> Result<(String, String), String> {
+        if !until(&|h| h.starts_with("HTTP/1.1 200")) { return Err("server did not become healthy".into()) }
+        let first = chat();
+        if !until(&|h| h.contains("\"unloaded\":true")) { return Err("the model was not unloaded".into()) }
+        let second = chat();
+        if health().contains("unloaded") { return Err("the model is still unloaded after a chat".into()) }
+        Ok((first, second))
+    })();
+    #[cfg(unix)]
+    let _ = std::process::Command::new("kill").args(["-TERM", &p.id().to_string()]).status();
+    let _ = p.kill();
+    let _ = p.wait();
+    let (first, second) = result.unwrap_or_else(|e| panic!("--parallel {parallel}: {e}"));
+    for r in [first, second] { assert!(r.contains("200 OK") && r.contains("\"choices\""), "--parallel {parallel}: {r}"); }
+    }
 }

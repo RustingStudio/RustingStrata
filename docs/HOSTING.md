@@ -330,6 +330,9 @@ docker run -d --name strata --gpus all -p 127.0.0.1:8080:8080 \
 - `200 {"status": "ok", "waiting": N, "slots": S}` once a model is loaded. `waiting` counts the requests being read,
   generated or queued besides this one; `slots` is how many are generated at once (`--parallel`). A load balancer
   can send the next request to the server with the lowest `waiting / slots`.
+- `200 {"status": "ok", "unloaded": true, "waiting": N}` when `--auto-unload` has freed the model: the next chat
+  request loads it again, so the server stays in rotation. During that load `/health` answers `503 loading`, as for
+  any load.
 - `503 {"status": "loading"}` or `503 {"status": "no model"}` otherwise.
 - `503` with an `error` body (no `status`) when `--max-waiting` connections are open, or while the server stops. A
   load balancer then treats a full server as down, which sends the next requests elsewhere.

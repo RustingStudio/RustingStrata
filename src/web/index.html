@@ -1203,9 +1203,9 @@ async function stats() {
   if (firstStats) { models(); $('files').sync(); }   // the fit notes need this computer's memory
   const st = $('state');
   if (!s) { [st.textContent, st.className] = ['Offline', 'state']; return; }
-  [st.textContent, st.className] = s.loading ? ['Loading', 'state busy'] : s.busy ? [`Writing${s.busy > 1 ? ' ' + s.busy + ' replies' : ''}, ${s.live_tokens} tokens`, 'state busy'] : s.model ? ['Ready', 'state ready'] : ['No model', 'state'];
+  [st.textContent, st.className] = s.loading ? ['Loading', 'state busy'] : s.busy ? [`Writing${s.busy > 1 ? ' ' + s.busy + ' replies' : ''}, ${s.live_tokens} tokens`, 'state busy'] : s.unloaded ? ['Unloaded, loads on the next message', 'state'] : s.model ? ['Ready', 'state ready'] : ['No model', 'state'];
   $('mname').textContent = s.model || 'No model loaded';
-  $('minfo').innerHTML = s.model && !s.loading ? dl([
+  $('minfo').innerHTML = s.model && !s.loading && !s.unloaded ? dl([
     ['Runs on', { cpu: 'Processor', cuda: 'CUDA', vulkan: 'Vulkan' }[s.backend]],
     ['Device', s.device || s.system.cpu],
     ['Context', num(s.ctx) + ' tokens'],

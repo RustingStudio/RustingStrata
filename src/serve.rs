@@ -358,6 +358,8 @@ pub struct Stats {
     /// The loaded model's name, or the one loading.
     pub model: Option<String>,
     pub loading: bool,
+    /// `--auto-unload` freed `model`; a chat request loads it again.
+    pub unloaded: bool,
     /// "cuda", "vulkan" or "cpu", and the GPU's name.
     pub backend: String,
     pub device: String,
