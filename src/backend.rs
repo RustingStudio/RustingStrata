@@ -267,6 +267,11 @@ pub trait Backend: Send {
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()>;
     /// g = silu(g) * u.
     fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()>;
+    /// Gyro files (`config::Hadamard`): each of `rows` rows of n floats at `x` (times silu(x) * u first when `u` is
+    /// not 0) becomes H (s x) per `block` values, written to `out`, which may be `x`. `s`: the row's n signs as floats.
+    fn hadamard(&self, _x: u64, _u: u64, _s: u64, _out: u64, _n: usize, _block: usize, _rows: usize) -> anyhow::Result<()> {
+        anyhow::bail!("this file rotates its expert inputs (prism.hadamard), which the {} backend does not do", self.name())
+    }
     /// The SwiGLU of `rows` rows of n for a GEMV with quantized weights: either g = silu(g) * u (returns 0), or
     /// silu(g) * u quantized into `xq` as `quant_xq` does (returns xq, for the GEMV's xq; g is then left as is).
     fn swiglu_q(&self, g: u64, u: u64, n: usize, rows: usize, _xq: u64) -> anyhow::Result<u64> {

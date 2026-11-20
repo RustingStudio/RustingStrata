@@ -1,5 +1,5 @@
 // Decode-path kernels. Dequant ports of src/quant/mod.rs (from llama.cpp ggml-quants.c, MIT License, ggml authors).
-// Tables (iq2xs_grid, iq3xxs_grid, ksigns_iq2xs, kvalues_iq4nl) are prepended by src/cuda/mod.rs.
+// Tables (iq2xs_grid, iq3xxs_grid, ksigns_iq2xs, kvalues_iq4nl, tq_lut) are prepended by src/cuda/mod.rs.
 
 typedef unsigned char u8;
 typedef unsigned short u16;
@@ -261,6 +261,40 @@ template <> __device__ __forceinline__ void deq8<35>(const u8* b, int sub, float
     int q[8]; tq2_vals(b, sub, q); float d = ldh(b + 64);
     for (int i = 0; i < 8; i++) o[i] = d * (float)q[i];
 }
+
+// Trellis types of agentionai's llama.cpp fork (Gyro files): blocks of 128 values, {f16 d; u8 qs[4 K]} with K = 8
+// (TQ2_T, 144), 6 (TQK6, 145) and 7 (TQK7, 146). Step t of 32 gives values 4 t .. 4 t + 3: the hash x = s * 0x9e3779b1
+// of the step's 15-bit state s names two points of the codebook tq_lut (two values each), x >> 21 and (x >> 10) & 2047.
+// TQ2_T: s is byte t under byte t - 1. TQK: s is the K * 32 bit ring of qs from bit (31 - t) K.
+// The codebook is not on an int8 grid, so these types run as float types (FTYPES).
+template <int T> __device__ __forceinline__ void tq_points(const u8* qs, int t, u32& pa, u32& pb) {
+    constexpr int K = T == 144 ? 8 : T == 145 ? 6 : 7, N = 4 * K;
+    u32 s;
+    if (K == 8) {
+        s = (u32)qs[(t + 31) & 31] << 8 | qs[t];
+    } else {
+        int off = (31 - t) * K, b = off >> 3, b1 = b + 1 < N ? b + 1 : b + 1 - N, b2 = b + 2 < N ? b + 2 : b + 2 - N;
+        s = ((u32)qs[b] | (u32)qs[b1] << 8 | (u32)qs[b2] << 16) >> (off & 7);
+    }
+    u32 x = (s & 0x7fff) * 0x9e3779b1u;
+    pa = x >> 21; pb = (x >> 10) & 2047;
+}
+// The block of lane `sub` of a super-block (two blocks); the lane's 8 values are its steps t and t + 1.
+template <int T> __device__ __forceinline__ const u8* tq_blk(const u8* b, int sub, int& t) {
+    t = (sub & 15) * 2;
+    return b + (sub >> 4) * (2 + 4 * (T == 144 ? 8 : T == 145 ? 6 : 7));
+}
+template <int T> __device__ __forceinline__ void tq_deq8(const u8* b, int sub, float* o) {
+    int t; const u8* p = tq_blk<T>(b, sub, t); float d = ldh(p);
+    for (int i = 0; i < 2; i++) {
+        u32 pa, pb; tq_points<T>(p + 2, t + i, pa, pb);
+        o[4 * i] = tq_lut[2 * pa] * d; o[4 * i + 1] = tq_lut[2 * pa + 1] * d;
+        o[4 * i + 2] = tq_lut[2 * pb] * d; o[4 * i + 3] = tq_lut[2 * pb + 1] * d;
+    }
+}
+template <> __device__ __forceinline__ void deq8<144>(const u8* b, int sub, float* o) { tq_deq8<144>(b, sub, o); }  // TQ2_T
+template <> __device__ __forceinline__ void deq8<145>(const u8* b, int sub, float* o) { tq_deq8<145>(b, sub, o); }  // TQK6
+template <> __device__ __forceinline__ void deq8<146>(const u8* b, int sub, float* o) { tq_deq8<146>(b, sub, o); }  // TQK7
 
 // Rows of `cols` values (a multiple of 32, or of the type's block): GEMVs loop over the full super-blocks, then the
 // lanes whose 8 values lie inside a partial last one (cols % 256) read it. Only the `_p` kernels (P = true) have that
@@ -774,7 +808,7 @@ __device__ __forceinline__ void gemv_row_qn(const u8* __restrict__ w, const sign
     }
 }
 
-#define FTYPES(X) X(0, f32, 1024) X(30, bf16, 512)
+#define FTYPES(X) X(0, f32, 1024) X(30, bf16, 512) X(144, tq2_t, 68) X(145, tqk6, 52) X(146, tqk7, 60)
 #define ITYPES(X) X(8, q8_0, 272) X(10, q2_k, 84) X(11, q3_k, 110) X(12, q4_k, 144) X(13, q5_k, 176) X(14, q6_k, 210) \
     X(19, iq1_s, 50) X(29, iq1_m, 56) X(16, iq2_xxs, 66) X(17, iq2_xs, 74) X(22, iq2_s, 82) X(18, iq3_xxs, 98) X(21, iq3_s, 110) X(23, iq4_xs, 136) X(20, iq4_nl, 144) X(42, q2_0, 72) X(34, tq1_0, 54) X(35, tq2_0, 66) X(2, q4_0, 144) X(6, q5_0, 176) \
     X(3, q4_1, 160) X(7, q5_1, 192)
@@ -788,7 +822,7 @@ __device__ __forceinline__ void gemv_row_qn(const u8* __restrict__ w, const sign
     }
 QTYPES(DEF_DEQUANT)
 
-// Float types read x directly.
+// Float types and the trellis types (their codebook is float) read x directly.
 #define DEF_FGEMV(T, NAME, SBB) DEF_FGEMV_(T, NAME, SBB, false) DEF_FGEMV_(T, NAME##_p, SBB, true)
 #define DEF_FGEMV_(T, NAME, SBB, P)                                                                                   \
     extern "C" __global__ void gemv_##NAME(const u8* w, const float* x, float* y, int rows, int cols, int,     \
@@ -1588,6 +1622,26 @@ extern "C" __global__ void add(float* x, const float* y, int n) {
 extern "C" __global__ void swiglu(float* g, const float* u, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) g[i] = silu(g[i]) * u[i];
+}
+
+// Gyro files (config::Hadamard): the routed experts read H (s x) in place of x, H the normalized Sylvester-Walsh-
+// Hadamard matrix over blocks of bs values (a power of two, at most 1024) and s the n signs of a row. One block of
+// bs threads per block of values, one butterfly stage per barrier, in the order of the CPU's transform (the same
+// bits). With `u`, x is silu(x) * u first (the SwiGLU before the down matrix). `out` may be x.
+extern "C" __global__ void hadamard(const float* x, const float* u, const float* s, float* out, int n, int bs, float scale) {
+    __shared__ float sh[2][1024];
+    int j = threadIdx.x;
+    size_t i = (size_t)blockIdx.x * bs + j;
+    float v = x[i];
+    if (u) v = silu(v) * u[i];
+    v *= s[i % n];
+    for (int len = 1, b = 0; len < bs; len <<= 1, b ^= 1) {
+        sh[b][j] = v;
+        __syncthreads();
+        float c = sh[b][j ^ len];
+        v = (j & len) ? c - v : v + c;
+    }
+    out[i] = v * scale;
 }
 
 // swiglu on rows of n (a multiple of 32) quantized as quant_xq does into out; g is left as is. Block (c, t) of one

@@ -356,7 +356,7 @@ fn build_shortlist(m: &Model, gpu: &dyn Backend, output: Option<&GpuTensor>) -> 
     let c = &m.cfg;
     if c.n_vocab <= 65536 || !gpu.supports_gemv_rows() { return Ok(None); }
     let Some(out) = output else { return Ok(None); };
-    if matches!(out.ty, GgmlType::F32 | GgmlType::BF16) { return Ok(None); }
+    if out.ty.float_x() { return Ok(None); }
     let Ok(crate::gguf::Value::Arr(arr)) = m.w.g.get("tokenizer.ggml.tokens") else { return Ok(None); };
     if arr.len() != c.n_vocab { return Ok(None); }
 
@@ -543,6 +543,8 @@ pub struct GpuModel<'a> {
     ext_draft: Option<Box<GpuModel<'a>>>,
     ext_draft_pend: Vec<u32>,
     mhc_ones: Option<Buf>,
+    /// Gyro files (`config::Hadamard`): the signs of a hidden row and of an expert's inner row, as floats.
+    hada: Option<[Buf; 2]>,
     graph_tag: u64,
     /// Speculative N-gram / lookup cache drafter (standalone or combined with `mtp`/`dflash` via `hybrid_spec_step`).
     pub ngram: Option<crate::ngram::NgramDrafter>,
@@ -1009,6 +1011,21 @@ impl<'a> GpuModel<'a> {
         } else {
             None
         };
+        let hada = match &c.hadamard {
+            Some(r) => {
+                // ponytail: the rotated inputs stay floats. A rotated file with int8-input expert types needs a
+                // `quant_xq` of "hr" and of the rotated SwiGLU output.
+                for (name, info) in &m.w.g.tensors {
+                    if name.contains("_exps.") && !GgmlType::from_u32(info.ty)?.float_x() {
+                        anyhow::bail!("{name}: a rotated (prism.hadamard) expert matrix of type {} runs only on the CPU", GgmlType::from_u32(info.ty)?.name());
+                    }
+                }
+                sizes.push(("hr", c.n_embd));
+                let up = |n: usize| -> anyhow::Result<Buf> { let b = gpu.zeros::<f32>(n)?; gpu.put(r.signs(n), &b, 0)?; Ok(b) };
+                Some([up(c.n_embd)?, up(c.n_ff_exp)?])
+            }
+            None => None,
+        };
         let bufs = sizes.into_iter().map(|(name, n)| Ok((name, gpu.zeros::<f32>(TMAX * n)?))).collect::<anyhow::Result<HashMap<_, _>>>()?;
         let (x, logits, ids) = (gpu.zeros::<f32>(TMAX * hcn * c.n_embd)?, gpu.zeros::<f32>(TMAX * c.n_vocab)?, gpu.zeros::<i32>(TMAX * ke)?);
         let amax = gpu.zeros::<i32>(TMAX)?;
@@ -1111,7 +1128,7 @@ impl<'a> GpuModel<'a> {
         let adapt_swaps = std::env::var("STRATA_ADAPT_SWAPS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
         let reset_counts_after_prefill = std::env::var_os("STRATA_RESET_COUNTS").is_some();
         let _ = &mut ext_draft;
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], ple_undo: ([-1, -1], vec![]), bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, nsnap, short: 32, pf, prompt_cache_path: None, bt, mtp, dflash, ext_draft, ext_draft_pend: Vec::new(), mhc_ones, graph_tag: 0, ngram: None, first: range.start, next: None,
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], ple_undo: ([-1, -1], vec![]), bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, hada, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, nsnap, short: 32, pf, prompt_cache_path: None, bt, mtp, dflash, ext_draft, ext_draft_pend: Vec::new(), mhc_ones, graph_tag: 0, ngram: None, first: range.start, next: None,
                       cur: 0, seqs, rows: vec![], row_tokens: 0 })
     }
 
@@ -2236,7 +2253,7 @@ impl<'a> GpuModel<'a> {
                 g.rms_norm_q(df.x.addr(), ne, dl.post_norm.ptr, df.h.addr(), ne, ne, b_len, eps, hq, post_res)?;
                 let m_in = conv_prepare(dl.mlp_conv.as_ref(), df.h.addr(), false, true)?;
                 g.batch(&mut || g.gemvq2(&dl.gate, &dl.up, m_in, ne, hq, df.ge.addr(), df.ue.addr(), b_len))?;
-                let dq = if matches!(dl.down.ty, GgmlType::F32 | GgmlType::BF16) {
+                let dq = if dl.down.ty.float_x() {
                     g.swiglu(df.ge.addr(), df.ue.addr(), b_len * dc.n_ff)?;
                     0
                 } else {
@@ -3063,7 +3080,7 @@ impl<'a> GpuModel<'a> {
         let mv2 = |a: &GpuTensor, b: &GpuTensor, ya: &str, yb: &str| g.gemvq2(a, b, p("h"), ne, p("hq"), p(ya), p(yb), nt);
         // The SwiGLU for a down GEMV of type `ty` (float weights read g itself). Returns the xq for the GEMV.
         let sw = |ty: GgmlType, ga: &str, ua: &str, n: usize, rows: usize, q: &str| -> anyhow::Result<u64> {
-            if matches!(ty, GgmlType::F32 | GgmlType::BF16) { g.swiglu(p(ga), p(ua), rows * n)?; return Ok(0); }
+            if ty.float_x() { g.swiglu(p(ga), p(ua), rows * n)?; return Ok(0); }
             g.swiglu_q(p(ga), p(ua), n, rows, p(q))
         };
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
@@ -3331,7 +3348,15 @@ impl<'a> GpuModel<'a> {
                     // The previous token's routing of this layer, for the next token's prefetch (R3a).
                     let pid = self.pids.as_ref().map_or(0, |b| b.addr() + (4 * k * il) as u64);
                     // Resuming: what the skipped part left (the swiglu_q of Vulkan, the only backend that resumes).
-                    if resume { dq = if matches!(md.ty, GgmlType::F32 | GgmlType::BF16) { 0 } else { p("ffq") }; }
+                    if resume { dq = if md.ty.float_x() { 0 } else { p("ffq") }; }
+                    // Gyro files: the routed experts read the rotated h ("hr") and the rotated SwiGLU output, both as
+                    // floats (`config::Hadamard`). The CPU worker rotates the plain h of the mailbox itself.
+                    let rot = self.hada.as_ref().zip(c.hadamard.as_ref());
+                    let hx = if rot.is_some() { p("hr") } else { p("h") };
+                    let swd = || match rot {
+                        Some((s, r)) => g.hadamard(p("ge"), p("ue"), s[1].addr(), p("ge"), c.n_ff_exp, r.block, kt).map(|_| 0),
+                        None => sw(md.ty, "ge", "ue", c.n_ff_exp, kt, "ffq"),
+                    };
                     // Prefetch the next layer's predicted experts while this layer runs (knob off by default).
                     if !resume { self.prefetch_next(il, &**g, cache, k)?; }
                     // The shared expert's GEMVs and swiglu share batches with the routed ones.
@@ -3353,14 +3378,16 @@ impl<'a> GpuModel<'a> {
                             Ok(())
                         })?;
                     }
+                    // ponytail: a launch of its own; it fits the router's batch if it shows in the decode profile.
+                    if let Some((s, r)) = rot { g.hadamard(p("h"), 0, s[0].addr(), hx, ne, r.block, nt)?; }
                     g.moe_route(p("rl"), c.n_expert, k, c.expert_weights_scale, lx.table_dev.addr(), ids, p("wts"), slots, p("wh"), p("h"), mb, ne, w.layout.h, step, nt, pid, c.router_sigmoid)?;
                     g.batch(&mut || {
                         if mg.ty == mu.ty && (mg.rows, mg.cols) == (mu.rows, mu.cols) {
                             let pair = (mu.off as i64 - mg.off as i64, p("ue") as i64 - p("ge") as i64);
-                            g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, p("h"), ne, k, p("ge"), Some(pair), p("hq"))?;
+                            g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, hx, ne, k, p("ge"), Some(pair), p("hq"))?;
                         } else {
-                            g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, p("h"), ne, k, p("ge"), None, p("hq"))?;
-                            g.moe_gemv(mu.ty, mu.rows, mu.cols, base + mu.off as u64, stride, slots, kt, p("h"), ne, k, p("ue"), None, p("hq"))?;
+                            g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, hx, ne, k, p("ge"), None, p("hq"))?;
+                            g.moe_gemv(mu.ty, mu.rows, mu.cols, base + mu.off as u64, stride, slots, kt, hx, ne, k, p("ue"), None, p("hq"))?;
                         }
                         if !sh_gemm {
                             if let Some(s) = shared { sq = sw(s.down.ty, "shg", "shu", c.n_ff_shexp, nt, "shq")?; }
@@ -3370,10 +3397,10 @@ impl<'a> GpuModel<'a> {
                     if sh_gemm {
                         let s = shared.as_ref().unwrap();
                         g.gemm_dense(&s.down, nt, p("shg"), c.n_ff_shexp, p("shy"), ne, 0)?;
-                        dq = sw(md.ty, "ge", "ue", c.n_ff_exp, kt, "ffq")?;
+                        dq = swd()?;
                     } else {
                         g.batch(&mut || {
-                            dq = sw(md.ty, "ge", "ue", c.n_ff_exp, kt, "ffq")?;
+                            dq = swd()?;
                             if let Some(s) = shared { g.gemvq(&s.down, p("shg"), c.n_ff_shexp, sq, p("shy"), ne, nt)?; }
                             Ok(())
                         })?;
@@ -3385,7 +3412,7 @@ impl<'a> GpuModel<'a> {
                     g.moe_down_combine(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, k, p("ge"), p("ye"), dq,
                                         fx, p("wh"), sh, sg, mb, w.layout.y, step, nt)?;
                     if !self.m.loras.is_empty() {
-                        let use_ge = matches!(md.ty, GgmlType::F32 | GgmlType::BF16);
+                        let use_ge = md.ty.float_x();
                         self.apply_lora_gpu_down(il, nt, k, c.n_ff_exp, c.n_embd, l.hc.is_some(), use_ge)?;
                     }
                     if l.hc.is_some() { g.hc_write(x, p("mo"), p("inj"), ne, c.hc_n, nt, true)?; }
@@ -3462,6 +3489,8 @@ impl<'a> GpuModel<'a> {
         if use_ge {
             let ge = self.gpu.get::<f32>(&self.bufs["ge"], 0, kt * ff)?;
             acts.copy_from_slice(&ge);
+            // The delta reads the plain SwiGLU output, "ge" holds the rotated one.
+            if let Some(r) = &self.m.cfg.hadamard { for a in acts.chunks_exact_mut(ff) { r.unrotate(a); } }
         } else {
             let quant_bytes = kt * ff;
             let quant_words = quant_bytes / 4;

@@ -1,0 +1,27 @@
+#version 460
+// Gyro files (config::Hadamard; CUDA hadamard): row gl_WorkGroupID.y of n floats at x (times silu(x) * u first when u
+// is not null) becomes H (s x) / sqrt(BS) per BS values, written to o, which may be x. s: the n signs of a row as
+// floats. One workgroup per block of BS values (specialization constant 1, a power of two).
+layout(constant_id = 1) const uint BS = 128;
+layout(local_size_x_id = 1) in;
+#include "common.glsl"
+layout(push_constant) uniform P { F32 x; F32 u; F32 s; F32 o; uint n; float scale; } p;
+shared float sh[2 * BS];
+
+void main() {
+    uint j = gl_LocalInvocationID.x, c = gl_WorkGroupID.x * BS + j, i = gl_WorkGroupID.y * p.n + c;
+    float v = p.x.v[i];
+    if (uint64_t(p.u) != 0) v = silu(v) * p.u.v[i];
+    v *= p.s.v[c];
+    // The fast Walsh-Hadamard transform in natural order; the two halves of sh alternate, so a step never reads
+    // what the same step writes.
+    uint b = 0;
+    for (uint len = 1; len < BS; len <<= 1) {
+        sh[b + j] = v;
+        barrier();
+        float w = sh[b + (j ^ len)];
+        v = (j & len) != 0 ? w - v : v + w;
+        b ^= BS;
+    }
+    p.o.v[i] = v * p.scale;
+}

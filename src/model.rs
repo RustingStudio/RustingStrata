@@ -801,9 +801,14 @@ impl<'a> Model<'a> {
     }
 
     fn ffn(&self, il: usize, gate: &Tensor, up: &Tensor, down: &Tensor, down_name: &str, expert: Option<usize>, h: &[f32]) -> Vec<f32> {
+        // A routed expert of a Gyro file reads rotated inputs (`config::Hadamard`); the LoRA delta reads the plain ones.
+        // The shared expert (also called with an expert index) reads plain inputs.
+        let rot = self.cfg.hadamard.as_ref().filter(|_| down_name == "ffn_down_exps.weight");
+        let hr = rot.map(|r| r.rotated(h));
+        let h = hr.as_deref().unwrap_or(h);
         let mut a = mv(gate, h);
         for (x, u) in a.iter_mut().zip(mv(up, h)) { *x = ops::silu(*x) * u; }
-        let mut y = mv(down, &a);
+        let mut y = match rot { Some(r) => mv(down, &r.rotated(&a)), None => mv(down, &a) };
         if down_name == "ffn_down_exps.weight" {
             self.lora_delta(&format!("blk.{il}.{down_name}"), &a, &mut y, expert);
         }

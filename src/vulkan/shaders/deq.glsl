@@ -378,9 +378,30 @@ void qw_sb(U8 w, uint b, uint sub, bool full, out uint lo, out uint hi, out floa
     qw(w, b, sub, lo, hi, d, m);
 }
 
+// Codebook points of trellis step t of the 4 K code bytes at o (quant::tq_points; K 8 for TQ2_T, 6 TQK6, 7 TQK7).
+void tq_points(U8 w, uint o, uint K, uint t, out uint pa, out uint pb) {
+    uint s;
+    if (K == 8) s = u8_(w, o + ((t + 31) & 31)) << 8 | u8_(w, o + t);
+    else {
+        uint off = (31 - t) * K, n = 4 * K, i = off >> 3;
+        s = (u8_(w, o + i) | u8_(w, o + (i + 1) % n) << 8 | u8_(w, o + (i + 2) % n) << 16) >> (off & 7);
+    }
+    uint x = (s & 0x7FFFu) * 0x9E3779B1u;
+    pa = x >> 21; pb = (x >> 10) & 2047u;
+}
+
 // Values [8 sub, 8 sub + 8) of the super-block at byte b (deq8<T> in kernels.cu; d * q - m is the same float).
 void deq8(U8 w, uint b, uint sub, out float o[8]) {
-    if (T == 0) {  // F32
+    if (T >= 144 && T <= 146) {  // TQ2_T, TQK6, TQK7: two blocks of f16 d and 32 steps of 4 values; floats only
+        uint K = T == 144 ? 8 : (T == 145 ? 6 : 7), bb = b + (sub >> 4) * (2 + 4 * K), t = (sub & 15) * 2;
+        float d = ldh(w, bb);
+        [[unroll]] for (uint i = 0; i < 2; i++) {
+            uint pa, pb;
+            tq_points(w, bb + 2, K, t + i, pa, pb);
+            o[4 * i] = tq_lut[2 * pa] * d; o[4 * i + 1] = tq_lut[2 * pa + 1] * d;
+            o[4 * i + 2] = tq_lut[2 * pb] * d; o[4 * i + 3] = tq_lut[2 * pb + 1] * d;
+        }
+    } else if (T == 0) {  // F32
         [[unroll]] for (uint i = 0; i < 8; i++) o[i] = F32(uint64_t(w)).v[b / 4 + 8 * sub + i];
     } else if (T == 30) {  // BF16
         uvec4 q = U32x4(uint64_t(w) + b + 16 * sub).v[0];  // rows of BF16 start 16-aligned (cols % 8 == 0)

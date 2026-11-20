@@ -47,6 +47,7 @@ const SPV: &[(&str, &[u8])] = &[
     ("gemmi_s_16", include_bytes!("spv/gemmi_s_16.spv")),
     ("gemv_f", include_bytes!("spv/gemv_f.spv")),
     ("gemv_q", include_bytes!("spv/gemv_q.spv")),
+    ("hadamard", include_bytes!("spv/hadamard.spv")),
     ("hc_mix", include_bytes!("spv/hc_mix.spv")),
     ("hc_silu", include_bytes!("spv/hc_silu.spv")),
     ("hc_write", include_bytes!("spv/hc_write.spv")),
@@ -91,6 +92,7 @@ layout(constant_id = 4) const uint TAB_HI = 0;
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Tab64 { uint64_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Tab32 { uint v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer TabI { int v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer TabF { float v[]; };
 #define TAB (uint64_t(TAB_LO) | uint64_t(TAB_HI) << 32)
 "));
     let mut add = |name: &str, ty: &str, v: Vec<u8>| { g += &format!("#define {name} {ty}(TAB + {}ul).v\n", b.len()); b.extend(v) };
@@ -104,6 +106,7 @@ layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Tab
     add("iq3s_grid", "Tab32", le32(&IQ3S_GRID));
     add("ksigns_iq2xs", "Tab32", le32(&KSIGNS_IQ2XS.map(u32::from)));
     add("kvalues_iq4nl", "TabI", KVALUES_IQ4NL.iter().flat_map(|&x| i32::from(x).to_le_bytes()).collect());
+    add("tq_lut", "TabF", crate::quant::TQ_LUT.iter().flatten().flat_map(|x| x.to_le_bytes()).collect());
     (b, g)
 }
 
@@ -929,7 +932,7 @@ impl Vk {
     /// Specialization constants of the weight kernels (deq.glsl): llama numerics, the ggml type id, the bytes per
     /// 256-element super-block and the IQ tables' address (low, high).
     fn wspec(&self, ty: GgmlType) -> [u32; 5] {
-        let id = (0..64).find(|&i| GgmlType::from_u32(i).is_ok_and(|t| t == ty)).unwrap();
+        let id = (0..256).find(|&i| GgmlType::from_u32(i).is_ok_and(|t| t == ty)).unwrap();
         let t = self.2.addr();
         [self.0.llama, id, (ty.block_bytes() * 256 / ty.block_elems()) as u32, t as u32, (t >> 32) as u32]
     }
@@ -1234,7 +1237,7 @@ impl Backend for Vk {
     fn gemvq(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
         ensure!((1..=crate::cpu_worker::TMAX).contains(&nt), "gemvn: {nt} inputs (1 to {})", crate::cpu_worker::TMAX);
         let (nc, spec) = (gemv_cols(self.0.llama, w.ty, w.cols)?, [&self.wspec(w.ty)[..], &[nt as u32]].concat());
-        if matches!(w.ty, GgmlType::F32 | GgmlType::BF16) {
+        if w.ty.float_x() {
             // Rows per workgroup as CUDA gemv_cfg: 8 for tall matrices, else 1 (hc_attn_up 10240 x 320).
             let wpb = if w.rows >= 4096 { 8 } else { 1 };
             let spec = [&spec[..], &[32 * wpb as u32]].concat();
@@ -1248,7 +1251,7 @@ impl Backend for Vk {
         self.run("gemv_q", &spec, [w.rows.div_ceil(8), 1, 1], &[&w.ptr, &xq, &y, &0u64, &0u64, &0u64, &(y_stride as u32), &(w.rows as u32), &0u32, &nc])
     }
     fn gemvq2(&self, a: &GpuTensor, b: &GpuTensor, x: u64, x_stride: usize, xq: u64, ya: u64, yb: u64, nt: usize) -> anyhow::Result<()> {
-        if a.ty != b.ty || a.cols != b.cols || matches!(a.ty, GgmlType::F32 | GgmlType::BF16) {
+        if a.ty != b.ty || a.cols != b.cols || a.ty.float_x() {
             self.gemvq(a, x, x_stride, xq, ya, a.rows, nt)?;
             return self.gemvq(b, x, x_stride, xq, yb, b.rows, nt);
         }
@@ -1267,7 +1270,7 @@ impl Backend for Vk {
         self.gemv_rows_n(w, x, w.cols, 0, ids, n_rows, y, 1)
     }
     fn gemv_rows_n(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, ids: u64, n_rows: usize, y: u64, nt: usize) -> anyhow::Result<()> {
-        ensure!(!matches!(w.ty, GgmlType::F32 | GgmlType::BF16), "gemv_rows: float weights unsupported");
+        ensure!(!w.ty.float_x(), "gemv_rows: float weights unsupported");
         ensure!((1..=crate::cpu_worker::TMAX).contains(&nt), "gemv_rows_n: {nt} inputs (1 to {})", crate::cpu_worker::TMAX);
         let (nc, spec) = (gemv_cols(self.0.llama, w.ty, w.cols)?, [&self.wspec(w.ty)[..], &[nt as u32]].concat());
         let xq = if xq != 0 { xq } else {
@@ -1321,6 +1324,12 @@ impl Backend for Vk {
     }
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()> { self.run("add", &[], [n.div_ceil(256), 1, 1], &[&x, &y, &(n as u32)]) }
     fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()> { self.run("swiglu", &[], [n.div_ceil(256), 1, 1], &[&g, &u, &(n as u32)]) }
+    fn hadamard(&self, x: u64, u: u64, s: u64, out: u64, n: usize, block: usize, rows: usize) -> anyhow::Result<()> {
+        // ponytail: a block is one workgroup, and 128 invocations is what every Vulkan device takes; a larger block
+        // needs maxComputeWorkGroupInvocations checked.
+        ensure!(block <= 128, "prism.hadamard.block_size {block}: at most 128 on Vulkan");
+        self.run("hadamard", &[self.0.llama, block as u32], [n / block, rows, 1], &[&x, &u, &s, &out, &(n as u32), &(1.0 / (block as f32).sqrt())])
+    }
     fn ssm_gates(&self, beta: u64, g: u64, dt_bias: u64, a: u64, n: usize, nv: usize) -> anyhow::Result<()> {
         self.run("ssm_gates", &[], [n.div_ceil(256), 1, 1], &[&beta, &g, &dt_bias, &a, &(n as u32), &(nv as u32)])
     }
@@ -1483,7 +1492,7 @@ impl Vk {
         ensure!(xg > 0 && k % xg == 0, "moe_gemv: {k} slots in groups of {xg}");
         let (nc, ws, ntok) = (gemv_cols(self.0.llama, ty, cols)?, self.wspec(ty), k / xg);
         let (w2, y2) = pair.unwrap_or((0, 0));
-        if matches!(ty, GgmlType::F32 | GgmlType::BF16) {
+        if ty.float_x() {
             let z = if pair.is_some() { 2 } else { 1 };
             return self.run("moe_gemv_f", &ws, [rows, k, z], &[&w, &ids, &x, &y, &(stride as u64), &(w2 as u64), &(y2 as u64),
                 &(x_stride as u32), &(rows as u32), &nc, &(xg as u32)]);

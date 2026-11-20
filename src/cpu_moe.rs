@@ -1284,6 +1284,28 @@ mod avx512 {
     }
 }
 
+/// A trellis row (blocks of B bytes for 128 values, `quant::tq_points`) times x, in f32: the codebook is not on an
+/// int8 grid, so these types have no Q8_K kernel. Eight partial sums per block, where `Tensor::matvec` adds in order.
+fn dot_tq<const B: usize>(row: &[u8], x: &[f32]) -> f32 {
+    use crate::quant::{TQ_LUT as L, tq_points};
+    let mut sum = 0f32;
+    for (b, xb) in row.chunks_exact(B).zip(x.chunks_exact(128)) {
+        let (qs, mut acc) = (&b[2..B], [0f32; 8]);
+        for (t, xs) in xb.chunks_exact(8).enumerate() {
+            let ((p0, p1), (p2, p3)) = (tq_points(qs, 2 * t), tq_points(qs, 2 * t + 1));
+            let w = [L[p0][0], L[p0][1], L[p1][0], L[p1][1], L[p2][0], L[p2][1], L[p3][0], L[p3][1]];
+            for i in 0..8 { acc[i] += w[i] * xs[i]; }
+        }
+        sum += d16(b) * acc.iter().sum::<f32>();
+    }
+    sum
+}
+
+/// The f32 kernel of a type that has no integer one but is too slow through `Tensor::row`.
+pub fn float_dot(ty: GgmlType) -> Option<fn(&[u8], &[f32]) -> f32> {
+    match ty { GgmlType::TQ2T => Some(dot_tq::<34>), GgmlType::TQK6 => Some(dot_tq::<26>), GgmlType::TQK7 => Some(dot_tq::<30>), _ => None }
+}
+
 pub fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vnni", target_feature = "avx512vbmi"))]
     // Opt-in: these kernels add the block sums in a different order than the AVX2 ones, so their results differ in the
@@ -1315,9 +1337,14 @@ pub fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
 
 /// y = t · x for every row, using the integer kernel when the type has one.
 pub fn matvec(t: &Tensor, x: &[f32], y: &mut [f32]) {
+    let rb = t.data.len() / t.rows;
+    if let Some(dot) = float_dot(t.ty) {
+        return y.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
+            for (k, v) in ys.iter_mut().enumerate() { let r = c * 32 + k; *v = dot(&t.data[r * rb..(r + 1) * rb], x); }
+        });
+    }
     let Some(dot) = int_dot(t.ty) else { return t.matvec(x, y) };
     let xq = quantize_q8k(x);
-    let rb = t.data.len() / t.rows;
     y.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
         for (k, v) in ys.iter_mut().enumerate() {
             let r = c * 32 + k;
@@ -1330,7 +1357,7 @@ pub fn matvec(t: &Tensor, x: &[f32], y: &mut [f32]) {
 /// matrix j uses xs[j * xs.len() / mats.len()] (one x for all, or one each), so a shared x is quantized once.
 fn batch_rows(mats: &[Tensor], xs: &[&[f32]], out: &mut [f32]) {
     let rows = out.len() / mats.len();
-    let dot = int_dot(mats[0].ty);
+    let (dot, fdot) = (int_dot(mats[0].ty), float_dot(mats[0].ty));
     let xq: Vec<Vec<Q8K>> = if dot.is_some() { xs.iter().map(|x| quantize_q8k(x)).collect() } else { vec![] };
     // Q2_0 experts benefit from fewer Rayon tasks on AVX2. Keep enough chunks to occupy the pool,
     // including when only one expert misses; other formats keep their existing granularity.
@@ -1341,9 +1368,10 @@ fn batch_rows(mats: &[Tensor], xs: &[&[f32]], out: &mut [f32]) {
             let i = c * batch + k;
             let (t, r, x) = (&mats[i / rows], i % rows, i / rows * xs.len() / mats.len());
             let rb = t.data.len() / t.rows;
-            *v = match dot {
-                Some(d) => d(&t.data[r * rb..(r + 1) * rb], &xq[x]),
-                None => { t.row(r, buf); buf.iter().zip(xs[x]).map(|(a, b)| a * b).sum() }
+            *v = match (dot, fdot) {
+                (Some(d), _) => d(&t.data[r * rb..(r + 1) * rb], &xq[x]),
+                (_, Some(d)) => d(&t.data[r * rb..(r + 1) * rb], xs[x]),
+                _ => { t.row(r, buf); buf.iter().zip(xs[x]).map(|(a, b)| a * b).sum() }
             };
         }
     });
@@ -1360,15 +1388,20 @@ pub fn experts(m: &Model, il: usize, h: &[f32], sel: &[(usize, f32)]) -> Vec<f32
     // Gate and up of every expert in one parallel pass (gate and up share a type in all supported files).
     let gu: Vec<Tensor> = sel.iter().flat_map(|&(e, _)| [gate.expert(e, n), up.expert(e, n)]).collect();
     let mut a = vec![0f32; 2 * k * ff];
+    // Gyro files: the routed experts read rotated inputs (`config::Hadamard`); the LoRA delta below reads `acts`.
+    let rot = c.hadamard.as_ref();
+    let hr = rot.map(|r| r.rotated(h));
+    let h = hr.as_deref().unwrap_or(h);
     if gate.ty == up.ty {
         batch_rows(&gu, &[h], &mut a);
     } else {
         for (i, t) in gu.iter().enumerate() { matvec(t, h, &mut a[i * ff..(i + 1) * ff]); }
     }
     let acts: Vec<Vec<f32>> = a.chunks_exact(2 * ff).map(|g| (0..ff).map(|i| ops::silu(g[i]) * g[ff + i]).collect()).collect();
+    let racts: Option<Vec<Vec<f32>>> = rot.map(|r| acts.iter().map(|a| r.rotated(a)).collect());
     let ds: Vec<Tensor> = sel.iter().map(|&(e, _)| down.expert(e, n)).collect();
     let mut o = vec![0f32; k * c.n_embd];
-    batch_rows(&ds, &acts.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), &mut o);
+    batch_rows(&ds, &racts.as_ref().unwrap_or(&acts).iter().map(|v| v.as_slice()).collect::<Vec<_>>(), &mut o);
     for (j, &(e, _)) in sel.iter().enumerate() {
         m.lora_delta(&format!("blk.{il}.ffn_down_exps.weight"), &acts[j], &mut o[j * c.n_embd..(j + 1) * c.n_embd], Some(e));
     }
@@ -1391,6 +1424,10 @@ pub fn experts_multi(m: &Model, il: usize, hs: &[Vec<f32>], sels: &[Vec<(usize, 
     let (gate, up, down) = (t("ffn_gate_exps.weight"), t("ffn_up_exps.weight"), t("ffn_down_exps.weight"));
     let (n, ff, k) = (c.n_expert, c.n_ff_exp, pairs.len());
     let gu: Vec<Tensor> = pairs.iter().flat_map(|&(_, e, _)| [gate.expert(e, n), up.expert(e, n)]).collect();
+    // Gyro files: the routed experts read rotated inputs (`config::Hadamard`); the LoRA delta below reads `acts`.
+    let rot = c.hadamard.as_ref();
+    let hr: Option<Vec<Vec<f32>>> = rot.map(|r| hs.iter().map(|h| r.rotated(h)).collect());
+    let hs = hr.as_deref().unwrap_or(hs);
     let xs: Vec<&[f32]> = pairs.iter().map(|&(t, ..)| hs[t].as_slice()).collect();
     let mut a = vec![0f32; 2 * k * ff];
     if gate.ty == up.ty {
@@ -1399,9 +1436,10 @@ pub fn experts_multi(m: &Model, il: usize, hs: &[Vec<f32>], sels: &[Vec<(usize, 
         for (i, t) in gu.iter().enumerate() { matvec(t, xs[i / 2], &mut a[i * ff..(i + 1) * ff]); }
     }
     let acts: Vec<Vec<f32>> = a.chunks_exact(2 * ff).map(|g| (0..ff).map(|i| ops::silu(g[i]) * g[ff + i]).collect()).collect();
+    let racts: Option<Vec<Vec<f32>>> = rot.map(|r| acts.iter().map(|a| r.rotated(a)).collect());
     let ds: Vec<Tensor> = pairs.iter().map(|&(_, e, _)| down.expert(e, n)).collect();
     let mut o = vec![0f32; k * c.n_embd];
-    batch_rows(&ds, &acts.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), &mut o);
+    batch_rows(&ds, &racts.as_ref().unwrap_or(&acts).iter().map(|v| v.as_slice()).collect::<Vec<_>>(), &mut o);
     for (j, (oj, &(t, e, w))) in o.chunks_exact_mut(c.n_embd).zip(&pairs).enumerate() {
         m.lora_delta(&format!("blk.{il}.ffn_down_exps.weight"), &acts[j], oj, Some(e));
         for (yy, oo) in ys[t].iter_mut().zip(oj.iter()) { *yy += w * oo; }
@@ -1447,6 +1485,23 @@ mod tests {
                     assert_eq!(got[i * rows + r], want, "{} matrix {i} row {r}", ty.name());
                 }
             }
+        }
+    }
+
+    /// The trellis kernels equal the f32 dequantized dot on random blocks.
+    #[test]
+    fn tq_dots_match_dequant() {
+        let mut r = 0x9E3779B97F4A7C15u64;
+        let mut rnd = || { r ^= r << 13; r ^= r >> 7; r ^= r << 17; r as u8 };
+        let x: Vec<f32> = (0..640).map(|i| ((i as f32 * 0.7548777).fract() - 0.5) * 2.0).collect();
+        for ty in [GgmlType::TQ2T, GgmlType::TQK6, GgmlType::TQK7] {
+            let mut row: Vec<u8> = (0..5 * ty.block_bytes()).map(|_| rnd()).collect();
+            for b in row.chunks_exact_mut(ty.block_bytes()) { b[..2].copy_from_slice(&f16::from_f32(0.01).to_le_bytes()); }
+            let mut w = vec![0f32; 640];
+            crate::quant::dequant_row(ty, &row, &mut w);
+            let want: f64 = w.iter().zip(&x).map(|(&a, &b)| a as f64 * b as f64).sum();
+            let got = float_dot(ty).unwrap()(&row, &x);
+            assert!(((got as f64 - want) / want.abs().max(1e-3)).abs() < 1e-5, "{}: {got} vs {want}", ty.name());
         }
     }
 

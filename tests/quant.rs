@@ -25,6 +25,17 @@ fn check(name: &str, ty: GgmlType) {
 #[test] fn tq1_0() { check("TQ1_0", GgmlType::TQ1_0) }
 #[test] fn tq2_0() { check("TQ2_0", GgmlType::TQ2_0) }
 #[test] fn rejects_unknown() { assert!(GgmlType::from_u32(24).is_err()); } // I8 is not supported
+#[test]
+fn names_the_gyro_l_types() {
+    // The pair trellis of Gyro-L is not ported: the error must name the type, not read as "unknown" (issue #30).
+    let e = GgmlType::from_u32(148).unwrap_err().to_string();
+    assert!(e.contains("TQP6") && e.contains("Gyro-L"), "{e}");
+    assert!(GgmlType::from_u32(150).unwrap_err().to_string().contains("unknown"));
+}
+// Random blocks decoded by the reference C++ decoder (tools/gen_tq_fixtures.cpp).
+#[test] fn tq2_t() { check("TQ2_T", GgmlType::TQ2T) }
+#[test] fn tqk6() { check("TQK6", GgmlType::TQK6) }
+#[test] fn tqk7() { check("TQK7", GgmlType::TQK7) }
 
 /// One Q4_0 block (value = (q - 8) d) and one Q5_0 block (32 high bits after d; value = (q - 16) d): element j is
 /// the low nibble of byte j, j + 16 the high nibble. Converted to Q8_0 they give the same values.

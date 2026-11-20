@@ -86,6 +86,113 @@ fn arch(name: &str) -> Option<Arch> {
     })
 }
 
+/// `prism.hadamard.*` of agentionai's Gyro files. Every routed expert matrix is stored as `W diag(s) H^T` over blocks
+/// of `block` input columns (H the normalized Sylvester-Walsh-Hadamard matrix, s a vector of +1 and -1), so its input
+/// x has to become `H (s x)` first: the layer input before gate and up, the SwiGLU output before down. The router and
+/// the shared expert see the unrotated values.
+#[derive(Clone)]
+pub struct Hadamard { pub block: usize, signs: Vec<Vec<f32>> }
+
+impl std::fmt::Debug for Hadamard {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Hadamard {{ block: {}, widths: {:?} }}", self.block, self.signs.iter().map(|s| s.len()).collect::<Vec<_>>())
+    }
+}
+
+impl Hadamard {
+    fn from_gguf(g: &Gguf) -> anyhow::Result<Option<Hadamard>> {
+        use crate::gguf::Value;
+        let key = |k: &str| g.meta.get(&format!("prism.hadamard.{k}"));
+        let Some(version) = key("version") else { return Ok(None) };
+        let text = |k: &str| key(k).and_then(|v| v.as_str()).unwrap_or("");
+        let arr = |k: &str| key(k).and_then(|v| v.as_arr()).unwrap_or(&[]);
+        let block = key("block_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        anyhow::ensure!(version.as_u64() == Some(1) && text("transform") == "normalized-sylvester-walsh-hadamard" && text("axis") == "input-last-dimension"
+            && block > 1 && block.is_power_of_two() && arr("inverse_weight_names").is_empty(),
+            "unsupported prism.hadamard metadata (version {version:?}, transform {:?}, axis {:?}, block_size {block})", text("transform"), text("axis"));
+        // ponytail: all routed experts rotated or none (true for the Gyro files); a table per layer if a file ever
+        // rotates only some of them.
+        let mut named: Vec<&str> = arr("weight_names").iter().filter_map(|v| v.as_str()).collect();
+        let mut routed: Vec<&str> = g.tensors.keys().map(|n| n.as_str())
+            .filter(|n| n.starts_with("blk.") && ["gate", "up", "down"].iter().any(|r| n.ends_with(&format!(".ffn_{r}_exps.weight")))).collect();
+        named.sort_unstable();
+        routed.sort_unstable();
+        anyhow::ensure!(named == routed, "prism.hadamard.weight_names lists {} tensors, the file has {} routed expert tensors: only files with every routed expert rotated are supported", named.len(), routed.len());
+        let mut widths: Vec<usize> = routed.iter().map(|n| g.tensors[*n].dims[0] as usize).collect();
+        widths.sort_unstable();
+        widths.dedup();
+        anyhow::ensure!(widths.iter().all(|w| w % block == 0), "prism.hadamard.block_size {block} does not divide the expert widths {widths:?}");
+        let signs = match text("sign_mode") {
+            "identity" => widths.iter().map(|&w| vec![1f32; w]).collect(),
+            "explicit" => {
+                let sw: Vec<usize> = arr("sign_widths").iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect();
+                let sv: Vec<f32> = arr("sign_values").iter().map(|v| match *v {
+                    Value::I8(v) => v as f32, Value::I16(v) => v as f32, Value::I32(v) => v as f32, Value::I64(v) => v as f32,
+                    _ => v.as_f32().unwrap_or(0.0),
+                }).collect();
+                anyhow::ensure!(sw.iter().sum::<usize>() == sv.len() && sv.iter().all(|v| v.abs() == 1.0), "prism.hadamard sign_widths / sign_values are inconsistent");
+                let mut at = 0;
+                let all: Vec<Vec<f32>> = sw.iter().map(|&w| { at += w; sv[at - w..at].to_vec() }).collect();
+                anyhow::ensure!(widths.iter().all(|w| all.iter().any(|s| s.len() == *w)), "prism.hadamard has no sign vector for one of the widths {widths:?}");
+                all
+            }
+            mode => bail!("unsupported prism.hadamard.sign_mode {mode:?}"),
+        };
+        Ok(Some(Hadamard { block, signs }))
+    }
+
+    /// The signs for an input of `n` values.
+    pub fn signs(&self, n: usize) -> &[f32] {
+        self.signs.iter().find(|s| s.len() == n).unwrap_or_else(|| panic!("no prism.hadamard signs for width {n}"))
+    }
+
+    /// `x` becomes `H (s x)`, block by block.
+    pub fn rotate(&self, x: &mut [f32]) {
+        let signs = self.signs(x.len());
+        for (v, s) in x.iter_mut().zip(signs) { *v *= s; }
+        Self::fwht(x, self.block);
+    }
+
+    /// `x` becomes `H x` per `block` values: the fast Walsh-Hadamard transform in natural (Sylvester) order, where
+    /// entry (r, c) of H is (-1)^popcount(r & c) / sqrt(block).
+    fn fwht(x: &mut [f32], block: usize) {
+        let scale = 1.0 / (block as f32).sqrt();
+        for v in x.chunks_exact_mut(block) {
+            let mut len = 1;
+            while len < block {
+                for i in (0..block).step_by(2 * len) {
+                    for j in i..i + len { let (a, c) = (v[j], v[j + len]); v[j] = a + c; v[j + len] = a - c; }
+                }
+                len *= 2;
+            }
+            for a in v { *a *= scale; }
+        }
+    }
+
+    pub fn rotated(&self, x: &[f32]) -> Vec<f32> { let mut y = x.to_vec(); self.rotate(&mut y); y }
+
+    /// The inverse of `rotate`: H is its own inverse, so `x` becomes `s (H x)`.
+    pub fn unrotate(&self, x: &mut [f32]) {
+        let signs = self.signs(x.len());
+        Self::fwht(x, self.block);
+        for (v, s) in x.iter_mut().zip(signs) { *v *= s; }
+    }
+}
+
+#[test]
+fn hadamard_rotation_is_the_matrix_product() {
+    let h = Hadamard { block: 8, signs: vec![(0..16).map(|i| if i % 3 == 0 { -1.0 } else { 1.0 }).collect()] };
+    let x: Vec<f32> = (0..16).map(|i| (i * i) as f32 - 20.0).collect();
+    let y = h.rotated(&x);
+    for r in 0..16 {
+        let want: f32 = (0..8).map(|c| { let i: usize = r / 8 * 8 + c; (if (r % 8 & c as usize).count_ones() % 2 == 1 { -1.0 } else { 1.0 }) * h.signs(16)[i] * x[i] }).sum::<f32>() / 8f32.sqrt();
+        assert!((y[r] - want).abs() < 1e-4, "{r}: {} vs {want}", y[r]);
+    }
+    let mut back = y;
+    h.unrotate(&mut back);
+    assert!(back.iter().zip(&x).all(|(a, b)| (a - b).abs() < 1e-4), "unrotate: {back:?} vs {x:?}");
+}
+
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
     pub arch: String,
@@ -113,6 +220,8 @@ pub struct ModelConfig {
     pub expert_weights_scale: f32,
     /// Router activation is sigmoid (Flint) instead of softmax.
     pub router_sigmoid: bool,
+    /// The rotation of the routed experts' inputs (Gyro files), if the file asks for one.
+    pub hadamard: Option<Hadamard>,
     /// Sliding-window width for the layers flagged in `swa` (0 = all layers are dense).
     pub n_swa: usize,
     /// Per-layer sliding-window attention (Flint). Empty for architectures without it.
@@ -268,6 +377,7 @@ impl ModelConfig {
             n_dense,
             expert_weights_scale: f("expert_weights_scale").unwrap_or(0.0),
             router_sigmoid: arch == "flint" && opt("expert_gating_func") == 2,
+            hadamard: Hadamard::from_gguf(g)?,
             n_swa,
             swa,
             rope_layer,

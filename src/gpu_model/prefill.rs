@@ -13,7 +13,7 @@ const STAGE: usize = 16;
 
 /// Float offsets into the scratch slab (each region holds `chunk` rows). Mixer and FFN regions alias, and so do the
 /// hyper-connection read and PLE temporaries (`xn` .. `pv`), which run outside both.
-struct Lay { h: usize, a: usize, b: usize, c: usize, d: usize, e: usize, rl: usize, wts: usize, ge: usize, ye: usize, shg: usize, shy: usize, sg: usize,
+struct Lay { h: usize, a: usize, b: usize, c: usize, d: usize, e: usize, rl: usize, wts: usize, ge: usize, ye: usize, shg: usize, shy: usize, sg: usize, hr: usize,
              xn: usize, lo: usize, hg: usize, pk: usize, pq: usize, pg: usize, pn: usize, pv: usize, inj: usize, mix: usize, mo: usize, emb: usize }
 
 pub(super) struct Scratch {
@@ -58,6 +58,7 @@ impl Scratch {
         let mut take = |n: usize| { let o = at; at += n * chunk; o };
         let (rl, wts, ge) = (take(c.n_expert), take(k), take((k * c.n_ff_exp).max(c.n_ff)));
         let (ye, shg, shy, sg) = (take(k * ne), take(c.n_ff_shexp), take(ne), take(1));
+        let hr = take(if c.hadamard.is_some() { ne } else { 0 });  // Gyro files: the rotated h
         let mut total = at.max(mix_end);
         let (mut xn, mut lo, mut hg, mut pk, mut pq, mut pg, mut pn, mut pv, mut inj, mut mix, mut mo, mut emb) = Default::default();
         if c.hc_n > 0 {
@@ -80,7 +81,7 @@ impl Scratch {
         }
         let n_tiles = 3 * (chunk * k / GEMM_BM + 2 * c.n_expert);
         Ok(Scratch {
-            chunk, lay: Lay { h, a, b, c: c2, d, e, rl, wts, ge, ye, shg, shy, sg, xn, lo, hg, pk, pq, pg, pn, pv, inj, mix, mo, emb },
+            chunk, lay: Lay { h, a, b, c: c2, d, e, rl, wts, ge, ye, shg, shy, sg, hr, xn, lo, hg, pk, pq, pg, pn, pv, inj, mix, mo, emb },
             slab: gpu.zeros::<f32>(total)?,
             feat: if c.eagle3.is_some() { Some(gpu.zeros::<f32>(3 * ne * chunk)?) } else { None },
             dflash_feat: c.dflash.as_ref().map(|dc| gpu.zeros::<f32>(dc.target_layer_ids.len() * ne * chunk)).transpose()?,
@@ -642,6 +643,12 @@ impl GpuModel<'_> {
                     let tp = |s: usize| pf.tiles.addr() + 16 * s as u64;
                     let xrow_d = pf.ints.addr() + 4 * (n * k) as u64;
                     let [mg, mu, md] = lx.mats;
+                    // Gyro files: the routed experts read the rotated h and the rotated SwiGLU output (`config::Hadamard`).
+                    let rot = self.hada.as_ref().zip(c.hadamard.as_ref());
+                    let (hx, same) = match rot {
+                        Some((s, r)) => { g.hadamard(h, 0, s[0].addr(), at(l.hr), ne, r.block, t)?; (at(l.hr), 0) }
+                        None => (h, SAME_X),
+                    };
                     let copy = |j: usize| -> anyhow::Result<()> {
                         let grp = &staged[j];
                         for (name, mat) in MATS.iter().zip(&lx.mats) {
@@ -660,10 +667,12 @@ impl GpuModel<'_> {
                     for ((_, cp), (gu, downs)) in steps.iter().zip(&spans) {
                         g.beside(&mut || {
                             if gu[0].1 > 0 {
-                                g.gemm(mg.ty, mg.rows, mg.cols, tp(gu[0].0), gu[0].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, SAME_X)?;
-                                g.gemm(mu.ty, mu.rows, mu.cols, tp(gu[1].0), gu[1].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X)?;
+                                g.gemm(mg.ty, mg.rows, mg.cols, tp(gu[0].0), gu[0].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, same)?;
+                                g.gemm(mu.ty, mu.rows, mu.cols, tp(gu[1].0), gu[1].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X)?;
                             }
                             for &((s0, n0), lo, hi) in downs {
+                                let ge = at(l.ge) + (4 * lo * c.n_ff_exp) as u64;
+                                if let Some((s, r)) = rot { g.hadamard(ge, 0, s[1].addr(), ge, c.n_ff_exp, r.block, hi - lo)?; }
                                 g.gemm(md.ty, md.rows, md.cols, tp(s0), n0, at(l.ge) + (4 * lo * c.n_ff_exp) as u64, c.n_ff_exp, hi - lo, 0, at(l.ye) + (4 * lo * ne) as u64, ne, 0)?;
                             }
                             if let Some(j) = *cp { copy(j)?; }

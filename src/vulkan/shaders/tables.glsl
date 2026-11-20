@@ -4,6 +4,7 @@ layout(constant_id = 4) const uint TAB_HI = 0;
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Tab64 { uint64_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Tab32 { uint v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer TabI { int v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer TabF { float v[]; };
 #define TAB (uint64_t(TAB_LO) | uint64_t(TAB_HI) << 32)
 #define iq2xs_grid Tab64(TAB + 0ul).v
 #define iq2xxs_grid Tab64(TAB + 4096ul).v
@@ -13,3 +14,4 @@ layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Tab
 #define iq3s_grid Tab32(TAB + 31744ul).v
 #define ksigns_iq2xs Tab32(TAB + 33792ul).v
 #define kvalues_iq4nl TabI(TAB + 34304ul).v
+#define tq_lut TabF(TAB + 34368ul).v

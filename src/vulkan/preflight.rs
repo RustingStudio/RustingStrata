@@ -41,7 +41,7 @@ impl Vk {
             let mut st = self.0.st();
             for &ty in types {
                 let ws = self.wspec(ty);
-                if !matches!(ty, GgmlType::F32 | GgmlType::BF16) {
+                if !ty.float_x() {
                     for nt in [1u32, 3, 5, 9, 17] {
                         let _ = self.0.pipeline(&mut st, "gemv_q", &[&ws[..], &[nt]].concat());
                     }
@@ -86,7 +86,7 @@ impl Vk {
         let mut pairs: Vec<(&'static str, Vec<u32>)> = Vec::new();
         for &ty in types {
             let ws = self.wspec(ty).to_vec();
-            let float = matches!(ty, GgmlType::F32 | GgmlType::BF16);
+            let float = ty.float_x();
             let mut push = |name: &'static str, spec: Vec<u32>| pairs.push((name, spec));
             // gemm_raw: `f = !mmq(ty) || cols % 128 != 0`; the float kernel takes every type, the int8 one the rest.
             if float || !crate::cuda::Gpu::mmq(ty) {

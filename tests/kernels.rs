@@ -10,7 +10,7 @@ fn xs(n: usize) -> Vec<f32> {
 
 /// x as the integer GEMV path sees it: int8 per 32 elements with scale max|x| / 127 (float weight types read x as is).
 fn as_seen(ty: GgmlType, x: &[f32]) -> Vec<f32> {
-    if matches!(ty, GgmlType::F32 | GgmlType::BF16) { return x.to_vec(); }
+    if ty.float_x() { return x.to_vec(); }
     x.chunks(32).flat_map(|b| {
         let mx = b.iter().fold(0f32, |m, v| m.max(v.abs()));
         let id = if mx > 0.0 { 127.0 / mx } else { 0.0 };
@@ -958,6 +958,32 @@ fn moe_combine_seq_matches_cpu() {
     }
 }
 
+/// `hadamard` (Gyro files) against the matrix product: out = H (s x) / sqrt(block) per block, H[j][k] = +1 or -1 by
+/// the parity of the bits of j & k. Two rows; out of place from x, then in place from silu(x) * u.
+#[test]
+fn hadamard_matches_matrix_product() {
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        let (n, block, rows) = (640, 128, 2);
+        let (x, u) = (xs(rows * n).iter().map(|v| v * 4.0).collect::<Vec<f32>>(), xs(rows * n + 1)[1..].to_vec());
+        let s: Vec<f32> = (0..n).map(|i| if i * 7 % 5 < 2 { -1.0 } else { 1.0 }).collect();
+        let want = |v: &[f32]| -> Vec<f32> { (0..rows * n).map(|i| {
+            let (b, j) = (i - i % block, i % block);
+            (0..block).map(|k| if (j & k).count_ones() % 2 == 1 { -1.0 } else { 1.0 } * s[(b + k) % n] * v[b + k]).sum::<f32>() / (block as f32).sqrt()
+        }).collect() };
+        let (dx, du, ds, dout) = (up(gpu, &x), up(gpu, &u), up(gpu, &s), gpu.zeros::<f32>(rows * n).unwrap());
+        gpu.hadamard(dx.addr(), 0, ds.addr(), dout.addr(), n, block, rows).unwrap();
+        let e = rel_l2(&down::<f32>(gpu, &dout), &want(&x));
+        eprintln!("hadamard {bk}: rel err {e:.2e}");
+        assert!(e < 1e-6, "{bk}: {e}");
+        gpu.hadamard(dx.addr(), du.addr(), ds.addr(), dx.addr(), n, block, rows).unwrap();
+        let act: Vec<f32> = x.iter().zip(&u).map(|(g, u)| g / (1.0 + (-g).exp()) * u).collect();
+        let e = rel_l2(&down::<f32>(gpu, &dx), &want(&act));
+        eprintln!("hadamard in place with swiglu {bk}: rel err {e:.2e}");
+        assert!(e < 1e-6, "{bk}: {e}");
+    }
+}
+
 #[test]
 fn elementwise_ops_match_cpu() {
     // Measurement only (M2-T7): relative error against the CPU reference and differing bits from the
@@ -1440,6 +1466,9 @@ fn attn_decode_bandwidth() {
 /// | Q2_0 | 18 | `d` f16 @0 |
 /// | TQ1_0 | 54 | `d` f16 @52 |
 /// | TQ2_0 | 66 | `d` f16 @64 |
+/// | TQ2_T | 34 | `d` f16 @0 |
+/// | TQK6 | 26 | `d` f16 @0 |
+/// | TQK7 | 30 | `d` f16 @0 |
 /// | Q4_0 | 18 | `d` f16 @0 |
 /// | Q5_0 | 22 | `d` f16 @0 |
 /// | Q8_0 | 34 | `d` f16 @0 |
@@ -1522,14 +1551,14 @@ fn random_tensor_scales_are_finite() {
 
 /// Every supported `GgmlType`, in the order `from_u32` accepts them.
 fn all_types() -> Vec<GgmlType> {
-    (0..64).filter_map(|i| GgmlType::from_u32(i).ok()).collect()
+    (0..150).filter_map(|i| GgmlType::from_u32(i).ok()).collect()
 }
 
 #[test]
 fn gemv_partial_superblocks_and_q2_0() {
     for (bk, gpu) in common::backends_except(&[]) {
         let gpu = &*gpu;
-        for ty in [GgmlType::Q2_0, GgmlType::TQ1_0, GgmlType::TQ2_0, GgmlType::Q8_0, GgmlType::IQ4NL, GgmlType::Q4_0, GgmlType::Q5_0, GgmlType::Q4_1, GgmlType::Q5_1, GgmlType::BF16, GgmlType::F32] {
+        for ty in [GgmlType::Q2_0, GgmlType::TQ1_0, GgmlType::TQ2_0, GgmlType::TQ2T, GgmlType::TQK6, GgmlType::TQK7, GgmlType::Q8_0, GgmlType::IQ4NL, GgmlType::Q4_0, GgmlType::Q5_0, GgmlType::Q4_1, GgmlType::Q5_1, GgmlType::BF16, GgmlType::F32] {
             for cols in [640, 320, 2560] {
                 if cols % ty.block_elems() != 0 { continue; }
                 let (rows, nt, ne) = (40, 3, 4);  // ne experts of `rows` rows for moe_gemv
@@ -1619,7 +1648,7 @@ fn vulkan_type_matrix() {
     let gpu: &dyn Backend = &g;
     let not_impl = |e: &anyhow::Error| format!("{e:#}").contains("not implemented");
     let types = all_types();
-    assert_eq!(types.len(), 25, "GgmlType variants");
+    assert_eq!(types.len(), 28, "GgmlType variants");
     let (rows, ne, cols, nt) = (40, 4, 256, 3);
     let mut failures = 0;
     for ty in types {
@@ -1640,7 +1669,7 @@ fn vulkan_type_matrix() {
             ("pass", "pass", "pass", "pass", "pass", "pass", "pass");
         let mut note = if matches!(ty, GgmlType::Q4_0 | GgmlType::Q5_0) { "native bytes; loader uploads Q8_0".to_string() } else { String::new() };
         // The f16 GEMM path converts its operands with packFloat2x16; on this Volta driver OpFConvert truncates.
-        if matches!(ty, GgmlType::F32 | GgmlType::BF16 | GgmlType::IQ2XS | GgmlType::IQ2S) {
+        if ty.float_x() || matches!(ty, GgmlType::IQ2XS | GgmlType::IQ2S) {
             note = format!("{note}{}f16 GEMM inputs truncate (Volta OpFConvert); reference matches", if note.is_empty() { "" } else { "; " });
         }
         let data = random_tensor(ty, ne * rows, cols, cols as u32 + ty as u32);

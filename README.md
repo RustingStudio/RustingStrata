@@ -76,7 +76,13 @@ Other models, greedy "The capital of France is" with `--gpu` (CUDA / Vulkan, sec
 | Qwen3.8-Flash-Next GSQ-RCO IQ2_XS (64 GB in two files, pass the `-00001-of-00002` one; 18% of experts fit in VRAM, and with 32 GB RAM the rest are partly read from disk) | Q2_0, IQ1_M to IQ4_XS, Q6_K, Q8_0, F16, BF16 | 22 / 20 tok/s |
 
 Supported GGUF types: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_0, TQ1_0, TQ2_0, Q2_K-Q6_K, IQ1_S, IQ1_M,
-IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL.
+IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, and the trellis types TQ2_T, TQK6 and TQK7 of agentionai's
+llama.cpp fork.
+
+The Gyro files of agentionai load too. Their names say TQ1_0 and TQ2_0, but the experts are stored in the trellis
+types and read inputs rotated by a Hadamard transform (`prism.hadamard.*`). `Gyro-S-TQ1_0` (TQK6, TQK7) is tested on
+CPU, CUDA and Vulkan. `Gyro-M-TQ2_0` (TQ2_T) has the same layout and only supported types, but was not run here.
+Gyro-L (TQP5 to TQP7, PTQ1_0) is not supported yet.
 
 ## Build
 
