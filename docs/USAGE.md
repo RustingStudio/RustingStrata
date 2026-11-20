@@ -167,10 +167,18 @@ OpenCode and other agents use the OpenAI address.
 cards run one after the other, so one request gets more memory, not twice the speed of one card. MTP drafting is off on
 a split model.
 
-`--split 30,70` sets the share of the layers per card by hand, in `--device` order (`STRATA_SPLIT=30,70` for
-`calibrate`). A card with fewer layers keeps more of their experts in VRAM, so fewer are uploaded to it during prefill:
-that is the setting to try for a card on a slow PCIe link (x1 riser, x4 slot). The load prints each card's layers and
-its measured host-to-VRAM copy rate. AMD cards clock down in the gaps while the other card works; `echo high >
+The split by free VRAM does not know which card is faster or which sits on a slow PCIe link (x1 riser, x4 slot).
+`rustingstrata calibrate --model M.gguf --device 0,1` measures it: it times prefill and decode with the split by free
+VRAM, then with layers moved from one card to the other in steps of 15% of the layers, and follows the faster
+direction for up to three rounds. A split that is more than 3% faster (prefill tok/s times decode tok/s) is written to
+the calibration file as layers per card, and later runs with the same cards in the same `--device` order load with it.
+A card with fewer layers keeps more of their experts in VRAM, so fewer are uploaded to it during prefill, and the other
+card then keeps fewer of its own: the timings decide. The order of the cards is not searched: to compare, calibrate
+`--device 1,0` too and calibrate the faster order last (the file holds the last calibration).
+
+`--split 30,70` (or `STRATA_SPLIT=30,70`) sets the share of the layers per card by hand, in `--device` order, and
+takes precedence over the calibrated split; `calibrate --split 30,70` measures chunk and drafts with that split and
+stores it. The load prints each card's layers and its measured host-to-VRAM copy rate. AMD cards clock down in the gaps while the other card works; `echo high >
 /sys/class/drm/cardN/device/power_dpm_force_performance_level` (as root, per card) took a two-card split from 44 to 57
 tok/s in one report.
 

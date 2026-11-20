@@ -433,7 +433,6 @@ impl Engine {
         for n in notes { eprintln!("{n}"); }
         (self.parallel, self.mtp) = (parallel, Some(mtp));
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
-        if let Some(s) = &self.split { unsafe { std::env::set_var("STRATA_SPLIT", s) } }  // read by GpuModel::load_split_margins
         // Before the first weight is uploaded: fail if a pipeline these weight types need does not fit the device's
         // shared memory (Vulkan; a no-op elsewhere). No pipeline or model buffer exists yet.
         let mut types = rusting_strata::gpu_model::gpu_weight_types(&m.w.g);
@@ -451,10 +450,15 @@ impl Engine {
         } else {
             unsafe { std::env::remove_var("STRATA_SPEC_SNAP") };
         }
+        // The layer split: `--split`, else the one `calibrate` measured as fastest for these devices, else by free VRAM.
+        let split = match split_arg(self.split.as_deref(), self.device.len())? {
+            Some(s) => Some(s),
+            None => calibrated_split(&v, &self.device, &bk.iter().map(|b| b.device()).collect::<Vec<_>>()),
+        };
         let mut g = if self.parallel > 1 {
-            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, 0, self.parallel).context(LOAD_HINT)?
+            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, split.as_deref(), 0, self.parallel).context(LOAD_HINT)?
         } else {
-            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, mtp, 1).context(LOAD_HINT)?
+            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, split.as_deref(), mtp, 1).context(LOAD_HINT)?
         };
         if ngram_cfg.is_enabled() && self.parallel <= 1 {
             let tok = Tokenizer::from_gguf(&m.w.g).ok();
@@ -661,6 +665,38 @@ fn calibration_path(model: &Path, backend: &str) -> PathBuf {
     let stem = model.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
     let sfx = if backend == "cuda" { String::new() } else { format!("-{backend}") };
     rusting_strata::expert_cache::cache_dir().join(format!("strata-{stem}{sfx}.json"))
+}
+
+/// The layer shares of `--split` or, without the flag, of `STRATA_SPLIT`, for `n` devices (`None`: not given, or one
+/// device).
+fn split_arg(flag: Option<&str>, n: usize) -> anyhow::Result<Option<Vec<f64>>> {
+    let Some(s) = flag.map(String::from).or_else(|| std::env::var("STRATA_SPLIT").ok()).filter(|s| !s.is_empty() && n > 1) else { return Ok(None) };
+    rusting_strata::gpu_model::split_shares(&s, n).map(Some)
+}
+
+/// The layers per device that `calibrate` chose, if file `v` has them for these devices: the same GPU indices and
+/// names (`Backend::device`) in the same `--device` order.
+fn calibrated_split(v: &serde_json::Value, devices: &[usize], gpus: &[String]) -> Option<Vec<f64>> {
+    let s = &v["split"];
+    if s["devices"] != json!(devices) || s["gpus"] != json!(gpus) { return None; }
+    let l: Vec<f64> = s["layers"].as_array()?.iter().filter_map(|x| x.as_f64()).filter(|&x| x > 0.0).collect();
+    (l.len() == devices.len()).then_some(l)
+}
+
+/// The splits one move away from `cur` (layers per device): `step` layers moved between two neighbouring devices,
+/// each device keeping at least one layer.
+fn split_moves(cur: &[usize], step: usize) -> Vec<Vec<usize>> {
+    let mut v = vec![];
+    for i in 0..cur.len().saturating_sub(1) {
+        for (a, b) in [(i, i + 1), (i + 1, i)] {
+            if cur[a] > step {
+                let mut c = cur.to_vec();
+                (c[a], c[b]) = (c[a] - step, c[b] + step);
+                v.push(c);
+            }
+        }
+    }
+    v
 }
 
 /// Whether calibration file `v` may be used on `gpu` (`Backend::device`). A file names the GPU it was measured on;
@@ -888,6 +924,10 @@ enum Cmd {
         /// GPU index, or several separated by commas (such as 0,1) to calibrate the layer split over those GPUs.
         #[arg(long, default_value = "0", value_delimiter = ',')]
         device: Vec<usize>,
+        /// Share of the layers per device, as `--split` of the other commands: calibrate with this split and do not
+        /// measure others.
+        #[arg(long)]
+        split: Option<String>,
         /// Accepted for consistency with the other commands; calibration always uses the base model.
         #[arg(long, value_name = "PATH:SCALE", action = clap::ArgAction::Append)]
         lora: Vec<String>,
@@ -1212,11 +1252,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 std::fs::write(&path, line).with_context(|| format!("writing the JSON record to {}", path.display()))?;
             }
         }
-        Cmd::Calibrate { model, ctx, vram_margin, backend, device, kv, lora, gpu: _ } => {
+        Cmd::Calibrate { model, ctx, vram_margin, backend, device, split, kv, lora, gpu: _ } => {
             set_kv_env(&kv);  // read by Gpu::new and Vk::new
             if !lora.is_empty() { eprintln!("note: --lora is ignored by calibrate; calibration uses the base model"); }
             let margins = vram_margins(&vram_margin, &device)?.into_iter().map(|mb| mb << 20).collect::<Vec<_>>();
-            calibrate(&model, ctx, &margins, backend.as_deref(), &device)?
+            calibrate(&model, ctx, &margins, backend.as_deref(), &device, split_arg(split.as_deref(), device.len())?)?
         }
         Cmd::Check { model, backend, device } => {
             let g = Gguf::open(&model)?;
@@ -1569,7 +1609,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     set_kv_env(&engine.kv);
                     s.stats.lock().unwrap().unload(p.file_stem().and_then(|n| n.to_str()).map(String::from));
                     vram_margins(&engine.vram_margin, &engine.device)
-                        .and_then(|mb| calibrate(&p, engine.ctx, &mb.into_iter().map(|mb| mb << 20).collect::<Vec<_>>(), engine.backend.as_deref(), &engine.device))
+                        .and_then(|mb| calibrate(&p, engine.ctx, &mb.into_iter().map(|mb| mb << 20).collect::<Vec<_>>(), engine.backend.as_deref(), &engine.device,
+                            split_arg(engine.split.as_deref(), engine.device.len())?))
                 } else { Ok(()) };
                 match cal.and_then(|()| serve_model(&p, engine.clone(), &s, &mut w)) {
                     Ok(Some((p, w))) => next = Some((p, Some(w))),
@@ -1783,16 +1824,16 @@ fn best(f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<f64> {
     Ok(b)
 }
 
-fn calibrate(model: &Path, ctx: usize, margin: &[usize], kind: Option<&str>, device: &[usize]) -> anyhow::Result<()> {
+fn calibrate(model: &Path, ctx: usize, margin: &[usize], kind: Option<&str>, device: &[usize], mut split: Option<Vec<f64>>) -> anyhow::Result<()> {
     let g = Gguf::open(model)?;
     let m = Model::load(&g)?;
     let tok = Tokenizer::from_gguf(&g)?;
     let n_pf = 4096.min(ctx.saturating_sub(256));
     anyhow::ensure!(n_pf >= 512, "--ctx too small to calibrate");
     let pf = prose(&tok, n_pf)?;
-    let load = |chunk: usize| -> anyhow::Result<GpuModel> {
+    let load = |chunk: usize, split: Option<&[f64]>| -> anyhow::Result<GpuModel> {
         let bk = device.iter().map(|&d| backend::open(kind, d)).collect::<anyhow::Result<Vec<_>>>()?;
-        let mut gm = GpuModel::load_split_margins(&m, bk, ctx, chunk, margin, 3, 1).context(LOAD_HINT)?;
+        let mut gm = GpuModel::load_split_margins(&m, bk, ctx, chunk, margin, split, 3, 1).context(LOAD_HINT)?;
         gm.adapt_every = 0; // fixed placement: steadier timings
         Ok(gm)
     };
@@ -1800,14 +1841,63 @@ fn calibrate(model: &Path, ctx: usize, margin: &[usize], kind: Option<&str>, dev
     let mut chunk = (0, 0.0);
     for c in [512, 1024, 2048, 4096].into_iter().filter(|&c| c <= ctx) {
         // A larger chunk's prefill scratch may not fit beside a long --ctx: keep the chunks measured so far.
-        let mut gm = match load(c) { Ok(gm) => gm, Err(e) if chunk.0 > 0 => { eprintln!("chunk {c:5}: {e:#}"); break } Err(e) => return Err(e) };
+        let mut gm = match load(c, split.as_deref()) { Ok(gm) => gm, Err(e) if chunk.0 > 0 => { eprintln!("chunk {c:5}: {e:#}"); break } Err(e) => return Err(e) };
         let t = best(&mut || { gm.reset()?; gm.prefill(&pf).map(drop) })?;
         let tps = n_pf as f64 / t;
         eprintln!("chunk {c:5}: prefill {n_pf} tok {tps:.0} tok/s");
         if tps > chunk.1 { chunk = (c, tps); }
     }
 
-    let mut gm = load(chunk.0)?;
+    let dec = tok.encode("Write a long story about a dragon.")?;
+    // Several devices and no split given by hand: measure other layer splits and keep the fastest. The split by free
+    // VRAM does not know a card's speed or its PCIe link; the timings do. A card with fewer layers keeps more of
+    // their experts in VRAM (fewer uploads over its link in prefill), and the other cards then keep fewer.
+    if device.len() > 1 && split.is_none() {
+        // Prefill of the long prompt and decode after the short one, in tok/s, with the layers per device.
+        let measure = |s: Option<&[f64]>| -> anyhow::Result<(Vec<usize>, f64, f64)> {
+            let mut gm = load(chunk.0, s)?;
+            gm.k = 1;
+            let layers = gm.part_layers();
+            let mut r = Runner::Gpu(Box::new(gm));
+            let tp = best(&mut || { r.reset()?; r.prefill(&pf).map(drop) })?;
+            let mut toks = 0;
+            let td = best(&mut || {
+                r.reset()?;
+                let l = r.prefill(&dec)?;
+                toks = decode(&mut r, &tok, false, &mut Sampler::greedy(), l, 64, None, &mut |_| Ok(false))?.0.len();
+                Ok(())
+            })?;
+            Ok((layers, n_pf as f64 / tp, toks as f64 / td))
+        };
+        let (base, mut bp, mut bd) = measure(None)?;
+        eprintln!("split {base:?} (by free VRAM): prefill {bp:.0} tok/s, decode {bd:.1} tok/s");
+        // ponytail: a fixed step of 15% of the layers and three rounds; a finer search if a report shows the best
+        // split lies between two steps.
+        let step = (m.cfg.n_layer * 3 / 20).max(1);
+        let (mut cur, mut seen) = (base.clone(), vec![base.clone()]);
+        for _ in 0..3 {
+            let mut better = None;
+            for c in split_moves(&cur, step) {
+                if seen.contains(&c) { continue; }
+                seen.push(c.clone());
+                match measure(Some(&c.iter().map(|&x| x as f64).collect::<Vec<_>>())) {
+                    Ok((_, p, d)) => {
+                        eprintln!("split {c:?}: prefill {p:.0} tok/s, decode {d:.1} tok/s");
+                        // Prefill and decode count the same; 3% over the best so far, above the run-to-run spread.
+                        if p * d > 1.03 * bp * bd { (bp, bd, better) = (p, d, Some(c)); }
+                    }
+                    Err(e) => eprintln!("split {c:?}: {e:#}"),
+                }
+            }
+            match better { Some(c) => cur = c, None => break }
+        }
+        if cur != base {
+            chunk.1 = bp;
+            split = Some(cur.iter().map(|&x| x as f64).collect());
+        }
+    }
+
+    let mut gm = load(chunk.0, split.as_deref())?;
     let mut short = usize::MAX;
     for n in [8, 16, 32, 64, 128] {
         let p = &pf[..n];
@@ -1820,7 +1910,6 @@ fn calibrate(model: &Path, ctx: usize, margin: &[usize], kind: Option<&str>, dev
     }
     if short == usize::MAX { short = 256; }
 
-    let dec = tok.encode("Write a long story about a dragon.")?;
     let kmax = if m.cfg.n_nextn > 0 { gm.k } else { 0 };
     let mut r = Runner::Gpu(Box::new(gm));
     let mut mtp = (0, 0.0);
@@ -1842,8 +1931,13 @@ fn calibrate(model: &Path, ctx: usize, margin: &[usize], kind: Option<&str>, dev
     let Runner::Gpu(g) = &r else { unreachable!() };
     let path = calibration_path(model, g.gpu.name());
     std::fs::create_dir_all(path.parent().unwrap())?;
-    let v = json!({"chunk": chunk.0, "mtp": mtp.0, "short": short, "ctx": ctx, "gpu": g.gpu.device(),
+    let mut v = json!({"chunk": chunk.0, "mtp": mtp.0, "short": short, "ctx": ctx, "gpu": g.gpu.device(),
         "measured": {"prefill_tok_s": chunk.1.round(), "decode_tok_s": (mtp.1 * 10.0).round() / 10.0}});
+    // Only a split that was measured as faster, or given by hand: without one, later runs split by the free VRAM
+    // they find.
+    if split.is_some() {
+        v["split"] = json!({"devices": device, "gpus": g.parts().map(|p| p.gpu.device()).collect::<Vec<_>>(), "layers": g.part_layers()});
+    }
     std::fs::write(&path, serde_json::to_string_pretty(&v)?)?;
     println!("{v}\nwritten to {}", path.display());
     Ok(())
@@ -2775,7 +2869,26 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
 
 #[cfg(test)]
 mod flag_tests {
-    use super::{resolve_flags, vram_margins};
+    use super::{calibrated_split, resolve_flags, split_moves, vram_margins};
+
+    #[test]
+    fn calibrated_split_needs_the_same_devices_in_the_same_order() {
+        let v = serde_json::json!({"split": {"devices": [0, 1], "gpus": ["A", "B"], "layers": [12, 28]}});
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(calibrated_split(&v, &[0, 1], &names(&["A", "B"])), Some(vec![12.0, 28.0]));
+        assert_eq!(calibrated_split(&v, &[1, 0], &names(&["A", "B"])), None);
+        assert_eq!(calibrated_split(&v, &[0, 1], &names(&["A", "C"])), None);
+        assert_eq!(calibrated_split(&v, &[0], &names(&["A"])), None);
+        assert_eq!(calibrated_split(&serde_json::json!({"chunk": 4096}), &[0, 1], &names(&["A", "B"])), None);
+    }
+
+    #[test]
+    fn split_moves_shift_layers_between_neighbours() {
+        assert_eq!(split_moves(&[20, 20], 6), [vec![14, 26], vec![26, 14]]);
+        assert_eq!(split_moves(&[4, 36], 6), [vec![10, 30]]);
+        assert_eq!(split_moves(&[15, 15, 10], 6), [vec![9, 21, 10], vec![21, 9, 10], vec![15, 9, 16], vec![15, 21, 4]]);
+        assert!(split_moves(&[40], 6).is_empty());
+    }
 
     #[test]
     fn calibration_from_another_gpu_is_refused() {
