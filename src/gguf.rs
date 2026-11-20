@@ -37,7 +37,15 @@ pub struct Gguf {
     pub meta: BTreeMap<String, Value>,
     pub tensors: BTreeMap<String, TensorInfo>,
     /// Each shard's map and data offset (one entry unless the model is split).
-    files: Vec<(Mmap, usize)>,
+    files: Vec<(Map, usize)>,
+}
+
+/// A mapped model file. `weights::preload` counted its bytes; unmapping takes them off the count, so a file that was
+/// opened only to read its metadata, or the model before a switch, does not make the next one look too large for RAM.
+struct Map(Mmap);
+
+impl Drop for Map {
+    fn drop(&mut self) { crate::weights::unmapped(self.0.len()); }
 }
 
 struct Cur<'a> { b: &'a [u8], p: usize }
@@ -85,16 +93,16 @@ impl Gguf {
     /// Open a GGUF; for a split model (`split.count` > 1), pass the `-00001-of-0000N` shard and the others are
     /// opened from the same directory.
     pub fn open(path: &Path) -> anyhow::Result<Gguf> {
-        let mut g = Self::open_one(path, 0)?;
+        let mut g = Self::open_one(path, 0, true)?;
         let n = g.meta.get("split.count").and_then(Value::as_u64).unwrap_or(1) as usize;
         if n > 1 {
             let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
             let tag = format!("-00001-of-{n:05}.gguf");
             let stem = name.strip_suffix(&tag).with_context(|| format!("{}: split model; open its first shard (*{tag})", path.display()))?;
             for i in 1..n {
-                let s = Self::open_one(&path.with_file_name(format!("{stem}-{:05}-of-{n:05}.gguf", i + 1)), i)?;
-                g.files.extend(s.files);
-                for (k, t) in s.tensors { anyhow::ensure!(g.tensors.insert(k.clone(), t).is_none(), "tensor {k} in two shards"); }
+                let mut s = Self::open_one(&path.with_file_name(format!("{stem}-{:05}-of-{n:05}.gguf", i + 1)), i, true)?;
+                g.files.append(&mut s.files);
+                for (k, t) in std::mem::take(&mut s.tensors) { anyhow::ensure!(g.tensors.insert(k.clone(), t).is_none(), "tensor {k} in two shards"); }
             }
         }
         // The reads are queued by `weights::preload`, one call per file. Said here because nothing else shows it: the
@@ -102,12 +110,18 @@ impl Gguf {
         #[cfg(target_os = "linux")]
         if crate::weights::fits_ram() {
             eprintln!("page cache: reading {} MB of {} in the background (it shows as buff/cache, not as used memory)",
-                g.files.iter().map(|(m, _)| m.len()).sum::<usize>() >> 20, path.file_name().and_then(|s| s.to_str()).unwrap_or("the model"));
+                g.files.iter().map(|(m, _)| m.0.len()).sum::<usize>() >> 20, path.file_name().and_then(|s| s.to_str()).unwrap_or("the model"));
         }
         Ok(g)
     }
 
-    fn open_one(path: &Path, file: usize) -> anyhow::Result<Gguf> {
+    /// `general.architecture` of a model, from its first shard and without starting to read the file into the page
+    /// cache: for a caller that only chooses which server gets the model.
+    pub fn arch(path: &Path) -> Option<String> {
+        Self::open_one(path, 0, false).ok()?.meta.get("general.architecture")?.as_str().map(str::to_owned)
+    }
+
+    fn open_one(path: &Path, file: usize, read: bool) -> anyhow::Result<Gguf> {
         let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
         let mmap = unsafe { Mmap::map(&f)? };
         // Expert rows are 2 MB apart in a file the page cache reads at random: huge pages save TLB misses.
@@ -115,8 +129,9 @@ impl Gguf {
         if std::env::var_os("STRATA_HUGEPAGE").is_some() {
             let _ = mmap.advise(memmap2::Advice::HugePage);
         }
-        crate::weights::preload(&mmap);
-        let mut c = Cur { b: &mmap, p: 0 };
+        crate::weights::preload(&mmap, read);
+        let mmap = Map(mmap);
+        let mut c = Cur { b: &mmap.0, p: 0 };
         if c.take(4)? != b"GGUF" { bail!("{}: not a GGUF file", path.display()); }
         let ver = c.u32()?;
         if !(2..=3).contains(&ver) { bail!("unsupported GGUF version {ver}"); }
@@ -142,7 +157,7 @@ impl Gguf {
         for t in tensors.values() {
             let Ok(ty) = GgmlType::from_u32(t.ty) else { continue };  // Weights::validate reports it
             let n = t.dims.iter().skip(1).try_fold(ty.row_bytes(t.dims.first().copied().unwrap_or(0)) as u64, |a, &d| a.checked_mul(d));
-            if n.and_then(|n| n.checked_add(t.offset)).is_none_or(|e| e > (mmap.len() as u64).saturating_sub(data_offset as u64)) {
+            if n.and_then(|n| n.checked_add(t.offset)).is_none_or(|e| e > (mmap.0.len() as u64).saturating_sub(data_offset as u64)) {
                 bail!("{}: GGUF truncated (tensor {} lies past the end of the file; re-download it)", path.display(), t.name);
             }
         }
@@ -159,14 +174,14 @@ impl Gguf {
         let n = ty.row_bytes(t.dims[0]) * t.dims[1..].iter().product::<u64>() as usize;
         let (mmap, data_offset) = &self.files[t.file];
         let o = data_offset + t.offset as usize;
-        &mmap[o..o + n]
+        &mmap.0[o..o + n]
     }
 
     /// Raw bytes for auxiliary metadata tensors whose GGML type is not in `GgmlType` (e.g. EAGLE3 `d2t` I32/I64).
     pub fn raw_bytes(&self, t: &TensorInfo, byte_len: usize) -> anyhow::Result<&[u8]> {
         let (mmap, data_offset) = &self.files[t.file];
         let o = data_offset + t.offset as usize;
-        mmap.get(o..o + byte_len).context("GGUF tensor bytes out of range")
+        mmap.0.get(o..o + byte_len).context("GGUF tensor bytes out of range")
     }
 }
 

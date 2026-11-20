@@ -1373,30 +1373,34 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             engine.ds_env();
             anyhow::ensure!(host.auto_unload != Some(0), "--auto-unload must be at least 1 second");
             // The four architectures below have their own servers, which keep the model for as long as they run.
-            if host.auto_unload.is_some() && let Some(mp) = &model && let Ok(g) = Gguf::open(mp) && let Some(a) = g.get("general.architecture").ok().and_then(|v| v.as_str())
-                && ["gemma4", "glm5-next", "deepseek41", rusting_strata::hy4::ARCH].contains(&a) {
+            let arch = model.as_deref().and_then(Gguf::arch);
+            if host.auto_unload.is_some() && let Some(a) = arch.as_deref() && ["gemma4", "glm5-next", "deepseek41", rusting_strata::hy4::ARCH].contains(&a) {
                 anyhow::bail!("--auto-unload is not available for {a} models");
             }
-            if let Some(mp) = &model && let Ok(g) = Gguf::open(mp) && g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
+            if let Some(mp) = &model && arch.as_deref() == Some("gemma4") {
+                let g = Gguf::open(mp)?;
                 let name = mp.file_name().map_or("gemma4".into(), |n| n.to_string_lossy().into_owned());
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
                 anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
                 let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(mp));
                 return rusting_strata::gemma4::serve(&g, &name, &addr, key.as_deref(), mmproj.as_deref());
             }
-            if let Some(mp) = &model && let Ok(g) = Gguf::open(mp) && g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("glm5-next") {
+            if let Some(mp) = &model && arch.as_deref() == Some("glm5-next") {
+                let g = Gguf::open(mp)?;
                 let name = mp.file_name().map_or("glm".into(), |n| n.to_string_lossy().into_owned());
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
                 anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
                 return rusting_strata::glm::serve(&g, &name, &addr, key.as_deref());
             }
-            if let Some(mp) = &model && let Ok(g) = Gguf::open(mp) && g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
+            if let Some(mp) = &model && arch.as_deref() == Some("deepseek41") {
+                let g = Gguf::open(mp)?;
                 let name = mp.file_name().map_or("deepseek".into(), |n| n.to_string_lossy().into_owned());
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
                 anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
                 return rusting_strata::deepseek::chat::serve(&g, &name, &addr, key.as_deref());
             }
-            if let Some(mp) = &model && let Ok(g) = Gguf::open(mp) && g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::hy4::ARCH) {
+            if let Some(mp) = &model && arch.as_deref() == Some(rusting_strata::hy4::ARCH) {
+                let g = Gguf::open(mp)?;
                 let name = mp.file_name().map_or("hy4".into(), |n| n.to_string_lossy().into_owned());
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
                 anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");

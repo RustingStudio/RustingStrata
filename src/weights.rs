@@ -275,13 +275,12 @@ pub fn will_need(p: usize, n: usize) {
     }
 }
 
-/// Bytes of every GGUF mapped by this process.
+/// Bytes of the GGUF files this process has mapped now.
 static MAPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether the mapped model files fit in RAM with 4 GiB to spare: then their pages stay in the page cache (`cold` is
 /// a no-op) and `preload` reads them. `STRATA_PRELOAD=0`/`1` overrides.
-// ponytail: MemTotal, not what other programs left free, and files of dropped models still count; use
-// MemAvailable and subtract on drop if either one decides wrongly.
+// ponytail: MemTotal, not what other programs left free; use MemAvailable if that decides wrongly.
 pub fn fits_ram() -> bool {
     match std::env::var("STRATA_PRELOAD").ok().as_deref() {
         Some("0") => false,
@@ -290,16 +289,22 @@ pub fn fits_ram() -> bool {
     }
 }
 
-/// Counts a newly mapped model file; when the files fit in RAM (`fits_ram`), a background thread starts reading it
-/// into the page cache, so experts that run on the CPU do not wait for the drive on their first use (issue #49).
-pub fn preload(b: &[u8]) {
+/// Counts a newly mapped model file; with `read`, when the files fit in RAM (`fits_ram`), a background thread starts
+/// reading it into the page cache, so experts that run on the CPU do not wait for the drive on their first use
+/// (issue #49).
+pub fn preload(b: &[u8], read: bool) {
     MAPPED.fetch_add(b.len() as u64, std::sync::atomic::Ordering::Relaxed);
     let (p, n) = (b.as_ptr() as usize, b.len());
     // The thread holds no borrow: MADV_WILLNEED on a range unmapped in the meantime fails without a fault.
-    if fits_ram() {
+    if read && fits_ram() {
         PRELOADING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::thread::spawn(move || { will_need(p, n); PRELOADING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); });
     }
+}
+
+/// Takes the bytes of an unmapped model file off the count.
+pub fn unmapped(n: usize) {
+    MAPPED.fetch_sub(n as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `preload` threads still queueing reads.
