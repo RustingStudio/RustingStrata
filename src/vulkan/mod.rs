@@ -347,7 +347,7 @@ fn features<'a>(f11: &'a mut vk::PhysicalDeviceVulkan11Features<'static>, f12: &
 }
 
 impl Vk {
-    /// The `device`-th usable GPU. Fails with "Vulkan init" (and the reasons) when there is none.
+    /// The usable GPU with index `device` (`backend::device_order`). Fails with "Vulkan init" (and the reasons) when there is none.
     pub fn new(device: usize) -> anyhow::Result<Vk> {
         ensure!(!(crate::cuda::kv_mode() > 0 && crate::cuda::llama_numerics()), "--kv q8/q4 does not combine with --llama-numerics (its attention reads f16 KV)");
         // RADV hides VK_AMD_device_coherent_memory on RDNA4 (RX 9000) unless this driconf option is set, and without
@@ -368,7 +368,16 @@ impl Vk {
         // Discrete GPUs first (stable), so device 0 is the dedicated card, not an integrated GPU that comes first in the driver's list.
         usable.sort_by_key(|u| match u.2 { vk::PhysicalDeviceType::DISCRETE_GPU => 0, vk::PhysicalDeviceType::INTEGRATED_GPU => 1, _ => 2 });
         let usable: Vec<_> = usable.into_iter().map(|u| (u.0, u.1)).collect();
-        let Some((pd, name)) = usable.get(device).cloned() else {
+        // `device` counts as CUDA does where CUDA knows the cards, so that an index is the same card on both backends:
+        // CUDA puts the fastest card first and Vulkan does not, so device 1 of a run that fell back from CUDA to
+        // Vulkan for that device only was the card device 0 already ran on.
+        let ids: Vec<_> = usable.iter().map(|u| {
+            let mut id = vk::PhysicalDeviceIDProperties::default();
+            unsafe { instance.get_physical_device_properties2(u.0, &mut vk::PhysicalDeviceProperties2::default().push_next(&mut id)) };
+            id.device_uuid
+        }).collect();
+        let pick = crate::backend::device_order(&crate::cuda::device_uuids(), &ids).get(device).copied().flatten();
+        let Some((pd, name)) = pick.map(|i| usable[i].clone()) else {
             unsafe { instance.destroy_instance(None) };
             return Err(anyhow!("no usable Vulkan device {device} ({} usable; {})", usable.len(), why.join("; "))).context("Vulkan init");
         };

@@ -177,6 +177,10 @@ OpenCode and other agents use the OpenAI address.
 cards run one after the other, so one request gets more memory, not twice the speed of one card. MTP drafting is off on
 a split model.
 
+An index is the same card on both backends. NVIDIA cards are counted as CUDA counts them (by default the fastest card
+first, which is not the order of `nvidia-smi`), on Vulkan too; the other Vulkan devices follow, dedicated cards before
+integrated ones. The load prints the card of every index (`cuda device 1: ...` or `vulkan device 1: ...`).
+
 The split by free VRAM does not know which card is faster or which sits on a slow PCIe link (x1 riser, x4 slot).
 `rustingstrata calibrate --model M.gguf --device 0,1` measures it: it times prefill and decode with the split by free
 VRAM, then with layers moved from one card to the other in steps of 15% of the layers, and follows the faster

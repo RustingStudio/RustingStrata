@@ -443,6 +443,22 @@ macro_rules! launch {
 
 fn kname(prefix: &str, ty: GgmlType) -> String { format!("{prefix}_{}", ty.name().to_lowercase()) }
 
+/// The UUID of every CUDA device in CUDA's order, the order `Gpu::new` counts in: `None` for a device the driver
+/// gives none for, empty when CUDA does not load. No context is created. NVIDIA's Vulkan driver reports the same 16
+/// bytes as `deviceUUID` (NVIDIA's simpleVulkan sample picks its CUDA device by comparing the two), so `Vk::new`
+/// finds the card of a CUDA index with them.
+pub fn device_uuids() -> Vec<Option<[u8; 16]>> {
+    if !unsafe { sys::is_culib_present() } || result::init().is_err() { return vec![]; }
+    // Looked up by hand: cudarc panics on a symbol the driver lacks, and this one came with CUDA 11.4.
+    type GetUuid = unsafe extern "C" fn(*mut sys::CUuuid, sys::CUdevice) -> sys::CUresult;
+    let get = unsafe { sys::culib().get::<GetUuid>(b"cuDeviceGetUuid_v2\0") }.ok().map(|f| *f);
+    (0..result::device::get_count().unwrap_or(0)).map(|i| {
+        let mut u = sys::CUuuid { bytes: [0; 16] };
+        let ok = get.is_some_and(|f| result::device::get(i).is_ok_and(|d| unsafe { f(&mut u, d) } == sys::CUresult::CUDA_SUCCESS));
+        ok.then(|| u.bytes.map(|b| b as u8))
+    }).collect()
+}
+
 impl Gpu {
     pub fn new(device: usize) -> anyhow::Result<Gpu> {
         let kv_mode = kv_mode();

@@ -74,6 +74,19 @@ pub fn open(kind: Option<&str>, device: usize) -> anyhow::Result<Box<dyn Backend
     }
 }
 
+/// Which usable Vulkan device each GPU index opens, so that an index is the same card on both backends. `cuda` is the
+/// identifier of every CUDA device in CUDA's order (`None`: the driver gives none), `vk` the one of every usable
+/// Vulkan device in the order Vulkan alone would count them. Index i is the position in `vk` of CUDA device i's
+/// identifier, `None` when no usable Vulkan device has it. A CUDA device without identifier takes the next Vulkan
+/// device that no CUDA device names, and the rest of those follow the CUDA devices: with no CUDA device, or none
+/// that Vulkan knows, the order is `vk`'s own.
+pub fn device_order<T: PartialEq>(cuda: &[Option<T>], vk: &[T]) -> Vec<Option<usize>> {
+    let mut rest = (0..vk.len()).filter(|&i| !cuda.iter().flatten().any(|c| *c == vk[i]));
+    let mut order: Vec<_> = cuda.iter().map(|c| match c { Some(c) => vk.iter().position(|v| v == c), None => rest.next() }).collect();
+    order.extend(rest.map(Some));
+    order
+}
+
 /// `gemm` `act` flag: x is unchanged since the previous gemm call, which read the same x, so its int8 copy is reused.
 pub const SAME_X: i32 = 4;
 
@@ -421,5 +434,27 @@ impl<'a> dyn Backend + 'a {
         let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), n * size_of::<T>()) };
         self.dtoh(src, at * size_of::<T>(), b)?;
         Ok(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::device_order;
+
+    /// Identifiers are letters here. Two cards of one model have one name and two identifiers, so names play no part.
+    #[test]
+    fn a_gpu_index_is_the_same_card_on_cuda_and_vulkan() {
+        // CUDA counts the faster card first, Vulkan in bus order (the 5060 Ti and 3060 of the report).
+        assert_eq!(device_order(&[Some('T'), Some('S')], &['S', 'T']), [Some(1), Some(0)]);
+        // Two cards of the same model, and an integrated GPU that CUDA does not know: it follows the CUDA devices.
+        assert_eq!(device_order(&[Some('B'), Some('A')], &['A', 'I', 'B']), [Some(2), Some(0), Some(1)]);
+        // CUDA device 0 is not usable on Vulkan (filtered out): index 0 fails, index 1 is still CUDA's card 1.
+        assert_eq!(device_order(&[Some('A'), Some('B')], &['B']), [None, Some(0)]);
+        // A CUDA device without identifier takes the first Vulkan device that no CUDA device names.
+        assert_eq!(device_order(&[None, Some('B')], &['B', 'A']), [Some(1), Some(0)]);
+        // No CUDA (AMD, Intel, llvmpipe), or no identifier at all: Vulkan's own order, as before.
+        assert_eq!(device_order(&[], &['A', 'B']), [Some(0), Some(1)]);
+        assert_eq!(device_order(&[None, None], &['A', 'B']), [Some(0), Some(1)]);
+        assert_eq!(device_order::<char>(&[Some('A')], &[]), [None]);
     }
 }
