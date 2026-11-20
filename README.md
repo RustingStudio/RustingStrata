@@ -12,8 +12,33 @@ Version 1.2.6. Docs: [usage and server API](docs/USAGE.md), [hosting for other p
 
 ## Numbers
 
-Reference machine: RTX 3060 12 GB, Ryzen 5 7600X, 32 GB RAM. Model: `Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf` (11.7 GiB,
-does not fit in VRAM). llama.cpp is the 2026-10-28 build 11876, tuned for the same file (`-ncmoe 12 -ub 2048
+Reference machine: RTX 3060 12 GB, Ryzen 5 7600X, 32 GB RAM.
+
+### Qwen3.6-35B-A3B UD-Q5_K_M
+
+`Qwen3.6-35B-A3B-UD-Q5_K_M.gguf` (25.2 GiB, does not fit in VRAM: a third of the experts are on the GPU). llama.cpp
+is build 12191, tuned for the same file (`-cmoe --moe-cache-mib 7500 -ngl 99 -fa on -t 6 -ub 2048 -b 2048`, the best
+decode of a 9-config sweep over `-ncmoe`, `--moe-cache-mib` and `--moe-cache-cpu-share`).
+
+| | CUDA | llama.cpp |
+|---|---|---|
+| Decode after 4K prompt | **80.5 tok/s** (75.1-82.0) | 64.4 (58.8-66.0) |
+| Prefill, 4K prompt | **1530 tok/s** (1451-1596) | 1118-1122 with `-ncmoe 27`, its best prefill flags (2 runs, one load); 793 (367-1063) with the decode flags above |
+
+Measured at commit 3945476 (1.2.5) with `rustingstrata serve --gpu --ctx 8192 --mtp 0` and `llama-server`: the same
+4241-token prompt file and the same script for both, greedy, thinking off, 128 tokens, no drafts in either engine.
+Two loads per engine in alternating order; in each load a warm-up and the first 4K request are thrown away. Decode is
+the mean of runs 4-8 of each load (10 runs, range in brackets). Both engines climb for the first runs after a load;
+over all 16 runs it is 78.8 (63.6-82.0) against 60.3 (31.3-66.0). Prefill is 4 new prompts per load (8 runs).
+
+Not equal: the replies were 128 tokens (RustingStrata) and 125 (llama.cpp, ended by itself). About 20 GiB of RAM was
+free for the 25.2 GiB file, so neither engine had the whole file in the page cache. Perplexity against llama.cpp was
+not run on this file; for UD-Q3_K_M it is in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md#quality-vs-llamacpp-qwen36-35b-a3b-ud-q3_k_m).
+
+### Qwen3.6-35B-A3B UD-Q2_K_XL
+
+`Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf` (11.7 GiB, does not fit in VRAM). llama.cpp is the 2026-10-28 build 11876, tuned for the same file (`-ncmoe 12 -ub 2048
 -b 2048`, flash attention; with its default ubatch its 4K prefill is ~1550).
 
 | | CUDA | Vulkan | llama.cpp |
