@@ -51,6 +51,14 @@ const SPV: &[(&str, &[u8])] = &[
     ("hc_mix", include_bytes!("spv/hc_mix.spv")),
     ("hc_silu", include_bytes!("spv/hc_silu.spv")),
     ("hc_write", include_bytes!("spv/hc_write.spv")),
+    ("ink_attn", include_bytes!("spv/ink_attn.spv")),
+    ("ink_attn_merge", include_bytes!("spv/ink_attn_merge.spv")),
+    ("ink_clip", include_bytes!("spv/ink_clip.spv")),
+    ("ink_conv", include_bytes!("spv/ink_conv.spv")),
+    ("ink_ctrl_gate", include_bytes!("spv/ink_ctrl_gate.spv")),
+    ("ink_ctrl_out", include_bytes!("spv/ink_ctrl_out.spv")),
+    ("ink_ffn_sum", include_bytes!("spv/ink_ffn_sum.spv")),
+    ("ink_mix", include_bytes!("spv/ink_mix.spv")),
     ("kv_store", include_bytes!("spv/kv_store.spv")),
     ("l2_norm", include_bytes!("spv/l2_norm.spv")),
     ("moe_combine", include_bytes!("spv/moe_combine.spv")),
@@ -1336,6 +1344,27 @@ impl Backend for Vk {
     fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()> { self.run("swiglu", &[], [n.div_ceil(256), 1, 1], &[&g, &u, &(n as u32)]) }
     fn situ(&self, y: u64, n: usize, rows: usize, beta: f32, lb: f32) -> anyhow::Result<()> {
         self.run("situ", &[], [(n * rows).div_ceil(256), 1, 1], &[&y, &(n as u32), &(rows as u32), &beta, &lb])
+    }
+    fn ink_mix(&self, blocks: u64, nb: usize, cur: u64, q: u64, nq: usize, out: u64, n: usize) -> anyhow::Result<()> {
+        self.run("ink_mix", &[], [nq, 1, 1], &[&blocks, &cur, &q, &out, &(nb as u32), &(n as u32)])
+    }
+    fn ink_ctrl(&self, down: u64, gain: u64, forget: u64, cur: u64, nins: usize, msg: u64, gate: u64, out: u64, n: usize, rank: usize, count: usize) -> anyhow::Result<()> {
+        self.run("ink_ctrl_gate", &[], [rank, count, 1], &[&down, &cur, &msg, &gate, &(nins as u32), &(n as u32), &(rank as u32)])?;
+        self.run("ink_ctrl_out", &[], [n.div_ceil(256), count, 1], &[&gain, &forget, &gate, &cur, &msg, &out, &(nins as u32), &(n as u32), &(rank as u32)])
+    }
+    fn ink_conv(&self, cur: u64, w: u64, taps: u64, hist: u64, out: u64, n: usize, n_conv: usize, per: usize) -> anyhow::Result<()> {
+        self.run("ink_conv", &[], [n.div_ceil(256), 1, 1], &[&cur, &w, &taps, &hist, &out, &(n as u32), &(n_conv as u32), &(per as u32)])
+    }
+    fn ink_clip(&self, x: u64, scale: u64, w: usize, rows: usize, thr: f32, eps: f32, mul: f32, dst: u64) -> anyhow::Result<()> {
+        self.run("ink_clip", &[], [rows, 1, 1], &[&x, &scale, &dst, &(w as u32), &thr, &eps, &mul])
+    }
+    fn ink_attn(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, rows: usize, at: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
+        let chunks = rows.div_ceil(64);
+        self.run("ink_attn", &[], [nh, chunks, 1], &[&q, &r, &sink, &k, &v, &bias, &sc, &(rows as u32), &(at as u32), &(nh as u32), &(nkv as u32), &(hd as u32), &(nr as u32), &(ext as u32)])?;
+        self.run("ink_attn_merge", &[], [nh, 1, 1], &[&sc, &gate, &out, &(chunks as u32), &(hd as u32)])
+    }
+    fn ink_ffn_sum(&self, acc: u64, d: u64, wts: u64, ne: usize, n: usize, cpu: u64) -> anyhow::Result<()> {
+        self.run("ink_ffn_sum", &[], [n.div_ceil(256), 1, 1], &[&acc, &d, &wts, &cpu, &(ne as u32), &(n as u32)])
     }
     fn hadamard(&self, x: u64, u: u64, s: u64, out: u64, n: usize, block: usize, rows: usize) -> anyhow::Result<()> {
         // ponytail: a block is one workgroup, and 128 invocations is what every Vulkan device takes; a larger block

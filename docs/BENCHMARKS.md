@@ -20,7 +20,7 @@ Reference machine unless stated: RTX 3060 12 GB, Ryzen 5 7600X, 32 GB RAM.
 | Qwen3.8-Flash-Next GSQ-RCO IQ2_XS, 1262-token prompt | 33.0 tok/s (29.3-35.8) | 25.6 (23.2-26.9) | - | [below](#qwen38-flash-next-gsq-rco-iq2_xs) |
 | GLM-5.3-Flash UD-Q2_K_XL (119 GB) | 1.35-1.57 tok/s | 0.57-0.62 | - | [below](#glm-53-flash-ud-q2_k_xl-119-gb) |
 | DeepSeek-V4.1-Flash IQ2_XXS (249 GB) | 2-3.6 tok/s | 0.3-1.5 | - | [below](#deepseek-v41-flash-iq2_xxs-249-gb) |
-| Inkling 2 Mini IQ4_NL (17.6 GB), 512-token prompt | 27.1 tok/s (26.7-27.4) | 8.7-10.5 | - | [below](#inkling-2-mini-iq4_nl-176-gb) |
+| Inkling 2 Mini IQ4_NL (17.6 GB), 512-token prompt | 31.2 tok/s (28.7-33.7) | 8.7-10.5 | - | [below](#inkling-2-mini-iq4_nl-176-gb) |
 | Recursive Flint 39.8B UD-Q5_K_XL, 4102-token prompt | 64.6 tok/s (63.8-65.6) | 48.6 (47.5-49.3) | - | [below](#recursive-flint-398b-ud-q5_k_xl) |
 
 ## Qwen3.6-35B-A3B UD-Q2_K_XL
@@ -218,9 +218,9 @@ of VRAM; 12, 16 and 20 layers measured within 3% of 18 at 64 and 512 tokens), an
 
 | | Prefill 64 tokens | Prefill 512 | Prefill 2048 | Decode (tok/s) |
 |---|---|---|---|---|
-| RustingStrata, CUDA | 120.7 (59.2, 182.2) | 259.2 (254.6, 263.9) | 220.2 (218.7, 221.8) | 29.9 / 27.1 / 25.6 after 64 / 512 / 2048 tokens |
-| RustingStrata, Vulkan (same card) | 82.7 (34.5, 130.9) | 226.9 (226.6, 227.1) | 182.6 (179.0, 186.2) | 21.5 / 20.9 / 19.8 |
-| RustingStrata, CPU only | 47.5 (47.1, 47.9) | 49.8 (49.7, 49.8) | 48.2 (48.2, 48.2) | 12.0 / 11.6 / 11.3 |
+| RustingStrata, CUDA | 120.7 (59.2, 182.2) | 259.2 (254.6, 263.9) | 220.2 (218.7, 221.8) | 34.5 / 31.2 / 31.2 after 64 / 512 / 2048 tokens |
+| RustingStrata, Vulkan (same card) | 82.7 (34.5, 130.9) | 226.9 (226.6, 227.1) | 182.6 (179.0, 186.2) | 27.3 / 27.5 / 24.5 |
+| RustingStrata, CPU only | 47.5 (47.1, 47.9) | 49.8 (49.7, 49.8) | 48.2 (48.2, 48.2) | 11.8 / 11.6 / 10.9 |
 | llama.cpp, CUDA build, `-ngl 18` | 124.7 ± 3.6 | 383.9 ± 7.2 | 322.6 ± 1.0 | 8.7 ± 1.3 |
 | llama.cpp, CUDA build, `-ngl 0` | 122.3 ± 5.0 | 377.5 ± 7.8 | not run | 10.5 ± 1.2 |
 
@@ -236,6 +236,12 @@ the decode columns are not the same test. The first run of the 64-token prompt i
 is the slow one of the two. A CPU-only llama.cpp build was not benchmarked with `llama-bench`; its server reported
 40.4 tok/s for the prompt and 11.0 tok/s for the reply earlier the same day (one run, not side by side). Vulkan was
 run on the RTX 3060 only. Decoding is greedy in both engines.
+
+The decode column was measured again later the same day, same command, after a decoded token moved onto the GPU
+(it was 29.9 / 27.1 / 25.6 on CUDA, 21.5 / 20.9 / 19.8 on Vulkan and 12.0 / 11.6 / 11.3 on the CPU). A desktop app
+used part of the GPU during that run. Alternating runs of the old and new build at a 512-token prompt, same load:
+CUDA 25.4 to 33.5 tok/s, Vulkan 16.6 to 25.4 tok/s, prefill unchanged (within 1-4%). Most of the Vulkan gain is the
+IQ4_NL expert matvec (105 to 270 GB/s on 8 experts of 2304x2304).
 
 ## Not yet measured
 

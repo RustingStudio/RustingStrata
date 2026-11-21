@@ -8,7 +8,7 @@ use std::sync::{Mutex, OnceLock};
 /// copied up and the result down per call, so everything else in the forward stays the CPU reference code.
 /// STRATA_DS_BACKEND (cuda or vulkan; unset: CUDA if it loads, else Vulkan) and STRATA_DS_DEVICES (such as 0,1) pick the GPUs; with several,
 /// the weights fill them in order and the expert budget is divided in proportion to free VRAM.
-mod dev {
+pub(crate) mod dev {
     use super::*;
     use crate::backend::{Backend, Buf, GpuTensor};
     use crate::weights::Tensor;
@@ -20,8 +20,8 @@ mod dev {
     /// A tensor id holds its GPU in the top 8 bits (so STAGED, GPU 255, is never a real id) and its index there below.
     const SHIFT: u32 = 24;
     pub fn gpu_of(id: u32) -> usize { (id >> SHIFT) as usize }
-    struct Part { be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, stage: Buf, bytes: usize, budget: usize, room: usize }
-    pub struct Dev { parts: Vec<Part>, ex: std::collections::HashMap<usize, usize>, exs: Vec<(u32, usize, u64, f32)>, now: u64, cur: usize, lookups: u64 }
+    pub(crate) struct Part { pub(crate) be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, stage: Buf, bytes: usize, budget: usize, room: usize }
+    pub struct Dev { pub(crate) parts: Vec<Part>, ex: std::collections::HashMap<usize, usize>, exs: Vec<(u32, usize, u64, f32)>, now: u64, cur: usize, lookups: u64 }
     static DEV: OnceLock<Option<Mutex<Dev>>> = OnceLock::new();
     pub fn get() -> Option<&'static Mutex<Dev>> {
         DEV.get_or_init(|| {
@@ -79,7 +79,7 @@ mod dev {
             let d = self.pick(data.len());
             self.upload_on(d, data, ty, rows, cols)
         }
-        fn tensor(&self, i: u32) -> &GpuTensor { &self.parts[gpu_of(i)].ts[(i & (1 << SHIFT) - 1) as usize] }
+        pub(crate) fn tensor(&self, i: u32) -> &GpuTensor { &self.parts[gpu_of(i)].ts[(i & (1 << SHIFT) - 1) as usize] }
         /// VRAM copy of one routed expert: uploaded on first use while under a GPU's STRATA_DS_GPU_EXPERTS share (GB), then the
         /// least recently used slot of the same shape is overwritten. Slots touched in the last 96 lookups are kept (the
         /// matrices of one layer's experts are in flight together). No slot to take: STAGED (copied up per use).
@@ -178,7 +178,7 @@ mod dev {
             Some(y)
         }
         /// The device tensor of `m`. A staged expert is uploaded into a buffer that `owned` keeps until the readback.
-        fn weight<'b>(&'b self, p: &Part, m: &Mat, owned: &'b mut Vec<GpuTensor>) -> Option<&'b GpuTensor> {
+        pub(crate) fn weight<'b>(&'b self, p: &Part, m: &Mat, owned: &'b mut Vec<GpuTensor>) -> Option<&'b GpuTensor> {
             Some(match m.gpu? {
                 STAGED => {
                     let b = p.be.alloc(m.data.len()).ok()?;

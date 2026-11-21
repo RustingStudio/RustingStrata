@@ -1,0 +1,20 @@
+#version 460
+layout(local_size_x = 256) in;
+#include "common.glsl"
+layout(push_constant) uniform P { U16 gain; U16 forget; F32 gate; F32 cur; F32 msg; F32 o; uint nins; uint n; uint rank; } p;
+
+// Inkling 2's loop controllers, the update: out_j = cur_j - tanh(gate_j . forget) * cur_j + tanh(gate_j . gain) * msg_j
+// (gain and forget f16, [rank][n]). tanh of a clamped value, as in situ. CUDA: ink_ctrl_out.
+void main() {
+    uint c = gl_GlobalInvocationID.x, j = gl_WorkGroupID.y;
+    if (c >= p.n) return;
+    uint wo = j * p.rank * p.n + c;
+    float g = 0.0, f = 0.0;
+    for (uint r = 0; r < p.rank; r++) {
+        float t = p.gate.v[j * p.rank + r];
+        g += t * unpackHalf2x16(uint(p.gain.v[wo + r * p.n])).x;
+        f += t * unpackHalf2x16(uint(p.forget.v[wo + r * p.n])).x;
+    }
+    float x = p.cur.v[min(j, p.nins - 1) * p.n + c];
+    p.o.v[j * p.n + c] = x - tanh(clamp(f, -10.0, 10.0)) * x + tanh(clamp(g, -10.0, 10.0)) * p.msg.v[j * p.n + c];
+}

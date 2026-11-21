@@ -283,6 +283,28 @@ pub trait Backend: Send {
     /// Inkling's activation on `rows` rows of 2n floats at `y`, n gates then n ups: each gate becomes
     /// beta*tanh(gate/beta) * sigmoid(gate) * lb*tanh(up/lb) (`lb` not above 0: times the up as it is).
     fn situ(&self, _y: u64, _n: usize, _rows: usize, _beta: f32, _lb: f32) -> anyhow::Result<()> { anyhow::bail!("{}: SITU not implemented", self.name()) }
+    // Inkling 2's decode token on the device (`inkling2::device`); the host math is in `inkling2::forward`.
+    /// Depth mix: `out[j]` (n floats each, j < nq) = the softmax-weighted sum of the RMS-normed states, scored by
+    /// query row j of `q`. The states are the `nb` rows of `blocks` (the newest last) and `cur`.
+    fn ink_mix(&self, _blocks: u64, _nb: usize, _cur: u64, _q: u64, _nq: usize, _out: u64, _n: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
+    /// `count` loop controllers: `out[j] = cur_j - tanh(forget)*cur_j + tanh(gain)*msg[j]`, `cur_j` row
+    /// `min(j, nins - 1)` of `cur`. `down` (`[rank][2n]`), `gain` and `forget` (`[rank][n]`) are f16, a controller
+    /// after another. `gate`: `count * rank` floats of scratch.
+    fn ink_ctrl(&self, _down: u64, _gain: u64, _forget: u64, _cur: u64, _nins: usize, _msg: u64, _gate: u64, _out: u64, _n: usize, _rank: usize, _count: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
+    /// Short causal convolution with a residual, `out` may be `cur`: weights `w` `[channel][lag]`, the last
+    /// `n_conv - 1` inputs in `hist` (advanced by `cur`), and input-dependent `taps` `[channel / per][lag]` or 0.
+    fn ink_conv(&self, _cur: u64, _w: u64, _taps: u64, _hist: u64, _out: u64, _n: usize, _n_conv: usize, _per: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
+    /// `rows` rows of `w` (at most 128) floats at `x`, in place: times `scale` (per value, or 0), then each row
+    /// scaled to an L2 norm of at most `thr`, or with `thr` 0 to an RMS of 1 (`eps`); then times `mul`. `dst` not 0:
+    /// the result also goes there as f16.
+    fn ink_clip(&self, _x: u64, _scale: u64, _w: usize, _rows: usize, _thr: f32, _eps: f32, _mul: f32, _dst: u64) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
+    /// Attention of one token over `rows` f16 key and value rows (`nkv * hd` wide; the token's own row is `at`, the
+    /// row before it `at - 1` modulo `rows`). Logit: q.k / sqrt(hd) + r.bias[distance] (distance < `ext`) - sink, a
+    /// softmax with one more logit of 0, times sigmoid(gate). `hd` divides 128. `sc`: `nh * rows.div_ceil(64) * (hd + 2)`
+    /// floats of scratch.
+    fn ink_attn(&self, _q: u64, _r: u64, _sink: u64, _gate: u64, _k: u64, _v: u64, _bias: u64, _sc: u64, _out: u64, _rows: usize, _at: usize, _nh: usize, _nkv: usize, _hd: usize, _nr: usize, _ext: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
+    /// `acc[c] = cpu[c] + sum over e < ne of wts[e] * d[e * n + c]`.
+    fn ink_ffn_sum(&self, _acc: u64, _d: u64, _wts: u64, _ne: usize, _n: usize, _cpu: u64) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
     /// Gyro files (`config::Hadamard`): each of `rows` rows of n floats at `x` (times silu(x) * u first when `u` is
     /// not 0) becomes H (s x) per `block` values, written to `out`, which may be `x`. `s`: the row's n signs as floats.
     fn hadamard(&self, _x: u64, _u: u64, _s: u64, _out: u64, _n: usize, _block: usize, _rows: usize) -> anyhow::Result<()> {

@@ -1,0 +1,22 @@
+#version 460
+layout(local_size_x = 128) in;
+#include "common.glsl"
+layout(push_constant) uniform P { F32 x; F32 scale; U16 dst; uint w; float thr; float eps; float mul; } p;
+
+// One workgroup per row of w values (w at most 128): times scale (may be null), then the row scaled to an L2 norm of
+// at most thr, or (thr 0) to an RMS of 1; times mul. dst not null: the result also as f16. CUDA: ink_clip.
+void main() {
+    uint t = gl_LocalInvocationID.x, at = gl_WorkGroupID.x * p.w + t;
+    float v = 0.0;
+    if (t < p.w) {
+        v = p.x.v[at];
+        if (uint64_t(p.scale) != 0) v *= p.scale.v[at];
+    }
+    float ss = block_sum(v * v);
+    float f = (p.thr > 0.0 ? min(fdiv(p.thr, sqrt_(ss) + 1e-6), 1.0) : fdiv(1.0, sqrt_(fdiv(ss, float(p.w)) + p.eps))) * p.mul;
+    if (t < p.w) {
+        v *= f;
+        p.x.v[at] = v;
+        if (uint64_t(p.dst) != 0) p.dst.v[at] = uint16_t(f2h(v));
+    }
+}

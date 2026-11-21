@@ -17,11 +17,12 @@ const QTYPES: [GgmlType; 27] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_1, Q5_1, Q4_0, Q5_0]
 };
-const KERNELS: [&str; 39] = [
+const KERNELS: [&str; 47] = [
     "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "dflash2_conv", "hadamard",
+    "ink_mix", "ink_ctrl_gate", "ink_ctrl_out", "ink_conv", "ink_clip", "ink_attn", "ink_attn_merge", "ink_ffn_sum",
 ];
 
 pub use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
@@ -1050,6 +1051,33 @@ impl Backend for Gpu {
         launch!(self, "situ", Self::grid(n * rows), y, n as i32, rows as i32, beta, lb);
         Ok(())
     }
+    fn ink_mix(&self, blocks: u64, nb: usize, cur: u64, q: u64, nq: usize, out: u64, n: usize) -> anyhow::Result<()> {
+        launch!(self, "ink_mix", cfg((nq as u32, 1), 256, 0), blocks, nb as i32, cur, q, out, n as i32);
+        Ok(())
+    }
+    fn ink_ctrl(&self, down: u64, gain: u64, forget: u64, cur: u64, nins: usize, msg: u64, gate: u64, out: u64, n: usize, rank: usize, count: usize) -> anyhow::Result<()> {
+        launch!(self, "ink_ctrl_gate", cfg((rank as u32, count as u32), 256, 0), down, cur, nins as i32, msg, gate, n as i32, rank as i32);
+        launch!(self, "ink_ctrl_out", cfg((n.div_ceil(256) as u32, count as u32), 256, 0), gain, forget, gate, cur, nins as i32, msg, out, n as i32, rank as i32);
+        Ok(())
+    }
+    fn ink_conv(&self, cur: u64, w: u64, taps: u64, hist: u64, out: u64, n: usize, n_conv: usize, per: usize) -> anyhow::Result<()> {
+        launch!(self, "ink_conv", Self::grid(n), cur, w, taps, hist, out, n as i32, n_conv as i32, per as i32);
+        Ok(())
+    }
+    fn ink_clip(&self, x: u64, scale: u64, w: usize, rows: usize, thr: f32, eps: f32, mul: f32, dst: u64) -> anyhow::Result<()> {
+        launch!(self, "ink_clip", cfg((rows as u32, 1), 128, 0), x, scale, w as i32, thr, eps, mul, dst);
+        Ok(())
+    }
+    fn ink_attn(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, rows: usize, at: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
+        let chunks = rows.div_ceil(64) as u32;
+        launch!(self, "ink_attn", cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, rows as i32, at as i32, nkv as i32, hd as i32, nr as i32, ext as i32);
+        launch!(self, "ink_attn_merge", cfg((nh as u32, 1), 128, 0), sc, gate, out, chunks as i32, hd as i32);
+        Ok(())
+    }
+    fn ink_ffn_sum(&self, acc: u64, d: u64, wts: u64, ne: usize, n: usize, cpu: u64) -> anyhow::Result<()> {
+        launch!(self, "ink_ffn_sum", Self::grid(n), acc, d, wts, ne as i32, n as i32, cpu);
+        Ok(())
+    }
     fn hadamard(&self, x: u64, u: u64, s: u64, out: u64, n: usize, block: usize, rows: usize) -> anyhow::Result<()> {
         anyhow::ensure!(block <= 1024, "prism.hadamard.block_size {block}: at most 1024 on the GPU");
         launch!(self, "hadamard", cfg(((rows * n / block) as u32, 1), block as u32, 0), x, u, s, out, n as i32, block as i32, 1.0 / (block as f32).sqrt());
@@ -1389,8 +1417,8 @@ mod tests {
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 335);
-        assert_eq!(sm70.len(), 291);
+        assert_eq!(sm80.len(), 343);
+        assert_eq!(sm70.len(), 299);
         assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmis")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());

@@ -1,0 +1,22 @@
+#version 460
+layout(local_size_x = 256) in;
+#include "common.glsl"
+layout(push_constant) uniform P { U16 down; F32 cur; F32 msg; F32 gate; uint nins; uint n; uint rank; } p;
+
+// Inkling 2's loop controllers, the gates: workgroup (r, j) is row r of controller j's down matrix (f16, [rank][2n])
+// on [rms_norm(cur_j) | rms_norm(msg_j)]. CUDA: ink_ctrl_gate.
+void main() {
+    uint r = gl_WorkGroupID.x, j = gl_WorkGroupID.y;
+    uint wo = (j * p.rank + r) * 2 * p.n, co = min(j, p.nins - 1) * p.n, mo = j * p.n;
+    float a = 0.0, b = 0.0, sa = 0.0, sb = 0.0;
+    for (uint i = gl_LocalInvocationID.x; i < p.n; i += 256) {
+        float c = p.cur.v[co + i], m = p.msg.v[mo + i];
+        a += unpackHalf2x16(uint(p.down.v[wo + i])).x * c;
+        b += unpackHalf2x16(uint(p.down.v[wo + p.n + i])).x * m;
+        sa += c * c;
+        sb += m * m;
+    }
+    a = block_sum(a); b = block_sum(b); sa = block_sum(sa); sb = block_sum(sb);
+    if (gl_LocalInvocationID.x == 0)
+        p.gate.v[j * p.rank + r] = fdiv(a, sqrt_(fdiv(sa, float(p.n)) + 1e-6)) + fdiv(b, sqrt_(fdiv(sb, float(p.n)) + 1e-6));
+}

@@ -259,15 +259,18 @@ the two runs, and the two runs):
 
 | Backend | Prefill 64 / 512 / 2048 tokens (tok/s) | Decode after them (tok/s) |
 |---|---|---|
-| CUDA | 120.7 (59.2, 182.2) / 259.2 (254.6, 263.9) / 220.2 (218.7, 221.8) | 29.9 / 27.1 / 25.6 |
-| Vulkan (same card) | 82.7 (34.5, 130.9) / 226.9 (226.6, 227.1) / 182.6 (179.0, 186.2) | 21.5 / 20.9 / 19.8 |
-| CPU only (`STRATA_DS_GPU=0`) | 47.5 / 49.8 / 48.2 | 12.0 / 11.6 / 11.3 |
+| CUDA | 120.7 (59.2, 182.2) / 259.2 (254.6, 263.9) / 220.2 (218.7, 221.8) | 34.5 / 31.2 / 31.2 |
+| Vulkan (same card) | 82.7 (34.5, 130.9) / 226.9 (226.6, 227.1) / 182.6 (179.0, 186.2) | 27.3 / 27.5 / 24.5 |
+| CPU only (`STRATA_DS_GPU=0`) | 47.5 / 49.8 / 48.2 | 11.8 / 11.6 / 10.9 |
 
-The first run of the 64-token prompt is the first work of the process and is the slow one of the two.
+The first run of the 64-token prompt is the first work of the process and is the slow one of the two. The decode
+column was measured again after a decoded token moved onto the GPU (attention, controllers and mixes in VRAM, one
+round trip per layer run for the CPU experts), with the GPU shared with a desktop; the prefill path did not change
+(alternating runs within 1-4%). `STRATA_DS_DEVICE=0` runs a decoded token on the host like the prompt.
 llama.cpp c622f62 built with CUDA, in the same session (`llama-bench -t 6 -r 2`; `-ngl 99` runs out of VRAM):
 with `-ngl 18` prefill 124.7 / 383.9 / 322.6 tok/s and decode 8.7 tok/s, with `-ngl 0` prefill 122.3 / 377.5 tok/s
 (64 / 512) and decode 10.5 tok/s. So on this box the prompt is read at 0.6-0.7 of llama.cpp's speed from 512 tokens
-on, and the reply is written 2.4-3.4 times as fast. `llama-bench` decodes from an empty context and `bench` decodes
+on, and the reply is written 3.0-4.0 times as fast. `llama-bench` decodes from an empty context and `bench` decodes
 after the prompt. More in [BENCHMARKS.md](docs/BENCHMARKS.md#inkling-2-mini-iq4_nl-176-gb).
 Not measured: an AMD or Intel card (the Vulkan path was run on the RTX 3060 only) and more than one card.
 

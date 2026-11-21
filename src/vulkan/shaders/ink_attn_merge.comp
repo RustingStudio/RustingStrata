@@ -1,0 +1,19 @@
+#version 460
+layout(local_size_x = 128) in;
+#include "common.glsl"
+layout(push_constant) uniform P { F32 sc; F32 gate; F32 o; uint chunks; uint hd; } p;
+
+// Second dispatch of Inkling 2's attention: one workgroup per head joins the chunks of ink_attn with the sink, one
+// more logit of 0 with no value, and applies sigmoid(gate). CUDA: ink_attn_merge.
+void main() {
+    uint h = gl_WorkGroupID.x, t = gl_LocalInvocationID.x, w = p.hd + 2, b = h * p.chunks * w;
+    float mx = 0.0;
+    for (uint j = 0; j < p.chunks; j++) mx = max(mx, p.sc.v[b + j * w]);
+    float z = expf_(-mx), o = 0.0;
+    for (uint j = 0; j < p.chunks; j++) {
+        float e = expf_(p.sc.v[b + j * w] - mx);
+        z += p.sc.v[b + j * w + 1] * e;
+        if (t < p.hd) o += p.sc.v[b + j * w + 2 + t] * e;
+    }
+    if (t < p.hd) p.o.v[h * p.hd + t] = fdiv(o, z) * sigmoid(p.gate.v[h * p.hd + t]);
+}

@@ -1,0 +1,20 @@
+#version 460
+layout(local_size_x = 256) in;
+#include "common.glsl"
+layout(push_constant) uniform P { F32 cur; F32 w; F32 taps; F32 hist; F32 o; uint n; uint nc; uint per; } p;
+
+// Inkling 2's short causal convolution with a residual (nc at most 8; out may be cur): hist holds the last nc - 1
+// inputs, the oldest first, and is advanced by cur. taps ([c / per][lag], lag 0 the current input) may be null.
+// CUDA: ink_conv.
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= p.n) return;
+    bool taps = uint64_t(p.taps) != 0;
+    float x[8], o = 0.0;
+    for (uint k = 0; k + 1 < p.nc; k++) x[k] = p.hist.v[k * p.n + c];
+    x[p.nc - 1] = p.cur.v[c];
+    for (uint k = 0; k < p.nc; k++) o += x[k] * p.w.v[c * p.nc + k];
+    if (taps) for (uint lag = 0; lag < p.nc; lag++) o += x[p.nc - 1 - lag] * p.taps.v[c / p.per * p.nc + lag];
+    p.o.v[c] = fdiv(x[p.nc - 1] + o, sqrt_(float((taps ? 2 * p.nc : p.nc) + 1)));
+    for (uint k = 0; k + 1 < p.nc; k++) p.hist.v[k * p.n + c] = x[k + 1];
+}

@@ -14,6 +14,8 @@ use anyhow::{Context, Result, ensure};
 use half::{f16, slice::HalfFloatSliceExt};
 use rayon::prelude::*;
 
+mod device;
+
 /// ponytail: the full-attention layers keep the rows of every position in host RAM (8 KiB a position and slot).
 pub const MAX_CTX: usize = 32768;
 /// Epsilon of the norms without a weight (depth mix, loop controllers).
@@ -87,8 +89,13 @@ pub struct Inkling2Model<'a> {
     pub trace: bool,
     /// Seconds per part of a token, printed with `STRATA_DS_PROF`; see `PROF`.
     prof: [std::cell::Cell<f64>; PROF.len()],
+    /// The state of `step` in VRAM, made by the first `step`. `no_device`: it cannot be made, `run` does every token.
+    device: Option<Box<device::Device>>,
+    no_device: bool,
 }
 
+/// A token of `device` counts all the device work before the router as "mix": the queue runs while the host waits
+/// for the router's input.
 const PROF: [&str; 8] = ["mix", "proj", "scores", "out-proj", "route", "experts-gpu", "experts-cpu", "logits"];
 
 /// A tensor read from the mapped file only: never uploaded.
@@ -480,6 +487,8 @@ impl<'a> Inkling2Model<'a> {
             toks: vec![],
             trace: std::env::var_os("STRATA_DS_TRACE").is_some(),
             prof: Default::default(),
+            device: None,
+            no_device: false,
             cfg,
         })
     }
@@ -487,6 +496,7 @@ impl<'a> Inkling2Model<'a> {
     pub fn reset(&mut self) {
         for s in &mut self.slots { *s = Slot::default(); }
         self.toks.clear();
+        if let Some(d) = &mut self.device { d.forget(); }
     }
 
     /// Add the time since `t` to part `i` of the profile; returns the time now.
@@ -641,8 +651,10 @@ impl<'a> Inkling2Model<'a> {
         (fixed.unwrap_or(share.get()).clamp(0.0, 1.0), fixed.is_some())
     }
 
-    /// MoE of one token with the weights of layer `ip`.
-    fn ffn(&self, ip: usize, x: &[f32]) -> Vec<f32> {
+    /// The routed experts of one token in layer `ip`: those of the GPU as `(gate_up, expert, weight)`, those of the
+    /// CPU as `(gate_up, down, weight)`, and whether the CPU share follows the two times.
+    #[allow(clippy::type_complexity)]
+    fn plan(&self, ip: usize, x: &[f32]) -> (Vec<(Mat<'a>, usize, f32)>, Vec<(Mat<'a>, Mat<'a>, f32)>, bool) {
         let (cfg, l) = (&self.cfg, &self.layers[ip]);
         let ne = cfg.n_expert;
         let t = std::time::Instant::now();
@@ -657,7 +669,6 @@ impl<'a> Inkling2Model<'a> {
         // share; 0 (also `--fixed-experts`) runs every expert on the GPU: the same numerics on every run.
         self.lap(4, t);
         let (share, fixed) = self.share(&self.cpu_share);
-        let on = |m: &Mat<'a>, e: usize| { let x = m.expert_opt(e, ne, true); if x.gpu.is_some() { x } else { x.staged() } };
         let gus: Vec<Mat> = sel.iter().map(|s| l.gate_up.expert_opt(s.0, ne, share == 0.0)).collect();
         let n_miss = gus.iter().filter(|m| m.gpu.is_none()).count();
         let mut left = (share * n_miss as f32).round() as usize;
@@ -670,17 +681,30 @@ impl<'a> Inkling2Model<'a> {
                 on_gpu.push((gu, e, w));
             }
         }
+        (on_gpu, on_cpu, !fixed && n_miss > 0)
+    }
+
+    /// The GPU's experts of `plan` with both matrices in VRAM: in a cache slot, or copied up for this use.
+    fn resident(l: &Layer<'a>, ne: usize, on_gpu: &[(Mat<'a>, usize, f32)]) -> Vec<(Mat<'a>, Mat<'a>, f32)> {
+        let on = |m: &Mat<'a>, e: usize| { let x = m.expert_opt(e, ne, true); if x.gpu.is_some() { x } else { x.staged() } };
+        on_gpu.iter().map(|&(gu, e, w)| (if gu.gpu.is_some() { gu } else { on(&l.gate_up, e) }, on(&l.down, e), w)).collect()
+    }
+
+    /// MoE of one token with the weights of layer `ip`.
+    fn ffn(&self, ip: usize, x: &[f32]) -> Vec<f32> {
+        let (cfg, l) = (&self.cfg, &self.layers[ip]);
+        let ne = cfg.n_expert;
+        let (on_gpu, on_cpu, adapt) = self.plan(ip, x);
         let gpu_side = || {
             let t = std::time::Instant::now();
-            let list: Vec<_> = on_gpu.iter().map(|&(gu, e, w)| (if gu.gpu.is_some() { gu } else { on(&l.gate_up, e) }, on(&l.down, e), w)).collect();
-            (run_experts(&list, x, cfg), t.elapsed().as_secs_f32())
+            (run_experts(&Self::resident(l, ne, &on_gpu), x, cfg), t.elapsed().as_secs_f32())
         };
         let cpu_side = || {
             let t = std::time::Instant::now();
             (run_experts(&on_cpu, x, cfg), t.elapsed().as_secs_f32())
         };
         let ((a, tg), (b, tc)) = rayon::join(gpu_side, cpu_side);
-        self.balance(&self.cpu_share, !fixed && n_miss > 0, tg, tc);
+        self.balance(&self.cpu_share, adapt, tg, tc);
         a.iter().zip(&b).map(|(a, b)| a + b).collect()
     }
 
@@ -835,6 +859,27 @@ impl<'a> Inkling2Model<'a> {
 
     /// Run one token. Returns the logits of the next one.
     pub fn step(&mut self, tok: u32) -> Vec<f32> {
+        let (pos, t0) = (self.toks.len(), std::time::Instant::now());
+        if self.device.is_none() && !self.no_device {
+            self.device = device::Device::new(self).map(Box::new);
+            self.no_device = self.device.is_none();
+        }
+        if let Some(mut d) = self.device.take() {
+            match d.prepare(self, pos) {
+                Ok(()) => {
+                    let logits = d.step(self, tok);
+                    self.device = Some(d);
+                    self.toks.push(tok);
+                    self.report(pos, 1, t0);
+                    return logits;
+                }
+                Err(e) => {
+                    eprintln!("inkling2: no room in VRAM for the decode state ({e:#}); the tokens run as prompt chunks do");
+                    d.to_host(&self.cfg, &self.layers, &mut self.slots, pos);
+                    self.no_device = true;
+                }
+            }
+        }
         self.run(&[tok], true)
     }
 
@@ -853,6 +898,7 @@ impl<'a> Inkling2Model<'a> {
         let cfg = self.cfg.clone();
         let (pos, nt) = (self.toks.len(), toks.len());
         let t0 = std::time::Instant::now();
+        if let Some(d) = &mut self.device { d.to_host(&cfg, &self.layers, &mut self.slots, pos); }
         assert!(pos + nt <= MAX_CTX, "context is limited to {MAX_CTX} tokens");
         let n = cfg.n_embd;
         let mut cur: Vec<Vec<f32>> = toks.iter().map(|&tok| {
@@ -894,6 +940,12 @@ impl<'a> Inkling2Model<'a> {
             if cfg.softcap != 0.0 { logits.par_iter_mut().for_each(|v| *v = cfg.softcap * (*v / cfg.softcap).tanh()); }
         }
         self.lap(7, t);
+        self.report(pos, nt, t0);
+        logits
+    }
+
+    /// The `STRATA_DS_PROF` line of `nt` tokens run from `pos` on.
+    fn report(&self, pos: usize, nt: usize, t0: std::time::Instant) {
         if std::env::var_os("STRATA_DS_PROF").is_some() {
             use std::sync::atomic::Ordering::Relaxed;
             let ex = &crate::deepseek::mat::EX_LOOKUPS;
@@ -901,7 +953,6 @@ impl<'a> Inkling2Model<'a> {
             eprintln!("PROF pos {pos}, {nt} tokens: {:.1} ms ({}), expert cache hit {} miss {}, cpu share {:.2} chunk {:.2}",
                 t0.elapsed().as_secs_f64() * 1e3, parts.join(", "), ex[0].swap(0, Relaxed), ex[1].swap(0, Relaxed), self.cpu_share.get(), self.chunk_share.get());
         }
-        logits
     }
 }
 

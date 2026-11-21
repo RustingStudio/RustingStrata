@@ -6,12 +6,18 @@ layout(constant_id = 1) const uint T = 0;
 layout(constant_id = 2) const uint SBB = 1024;
 // With SHARED_TABLES defined, the IQ3_S / IQ3_XXS / IQ2_S grids come from shared memory, which the shader fills
 // with load_tables (all its invocations) first; the IQ4_NL LUT lives directly in register constants.
-const uint IQ4_LUT_W[4] = uint[4](0xbfad9881u, 0xf6eaddcfu, 0x26190d01u, 0x71594535u);
-int iq4_lut(uint nib) { return int(IQ4_LUT_W[nib >> 2u] << (24u - 8u * (nib & 3u))) >> 24; }
+// Bytes of kvalues_iq4nl 0-7 and 8-15. A select and a shift: a constant array indexed per value ran IQ4_NL at a
+// third of the speed of Q4_0.
+int iq4_lut(uint nib) {
+    uint64_t t = nib < 8u ? 0xF6EADDCFBFAD9881ul : 0x7159453526190D01ul;
+    return int(uint(t >> (8u * (nib & 7u))) << 24) >> 24;
+}
 #ifdef SHARED_TABLES
 // Sized by T (1 entry for the other types), so only the table in use takes shared memory.
 shared uint s_g3[T == 21 ? 512 : (T == 18 ? 256 : 1)];
 shared uint64_t s_g2[T == 22 ? 1024 : 1];
+// IQ4_NL / IQ4_XS: the values of two codes (the low nibble of the index, then the high) as the two low bytes.
+shared uint s_iq4[T == 20 || T == 23 ? 256 : 1];
 #define IQ3S_GRID s_g3
 #define IQ3XXS_GRID s_g3
 #define IQ2S_GRID s_g2
@@ -75,6 +81,7 @@ void load_tables() {
     if (T == 18) { for (uint i = li; i < 256; i += n) s_g3[i] = iq3xxs_grid[i]; barrier(); }
     if (T == 21) { for (uint i = li; i < 512; i += n) s_g3[i] = iq3s_grid[i]; barrier(); }
     if (T == 22) { for (uint i = li; i < 1024; i += n) s_g2[i] = iq2s_grid[i]; barrier(); }
+    if (T == 20 || T == 23) { for (uint i = li; i < 256; i += n) s_iq4[i] = uint(iq4_lut(i & 15) & 255) | uint(iq4_lut(i >> 4) & 255) << 8; barrier(); }
 }
 #endif
 // Bytewise a - c (each byte of a below 128; CUDA __vsub4).
@@ -196,6 +203,21 @@ void iq_grid(U8 w, uint b, uint ib, uint l, out uint g0, out uint g1, out uint s
 // 32-bit add since no grid byte is 0 (no carries).
 uint apply_signs(uint g, uint s) { uint n = (s * 0x00204081u) & 0x01010101u; return (g ^ (n * 0xFFu)) + n; }
 
+// IQ4_XS (23) or IQ4_NL (20, 8 blocks of 18): scale and byte offset of the codes of values [8 sub, 8 sub + 8).
+void iq4_at(U8 w, uint b, uint sub, out uint o, out float d) {
+    uint ib = sub >> 2, r = (sub & 3) * 8;
+    if (T == 23) {
+        uvec2 hd = ld8(w, b);  // d, scales_h, scales_l
+        uint ls = ((hd.y >> (4 * ib)) & 15) | ((hd.x >> (16 + 2 * ib)) & 3) << 4;
+        d = h2f(hd.x & 0xFFFF) * float(int(ls) - 32);
+        o = b + 8 + 16 * ib + (r & 15);
+    } else {
+        uint p = b + 18 * ib;
+        d = ldh(w, p);
+        o = p + 2 + (r & 15);
+    }
+}
+
 // Values [8 sub, 8 sub + 8) of the quantized super-block at byte b as value i = d * q[i] - m with q[i] an int8
 // (QI<T> in kernels.cu).
 void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
@@ -238,16 +260,7 @@ void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
         [[unroll]] for (uint i = 0; i < 8; i++) q[i] = int((u8_(w, b + 32 * j + m + i) >> (2 * l)) & 3) - 1;
     } else {  // IQ4_XS (23), IQ4_NL (20, 8 blocks of 18)
         uint r = l * 8, o;
-        if (T == 23) {
-            uvec2 hd = ld8(w, b);  // d, scales_h, scales_l
-            uint ls = ((hd.y >> (4 * ib)) & 15) | ((hd.x >> (16 + 2 * ib)) & 3) << 4;
-            d = h2f(hd.x & 0xFFFF) * float(int(ls) - 32);
-            o = b + 8 + 16 * ib + (r & 15);
-        } else {
-            uint p = b + 18 * ib;
-            d = ldh(w, p);
-            o = p + 2 + (r & 15);
-        }
+        iq4_at(w, b, sub, o, d);
         uvec2 v = ld8(w, o);
         [[unroll]] for (uint i = 0; i < 8; i++) q[i] = iq4_lut(((i < 4 ? v.x : v.y) >> (8 * (i & 3) + (r < 16 ? 0 : 4))) & 15);
     }
@@ -270,6 +283,18 @@ void qw(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out float
         lo = vsub4(q, 0x01010101u); hi = vsub4(c, 0x01010101u);
         return;
     }
+#ifdef SHARED_TABLES
+    if (T == 20 || T == 23) {  // two codes a table lookup
+        uint o;
+        m = 0.0;
+        iq4_at(w, b, sub, o, d);
+        uvec2 v = ld8(w, o);
+        uint sh = (sub & 3) < 2 ? 0 : 4, a = (v.x >> sh) & 0x0F0F0F0Fu, c = (v.y >> sh) & 0x0F0F0F0Fu;
+        lo = s_iq4[(a & 15u) | ((a >> 4) & 0xF0u)] | s_iq4[((a >> 16) & 15u) | ((a >> 20) & 0xF0u)] << 16;
+        hi = s_iq4[(c & 15u) | ((c >> 4) & 0xF0u)] | s_iq4[((c >> 16) & 15u) | ((c >> 20) & 0xF0u)] << 16;
+        return;
+    }
+#endif
     int q[8];
     qi8(w, b, sub, q, d, m);
     lo = pack4(q[0], q[1], q[2], q[3]); hi = pack4(q[4], q[5], q[6], q[7]);
