@@ -117,7 +117,7 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   the chat page, the model list, `/health` and the stats do not. The file stays in the page cache (`buff/cache`,
   which the system takes back when it needs the memory), so the load after an unload is faster than the first one.
   The saved conversation (prompt cache) goes with the model: the first request after a load prefills its whole
-  prompt. Not available for `gemma4`, `glm5-next`, `deepseek41` and `hy_v4_flash` models.
+  prompt. Not available for `gemma4`, `glm5-next`, `deepseek41`, `hy_v4_flash` and `inkling2_loop` models.
 - `--lora PATH:SCALE` applies a LoRA adapter at runtime, see [LORA.md](LORA.md).
 - `--mcp FILE` (`serve` only, or `STRATA_MCP`) lists the MCP servers whose tools the chat page may call, see
   [Tools (MCP)](#tools-mcp).

@@ -27,6 +27,9 @@ const JOYAI_RE: [&str; 3] = [
 ];
 
 /// llama.cpp `LLAMA_VOCAB_PRE_TYPE_FLINT`: digits in groups of three, CJK runs, then Llama-3-style words.
+/// GPT-4o (o200k), used by Inkling 2: case-aware words with an optional contraction, digits in groups of three.
+const GPT4O_RE: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 const FLINT_RE: [&str; 3] = [
     r"\p{N}{1,3}",
     "[一-龥぀-ゟ゠-ヿ]+",
@@ -48,6 +51,7 @@ impl Tokenizer {
             "qwen35" => &[QWEN35_RE], "qwen2" => &[QWEN2_RE], "joyai-llm" | "hy_v4" => &JOYAI_RE,
             "flint" => &FLINT_RE,
             "glm4" | "glm5" | "chatglm-bpe" => &[GLM4_RE],
+            "inkling2" => &[GPT4O_RE],
             _ => bail!("unsupported pre-tokenizer '{pre}'"),
         };
         let strs = |k: &str| -> anyhow::Result<Vec<String>> {
@@ -87,6 +91,7 @@ impl Tokenizer {
         for t in ["<|im_end|>", "<|endoftext|>"] {
             if let Some(id) = inner.token_to_id(t) && !eos.contains(&id) { eos.push(id); }
         }
+        if pre == "inkling2" && let Some(id) = inner.token_to_id("<|content_model_end_sampling|>") && !eos.contains(&id) { eos.push(id); }
         if pre == "flint" {
             // llama.cpp treats these turn markers as end of generation for Flint.
             for t in ["<|user|>", "<|observation|>"] {

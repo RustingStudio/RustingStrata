@@ -71,6 +71,7 @@ const SPV: &[(&str, &[u8])] = &[
     ("rope_neox", include_bytes!("spv/rope_neox.spv")),
     ("router_topk", include_bytes!("spv/router_topk.spv")),
     ("ssm_gates", include_bytes!("spv/ssm_gates.spv")),
+    ("situ", include_bytes!("spv/situ.spv")),
     ("swiglu", include_bytes!("spv/swiglu.spv")),
     // quant_xq under another name, so that it gets no barrier inside a batch: its output is read after the batch.
     ("swiglu_q", include_bytes!("spv/quant_xq.spv")),
@@ -1333,6 +1334,9 @@ impl Backend for Vk {
     }
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()> { self.run("add", &[], [n.div_ceil(256), 1, 1], &[&x, &y, &(n as u32)]) }
     fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()> { self.run("swiglu", &[], [n.div_ceil(256), 1, 1], &[&g, &u, &(n as u32)]) }
+    fn situ(&self, y: u64, n: usize, rows: usize, beta: f32, lb: f32) -> anyhow::Result<()> {
+        self.run("situ", &[], [(n * rows).div_ceil(256), 1, 1], &[&y, &(n as u32), &(rows as u32), &beta, &lb])
+    }
     fn hadamard(&self, x: u64, u: u64, s: u64, out: u64, n: usize, block: usize, rows: usize) -> anyhow::Result<()> {
         // ponytail: a block is one workgroup, and 128 invocations is what every Vulkan device takes; a larger block
         // needs maxComputeWorkGroupInvocations checked.

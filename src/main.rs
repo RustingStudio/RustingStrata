@@ -1108,6 +1108,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 return rusting_strata::hy4::chat::generate(&g, &prompt, n);
             }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::inkling2::ARCH) {
+                anyhow::ensure!(image.is_empty(), "--image is not supported for inkling2_loop");
+                let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
+                return rusting_strata::inkling2::chat::generate(&g, &prompt, n);
+            }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
@@ -1193,12 +1198,14 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let g = Gguf::open(&model)?;
             engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
             if let Some(arch) = g.get("general.architecture").ok().and_then(|v| v.as_str()) {
-                if arch == "deepseek41" || arch == "glm5-next" || arch == rusting_strata::hy4::ARCH {
+                if arch == "deepseek41" || arch == "glm5-next" || arch == rusting_strata::hy4::ARCH || arch == rusting_strata::inkling2::ARCH {
                     engine.ds_env();
                     return if arch == "deepseek41" {
                         bench_deepseek(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else if arch == rusting_strata::hy4::ARCH {
                         bench_hy4(&g, &model, &pp, tg, reps, json_out, &mut engine)
+                    } else if arch == rusting_strata::inkling2::ARCH {
+                        bench_inkling2(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else {
                         bench_glm(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     };
@@ -1264,6 +1271,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Check { model, backend, device } => {
             let g = Gguf::open(&model)?;
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::inkling2::ARCH) {
+                let m = rusting_strata::inkling2::forward::Inkling2Model::new(&g)?;
+                println!("check: inkling2_loop ok: {} layers ({} layer runs a token), {} experts ({} used), {} tensors, every tensor of the forward is present", m.cfg.n_layer, m.cfg.n_slot(), m.cfg.n_expert, m.cfg.n_used, g.tensors.len());
+                return Ok(());
+            }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::hy4::ARCH) {
                 let m = rusting_strata::hy4::forward::Hy4Model::new(&g)?;
                 println!("check: hy_v4_flash ok: {} layers, {} experts ({} used), {} tensors, every tensor of the forward is present", m.cfg.n_layer, m.cfg.n_expert, m.cfg.n_used, g.tensors.len());
@@ -1328,6 +1340,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 anyhow::ensure!(image.is_empty(), "--image is not supported for hy_v4_flash");
                 return rusting_strata::hy4::chat::chat(&g, system, n, think);
             }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::inkling2::ARCH) {
+                anyhow::ensure!(image.is_empty(), "--image is not supported for inkling2_loop");
+                return rusting_strata::inkling2::chat::chat(&g, system, n, think);
+            }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
@@ -1374,7 +1390,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             anyhow::ensure!(host.auto_unload != Some(0), "--auto-unload must be at least 1 second");
             // The four architectures below have their own servers, which keep the model for as long as they run.
             let arch = model.as_deref().and_then(Gguf::arch);
-            if host.auto_unload.is_some() && let Some(a) = arch.as_deref() && ["gemma4", "glm5-next", "deepseek41", rusting_strata::hy4::ARCH].contains(&a) {
+            if host.auto_unload.is_some() && let Some(a) = arch.as_deref() && ["gemma4", "glm5-next", "deepseek41", rusting_strata::hy4::ARCH, rusting_strata::inkling2::ARCH].contains(&a) {
                 anyhow::bail!("--auto-unload is not available for {a} models");
             }
             if let Some(mp) = &model && arch.as_deref() == Some("gemma4") {
@@ -1405,6 +1421,13 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
                 anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
                 return rusting_strata::hy4::chat::serve(&g, &name, &addr, key.as_deref());
+            }
+            if let Some(mp) = &model && arch.as_deref() == Some(rusting_strata::inkling2::ARCH) {
+                let g = Gguf::open(mp)?;
+                let name = mp.file_name().map_or("inkling2".into(), |n| n.to_string_lossy().into_owned());
+                let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
+                anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
+                return rusting_strata::inkling2::chat::serve(&g, &name, &addr, key.as_deref());
             }
             engine.parallel = host.parallel;
             // Before the model is loaded: a slot count outside 1..=255 is an invalid request, not a downgrade.
@@ -1766,11 +1789,13 @@ fn bench_deepseek(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, 
     write_bench_json(json_out, &meta, &results, expert.as_ref())
 }
 
-/// `strata bench` for Hy4-flash (token-by-token forward, GPU matvecs when enabled).
-fn bench_hy4(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {
+/// `strata bench` for a token-by-token forward (GPU matvecs when enabled).
+macro_rules! bench_tokenwise {
+    ($name:ident, $model:ty) => {
+fn $name(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {
     rusting_strata::deepseek::chat::gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
-    let mut m = rusting_strata::hy4::forward::Hy4Model::new(g)?;
+    let mut m = <$model>::new(g)?;
     let eos = tok.eos_ids();
     let mut results = Vec::with_capacity(pp.len());
     for &n in pp {
@@ -1805,6 +1830,10 @@ fn bench_hy4(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_
     };
     write_bench_json(json_out, &meta, &results, expert.as_ref())
 }
+    };
+}
+bench_tokenwise!(bench_hy4, rusting_strata::hy4::forward::Hy4Model);
+bench_tokenwise!(bench_inkling2, rusting_strata::inkling2::forward::Inkling2Model);
 
 /// `strata bench` for GLM-5.3-Flash (chunked reference forward, GPU matvecs when enabled).
 fn bench_glm(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {

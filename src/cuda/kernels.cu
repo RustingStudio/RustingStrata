@@ -1624,6 +1624,17 @@ extern "C" __global__ void swiglu(float* g, const float* u, int n) {
     if (i < n) g[i] = silu(g[i]) * u[i];
 }
 
+// Inkling's SITU on rows of 2n floats, n gates then n ups: gate = beta*tanh(gate/beta) * sigmoid(gate) * lb*tanh(up/lb)
+// (lb not above 0: times the up as it is).
+extern "C" __global__ void situ(float* y, int n, int rows, float beta, float lb) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * rows) return;
+    float* g = y + (size_t)(i / n) * 2 * n + i % n;
+    float u = g[n];
+    if (lb > 0.f) u = lb * tanhf(u / lb);
+    *g = beta * tanhf(*g / beta) / (1.f + expf(-*g)) * u;
+}
+
 // Gyro files (config::Hadamard): the routed experts read H (s x) in place of x, H the normalized Sylvester-Walsh-
 // Hadamard matrix over blocks of bs values (a power of two, at most 1024) and s the n signs of a row. One block of
 // bs threads per block of values, one butterfly stage per barrier, in the order of the CPU's transform (the same

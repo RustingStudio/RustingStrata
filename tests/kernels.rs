@@ -1006,6 +1006,21 @@ fn elementwise_ops_match_cpu() {
         let got = down::<f32>(gpu, &dg);
         assert!(rel_l2(&got, &want) < 1e-6);
         report("swiglu", &got, &want);
+        // situ: 3 rows of 2 * 200 floats, the gates of each row replaced; a zero linear beta leaves the up as it is.
+        for lb in [25.0f32, 0.0] {
+            let (nf, y) = (200, xs(1200).iter().map(|v| v * 12.0).collect::<Vec<f32>>());
+            let dy = up(gpu, &y);
+            gpu.situ(dy.addr(), nf, 3, 4.0, lb).unwrap();
+            let mut want = y.clone();
+            for r in want.chunks_exact_mut(2 * nf) {
+                for i in 0..nf {
+                    let up = if lb > 0.0 { lb * (r[nf + i] / lb).tanh() } else { r[nf + i] };
+                    r[i] = 4.0 * (r[i] / 4.0).tanh() / (1.0 + (-r[i]).exp()) * up;
+                }
+            }
+            let got = down::<f32>(gpu, &dy);
+            assert!(rel_l2(&got, &want) < 1e-6, "situ, linear beta {lb}");
+        }
         gpu.add(dg.addr(), du.addr(), n).unwrap();
         let want: Vec<f32> = want.iter().zip(&u).map(|(a, b)| a + b).collect();
         let got = down::<f32>(gpu, &dg);

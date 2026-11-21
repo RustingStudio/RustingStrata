@@ -280,6 +280,9 @@ pub trait Backend: Send {
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()>;
     /// g = silu(g) * u.
     fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()>;
+    /// Inkling's activation on `rows` rows of 2n floats at `y`, n gates then n ups: each gate becomes
+    /// beta*tanh(gate/beta) * sigmoid(gate) * lb*tanh(up/lb) (`lb` not above 0: times the up as it is).
+    fn situ(&self, _y: u64, _n: usize, _rows: usize, _beta: f32, _lb: f32) -> anyhow::Result<()> { anyhow::bail!("{}: SITU not implemented", self.name()) }
     /// Gyro files (`config::Hadamard`): each of `rows` rows of n floats at `x` (times silu(x) * u first when `u` is
     /// not 0) becomes H (s x) per `block` values, written to `out`, which may be `x`. `s`: the row's n signs as floats.
     fn hadamard(&self, _x: u64, _u: u64, _s: u64, _out: u64, _n: usize, _block: usize, _rows: usize) -> anyhow::Result<()> {

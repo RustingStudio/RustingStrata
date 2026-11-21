@@ -15,6 +15,8 @@ mod dev {
     /// Scratch slot for experts that missed the VRAM cache: copied up per use, so the CPU never dequantises them.
     pub const STAGE: usize = 16 << 20;
     pub const STAGED: u32 = u32::MAX;
+    /// Floats in each of the two activation scratch buffers of a GPU.
+    pub const SCRATCH: usize = 5_000_000;
     /// A tensor id holds its GPU in the top 8 bits (so STAGED, GPU 255, is never a real id) and its index there below.
     const SHIFT: u32 = 24;
     pub fn gpu_of(id: u32) -> usize { (id >> SHIFT) as usize }
@@ -44,7 +46,7 @@ mod dev {
             let total: usize = free.iter().sum();
             let parts = bes.into_iter().zip(&free).map(|(be, &f)| {
                 // Room for a prefill chunk of activations and outputs, so row batches reuse them instead of allocating per expert.
-                let (x, y, stage) = (be.alloc(4 * 5_000_000).ok()?, be.alloc(4 * 5_000_000).ok()?, be.alloc(STAGE).ok()?);
+                let (x, y, stage) = (be.alloc(4 * SCRATCH).ok()?, be.alloc(4 * SCRATCH).ok()?, be.alloc(STAGE).ok()?);
                 let budget = match gb {
                     Some(g) => (g * 1e9 * f as f64 / total as f64) as usize,
                     None => (f.saturating_sub(56 << 20) as f64 * frac) as usize,
@@ -168,19 +170,39 @@ mod dev {
             let mut off = 0;
             for (i, m) in ms.iter().enumerate() {
                 if off + m.rows > p.y.len() / 4 { return None; }
-                let w = match m.gpu? {
-                    STAGED => {
-                        let b = p.be.alloc(m.data.len()).ok()?;
-                        p.be.htod(m.data, &b, 0).ok()?;
-                        owned.push(GpuTensor::new(m.ty, m.rows, m.cols, b));
-                        owned.last().unwrap()
-                    }
-                    t => self.tensor(t),
-                };
-                p.be.gemv(w, p.x.addr() + (4 * i * xs) as u64, p.y.addr() + (4 * off) as u64).ok()?;
+                p.be.gemv(self.weight(p, m, &mut owned)?, p.x.addr() + (4 * i * xs) as u64, p.y.addr() + (4 * off) as u64).ok()?;
                 off += m.rows;
             }
             let y = p.be.get(&p.y, 0, off).ok()?;
+            drop(owned);
+            Some(y)
+        }
+        /// The device tensor of `m`. A staged expert is uploaded into a buffer that `owned` keeps until the readback.
+        fn weight<'b>(&'b self, p: &Part, m: &Mat, owned: &'b mut Vec<GpuTensor>) -> Option<&'b GpuTensor> {
+            Some(match m.gpu? {
+                STAGED => {
+                    let b = p.be.alloc(m.data.len()).ok()?;
+                    p.be.htod(m.data, &b, 0).ok()?;
+                    owned.push(GpuTensor::new(m.ty, m.rows, m.cols, b));
+                    owned.last().unwrap()
+                }
+                t => self.tensor(t),
+            })
+        }
+        /// Inkling's routed experts of one token in one round trip: `gus[i]` x (n gates, then n ups), the activation
+        /// on the device (`Backend::situ`), then `downs[i]` of that. The down outputs, one after another. None unless
+        /// the matrices share one GPU that has the kernel.
+        pub fn situ_experts(&self, gus: &[Mat], downs: &[Mat], x: &[f32], beta: f32, lb: f32) -> Option<Vec<f32>> {
+            let d = self.part_of(gus.first()?)?;
+            if gus.iter().chain(downs).any(|m| self.part_of(m) != Some(d)) { return None; }
+            let (p, ne, nf, nl) = (&self.parts[d], gus.len(), downs[0].cols, downs[0].rows);
+            if x.len() > p.x.len() / 4 || ne * (2 * nf + nl) > p.y.len() / 4 { return None; }
+            p.be.put(x, &p.x, 0).ok()?;
+            let (mut owned, at) = (vec![], |i: usize| p.y.addr() + (4 * i) as u64);
+            for (i, m) in gus.iter().enumerate() { p.be.gemv(self.weight(p, m, &mut owned)?, p.x.addr(), at(i * 2 * nf)).ok()?; }
+            p.be.situ(p.y.addr(), nf, ne, beta, lb).ok()?;
+            for (i, m) in downs.iter().enumerate() { p.be.gemv(self.weight(p, m, &mut owned)?, at(i * 2 * nf), at(ne * 2 * nf + i * nl)).ok()?; }
+            let y = p.be.get(&p.y, ne * 2 * nf, ne * nl).ok()?;
             drop(owned);
             Some(y)
         }
@@ -225,6 +247,108 @@ mod dev {
             drop(owned);
             Some(y)
         }
+        /// The routed experts of a chunk of tokens, all on the device. `x`: one row of activations a token. Expert i
+        /// (`gus[i]`: its gate rows then its up rows; `downs[i]`) runs on `pairs[i]`, a list of (token, slot of the
+        /// expert among the `k` of that token, router weight). Returns per token the weighted sum of these experts'
+        /// outputs: one upload and one readback of a row a token, whatever the number of pairs.
+        /// None when a matrix is on another GPU or the device has no room for the chunk.
+        pub fn situ_chunk(&self, gus: &[Mat], downs: &[Mat], pairs: &[Vec<(usize, usize, f32)>], x: &[f32], k: usize, beta: f32, lb: f32) -> Option<Vec<f32>> {
+            use crate::backend::GEMM_BM;
+            let d = self.part_of(gus.first()?)?;
+            if gus.iter().chain(downs).any(|m| self.part_of(m) != Some(d)) { return None; }
+            let (p, nf, nl) = (&self.parts[d], downs[0].cols, downs[0].rows);
+            let (nt, np) = (x.len() / nl, pairs.iter().map(|v| v.len()).sum::<usize>());
+            // GEMM tiles [weights, first pair | pairs << 32] of the gate and up matrices, then of the down ones;
+            // then per pair its token, and per (token, slot) the router weight and the pair (weight 0: not here).
+            let (mut owned, mut tiles, mut xrow) = (vec![], vec![], vec![]);
+            let (mut wts, mut inv) = (vec![0f32; nt * k], vec![0i32; nt * k]);
+            let mut shape = [(GgmlType::F32, 0, 0); 2];
+            for (side, mats) in [gus, downs].into_iter().enumerate() {
+                let mut m0 = 0;
+                for (m, ps) in mats.iter().zip(pairs) {
+                    let w = self.weight(p, m, &mut owned)?;
+                    shape[side] = (w.ty, w.rows, w.cols);
+                    for at in (0..ps.len()).step_by(GEMM_BM) {
+                        tiles.extend([w.ptr, (m0 + at) as u64 | (GEMM_BM.min(ps.len() - at) as u64) << 32]);
+                    }
+                    m0 += ps.len();
+                }
+            }
+            for &(t, j, w) in pairs.iter().flatten() {
+                (wts[t * k + j], inv[t * k + j]) = (w, xrow.len() as i32);
+                xrow.push(t as i32);
+            }
+            let (n_tiles, ints) = (tiles.len() / 4, 2 * tiles.len());
+            if x.len() > p.x.len() / 4 || ints + np + 2 * nt * k > p.y.len() / 4 { return None; }
+            // Zeroed: the sums, then per pair the gate and up rows, then per pair the down rows.
+            let b = p.be.alloc(4 * (nt * nl + np * (2 * nf + nl))).ok()?;
+            let (ia, ya) = (|i: usize| p.y.addr() + 4 * i as u64, |i: usize| b.addr() + 4 * i as u64);
+            let (gate_up, down) = (nt * nl, nt * nl + np * 2 * nf);
+            p.be.put(x, &p.x, 0).ok()?;
+            p.be.put(&tiles, &p.y, 0).ok()?;
+            p.be.put(&xrow, &p.y, ints).ok()?;
+            p.be.put(&wts, &p.y, ints + np).ok()?;
+            p.be.put(&inv, &p.y, ints + np + nt * k).ok()?;
+            let [(ty, rows, cols), (dty, drows, dcols)] = shape;
+            p.be.gemm(ty, rows, cols, ia(0), n_tiles, p.x.addr(), nl, nt, ia(ints), ya(gate_up), 2 * nf, 0).ok()?;
+            p.be.situ(ya(gate_up), nf, np, beta, lb).ok()?;
+            p.be.gemm(dty, drows, dcols, ia(4 * n_tiles), n_tiles, ya(gate_up), 2 * nf, np, 0, ya(down), nl, 0).ok()?;
+            p.be.moe_combine_seq(b.addr(), ya(down), ia(ints + np), ia(ints + np + nt * k), k, 0, 0, nl, nt).ok()?;
+            let y = p.be.get(&b, 0, nt * nl).ok()?;
+            drop(owned);
+            Some(y)
+        }
+        /// `rows` for several matrices on one chunk of `n` rows: matrix i reads input set `ms[i].1` of `x` (set after
+        /// set). One upload of the sets and one readback for all matrices. None when a matrix is staged or on
+        /// another GPU, or the chunk does not fit the scratch buffers.
+        pub fn rows_sets(&self, ms: &[(Mat, usize)], x: &[f32], n: usize) -> Option<Vec<f32>> {
+            let (d, cols) = (self.part_of(&ms.first()?.0)?, ms[0].0.cols);
+            if ms.iter().any(|(m, j)| self.part_of(m) != Some(d) || m.gpu == Some(STAGED) || m.cols != cols || (j + 1) * n * cols > x.len()) { return None; }
+            let p = &self.parts[d];
+            if n <= 4 || x.len() > p.x.len() / 4 || ms.iter().map(|m| n * m.0.rows).sum::<usize>() > p.y.len() / 4 { return None; }
+            p.be.put(x, &p.x, 0).ok()?;
+            let mut yo = 0;
+            for (m, j) in ms {
+                p.be.gemm_dense(self.tensor(m.gpu?), n, p.x.addr() + (4 * j * n * cols) as u64, cols, p.y.addr() + 4 * yo as u64, m.rows, 0).ok()?;
+                yo += n * m.rows;
+            }
+            p.be.get(&p.y, 0, yo).ok()
+        }
+        /// `rows` for several matrices: job i runs its matrix on its own `n` rows of `x` (after job i-1's rows).
+        /// One upload and one readback for all jobs. None when the batch does not fit the scratch buffers.
+        /// ponytail: None too when the weights are on different GPUs; batch per GPU if a multi-GPU prompt waits here.
+        pub fn rows_many(&self, jobs: &[(Mat, usize)], x: &[f32]) -> Option<Vec<f32>> {
+            let d = self.part_of(&jobs.first()?.0)?;
+            if jobs.iter().any(|j| self.part_of(&j.0) != Some(d)) { return None; }
+            let p = &self.parts[d];
+            let (nx, ny): (usize, usize) = jobs.iter().fold((0, 0), |a, (m, n)| (a.0 + n * m.cols, a.1 + n * m.rows));
+            if nx != x.len() || nx > p.x.len() / 4 || ny > p.y.len() / 4 { return None; }
+            p.be.put(x, &p.x, 0).ok()?;
+            let mut owned = vec![];
+            let (mut xo, mut yo) = (0, 0);
+            for (m, n) in jobs {
+                let w = match m.gpu? {
+                    STAGED => {
+                        let b = p.be.alloc(m.data.len()).ok()?;
+                        p.be.htod(m.data, &b, 0).ok()?;
+                        owned.push(GpuTensor::new(m.ty, m.rows, m.cols, b));
+                        owned.last().unwrap()
+                    }
+                    t => self.tensor(t),
+                };
+                let (xa, ya) = (p.x.addr() + 4 * xo as u64, p.y.addr() + 4 * yo as u64);
+                if *n <= 4 {
+                    p.be.gemvn(w, xa, m.cols, ya, m.rows, *n).ok()?;
+                } else {
+                    p.be.gemm_dense(w, *n, xa, m.cols, ya, m.rows, 0).ok()?;
+                }
+                xo += n * m.cols;
+                yo += n * m.rows;
+            }
+            let y = p.be.get(&p.y, 0, yo).ok()?;
+            drop(owned);
+            Some(y)
+        }
     }
 }
 /// Matvecs of several matrices on one activation (xs = 0) or on consecutive slices x[i*xs..] (xs > 0); outputs concatenated.
@@ -248,12 +372,82 @@ pub fn matvec_many_opt(ms: &[Mat], x: &[f32], xs: usize) -> Option<Vec<f32>> {
     dev::get().and_then(|d| d.lock().unwrap().batch_mats(ms, x, xs))
 }
 
+/// `Dev::situ_experts`, or None where it does not apply.
+/// `Dev::situ_chunk` on the open GPU path (None without one).
+pub fn situ_chunk(gus: &[Mat], downs: &[Mat], pairs: &[Vec<(usize, usize, f32)>], x: &[f32], k: usize, beta: f32, lb: f32) -> Option<Vec<f32>> {
+    dev::get().and_then(|d| d.lock().unwrap().situ_chunk(gus, downs, pairs, x, k, beta, lb))
+}
+pub fn situ_experts(gus: &[Mat], downs: &[Mat], x: &[f32], beta: f32, lb: f32) -> Option<Vec<f32>> {
+    dev::get().and_then(|d| d.lock().unwrap().situ_experts(gus, downs, x, beta, lb))
+}
+
 /// W x[t] for each row of `xs` (all rows of one matrix). Batches on the GPU when the weight is resident.
 pub fn matvec_rows(m: &Mat, xs: &[&[f32]]) -> Vec<f32> {
-    if let Some(y) = dev::get().and_then(|d| d.lock().unwrap().rows(m, xs)) { return y; }
-    let mut y = vec![0f32; xs.len() * m.rows];
+    // A host matrix does not take the device lock: its rows run while another thread holds the device.
+    if let Some(y) = dev::get().filter(|_| m.gpu.is_some()).and_then(|d| d.lock().unwrap().rows(m, xs)) { return y; }
+    let (n, mut y) = (xs.len(), vec![0f32; xs.len() * m.rows]);
+    // On the CPU each weight row is read once for all the activations: the dots of `matvec`, in another order.
+    if let Some(dot) = m.int_dot().filter(|_| n > 1 && (m.gpu.is_none() || dev::get().is_none()) && xs.iter().all(|x| x.len() == m.cols)) {
+        let rb = m.ty.row_bytes(m.cols as u64);
+        let xq: Vec<_> = xs.par_iter().map(|x| crate::cpu_moe::quantize_q8k(x)).collect();
+        let mut by_row = vec![0f32; m.rows * n];
+        let dot4 = crate::cpu_moe::int_dot4(m.ty);
+        by_row.par_chunks_mut(32 * n).enumerate().for_each(|(c, o)| {
+            for (k, o) in o.chunks_exact_mut(n).enumerate() {
+                let w = &m.data[(c * 32 + k) * rb..(c * 32 + k + 1) * rb];
+                let mut t = 0;
+                if let Some(dot4) = dot4 {
+                    while t + 4 <= n {
+                        o[t..t + 4].copy_from_slice(&dot4(w, [&xq[t], &xq[t + 1], &xq[t + 2], &xq[t + 3]]));
+                        t += 4;
+                    }
+                }
+                for t in t..n { o[t] = dot(w, &xq[t]); }
+            }
+        });
+        y.par_chunks_mut(m.rows).enumerate().for_each(|(t, y)| {
+            for (r, v) in y.iter_mut().enumerate() { *v = by_row[r * n + t]; }
+        });
+        return y;
+    }
     for (i, x) in xs.iter().enumerate() {
         m.matvec(x, &mut y[i * m.rows..(i + 1) * m.rows]);
+    }
+    y
+}
+
+/// `matvec_rows` of several matrices on one chunk of `n` tokens: matrix i reads input set `ms[i].1` of `x` (set after
+/// set, a row a token). Outputs concatenated. On the GPU the sets go up once and the outputs come back in one copy.
+pub fn matvec_rows_sets(ms: &[(Mat, usize)], x: &[f32], n: usize) -> Vec<f32> {
+    if let Some(y) = dev::get().filter(|_| ms.iter().all(|m| m.0.gpu.is_some())).and_then(|d| d.lock().unwrap().rows_sets(ms, x, n)) { return y; }
+    let w = n * ms[0].0.cols;
+    ms.iter().flat_map(|(m, j)| matvec_rows(m, &x[j * w..(j + 1) * w].chunks_exact(m.cols).collect::<Vec<_>>())).collect()
+}
+
+/// `matvec_rows` for several matrices: job i runs its matrix on its own `n` rows of `x` (after job i-1's rows);
+/// outputs concatenated. On the GPU each run of jobs that fits the scratch buffers is one round trip.
+pub fn matvec_rows_many(jobs: &[(Mat, usize)], x: &[f32]) -> Vec<f32> {
+    let size = |j: &(Mat, usize)| (j.1 * j.0.cols, j.1 * j.0.rows);
+    let mut y = Vec::with_capacity(jobs.iter().map(|j| size(j).1).sum());
+    let (mut i, mut at) = (0, 0);
+    while i < jobs.len() {
+        let (mut j, mut nx, mut ny) = (i + 1, size(&jobs[i]).0, size(&jobs[i]).1);
+        while j < jobs.len() && nx + size(&jobs[j]).0 <= dev::SCRATCH && ny + size(&jobs[j]).1 <= dev::SCRATCH {
+            nx += size(&jobs[j]).0;
+            ny += size(&jobs[j]).1;
+            j += 1;
+        }
+        match dev::get().and_then(|d| d.lock().unwrap().rows_many(&jobs[i..j], &x[at..at + nx])) {
+            Some(r) => y.extend(r),
+            None => {
+                let mut o = at;
+                for (m, n) in &jobs[i..j] {
+                    y.extend(matvec_rows(m, &x[o..o + n * m.cols].chunks_exact(m.cols).collect::<Vec<_>>()));
+                    o += n * m.cols;
+                }
+            }
+        }
+        (i, at) = (j, at + nx);
     }
     y
 }
@@ -368,6 +562,17 @@ impl<'a> Mat<'a> {
     }
 
     /// y = W x
+    /// The integer dot of the CPU path, when this matrix uses it. Integer Q8_K dots are several times faster than
+    /// dequantising each row, and match llama.cpp's CPU path. `STRATA_CPU_REF=1` keeps the f32 reference for
+    /// debugging and exact old numerics.
+    fn int_dot(&self) -> Option<fn(&[u8], &[crate::cpu_moe::Q8K]) -> f32> {
+        if (self.cpu || self.rows >= 512) && std::env::var_os("STRATA_CPU_REF").is_none() && self.cols % self.ty.block_elems() == 0 {
+            crate::cpu_moe::int_dot(self.ty)
+        } else {
+            None
+        }
+    }
+
     pub fn matvec(&self, x: &[f32], y: &mut [f32]) {
         assert_eq!(x.len(), self.cols);
         assert_eq!(y.len(), self.rows);
@@ -375,19 +580,15 @@ impl<'a> Mat<'a> {
             return d.lock().unwrap().gemv(i, x, y, (i == dev::STAGED).then_some((self.data, self.ty, self.rows, self.cols)));
         }
         let rb = self.ty.row_bytes(self.cols as u64);
-        // Integer Q8_K dots are several times faster than dequantising each row, and match llama.cpp's CPU path.
-        // `STRATA_CPU_REF=1` keeps the f32 reference for debugging and exact old numerics.
-        if (self.cpu || self.rows >= 512) && std::env::var_os("STRATA_CPU_REF").is_none() && self.cols % self.ty.block_elems() == 0 {
-            if let Some(dot) = crate::cpu_moe::int_dot(self.ty) {
-                let xq = crate::cpu_moe::quantize_q8k(x);
-                y.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
-                    for (k, o) in ys.iter_mut().enumerate() {
-                        let r = c * 32 + k;
-                        *o = dot(&self.data[r * rb..(r + 1) * rb], &xq);
-                    }
-                });
-                return;
-            }
+        if let Some(dot) = self.int_dot() {
+            let xq = crate::cpu_moe::quantize_q8k(x);
+            y.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
+                for (k, o) in ys.iter_mut().enumerate() {
+                    let r = c * 32 + k;
+                    *o = dot(&self.data[r * rb..(r + 1) * rb], &xq);
+                }
+            });
+            return;
         }
         let xq = q8_roundtrip(self.ty, self.cpu, x);
         let x = &xq[..];
