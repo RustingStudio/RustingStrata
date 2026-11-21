@@ -214,7 +214,7 @@ llama.cpp batch vs token-by-token modes differ by about 1.7% in top-token agreem
 machine (30 GB RAM), warm page cache, in one session. RustingStrata: `bench --pp 64,512,2048 --tg 64 --reps 2` with
 `--backend cuda`, `--backend vulkan` and `STRATA_DS_GPU=0`; mean of the two runs, the two runs in brackets.
 llama.cpp c622f62 built with CUDA: `llama-bench -t 6 -r 2 -p 64,512,2048 -n 64` with `-ngl 18` (`-ngl 99` runs out
-of VRAM; 12, 16 and 20 layers measured within 3% of 18 at 64 and 512 tokens), and with `-ngl 0` at 64 and 512 tokens.
+of VRAM; 12, 16 and 20 layers measured within 3% of 18 at 64 and 512 tokens), and with `-ngl 0` at 64, 512 and 2048 tokens.
 
 | | Prefill 64 tokens | Prefill 512 | Prefill 2048 | Decode (tok/s) |
 |---|---|---|---|---|
@@ -222,7 +222,7 @@ of VRAM; 12, 16 and 20 layers measured within 3% of 18 at 64 and 512 tokens), an
 | RustingStrata, Vulkan (same card) | 82.7 (34.5, 130.9) | 226.9 (226.6, 227.1) | 182.6 (179.0, 186.2) | 27.3 / 27.5 / 24.5 |
 | RustingStrata, CPU only | 47.5 (47.1, 47.9) | 49.8 (49.7, 49.8) | 48.2 (48.2, 48.2) | 11.8 / 11.6 / 10.9 |
 | llama.cpp, CUDA build, `-ngl 18` | 124.7 ± 3.6 | 383.9 ± 7.2 | 322.6 ± 1.0 | 8.7 ± 1.3 |
-| llama.cpp, CUDA build, `-ngl 0` | 122.3 ± 5.0 | 377.5 ± 7.8 | not run | 10.5 ± 1.2 |
+| llama.cpp, CUDA build, `-ngl 0` | 122.3 ± 5.0 | 377.5 ± 7.8 | 311.9 ± 4.4 | 10.5 ± 1.2 |
 
 Quality vs llama.cpp, same GGUF, teacher-forced: llama.cpp c622f62's greedy tokens (CPU build, `/completion` at
 temperature 0) are fed through RustingStrata's forward and the top token is compared at every step

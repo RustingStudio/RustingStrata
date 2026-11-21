@@ -208,6 +208,36 @@ pub fn list_models(dir: &Path) -> Vec<(String, PathBuf, u64)> {
     out
 }
 
+/// GGUF models that the Hugging Face hub cache (`hf download`, `huggingface_hub`, llama.cpp `-hf`) and llama.cpp's
+/// own cache already hold, so the page offers them without a second download. Hub repos appear as
+/// `hf/<org>/<repo>/<file>` from the snapshot that `refs/main` names (else the newest one); llama.cpp's cache as
+/// `llama.cpp/<file>`.
+pub fn cached_models() -> Vec<(String, PathBuf, u64)> {
+    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let home = env("HOME").or_else(|| env("USERPROFILE")).unwrap_or_default();
+    let cache = env("XDG_CACHE_HOME").unwrap_or_else(|| home.join(".cache"));
+    let hub = env("HF_HUB_CACHE").or_else(|| env("HF_HOME").map(|h| h.join("hub"))).unwrap_or_else(|| cache.join("huggingface/hub"));
+    let mut out = hub_models(&hub);
+    let llama = env("LLAMA_CACHE").unwrap_or_else(|| cache.join("llama.cpp"));
+    out.extend(list_models(&llama).into_iter().map(|(id, p, n)| (format!("llama.cpp/{id}"), p, n)));
+    out
+}
+
+/// The models of a Hugging Face hub cache folder (`cached_models`).
+pub fn hub_models(hub: &Path) -> Vec<(String, PathBuf, u64)> {
+    let mut out = Vec::new();
+    for repo in std::fs::read_dir(hub).into_iter().flatten().flatten().map(|e| e.path()) {
+        let Some(name) = repo.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_prefix("models--")) else { continue };
+        let snaps = repo.join("snapshots");
+        let snap = std::fs::read_to_string(repo.join("refs/main")).ok().map(|h| snaps.join(h.trim())).filter(|p| p.is_dir())
+            .or_else(|| std::fs::read_dir(&snaps).ok()?.flatten().map(|e| e.path())
+                .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()));
+        let Some(snap) = snap else { continue };
+        out.extend(list_models(&snap).into_iter().map(|(id, p, n)| (format!("hf/{}/{id}", name.replacen("--", "/", 1)), p, n)));
+    }
+    out
+}
+
 /// Whether an error is a GPU failure no later request can recover from: a lost Vulkan device, or a CUDA error that
 /// leaves the context unusable (the CUDA documentation: "the process must be terminated and relaunched"). It looks
 /// only at the backend's typed error in the chain, never at message text: an error message can quote request data.

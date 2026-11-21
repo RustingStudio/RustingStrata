@@ -1,5 +1,5 @@
 use rusting_strata::chat::{Hold, Json, Msg, Template};
-use rusting_strata::serve::{Keys, Who, chat_request, host_ok, key_ok, list_models, messages_body, models, read_request};
+use rusting_strata::serve::{Keys, Who, chat_request, host_ok, hub_models, key_ok, list_models, messages_body, models, read_request};
 
 /// Every request in tests/fixtures/chat renders byte-identical to llama.cpp's Jinja rendering of the model's own
 /// template (tools/gen_chat_fixtures.py); a request llama.cpp rejects must be rejected too.
@@ -256,6 +256,26 @@ fn lists_models_once_per_split() {
     let l: Vec<_> = list_models(&d).into_iter().map(|(id, p, n)| (id, p.strip_prefix(&d).unwrap().to_path_buf(), n)).collect();
     std::fs::remove_dir_all(&d).unwrap();
     assert_eq!(l, [("a.gguf".into(), "a.gguf".into(), 3), ("org/repo/big-00001-of-00002.gguf".into(), "org/repo/big-00001-of-00002.gguf".into(), 12)]);
+}
+
+#[test]
+fn lists_hub_cache_models_from_main_snapshot() {
+    let d = std::env::temp_dir().join(format!("strata-hub-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let r = d.join("models--unsloth--Big-GGUF");
+    for f in ["snapshots/new/Q2/big-00001-of-00002.gguf", "snapshots/new/Q2/big-00002-of-00002.gguf", "snapshots/new/mmproj-BF16.gguf",
+        "snapshots/old/small.gguf", "snapshots/other.gguf"] {
+        std::fs::create_dir_all(r.join(f).parent().unwrap()).unwrap();
+        std::fs::write(r.join(f), [0u8; 2]).unwrap();
+    }
+    std::fs::create_dir_all(r.join("refs")).unwrap();
+    std::fs::write(r.join("refs/main"), "new").unwrap();
+    std::fs::create_dir_all(d.join("datasets--x--y/snapshots/a")).unwrap();
+    std::fs::write(d.join("datasets--x--y/snapshots/a/d.gguf"), [0u8; 2]).unwrap();
+    let l: Vec<_> = hub_models(&d).into_iter().map(|(id, p, n)| (id, p.strip_prefix(&d).unwrap().to_path_buf(), n)).collect();
+    std::fs::remove_dir_all(&d).unwrap();
+    assert_eq!(l, [("hf/unsloth/Big-GGUF/Q2/big-00001-of-00002.gguf".into(),
+        "models--unsloth--Big-GGUF/snapshots/new/Q2/big-00001-of-00002.gguf".into(), 4)]);
 }
 
 #[test]

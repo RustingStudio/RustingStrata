@@ -220,6 +220,10 @@ struct Hosting {
     /// next chat request loads it again, with the same options, and is answered after the load.
     #[arg(long, value_name = "SECONDS")]
     auto_unload: Option<u64>,
+    /// The model name in `/v1/models` and in the replies, whatever file is loaded [default: the file name]. Clients
+    /// configured for this name keep working when another model is loaded.
+    #[arg(long)]
+    alias: Option<String>,
 }
 
 enum Runner<'a> { Cpu(&'a Model<'a>, State), Gpu(Box<GpuModel<'a>>), Slot(Client) }
@@ -406,6 +410,10 @@ impl Engine {
         let mut ngram_cfg = self.ngram_config()?;
         ngram_cfg.n_vocab = m.cfg.n_vocab;
         self.chunk.get_or_insert(get("chunk").unwrap_or(4096));
+        // The draft count was measured with this draft file (`calibrate --mtp-model/--draft-model`), or with none.
+        let aux = self.aux_model_path().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+        let cal_mtp = get("mtp").filter(|_| v["aux"].as_str() == aux.as_deref());
+        if aux.is_some() && self.mtp.is_none() { self.mtp = cal_mtp; }
         if let Some(df) = &m.cfg.dflash {
             if self.mtp.is_none() {
                 self.mtp = Some(df.block_size.saturating_sub(1).max(1));
@@ -417,7 +425,7 @@ impl Engine {
         } else if ngram_cfg.is_enabled() && self.mtp.is_none() {
             self.mtp = Some(0);
         } else {
-            self.mtp.get_or_insert(get("mtp").unwrap_or(0));
+            self.mtp.get_or_insert(cal_mtp.unwrap_or(0));
         }
         let short = self.short.unwrap_or_else(|| get("short").unwrap_or(32));
         // The global pool can be built once; a model loaded later by `serve` keeps the first one's threads.
@@ -942,6 +950,13 @@ enum Cmd {
         /// Accepted for symmetry with the other commands: calibration always runs on the GPU.
         #[arg(long, hide = true)]
         gpu: bool,
+        /// Standalone MTP head GGUF, as `--mtp-model` of the runs: calibrate the drafts with it.
+        #[arg(long)]
+        mtp_model: Option<PathBuf>,
+        /// Draft model (DFlash, EAGLE3 or a small model of the same vocabulary), as `--draft-model` of the runs:
+        /// calibrate the drafts with it.
+        #[arg(long)]
+        draft_model: Option<PathBuf>,
     },
     /// Check that every Vulkan pipeline this model needs fits the device's `maxComputeSharedMemorySize`, naming the
     /// kernel, specialization, bytes needed and limit when one does not; exits non-zero on overflow. No model is
@@ -1271,11 +1286,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 std::fs::write(&path, line).with_context(|| format!("writing the JSON record to {}", path.display()))?;
             }
         }
-        Cmd::Calibrate { model, ctx, vram_margin, backend, device, split, kv, lora, gpu: _ } => {
+        Cmd::Calibrate { model, ctx, vram_margin, backend, device, split, kv, lora, gpu: _, mtp_model, draft_model } => {
             set_kv_env(&kv);  // read by Gpu::new and Vk::new
             if !lora.is_empty() { eprintln!("note: --lora is ignored by calibrate; calibration uses the base model"); }
             let margins = vram_margins(&vram_margin, &device)?.into_iter().map(|mb| mb << 20).collect::<Vec<_>>();
-            calibrate(&model, ctx, &margins, backend.as_deref(), &device, split_arg(split.as_deref(), device.len())?)?
+            calibrate(&model, draft_model.as_deref().or(mtp_model.as_deref()), ctx, &margins, backend.as_deref(), &device, split_arg(split.as_deref(), device.len())?)?
         }
         Cmd::Check { model, backend, device } => {
             let g = Gguf::open(&model)?;
@@ -1403,7 +1418,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             if let Some(mp) = &model && arch.as_deref() == Some("gemma4") {
                 let g = Gguf::open(mp)?;
-                let name = mp.file_name().map_or("gemma4".into(), |n| n.to_string_lossy().into_owned());
+                let name = host.alias.clone().unwrap_or_else(|| mp.file_name().map_or("gemma4".into(), |n| n.to_string_lossy().into_owned()));
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
                 anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
                 let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(mp));
@@ -1411,28 +1426,28 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             if let Some(mp) = &model && arch.as_deref() == Some("glm5-next") {
                 let g = Gguf::open(mp)?;
-                let name = mp.file_name().map_or("glm".into(), |n| n.to_string_lossy().into_owned());
+                let name = host.alias.clone().unwrap_or_else(|| mp.file_name().map_or("glm".into(), |n| n.to_string_lossy().into_owned()));
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
                 anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
                 return rusting_strata::glm::serve(&g, &name, &addr, key.as_deref());
             }
             if let Some(mp) = &model && arch.as_deref() == Some("deepseek41") {
                 let g = Gguf::open(mp)?;
-                let name = mp.file_name().map_or("deepseek".into(), |n| n.to_string_lossy().into_owned());
+                let name = host.alias.clone().unwrap_or_else(|| mp.file_name().map_or("deepseek".into(), |n| n.to_string_lossy().into_owned()));
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
                 anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
                 return rusting_strata::deepseek::chat::serve(&g, &name, &addr, key.as_deref());
             }
             if let Some(mp) = &model && arch.as_deref() == Some(rusting_strata::hy4::ARCH) {
                 let g = Gguf::open(mp)?;
-                let name = mp.file_name().map_or("hy4".into(), |n| n.to_string_lossy().into_owned());
+                let name = host.alias.clone().unwrap_or_else(|| mp.file_name().map_or("hy4".into(), |n| n.to_string_lossy().into_owned()));
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
                 anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
                 return rusting_strata::hy4::chat::serve(&g, &name, &addr, key.as_deref());
             }
             if let Some(mp) = &model && arch.as_deref() == Some(rusting_strata::inkling2::ARCH) {
                 let g = Gguf::open(mp)?;
-                let name = mp.file_name().map_or("inkling2".into(), |n| n.to_string_lossy().into_owned());
+                let name = host.alias.clone().unwrap_or_else(|| mp.file_name().map_or("inkling2".into(), |n| n.to_string_lossy().into_owned()));
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
                 anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
                 return rusting_strata::inkling2::chat::serve(&g, &name, &addr, key.as_deref());
@@ -1630,7 +1645,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 });
             });
             let s = Serving { rx: rx.into(), waiting, stop, addr, allowed_hosts, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(), extra: Default::default(),
-                dl: Default::default(), stats, opts: Default::default(), idle: host.auto_unload.map(Duration::from_secs), asleep: Default::default(), parked: Default::default() };
+                dl: Default::default(), stats, opts: Default::default(), idle: host.auto_unload.map(Duration::from_secs), asleep: Default::default(), parked: Default::default(), alias: host.alias };
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
             eprintln!("listening on {url} (models folder: {})", s.dir.display());
@@ -1659,9 +1674,9 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let cal = if o["calibrate"] == true && engine.gpu {
                     (engine.chunk, engine.mtp) = (None, None);
                     set_kv_env(&engine.kv);
-                    s.stats.lock().unwrap().unload(p.file_stem().and_then(|n| n.to_str()).map(String::from));
+                    s.stats.lock().unwrap().unload(Some(s.name(&p)));
                     vram_margins(&engine.vram_margin, &engine.device)
-                        .and_then(|mb| calibrate(&p, engine.ctx, &mb.into_iter().map(|mb| mb << 20).collect::<Vec<_>>(), engine.backend.as_deref(), &engine.device,
+                        .and_then(|mb| calibrate(&p, engine.aux_model_path(), engine.ctx, &mb.into_iter().map(|mb| mb << 20).collect::<Vec<_>>(), engine.backend.as_deref(), &engine.device,
                             split_arg(engine.split.as_deref(), engine.device.len())?))
                 } else { Ok(()) };
                 match cal.and_then(|()| serve_model(&p, engine.clone(), &s, &mut w)) {
@@ -1895,16 +1910,21 @@ fn best(f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<f64> {
     Ok(b)
 }
 
-fn calibrate(model: &Path, ctx: usize, margin: &[usize], kind: Option<&str>, device: &[usize], mut split: Option<Vec<f64>>) -> anyhow::Result<()> {
+/// With `aux` (`--mtp-model`/`--draft-model`) the drafts are measured with that file, and runs given the same file use
+/// the measured draft count.
+fn calibrate(model: &Path, aux: Option<&Path>, ctx: usize, margin: &[usize], kind: Option<&str>, device: &[usize], mut split: Option<Vec<f64>>) -> anyhow::Result<()> {
     let g = Gguf::open(model)?;
-    let m = Model::load(&g)?;
+    let aux_g = open_mtp_gguf(aux)?;
+    let m = Model::load_with_aux(&g, aux_g.as_ref(), &[])?;
+    // Most drafts per step to measure: a DFlash block, else as many as the runs default to.
+    let kload = m.cfg.dflash.as_ref().map_or(if m.draft_model.is_some() { 4 } else { 3 }, |d| d.block_size.saturating_sub(1).max(1));
     let tok = Tokenizer::from_gguf(&g)?;
     let n_pf = 4096.min(ctx.saturating_sub(256));
     anyhow::ensure!(n_pf >= 512, "--ctx too small to calibrate");
     let pf = prose(&tok, n_pf)?;
     let load = |chunk: usize, split: Option<&[f64]>| -> anyhow::Result<GpuModel> {
         let bk = device.iter().map(|&d| backend::open(kind, d)).collect::<anyhow::Result<Vec<_>>>()?;
-        let mut gm = GpuModel::load_split_margins(&m, bk, ctx, chunk, margin, split, 3, 1).context(LOAD_HINT)?;
+        let mut gm = GpuModel::load_split_margins(&m, bk, ctx, chunk, margin, split, kload, 1).context(LOAD_HINT)?;
         gm.adapt_every = 0; // fixed placement: steadier timings
         Ok(gm)
     };
@@ -1981,10 +2001,11 @@ fn calibrate(model: &Path, ctx: usize, margin: &[usize], kind: Option<&str>, dev
     }
     if short == usize::MAX { short = 256; }
 
-    let kmax = if m.cfg.n_nextn > 0 { gm.k } else { 0 };
+    let drafts = m.cfg.n_nextn > 0 || m.cfg.dflash.is_some() || m.cfg.eagle3.is_some() || m.draft_model.is_some();
+    let kmax = if drafts { gm.k } else { 0 };
     let mut r = Runner::Gpu(Box::new(gm));
     let mut mtp = (0, 0.0);
-    for k in 0..=kmax {
+    for k in (0..=kmax).filter(|&k| k <= 4 || k % 2 == 0 || k == kmax) {
         if let Runner::Gpu(g) = &mut r { g.k = k.max(1); }
         let mut toks = 0;
         let t = best(&mut || {
@@ -2004,6 +2025,7 @@ fn calibrate(model: &Path, ctx: usize, margin: &[usize], kind: Option<&str>, dev
     std::fs::create_dir_all(path.parent().unwrap())?;
     let mut v = json!({"chunk": chunk.0, "mtp": mtp.0, "short": short, "ctx": ctx, "gpu": g.gpu.device(),
         "measured": {"prefill_tok_s": chunk.1.round(), "decode_tok_s": (mtp.1 * 10.0).round() / 10.0}});
+    if let Some(a) = aux.and_then(|a| a.file_name()) { v["aux"] = a.to_string_lossy().into(); }
     // Only a split that was measured as faster, or given by hand: without one, later runs split by the free VRAM
     // they find.
     if split.is_some() {
@@ -2151,6 +2173,8 @@ struct Serving {
     max_tokens: usize,
     dir: PathBuf,
     /// The --model, offered beside the models folder.
+    /// `--alias`.
+    alias: Option<String>,
     model: Option<PathBuf>,
     /// GGUF files outside the models folder that `/api/load` was given as `path`, offered until the server stops.
     extra: std::sync::Mutex<Vec<PathBuf>>,
@@ -2229,7 +2253,7 @@ impl Serving {
     fn sleep(&self, model: PathBuf, ctx: usize) {
         let mut st = self.stats.lock().unwrap();
         st.unload(None);
-        (st.model, st.unloaded, st.ctx) = (model.file_stem().and_then(|n| n.to_str()).map(String::from), true, ctx);
+        (st.model, st.unloaded, st.ctx) = (Some(self.name(&model)), true, ctx);
         *self.asleep.lock().unwrap() = Some(model);
     }
     /// A request for the model that `handle` does not refuse for its Host, key or content type. Only these count as
@@ -2243,9 +2267,15 @@ impl Serving {
     /// SIGTERM came and the requests accepted before it are answered: `serve` returns None, so the expert profile
     /// is saved and the server exits.
     fn stopped(&self) -> bool { self.stop.load(Relaxed) && self.waiting.load(Relaxed) == 0 }
-    /// The models the page offers: the models folder, then --model if it is elsewhere.
+    /// The model's name in `/v1/models` and the replies: `--alias`, else the file name without `.gguf`.
+    fn name(&self, p: &Path) -> String {
+        self.alias.clone().unwrap_or_else(|| p.file_stem().and_then(|n| n.to_str()).unwrap_or("strata").to_string())
+    }
+    /// The models the page offers: the models folder, the Hugging Face and llama.cpp caches, then --model if it is
+    /// elsewhere.
     fn models(&self) -> Vec<(String, PathBuf, u64)> {
         let mut v = serve::list_models(&self.dir);
+        for m in serve::cached_models() { if !v.iter().any(|x| x.1 == m.1) { v.push(m); } }
         for p in self.model.iter().chain(self.extra.lock().unwrap().iter()) {
             if !v.iter().any(|x| &x.1 == p) { v.push((p.display().to_string(), p.clone(), std::fs::metadata(p).map_or(0, |m| m.len()))); }
         }
@@ -2575,7 +2605,7 @@ fn open_mtp_gguf(path: Option<&Path>) -> anyhow::Result<Option<Gguf>> {
 /// for or `--auto-unload` ends it. The model and its GPU memory are freed on return.
 fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<TcpStream>) -> anyhow::Result<Next> {
     eprintln!("loading {}", model.display());
-    let name = model.file_stem().and_then(|s| s.to_str()).unwrap_or("strata").to_string();
+    let name = s.name(model);
     {
         let mut st = s.stats.lock().unwrap();
         st.unload(Some(name.clone()));
