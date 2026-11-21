@@ -24,7 +24,8 @@ struct Engine {
     /// Run on the GPU (experts that do not fit in VRAM run on the CPU) instead of the CPU reference.
     #[arg(long)]
     gpu: bool,
-    /// GPU context length (KV cache size) in tokens.
+    /// GPU context length (KV cache size) in tokens. Inkling 2, Hy4, GLM, DeepSeek and Gemma 4: the prompt plus reply
+    /// limit, the model's trained context when not given (their caches grow with the text).
     #[arg(long, default_value_t = 4096)]
     ctx: usize,
     /// Prefill chunk in tokens (GPU; 0 = token by token) [default: calibrated, else 4096].
@@ -1014,7 +1015,12 @@ enum Cmd {
 }
 
 fn main() -> anyhow::Result<()> {
-    let Some(cmd) = Cli::parse().cmd else {
+    let m = <Cli as clap::CommandFactory>::command().get_matches();
+    if let Some((_, sm)) = m.subcommand() && let Ok(Some(&n)) = sm.try_get_one::<usize>("ctx")
+        && sm.value_source("ctx") == Some(clap::parser::ValueSource::CommandLine) {
+        rusting_strata::CTX.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+    let Some(cmd) = <Cli as clap::FromArgMatches>::from_arg_matches(&m).unwrap_or_else(|e| e.exit()).cmd else {
         // Started without arguments, as by a double click: keep the window open on an error so it can be read.
         let Some(Cmd::Serve { model, models_dir, addr, api_key, mcp, open, host, mut engine }) = Cli::parse_from(["rustingstrata", "serve", "--gpu", "--open"]).cmd else { unreachable!() };
         engine.cpu_fallback = true;
@@ -1200,6 +1206,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             if let Some(arch) = g.get("general.architecture").ok().and_then(|v| v.as_str()) {
                 if arch == "deepseek41" || arch == "glm5-next" || arch == rusting_strata::hy4::ARCH || arch == rusting_strata::inkling2::ARCH {
                     engine.ds_env();
+                    // A --ctx below the test grows to fit it, as on the main engine.
+                    if rusting_strata::CTX.load(std::sync::atomic::Ordering::Relaxed) != 0 { rusting_strata::CTX.store(engine.ctx, std::sync::atomic::Ordering::Relaxed); }
                     return if arch == "deepseek41" {
                         bench_deepseek(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else if arch == rusting_strata::hy4::ARCH {
@@ -1840,9 +1848,6 @@ fn bench_glm(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_
     rusting_strata::glm::gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
     let mut m = rusting_strata::glm::forward::GlmModel::new(g)?;
-    if engine.ctx > rusting_strata::glm::forward::max_ctx(&m.cfg) {
-        unsafe { std::env::set_var("STRATA_GLM_CTX", engine.ctx.to_string()) }
-    }
     let eos = tok.eos_ids();
     let chunk = std::env::var("STRATA_GLM_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
     let mut results = Vec::with_capacity(pp.len());

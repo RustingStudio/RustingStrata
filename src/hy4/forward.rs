@@ -12,8 +12,6 @@ use crate::weights::dot;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 
-/// ponytail: every layer keeps the key rows of all positions; trim the sliding-window layers to raise this.
-pub const MAX_CTX: usize = 32768;
 /// Epsilon of every Engram norm (FLT_EPSILON).
 const ENGRAM_EPS: f32 = 1.1920929e-7;
 

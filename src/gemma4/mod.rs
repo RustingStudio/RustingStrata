@@ -220,7 +220,7 @@ pub fn chat(
     let tok = crate::tokenizer::Tokenizer::from_gguf(g)?;
     let mut m = forward::Gemma4Model::new(g)?;
     let stop = stop_ids(&tok);
-    let ctx = m.cfg.n_ctx_train;
+    let ctx = crate::ctx_limit(m.cfg.n_ctx_train);
     let mut msgs: Vec<(String, String)> = system.into_iter().map(|s| ("system".to_string(), s)).collect();
     let mut first_user = true;
     loop {
@@ -277,7 +277,7 @@ pub fn serve(
     let mut m = forward::Gemma4Model::new(g)?;
     let projector = mmproj.map(crate::vision::VisionProjector::open).transpose()?;
     let stop = stop_ids(&tok);
-    let ctx = m.cfg.n_ctx_train;
+    let ctx = crate::ctx_limit(m.cfg.n_ctx_train);
     let l = std::net::TcpListener::bind(addr)?;
     eprintln!("gemma4 serve on http://{addr}/ model {name}");
     for c in l.incoming() {

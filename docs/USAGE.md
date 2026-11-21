@@ -56,7 +56,7 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 
 ## Flags
 
-- `--ctx` KV cache size in tokens (default 4096).
+- `--ctx` KV cache size in tokens (default 4096). For Inkling 2, Hy4, GLM, DeepSeek and Gemma 4 it is the prompt plus reply limit instead, and the default is the context the model was trained on; their caches grow with the text.
 - `--mtp [N]` speculative decoding with the model's draft head. Greedy tokens stay the same; sampling keeps its
   distribution. Needs a GGUF with an MTP head (for example the Qwen3.6-35B-A3B MTP files).
   Qwen3.8-Flash-Next (`qwen4exp`) takes its head from a companion file: `--mtp-model mtp-...-shared-Q8_0.gguf`.

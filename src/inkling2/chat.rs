@@ -1,7 +1,7 @@
 //! `rustingstrata generate|chat|serve` for Inkling 2: greedy, GPU for the matvecs and the expert cache, state kept across turns.
 //! A reply is a list of blocks, each `<|message_model|>`, a content token, the body and `<|end_message|>`; the model
 //! writes the block headers itself, so the prompt has no generation prefix.
-use super::forward::{Inkling2Model, MAX_CTX};
+use super::forward::Inkling2Model;
 use crate::{chat::{Json, Msg}, gguf::Gguf, tokenizer::Tokenizer};
 use std::io::{BufRead, Write};
 
@@ -110,13 +110,14 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
     gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
     let mut m = Inkling2Model::new(g)?;
+    let max_ctx = m.cfg.n_ctx;
     let ids = tok.encode(prompt)?;
-    anyhow::ensure!(!ids.is_empty() && ids.len() < MAX_CTX, "prompt is {} tokens, the limit is {MAX_CTX}", ids.len());
+    anyhow::ensure!(!ids.is_empty() && ids.len() < max_ctx, "prompt is {} tokens, the limit is {max_ctx}", ids.len());
     let trace = std::env::var_os("STRATA_DS_TRACE").is_some();
     if trace { eprintln!("prompt tokens: {ids:?}"); }
     let mut logits = m.prefill(&ids);
     let (eos, mut out, mut shown) = (tok.eos_ids(), vec![], 0);
-    for i in 0..n.min(MAX_CTX - ids.len()) {
+    for i in 0..n.min(max_ctx - ids.len()) {
         let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
         if eos.contains(&next) { break; }
         out.push(next);
@@ -137,6 +138,7 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
     gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
     let mut m = Inkling2Model::new(g)?;
+    let max_ctx = m.cfg.n_ctx;
     let stdin = std::io::stdin();
     let mut ended = true;
     loop {
@@ -155,12 +157,12 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
             format!("{}{DONE}{USER}{TEXT}{line}{END}", if ended { "" } else { END })
         };
         let ids = tok.encode(&text)?;
-        if m.toks.len() + ids.len() >= MAX_CTX {
-            println!("context is full ({MAX_CTX} tokens); restart the chat");
+        if m.toks.len() + ids.len() >= max_ctx {
+            println!("context is full ({max_ctx} tokens); restart the chat");
             break;
         }
         let logits = m.prefill(&ids);
-        let left = MAX_CTX - m.toks.len();
+        let left = max_ctx - m.toks.len();
         let mut last = Part::Text;
         (_, ended) = decode(&mut m, &tok, logits, n.min(left), |p, start, s| {
             // Thinking is shown dim.
@@ -185,6 +187,7 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
     gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
     let mut m = Inkling2Model::new(g)?;
+    let max_ctx = m.cfg.n_ctx;
     let l = std::net::TcpListener::bind(addr)?;
     eprintln!("inkling2 serve on http://{addr}/ model {name}");
     for c in l.incoming() {
@@ -219,13 +222,13 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
                     Ok(i) if !i.is_empty() => i,
                     _ => { bad(&mut c, "cannot encode prompt".into()); continue }
                 };
-                if ids.len() >= MAX_CTX {
-                    bad(&mut c, format!("prompt is {} tokens, the limit is {MAX_CTX}", ids.len()));
+                if ids.len() >= max_ctx {
+                    bad(&mut c, format!("prompt is {} tokens, the limit is {max_ctx}", ids.len()));
                     continue;
                 }
                 let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
                 let logits = m.prefill(&ids[keep..]);
-                let n = q.max_tokens.unwrap_or(256).min(MAX_CTX - ids.len());
+                let n = q.max_tokens.unwrap_or(256).min(max_ctx - ids.len());
                 if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
                 let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
                 let tools = q.tool_calls && !q.tools.is_empty();

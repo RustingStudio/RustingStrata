@@ -80,6 +80,29 @@ pub(crate) mod dev {
             self.upload_on(d, data, ty, rows, cols)
         }
         pub(crate) fn tensor(&self, i: u32) -> &GpuTensor { &self.parts[gpu_of(i)].ts[(i & (1 << SHIFT) - 1) as usize] }
+        /// Free the least recently used expert slots of GPU `d` until `bytes` are freed or none is left, for state
+        /// that is allocated after the cache filled. The budget falls by the same amount, so the cache does not take
+        /// the room back. Returns the bytes freed.
+        pub fn release(&mut self, d: usize, bytes: usize) -> usize {
+            if self.parts[d].be.sync().is_err() { return 0; }
+            let mut old: Vec<(u64, usize)> = self.exs.iter().filter(|e| gpu_of(e.0) == d).map(|e| (e.2, e.1)).collect();
+            old.sort_unstable();
+            let mut freed = 0;
+            for (_, k) in old {
+                if freed >= bytes { break; }
+                let p = self.ex.remove(&k).unwrap();
+                let (i, ..) = self.exs.swap_remove(p);
+                if p < self.exs.len() { self.ex.insert(self.exs[p].1, p); }
+                // The slot index stays taken: tensor ids are positions in `ts`.
+                let t = &mut self.parts[d].ts[(i & (1 << SHIFT) - 1) as usize];
+                freed += t.bytes();
+                *t = GpuTensor::new(t.ty, 0, 0, Buf::new(0, 0, ()));
+            }
+            let p = &mut self.parts[d];
+            p.bytes -= freed;
+            p.budget = p.budget.saturating_sub(freed);
+            freed
+        }
         /// VRAM copy of one routed expert: uploaded on first use while under a GPU's STRATA_DS_GPU_EXPERTS share (GB), then the
         /// least recently used slot of the same shape is overwritten. Slots touched in the last 96 lookups are kept (the
         /// matrices of one layer's experts are in flight together). No slot to take: STAGED (copied up per use).

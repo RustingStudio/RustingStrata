@@ -12,6 +12,9 @@ pub const ARCH: &str = "inkling2_loop";
 pub struct Inkling2Config {
     /// Layers in the file. The core layers `loop_start..loop_end` run `loop_count` times.
     pub n_layer: usize,
+    /// Prompt plus reply limit: `--ctx`, else the trained context. The rows of the full-attention layers grow with
+    /// the text, so RAM and VRAM are the real bound.
+    pub n_ctx: usize,
     pub n_embd: usize,
     pub n_head: usize,
     pub n_head_kv: usize,
@@ -58,6 +61,7 @@ impl Inkling2Config {
             Ok(v[0])
         };
         let cfg = Self {
+            n_ctx: crate::ctx_limit(u("context_length")?),
             n_layer: u("block_count")?,
             n_embd: u("embedding_length")?,
             n_head: same("attention.head_count")?,

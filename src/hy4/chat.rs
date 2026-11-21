@@ -1,5 +1,5 @@
 //! `rustingstrata generate|chat|serve` for Hy4-flash: greedy, CUDA for the matvecs and expert staging, KV kept across turns.
-use super::forward::{Hy4Model, MAX_CTX};
+use super::forward::Hy4Model;
 use crate::{chat::{Json, Msg}, gguf::Gguf, tokenizer::Tokenizer};
 use std::io::{BufRead, Write};
 
@@ -129,11 +129,12 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
     gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
     let mut m = Hy4Model::new(g)?;
+    let max_ctx = m.cfg.n_ctx;
     let ids = tok.encode(prompt)?;
-    anyhow::ensure!(!ids.is_empty() && ids.len() < MAX_CTX, "prompt is {} tokens, the limit is {MAX_CTX}", ids.len());
+    anyhow::ensure!(!ids.is_empty() && ids.len() < max_ctx, "prompt is {} tokens, the limit is {max_ctx}", ids.len());
     if std::env::var_os("STRATA_DS_TRACE").is_some() { eprintln!("prompt tokens: {ids:?}"); }
     let logits = m.prefill(&ids);
-    let (out, _) = decode(&mut m, &tok, logits, n.min(MAX_CTX - ids.len()), show);
+    let (out, _) = decode(&mut m, &tok, logits, n.min(max_ctx - ids.len()), show);
     if std::env::var_os("STRATA_DS_TRACE").is_some() { eprintln!("\noutput tokens: {out:?}"); }
     println!();
     Ok(())
@@ -143,6 +144,7 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
     gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
     let mut m = Hy4Model::new(g)?;
+    let max_ctx = m.cfg.n_ctx;
     let stdin = std::io::stdin();
     loop {
         print!("> ");
@@ -161,12 +163,12 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
             format!("{END}{}", render(&user, &[], think, None).split_once(END).unwrap().1)
         };
         let ids = tok.encode(&text)?;
-        if m.toks.len() + ids.len() >= MAX_CTX {
-            println!("context is full ({MAX_CTX} tokens); restart the chat");
+        if m.toks.len() + ids.len() >= max_ctx {
+            println!("context is full ({max_ctx} tokens); restart the chat");
             break;
         }
         let logits = m.prefill(&ids);
-        let left = MAX_CTX - m.toks.len();
+        let left = max_ctx - m.toks.len();
         decode(&mut m, &tok, logits, n.min(left), show);
         println!();
     }
@@ -181,6 +183,7 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
     gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
     let mut m = Hy4Model::new(g)?;
+    let max_ctx = m.cfg.n_ctx;
     let l = std::net::TcpListener::bind(addr)?;
     eprintln!("hy4 serve on http://{addr}/ model {name}");
     for c in l.incoming() {
@@ -215,13 +218,13 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
                     Ok(i) if !i.is_empty() => i,
                     _ => { bad(&mut c, "cannot encode prompt".into()); continue }
                 };
-                if ids.len() >= MAX_CTX {
-                    bad(&mut c, format!("prompt is {} tokens, the limit is {MAX_CTX}", ids.len()));
+                if ids.len() >= max_ctx {
+                    bad(&mut c, format!("prompt is {} tokens, the limit is {max_ctx}", ids.len()));
                     continue;
                 }
                 let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
                 let logits = m.prefill(&ids[keep..]);
-                let n = q.max_tokens.unwrap_or(256).min(MAX_CTX - ids.len());
+                let n = q.max_tokens.unwrap_or(256).min(max_ctx - ids.len());
                 if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
                 let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
                 let tools = q.tool_calls && !q.tools.is_empty();

@@ -376,7 +376,7 @@ pub fn gpu_defaults() {
     if std::env::var_os("STRATA_GLM_PREFETCH").is_none() { unsafe { std::env::set_var("STRATA_GLM_PREFETCH", "2") } }
 }
 
-/// Context limit per request: the model's trained context, or `STRATA_GLM_CTX`.
+/// Context limit per request: `--ctx`, else `STRATA_GLM_CTX`, else the model's trained context.
 fn ctx_limit(m: &forward::GlmModel) -> usize { forward::max_ctx(&m.cfg) }
 
 /// `rustingstrata chat` for GLM: greedy, thinking on, KV kept across turns while the history extends it.

@@ -3,8 +3,8 @@
 //! experts then run where `Inkling2Model::plan` puts them, as in `ffn`.
 //! `Inkling2Model::run` is the reference and the path of a prompt chunk. The attention rows and the convolution
 //! state move between the two when the other side runs next (`to_device`, `to_host`).
-//! ponytail: the state (about 400 MB) is not counted in the expert budget; it fits in the margin `mat::dev` leaves.
-//! Count it when a card with less room loses the decode state to the fallback.
+//! The state is made at the first decoded token, after the prompt filled the expert cache, so `room` frees the least
+//! recently used experts when VRAM is short.
 use super::*;
 use crate::backend::{Backend, Buf};
 use crate::deepseek::mat::dev;
@@ -22,7 +22,7 @@ struct DSlot { k: Buf, v: Buf, hist: Buf }
 struct Scratch {
     cur: u64, x: u64, blocks: u64, bank: u64, outb: u64, prelude: u64, msg: u64, ins: u64, ins2: u64, gate: u64, nrm: u64,
     q: u64, r: u64, sink: u64, og: u64, k: u64, v: u64, kp: u64, vp: u64, att: u64, proj: u64, h: u64, h2: u64, hn: u64,
-    y: u64, d: u64, ids: u64, xh: u64, xq: u64, wc: u64, acc: u64, sc: u64, logits: u64, end: u64,
+    y: u64, d: u64, ids: u64, xh: u64, xq: u64, wc: u64, acc: u64, logits: u64, end: u64,
 }
 
 impl Scratch {
@@ -33,7 +33,7 @@ impl Scratch {
             cur: f(n), x: f(n), blocks: f(4 * n), bank: f(4 * n), outb: f(n), prelude: f(n), msg: f(4 * n), ins: f(3 * n), ins2: f(3 * n),
             gate: f(4 * rank), nrm: f(3 * n), q: f(q), r: f(c.n_head * c.n_rel), sink: f(c.n_head), og: f(q), k: f(c.n_head_kv * c.head_dim),
             v: f(c.n_head_kv * c.head_dim), kp: f(c.n_head_kv * c.n_conv), vp: f(c.n_head_kv * c.n_conv), att: f(q), proj: f(n), h: f(n),
-            h2: f(n), hn: f(n), y: f(c.n_used * 2 * c.n_ff_exp), d: f(c.n_used * n), ids: f(2 * c.n_used), xh: f(n), xq: f(c.n_used * c.n_ff_exp), wc: f(c.n_used + n), acc: f(n), sc: f(c.n_head * MAX_CTX.div_ceil(64) * (c.head_dim + 2)),
+            h2: f(n), hn: f(n), y: f(c.n_used * 2 * c.n_ff_exp), d: f(c.n_used * n), ids: f(2 * c.n_used), xh: f(n), xq: f(c.n_used * c.n_ff_exp), wc: f(c.n_used + n), acc: f(n),
             logits: f(vocab), end: f(0),
         }
     }
@@ -47,6 +47,8 @@ pub(super) struct Device {
     out_norm: Buf,
     scr: Buf,
     s: Scratch,
+    /// Attention partials of every 64 rows; grows with the full-attention rows.
+    sc: Buf,
     rank: usize,
     /// Positions whose rows both sides hold, and whether the device has run tokens after them.
     synced: usize,
@@ -60,6 +62,15 @@ fn up<T: crate::backend::Plain>(be: &dyn Backend, v: &[T]) -> Result<Buf> {
 }
 
 fn f(floats: usize) -> u64 { 4 * floats as u64 }
+
+/// Free expert slots until `need` bytes of VRAM are free.
+fn room(d: &mut dev::Dev, need: usize) {
+    let free = d.parts[0].be.mem_info().map_or(0, |m| m.0);
+    if free < need { d.release(0, need - free); }
+}
+
+/// Bytes of the attention partials for `rows` full-attention rows.
+fn sc_bytes(c: &Inkling2Config, rows: usize) -> usize { 4 * c.n_head * rows.div_ceil(64) * (c.head_dim + 2) }
 
 /// `moe_gemv` operands for matrices at `ptrs`: the lowest address, a step every address is a multiple of from it, and
 /// each one's index in steps. None when an index does not fit an i32.
@@ -128,14 +139,18 @@ impl Device {
         if off || c.n_conv > 8 || 128 % c.head_dim != 0 || m.loops.is_empty() { return None; }
         let rank = m.loops[0].down[0].len() / (2 * c.n_embd);
         if !shapes_fit(m, rank) { return None; }
-        let d = dev::get()?.lock().unwrap();
+        let mut d = dev::get()?.lock().unwrap();
         if d.parts.len() != 1 { return None; }
-        let be = &*d.parts[0].be;
         let dense = |x: &Mat| !x.host_only();
         if !dense(&m.output) || !m.layers.iter().all(|l| {
             [l.wq, l.wk, l.wv, l.wo, l.gate, l.rel, l.sink].iter().chain(l.conv_proj.iter().flatten()).all(dense)
         }) { return None; }
         let (kw, nr, ext) = (c.n_head_kv * c.head_dim, c.n_rel, c.rel_extent);
+        let full = (pos + 1 + 4096).min(c.n_ctx);
+        let rows: usize = (0..c.n_slot()).map(|il| if c.swa[layer_of(c, il)] { c.n_swa } else { full }).sum();
+        // Rows, partials and scratch, plus 512 MB for the small weights and what the driver needs.
+        room(&mut d, 4 * rows * kw + sc_bytes(c, full) + Scratch::at(0, c, rank, m.output.rows).end as usize + (512 << 20));
+        let be = &*d.parts[0].be;
         let made = (|| -> Result<Self> {
             let layers = m.layers.iter().map(|l| Ok(DLayer {
                 res_query: l.res_query.as_ref().map(|q| up(be, q)).transpose()?,
@@ -153,12 +168,12 @@ impl Device {
                 Ok(DLoop { msg_query: up(be, &l.msg_query)?, down: half(&l.down)?, gain: half(&l.gain)?, forget: half(&l.forget)? })
             }).collect::<Result<Vec<_>>>()?;
             let slots = (0..c.n_slot()).map(|il| {
-                let rows = if c.swa[layer_of(c, il)] { c.n_swa } else { (2 * (pos + 1)).clamp(4096, MAX_CTX) };
+                let rows = if c.swa[layer_of(c, il)] { c.n_swa } else { full };
                 Ok(DSlot { k: be.alloc(2 * rows * kw)?, v: be.alloc(2 * rows * kw)?, hist: be.zeros::<f32>(hists(c).1)? })
             }).collect::<Result<Vec<_>>>()?;
             let scr = be.alloc(Scratch::at(0, c, rank, m.output.rows).end as usize)?;
             let s = Scratch::at(scr.addr(), c, rank, m.output.rows);
-            Ok(Device { layers, loops, slots, out_query: up(be, &m.out_query)?, out_norm: up(be, &m.out_norm)?, scr, s, rank, synced: 0, ahead: false })
+            Ok(Device { layers, loops, slots, out_query: up(be, &m.out_query)?, out_norm: up(be, &m.out_norm)?, scr, s, sc: be.alloc(sc_bytes(c, full))?, rank, synced: 0, ahead: false })
         })();
         made.inspect_err(|e| eprintln!("inkling2: no room in VRAM for the decode state ({e:#}); the tokens run as prompt chunks do")).ok()
     }
@@ -171,16 +186,27 @@ impl Device {
     /// Room for the rows of position `pos` in the slots that grow.
     pub(super) fn prepare(&mut self, m: &Inkling2Model, pos: usize) -> Result<()> {
         let (c, kw) = (&m.cfg, m.cfg.n_head_kv * m.cfg.head_dim);
-        let d = dev::get().unwrap().lock().unwrap();
+        let mut d = dev::get().unwrap().lock().unwrap();
+        let grow = |cap: usize| (pos + 1 + 4096).max(cap + cap / 2).min(c.n_ctx);
+        let full = self.slots.iter().enumerate().find(|&(il, _)| !c.swa[layer_of(c, il)]).map(|(_, s)| s.k.len() / (2 * kw));
+        if let Some(cap) = full && pos >= cap {
+            let n = (0..c.n_slot()).filter(|&il| !c.swa[layer_of(c, il)]).count();
+            room(&mut d, 4 * n * grow(cap) * kw + sc_bytes(c, grow(cap)) + (128 << 20));
+        }
         let be = &*d.parts[0].be;
         for (il, s) in self.slots.iter_mut().enumerate() {
             let cap = s.k.len() / (2 * kw);
             if c.swa[layer_of(c, il)] || pos < cap { continue; }
             for b in [&mut s.k, &mut s.v] {
-                let new = be.alloc(2 * (2 * cap).min(MAX_CTX) * kw)?;
+                let new = be.alloc(2 * grow(cap) * kw)?;
                 be.dtod(b, 0, &new, 0, b.len())?;
                 be.sync()?;  // the copy reads the buffer that `*b = new` frees
                 *b = new;
+            }
+            let need = sc_bytes(c, s.k.len() / (2 * kw));
+            if self.sc.len() < need {
+                be.sync()?;
+                self.sc = be.alloc(need)?;
             }
         }
         Ok(())
@@ -195,7 +221,7 @@ impl Device {
             let mut h = vec![0f32; len];
             for (j, x) in hs.hist.iter().enumerate() { h[at[j]..at[j] + x.len()].copy_from_slice(x); }
             be.put(&h, &ds.hist, 0)?;
-            let ring = if c.swa[layer_of(c, il)] { c.n_swa } else { MAX_CTX };
+            let ring = if c.swa[layer_of(c, il)] { c.n_swa } else { c.n_ctx };
             for (a, row, rows) in runs(self.synced, pos, ring) {
                 for (host, buf) in [(&hs.k, &ds.k), (&hs.v, &ds.v)] {
                     // The host keeps a run of rows per key head, the row of position `pos - 1` last.
@@ -222,7 +248,7 @@ impl Device {
         for (il, (ds, hs)) in self.slots.iter().zip(slots).enumerate() {
             let h: Vec<f32> = be.get(&ds.hist, 0, len).expect("inkling2 device state");
             for j in 0..4 { hs.hist[j] = h[at[j]..if j < 3 { at[j + 1] } else { len }].to_vec(); }
-            let ring = if layers[layer_of(c, il)].swa { c.n_swa } else { MAX_CTX };
+            let ring = if layers[layer_of(c, il)].swa { c.n_swa } else { c.n_ctx };
             for (_, row, rows) in runs(self.synced, pos, ring) {
                 for (host, buf) in [(&mut hs.k, &ds.k), (&mut hs.v, &ds.v)] {
                     let x: Vec<u16> = be.get(buf, row * kw, rows * kw).expect("inkling2 device state");
@@ -237,7 +263,7 @@ impl Device {
     /// Run one token at the end of `m.toks` (the caller appends it). Returns the logits of the next one.
     pub(super) fn step(&mut self, m: &Inkling2Model, tok: u32) -> Vec<f32> {
         let (c, pos) = (&m.cfg, m.toks.len());
-        assert!(pos < MAX_CTX, "context is limited to {MAX_CTX} tokens");
+        assert!(pos < c.n_ctx, "context is limited to {} tokens", c.n_ctx);
         assert!((tok as usize) < m.tok_embd.rows, "token {tok} is outside the vocabulary");
         let (n, core, o) = (c.n_embd, c.loop_end - c.loop_start, self.scr.addr());
         let (mut emb, mut cur) = (vec![0f32; n], vec![0f32; n]);
@@ -346,7 +372,7 @@ impl Device {
                 be.ink_clip(s.k, 0, hd, nkv, c.qk_clip, 0.0, 1.0, ds.k.addr() + row)?;
                 be.ink_clip(s.v, 0, hd, nkv, 0.0, c.eps, 1.0, ds.v.addr() + row)?;
                 be.ink_clip(s.r, l.rel_clip.addr(), nr, nh, c.rel_clip, 0.0, tau, 0)?;
-                be.ink_attn(s.q, s.r, s.sink, s.og, ds.k.addr(), ds.v.addr(), l.rel_bias.addr(), s.sc, s.att, rows, at, nh, nkv, hd, nr, c.rel_extent)?;
+                be.ink_attn(s.q, s.r, s.sink, s.og, ds.k.addr(), ds.v.addr(), l.rel_bias.addr(), self.sc.addr(), s.att, rows, at, nh, nkv, hd, nr, c.rel_extent)?;
                 be.gemv(w(&ml.wo), s.att, s.proj)?;
                 be.ink_conv(s.proj, l.convs[2].addr(), 0, hist(2), s.x, n, nc, hd)?;
                 // The first layer of each block starts a new residual stream; the earlier one joins the mixed blocks.

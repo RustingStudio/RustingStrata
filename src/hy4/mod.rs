@@ -12,6 +12,9 @@ pub const ARCH: &str = "hy_v4_flash";
 #[derive(Debug, Clone)]
 pub struct Hy4Config {
     pub n_layer: usize,
+    /// Prompt plus reply limit: `--ctx`, else the trained context (32768 when the file does not say). Every layer
+    /// keeps the key rows of all positions, so RAM is the real bound.
+    pub n_ctx: usize,
     pub n_embd: usize,
     pub n_vocab: usize,
     /// Heads per layer (32 on the sparse layers, 64 on the sliding-window ones).
@@ -82,6 +85,7 @@ impl Hy4Config {
             idx_top = u("attention.indexer.top_k")? / kpool - 1;
         }
         Ok(Hy4Config {
+            n_ctx: crate::ctx_limit(g.meta.get(&k("context_length")).and_then(|v| v.as_u64()).map_or(32768, |v| v as usize)),
             n_layer,
             n_embd: u("embedding_length")?,
             n_vocab: g.tensors.get("token_embd.weight").context("missing token_embd.weight")?.dims[1] as usize,

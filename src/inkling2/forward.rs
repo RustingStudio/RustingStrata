@@ -16,8 +16,6 @@ use rayon::prelude::*;
 
 mod device;
 
-/// ponytail: the full-attention layers keep the rows of every position in host RAM (8 KiB a position and slot).
-pub const MAX_CTX: usize = 32768;
 /// Epsilon of the norms without a weight (depth mix, loop controllers).
 const MIX_EPS: f32 = 1e-6;
 
@@ -899,7 +897,7 @@ impl<'a> Inkling2Model<'a> {
         let (pos, nt) = (self.toks.len(), toks.len());
         let t0 = std::time::Instant::now();
         if let Some(d) = &mut self.device { d.to_host(&cfg, &self.layers, &mut self.slots, pos); }
-        assert!(pos + nt <= MAX_CTX, "context is limited to {MAX_CTX} tokens");
+        assert!(pos + nt <= self.cfg.n_ctx, "context is limited to {} tokens", self.cfg.n_ctx);
         let n = cfg.n_embd;
         let mut cur: Vec<Vec<f32>> = toks.iter().map(|&tok| {
             assert!((tok as usize) < self.tok_embd.rows, "token {tok} is outside the vocabulary");
