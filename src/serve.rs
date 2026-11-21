@@ -98,6 +98,23 @@ pub fn gone(c: &std::net::TcpStream) -> bool {
 }
 
 /// `Authorization` header check for `--api-key`, without an early exit on the first differing byte.
+/// The chat page of `serve`.
+pub const PAGE: &str = include_str!("web/index.html");
+
+/// For the servers of the models outside the main engine (one model, no loading): the chat page at GET / and a
+/// GET /api/models that lists `name` as loaded. True when it answered. `authed`: the request passed the API key, or
+/// there is none; the page itself is open as in the main server, it asks for the key.
+/// ponytail: the page's load, stats, download and MCP calls get 404 here; the chat and model name work.
+pub fn side_page(c: &mut impl std::io::Write, method: &str, path: &str, name: &str, authed: bool) -> bool {
+    let (ty, body) = match (method, path) {
+        ("GET", "/") => ("text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'", PAGE.to_string()),
+        ("GET", "/api/models") if authed => ("application/json", serde_json::json!({"dir": "", "models": [{"id": name, "bytes": 0, "loaded": true}], "options": {}}).to_string()),
+        _ => return false,
+    };
+    let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+    true
+}
+
 pub fn key_ok(auth: &str, key: &str) -> bool {
     if key.is_empty() { return false; }
     let a = auth.strip_prefix("Bearer ").unwrap_or("").as_bytes();

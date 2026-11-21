@@ -2665,7 +2665,7 @@ fn llama_timings(l: &serve::Last) -> serde_json::Value {
 }
 
 /// The chat page, served by the connection threads of `strata serve`.
-const PAGE: &str = include_str!("web/index.html");
+use rusting_strata::serve::PAGE;
 
 fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Loaded>, e: &Engine, s: &Serving, i: usize,
     next: &mut Option<(PathBuf, TcpStream)>) -> anyhow::Result<()> {

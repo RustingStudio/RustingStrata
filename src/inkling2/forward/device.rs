@@ -70,6 +70,33 @@ fn slab(ptrs: &[u64]) -> Option<(u64, usize, Vec<i32>)> {
     Some((base, step as usize, ptrs.iter().map(|&p| i32::try_from((p - base) / step).ok()).collect::<Option<_>>()?))
 }
 
+/// The kernels index the scratch buffer and the small tensors with the config's sizes and do not check bounds: a file
+/// whose tensors have other lengths runs on the host, where a wrong length panics instead of reading or writing past a
+/// buffer on the card.
+fn shapes_fit(m: &Inkling2Model, rank: usize) -> bool {
+    let c = &m.cfg;
+    let (n, q, kw, nh, nc, nf) = (c.n_embd, c.n_head * c.head_dim, c.n_head_kv * c.head_dim, c.n_head, c.n_conv, c.n_ff_exp);
+    let mat = |x: &Mat, rows: usize, cols: usize| x.rows == rows && x.cols == cols;
+    // Residual blocks held at once: those of the prelude, one pass of the core and the coda (the `blocks` region).
+    let starts = |r: std::ops::Range<usize>| r.filter(|i| i % c.block_size == 0).count();
+    let blocks = starts(0..c.loop_start) + starts(c.loop_start..c.loop_end) + starts(c.loop_end..c.n_layer);
+    blocks <= 4 && rank > 0 && mat(&m.output, m.output.rows, n) && m.out_query.len() == n && m.out_norm.len() == n
+        && m.loops.iter().all(|l| {
+            l.msg_query.len() == 4 * n && [(&l.down, 2 * n), (&l.gain, n), (&l.forget, n)].iter().all(|(w, cols)| w.len() == 4 && w.iter().all(|x| x.len() == rank * cols))
+        })
+        && m.layers.iter().all(|l| {
+            let (gu, dn) = (l.gate_up.expert_host(0, c.n_expert), l.down.expert_host(0, c.n_expert));
+            [(&l.wq, q), (&l.gate, q), (&l.wk, kw), (&l.wv, kw), (&l.rel, nh * c.n_rel), (&l.sink, nh)].iter().all(|(x, r)| mat(x, *r, n))
+                && mat(&l.wo, n, q) && mat(&gu, 2 * nf, n) && mat(&dn, n, nf)
+                && l.conv_proj.as_ref().is_none_or(|p| p.iter().all(|x| mat(x, c.n_head_kv * nc, n)))
+                && l.res_query.as_ref().is_none_or(|r| !r.is_empty() && r.len() % n == 0 && r.len() <= 3 * n)
+                && (1..=3).contains(&l.norms.len()) && l.norms.iter().all(|x| x.len() == n)
+                && l.q_clip.len() == q && l.rel_clip.len() == nh * c.n_rel && l.rel_bias.len() == c.n_rel * c.rel_extent
+                && [kw, kw, n, n].iter().zip(&l.convs).all(|(ch, w)| w.len() == ch * nc)
+                && l.ffn_query.len() == n && l.ffn_norm.len() == n
+        })
+}
+
 /// The layer whose weights slot `il` runs.
 fn layer_of(c: &Inkling2Config, il: usize) -> usize {
     if il < c.n_layer { il } else { c.loop_start + (il - c.n_layer) % (c.loop_end - c.loop_start) }
@@ -99,6 +126,8 @@ impl Device {
         let (c, pos) = (&m.cfg, m.toks.len());
         let off = std::env::var("STRATA_DS_DEVICE").is_ok_and(|v| v == "0") || m.trace || std::env::var_os("STRATA_DS_DUMP").is_some();
         if off || c.n_conv > 8 || 128 % c.head_dim != 0 || m.loops.is_empty() { return None; }
+        let rank = m.loops[0].down[0].len() / (2 * c.n_embd);
+        if !shapes_fit(m, rank) { return None; }
         let d = dev::get()?.lock().unwrap();
         if d.parts.len() != 1 { return None; }
         let be = &*d.parts[0].be;
@@ -106,8 +135,7 @@ impl Device {
         if !dense(&m.output) || !m.layers.iter().all(|l| {
             [l.wq, l.wk, l.wv, l.wo, l.gate, l.rel, l.sink].iter().chain(l.conv_proj.iter().flatten()).all(dense)
         }) { return None; }
-        let (n, kw, nr, ext) = (c.n_embd, c.n_head_kv * c.head_dim, c.n_rel, c.rel_extent);
-        let rank = m.loops[0].down[0].len() / (2 * n);
+        let (kw, nr, ext) = (c.n_head_kv * c.head_dim, c.n_rel, c.rel_extent);
         let made = (|| -> Result<Self> {
             let layers = m.layers.iter().map(|l| Ok(DLayer {
                 res_query: l.res_query.as_ref().map(|q| up(be, q)).transpose()?,
