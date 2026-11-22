@@ -128,7 +128,7 @@ sudo -u strata env STRATA_API_KEY=<admin key> rustingstrata serve --model $M --g
 
 Clients then use the OpenAI address `https://api.example.com/v1` with their key, or the Anthropic address
 `https://api.example.com` (`POST /v1/messages`). The request fields RustingStrata honors (sampling, `stop`, tools,
-thinking) are listed under [Use](../README.md#use) in the README; the usage of a streamed reply comes in its last
+thinking) are listed under [Server API](USAGE.md#server-api); the usage of a streamed reply comes in its last
 chunk.
 
 ## Keys
