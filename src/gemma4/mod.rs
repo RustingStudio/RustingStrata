@@ -259,26 +259,19 @@ pub fn chat(
     Ok(())
 }
 
-/// `rustingstrata serve` for gemma4: one request at a time, OpenAI `/v1/chat/completions` (JSON or SSE),
-/// `/v1/models`, `/health`. Greedy only (sampling and stop strings are not applied); prompt + reply limited
+/// The chat of `rustingstrata serve` for gemma4 (see `serve::Own`): one request at a time, JSON or SSE.
+/// Greedy only (sampling and stop strings are not applied); prompt + reply limited
 /// to the trained context; KV reused when the prompt extends it. Images in messages are encoded with
 /// `mmproj` when given.
-pub fn serve(
-    g: &Gguf,
-    name: &str,
-    addr: &str,
-    api_key: Option<&str>,
-    mmproj: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
+pub fn serve<'a>(g: &'a Gguf, tok: &'a crate::tokenizer::Tokenizer, name: &'a str, mmproj: Option<&std::path::Path>) -> anyhow::Result<crate::serve::Own<'a>> {
     use serde_json::json;
     use std::io::Write;
     gpu_defaults();
-    let tok = crate::tokenizer::Tokenizer::from_gguf(g)?;
     let mut m = forward::Gemma4Model::new(g)?;
     let projector = mmproj.map(crate::vision::VisionProjector::open).transpose()?;
-    let stop = stop_ids(&tok);
+    let stop = stop_ids(tok);
     let ctx = crate::ctx_limit(m.cfg.n_ctx_train);
-    crate::serve::own(name, addr, api_key, "gemma4", |c, q| {
+    Ok(Box::new(move |c: &mut std::net::TcpStream, q: &crate::serve::ChatRequest| {
         anyhow::ensure!(q.tools.is_empty() && !q.messages.iter().any(|m| m.role == "tool"), "tools are not supported for gemma4");
         let mut grids = vec![];
         let mut embs = vec![];
@@ -316,7 +309,7 @@ pub fn serve(
             crate::serve::send(c, "200 OK", "application/json", &b.to_string());
         }
         Ok(crate::serve::Done { prompt: ids.len(), cached: keep, completion: out.len(), prefill_s, finish: done })
-    })
+    }))
 }
 
 /// EOS plus the end-of-turn token that llama.cpp treats as EOG for gemma4.

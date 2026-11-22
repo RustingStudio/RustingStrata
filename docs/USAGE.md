@@ -129,12 +129,14 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   the chat page, the model list, `/health` and the stats do not. The file stays in the page cache (`buff/cache`,
   which the system takes back when it needs the memory), so the load after an unload is faster than the first one.
   The saved conversation (prompt cache) goes with the model: the first request after a load prefills its whole
-  prompt. Not available for `gemma4`, `glm5-next`, `deepseek41`, `hy_v4_flash` and `inkling2_loop` models.
+  prompt.
 - `--alias prism` (`serve`) is the model name in `/v1/models` and in the replies, whatever file is loaded (default: the
   file name), so clients set up for `prism` keep working when another model is loaded. Calibration and the expert
   profile stay per file.
-- Inkling 2, Hy4, GLM, DeepSeek and Gemma 4 have their own server: start it with `serve --model <file>`. It serves
-  that one model (greedy), and the chat page of a server started with another model, or with none, cannot load them.
+- Inkling 2, Hy4, GLM, DeepSeek and Gemma 4 run on their own code path. The server loads them like any other model
+  (`serve --model <file>`, or from the chat page of a running server, in either direction), with these limits: one
+  request at a time, greedy, `/v1/chat/completions` only (no `/v1/messages`), and nothing to calibrate. The
+  context limit is `--ctx` (or the page's context setting) when given, else the trained context.
 - `--lora PATH:SCALE` applies a LoRA adapter at runtime, see [LORA.md](LORA.md).
 - `--mcp FILE` (`serve` only, or `STRATA_MCP`) lists the MCP servers whose tools the chat page may call, see
   [Tools (MCP)](#tools-mcp).

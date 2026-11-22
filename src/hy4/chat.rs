@@ -175,17 +175,16 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
     Ok(())
 }
 
-/// `rustingstrata serve` for Hy4-flash: one request at a time, OpenAI `/v1/chat/completions` (JSON or SSE), `/v1/models`, `/health`.
+/// The chat of `rustingstrata serve` for Hy4-flash (see `serve::Own`): one request at a time, JSON or SSE.
 /// ponytail: greedy only, no stop strings; thinking (`"think": true`) arrives inside `content` up to `</think:opensource>`;
 /// the KV cache is reused only when the new prompt extends the last sequence.
-pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow::Result<()> {
+pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str) -> anyhow::Result<crate::serve::Own<'a>> {
     use anyhow::Context;
     use serde_json::json;
     gpu_defaults();
-    let tok = Tokenizer::from_gguf(g)?;
     let mut m = Hy4Model::new(g)?;
     let max_ctx = m.cfg.n_ctx;
-    crate::serve::own(name, addr, api_key, "hy4", |c, q| {
+    Ok(Box::new(move |c: &mut std::net::TcpStream, q: &crate::serve::ChatRequest| {
         let ids = tok.encode(&render(&q.messages, &q.tools, q.think.unwrap_or(false), q.preserve_thinking)).ok().filter(|i| !i.is_empty()).context("cannot encode prompt")?;
         anyhow::ensure!(ids.len() < max_ctx, "prompt is {} tokens, the limit is {max_ctx}", ids.len());
         let t = std::time::Instant::now();
@@ -225,7 +224,7 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
             crate::serve::send(c, "200 OK", "application/json", &b.to_string());
         }
         Ok(crate::serve::Done { prompt: ids.len(), cached: keep, completion: out.len(), prefill_s, finish: done })
-    })
+    }))
 }
 
 #[test]

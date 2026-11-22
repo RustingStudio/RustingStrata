@@ -268,8 +268,7 @@ impl ModelConfig {
     pub fn from_gguf(g: &Gguf) -> anyhow::Result<ModelConfig> {
         let arch = g.get("general.architecture")?.as_str().context("general.architecture")?.to_string();
         let Some(a) = self::arch(&arch) else {
-            ensure!(!OWN_ARCHS.contains(&arch.as_str()), "'{arch}' models run with chat, generate, bench and `rustingstrata serve --model <file>`; \
-                a server started without that model cannot switch to them");
+            ensure!(!OWN_ARCHS.contains(&arch.as_str()), "'{arch}' models run with chat, generate, bench and serve only");
             bail!("unsupported architecture '{arch}' (supported: qwen3, qwen3moe, qwen3next, qwen35, qwen35moe, qwen4exp, flint, sensenova_loop)")
         };
         let opt = |k: &str| g.meta.get(&format!("{arch}.{k}")).and_then(|v| v.as_u64()).unwrap_or(0) as usize;

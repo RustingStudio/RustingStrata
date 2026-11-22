@@ -86,18 +86,17 @@ fn ctx_limit(g: &Gguf) -> usize {
         .or_else(|| g.meta.get(&format!("{arch}.context_length")).and_then(Value::as_u64).map(|v| v as usize)).unwrap_or(usize::MAX))
 }
 
-/// `rustingstrata serve` for DeepSeek: one request at a time, OpenAI `/v1/chat/completions` (JSON or SSE), `/v1/models`, `/health`.
+/// The chat of `rustingstrata serve` for DeepSeek (see `serve::Own`): one request at a time, JSON or SSE.
 /// Earlier reasoning is kept by default, like llama-server (`chat_template_kwargs.preserve_thinking:false` drops it).
 /// ponytail: greedy only, no tools/stop strings; the KV cache is reused only when the new prompt extends the last sequence.
-pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow::Result<()> {
+pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str) -> anyhow::Result<crate::serve::Own<'a>> {
     use anyhow::Context;
     use serde_json::json;
     gpu_defaults();
-    let tok = Tokenizer::from_gguf(g)?;
     let mut m = DsModel::new(g)?;
     let eos = tok.eos_ids();
     let ctx = ctx_limit(g);
-    crate::serve::own(name, addr, api_key, "deepseek", |c, q| {
+    Ok(Box::new(move |c: &mut std::net::TcpStream, q: &crate::serve::ChatRequest| {
         let ids = tok.encode(&Template::Ds.render(&q.messages, &q.tools, q.think.unwrap_or(false), q.preserve_thinking.unwrap_or(true), true)).ok().filter(|i| !i.is_empty()).context("cannot encode prompt")?;
         anyhow::ensure!(ids.len() <= ctx, "prompt is {} tokens, the limit is {ctx}", ids.len());
         let t = std::time::Instant::now();
@@ -149,5 +148,5 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
             crate::serve::send(c, "200 OK", "application/json", &b.to_string());
         }
         Ok(crate::serve::Done { prompt: ids.len(), cached: keep, completion: out.len(), prefill_s, finish: done })
-    })
+    }))
 }

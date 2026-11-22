@@ -407,18 +407,17 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `rustingstrata serve` for GLM: one request at a time, OpenAI `/v1/chat/completions` (JSON or SSE), `/v1/models`, `/health`.
+/// The chat of `rustingstrata serve` for GLM (see `serve::Own`): one request at a time, JSON or SSE.
 /// ponytail: greedy only, no stop strings; prompt + reply limited to the model's context (STRATA_GLM_CTX overrides); KV reused when the prompt extends it.
-pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow::Result<()> {
+pub fn serve<'a>(g: &'a Gguf, tok: &'a crate::tokenizer::Tokenizer, name: &'a str) -> anyhow::Result<crate::serve::Own<'a>> {
     use anyhow::Context;
     use serde_json::json;
     use std::io::Write;
     gpu_defaults();
-    let tok = crate::tokenizer::Tokenizer::from_gguf(g)?;
     let mut m = forward::GlmModel::new(g)?;
-    let stop = stop_ids(g, &tok);
+    let stop = stop_ids(g, tok);
     let ctx = ctx_limit(&m);
-    crate::serve::own(name, addr, api_key, "glm", |c, q| {
+    Ok(Box::new(move |c: &mut std::net::TcpStream, q: &crate::serve::ChatRequest| {
         let ids = tok.encode(&chat_prompt_tools(&q.messages, &q.tools)).ok().filter(|i| !i.is_empty()).context("cannot encode prompt")?;
         anyhow::ensure!(ids.len() < ctx, "prompt is {} tokens, the limit is {}", ids.len(), ctx - 1);
         let t = std::time::Instant::now();
@@ -464,7 +463,7 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
             crate::serve::send(c, "200 OK", "application/json", &b.to_string());
         }
         Ok(crate::serve::Done { prompt: ids.len(), cached: keep, completion: out.len(), prefill_s, finish: done })
-    })
+    }))
 }
 
 #[cfg(test)]

@@ -226,18 +226,20 @@ struct Hosting {
     alias: Option<String>,
 }
 
-enum Runner<'a> { Cpu(&'a Model<'a>, State), Gpu(Box<GpuModel<'a>>), Slot(Client) }
+/// `Own`: a model outside the main engine (`config::OWN_ARCHS`). Its chat answers a request whole, so the token
+/// methods below do not apply to it.
+enum Runner<'a> { Cpu(&'a Model<'a>, State), Gpu(Box<GpuModel<'a>>), Slot(Client), Own(serve::Own<'a>) }
 
 impl Runner<'_> {
     fn step(&mut self, t: u32) -> anyhow::Result<Vec<f32>> {
-        match self { Runner::Cpu(m, st) => Ok(m.step(st, t)), Runner::Gpu(g) => g.step(t), Runner::Slot(c) => Ok(c.step(t, true)?.1) }
+        match self { Runner::Cpu(m, st) => Ok(m.step(st, t)), Runner::Gpu(g) => g.step(t), Runner::Slot(c) => Ok(c.step(t, true)?.1), Runner::Own(_) => anyhow::bail!("step on a model outside the main engine") }
     }
     /// Feed a prompt; returns the logits after its last token.
     fn prefill(&mut self, ts: &[u32]) -> anyhow::Result<Vec<f32>> {
         match self {
             Runner::Cpu(m, st) => Ok(ts.iter().map(|&t| m.step(st, t)).last().unwrap_or_default()),
             Runner::Gpu(g) => g.prefill(ts),
-            Runner::Slot(_) => anyhow::bail!("prefill on a slot"),
+            Runner::Slot(_) | Runner::Own(_) => anyhow::bail!("prefill on a slot or a model outside the main engine"),
         }
     }
     /// Feed a chat prompt as a fresh sequence, reusing the earlier request's state for the shared message history
@@ -261,12 +263,12 @@ impl Runner<'_> {
         match self {
             Runner::Cpu(m, st) => { *st = State::new(&m.cfg); vision::feed_prompt(m, st, p, embs) }
             Runner::Gpu(g) => g.prefill_image(p, embs),
-            Runner::Slot(_) => anyhow::bail!("image input is not supported on a serve slot"),
+            Runner::Slot(_) | Runner::Own(_) => anyhow::bail!("image input is not supported on a serve slot"),
         }
     }
     /// Forget the sequence so far.
     fn reset(&mut self) -> anyhow::Result<()> {
-        match self { Runner::Cpu(m, st) => { *st = State::new(&m.cfg); Ok(()) } Runner::Gpu(g) => g.reset(), Runner::Slot(_) => Ok(()) }
+        match self { Runner::Cpu(m, st) => { *st = State::new(&m.cfg); Ok(()) } Runner::Gpu(g) => g.reset(), Runner::Slot(_) | Runner::Own(_) => Ok(()) }
     }
     /// Seconds spent waiting on CPU experts so far (GPU only).
     fn cpu_secs(&self) -> f64 { if let Runner::Gpu(g) = self { g.parts().map(|p| p.cpu_time.as_secs_f64()).sum() } else { 0.0 } }
@@ -287,6 +289,7 @@ impl Runner<'_> {
             Runner::Cpu(..) => "cpu",
             Runner::Gpu(g) => g.parts().next().map_or("cpu", |p| p.gpu.name()),
             Runner::Slot(_) => "slot",
+            Runner::Own(_) => "own",
         }
     }
     /// Expert-cache counters summed over the parts, for `finish()` and the benchmark JSON (`None` off the GPU).
@@ -1440,47 +1443,6 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Serve { model, models_dir, addr, api_key, mcp, open, host, mut engine } => {
             engine.ds_env();
             anyhow::ensure!(host.auto_unload != Some(0), "--auto-unload must be at least 1 second");
-            // The four architectures below have their own servers, which keep the model for as long as they run.
-            let arch = model.as_deref().and_then(Gguf::arch);
-            if host.auto_unload.is_some() && let Some(a) = arch.as_deref() && rusting_strata::config::OWN_ARCHS.contains(&a) {
-                anyhow::bail!("--auto-unload is not available for {a} models");
-            }
-            if let Some(mp) = &model && arch.as_deref() == Some("gemma4") {
-                let g = Gguf::open(mp)?;
-                let name = host.alias.clone().unwrap_or_else(|| mp.file_name().map_or("gemma4".into(), |n| n.to_string_lossy().into_owned()));
-                let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
-                anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
-                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(mp));
-                return rusting_strata::gemma4::serve(&g, &name, &addr, key.as_deref(), mmproj.as_deref());
-            }
-            if let Some(mp) = &model && arch.as_deref() == Some("glm5-next") {
-                let g = Gguf::open(mp)?;
-                let name = host.alias.clone().unwrap_or_else(|| mp.file_name().map_or("glm".into(), |n| n.to_string_lossy().into_owned()));
-                let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
-                anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
-                return rusting_strata::glm::serve(&g, &name, &addr, key.as_deref());
-            }
-            if let Some(mp) = &model && arch.as_deref() == Some("deepseek41") {
-                let g = Gguf::open(mp)?;
-                let name = host.alias.clone().unwrap_or_else(|| mp.file_name().map_or("deepseek".into(), |n| n.to_string_lossy().into_owned()));
-                let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
-                anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
-                return rusting_strata::deepseek::chat::serve(&g, &name, &addr, key.as_deref());
-            }
-            if let Some(mp) = &model && arch.as_deref() == Some(rusting_strata::hy4::ARCH) {
-                let g = Gguf::open(mp)?;
-                let name = host.alias.clone().unwrap_or_else(|| mp.file_name().map_or("hy4".into(), |n| n.to_string_lossy().into_owned()));
-                let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
-                anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
-                return rusting_strata::hy4::chat::serve(&g, &name, &addr, key.as_deref());
-            }
-            if let Some(mp) = &model && arch.as_deref() == Some(rusting_strata::inkling2::ARCH) {
-                let g = Gguf::open(mp)?;
-                let name = host.alias.clone().unwrap_or_else(|| mp.file_name().map_or("inkling2".into(), |n| n.to_string_lossy().into_owned()));
-                let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
-                anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
-                return rusting_strata::inkling2::chat::serve(&g, &name, &addr, key.as_deref());
-            }
             engine.parallel = host.parallel;
             // Before the model is loaded: a slot count outside 1..=255 is an invalid request, not a downgrade.
             anyhow::ensure!((1..=255).contains(&engine.parallel), "--parallel {}: 1 to 255 slots", engine.parallel);
@@ -1691,10 +1653,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     },
                 };
                 // The page's load options stay for later loads; a load that fails takes the old ones back.
-                let old = engine.clone();
+                let (old, old_ctx) = (engine.clone(), rusting_strata::CTX.load(Relaxed));
                 let o = s.opts.lock().unwrap().take();
                 if !o.is_null() {
                     engine = engine.with(&o)?;
+                    // The models outside the main engine read their limit here (`ctx_limit`).
+                    if !o["ctx"].is_null() { rusting_strata::CTX.store(engine.ctx, Relaxed); }
                     // `runner` also sets it, and calibrate runs before `runner`.
                     set_kv_env(&engine.kv);
                 }
@@ -1730,6 +1694,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     Err(e) if w.is_none() => return Err(e),
                     Err(e) => {
                         engine = old;
+                        rusting_strata::CTX.store(old_ctx, Relaxed);
                         set_kv_env(&engine.kv);
                         s.stats.lock().unwrap().unload(None);
                         eprintln!("loading {}: {e:#}", p.display());
@@ -2143,7 +2108,7 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
                 ahead = None;
                 match r {
                     Runner::Gpu(g) => { logits = g.force_tokens(&close_ids, &mut row)?; }
-                    Runner::Cpu(..) | Runner::Slot(..) => {
+                    Runner::Cpu(..) | Runner::Slot(..) | Runner::Own(..) => {
                         for &ct in &close_ids { logits = r.step(ct)?; }
                     }
                 }
@@ -2645,20 +2610,37 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
     let g = Gguf::open(model)?;
     let arch = g.get("general.architecture")?.as_str().context("general.architecture")?;
     s.stats.lock().unwrap().ctx_train = g.meta.get(&format!("{arch}.context_length")).and_then(|v| v.as_u64());
-    let aux_g = open_mtp_gguf(engine.aux_model_path())?;
-    let mut m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
-    if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
     let tok = Tokenizer::from_gguf(&g)?;
-    let mut r = engine.runner(&m, model)?;
+    // Declared before the model, so it is dropped after it.
+    let _own = rusting_strata::config::OWN_ARCHS.contains(&arch).then(OwnState::new);
+    let (aux_g, m);
+    let mut r = if _own.is_some() {
+        let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(model));
+        Runner::Own(match arch {
+            "gemma4" => rusting_strata::gemma4::serve(&g, &tok, &name, mmproj.as_deref())?,
+            "glm5-next" => rusting_strata::glm::serve(&g, &tok, &name)?,
+            "deepseek41" => rusting_strata::deepseek::chat::serve(&g, &tok, &name)?,
+            rusting_strata::hy4::ARCH => rusting_strata::hy4::chat::serve(&g, &tok, &name)?,
+            _ => rusting_strata::inkling2::chat::serve(&g, &tok, &name)?,
+        })
+    } else {
+        aux_g = open_mtp_gguf(engine.aux_model_path())?;
+        m = { let mut m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?; if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; } m };
+        engine.runner(&m, model)?
+    };
     // Serving decodes one reply after a (usually cached) prompt: follow the reply's routing, not the prompt's.
     if let Runner::Gpu(g) = &mut r { g.set_decode_only(true); }
     {
         let mut st = s.stats.lock().unwrap();
         st.loading = false;
-        (st.backend, st.device, st.ctx, st.slots) = match &r { Runner::Gpu(g) => (g.gpu.name().into(), g.gpu.device(), engine.ctx, g.slots()), _ => ("cpu".into(), String::new(), engine.ctx, 1) };
+        (st.backend, st.device, st.ctx, st.slots) = match &r {
+            Runner::Gpu(g) => (g.gpu.name().into(), g.gpu.device(), engine.ctx, g.slots()),
+            Runner::Own(_) => { let d = rusting_strata::deepseek::mat::dev_stats(); (d.as_ref().map_or("cpu", |d| d.0).into(), d.map(|d| d.1).unwrap_or_default(), rusting_strata::ctx_limit(st.ctx_train.unwrap_or(0) as usize), 1) }
+            _ => ("cpu".into(), String::new(), engine.ctx, 1),
+        };
         gpu_stats(&r, &mut st);
     }
-    let mut l = Loaded { r, tok: &tok, tpl: template(&g), name, path: model.to_path_buf() };
+    let mut l = Loaded { r, tok: &tok, tpl: if _own.is_some() { Template::Xml } else { template(&g) }, name: name.clone(), path: model.to_path_buf() };
     eprintln!("loaded {}", l.name);
     if let Some(mut w) = w.take() {
         let b = json!({"loaded": l.name}).to_string();
@@ -2673,7 +2655,31 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
 
 /// The side panel's device memory, expert cache and MTP counts.
 fn gpu_stats(r: &Runner, s: &mut serve::Stats) {
-    if let Runner::Gpu(g) = r { gpu_model_stats(g, s) }
+    match r {
+        Runner::Gpu(g) => gpu_model_stats(g, s),
+        Runner::Own(_) => s.vram = rusting_strata::deepseek::mat::dev_stats().and_then(|d| d.2),
+        _ => {}
+    }
+}
+
+/// What a model outside the main engine leaves in the process: the GPUs of `deepseek::mat` and the `STRATA_*`
+/// defaults its architecture set. Dropping it frees the GPUs and puts the variables back, so the next model (of any
+/// architecture) starts clean.
+struct OwnState(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl OwnState {
+    fn new() -> OwnState {
+        OwnState(["STRATA_DS_GPU", "STRATA_DS_GPU_FRACTION", "STRATA_DS_GPU_EXPERTS", "STRATA_DS_NOEVICT", "STRATA_GLM_PREFETCH"].map(|k| (k, std::env::var_os(k))).into())
+    }
+}
+
+impl Drop for OwnState {
+    fn drop(&mut self) {
+        rusting_strata::deepseek::mat::dev_free();
+        for (k, v) in &self.0 {
+            unsafe { match v { Some(v) => std::env::set_var(k, v), None => std::env::remove_var(k) } }
+        }
+    }
 }
 
 fn gpu_model_stats(g: &GpuModel, s: &mut serve::Stats) {
@@ -2732,6 +2738,13 @@ fn llama_timings(l: &serve::Last) -> serde_json::Value {
 /// The chat page, served by the connection threads of `strata serve`.
 use rusting_strata::serve::PAGE;
 
+/// The Messages API needs the main engine: for another model the request gets a 400, and true is returned.
+fn anthropic_refused(w: &mut TcpStream, r: &Runner) -> bool {
+    let own = matches!(r, Runner::Own(_));
+    if own { serve::send(w, "400 Bad Request", "application/json", r#"{"error":{"message":"the Messages API is not available for this model; use /v1/chat/completions","type":"invalid_request_error"}}"#); }
+    own
+}
+
 fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Loaded>, e: &Engine, s: &Serving, i: usize,
     next: &mut Option<(PathBuf, TcpStream)>) -> anyhow::Result<()> {
     let send = |w: &mut TcpStream, status: &str, v: serde_json::Value| -> anyhow::Result<()> {
@@ -2769,7 +2782,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let options = json!({"ctx": e.ctx, "kv": e.kv, "cache_ram": e.cache_ram, "vram_margin": e.vram_margin.join(","), "mtp": e.mtp, "chunk": e.chunk,
                 "gpu": e.gpu, "ctx_train": s.stats.lock().unwrap().ctx_train,
                 // false: a GPU model with no calibration file (the page offers to calibrate it).
-                "calibrated": l.as_ref().filter(|_| e.gpu).map(|l| calibration_path(&l.path, &s.stats.lock().unwrap().backend, &e.device).exists())});
+                "calibrated": l.as_ref().filter(|l| e.gpu && !matches!(l.r, Runner::Own(_))).map(|l| calibration_path(&l.path, &s.stats.lock().unwrap().backend, &e.device).exists())});
             send(&mut w, "200 OK", json!({"dir": s.dir, "models": models, "options": options}))
         }
         // Answered once the model has loaded (or failed to).
@@ -2819,6 +2832,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
         // The prompt's tokens as the model would see them, template and tools included.
         ("POST", "/v1/messages/count_tokens") => {
             let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
+            if anthropic_refused(&mut w, &l.r) { return Ok(()); }
             match serve::messages_body(&body).and_then(|b| serve::chat_request(&b)) {
                 Ok(req) => {
                     let prompt = l.tpl.render(&req.messages, &req.tools, req.think.unwrap_or(e.think_default), req.preserve_thinking.unwrap_or(e.preserve_thinking), true);
@@ -2838,12 +2852,57 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
         ("POST", p @ ("/v1/chat/completions" | "/v1/messages")) => {
             let anth = p == "/v1/messages";
             let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
+            if anth && anthropic_refused(&mut w, &l.r) { return Ok(()); }
             let (r, tok, tpl, name) = (&mut l.r, &l.tok, l.tpl, l.name.as_str());
             match r { Runner::Gpu(g) => g.owner = who.id, Runner::Slot(c) => (c.owner, c.conn) = (who.id, w.try_clone().ok()), _ => {} }
-            let req = match if anth { serve::messages_body(&body) } else { Ok(body.clone()) }.and_then(|b| serve::chat_request(&b)) {
+            let mut req = match if anth { serve::messages_body(&body) } else { Ok(body.clone()) }.and_then(|b| serve::chat_request(&b)) {
                 Ok(q) => q,
                 Err(err) => return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
             };
+            let key_name = if who.name.is_empty() { "open" } else { who.name.as_str() };
+            // The `done:` line of a chat request, and its line in the usage log.
+            let log = |last: &serve::Last| {
+                let decode_s = last.decode_ms / 1e3;
+                let prefill_s = last.prefill_ms / 1e3;
+                // Cached prompt tokens were not prefilled again, so they do not count toward the prefill speed.
+                let new_prompt = last.prompt_tokens.saturating_sub(last.cached_tokens);
+                let decode_tps = if decode_s > 0.0 { last.completion_tokens as f64 / decode_s } else { 0.0 };
+                let prefill_tps = if prefill_s > 0.0 { new_prompt as f64 / prefill_s } else { 0.0 };
+                eprintln!("done: key={key_name} model={} prompt={} tok ({} cached) -> {} tok in {decode_s:.2} s, \
+                    decode {decode_tps:.1} tok/s, prefill {prefill_tps:.1} tok/s, finish={}",
+                    last.model, last.prompt_tokens, last.cached_tokens, last.completion_tokens, last.finish);
+                if let Some(f) = &s.usage {
+                    let mut v = json!(last);
+                    v["key"] = who.name.clone().into();
+                    // A failed write must not fail the reply; it is reported.
+                    if let Err(err) = writeln!(f.lock().unwrap(), "{v}") { eprintln!("usage log: {err}"); }
+                }
+            };
+            // A model outside the main engine answers the request itself (greedy; it fails before it writes).
+            if let Runner::Own(chat) = r {
+                if s.max_tokens < usize::MAX { req.max_tokens = Some(req.max_tokens.unwrap_or(s.max_tokens).min(s.max_tokens)); }
+                eprintln!("request: {method} {p} key={key_name} model={name} messages={} stream={} tools={}", req.messages.len(), req.stream, req.tools.len());
+                s.stats.lock().unwrap().busy += 1;
+                let t = Instant::now();
+                let res = chat(&mut w, &req);
+                let total_ms = t.elapsed().as_secs_f64() * 1e3;
+                let mut st = s.stats.lock().unwrap();
+                st.busy -= 1;
+                gpu_stats(r, &mut st);
+                return match res {
+                    Ok(d) => {
+                        let last = serve::Last { at: created, model: name.into(), system_tokens: 0, cached_tokens: d.cached, prompt_tokens: d.prompt,
+                            completion_tokens: d.completion, prefill_ms: d.prefill_s * 1e3, decode_ms: (total_ms - d.prefill_s * 1e3).max(0.0), finish: d.finish.into() };
+                        log(&last);
+                        st.record(last);
+                        Ok(())
+                    }
+                    Err(err) => {
+                        eprintln!("request: {err:#}");
+                        send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}}))
+                    }
+                };
+            }
             // Room is checked on the full prompt before any state changes.
             let preserve = req.preserve_thinking.unwrap_or(e.preserve_thinking);
             // An assistant message at the end is continued, not answered: the prompt stops inside it.
@@ -2864,8 +2923,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 None => None,
             };
             let ids = match &vision_prompt { Some(p) => p.ids.clone(), None => tok.encode(&prompt)? };
-            // One line per chat request, and one when it finishes (see `log` below).
-            let key_name = if who.name.is_empty() { "open" } else { who.name.as_str() };
+            // One line per chat request, and one when it finishes (see `log` above).
             eprintln!("request: {method} {p} key={key_name} model={name} prompt={} tok stream={} tools={}",
                 ids.len(), req.stream, req.tools.len());
             let mut smp = e.sampler();
@@ -2963,23 +3021,6 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let ms = |d: Duration| d.as_secs_f64() * 1e3;
             let mut last = serve::Last { at: created, model: name.into(), system_tokens: n_system, cached_tokens: cached,
                 prompt_tokens: ids.len(), completion_tokens: k, prefill_ms: ms(t1 - t0), decode_ms: ms(decoded), finish: String::new() };
-            let log = |last: &serve::Last| {
-                let decode_s = last.decode_ms / 1e3;
-                let prefill_s = last.prefill_ms / 1e3;
-                // Cached prompt tokens were not prefilled again, so they do not count toward the prefill speed.
-                let new_prompt = last.prompt_tokens.saturating_sub(last.cached_tokens);
-                let decode_tps = if decode_s > 0.0 { last.completion_tokens as f64 / decode_s } else { 0.0 };
-                let prefill_tps = if prefill_s > 0.0 { new_prompt as f64 / prefill_s } else { 0.0 };
-                eprintln!("done: key={key_name} model={} prompt={} tok ({} cached) -> {} tok in {decode_s:.2} s, \
-                    decode {decode_tps:.1} tok/s, prefill {prefill_tps:.1} tok/s, finish={}",
-                    last.model, last.prompt_tokens, last.cached_tokens, last.completion_tokens, last.finish);
-                if let Some(f) = &s.usage {
-                    let mut v = json!(last);
-                    v["key"] = who.name.clone().into();
-                    // A failed write must not fail the reply; it is reported.
-                    if let Err(err) = writeln!(f.lock().unwrap(), "{v}") { eprintln!("usage log: {err}"); }
-                }
-            };
             // The next request starts from the saved history state or from scratch. A stream that already started is just cut off.
             let (out, stop) = match res {
                 Ok(x) => x,
@@ -3341,6 +3382,17 @@ mod bench_tests {
         assert_eq!(pe["mb_per_token"], 313.8);
         assert_eq!(pe["gb_per_s"], round1(329_006_694.0 * 129.7 / 1e9));
         assert_eq!(pe["at_decode_tok_s"], 129.7);
+    }
+
+    /// A model outside the main engine leaves no `STRATA_*` default behind for the next model.
+    #[test]
+    fn own_state_restores_the_environment() {
+        // Safety: no other test reads this variable.
+        unsafe { std::env::remove_var("STRATA_GLM_PREFETCH") };
+        let st = super::OwnState::new();
+        unsafe { std::env::set_var("STRATA_GLM_PREFETCH", "2") };
+        drop(st);
+        assert!(std::env::var_os("STRATA_GLM_PREFETCH").is_none());
     }
 
     #[test]

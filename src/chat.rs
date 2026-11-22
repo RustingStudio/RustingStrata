@@ -168,6 +168,10 @@ impl Msg {
             Json::Null => bail!("{role} message without content"),
             _ => bail!("bad content"),
         };
+        // Messages come from the network: a plain path would make the server read a local file.
+        if let Some(u) = images.iter().find(|u| !["data:", "http://", "https://"].iter().any(|p| u.starts_with(p))) {
+            bail!("image source {u:?} is not a data: or http(s) URL");
+        }
         let calls = match m.get("tool_calls") {
             Json::Null => vec![],
             Json::Arr(a) if role == "assistant" => a.iter().map(|c| {
@@ -709,6 +713,12 @@ impl Think {
 #[cfg(test)]
 mod think_tests {
     use super::*;
+    #[test]
+    fn image_source_must_be_a_url() {
+        let req = |url: &str| crate::serve::chat_request(format!(r#"{{"messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"{url}"}}}}]}}]}}"#).as_bytes());
+        assert!(req("/etc/hostname").is_err());
+        assert_eq!(req("data:image/png;base64,AA==").unwrap().messages[0].images.len(), 1);
+    }
     #[test]
     fn splits_across_tokens() {
         let mut t = Think::new(true);

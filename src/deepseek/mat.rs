@@ -2,7 +2,7 @@
 use crate::gguf::{Gguf, TensorInfo};
 use crate::quant::{GgmlType, dequant_row};
 use rayon::prelude::*;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex};
 
 /// Optional GPU offload of the non-expert matvecs (STRATA_DS_GPU=1). Weights stay resident in VRAM; the activation is
 /// copied up and the result down per call, so everything else in the forward stays the CPU reference code.
@@ -21,42 +21,59 @@ pub(crate) mod dev {
     const SHIFT: u32 = 24;
     pub fn gpu_of(id: u32) -> usize { (id >> SHIFT) as usize }
     pub(crate) struct Part { pub(crate) be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, stage: Buf, bytes: usize, budget: usize, room: usize }
+    #[derive(Default)]
     pub struct Dev { pub(crate) parts: Vec<Part>, ex: std::collections::HashMap<usize, usize>, exs: Vec<(u32, usize, u64, f32)>, now: u64, cur: usize, lookups: u64 }
-    static DEV: OnceLock<Option<Mutex<Dev>>> = OnceLock::new();
+    static DEV: LazyLock<Mutex<Dev>> = LazyLock::new(Default::default);
+    /// Whether `DEV` is open: None before the first `get` and after `free`.
+    static OPEN: Mutex<Option<bool>> = Mutex::new(None);
     pub fn get() -> Option<&'static Mutex<Dev>> {
-        DEV.get_or_init(|| {
-            // Unset or 0: every matvec runs on the CPU.
-            if std::env::var("STRATA_DS_GPU").map_or(true, |v| v == "0") { return None; }
-            let kind = std::env::var("STRATA_DS_BACKEND").ok();
-            let ids: Vec<usize> = std::env::var("STRATA_DS_DEVICES").ok()
-                .map(|v| v.split(',').filter_map(|d| d.trim().parse().ok()).collect()).filter(|v: &Vec<usize>| !v.is_empty()).unwrap_or(vec![0]);
-            // `STRATA_DS_GPU_EXPERTS` is the absolute weight budget in GB (plain weights and expert cache). Unset:
-            // `STRATA_DS_GPU_FRACTION` of free VRAM (80% by default, 90% for GLM), which keeps the old defaults on a
-            // 12 GB card and uses most of an 80 GB one.
-            let gb: Option<f64> = std::env::var("STRATA_DS_GPU_EXPERTS").ok().and_then(|v| v.parse().ok());
-            let frac: f64 = std::env::var("STRATA_DS_GPU_FRACTION").ok().and_then(|v| v.parse().ok()).unwrap_or(0.8);
-            let mut bes = vec![];
-            for d in ids {
-                match crate::backend::open(kind.as_deref(), d) {
-                    Ok(be) => bes.push(be),
-                    Err(e) => { eprintln!("GPU {d}: {e:#}; running without it"); return None; }
-                }
+        let mut on = OPEN.lock().unwrap();
+        if on.is_none() {
+            let d = open();
+            *on = Some(d.is_some());
+            *DEV.lock().unwrap() = d.unwrap_or_default();
+        }
+        on.unwrap().then(|| &*DEV)
+    }
+    /// Frees the GPUs and everything uploaded to them; the next `get` opens them again from the environment. For a
+    /// server that changes models: call it once the model that used them is dropped.
+    pub fn free() {
+        let mut on = OPEN.lock().unwrap();
+        *DEV.lock().unwrap() = Dev::default();
+        *on = None;
+    }
+    fn open() -> Option<Dev> {
+        // Unset or 0: every matvec runs on the CPU.
+        if std::env::var("STRATA_DS_GPU").map_or(true, |v| v == "0") { return None; }
+        let kind = std::env::var("STRATA_DS_BACKEND").ok();
+        let ids: Vec<usize> = std::env::var("STRATA_DS_DEVICES").ok()
+            .map(|v| v.split(',').filter_map(|d| d.trim().parse().ok()).collect()).filter(|v: &Vec<usize>| !v.is_empty()).unwrap_or(vec![0]);
+        // `STRATA_DS_GPU_EXPERTS` is the absolute weight budget in GB (plain weights and expert cache). Unset:
+        // `STRATA_DS_GPU_FRACTION` of free VRAM (80% by default, 90% for GLM), which keeps the old defaults on a
+        // 12 GB card and uses most of an 80 GB one.
+        let gb: Option<f64> = std::env::var("STRATA_DS_GPU_EXPERTS").ok().and_then(|v| v.parse().ok());
+        let frac: f64 = std::env::var("STRATA_DS_GPU_FRACTION").ok().and_then(|v| v.parse().ok()).unwrap_or(0.8);
+        let mut bes = vec![];
+        for d in ids {
+            match crate::backend::open(kind.as_deref(), d) {
+                Ok(be) => bes.push(be),
+                Err(e) => { eprintln!("GPU {d}: {e:#}; running without it"); return None; }
             }
-            let free: Vec<usize> = bes.iter().map(|b| b.mem_info().map_or(1, |m| m.0.max(1))).collect();
-            let total: usize = free.iter().sum();
-            let parts = bes.into_iter().zip(&free).map(|(be, &f)| {
-                // Room for a prefill chunk of activations and outputs, so row batches reuse them instead of allocating per expert.
-                let (x, y, stage) = (be.alloc(4 * SCRATCH).ok()?, be.alloc(4 * SCRATCH).ok()?, be.alloc(STAGE).ok()?);
-                let budget = match gb {
-                    Some(g) => (g * 1e9 * f as f64 / total as f64) as usize,
-                    None => (f.saturating_sub(56 << 20) as f64 * frac) as usize,
-                };
-                // Room for the plain weights before moving on to the next GPU: what is free, less the expert cache and a margin.
-                let room = f.saturating_sub(budget + (768 << 20));
-                Some(Part { be, ts: vec![], x, y, stage, bytes: 0, budget, room })
-            }).collect::<Option<Vec<_>>>()?;
-            Some(Mutex::new(Dev { parts, ex: Default::default(), exs: vec![], now: 0, cur: 0, lookups: 0 }))
-        }).as_ref()
+        }
+        let free: Vec<usize> = bes.iter().map(|b| b.mem_info().map_or(1, |m| m.0.max(1))).collect();
+        let total: usize = free.iter().sum();
+        let parts = bes.into_iter().zip(&free).map(|(be, &f)| {
+            // Room for a prefill chunk of activations and outputs, so row batches reuse them instead of allocating per expert.
+            let (x, y, stage) = (be.alloc(4 * SCRATCH).ok()?, be.alloc(4 * SCRATCH).ok()?, be.alloc(STAGE).ok()?);
+            let budget = match gb {
+                Some(g) => (g * 1e9 * f as f64 / total as f64) as usize,
+                None => (f.saturating_sub(56 << 20) as f64 * frac) as usize,
+            };
+            // Room for the plain weights before moving on to the next GPU: what is free, less the expert cache and a margin.
+            let room = f.saturating_sub(budget + (768 << 20));
+            Some(Part { be, ts: vec![], x, y, stage, bytes: 0, budget, room })
+        }).collect::<Option<Vec<_>>>()?;
+        Some(Dev { parts, ..Default::default() })
     }
     impl Dev {
         pub fn bytes(&self) -> usize { self.parts.iter().map(|p| p.bytes).sum() }
@@ -485,6 +502,12 @@ pub fn budget_left() -> usize { dev::get().map_or(0, |d| d.lock().unwrap().budge
 /// (backend, resident expert slots, bytes of all uploaded weights) when the GPU path is open.
 pub fn dev_info() -> Option<(&'static str, usize, usize)> {
     dev::get().map(|d| d.lock().unwrap().info())
+}
+/// `dev::free`, for a server that changes models.
+pub fn dev_free() { dev::free() }
+/// The first GPU's backend, device name and (used, total) bytes of memory, for the server's side panel.
+pub fn dev_stats() -> Option<(&'static str, String, Option<(u64, u64)>)> {
+    dev::get().map(|d| { let b = &d.lock().unwrap().parts[0].be; (b.name(), b.device(), b.mem_info().ok().map(|(f, t)| ((t - f) as u64, t as u64))) })
 }
 
 /// Row-major weight: `rows` rows of `cols` elements (ggml dims[0] = cols, dims[1] = rows).
