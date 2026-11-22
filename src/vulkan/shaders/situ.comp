@@ -1,15 +1,16 @@
 #version 460
 layout(local_size_x = 256) in;
 #include "common.glsl"
-layout(push_constant) uniform P { F32 y; uint n; uint rows; float beta; float lb; } p;
+layout(push_constant) uniform P { F32 y; F32 s; uint n; uint rows; float beta; float lb; } p;
 
 // Inkling's SITU on rows of 2n floats, n gates then n ups: gate = beta*tanh(gate/beta) * sigmoid(gate) * lb*tanh(up/lb)
-// (lb not above 0: times the up as it is). tanh of a clamped value: a driver may compute it from exp, which overflows.
+// (lb not above 0: times the up as it is). Gate and up are first multiplied by s[row] (s null: by 1). tanh of a clamped value: a driver may compute it from exp, which overflows.
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= p.n * p.rows) return;
     uint a = i / p.n * 2 * p.n + i % p.n;
-    float g = p.y.v[a], u = p.y.v[a + p.n];
+    float s = uint64_t(p.s) != 0ul ? p.s.v[i / p.n] : 1.0;
+    float g = p.y.v[a] * s, u = p.y.v[a + p.n] * s;
     if (p.lb > 0.0) u = p.lb * tanh(clamp(u / p.lb, -10.0, 10.0));
     p.y.v[a] = p.beta * tanh(clamp(g / p.beta, -10.0, 10.0)) / (1.0 + exp(-g)) * u;
 }

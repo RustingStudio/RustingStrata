@@ -335,13 +335,20 @@ __device__ __forceinline__ int pack4(int a, int b, int c, int d) { return (a & 2
 __device__ __forceinline__ u32 ldu32(const u8* p) { return *(const u32*)p; }  // 4-byte aligned only
 // kvalues_iq4nl of the 8 nibbles of q (llama.cpp's get_int_from_table_16): .x the low nibbles of its 4 bytes, .y
 // the high, in byte order. The table lives in 4 registers, so the lookups take no loads.
-__device__ __forceinline__ int2 iq4nl_lut(u32 q) {
-    const u32 t0 = 0xBFAD9881u, t1 = 0xF6EADDCFu, t2 = 0x26190D01u, t3 = 0x71594535u;  // -127 .. -65, ..., 53 .. 113
+__device__ __forceinline__ int2 lut16(u32 q, u32 t0, u32 t1, u32 t2, u32 t3) {
     u32 hs = 0x32103210u | ((q & 0x88888888u) >> 1), lo = __byte_perm(t0, t1, q), hi = __byte_perm(t2, t3, q);
     u32 a = __byte_perm(lo, hi, hs);
     lo = __byte_perm(t0, t1, q >> 16); hi = __byte_perm(t2, t3, q >> 16);
     u32 b = __byte_perm(lo, hi, hs >> 16);
     return make_int2((int)__byte_perm(a, b, 0x6420), (int)__byte_perm(a, b, 0x7531));
+}
+__device__ __forceinline__ int2 iq4nl_lut(u32 q) { return lut16(q, 0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594535u); }  // -127 .. -65, ..., 53 .. 113
+// kvalues_fp4 (E2M1 values times 2: 0 1 2 3 4 6 8 12, then the same negated) in the same form.
+__device__ __forceinline__ int2 fp4_lut(u32 q) { return lut16(q, 0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu); }
+// An unsigned E4M3 scale halved (llama.cpp ggml_ue4m3_to_fp32, which pairs it with the doubled kvalues_fp4); 0x7F is 0.
+__device__ __forceinline__ float ue4m3(u32 x) {
+    u32 e = (x >> 3) & 15, m = x & 7;
+    return x == 0x7F ? 0.0f : e ? __uint_as_float((e + 119) << 23 | m << 20) : (float)m * 0x1p-10f;
 }
 // 8 bytes at 2-aligned p from the three 4-byte words that cover them, shifted when p is not 4-aligned (so the 2
 // bytes after p + 8 must be readable). No branch, so the loads of unrolled superblocks can be issued together.
@@ -604,6 +611,22 @@ template <int T> __device__ __forceinline__ void deq8_q40(const u8* b, int sub, 
 }
 template <> __device__ __forceinline__ void deq8<2>(const u8* b, int sub, float* o) { deq8_q40<2>(b, sub, o); }  // Q4_0
 template <> __device__ __forceinline__ void deq8<6>(const u8* b, int sub, float* o) { deq8_q40<6>(b, sub, o); }  // Q5_0
+template <> struct QI<40> {  // NVFP4, 4 blocks of 36: 4 UE4M3 scales (one per 16 values), then 32 bytes of codes
+    static constexpr bool MIN = false;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        // Values 16 s + j and 16 s + 8 + j of a block are the low and high nibbles of code byte 8 s + j.
+        const u8* p = b + 36 * (sub >> 3);
+        int s = (sub & 7) >> 1;
+        d = ue4m3(p[s]);
+        int2 a = fp4_lut(ldu32(p + 4 + 8 * s)), c = fp4_lut(ldu32(p + 8 + 8 * s));
+        lo = sub & 1 ? a.y : a.x; hi = sub & 1 ? c.y : c.x;
+    }
+};
+template <> __device__ __forceinline__ void deq8<40>(const u8* b, int sub, float* o) {
+    int lo, hi; float d, m;
+    QI<40>::get(b, sub, lo, hi, d, m);
+    for (int i = 0; i < 8; i++) o[i] = d * (float)(signed char)((i < 4 ? lo : hi) >> (8 * (i & 3)));
+}
 template <> struct QI<20> {  // IQ4_NL, 8 blocks of 18 (2-byte aligned: ld16 only)
     static constexpr bool MIN = false;
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
@@ -811,7 +834,7 @@ __device__ __forceinline__ void gemv_row_qn(const u8* __restrict__ w, const sign
 #define FTYPES(X) X(0, f32, 1024) X(30, bf16, 512) X(144, tq2_t, 68) X(145, tqk6, 52) X(146, tqk7, 60)
 #define ITYPES(X) X(8, q8_0, 272) X(10, q2_k, 84) X(11, q3_k, 110) X(12, q4_k, 144) X(13, q5_k, 176) X(14, q6_k, 210) \
     X(19, iq1_s, 50) X(29, iq1_m, 56) X(16, iq2_xxs, 66) X(17, iq2_xs, 74) X(22, iq2_s, 82) X(18, iq3_xxs, 98) X(21, iq3_s, 110) X(23, iq4_xs, 136) X(20, iq4_nl, 144) X(42, q2_0, 72) X(34, tq1_0, 54) X(35, tq2_0, 66) X(2, q4_0, 144) X(6, q5_0, 176) \
-    X(3, q4_1, 160) X(7, q5_1, 192)
+    X(3, q4_1, 160) X(7, q5_1, 192) X(40, nvfp4, 144)
 #define QTYPES(X) FTYPES(X) ITYPES(X)
 
 #define DEF_DEQUANT(T, NAME, SBB)                                                                                 \
@@ -1625,14 +1648,14 @@ extern "C" __global__ void swiglu(float* g, const float* u, int n) {
 }
 
 // Inkling's SITU on rows of 2n floats, n gates then n ups: gate = beta*tanh(gate/beta) * sigmoid(gate) * lb*tanh(up/lb)
-// (lb not above 0: times the up as it is).
-extern "C" __global__ void situ(float* y, int n, int rows, float beta, float lb) {
+// (lb not above 0: times the up as it is). Gate and up are first multiplied by sc[row] (sc null: by 1).
+extern "C" __global__ void situ(float* y, int n, int rows, const float* sc, float beta, float lb) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n * rows) return;
     float* g = y + (size_t)(i / n) * 2 * n + i % n;
-    float u = g[n];
+    float s = sc ? sc[i / n] : 1.f, gv = *g * s, u = g[n] * s;
     if (lb > 0.f) u = lb * tanhf(u / lb);
-    *g = beta * tanhf(*g / beta) / (1.f + expf(-*g)) * u;
+    *g = beta * tanhf(gv / beta) / (1.f + expf(-gv)) * u;
 }
 
 // ---- Inkling 2's decode token on the device (inkling2::device); the host math is in src/inkling2/forward.rs ----

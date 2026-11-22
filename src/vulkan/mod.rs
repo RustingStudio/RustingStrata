@@ -1342,8 +1342,8 @@ impl Backend for Vk {
     }
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()> { self.run("add", &[], [n.div_ceil(256), 1, 1], &[&x, &y, &(n as u32)]) }
     fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()> { self.run("swiglu", &[], [n.div_ceil(256), 1, 1], &[&g, &u, &(n as u32)]) }
-    fn situ(&self, y: u64, n: usize, rows: usize, beta: f32, lb: f32) -> anyhow::Result<()> {
-        self.run("situ", &[], [(n * rows).div_ceil(256), 1, 1], &[&y, &(n as u32), &(rows as u32), &beta, &lb])
+    fn situ(&self, y: u64, n: usize, rows: usize, scale: u64, beta: f32, lb: f32) -> anyhow::Result<()> {
+        self.run("situ", &[], [(n * rows).div_ceil(256), 1, 1], &[&y, &scale, &(n as u32), &(rows as u32), &beta, &lb])
     }
     fn ink_mix(&self, blocks: u64, nb: usize, cur: u64, q: u64, nq: usize, out: u64, n: usize) -> anyhow::Result<()> {
         self.run("ink_mix", &[], [nq, 1, 1], &[&blocks, &cur, &q, &out, &(nb as u32), &(n as u32)])

@@ -213,17 +213,18 @@ pub(crate) mod dev {
             })
         }
         /// Inkling's routed experts of one token in one round trip: `gus[i]` x (n gates, then n ups), the activation
-        /// on the device (`Backend::situ`), then `downs[i]` of that. The down outputs, one after another. None unless
-        /// the matrices share one GPU that has the kernel.
-        pub fn situ_experts(&self, gus: &[Mat], downs: &[Mat], x: &[f32], beta: f32, lb: f32) -> Option<Vec<f32>> {
+        /// on the device (`Backend::situ`, the gate and up rows of expert i times `gs[i]`), then `downs[i]` of that.
+        /// The down outputs, one after another. None unless the matrices share one GPU that has the kernel.
+        pub fn situ_experts(&self, gus: &[Mat], downs: &[Mat], gs: &[f32], x: &[f32], beta: f32, lb: f32) -> Option<Vec<f32>> {
             let d = self.part_of(gus.first()?)?;
             if gus.iter().chain(downs).any(|m| self.part_of(m) != Some(d)) { return None; }
             let (p, ne, nf, nl) = (&self.parts[d], gus.len(), downs[0].cols, downs[0].rows);
-            if x.len() > p.x.len() / 4 || ne * (2 * nf + nl) > p.y.len() / 4 { return None; }
+            if x.len() > p.x.len() / 4 || ne * (2 * nf + nl + 1) > p.y.len() / 4 { return None; }
             p.be.put(x, &p.x, 0).ok()?;
+            p.be.put(gs, &p.y, ne * (2 * nf + nl)).ok()?;
             let (mut owned, at) = (vec![], |i: usize| p.y.addr() + (4 * i) as u64);
             for (i, m) in gus.iter().enumerate() { p.be.gemv(self.weight(p, m, &mut owned)?, p.x.addr(), at(i * 2 * nf)).ok()?; }
-            p.be.situ(p.y.addr(), nf, ne, beta, lb).ok()?;
+            p.be.situ(p.y.addr(), nf, ne, at(ne * (2 * nf + nl)), beta, lb).ok()?;
             for (i, m) in downs.iter().enumerate() { p.be.gemv(self.weight(p, m, &mut owned)?, at(i * 2 * nf), at(ne * 2 * nf + i * nl)).ok()?; }
             let y = p.be.get(&p.y, ne * 2 * nf, ne * nl).ok()?;
             drop(owned);
@@ -271,11 +272,11 @@ pub(crate) mod dev {
             Some(y)
         }
         /// The routed experts of a chunk of tokens, all on the device. `x`: one row of activations a token. Expert i
-        /// (`gus[i]`: its gate rows then its up rows; `downs[i]`) runs on `pairs[i]`, a list of (token, slot of the
+        /// (`gus[i]`: its gate rows then its up rows, both times `gs[i]`; `downs[i]`) runs on `pairs[i]`, a list of (token, slot of the
         /// expert among the `k` of that token, router weight). Returns per token the weighted sum of these experts'
         /// outputs: one upload and one readback of a row a token, whatever the number of pairs.
         /// None when a matrix is on another GPU or the device has no room for the chunk.
-        pub fn situ_chunk(&self, gus: &[Mat], downs: &[Mat], pairs: &[Vec<(usize, usize, f32)>], x: &[f32], k: usize, beta: f32, lb: f32) -> Option<Vec<f32>> {
+        pub fn situ_chunk(&self, gus: &[Mat], downs: &[Mat], gs: &[f32], pairs: &[Vec<(usize, usize, f32)>], x: &[f32], k: usize, beta: f32, lb: f32) -> Option<Vec<f32>> {
             use crate::backend::GEMM_BM;
             let d = self.part_of(gus.first()?)?;
             if gus.iter().chain(downs).any(|m| self.part_of(m) != Some(d)) { return None; }
@@ -302,7 +303,8 @@ pub(crate) mod dev {
                 xrow.push(t as i32);
             }
             let (n_tiles, ints) = (tiles.len() / 4, 2 * tiles.len());
-            if x.len() > p.x.len() / 4 || ints + np + 2 * nt * k > p.y.len() / 4 { return None; }
+            let sc: Vec<f32> = pairs.iter().zip(gs).flat_map(|(ps, &s)| std::iter::repeat_n(s, ps.len())).collect();
+            if x.len() > p.x.len() / 4 || ints + 2 * np + 2 * nt * k > p.y.len() / 4 { return None; }
             // Zeroed: the sums, then per pair the gate and up rows, then per pair the down rows.
             let b = p.be.alloc(4 * (nt * nl + np * (2 * nf + nl))).ok()?;
             let (ia, ya) = (|i: usize| p.y.addr() + 4 * i as u64, |i: usize| b.addr() + 4 * i as u64);
@@ -312,9 +314,10 @@ pub(crate) mod dev {
             p.be.put(&xrow, &p.y, ints).ok()?;
             p.be.put(&wts, &p.y, ints + np).ok()?;
             p.be.put(&inv, &p.y, ints + np + nt * k).ok()?;
+            p.be.put(&sc, &p.y, ints + np + 2 * nt * k).ok()?;
             let [(ty, rows, cols), (dty, drows, dcols)] = shape;
             p.be.gemm(ty, rows, cols, ia(0), n_tiles, p.x.addr(), nl, nt, ia(ints), ya(gate_up), 2 * nf, 0).ok()?;
-            p.be.situ(ya(gate_up), nf, np, beta, lb).ok()?;
+            p.be.situ(ya(gate_up), nf, np, ia(ints + np + 2 * nt * k), beta, lb).ok()?;
             p.be.gemm(dty, drows, dcols, ia(4 * n_tiles), n_tiles, ya(gate_up), 2 * nf, np, 0, ya(down), nl, 0).ok()?;
             p.be.moe_combine_seq(b.addr(), ya(down), ia(ints + np), ia(ints + np + nt * k), k, 0, 0, nl, nt).ok()?;
             let y = p.be.get(&b, 0, nt * nl).ok()?;
@@ -397,11 +400,11 @@ pub fn matvec_many_opt(ms: &[Mat], x: &[f32], xs: usize) -> Option<Vec<f32>> {
 
 /// `Dev::situ_experts`, or None where it does not apply.
 /// `Dev::situ_chunk` on the open GPU path (None without one).
-pub fn situ_chunk(gus: &[Mat], downs: &[Mat], pairs: &[Vec<(usize, usize, f32)>], x: &[f32], k: usize, beta: f32, lb: f32) -> Option<Vec<f32>> {
-    dev::get().and_then(|d| d.lock().unwrap().situ_chunk(gus, downs, pairs, x, k, beta, lb))
+pub fn situ_chunk(gus: &[Mat], downs: &[Mat], gs: &[f32], pairs: &[Vec<(usize, usize, f32)>], x: &[f32], k: usize, beta: f32, lb: f32) -> Option<Vec<f32>> {
+    dev::get().and_then(|d| d.lock().unwrap().situ_chunk(gus, downs, gs, pairs, x, k, beta, lb))
 }
-pub fn situ_experts(gus: &[Mat], downs: &[Mat], x: &[f32], beta: f32, lb: f32) -> Option<Vec<f32>> {
-    dev::get().and_then(|d| d.lock().unwrap().situ_experts(gus, downs, x, beta, lb))
+pub fn situ_experts(gus: &[Mat], downs: &[Mat], gs: &[f32], x: &[f32], beta: f32, lb: f32) -> Option<Vec<f32>> {
+    dev::get().and_then(|d| d.lock().unwrap().situ_experts(gus, downs, gs, x, beta, lb))
 }
 
 /// W x[t] for each row of `xs` (all rows of one matrix). Batches on the GPU when the weight is resident.

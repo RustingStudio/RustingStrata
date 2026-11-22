@@ -13,9 +13,9 @@ use std::sync::Arc;
 
 mod nvrtc;
 
-const QTYPES: [GgmlType; 27] = {
+const QTYPES: [GgmlType; 28] = {
     use GgmlType::*;
-    [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_1, Q5_1, Q4_0, Q5_0]
+    [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_1, Q5_1, Q4_0, Q5_0, NVFP4]
 };
 const KERNELS: [&str; 47] = [
     "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
@@ -1047,8 +1047,8 @@ impl Backend for Gpu {
         launch!(self, "swiglu", Self::grid(n), g, u, n as i32);
         Ok(())
     }
-    fn situ(&self, y: u64, n: usize, rows: usize, beta: f32, lb: f32) -> anyhow::Result<()> {
-        launch!(self, "situ", Self::grid(n * rows), y, n as i32, rows as i32, beta, lb);
+    fn situ(&self, y: u64, n: usize, rows: usize, scale: u64, beta: f32, lb: f32) -> anyhow::Result<()> {
+        launch!(self, "situ", Self::grid(n * rows), y, n as i32, rows as i32, scale, beta, lb);
         Ok(())
     }
     fn ink_mix(&self, blocks: u64, nb: usize, cur: u64, q: u64, nq: usize, out: u64, n: usize) -> anyhow::Result<()> {
@@ -1413,12 +1413,12 @@ mod tests {
     }
 
     /// M1-T5, CPU-only: the loaded name list drops `gemmi_*`/`gemmis_*` only on a device where kernels.cu compiles
-    /// them out. 306 names today (sm_80); 22 non-float types x 2 fewer names = 262 on sm_70.
+    /// them out. 354 names today (sm_80); 23 non-float types x 2 fewer names = 308 on sm_70.
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 343);
-        assert_eq!(sm70.len(), 299);
+        assert_eq!(sm80.len(), 354);
+        assert_eq!(sm70.len(), 308);
         assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmis")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());

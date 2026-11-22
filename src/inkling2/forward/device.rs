@@ -33,7 +33,7 @@ impl Scratch {
             cur: f(n), x: f(n), blocks: f(4 * n), bank: f(4 * n), outb: f(n), prelude: f(n), msg: f(4 * n), ins: f(3 * n), ins2: f(3 * n),
             gate: f(4 * rank), nrm: f(3 * n), q: f(q), r: f(c.n_head * c.n_rel), sink: f(c.n_head), og: f(q), k: f(c.n_head_kv * c.head_dim),
             v: f(c.n_head_kv * c.head_dim), kp: f(c.n_head_kv * c.n_conv), vp: f(c.n_head_kv * c.n_conv), att: f(q), proj: f(n), h: f(n),
-            h2: f(n), hn: f(n), y: f(c.n_used * 2 * c.n_ff_exp), d: f(c.n_used * n), ids: f(2 * c.n_used), xh: f(n), xq: f(c.n_used * c.n_ff_exp), wc: f(c.n_used + n), acc: f(n),
+            h2: f(n), hn: f(n), y: f(c.n_used * 2 * c.n_ff_exp), d: f(c.n_used * n), ids: f(3 * c.n_used), xh: f(n), xq: f(c.n_used * c.n_ff_exp), wc: f(c.n_used + n), acc: f(n),
             logits: f(vocab), end: f(0),
         }
     }
@@ -403,16 +403,17 @@ impl Device {
             let (p, mut owned) = (&d.parts[0], vec![]);
             (|| -> Option<()> {
                 // One moe_gemv per matrix kind for all of them (8 small gemvs leave most of the card idle).
-                let Some((gu, dn, _)) = list.first() else { return Some(()) };
-                let k = list.len();
+                let Some((gu, dn, ..)) = list.first() else { return Some(()) };
+                let (k, gs) = (list.len(), list.iter().map(|e| e.3).collect::<Vec<f32>>());
                 let mut ptrs = |down: bool| list.iter().map(|e| d.weight(p, if down { &e.1 } else { &e.0 }, &mut owned).map(|t| t.ptr)).collect::<Option<Vec<u64>>>();
                 let (pg, pd) = (ptrs(false)?, ptrs(true)?);
                 match (slab(&pg), slab(&pd)) {
                     (Some((bg, sg, ig)), Some((bd, sd, id))) => {
                         p.be.put(&[ig, id].concat(), &self.scr, ((s.ids - o) / 4) as usize).ok()?;
+                        p.be.put(&gs, &self.scr, ((s.ids - o) / 4) as usize + 2 * k).ok()?;
                         // The inputs go in quantized (s.xh from the norm, s.xq here): the gemvs skip that step.
                         p.be.moe_gemv(gu.ty, gu.rows, gu.cols, bg, sg, s.ids, k, s.hn, n, k, s.y, None, s.xh).ok()?;
-                        p.be.situ(s.y, nf, k, c.situ_beta, c.situ_linear_beta).ok()?;
+                        p.be.situ(s.y, nf, k, s.ids + f(2 * k), c.situ_beta, c.situ_linear_beta).ok()?;
                         p.be.quant_xq(s.y, 2 * nf, nf, k, s.xq).ok()?;
                         p.be.moe_gemv(dn.ty, dn.rows, dn.cols, bd, sd, s.ids + 4 * k as u64, k, s.y, 2 * nf, 1, s.d, None, s.xq).ok()?;
                     }
@@ -420,7 +421,8 @@ impl Device {
                     _ => {
                         let t = |m: &Mat, at: u64| crate::backend::GpuTensor::new(m.ty, m.rows, m.cols, Buf::new(at, m.data.len(), ()));
                         for i in 0..k { p.be.gemv(&t(gu, pg[i]), s.hn, s.y + f(i * 2 * nf)).ok()?; }
-                        p.be.situ(s.y, nf, k, c.situ_beta, c.situ_linear_beta).ok()?;
+                        p.be.put(&gs, &self.scr, ((s.ids - o) / 4) as usize + 2 * k).ok()?;
+                        p.be.situ(s.y, nf, k, s.ids + f(2 * k), c.situ_beta, c.situ_linear_beta).ok()?;
                         for i in 0..k { p.be.gemv(&t(dn, pd[i]), s.y + f(i * 2 * nf), s.d + f(i * n)).ok()?; }
                     }
                 }

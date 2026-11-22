@@ -282,7 +282,7 @@ pub trait Backend: Send {
     fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()>;
     /// Inkling's activation on `rows` rows of 2n floats at `y`, n gates then n ups: each gate becomes
     /// beta*tanh(gate/beta) * sigmoid(gate) * lb*tanh(up/lb) (`lb` not above 0: times the up as it is).
-    fn situ(&self, _y: u64, _n: usize, _rows: usize, _beta: f32, _lb: f32) -> anyhow::Result<()> { anyhow::bail!("{}: SITU not implemented", self.name()) }
+    fn situ(&self, _y: u64, _n: usize, _rows: usize, _scale: u64, _beta: f32, _lb: f32) -> anyhow::Result<()> { anyhow::bail!("{}: SITU not implemented", self.name()) }
     // Inkling 2's decode token on the device (`inkling2::device`); the host math is in `inkling2::forward`.
     /// Depth mix: `out[j]` (n floats each, j < nq) = the softmax-weighted sum of the RMS-normed states, scored by
     /// query row j of `q`. The states are the `nb` rows of `blocks` (the newest last) and `cur`.

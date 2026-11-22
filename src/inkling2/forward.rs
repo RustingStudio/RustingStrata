@@ -47,6 +47,9 @@ struct Layer<'a> {
     bias: Vec<f32>,
     gate_up: Mat<'a>,
     down: Mat<'a>,
+    /// Per-expert scales of the gate_up and down outputs (`ffn_*_exps.scale`, e.g. NVFP4 files); ones without them.
+    gu_scale: Vec<f32>,
+    down_scale: Vec<f32>,
 }
 
 /// Cross-pass controllers of one core layer, in the order Q, K, V, FFN.
@@ -358,39 +361,41 @@ fn control(jobs: &[(&[f32], &[f32])], lp: &Loop, c: usize) -> Vec<Vec<f32>> {
 }
 
 /// situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb) on one output of the fused gate_up matrix
-/// (the gate rows first).
-fn situ(y: &[f32], cfg: &Inkling2Config) -> Vec<f32> {
+/// (the gate rows first), both times the expert's gate_up scale `s`.
+fn situ(y: &[f32], s: f32, cfg: &Inkling2Config) -> Vec<f32> {
     let (nf, beta, lb) = (cfg.n_ff_exp, cfg.situ_beta, cfg.situ_linear_beta);
     let (g, u, mut o) = (&y[..nf], &y[nf..2 * nf], vec![0f32; nf]);
     for i in 0..nf {
-        let up = if lb > 0.0 { lb * tanh(u[i] / lb) } else { u[i] };
-        o[i] = beta * tanh(g[i] / beta) * sigmoid(g[i]) * up;
+        let (g, u) = (g[i] * s, u[i] * s);
+        let up = if lb > 0.0 { lb * tanh(u / lb) } else { u };
+        o[i] = beta * tanh(g / beta) * sigmoid(g) * up;
     }
     o
 }
 
-/// The experts of one token and their weights: sigmoid router, the selection bias only picks the experts.
+/// The experts of one token and their weights: sigmoid router, the selection bias only picks the experts. The
+/// weight carries the expert's down scale.
 fn route(l: &Layer, x: &[f32], cfg: &Inkling2Config) -> Vec<(usize, f32)> {
     let probs: Vec<f32> = l.gate_inp.chunks_exact(x.len()).map(|w| sigmoid(dot(w, x))).collect();
     let mut sel: Vec<usize> = (0..cfg.n_expert).collect();
     sel.sort_by(|&a, &b| (probs[b] + l.bias[b]).partial_cmp(&(probs[a] + l.bias[a])).unwrap().then(a.cmp(&b)));
     sel.truncate(cfg.n_used);
     let sum = sel.iter().map(|&e| probs[e]).sum::<f32>() + 1e-20;
-    sel.into_iter().map(|e| (e, probs[e] / sum * cfg.exp_scale)).collect()
+    sel.into_iter().map(|e| (e, probs[e] / sum * cfg.exp_scale * l.down_scale[e])).collect()
 }
 
-/// Weighted sum of the listed experts' outputs, `(gate_up, down, weight)` each. Experts that share a GPU run as two
+/// Weighted sum of the listed experts' outputs, `(gate_up, down, weight, gate_up scale)` each. Experts that share a GPU run as two
 /// batched round trips; otherwise each matvec runs where its matrix lives.
-fn run_experts(list: &[(Mat, Mat, f32)], x: &[f32], cfg: &Inkling2Config) -> Vec<f32> {
+fn run_experts(list: &[(Mat, Mat, f32, f32)], x: &[f32], cfg: &Inkling2Config) -> Vec<f32> {
     let (nf, nl) = (cfg.n_ff_exp, x.len());
     let mut mix = vec![0f32; nl];
-    let act = |y: &[f32]| situ(y, cfg);
     let batched = (!list.is_empty() && list.iter().all(|e| e.0.gpu.is_some())).then(|| {
         let (gus, downs): (Vec<Mat>, Vec<Mat>) = list.iter().map(|e| (e.0, e.1)).unzip();
+        let gs: Vec<f32> = list.iter().map(|e| e.3).collect();
         // One round trip with the activation on the device; two, with the activation here, on more than one GPU.
-        situ_experts(&gus, &downs, x, cfg.situ_beta, cfg.situ_linear_beta).or_else(|| {
+        situ_experts(&gus, &downs, &gs, x, cfg.situ_beta, cfg.situ_linear_beta).or_else(|| {
             let y = matvec_many_opt(&gus, x, 0)?;
-            let a: Vec<f32> = y.chunks_exact(2 * nf).flat_map(act).collect();
+            let a: Vec<f32> = y.chunks_exact(2 * nf).zip(&gs).flat_map(|(y, &s)| situ(y, s, cfg)).collect();
             matvec_many_opt(&downs, &a, nf)
         })
     }).flatten();
@@ -402,9 +407,9 @@ fn run_experts(list: &[(Mat, Mat, f32)], x: &[f32], cfg: &Inkling2Config) -> Vec
         }
         None => {
             let (mut y, mut dy) = (vec![0f32; 2 * nf], vec![0f32; nl]);
-            for (gu, down, w) in list {
+            for (gu, down, w, s) in list {
                 gu.matvec(x, &mut y);
-                down.matvec(&act(&y), &mut dy);
+                down.matvec(&situ(&y, *s, cfg), &mut dy);
                 for (m, d) in mix.iter_mut().zip(&dy) { *m += w * d; }
             }
         }
@@ -454,6 +459,8 @@ impl<'a> Inkling2Model<'a> {
                 bias: if has(&p("exp_probs_b.bias")) { v("exp_probs_b.bias")? } else { vec![0.0; cfg.n_expert] },
                 gate_up: m("ffn_gate_up_exps.weight")?,
                 down: m("ffn_down_exps.weight")?,
+                gu_scale: if has(&p("ffn_gate_up_exps.scale")) { v("ffn_gate_up_exps.scale")? } else { vec![1.0; cfg.n_expert] },
+                down_scale: if has(&p("ffn_down_exps.scale")) { v("ffn_down_exps.scale")? } else { vec![1.0; cfg.n_expert] },
             });
         }
         let mut loops = vec![];
@@ -650,9 +657,9 @@ impl<'a> Inkling2Model<'a> {
     }
 
     /// The routed experts of one token in layer `ip`: those of the GPU as `(gate_up, expert, weight)`, those of the
-    /// CPU as `(gate_up, down, weight)`, and whether the CPU share follows the two times.
+    /// CPU as `(gate_up, down, weight, gate_up scale)`, and whether the CPU share follows the two times.
     #[allow(clippy::type_complexity)]
-    fn plan(&self, ip: usize, x: &[f32]) -> (Vec<(Mat<'a>, usize, f32)>, Vec<(Mat<'a>, Mat<'a>, f32)>, bool) {
+    fn plan(&self, ip: usize, x: &[f32]) -> (Vec<(Mat<'a>, usize, f32)>, Vec<(Mat<'a>, Mat<'a>, f32, f32)>, bool) {
         let (cfg, l) = (&self.cfg, &self.layers[ip]);
         let ne = cfg.n_expert;
         let t = std::time::Instant::now();
@@ -674,7 +681,7 @@ impl<'a> Inkling2Model<'a> {
         for (gu, &(e, w)) in gus.into_iter().zip(&sel) {
             if gu.gpu.is_none() && left > 0 {
                 left -= 1;
-                on_cpu.push((gu, l.down.expert_host(e, ne), w));
+                on_cpu.push((gu, l.down.expert_host(e, ne), w, l.gu_scale[e]));
             } else {
                 on_gpu.push((gu, e, w));
             }
@@ -683,9 +690,9 @@ impl<'a> Inkling2Model<'a> {
     }
 
     /// The GPU's experts of `plan` with both matrices in VRAM: in a cache slot, or copied up for this use.
-    fn resident(l: &Layer<'a>, ne: usize, on_gpu: &[(Mat<'a>, usize, f32)]) -> Vec<(Mat<'a>, Mat<'a>, f32)> {
+    fn resident(l: &Layer<'a>, ne: usize, on_gpu: &[(Mat<'a>, usize, f32)]) -> Vec<(Mat<'a>, Mat<'a>, f32, f32)> {
         let on = |m: &Mat<'a>, e: usize| { let x = m.expert_opt(e, ne, true); if x.gpu.is_some() { x } else { x.staged() } };
-        on_gpu.iter().map(|&(gu, e, w)| (if gu.gpu.is_some() { gu } else { on(&l.gate_up, e) }, on(&l.down, e), w)).collect()
+        on_gpu.iter().map(|&(gu, e, w)| (if gu.gpu.is_some() { gu } else { on(&l.gate_up, e) }, on(&l.down, e), w, l.gu_scale[e])).collect()
     }
 
     /// MoE of one token with the weights of layer `ip`.
@@ -745,7 +752,8 @@ impl<'a> Inkling2Model<'a> {
             // device (or on more than one GPU): two round trips with a row a (token, expert) pair, the activation here.
             let (gus, downs): (Vec<Mat>, Vec<Mat>) = on_gpu.iter().map(|(_, gu, d)| (*gu, *d)).unzip();
             let pairs: Vec<Vec<(usize, usize, f32)>> = on_gpu.iter().map(|(e, ..)| by_e[e].iter().map(|&(t, k)| (t, k, sels[t][k].1)).collect()).collect();
-            if let Some(sum) = situ_chunk(&gus, &downs, &pairs, &xs.concat(), cfg.n_used, cfg.situ_beta, cfg.situ_linear_beta) {
+            let gs: Vec<f32> = on_gpu.iter().map(|(e, ..)| l.gu_scale[*e]).collect();
+            if let Some(sum) = situ_chunk(&gus, &downs, &gs, &pairs, &xs.concat(), cfg.n_used, cfg.situ_beta, cfg.situ_linear_beta) {
                 return ((Some(sum), vec![]), t.elapsed().as_secs_f32());
             }
             let mut x = Vec::with_capacity(on_gpu.iter().map(|(e, ..)| by_e[e].len()).sum::<usize>() * nl);
@@ -753,7 +761,8 @@ impl<'a> Inkling2Model<'a> {
                 for &(t, _) in &by_e[e] { x.extend_from_slice(&xs[t]); }
             }
             let jobs = |down: bool| -> Vec<(Mat, usize)> { on_gpu.iter().map(|(e, gu, d)| (if down { *d } else { *gu }, by_e[e].len())).collect() };
-            let a: Vec<f32> = matvec_rows_many(&jobs(false), &x).par_chunks_exact(2 * nf).flat_map_iter(|y| situ(y, cfg)).collect();
+            let rs: Vec<f32> = on_gpu.iter().flat_map(|(e, ..)| std::iter::repeat_n(l.gu_scale[*e], by_e[e].len())).collect();
+            let a: Vec<f32> = matvec_rows_many(&jobs(false), &x).par_chunks_exact(2 * nf).zip(&rs).flat_map_iter(|(y, &s)| situ(y, s, cfg)).collect();
             let dy = matvec_rows_many(&jobs(true), &a);
             let mut at = 0;
             let out: Vec<(usize, Vec<f32>)> = on_gpu.iter().map(|(e, ..)| {
@@ -765,7 +774,7 @@ impl<'a> Inkling2Model<'a> {
         let cpu_side = || {
             let t = std::time::Instant::now();
             let out: Vec<(usize, Vec<f32>)> = on_cpu.par_iter().map(|(e, gu, d)| {
-                let a: Vec<f32> = matvec_rows(gu, &rows_of(*e)).chunks_exact(2 * nf).flat_map(|y| situ(y, cfg)).collect();
+                let a: Vec<f32> = matvec_rows(gu, &rows_of(*e)).chunks_exact(2 * nf).flat_map(|y| situ(y, l.gu_scale[*e], cfg)).collect();
                 (*e, matvec_rows(d, &a.chunks_exact(nf).collect::<Vec<_>>()))
             }).collect();
             (out, t.elapsed().as_secs_f32())

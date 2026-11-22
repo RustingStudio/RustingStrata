@@ -7,9 +7,10 @@
 int main(int argc, char **argv) {
     struct { const char *n; enum ggml_type t; } T[] = {
         {"iq2_xxs", GGML_TYPE_IQ2_XXS}, {"iq2_xs", GGML_TYPE_IQ2_XS}, {"iq1_m", GGML_TYPE_IQ1_M},
-        {"iq4_nl", GGML_TYPE_IQ4_NL}, {"q5_k", GGML_TYPE_Q5_K}, {"q8_0", GGML_TYPE_Q8_0}, {"bf16", GGML_TYPE_BF16}};
+        {"iq4_nl", GGML_TYPE_IQ4_NL}, {"q5_k", GGML_TYPE_Q5_K}, {"q8_0", GGML_TYPE_Q8_0}, {"bf16", GGML_TYPE_BF16},
+        {"nvfp4", GGML_TYPE_NVFP4}};
     srand(12345);
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < (int)(sizeof T / sizeof T[0]); i++) {
         const struct ggml_type_traits *tr = ggml_get_type_traits(T[i].t);
         size_t bs = tr->type_size; int ne = tr->blck_size, kept = 0;
         char p[256]; snprintf(p, sizeof p, "%s/%s.blk", argv[1], T[i].n); FILE *fb = fopen(p, "wb");

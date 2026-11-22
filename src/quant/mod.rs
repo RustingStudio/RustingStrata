@@ -8,14 +8,14 @@ use half::{bf16, f16};
 use tables::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GgmlType { F32, F16, BF16, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL }
+pub enum GgmlType { F32, F16, BF16, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, NVFP4 }
 use GgmlType::*;
 
 impl GgmlType {
     pub fn from_u32(id: u32) -> anyhow::Result<Self> {
         Ok(match id {
             0 => F32, 1 => F16, 30 => BF16, 42 => Q2_0, 34 => TQ1_0, 35 => TQ2_0, 144 => TQ2T, 145 => TQK6, 146 => TQK7, 2 => Q4_0, 3 => Q4_1, 6 => Q5_0, 7 => Q5_1, 8 => Q8_0, 10 => Q2K, 11 => Q3K, 12 => Q4K, 13 => Q5K, 14 => Q6K,
-            16 => IQ2XXS, 17 => IQ2XS, 19 => IQ1S, 29 => IQ1M, 18 => IQ3XXS, 21 => IQ3S, 22 => IQ2S, 23 => IQ4XS, 20 => IQ4NL,
+            16 => IQ2XXS, 17 => IQ2XS, 19 => IQ1S, 29 => IQ1M, 18 => IQ3XXS, 21 => IQ3S, 22 => IQ2S, 23 => IQ4XS, 20 => IQ4NL, 40 => NVFP4,
             _ => {
                 const NAMES: [&str; 40] = ["F32", "F16", "Q4_0", "Q4_1", "", "", "Q5_0", "Q5_1", "Q8_0", "Q8_1", "Q2_K",
                     "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_K", "IQ2_XXS", "IQ2_XS", "IQ3_XXS", "IQ1_S", "IQ4_NL", "IQ3_S",
@@ -27,18 +27,18 @@ impl GgmlType {
                     anyhow::bail!("unsupported quant type {name} (ggml type id {id}): of the trellis types of agentionai's llama.cpp fork only TQ2_T, TQK6 and TQK7 (the Gyro-S and Gyro-M files) are supported, not the pair trellis of Gyro-L");
                 }
                 let name = NAMES.get(id as usize).filter(|n| !n.is_empty()).unwrap_or(&"unknown");
-                anyhow::bail!("unsupported quant type {name} (ggml type id {id}); supported: F32 F16 BF16 Q2_0 TQ1_0 TQ2_0 TQ2_T TQK6 TQK7 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K-Q6_K IQ1_S IQ1_M IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_NL IQ4_XS")
+                anyhow::bail!("unsupported quant type {name} (ggml type id {id}); supported: F32 F16 BF16 Q2_0 TQ1_0 TQ2_0 TQ2_T TQK6 TQK7 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K-Q6_K IQ1_S IQ1_M IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_NL IQ4_XS NVFP4")
             }
         })
     }
     /// A GPU matvec of this type reads its input as floats, not as int8: the float types (F16 is uploaded as F32)
     /// and the trellis types, whose codebook is not on an int8 grid (as int8 its values are 0.8% off).
     pub fn float_x(self) -> bool { matches!(self, F32 | BF16 | TQ2T | TQK6 | TQK7) }
-    pub fn block_elems(self) -> usize { match self { F32 | F16 | BF16 => 1, Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | IQ4NL => 32, Q2_0 => 64, TQ2T | TQK6 | TQK7 => 128, _ => 256 } }
+    pub fn block_elems(self) -> usize { match self { F32 | F16 | BF16 => 1, Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | IQ4NL => 32, Q2_0 | NVFP4 => 64, TQ2T | TQK6 | TQK7 => 128, _ => 256 } }
     pub fn block_bytes(self) -> usize {
         match self {
             F32 => 4, F16 => 2, BF16 => 2, Q2_0 => 18, TQ1_0 => 54, TQ2_0 => 66, TQ2T => 34, TQK6 => 26, TQK7 => 30, Q4_0 => 18, Q4_1 => 20, Q5_0 => 22, Q5_1 => 24, Q8_0 => 34, Q2K => 84, Q3K => 110, Q4K => 144, Q5K => 176, Q6K => 210,
-            IQ1S => 50, IQ1M => 56, IQ2XXS => 66, IQ2XS => 74, IQ2S => 82, IQ3XXS => 98, IQ3S => 110, IQ4XS => 136, IQ4NL => 18,
+            IQ1S => 50, IQ1M => 56, IQ2XXS => 66, IQ2XS => 74, IQ2S => 82, IQ3XXS => 98, IQ3S => 110, IQ4XS => 136, IQ4NL => 18, NVFP4 => 36,
         }
     }
     /// Backend `backend` ("cuda" or "vulkan") has kernels for this type. F16 has none: `Backend::upload` converts it to
@@ -48,7 +48,7 @@ impl GgmlType {
     pub fn name(self) -> &'static str {
         match self {
             F32 => "F32", F16 => "F16", BF16 => "BF16", Q2_0 => "Q2_0", TQ1_0 => "TQ1_0", TQ2_0 => "TQ2_0", TQ2T => "TQ2_T", TQK6 => "TQK6", TQK7 => "TQK7", Q4_0 => "Q4_0", Q4_1 => "Q4_1", Q5_0 => "Q5_0", Q5_1 => "Q5_1", Q8_0 => "Q8_0", Q2K => "Q2_K", Q3K => "Q3_K", Q4K => "Q4_K",
-            Q5K => "Q5_K", Q6K => "Q6_K", IQ1S => "IQ1_S", IQ1M => "IQ1_M", IQ2XXS => "IQ2_XXS", IQ2XS => "IQ2_XS", IQ2S => "IQ2_S", IQ3XXS => "IQ3_XXS", IQ3S => "IQ3_S", IQ4XS => "IQ4_XS", IQ4NL => "IQ4_NL",
+            Q5K => "Q5_K", Q6K => "Q6_K", IQ1S => "IQ1_S", IQ1M => "IQ1_M", IQ2XXS => "IQ2_XXS", IQ2XS => "IQ2_XS", IQ2S => "IQ2_S", IQ3XXS => "IQ3_XXS", IQ3S => "IQ3_S", IQ4XS => "IQ4_XS", IQ4NL => "IQ4_NL", NVFP4 => "NVFP4",
         }
     }
 }
@@ -85,7 +85,7 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) {
             }
             Q8_0 => { let d = h(blk, 0); for j in 0..32 { y[j] = blk[2 + j] as i8 as f32 * d; } }
             Q2K => q2k(blk, y), Q3K => q3k(blk, y), Q4K => q4k(blk, y), Q5K => q5k(blk, y), Q6K => q6k(blk, y),
-            IQ1S => iq1s(blk, y), IQ1M => iq1m(blk, y), IQ2XXS => iq2xxs(blk, y), IQ2XS => iq2xs(blk, y), IQ2S => iq2s(blk, y), IQ3XXS => iq3xxs(blk, y), IQ3S => iq3s(blk, y), IQ4XS => iq4xs(blk, y), IQ4NL => iq4nl(blk, y),
+            IQ1S => iq1s(blk, y), IQ1M => iq1m(blk, y), IQ2XXS => iq2xxs(blk, y), IQ2XS => iq2xs(blk, y), IQ2S => iq2s(blk, y), IQ3XXS => iq3xxs(blk, y), IQ3S => iq3s(blk, y), IQ4XS => iq4xs(blk, y), IQ4NL => iq4nl(blk, y), NVFP4 => nvfp4(blk, y),
         }
     }
 }
@@ -401,5 +401,53 @@ fn iq4nl(b: &[u8], y: &mut [f32]) {
     for j in 0..16 {
         y[j] = d * KVALUES_IQ4NL[(b[2 + j] & 0xF) as usize] as f32;
         y[j + 16] = d * KVALUES_IQ4NL[(b[2 + j] >> 4) as usize] as f32;
+    }
+}
+
+/// E2M1 values times 2 (llama.cpp `kvalues_mxfp4`); `ue4m3` halves the scale to match.
+pub const KVALUES_FP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// An unsigned E4M3 scale byte, halved (llama.cpp `ggml_ue4m3_to_fp32`); 0x7F (NaN) reads as 0.
+pub fn ue4m3(x: u8) -> f32 {
+    if x == 0 || x == 0x7F { return 0.0; }
+    let (e, m) = ((x >> 3) & 15, (x & 7) as f32);
+    0.5 * if e == 0 { m * (2f32).powi(-9) } else { (1.0 + m / 8.0) * (2f32).powi(e as i32 - 7) }
+}
+
+/// NVFP4: 64 values as four sub-blocks of 16, each with a UE4M3 scale `d[s]`, then 32 bytes of E2M1 codes.
+fn nvfp4(b: &[u8], y: &mut [f32]) {
+    for s in 0..4 {
+        let d = ue4m3(b[s]);
+        for j in 0..8 {
+            let q = b[4 + 8 * s + j];
+            y[16 * s + j] = d * KVALUES_FP4[(q & 0xF) as usize] as f32;
+            y[16 * s + j + 8] = d * KVALUES_FP4[(q >> 4) as usize] as f32;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nvfp4_dequant() {
+        // Scale bytes: 0x38 = e 7, m 0 (1.0, halved 0.5); 0x01 = subnormal 2^-9 (halved 2^-10); 0x7F = NaN (0); 0x41 = e 8, m 1 (2.25, halved 1.125).
+        assert_eq!(ue4m3(0x38), 0.5);
+        assert_eq!(ue4m3(0x01), 2f32.powi(-10));
+        assert_eq!(ue4m3(0x7F), 0.0);
+        assert_eq!(ue4m3(0x41), 1.125);
+        let mut b = [0u8; 36];
+        b[..4].copy_from_slice(&[0x38, 0x41, 0x7F, 0x38]);
+        for (i, q) in b[4..].iter_mut().enumerate() { *q = (i as u8 * 7) ^ 0x5A; }
+        let mut y = [0f32; 64];
+        dequant_row(NVFP4, &b, &mut y);
+        let d = [0.5, 1.125, 0.0, 0.5];
+        for i in 0..64 {
+            let (s, j) = (i / 16, i % 16);
+            let q = b[4 + 8 * s + j % 8];
+            let c = if j < 8 { q & 15 } else { q >> 4 };
+            assert_eq!(y[i], d[s] * KVALUES_FP4[c as usize] as f32, "value {i}");
+        }
     }
 }

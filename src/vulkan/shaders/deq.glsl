@@ -12,6 +12,16 @@ int iq4_lut(uint nib) {
     uint64_t t = nib < 8u ? 0xF6EADDCFBFAD9881ul : 0x7159453526190D01ul;
     return int(uint(t >> (8u * (nib & 7u))) << 24) >> 24;
 }
+// kvalues_fp4 (E2M1 values times 2) in the same form, for NVFP4.
+int fp4_lut(uint nib) {
+    uint64_t t = nib < 8u ? 0x0C08060403020100ul : 0xF4F8FAFCFDFEFF00ul;
+    return int(uint(t >> (8u * (nib & 7u))) << 24) >> 24;
+}
+// An unsigned E4M3 scale halved (ue4m3 in kernels.cu); 0x7F is 0.
+float ue4m3(uint x) {
+    uint e = (x >> 3) & 15u, m = x & 7u;
+    return x == 0x7Fu ? 0.0 : e != 0u ? uintBitsToFloat((e + 119u) << 23 | m << 20) : float(m) * (1.0 / 1024.0);
+}
 #ifdef SHARED_TABLES
 // Sized by T (1 entry for the other types), so only the table in use takes shared memory.
 shared uint s_g3[T == 21 ? 512 : (T == 18 ? 256 : 1)];
@@ -258,6 +268,12 @@ void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
         uint e = sub * 8, j = e >> 7, l = (e >> 5) & 3, m = e & 31;
         d = ldh(w, b + 64);
         [[unroll]] for (uint i = 0; i < 8; i++) q[i] = int((u8_(w, b + 32 * j + m + i) >> (2 * l)) & 3) - 1;
+    } else if (T == 40) {  // NVFP4, 4 blocks of 36: 4 UE4M3 scales, then 32 code bytes; byte 8 s + j holds values 16 s + j, 16 s + 8 + j
+        uint p = b + 36 * (sub >> 3), s = (sub & 7) >> 1, sh = 4 * (sub & 1);
+        d = ue4m3(u8_(w, p + s));
+        U32 u = U32(uint64_t(w) + p + 4 + 8 * s);
+        uvec2 v = uvec2(u.v[0], u.v[1]);
+        [[unroll]] for (uint i = 0; i < 8; i++) q[i] = fp4_lut(((i < 4 ? v.x : v.y) >> (8 * (i & 3) + sh)) & 15);
     } else {  // IQ4_XS (23), IQ4_NL (20, 8 blocks of 18)
         uint r = l * 8, o;
         iq4_at(w, b, sub, o, d);

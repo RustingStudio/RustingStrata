@@ -1007,15 +1007,19 @@ fn elementwise_ops_match_cpu() {
         assert!(rel_l2(&got, &want) < 1e-6);
         report("swiglu", &got, &want);
         // situ: 3 rows of 2 * 200 floats, the gates of each row replaced; a zero linear beta leaves the up as it is.
-        for lb in [25.0f32, 0.0] {
+        // Row scales: none (1), or one per row.
+        for (lb, sc) in [(25.0f32, None), (0.0, None), (25.0, Some([0.5f32, 2.0, 1.5]))] {
             let (nf, y) = (200, xs(1200).iter().map(|v| v * 12.0).collect::<Vec<f32>>());
             let dy = up(gpu, &y);
-            gpu.situ(dy.addr(), nf, 3, 4.0, lb).unwrap();
+            let ds = sc.map(|s| up(gpu, &s));
+            gpu.situ(dy.addr(), nf, 3, ds.as_ref().map_or(0, |b| b.addr()), 4.0, lb).unwrap();
             let mut want = y.clone();
-            for r in want.chunks_exact_mut(2 * nf) {
+            for (j, r) in want.chunks_exact_mut(2 * nf).enumerate() {
+                let s = sc.map_or(1.0, |s| s[j]);
                 for i in 0..nf {
-                    let up = if lb > 0.0 { lb * (r[nf + i] / lb).tanh() } else { r[nf + i] };
-                    r[i] = 4.0 * (r[i] / 4.0).tanh() / (1.0 + (-r[i]).exp()) * up;
+                    let (g, u) = (r[i] * s, r[nf + i] * s);
+                    let up = if lb > 0.0 { lb * (u / lb).tanh() } else { u };
+                    r[i] = 4.0 * (g / 4.0).tanh() / (1.0 + (-g).exp()) * up;
                 }
             }
             let got = down::<f32>(gpu, &dy);
@@ -1537,6 +1541,8 @@ fn random_tensor(ty: GgmlType, rows: usize, cols: usize, seed: u32) -> Vec<u8> {
                             b[o..o + 2].copy_from_slice(&w.to_le_bytes());
                         }
                     }
+                    // Four UE4M3 scales, exponents 3 to 4 (about 0.004 to 0.015).
+                    GgmlType::NVFP4 => for v in &mut b[..4] { *v = 0x18 + (rnd() % 16) as u8; },
                     _ => b[0..2].copy_from_slice(&scale(&mut rnd)),
                 }
                 b
@@ -1573,7 +1579,7 @@ fn all_types() -> Vec<GgmlType> {
 fn gemv_partial_superblocks_and_q2_0() {
     for (bk, gpu) in common::backends_except(&[]) {
         let gpu = &*gpu;
-        for ty in [GgmlType::Q2_0, GgmlType::TQ1_0, GgmlType::TQ2_0, GgmlType::TQ2T, GgmlType::TQK6, GgmlType::TQK7, GgmlType::Q8_0, GgmlType::IQ4NL, GgmlType::Q4_0, GgmlType::Q5_0, GgmlType::Q4_1, GgmlType::Q5_1, GgmlType::BF16, GgmlType::F32] {
+        for ty in [GgmlType::Q2_0, GgmlType::TQ1_0, GgmlType::TQ2_0, GgmlType::TQ2T, GgmlType::TQK6, GgmlType::TQK7, GgmlType::Q8_0, GgmlType::IQ4NL, GgmlType::NVFP4, GgmlType::Q4_0, GgmlType::Q5_0, GgmlType::Q4_1, GgmlType::Q5_1, GgmlType::BF16, GgmlType::F32] {
             for cols in [640, 320, 2560] {
                 if cols % ty.block_elems() != 0 { continue; }
                 let (rows, nt, ne) = (40, 3, 4);  // ne experts of `rows` rows for moe_gemv
@@ -1653,7 +1659,7 @@ fn gemv_partial_superblocks_and_q2_0() {
     }
 }
 
-/// Per-type Vulkan pass/fail matrix over all 25 `GgmlType` variants: dequant, GEMV/GEMV-N/GEMV-Q, MoE GEMV, dense
+/// Per-type Vulkan pass/fail matrix over all `GgmlType` variants: dequant, GEMV/GEMV-N/GEMV-Q, MoE GEMV, dense
 /// and tiled GEMM, plus each type's largest shared-memory request. Synthetic raw blocks bypass `Backend::upload`, so
 /// native kernels run even for the types the loader converts (F16, Q4_0, Q5_0). Vulkan only: run it with
 /// `STRATA_TEST_BACKENDS=vulkan`. Prints one `MATRIX ty=...` line per type for `docs/V100-results.md`.
@@ -1663,7 +1669,7 @@ fn vulkan_type_matrix() {
     let gpu: &dyn Backend = &g;
     let not_impl = |e: &anyhow::Error| format!("{e:#}").contains("not implemented");
     let types = all_types();
-    assert_eq!(types.len(), 28, "GgmlType variants");
+    assert_eq!(types.len(), 29, "GgmlType variants");
     let (rows, ne, cols, nt) = (40, 4, 256, 3);
     let mut failures = 0;
     for ty in types {
