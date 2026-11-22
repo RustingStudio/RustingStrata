@@ -1231,78 +1231,90 @@ impl Device {
         let hist = |j: usize| ds.hist.addr() + f(hists(c).0[j]);
         let w = |x: &Mat| d.tensor(x.gpu.unwrap());
         let (mut ins, mut n_in) = (s.cur, 1);
-        if let Some(q) = &l.res_query {
-            (ins, n_in) = (s.ins, q.len() / (4 * n));
-            be.ink_mix(s.blocks, *nb, s.cur, q.addr(), n_in, ins, n)?;
-        }
-        if msgs {
-            be.ink_ctrl(lp.down.addr(), lp.gain.addr(), lp.forget.addr(), ins, n_in, s.msg, s.gate, s.ins2, n, rank, 3)?;
-            (ins, n_in) = (s.ins2, 3);
-        }
+        if let Some(q) = &l.res_query { (ins, n_in) = (s.ins, q.len() / (4 * n)); }
+        if msgs { (ins, n_in) = (s.ins2, 3); }
         let n_w = l.norms.len() / (4 * n);
         let n_n = n_in.max(n_w);
         let xq_step = ((n + n.div_ceil(32) * 4).div_ceil(16) * 16) as u64;
         let norm_xq = |j: usize| s.nrm_xq + j.min(n_n - 1) as u64 * xq_step;
-        if n_n == 1 {
-            be.rms_norm_q(ins, n, l.norms.addr(), s.nrm, n, n, 1, c.eps, norm_xq(0), 0)?;
-        } else {
+        let inp = |j: usize| s.nrm + f(j.min(n_n - 1) * n);
+        let taps = if ml.conv_proj.is_some() { [s.kp, s.vp] } else { [0, 0] };
+        // Every pointer and every argument here is the same on every token at this layer run, so one launch
+        // (a CUDA graph) replaces the ~16 this part costs otherwise; a launch costs 9.5 us on Windows and the
+        // card does the work in 0.26. The clips and the attention in between stay direct: their rows, ring
+        // position and log scale follow `pos`.
+        let key = 0x494E_0000_0000_0000u64 | (il as u64) << 1;
+        be.graph(key, &mut || {
+            if let Some(q) = &l.res_query { be.ink_mix(s.blocks, *nb, s.cur, q.addr(), n_in, ins, n)?; }
+            if msgs {
+                be.ink_ctrl(lp.down.addr(), lp.gain.addr(), lp.forget.addr(), ins, n_in, s.msg, s.gate, s.ins2, n, rank, 3)?;
+            }
+            if n_n == 1 {
+                be.rms_norm_q(ins, n, l.norms.addr(), s.nrm, n, n, 1, c.eps, norm_xq(0), 0)?;
+            } else {
+                be.batch(&mut || {
+                    for j in 0..n_n {
+                        be.rms_norm_q(ins + f(j.min(n_in - 1) * n), n, l.norms.addr() + f(j.min(n_w - 1) * n), s.nrm + f(j * n), n, n, 1, c.eps, norm_xq(j), 0)?;
+                    }
+                    Ok(())
+                })?;
+            }
             be.batch(&mut || {
-                for j in 0..n_n {
-                    be.rms_norm_q(ins + f(j.min(n_in - 1) * n), n, l.norms.addr() + f(j.min(n_w - 1) * n), s.nrm + f(j * n), n, n, 1, c.eps, norm_xq(j), 0)?;
+                be.gemvq2(w(&ml.wq), w(&ml.gate), inp(0), n, norm_xq(0), s.q, s.og, 1)?;
+                be.gemvq(w(&ml.rel), inp(0), n, norm_xq(0), s.r, ml.rel.rows, 1)?;
+                be.gemvq(w(&ml.sink), inp(0), n, norm_xq(0), s.sink, ml.sink.rows, 1)?;
+                if n_n == 1 {
+                    be.gemvq2(w(&ml.wk), w(&ml.wv), inp(0), n, norm_xq(0), s.k, s.v, 1)?;
+                } else {
+                    be.gemvq(w(&ml.wk), inp(1), n, norm_xq(1), s.k, ml.wk.rows, 1)?;
+                    be.gemvq(w(&ml.wv), inp(2), n, norm_xq(2), s.v, ml.wv.rows, 1)?;
+                }
+                if let Some([kp, vp]) = &ml.conv_proj {
+                    be.gemvq(w(kp), inp(1), n, norm_xq(1), s.kp, kp.rows, 1)?;
+                    be.gemvq(w(vp), inp(2), n, norm_xq(2), s.vp, vp.rows, 1)?;
                 }
                 Ok(())
             })?;
-        }
-        let inp = |j: usize| s.nrm + f(j.min(n_n - 1) * n);
-        be.batch(&mut || {
-            be.gemvq2(w(&ml.wq), w(&ml.gate), inp(0), n, norm_xq(0), s.q, s.og, 1)?;
-            be.gemvq(w(&ml.rel), inp(0), n, norm_xq(0), s.r, ml.rel.rows, 1)?;
-            be.gemvq(w(&ml.sink), inp(0), n, norm_xq(0), s.sink, ml.sink.rows, 1)?;
-            if n_n == 1 {
-                be.gemvq2(w(&ml.wk), w(&ml.wv), inp(0), n, norm_xq(0), s.k, s.v, 1)?;
-            } else {
-                be.gemvq(w(&ml.wk), inp(1), n, norm_xq(1), s.k, ml.wk.rows, 1)?;
-                be.gemvq(w(&ml.wv), inp(2), n, norm_xq(2), s.v, ml.wv.rows, 1)?;
-            }
-            if let Some([kp, vp]) = &ml.conv_proj {
-                be.gemvq(w(kp), inp(1), n, norm_xq(1), s.kp, kp.rows, 1)?;
-                be.gemvq(w(vp), inp(2), n, norm_xq(2), s.vp, vp.rows, 1)?;
-            }
-            Ok(())
-        })?;
-        let taps = if ml.conv_proj.is_some() { [s.kp, s.vp] } else { [0, 0] };
-        be.batch(&mut || {
-            be.ink_conv(s.k, l.convs[0].addr(), taps[0], hist(0), s.k, kw, nc, hd)?;
-            be.ink_conv(s.v, l.convs[1].addr(), taps[1], hist(1), s.v, kw, nc, hd)
+            be.batch(&mut || {
+                be.ink_conv(s.k, l.convs[0].addr(), taps[0], hist(0), s.k, kw, nc, hd)?;
+                be.ink_conv(s.v, l.convs[1].addr(), taps[1], hist(1), s.v, kw, nc, hd)
+            })
         })?;
         // Log-scaled positions sharpen the full-attention layers in a long context.
         let log_alpha = if ml.swa { 0.0 } else { c.log_alpha };
         let (rows, at) = if ml.swa { ((pos + 1).min(c.n_swa), pos % c.n_swa) } else { (pos + 1, pos) };
         let ring = ds.cap;
+        let t = std::time::Instant::now();
         be.batch(&mut || {
             be.ink_clip_n(s.q, l.q_clip.addr(), hd, nh, 1, c.qk_clip, 0.0, 1.0, 0, 0, 1, pos, log_alpha, c.log_floor)?;
             be.ink_clip_n(s.k, 0, hd, nkv, 1, c.qk_clip, 0.0, 1.0, ds.k.addr(), at, ring, 0, 0.0, 1.0)?;
             be.ink_clip_n(s.v, 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), at, ring, 0, 0.0, 1.0)?;
             be.ink_clip_n(s.r, l.rel_clip.addr(), nr, nh, 1, c.rel_clip, 0.0, 1.0, 0, 0, 1, pos, log_alpha, c.log_floor)
         })?;
+        let t = m.lap(8, t);
         be.ink_attn(s.q, s.r, s.sink, s.og, ds.k.addr(), ds.v.addr(), l.rel_bias.addr(), self.sc_buf.addr(), s.att, rows, at, nh, nkv, hd, nr, c.rel_extent)?;
-        be.gemv(w(&ml.wo), s.att, s.proj)?;
-        be.ink_conv(s.proj, l.convs[2].addr(), 0, hist(2), s.x, n, nc, hd)?;
-        // The first layer of each block starts a new residual stream; the earlier one joins the mixed blocks.
-        if ip % c.block_size == 0 {
-            be.dtod(&self.scr, (s.cur - o) as usize, &self.scr, (s.blocks - o) as usize + 4 * *nb * n, 4 * n)?;
-            *nb += 1;
-        } else {
-            be.add(s.x, s.cur, n)?;
-        }
-        be.ink_mix(s.blocks, *nb, s.x, l.ffn_query.addr(), 1, s.h, n)?;
-        let mut h = s.h;
-        if msgs {
-            let at = |b: &Buf, cols: usize| b.addr() + 2 * (3 * rank * cols) as u64;
-            be.ink_ctrl(at(&lp.down, 2 * n), at(&lp.gain, n), at(&lp.forget, n), h, 1, s.msg + f(3 * n), s.gate, s.h2, n, rank, 1)?;
-            h = s.h2;
-        }
-        be.rms_norm_q(h, n, l.ffn_norm.addr(), s.hn, n, n, 1, c.eps, s.xh, 0)
+        m.lap(9, t);
+        // The block the earlier layer runs joins here; `nb` is host bookkeeping, so it moves outside the graph.
+        let (nb_in, nb_out) = (*nb, *nb + (ip % c.block_size == 0) as usize);
+        be.graph(key | 1, &mut || {
+            be.gemv(w(&ml.wo), s.att, s.proj)?;
+            be.ink_conv(s.proj, l.convs[2].addr(), 0, hist(2), s.x, n, nc, hd)?;
+            if ip % c.block_size == 0 {
+                be.dtod(&self.scr, (s.cur - o) as usize, &self.scr, (s.blocks - o) as usize + 4 * nb_in * n, 4 * n)?;
+            } else {
+                be.add(s.x, s.cur, n)?;
+            }
+            be.ink_mix(s.blocks, nb_out, s.x, l.ffn_query.addr(), 1, s.h, n)?;
+            let mut h = s.h;
+            if msgs {
+                let at = |b: &Buf, cols: usize| b.addr() + 2 * (3 * rank * cols) as u64;
+                be.ink_ctrl(at(&lp.down, 2 * n), at(&lp.gain, n), at(&lp.forget, n), h, 1, s.msg + f(3 * n), s.gate, s.h2, n, rank, 1)?;
+                h = s.h2;
+            }
+            be.rms_norm_q(h, n, l.ffn_norm.addr(), s.hn, n, n, 1, c.eps, s.xh, 0)
+        })?;
+        *nb = nb_out;
+        Ok(())
     }
 
     fn layer_ffn_gpu(&mut self, be: &dyn Backend, m: &Inkling2Model, il: usize, ip: usize) -> Result<bool> {
@@ -1347,9 +1359,13 @@ impl Device {
                 m.lap(0, t);
                 return;
             }
+            // "proj" holds the wait for the router's input: the GPU drains its queue and the rows come back,
+            // while "mix" holds the submission of that work (which returns at once).
+            m.lap(0, t);
+            let t = std::time::Instant::now();
             hn = be.get(&self.scr, ((s.hn - o) / 4) as usize, n).expect("inkling2 device step");
+            m.lap(1, t);
         }
-        m.lap(0, t);
         // The experts: those of the GPU read the device's copy of the input and leave their outputs there.
         let (on_gpu, on_cpu, adapt) = m.plan(ip, &hn);
         let gpu_side = || {

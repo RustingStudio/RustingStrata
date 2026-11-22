@@ -27,6 +27,18 @@ fn agree(g: &Gguf, prompt: &str, want: &[u32]) -> usize {
     ok
 }
 
+/// Both exports of the model describe the same 24 blocks whose core 12 run three times: the legacy file
+/// (`inkling2`) puts the 48 layer runs in `block_count`, the current one (`inkling2_loop`) the 24 blocks.
+#[test]
+fn config_counts_physical_blocks() {
+    let Some(g) = open() else { return };
+    let cfg = rusting_strata::inkling2::Inkling2Config::from_gguf(&g).unwrap();
+    assert_eq!(cfg.n_layer, 24, "physical blocks");
+    assert_eq!(cfg.n_slot(), 48, "layer runs a token");
+    assert_eq!(cfg.swa.len(), 24);
+    assert_eq!((cfg.loop_start, cfg.loop_end, cfg.loop_count), (6, 18, 3));
+}
+
 #[test]
 fn short_prompt_follows_llama_cpp() {
     let Some(g) = open() else { return };

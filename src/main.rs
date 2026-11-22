@@ -530,7 +530,7 @@ impl Engine {
         if !rusting_strata::config::OWN_ARCHS.contains(&arch) { return; }
         let mtp = self.mtp.is_some_and(|n| n > 0) || self.mtp_model.is_some();
         // Inkling 2 drafts with a DSpark file (`--draft-model`) and with n-grams (`--spec-type`); it has no MTP head.
-        if arch == "inkling2_loop" {
+        if rusting_strata::inkling2::is_arch(arch) {
             if mtp { eprintln!("warning: '{arch}' models have no MTP drafts: --mtp and --mtp-model are ignored"); }
         } else if mtp || self.draft_model.is_some() || self.spec_type != "none" {
             eprintln!("warning: '{arch}' models decode without drafts: --mtp, --mtp-model, --draft-model and --spec-type are ignored");
@@ -1155,7 +1155,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 return rusting_strata::hy4::chat::generate(&g, &prompt, n);
             }
-            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::inkling2::ARCH) {
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()).is_some_and(rusting_strata::inkling2::is_arch) {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 let max_ctx = 0;
                 let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
@@ -1261,7 +1261,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             engine.own_warn(&g);
             engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
             if let Some(arch) = g.get("general.architecture").ok().and_then(|v| v.as_str()) {
-                if arch == "deepseek41" || arch == "glm5-next" || arch == rusting_strata::hy4::ARCH || arch == rusting_strata::inkling2::ARCH {
+                if arch == "deepseek41" || arch == "glm5-next" || arch == rusting_strata::hy4::ARCH || rusting_strata::inkling2::is_arch(arch) {
                     engine.ds_env();
                     // A --ctx below the test grows to fit it, as on the main engine.
                     if rusting_strata::CTX.load(std::sync::atomic::Ordering::Relaxed) != 0 { rusting_strata::CTX.store(engine.ctx, std::sync::atomic::Ordering::Relaxed); }
@@ -1269,7 +1269,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         bench_deepseek(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else if arch == rusting_strata::hy4::ARCH {
                         bench_hy4(&g, &model, &pp, tg, reps, json_out, &mut engine)
-                    } else if arch == rusting_strata::inkling2::ARCH {
+                    } else if rusting_strata::inkling2::is_arch(arch) {
                         bench_inkling2(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else {
                         bench_glm(&g, &model, &pp, tg, reps, json_out, &mut engine)
@@ -1357,7 +1357,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Check { model, backend, device } => {
             let g = Gguf::open(&model)?;
-            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::inkling2::ARCH) {
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()).is_some_and(rusting_strata::inkling2::is_arch) {
                 let m = rusting_strata::inkling2::forward::Inkling2Model::new(&g)?;
                 println!("check: inkling2_loop ok: {} layers ({} layer runs a token), {} experts ({} used), {} tensors, every tensor of the forward is present", m.cfg.n_layer, m.cfg.n_slot(), m.cfg.n_expert, m.cfg.n_used, g.tensors.len());
                 return Ok(());
@@ -1427,7 +1427,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 anyhow::ensure!(image.is_empty(), "--image is not supported for hy_v4_flash");
                 return rusting_strata::hy4::chat::chat(&g, system, n, think);
             }
-            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::inkling2::ARCH) {
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()).is_some_and(rusting_strata::inkling2::is_arch) {
                 let max_ctx = 0;
                 let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
                 let opts = rusting_strata::inkling2::chat::Inkling2Opts {
@@ -2739,9 +2739,10 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
             "glm5-next" => rusting_strata::glm::serve(&g, &tok, &name)?,
             "deepseek41" => rusting_strata::deepseek::chat::serve(&g, &tok, &name)?,
             rusting_strata::hy4::ARCH => rusting_strata::hy4::chat::serve(&g, &tok, &name)?,
-            _ => rusting_strata::inkling2::chat::serve(&g, &tok, &name, rusting_strata::inkling2::chat::Inkling2Opts {
+            a if rusting_strata::inkling2::is_arch(a) => rusting_strata::inkling2::chat::serve(&g, &tok, &name, rusting_strata::inkling2::chat::Inkling2Opts {
                 max_ctx: 0, sampler: engine.sampler(), thinking_budget: engine.thinking_budget, think_default: engine.think_default,
                 mmproj, draft_model: engine.draft_model.clone(), ngram_cfg: engine.ngram_config()? })?,
+            other => anyhow::bail!("{other}: no server for this architecture"),
         })
     } else {
         aux_g = open_mtp_gguf(engine.aux_model_path())?;

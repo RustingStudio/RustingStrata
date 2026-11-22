@@ -125,7 +125,8 @@ struct Tune {
 }
 
 /// Graphs kept by `Gpu::graph`.
-const GRAPHS_MAX: usize = 32;
+/// The graphs kept: the Qwen forward keys one per combination of slots, and Inkling 2 one per layer run and part.
+const GRAPHS_MAX: usize = 128;
 
 impl Tune {
     /// The shipped values: `GEMM_BK = 64`, no minimum-block hint, the byte-for-byte `QI` load widths.
@@ -431,14 +432,32 @@ pub fn cfg(grid: (u32, u32), block: u32, smem: u32) -> LaunchConfig {
 /// otherwise) names the kernel that raised it. Debugging only: no graphs, and every launch pays a stream sync.
 static SYNC_EACH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("STRATA_CUDA_SYNC").is_some());
 
+/// Kernels launched with `launch!` take at most this many arguments (the widest is `gemm_*` with 13).
+const MAX_ARGS: usize = 24;
+
+std::thread_local! {
+    /// The `CUcontext` this thread has current, so a launch binds it only when another thread or another `Gpu`
+    /// left something else there. `cuCtxGetCurrent` per launch cost more than the launch itself.
+    static BOUND: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 macro_rules! launch {
     ($g:expr, $name:expr, $cfg:expr, $($a:expr),* $(,)?) => {{
-        let f = $g.f($name);
-        let mut b = $g.st().launch_builder(f);
-        $( let v = $a; b.arg(&v); )*
-        unsafe { b.launch($cfg) }.with_context(|| format!("launch {}", $name))?;
+        let g = $g;
+        let cfg: LaunchConfig = $cfg;
+        // The driver reads the arguments through these pointers, so each one must outlive the launch: a `let`
+        // binding in this block does (shadowed ones keep their storage).
+        let mut params: [*mut std::ffi::c_void; MAX_ARGS] = [std::ptr::null_mut(); MAX_ARGS];
+        let mut n = 0usize;
+        $( let v = $a; params[n] = &v as *const _ as *mut std::ffi::c_void; n += 1; )*
+        debug_assert!(n <= MAX_ARGS, "launch {}: {} arguments", $name, n);
+        g.bind()?;
+        unsafe {
+            result::launch_kernel(g.f($name).cu_function(), cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes,
+                g.st().cu_stream(), &mut params[..n])
+        }.with_context(|| format!("launch {}", $name))?;
         if *SYNC_EACH {
-            $g.stream.synchronize().and_then(|_| $g.side.synchronize()).with_context(|| format!("kernel {} failed", $name))?;
+            g.stream.synchronize().and_then(|_| g.side.synchronize()).with_context(|| format!("kernel {} failed", $name))?;
         }
     }};
 }
@@ -527,6 +546,16 @@ impl Gpu {
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
+
+    /// Make this GPU's context current on the calling thread, once per thread: `launch!` runs on whichever thread
+    /// the caller is on (a rayon worker for the expert work), and only a change of context needs the driver call.
+    fn bind(&self) -> anyhow::Result<()> {
+        let id = self.ctx.cu_ctx() as usize;
+        if BOUND.with(|c| c.get()) == id { return Ok(()); }
+        self.ctx.bind_to_thread()?;
+        BOUND.with(|c| c.set(id));
+        Ok(())
+    }
 
     /// The rope frequencies base^(-2i / n_rot) as rms_norm_rope computes them in f64 (slow on consumer cards), made
     /// once by the rope_freq kernel. While a graph is captured, a missing table gives 0 (the kernel computes them

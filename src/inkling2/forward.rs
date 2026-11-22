@@ -119,7 +119,7 @@ pub struct Inkling2Model<'a> {
 
 /// A token of `device` counts all the device work before the router as "mix": the queue runs while the host waits
 /// for the router's input.
-const PROF: [&str; 8] = ["mix", "proj", "scores", "out-proj", "route", "experts-gpu", "experts-cpu", "logits"];
+const PROF: [&str; 10] = ["mix", "sync", "scores", "out-proj", "route", "experts-gpu", "experts-cpu", "logits", "clips", "attn"];
 
 /// A tensor read from the mapped file only: never uploaded.
 fn host_mat<'a>(g: &'a Gguf, name: &str) -> Result<Mat<'a>> {
@@ -451,6 +451,17 @@ impl<'a> Inkling2Model<'a> {
         }
         let cfg = Inkling2Config::from_gguf(g)?;
         let has = |n: &str| g.tensors.contains_key(n);
+        // The legacy export keeps one `loop_res_query` and one `loop_kv_res_query` table of 24 columns of
+        // `n_embd` values; the current files carry a `loop_msg_query` per core layer instead, which is
+        // [q, kv, kv, q] of that layer's two columns (`2i` and `2i + 1` for the i-th core layer).
+        let legacy_msg = if cfg.legacy {
+            let (n, q, kv) = (cfg.n_embd, f32s(g, "loop_res_query.weight")?, f32s(g, "loop_kv_res_query.weight")?);
+            ensure!(q.len() == 24 * n && kv.len() == 24 * n,
+                "loop_res_query / loop_kv_res_query: {} and {} values for 24 columns of {n}", q.len(), kv.len());
+            Some((q, kv))
+        } else {
+            None
+        };
         let mut layers = vec![];
         for il in 0..cfg.n_layer {
             let p = |s: &str| format!("blk.{il}.{s}");
@@ -495,9 +506,16 @@ impl<'a> Inkling2Model<'a> {
         }
         let mut loops = vec![];
         for il in cfg.loop_start..cfg.loop_end {
+            let ip = il - cfg.loop_start;
             let v = |s: &str| f32s(g, &format!("blk.{il}.loop_{s}.weight"));
             let ctrl = |kind: &str| ["q", "k", "v", "ffn"].iter().map(|c| {
-                let mut w = v(&format!("{c}_ctrl_{kind}"))?;
+                // The legacy export calls the query path `attn` and the feed-forward one `mlp`, without `_ctrl`.
+                let name = if cfg.legacy {
+                    format!("{}_{kind}", match *c { "q" => "attn", "ffn" => "mlp", other => other })
+                } else {
+                    format!("{c}_ctrl_{kind}")
+                };
+                let mut w = v(&name)?;
                 if kind != "down" {
                     let (n, rank) = (cfg.n_embd, w.len() / cfg.n_embd);
                     w = (0..w.len()).map(|i| w[i % n * rank + i / n]).collect();
@@ -506,7 +524,20 @@ impl<'a> Inkling2Model<'a> {
                 h.convert_from_f32_slice(&w);
                 Ok(h)
             }).collect::<Result<Vec<_>>>();
-            loops.push(Loop { msg_query: v("msg_query")?, down: ctrl("down")?, gain: ctrl("gain")?, forget: ctrl("forget")? });
+            let msg_query = match &legacy_msg {
+                Some((q, kv)) => {
+                    let n = cfg.n_embd;
+                    let (a, b) = (2 * ip * n, (2 * ip + 2) * n);
+                    let mut m = Vec::with_capacity(4 * n);
+                    m.extend_from_slice(&q[a..a + n]);
+                    m.extend_from_slice(&kv[a..a + n]);
+                    m.extend_from_slice(&kv[a + n..b]);
+                    m.extend_from_slice(&q[a + n..b]);
+                    m
+                }
+                None => v("msg_query")?,
+            };
+            loops.push(Loop { msg_query, down: ctrl("down")?, gain: ctrl("gain")?, forget: ctrl("forget")? });
         }
         let ctx_cap = if max_ctx == 0 { cfg.n_ctx } else { max_ctx.clamp(1, cfg.n_ctx) };
         let mut m = Self {
