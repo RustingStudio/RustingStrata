@@ -79,10 +79,11 @@ impl Inkling2Config {
         };
         ensure!(loop_start < loop_end && loop_count >= 1, "bad loop range");
         // `runs`: the file counts layer runs, and the later passes of the core sit between the core and the rest.
-        let extra = if runs { (loop_count - 1) * (loop_end - loop_start) } else { 0 };
+        let extra = if runs { (loop_count - 1).checked_mul(loop_end - loop_start).context("bad loop range")? } else { 0 };
         let n_layer = u("block_count")?.checked_sub(extra).context("block_count is below the layer runs of the loop")?;
         let mut swa: Vec<bool> = arr("attention.sliding_window_pattern")?.into_iter().map(|v| v != 0).collect();
         ensure!(swa.len() == n_layer + extra, "sliding_window_pattern: {} entries for {} layers", swa.len(), n_layer + extra);
+        ensure!(loop_end <= n_layer, "bad loop range");
         swa.drain(loop_end..loop_end + extra);
         let cfg = Self {
             n_ctx: crate::ctx_limit(u("context_length")?),
