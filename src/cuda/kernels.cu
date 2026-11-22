@@ -361,6 +361,11 @@ __device__ __forceinline__ float ue4m3(u32 x) {
     u32 e = (x >> 3) & 15, m = x & 7;
     return x == 0x7F ? 0.0f : e ? __uint_as_float((e + 119) << 23 | m << 20) : (float)m * 0x1p-10f;
 }
+// An unsigned E8M0 scale halved, `2^(x - 128)` (llama.cpp ggml_e8m0_to_fp32_half): the fp4 LUT holds doubled
+// values, as ue4m3 does.
+__device__ __forceinline__ float e8m0h(u32 x) {
+    return __uint_as_float(x < 2 ? 0x00200000u << x : (x - 1) << 23);
+}
 // 8 bytes at 2-aligned p from the three 4-byte words that cover them, shifted when p is not 4-aligned (so the 2
 // bytes after p + 8 must be readable). No branch, so the loads of unrolled superblocks can be issued together.
 __device__ __forceinline__ uint2 ld8a2(const u8* p) {
@@ -638,6 +643,23 @@ template <> __device__ __forceinline__ void deq8<40>(const u8* b, int sub, float
     QI<40>::get(b, sub, lo, hi, d, m);
     for (int i = 0; i < 8; i++) o[i] = d * (float)(signed char)((i < 4 ? lo : hi) >> (8 * (i & 3)));
 }
+template <> struct QI<39> {  // MXFP4, 8 blocks of 17: one E8M0 scale per 32 values, then 16 bytes of codes
+    static constexpr bool MIN = false;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        // Values j and j + 16 of a block are the low and high nibbles of code byte j.
+        const u8* p = b + 17 * (sub >> 2);
+        d = e8m0h(p[0]);
+        const u8* q = p + 1 + 8 * (sub & 1);
+        // 17-byte blocks, so the codes are not 4-byte aligned: `ld32`, not `ldu32`.
+        int2 a = fp4_lut(ld32(q)), c = fp4_lut(ld32(q + 4));
+        lo = sub & 2 ? a.y : a.x; hi = sub & 2 ? c.y : c.x;
+    }
+};
+template <> __device__ __forceinline__ void deq8<39>(const u8* b, int sub, float* o) {
+    int lo, hi; float d, m;
+    QI<39>::get(b, sub, lo, hi, d, m);
+    for (int i = 0; i < 8; i++) o[i] = d * (float)(signed char)((i < 4 ? lo : hi) >> (8 * (i & 3)));
+}
 template <> struct QI<20> {  // IQ4_NL, 8 blocks of 18 (2-byte aligned: ld16 only)
     static constexpr bool MIN = false;
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
@@ -845,7 +867,7 @@ __device__ __forceinline__ void gemv_row_qn(const u8* __restrict__ w, const sign
 #define FTYPES(X) X(0, f32, 1024) X(30, bf16, 512) X(43, f8_e4m3, 256) X(144, tq2_t, 68) X(145, tqk6, 52) X(146, tqk7, 60)
 #define ITYPES(X) X(8, q8_0, 272) X(10, q2_k, 84) X(11, q3_k, 110) X(12, q4_k, 144) X(13, q5_k, 176) X(14, q6_k, 210) \
     X(19, iq1_s, 50) X(29, iq1_m, 56) X(16, iq2_xxs, 66) X(17, iq2_xs, 74) X(22, iq2_s, 82) X(18, iq3_xxs, 98) X(21, iq3_s, 110) X(23, iq4_xs, 136) X(20, iq4_nl, 144) X(42, q2_0, 72) X(34, tq1_0, 54) X(35, tq2_0, 66) X(2, q4_0, 144) X(6, q5_0, 176) \
-    X(3, q4_1, 160) X(7, q5_1, 192) X(40, nvfp4, 144)
+    X(3, q4_1, 160) X(7, q5_1, 192) X(40, nvfp4, 144) X(39, mxfp4, 136)
 #define QTYPES(X) FTYPES(X) ITYPES(X)
 
 #define DEF_DEQUANT(T, NAME, SBB)                                                                                 \

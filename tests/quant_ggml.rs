@@ -20,3 +20,4 @@ fn check(name: &str, ty: GgmlType) {
 #[test] fn q8_0() { check("q8_0", GgmlType::Q8_0) }
 #[test] fn bf16() { check("bf16", GgmlType::BF16) }
 #[test] fn nvfp4() { check("nvfp4", GgmlType::NVFP4) }
+#[test] fn mxfp4() { check("mxfp4", GgmlType::MXFP4) }
