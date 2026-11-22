@@ -5,7 +5,7 @@
 //! The prompt runs layer by layer over a chunk of tokens: one GPU GEMM per dense matrix and per routed expert.
 //! ponytail: the attention scores run on the CPU. Move them to the GPU when a long prompt waits on them.
 use super::Inkling2Config;
-use crate::deepseek::mat::{Mat, matvec_many, matvec_many_opt, matvec_rows, matvec_rows_many, matvec_rows_sets, situ_chunk, situ_experts};
+use crate::deepseek::mat::{Mat, matvec_many, matvec_many_cpu, matvec_many_opt, matvec_rows, matvec_rows_many, matvec_rows_sets, situ_chunk, situ_experts};
 use crate::deepseek::ops::{rms_norm, rms_norm_w};
 use crate::gguf::Gguf;
 use crate::quant::GgmlType;
@@ -428,6 +428,20 @@ fn run_experts(list: &[(Mat, Mat, f32, f32)], x: &[f32], cfg: &Inkling2Config) -
             }
         }
         None => {
+            let gus: Vec<Mat> = list.iter().map(|e| e.0).collect();
+            let downs: Vec<Mat> = list.iter().map(|e| e.1).collect();
+            let gs: Vec<f32> = list.iter().map(|e| e.3).collect();
+            let gx: Vec<&[f32]> = vec![x; list.len()];
+            if let Some(y) = matvec_many_cpu(&gus, &gx) {
+                let a: Vec<f32> = y.chunks_exact(2 * nf).zip(&gs).flat_map(|(y, &s)| situ(y, s, cfg)).collect();
+                let acts: Vec<&[f32]> = a.chunks_exact(nf).collect();
+                if let Some(dy) = matvec_many_cpu(&downs, &acts) {
+                    for (e, dy) in list.iter().zip(dy.chunks_exact(nl)) {
+                        for (m, d) in mix.iter_mut().zip(dy) { *m += e.2 * d; }
+                    }
+                    return mix;
+                }
+            }
             let (mut y, mut dy) = (vec![0f32; 2 * nf], vec![0f32; nl]);
             for (gu, down, w, s) in list {
                 gu.matvec(x, &mut y);

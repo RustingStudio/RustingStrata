@@ -487,6 +487,31 @@ pub fn matvec_many(ms: &[Mat], x: &[f32], xs: usize) -> Vec<f32> {
 }
 
 /// The batched path of `matvec_many`, or None when the matrices cannot share one GPU batch (or batching is off).
+/// Host integer dot of several matrices, one activation each, in a single Rayon pass.
+pub fn matvec_many_cpu<'a>(ms: &[Mat<'a>], xs: &[&[f32]]) -> Option<Vec<f32>> {
+    let ty = ms.first()?.ty;
+    if ms.len() != xs.len() || ms.iter().any(|m| m.ty != ty || m.gpu.is_some() || m.cols != xs[0].len())
+        || xs.iter().any(|x| x.len() != xs[0].len()) { return None; }
+    if std::env::var_os("STRATA_CPU_REF").is_some() || xs[0].len() % ty.block_elems() != 0
+        || ms.iter().any(|m| !m.cpu && m.rows < 512) { return None; }
+    let dot = crate::cpu_moe::int_dot(ty)?;
+    let xq: Vec<_> = xs.par_iter().map(|x| crate::cpu_moe::quantize_q8k(x)).collect();
+    let rb = ty.row_bytes(xs[0].len() as u64);
+    let mut starts = Vec::with_capacity(ms.len());
+    let mut off = 0;
+    for m in ms { starts.push((off, *m)); off += m.rows; }
+    let mut y = vec![0f32; off];
+    y.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
+        for (k, o) in ys.iter_mut().enumerate() {
+            let r = c * 32 + k;
+            let i = starts.partition_point(|(s, _)| *s <= r) - 1;
+            let (s, m) = starts[i];
+            *o = dot(&m.data[(r - s) * rb..(r - s + 1) * rb], &xq[i]) * m.scale;
+        }
+    });
+    Some(y)
+}
+
 pub fn matvec_many_opt(ms: &[Mat], x: &[f32], xs: usize) -> Option<Vec<f32>> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var("STRATA_DS_BATCH").ok().as_deref() != Some("0")) { return None; }
