@@ -612,7 +612,7 @@ $('csys').onclick = () => { openSettings('chat'); $('csystem').focus(); };
 // Export and import.
 const download = (name, text, type) => { const a = el('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); };
 const pack = list => JSON.stringify({ version: 1, chats: list }, null, 1);
-const chatMd = c => `# ${c.title}\n\n` + c.msgs.filter(m => !m.error && (m.content || m.role !== 'assistant')).map(m => m.role === 'tool' ? `**tool ${m.name}:**\n\n~~~\n${m.content}\n~~~` : `**${m.role === 'user' ? 'you' : 'model'}:**\n\n${m.content}`).join('\n\n---\n\n') + '\n';
+const chatMd = c => `# ${c.title}\n\n` + c.msgs.filter(m => (m.role === 'tool' || !m.error) && (m.content || m.role !== 'assistant')).map(m => m.role === 'tool' ? `**${m.error ? 'tool failed' : 'tool'} ${m.name}:**\n\n~~~\n${m.content}\n~~~` : `**${m.role === 'user' ? 'you' : 'model'}:**\n\n${m.content}`).join('\n\n---\n\n') + '\n';
 // Takes chats from an export file; an existing chat is replaced only by a newer one. Throws on any other file.
 function merge(text) {
   const j = JSON.parse(text), inc = Array.isArray(j) ? j : j?.chats;
@@ -881,10 +881,14 @@ $('new').onclick = () => { if (busy) busy.abort(); cur = null; pendingImages = [
 // end of the request as the start of its answer and returns only the new text.
 // The chat as the API takes it. `open` is the reply being continued (its thinking goes along).
 function wire(msgs, open) {
-  return msgs.filter(x => !x.error).map(x => {
+  // `error` means two different things. On an assistant message the turn never happened, so there is nothing to send.
+  // On a tool message it means the tool failed, and that failure is the answer the model is waiting for: dropping it
+  // leaves the call unanswered, and a model with an unanswered call repeats the same call instead of noticing.
+  return msgs.filter(x => !x.error || x.role === 'tool').map(x => {
     const imgs = x.images || [];
     if (imgs.length) return { role: x.role, content: [{ type: 'text', text: x.content }, ...imgs.map(url => ({ type: 'image_url', image_url: { url } }))] };
-    if (x.role === 'tool') return { role: 'tool', tool_call_id: x.id, content: x.content };
+    // Say it is an error in the text too: a failed result otherwise looks like a payload that happens to be prose.
+    if (x.role === 'tool') return { role: 'tool', tool_call_id: x.id, content: x.error && !/^(Error: |The tool failed: )/.test(x.content) ? `Error: ${x.content}` : x.content };
     if (x.calls?.length) return { role: 'assistant', content: x.content, tool_calls: x.calls.map(c => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.args || '{}' } })) };
     return x === open && x.think ? { role: x.role, content: x.content, reasoning_content: x.think } : { role: x.role, content: x.content };
   });
@@ -1295,6 +1299,13 @@ function selftest() {
       const w = wire([{ role: 'user', content: 'q' }, { role: 'assistant', content: '', think: '', calls: [{ id: 'call_0_0', name: 'a__x', args: '{"k":1}' }] },
         { role: 'tool', id: 'call_0_0', name: 'a__x', content: 'r' }, { role: 'assistant', content: 'done' }]);
       return w[1].tool_calls[0].function.arguments === '{"k":1}' && w[1].tool_calls[0].id === 'call_0_0' && w[2].role === 'tool' && w[2].tool_call_id === 'call_0_0' && w[2].content === 'r' && !w[3].tool_calls;
+    }],
+    // `error` on a tool message is the tool's answer, so it goes; on an assistant message the turn never happened.
+    ['tool errors go to the model, transport errors do not', () => {
+      const w = wire([{ role: 'user', content: 'q' }, { role: 'assistant', content: '', calls: [{ id: 'c1', name: 'a__x', args: '{}' }, { id: 'c2', name: 'a__y', args: '{}' }] },
+        { role: 'tool', id: 'c1', name: 'a__x', content: 'boom', error: true },
+        { role: 'tool', id: 'c2', name: 'a__y', content: 'The tool failed: Bad Gateway', error: true }, { role: 'assistant', content: 'gone', error: true }]);
+      return w.length === 4 && w[1].tool_calls.length === 2 && w[2].role === 'tool' && w[2].tool_call_id === 'c1' && w[3].tool_call_id === 'c2' && w[2].content === 'Error: boom' && w[3].content === 'The tool failed: Bad Gateway';
     }],
     ['tool messages export and import', () => {
       const c = { id: 't1', title: 't', at: 1, msgs: [{ role: 'user', content: 'q' }, { role: 'assistant', content: '', calls: [{ id: 'c1', name: 'a__x', args: '{}' }] }, { role: 'tool', id: 'c1', name: 'a__x', content: 'r' }, { role: 'assistant', content: 'done' }] };
