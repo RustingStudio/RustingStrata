@@ -1352,7 +1352,7 @@ impl Device {
         m.lap(0, t);
         // The experts: those of the GPU read the device's copy of the input and leave their outputs there.
         let (on_gpu, on_cpu, adapt) = m.plan(ip, &hn);
-        let gpu_side = || {
+        let gpu_side = || -> Option<f32> {
             let t = std::time::Instant::now();
             let list = Inkling2Model::resident(ml, c.n_expert, &on_gpu);
             let d = lock();
@@ -1390,21 +1390,32 @@ impl Device {
                 // follows the time. With every expert in VRAM the queue runs on.
                 if adapt || !owned.is_empty() { p.be.sync().ok()?; }
                 Some(())
-            })().expect("inkling2 device step");
-            t.elapsed().as_secs_f32()
+            })()?;
+            Some(t.elapsed().as_secs_f32())
         };
         let cpu_side = || {
             let t = std::time::Instant::now();
             (run_experts(&on_cpu, &hn, c), t.elapsed().as_secs_f32())
         };
-        let (tg, (cpu, tc)) = rayon::join(gpu_side, cpu_side);
-        m.balance(&m.cpu_share, adapt, tg, tc);
-        let wc: Vec<f32> = (0..c.n_used).map(|i| on_gpu.get(i).map_or(0.0, |e| e.2)).chain(cpu).collect();
+        let (gpu, (cpu, tc)) = rayon::join(gpu_side, cpu_side);
         let d = lock();
         let be = &*d.parts[0].be;
+        match gpu {
+            Some(tg) => {
+                m.balance(&m.cpu_share, adapt, tg, tc);
+                let wc: Vec<f32> = (0..c.n_used).map(|i| on_gpu.get(i).map_or(0.0, |e| e.2)).chain(cpu).collect();
+                be.put(&wc, &self.scr, ((s.wc - o) / 4) as usize).expect("inkling2 device step");
+                be.ink_ffn_sum(s.acc, s.d, s.wc, on_gpu.len(), n, s.wc + f(c.n_used)).expect("inkling2 device step");
+            }
+            None => {
+                // No room to stage a routed weight: finish this layer's experts on the host and write the
+                // weighted sum straight into `s.acc`. The conv and residual stay on the device.
+                let (y, t_cpu) = m.experts_all_cpu(ip, &hn);
+                m.balance(&m.cpu_share, false, t_cpu, tc);
+                be.put(&y, &self.scr, ((s.acc - o) / 4) as usize).expect("inkling2 device step");
+            }
+        }
         (|| -> Result<()> {
-            be.put(&wc, &self.scr, ((s.wc - o) / 4) as usize)?;
-            be.ink_ffn_sum(s.acc, s.d, s.wc, on_gpu.len(), n, s.wc + f(c.n_used))?;
             be.ink_conv(s.acc, self.layers[ip].convs[3].addr(), 0, hist3, s.acc, n, nc, hd)?;
             be.add(s.x, s.acc, n)
         })().expect("inkling2 device step");

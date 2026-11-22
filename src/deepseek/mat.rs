@@ -211,8 +211,9 @@ pub(crate) mod dev {
             }
             if !evict || self.parts.iter().all(|p| p.budget == 0) || data.len() > STAGE || std::env::var_os("STRATA_DS_NOEVICT").is_some() { return None; }
             let lfu = std::env::var_os("STRATA_DS_LFU").is_some();
+            let age = std::env::var("STRATA_DS_EX_AGE").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(96);
             let victim = self.exs.iter().enumerate()
-                .filter(|(_, e)| e.2 + 96 <= now && { let t = self.tensor(e.0); t.ty == ty && t.rows == rows && t.cols == cols })
+                .filter(|(_, e)| e.2 + age <= now && { let t = self.tensor(e.0); t.ty == ty && t.rows == rows && t.cols == cols })
                 .min_by(|(_, a), (_, b)| if lfu { a.3.total_cmp(&b.3).then(a.2.cmp(&b.2)) } else { a.2.cmp(&b.2) })
                 .map(|(p, _)| p);
             let Some(p) = victim else { return Some(STAGED) };
@@ -470,6 +471,35 @@ pub fn matvec_many(ms: &[Mat], x: &[f32], xs: usize) -> Vec<f32> {
         off += m.rows;
     }
     y
+}
+
+/// Host integer dot of several matrices, one activation each, in a single Rayon pass. The activations are
+/// quantised once and every weight row is read once; callers with many small expert matrices avoid one parallel
+/// loop (and one quantisation) per matrix. None when the matrices do not share an integer kernel.
+pub fn matvec_many_cpu<'a>(ms: &[Mat<'a>], xs: &[&[f32]]) -> Option<Vec<f32>> {
+    let ty = ms.first()?.ty;
+    if ms.len() != xs.len() || ms.iter().any(|m| m.ty != ty || m.gpu.is_some() || m.cols != xs[0].len())
+        || xs.iter().any(|x| x.len() != xs[0].len()) { return None; }
+    // Same conditions as `Mat::int_dot`: keep the f32 reference for debugging and skip types whose blocks do not
+    // align with the activation.
+    if std::env::var_os("STRATA_CPU_REF").is_some() || xs[0].len() % ty.block_elems() != 0
+        || ms.iter().any(|m| !m.cpu && m.rows < 512) { return None; }
+    let dot = crate::cpu_moe::int_dot(ty)?;
+    let xq: Vec<_> = xs.par_iter().map(|x| crate::cpu_moe::quantize_q8k(x)).collect();
+    let rb = ty.row_bytes(xs[0].len() as u64);
+    let mut starts = Vec::with_capacity(ms.len());
+    let mut off = 0;
+    for m in ms { starts.push((off, *m)); off += m.rows; }
+    let mut y = vec![0f32; off];
+    y.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
+        for (k, o) in ys.iter_mut().enumerate() {
+            let r = c * 32 + k;
+            let i = starts.partition_point(|(s, _)| *s <= r) - 1;
+            let (s, m) = starts[i];
+            *o = dot(&m.data[(r - s) * rb..(r - s + 1) * rb], &xq[i]) * m.scale;
+        }
+    });
+    Some(y)
 }
 
 /// The batched path of `matvec_many`, or None when the matrices cannot share one GPU batch (or batching is off).

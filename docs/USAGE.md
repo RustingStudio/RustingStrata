@@ -148,6 +148,15 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   text only with `STRATA_FIXED_EXPERTS=1`, because the adaptive expert split moves the logits a little),
   `/v1/chat/completions` only (no `/v1/messages`), and no calibration (`calibrate` does
   not cover them). The context limit is `--ctx` (or the page's context setting) when given, else the trained context.
+- Inkling 2 performance: the default `STRATA_DS_GPU_FRACTION` is chosen from free VRAM (0.6 below 8 GB, 0.9 above)
+  because a small card cannot stage routed experts at 0.9; if a layer cannot stage a weight it now falls back to
+  host experts instead of aborting the token. Suffix speculative decoding is on by default (`--spec-type suffix`;
+  use `--spec-type none` to disable) and is verified, so the text is unchanged. On a 4 GB GPU suffix roughly
+  doubles decode throughput (9.5 → 16.3 tok/s at 512-token prefill). Adding the DSpark `--draft-model` on top is
+  not worth it: its drafts drop acceptance to 89% and decode fell to 15.7 tok/s in the same test.
+- Generic MoE models (e.g. 35B-A3B) benefit from the same suffix default: measured 29 → 46 tok/s with 100% draft
+  acceptance. `STRATA_MOE_PREFETCH=1` is available as an opt-in next-layer L2 prefetch; it helped when the expert
+  budget was small but was noisy on a full cache, so it stays off by default.
 - `--lora PATH:SCALE` applies a LoRA adapter at runtime, see [LORA.md](LORA.md).
 - `--mcp FILE` (`serve` only, or `STRATA_MCP`) lists the MCP servers whose tools the chat page may call, see
   [Tools (MCP)](#tools-mcp).

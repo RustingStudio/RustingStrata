@@ -47,7 +47,7 @@ struct Engine {
     draft_model: Option<PathBuf>,
     /// Speculative context-lookup drafter type(s), comma-separated: none, suffix, ngram-simple, ngram-map-k,
     /// ngram-map-k4v, ngram-mod, ngram-cache (combines with --mtp/--mtp-model/--draft-model in hybrid cascade).
-    #[arg(long, default_value = "none")]
+    #[arg(long, default_value = "suffix")]
     spec_type: String,
     /// Maximum number of speculative draft tokens verified per step (1..=16).
     #[arg(long, default_value_t = 16)]

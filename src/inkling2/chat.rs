@@ -47,7 +47,9 @@ impl Inkling2Opts {
         } else if self.ngram_cfg.draft_max != 16 {
             self.ngram_cfg.draft_max
         } else {
-            3
+            // Inkling 2 verifies drafts in batches of up to VERIFY_MAX (16) with no host round trip, so a
+            // longer draft saves whole layer scans; suffix drafts are accepted almost without exception.
+            16
         };
         if self.ngram_cfg.is_enabled() {
             let mut cfg = self.ngram_cfg.clone();
@@ -73,7 +75,7 @@ const DONE: &str = "<|content_model_end_sampling|>";
 
 pub fn gpu_defaults() {
     crate::deepseek::chat::gpu_defaults();
-    if std::env::var_os("STRATA_DS_GPU_FRACTION").is_none() { unsafe { std::env::set_var("STRATA_DS_GPU_FRACTION", "0.90") } }
+    super::gpu_fraction_default();
 }
 
 /// The template's `tojson(sort_keys=true, separators=(",", ":"))`.

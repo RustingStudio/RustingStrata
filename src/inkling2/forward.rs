@@ -5,7 +5,7 @@
 //! The prompt runs layer by layer over a chunk of tokens: one GPU GEMM per dense matrix and per routed expert.
 //! ponytail: the attention scores run on the CPU. Move them to the GPU when a long prompt waits on them.
 use super::Inkling2Config;
-use crate::deepseek::mat::{Mat, matvec_many, matvec_many_opt, matvec_rows, matvec_rows_many, matvec_rows_sets, situ_chunk, situ_experts};
+use crate::deepseek::mat::{Mat, matvec_many, matvec_many_cpu, matvec_many_opt, matvec_rows, matvec_rows_many, matvec_rows_sets, situ_chunk, situ_experts};
 use crate::deepseek::ops::{rms_norm, rms_norm_w};
 use crate::gguf::Gguf;
 use crate::quant::GgmlType;
@@ -428,6 +428,22 @@ fn run_experts(list: &[(Mat, Mat, f32, f32)], x: &[f32], cfg: &Inkling2Config) -
             }
         }
         None => {
+            // One Rayon pass for all of this layer's host experts instead of one per matrix: the activation is
+            // quantised once and the rows of every expert are read in the same sweep.
+            let gus: Vec<Mat> = list.iter().map(|e| e.0).collect();
+            let downs: Vec<Mat> = list.iter().map(|e| e.1).collect();
+            let gs: Vec<f32> = list.iter().map(|e| e.3).collect();
+            let gx: Vec<&[f32]> = vec![x; list.len()];
+            if let Some(y) = matvec_many_cpu(&gus, &gx) {
+                let a: Vec<f32> = y.chunks_exact(2 * nf).zip(&gs).flat_map(|(y, &s)| situ(y, s, cfg)).collect();
+                let acts: Vec<&[f32]> = a.chunks_exact(nf).collect();
+                if let Some(dy) = matvec_many_cpu(&downs, &acts) {
+                    for (e, dy) in list.iter().zip(dy.chunks_exact(nl)) {
+                        for (m, d) in mix.iter_mut().zip(dy) { *m += e.2 * d; }
+                    }
+                    return mix;
+                }
+            }
             let (mut y, mut dy) = (vec![0f32; 2 * nf], vec![0f32; nl]);
             for (gu, down, w, s) in list {
                 gu.matvec(x, &mut y);
@@ -446,9 +462,7 @@ impl<'a> Inkling2Model<'a> {
 
     /// Load the model with a context limit up to `cfg.ctx`.
     pub fn new_with_ctx(g: &'a Gguf, max_ctx: usize) -> Result<Self> {
-        if std::env::var_os("STRATA_DS_GPU_FRACTION").is_none() {
-            unsafe { std::env::set_var("STRATA_DS_GPU_FRACTION", "0.90"); }
-        }
+        super::gpu_fraction_default();
         let cfg = Inkling2Config::from_gguf(g)?;
         let has = |n: &str| g.tensors.contains_key(n);
         let mut layers = vec![];
@@ -765,6 +779,19 @@ impl<'a> Inkling2Model<'a> {
     fn resident(l: &Layer<'a>, ne: usize, on_gpu: &[(Mat<'a>, usize, f32)]) -> Vec<(Mat<'a>, Mat<'a>, f32, f32)> {
         let on = |m: &Mat<'a>, e: usize| { let x = m.expert_opt(e, ne, true); if x.gpu.is_some() { x } else { x.staged() } };
         on_gpu.iter().map(|&(gu, e, w)| (if gu.gpu.is_some() { gu } else { on(&l.gate_up, e) }, on(&l.down, e), w, l.gu_scale[e])).collect()
+    }
+
+    /// All routed experts of `x` in layer `ip` on the host, with no VRAM allocation. Used when the device cannot
+    /// stage a routed weight (a small card whose expert budget leaves no room for per-use copies).
+    pub(super) fn experts_all_cpu(&self, ip: usize, x: &[f32]) -> (Vec<f32>, f32) {
+        let t = std::time::Instant::now();
+        let (cfg, l) = (&self.cfg, &self.layers[ip]);
+        let ne = cfg.n_expert;
+        let sel = route(l, x, cfg);
+        let list: Vec<(Mat<'a>, Mat<'a>, f32, f32)> = sel.iter().map(|&(e, w)| {
+            (l.gate_up.expert_host(e, ne), l.down.expert_host(e, ne), w, l.gu_scale[e])
+        }).collect();
+        (run_experts(&list, x, cfg), t.elapsed().as_secs_f32())
     }
 
     /// MoE of one token with the weights of layer `ip`.

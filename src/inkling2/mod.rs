@@ -8,6 +8,18 @@ use anyhow::{Context, ensure};
 
 pub const ARCH: &str = "inkling2_loop";
 
+/// Default share of free VRAM for the expert budget. 90% suits a 12 GB card, but on a small one it leaves no room
+/// for per-use staging copies and KV growth, so decode falls back to the host on every layer. Query the card once
+/// and keep a larger margin there.
+pub fn gpu_fraction_default() {
+    if std::env::var_os("STRATA_DS_GPU_FRACTION").is_some() { return; }
+    let kind = std::env::var("STRATA_DS_BACKEND").ok();
+    let total = crate::backend::open(kind.as_deref(), 0).ok()
+        .and_then(|b| b.mem_info().ok().map(|(_, t)| t)).unwrap_or(0);
+    let frac = if total < 8 << 30 { "0.60" } else { "0.90" };
+    unsafe { std::env::set_var("STRATA_DS_GPU_FRACTION", frac); }
+}
+
 #[derive(Debug, Clone)]
 pub struct Inkling2Config {
     /// Layers in the file. The core layers `loop_start..loop_end` run `loop_count` times.
