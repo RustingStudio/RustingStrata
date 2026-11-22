@@ -15,6 +15,8 @@ pub struct Tensor<'a> {
     /// Product of the remaining dims; for 3-D expert tensors this is out_rows * n_expert.
     pub rows: usize,
     pub data: &'a [u8],
+    /// Optional per-tensor post-dequant multiplier (e.g. NVFP4 `<stem>.scale` F32 scalar, else `1.0`).
+    pub scale: f32,
 }
 
 impl<'a> Tensor<'a> {
@@ -23,6 +25,9 @@ impl<'a> Tensor<'a> {
     pub fn row(&self, r: usize, out: &mut [f32]) {
         let rb = self.row_bytes();
         dequant_row(self.ty, &self.data[r * rb..(r + 1) * rb], out);
+        if self.scale != 1.0 {
+            for v in out.iter_mut() { *v *= self.scale; }
+        }
     }
 
     /// y[r] = row_r · x for all rows.
@@ -156,6 +161,7 @@ impl<'a> Weights<'a> {
                     cols: t.dims[0] as usize,
                     rows: t.dims[1..].iter().product::<u64>() as usize,
                     data: ag.bytes(t),
+                    scale: 1.0,
                 });
             }
         }
@@ -178,11 +184,22 @@ impl<'a> Weights<'a> {
             .or_else(|| self.aux_g.and_then(find_t))
             .with_context(|| format!("missing tensor {name}"))?;
         let ty = GgmlType::from_u32(t.ty).with_context(|| format!("tensor {name}"))?;
+        let scale = t.name.strip_suffix(".weight")
+            .and_then(|stem| owner_g.tensors.get(&format!("{stem}.scale")))
+            .and_then(|st| {
+                if st.ty == 0 && owner_g.bytes(st).len() == 4 {
+                    Some(f32::from_le_bytes(owner_g.bytes(st).try_into().unwrap()))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(1.0);
         Ok(Tensor {
             ty,
             cols: t.dims[0] as usize,
             rows: t.dims[1..].iter().product::<u64>() as usize,
             data: owner_g.bytes(t),
+            scale,
         })
     }
 
@@ -233,7 +250,7 @@ impl<'a> Weights<'a> {
                 let bytes: Box<[u8]> = w.iter().flat_map(|f| f.to_le_bytes()).collect();
                 // `bytes` lives in `self.baked` until `clear_baked`, which removes the tensor below first.
                 let data: &'a [u8] = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
-                let t = Tensor { ty: crate::quant::GgmlType::F32, cols: base.cols, rows: base.rows, data };
+                let t = Tensor { ty: crate::quant::GgmlType::F32, cols: base.cols, rows: base.rows, data, scale: 1.0 };
                 self.baked.insert(name.clone(), bytes);
                 self.built.insert(name.clone(), t);
                 self.lora_baked.insert(name.clone());

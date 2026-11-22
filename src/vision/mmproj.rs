@@ -184,7 +184,7 @@ impl ClipModel {
         let cols = cols.unwrap_or(t.dims[0] as usize);
         let total: usize = t.dims.iter().map(|&d| d as usize).product();
         anyhow::ensure!(cols > 0 && total % cols == 0, "tensor {name}: {total} elements not divisible by cols {cols}");
-        Ok(Tensor { ty, cols, rows: total / cols, data: self.g.bytes(t) })
+        Ok(Tensor { ty, cols, rows: total / cols, data: self.g.bytes(t), scale: 1.0 })
     }
 
     /// F32 view of a tensor, copied out of the mmap.

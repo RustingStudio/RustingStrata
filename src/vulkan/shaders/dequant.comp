@@ -4,7 +4,7 @@ layout(local_size_x = 256) in;
 #include "common.glsl"
 #include "deq.glsl"
 
-layout(push_constant) uniform P { U8 w; F32 o; uint cols; } p;
+layout(push_constant) uniform P { U8 w; F32 o; uint cols; float sc; } p;
 
 void main() {
     uint row = gl_WorkGroupID.x;
@@ -12,6 +12,6 @@ void main() {
     for (uint s = gl_LocalInvocationID.x; s < p.cols / 8; s += 256) {
         deq8(p.w, row * rowb(p.cols) + (s >> 5) * SBB, s & 31, v);
         uint o = row * p.cols + s * 8;
-        for (uint i = 0; i < 8; i++) p.o.v[o + i] = v[i];
+        for (uint i = 0; i < 8; i++) p.o.v[o + i] = v[i] * p.sc;
     }
 }

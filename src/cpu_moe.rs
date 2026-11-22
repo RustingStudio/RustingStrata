@@ -555,6 +555,41 @@ mod avx2 {
         }
     }
 
+    /// NVFP4 (see `super::dot_nvfp4`): 64 values per 36-byte block across 4 sub-blocks of 16, processed two sub-blocks
+    /// (32 values) per AVX2 step with `_mm_shuffle_epi8` + `_mm256_maddubs_epi16`.
+    pub fn dot_nvfp4(row: &[u8], xq: &[Q8K]) -> f32 {
+        unsafe {
+            let values = _mm_loadu_si128(crate::quant::KVALUES_FP4.as_ptr() as *const __m128i);
+            let (m4, ones) = (_mm_set1_epi8(0xF), _mm256_set1_epi16(1));
+            let mut acc = _mm256_setzero_ps();
+            for (i, b) in row.chunks_exact(36).enumerate() {
+                let (y, o) = (&xq[i / 4], (i % 4) * 64);
+                for h in 0..2 {
+                    let s0 = 2 * h;
+                    let bits0 = _mm_loadl_epi64(b.as_ptr().add(4 + 8 * s0) as *const __m128i);
+                    let bits1 = _mm_loadl_epi64(b.as_ptr().add(12 + 8 * s0) as *const __m128i);
+                    let w0 = _mm_unpacklo_epi64(
+                        _mm_shuffle_epi8(values, _mm_and_si128(bits0, m4)),
+                        _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(bits0, 4), m4)),
+                    );
+                    let w1 = _mm_unpacklo_epi64(
+                        _mm_shuffle_epi8(values, _mm_and_si128(bits1, m4)),
+                        _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(bits1, 4), m4)),
+                    );
+                    let w = _mm256_set_m128i(w1, w0);
+                    let p16 = _mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(q8(y, o + 32 * h), w));
+                    let p32 = _mm256_madd_epi16(p16, ones);
+                    let d = _mm256_set_m128(
+                        _mm_set1_ps(crate::quant::ue4m3(b[s0 + 1]) * y.d),
+                        _mm_set1_ps(crate::quant::ue4m3(b[s0]) * y.d),
+                    );
+                    acc = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(p32), acc);
+                }
+            }
+            hsum(acc)
+        }
+    }
+
     /// IQ4_NL (see `super::dot_iq4nl`): two 32-value blocks per step so the two lookups and FMAs overlap.
     pub fn dot_iq4nl(row: &[u8], xq: &[Q8K]) -> f32 {
         unsafe {
@@ -1371,9 +1406,31 @@ fn dot_tq<const B: usize>(row: &[u8], x: &[f32]) -> f32 {
     sum
 }
 
+/// Signed OCP FP8 E4M3 row times x via the 256-entry `F8_E4M3_LUT` (no intermediate dequant buffer).
+fn dot_f8_e4m3(row: &[u8], x: &[f32]) -> f32 {
+    let lut = &crate::quant::F8_E4M3_LUT;
+    let mut acc = [0.0f32; 8];
+    let mut r = row.chunks_exact(8);
+    let mut xv = x.chunks_exact(8);
+    for (rb, xb) in r.by_ref().zip(xv.by_ref()) {
+        for i in 0..8 { acc[i] += lut[rb[i] as usize] * xb[i]; }
+    }
+    let mut sum: f32 = acc.iter().sum();
+    for (&b, &v) in r.remainder().iter().zip(xv.remainder()) {
+        sum += lut[b as usize] * v;
+    }
+    sum
+}
+
 /// The f32 kernel of a type that has no integer one but is too slow through `Tensor::row`.
 pub fn float_dot(ty: GgmlType) -> Option<fn(&[u8], &[f32]) -> f32> {
-    match ty { GgmlType::TQ2T => Some(dot_tq::<34>), GgmlType::TQK6 => Some(dot_tq::<26>), GgmlType::TQK7 => Some(dot_tq::<30>), _ => None }
+    match ty {
+        GgmlType::F8E4M3 => Some(dot_f8_e4m3),
+        GgmlType::TQ2T => Some(dot_tq::<34>),
+        GgmlType::TQK6 => Some(dot_tq::<26>),
+        GgmlType::TQK7 => Some(dot_tq::<30>),
+        _ => None,
+    }
 }
 
 pub fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
@@ -1400,7 +1457,7 @@ pub fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
     }
     #[cfg(target_feature = "avx2")]
     if std::env::var_os("STRATA_SCALAR").is_none() {
-        return match ty { GgmlType::IQ2XS => Some(avx2::dot_iq2xs), GgmlType::IQ3XXS => Some(avx2::dot_iq3xxs), GgmlType::IQ4XS => Some(avx2::dot_iq4xs), GgmlType::IQ4NL => Some(avx2::dot_iq4nl), GgmlType::IQ3S => Some(avx2::dot_iq3s), GgmlType::Q6K => Some(avx2::dot_q6k), GgmlType::Q5K => Some(avx2::dot_q5k), GgmlType::Q8_0 => Some(avx2::dot_q8_0), GgmlType::IQ2XXS => Some(avx2::dot_iq2xxs), GgmlType::IQ2S => Some(avx2::dot_iq2s), GgmlType::IQ1S => Some(avx2::dot_iq1s), GgmlType::IQ1M => Some(avx2::dot_iq1m), GgmlType::Q2K => Some(avx2::dot_q2k), GgmlType::Q3K => Some(avx2::dot_q3k), GgmlType::Q4K => Some(avx2::dot_q4k), GgmlType::Q2_0 => Some(avx2::dot_q2_0), GgmlType::TQ1_0 => Some(avx2::dot_tq1_0), GgmlType::TQ2_0 => Some(dot_tq2_0), GgmlType::NVFP4 => Some(dot_nvfp4), GgmlType::Q4_0 => Some(avx2::dot_q4::<2>), GgmlType::Q4_1 => Some(avx2::dot_q4::<3>), GgmlType::Q5_0 => Some(avx2::dot_q4::<6>), GgmlType::Q5_1 => Some(avx2::dot_q4::<7>), _ => None };
+        return match ty { GgmlType::IQ2XS => Some(avx2::dot_iq2xs), GgmlType::IQ3XXS => Some(avx2::dot_iq3xxs), GgmlType::IQ4XS => Some(avx2::dot_iq4xs), GgmlType::IQ4NL => Some(avx2::dot_iq4nl), GgmlType::IQ3S => Some(avx2::dot_iq3s), GgmlType::Q6K => Some(avx2::dot_q6k), GgmlType::Q5K => Some(avx2::dot_q5k), GgmlType::Q8_0 => Some(avx2::dot_q8_0), GgmlType::IQ2XXS => Some(avx2::dot_iq2xxs), GgmlType::IQ2S => Some(avx2::dot_iq2s), GgmlType::IQ1S => Some(avx2::dot_iq1s), GgmlType::IQ1M => Some(avx2::dot_iq1m), GgmlType::Q2K => Some(avx2::dot_q2k), GgmlType::Q3K => Some(avx2::dot_q3k), GgmlType::Q4K => Some(avx2::dot_q4k), GgmlType::Q2_0 => Some(avx2::dot_q2_0), GgmlType::TQ1_0 => Some(avx2::dot_tq1_0), GgmlType::TQ2_0 => Some(dot_tq2_0), GgmlType::NVFP4 => Some(avx2::dot_nvfp4), GgmlType::Q4_0 => Some(avx2::dot_q4::<2>), GgmlType::Q4_1 => Some(avx2::dot_q4::<3>), GgmlType::Q5_0 => Some(avx2::dot_q4::<6>), GgmlType::Q5_1 => Some(avx2::dot_q4::<7>), _ => None };
     }
     match ty { GgmlType::IQ2XS => Some(dot_iq2xs), GgmlType::IQ3XXS => Some(dot_iq3xxs), GgmlType::IQ4XS => Some(dot_iq4xs), GgmlType::IQ4NL => Some(dot_iq4nl), GgmlType::IQ3S => Some(dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::Q5K => Some(dot_q5k), GgmlType::Q8_0 => Some(dot_q8_0), GgmlType::IQ2XXS => Some(dot_iq2xxs), GgmlType::IQ2S => Some(dot_iq2s), GgmlType::IQ1S => Some(dot_iq1s), GgmlType::IQ1M => Some(dot_iq1m), GgmlType::Q2K => Some(dot_q2k), GgmlType::Q3K => Some(dot_q3k), GgmlType::Q4K => Some(dot_q4k), GgmlType::Q2_0 => Some(dot_q2_0), GgmlType::TQ1_0 => Some(dot_tq1_0), GgmlType::TQ2_0 => Some(dot_tq2_0), GgmlType::NVFP4 => Some(dot_nvfp4), GgmlType::Q4_0 => Some(dot_q4::<2>), GgmlType::Q4_1 => Some(dot_q4::<3>), GgmlType::Q5_0 => Some(dot_q4::<6>), GgmlType::Q5_1 => Some(dot_q4::<7>), _ => None }
 }
@@ -1421,7 +1478,7 @@ pub fn matvec(t: &Tensor, x: &[f32], y: &mut [f32]) {
     let rb = t.data.len() / t.rows;
     if let Some(dot) = float_dot(t.ty) {
         return y.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
-            for (k, v) in ys.iter_mut().enumerate() { let r = c * 32 + k; *v = dot(&t.data[r * rb..(r + 1) * rb], x); }
+            for (k, v) in ys.iter_mut().enumerate() { let r = c * 32 + k; *v = dot(&t.data[r * rb..(r + 1) * rb], x) * t.scale; }
         });
     }
     let Some(dot) = int_dot(t.ty) else { return t.matvec(x, y) };
@@ -1429,7 +1486,7 @@ pub fn matvec(t: &Tensor, x: &[f32], y: &mut [f32]) {
     y.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
         for (k, v) in ys.iter_mut().enumerate() {
             let r = c * 32 + k;
-            *v = dot(&t.data[r * rb..(r + 1) * rb], &xq);
+            *v = dot(&t.data[r * rb..(r + 1) * rb], &xq) * t.scale;
         }
     });
 }
@@ -1450,8 +1507,8 @@ fn batch_rows(mats: &[Tensor], xs: &[&[f32]], out: &mut [f32]) {
             let (t, r, x) = (&mats[i / rows], i % rows, i / rows * xs.len() / mats.len());
             let rb = t.data.len() / t.rows;
             *v = match (dot, fdot) {
-                (Some(d), _) => d(&t.data[r * rb..(r + 1) * rb], &xq[x]),
-                (_, Some(d)) => d(&t.data[r * rb..(r + 1) * rb], xs[x]),
+                (Some(d), _) => d(&t.data[r * rb..(r + 1) * rb], &xq[x]) * t.scale,
+                (_, Some(d)) => d(&t.data[r * rb..(r + 1) * rb], xs[x]) * t.scale,
                 _ => { t.row(r, buf); buf.iter().zip(xs[x]).map(|(a, b)| a * b).sum() }
             };
         }
@@ -1569,7 +1626,7 @@ mod tests {
                 }
                 v
             }).collect();
-            let mats: Vec<Tensor> = data.iter().map(|d| Tensor { ty, cols, rows, data: d }).collect();
+            let mats: Vec<Tensor> = data.iter().map(|d| Tensor { ty, cols, rows, data: d, scale: 1.0 }).collect();
             let xs: Vec<&[f32]> = inputs.iter().map(Vec::as_slice).collect();
             let mut got = vec![0.0; rows * count];
             pool.install(|| batch_rows(&mats, &xs, &mut got));
@@ -1617,6 +1674,9 @@ mod tests {
             // Offsets of the f16 scales (d, and dmin where the type has one).
             let fs: &[usize] = match ty { GgmlType::TQ1_0 => &[52], GgmlType::Q6K => &[208], GgmlType::Q2K => &[80, 82], GgmlType::Q3K => &[108], GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q4_1 | GgmlType::Q5_1 => &[0, 2], GgmlType::IQ1M | GgmlType::NVFP4 => &[], _ => &[0] };
             for b in row.chunks_exact_mut(ty.block_bytes()) { for &o in fs { b[o..o + 2].copy_from_slice(&f16::from_f32(0.01).to_le_bytes()); } }
+            if ty == GgmlType::NVFP4 {
+                for b in row.chunks_exact_mut(36) { for s in 0..4 { b[s] = 0x20 + (b[s] & 0x1F); } }
+            }
             // IQ1_M keeps d in the top nibbles of its four scale words.
             if ty == GgmlType::IQ1M {
                 let d = f16::from_f32(0.01).to_bits();
@@ -1629,6 +1689,23 @@ mod tests {
             for got in [scalar(&row, &xq), int_dot(ty).unwrap()(&row, &xq)] {
                 assert!(((got as f64 - want) / want.abs().max(1e-3)).abs() < 1e-5, "{}: {got} vs {want}", ty.name());
             }
+        }
+    }
+
+    #[test]
+    fn f8_e4m3_dot_and_scale_match_dequant() {
+        let mut r = 0x517CC1B727220A95u64;
+        let mut rnd = || { r ^= r << 13; r ^= r >> 7; r ^= r << 17; r as u8 };
+        let (rows, cols) = (5usize, 131usize);
+        let data: Vec<u8> = (0..rows * cols).map(|_| rnd()).collect();
+        let x: Vec<f32> = (0..cols).map(|i| ((i as f32 * 0.7548777).fract() - 0.5) * 2.0).collect();
+        let scale = 1.75f32;
+        let t = Tensor { ty: GgmlType::F8E4M3, cols, rows, data: &data, scale };
+        let (mut got, mut want) = (vec![0.0f32; rows], vec![0.0f32; rows]);
+        matvec(&t, &x, &mut got);
+        t.matvec(&x, &mut want);
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            assert!(((g - w) / w.abs().max(1e-3)).abs() < 1e-5, "row {i}: {g} vs {w}");
         }
     }
 

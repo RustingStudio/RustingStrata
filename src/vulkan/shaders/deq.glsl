@@ -26,8 +26,8 @@ float ue4m3(uint x) {
 // Sized by T (1 entry for the other types), so only the table in use takes shared memory.
 shared uint s_g3[T == 21 ? 512 : (T == 18 ? 256 : 1)];
 shared uint64_t s_g2[T == 22 ? 1024 : 1];
-// IQ4_NL / IQ4_XS: the values of two codes (the low nibble of the index, then the high) as the two low bytes.
-shared uint s_iq4[T == 20 || T == 23 ? 256 : 1];
+// IQ4_NL / IQ4_XS / NVFP4: the values of two codes (the low nibble of the index, then the high) as the two low bytes.
+shared uint s_iq4[T == 20 || T == 23 || T == 40 ? 256 : 1];
 #define IQ3S_GRID s_g3
 #define IQ3XXS_GRID s_g3
 #define IQ2S_GRID s_g2
@@ -44,6 +44,13 @@ uint ld16(U8 w, uint o) { return uint(U16(uint64_t(w)).v[o >> 1]); }  // 2-align
 uint ld32(U8 w, uint o) { return ld16(w, o) | ld16(w, o + 2) << 16; }
 float h2f(uint h) { return float(uint16BitsToFloat16(uint16_t(h))); }
 float ldh(U8 w, uint o) { return h2f(ld16(w, o)); }
+float f8_e4m3_to_f32(uint x) {
+    uint ax = x & 0x7Fu;
+    if (ax == 0u || ax == 0x7Fu) return 0.0;
+    uint exp = ax >> 3u, man = ax & 7u;
+    float mag = (exp == 0u) ? float(man) * (1.0 / 512.0) : uintBitsToFloat(((exp + 120u) << 23u) | (man << 20u));
+    return (x & 0x80u) != 0u ? -mag : mag;
+}
 // Bytes of a row of `cols` values (a multiple of the type's block).
 uint rowb(uint cols) { return cols * SBB / 256; }
 int sb(uint x) { return int(x << 24) >> 24; }  // the low byte, signed
@@ -73,9 +80,9 @@ int sgn(uint g, uint sg, uint j) { int v = int((g >> (8 * (j & 3))) & 255); retu
 
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer U32x2 { uvec2 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer U32x4 { uvec4 v[]; };
-// Q4_K, Q5_K and IQ4_XS blocks (144, 176, 136 bytes) and every field ld8 reads in them are 8-aligned; Q2_K's (84) 4-aligned.
+// Q4_K, Q5_K and IQ4_XS blocks (144, 176, 136 bytes) and every field ld8 reads in them are 8-aligned; Q2_K's (84) and NVFP4's (36) 4-aligned.
 const bool A8 = T == 12 || T == 13 || T == 23;
-const bool A4 = T == 10 || T == 3 || T == 7;  // and Q4_1, Q5_1 (20, 24)
+const bool A4 = T == 10 || T == 3 || T == 7 || T == 40 || T == 43;  // and Q4_1, Q5_1, NVFP4, F8_E4M3 (20, 24, 36, 4n)
 // 8 bytes at 2-aligned w + o: one load for the A8 types, two word loads for A4, else the three words around them
 // shifted (ld8a2 in kernels.cu) without a branch: in Q8_0 the lanes of a subgroup differ in alignment.
 uvec2 ld8(U8 w, uint o) {
@@ -92,6 +99,7 @@ void load_tables() {
     if (T == 21) { for (uint i = li; i < 512; i += n) s_g3[i] = iq3s_grid[i]; barrier(); }
     if (T == 22) { for (uint i = li; i < 1024; i += n) s_g2[i] = iq2s_grid[i]; barrier(); }
     if (T == 20 || T == 23) { for (uint i = li; i < 256; i += n) s_iq4[i] = uint(iq4_lut(i & 15) & 255) | uint(iq4_lut(i >> 4) & 255) << 8; barrier(); }
+    if (T == 40) { for (uint i = li; i < 256; i += n) s_iq4[i] = uint(fp4_lut(i & 15) & 255) | uint(fp4_lut(i >> 4) & 255) << 8; barrier(); }
 }
 #endif
 // Bytewise a - c (each byte of a below 128; CUDA __vsub4).
@@ -310,6 +318,16 @@ void qw(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out float
         hi = s_iq4[(c & 15u) | ((c >> 4) & 0xF0u)] | s_iq4[((c >> 16) & 15u) | ((c >> 20) & 0xF0u)] << 16;
         return;
     }
+    if (T == 40) {  // NVFP4: two codes a table lookup
+        uint p = b + 36u * (sub >> 3u), s = (sub >> 1u) & 3u, sh = (sub & 1u) * 4u;
+        m = 0.0;
+        d = ue4m3(u8_(w, p + s));
+        uvec2 v = ld8(w, p + 4u + 8u * s);
+        uint a = (v.x >> sh) & 0x0F0F0F0Fu, c = (v.y >> sh) & 0x0F0F0F0Fu;
+        lo = s_iq4[(a & 15u) | ((a >> 4u) & 0xF0u)] | s_iq4[((a >> 16u) & 15u) | ((a >> 20u) & 0xF0u)] << 16u;
+        hi = s_iq4[(c & 15u) | ((c >> 4u) & 0xF0u)] | s_iq4[((c >> 16u) & 15u) | ((c >> 20u) & 0xF0u)] << 16u;
+        return;
+    }
 #endif
     int q[8];
     qi8(w, b, sub, q, d, m);
@@ -447,6 +465,9 @@ void deq8(U8 w, uint b, uint sub, out float o[8]) {
     } else if (T == 30) {  // BF16
         uvec4 q = U32x4(uint64_t(w) + b + 16 * sub).v[0];  // rows of BF16 start 16-aligned (cols % 8 == 0)
         [[unroll]] for (uint i = 0; i < 4; i++) { o[2 * i] = uintBitsToFloat(q[i] << 16); o[2 * i + 1] = uintBitsToFloat(q[i] & 0xFFFF0000u); }
+    } else if (T == 43) {  // F8_E4M3
+        uvec2 v = ld8(w, b + sub * 8u);
+        [[unroll]] for (uint i = 0; i < 8; i++) o[i] = f8_e4m3_to_f32(((i < 4 ? v.x : v.y) >> (8u * (i & 3u))) & 0xFFu);
     } else {
         int q[8]; float d, m;
         qi8(w, b, sub, q, d, m);

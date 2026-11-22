@@ -68,16 +68,16 @@ pub(crate) mod dev {
             while self.cur + 1 < self.parts.len() && self.parts[self.cur].bytes + len > self.parts[self.cur].room { self.cur += 1; }
             self.cur
         }
-        pub fn upload_on(&mut self, d: usize, data: &[u8], ty: GgmlType, rows: usize, cols: usize) -> Option<u32> {
+        pub fn upload_on(&mut self, d: usize, data: &[u8], ty: GgmlType, rows: usize, cols: usize, scale: f32) -> Option<u32> {
             let p = &mut self.parts[d];
-            let t = p.be.upload(&Tensor { ty, cols, rows, data }).ok()?;
+            let t = p.be.upload(&Tensor { ty, cols, rows, data, scale }).ok()?;
             p.bytes += data.len();
             p.ts.push(t);
             Some((d as u32) << SHIFT | (p.ts.len() as u32 - 1))
         }
-        pub fn upload(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize) -> Option<u32> {
+        pub fn upload(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize, scale: f32) -> Option<u32> {
             let d = self.pick(data.len());
-            self.upload_on(d, data, ty, rows, cols)
+            self.upload_on(d, data, ty, rows, cols, scale)
         }
         pub(crate) fn tensor(&self, i: u32) -> &GpuTensor { &self.parts[gpu_of(i)].ts[(i & (1 << SHIFT) - 1) as usize] }
         /// Free the least recently used expert slots of GPU `d` until `bytes` are freed or none is left, for state
@@ -109,7 +109,7 @@ pub(crate) mod dev {
         /// `evict` false: a miss with no free room returns None, so the caller can run that expert on the CPU.
         /// Whether the expert that starts at `data` has a VRAM slot (no lookup is counted).
         pub fn resident(&self, data: &[u8]) -> bool { self.ex.contains_key(&(data.as_ptr() as usize)) }
-        pub fn expert(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize, evict: bool) -> Option<u32> {
+        pub fn expert(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize, scale: f32, evict: bool) -> Option<u32> {
             let k = data.as_ptr() as usize;
             self.now += 1;
             self.lookups += 1;
@@ -124,7 +124,7 @@ pub(crate) mod dev {
             EX_LOOKUPS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let room = |p: &Part| (p.bytes + data.len() <= p.budget).then(|| p.budget - p.bytes);
             if let Some(d) = (0..self.parts.len()).filter_map(|d| room(&self.parts[d]).map(|r| (r, d))).max().map(|(_, d)| d) {
-                let i = self.upload_on(d, data, ty, rows, cols)?;
+                let i = self.upload_on(d, data, ty, rows, cols, scale)?;
                 self.ex.insert(k, self.exs.len());
                 self.exs.push((i, k, now, 1.0));
                 return Some(i);
@@ -138,19 +138,24 @@ pub(crate) mod dev {
             let Some(p) = victim else { return Some(STAGED) };
             if lfu && self.exs[p].3 > 4.0 { return Some(STAGED); }
             let (i, old, _, _) = self.exs[p];
-            let (be, t) = (&self.parts[gpu_of(i)].be, self.tensor(i));
-            if be.htod(data, &Buf::new(t.ptr, data.len(), ()), 0).is_err() { return Some(STAGED); }
+            let (ptr, ok) = {
+                let (be, t) = (&self.parts[gpu_of(i)].be, self.tensor(i));
+                (t.ptr, be.htod(data, &Buf::new(t.ptr, data.len(), ()), 0).is_ok())
+            };
+            if !ok { return Some(STAGED); }
+            let _ = ptr;
+            self.parts[gpu_of(i)].ts[(i & (1 << SHIFT) - 1) as usize].scale = scale;
             self.ex.remove(&old);
             self.ex.insert(k, p);
             self.exs[p] = (i, k, now, 1.0);
             Some(i)
         }
-        pub fn gemv(&self, i: u32, x: &[f32], y: &mut [f32], staged: Option<(&[u8], GgmlType, usize, usize)>) {
+        pub fn gemv(&self, i: u32, x: &[f32], y: &mut [f32], staged: Option<(&[u8], GgmlType, usize, usize, f32)>) {
             let p = &self.parts[if i == STAGED { 0 } else { gpu_of(i) }];
             p.be.put(x, &p.x, 0).unwrap();
-            if let Some((d, ty, rows, cols)) = staged {
+            if let Some((d, ty, rows, cols, scale)) = staged {
                 p.be.htod(d, &p.stage, 0).unwrap();
-                let w = GpuTensor::new(ty, rows, cols, Buf::new(p.stage.addr(), d.len(), ()));
+                let w = GpuTensor::new(ty, rows, cols, Buf::new(p.stage.addr(), d.len(), ())).with_scale(scale);
                 p.be.gemv(&w, p.x.addr(), p.y.addr()).unwrap();
             } else {
                 p.be.gemv(self.tensor(i), p.x.addr(), p.y.addr()).unwrap();
@@ -206,7 +211,7 @@ pub(crate) mod dev {
                 STAGED => {
                     let b = p.be.alloc(m.data.len()).ok()?;
                     p.be.htod(m.data, &b, 0).ok()?;
-                    owned.push(GpuTensor::new(m.ty, m.rows, m.cols, b));
+                    owned.push(GpuTensor::new(m.ty, m.rows, m.cols, b).with_scale(m.scale));
                     owned.last().unwrap()
                 }
                 t => self.tensor(t),
@@ -249,7 +254,7 @@ pub(crate) mod dev {
             let w = if i == STAGED {
                 let b = p.be.alloc(m.data.len()).ok()?;
                 p.be.htod(m.data, &b, 0).ok()?;
-                owned.push(GpuTensor::new(m.ty, m.rows, m.cols, b));
+                owned.push(GpuTensor::new(m.ty, m.rows, m.cols, b).with_scale(m.scale));
                 &owned[0]
             } else { self.tensor(i) };
             // Reuse the scratch pair when the chunk fits; otherwise allocate a GEMM-sized pair for this call.
@@ -279,7 +284,7 @@ pub(crate) mod dev {
         pub fn situ_chunk(&self, gus: &[Mat], downs: &[Mat], gs: &[f32], pairs: &[Vec<(usize, usize, f32)>], x: &[f32], k: usize, beta: f32, lb: f32) -> Option<Vec<f32>> {
             use crate::backend::GEMM_BM;
             let d = self.part_of(gus.first()?)?;
-            if gus.iter().chain(downs).any(|m| self.part_of(m) != Some(d)) { return None; }
+            if gus.iter().chain(downs).any(|m| self.part_of(m) != Some(d) || m.scale != 1.0) { return None; }
             let (p, nf, nl) = (&self.parts[d], downs[0].cols, downs[0].rows);
             let (nt, np) = (x.len() / nl, pairs.iter().map(|v| v.len()).sum::<usize>());
             // GEMM tiles [weights, first pair | pairs << 32] of the gate and up matrices, then of the down ones;
@@ -357,7 +362,7 @@ pub(crate) mod dev {
                     STAGED => {
                         let b = p.be.alloc(m.data.len()).ok()?;
                         p.be.htod(m.data, &b, 0).ok()?;
-                        owned.push(GpuTensor::new(m.ty, m.rows, m.cols, b));
+                        owned.push(GpuTensor::new(m.ty, m.rows, m.cols, b).with_scale(m.scale));
                         owned.last().unwrap()
                     }
                     t => self.tensor(t),
@@ -418,17 +423,19 @@ pub fn matvec_rows(m: &Mat, xs: &[&[f32]]) -> Vec<f32> {
         let xq: Vec<_> = xs.par_iter().map(|x| crate::cpu_moe::quantize_q8k(x)).collect();
         let mut by_row = vec![0f32; m.rows * n];
         let dot4 = crate::cpu_moe::int_dot4(m.ty);
+        let sc = m.scale;
         by_row.par_chunks_mut(32 * n).enumerate().for_each(|(c, o)| {
             for (k, o) in o.chunks_exact_mut(n).enumerate() {
                 let w = &m.data[(c * 32 + k) * rb..(c * 32 + k + 1) * rb];
                 let mut t = 0;
                 if let Some(dot4) = dot4 {
                     while t + 4 <= n {
-                        o[t..t + 4].copy_from_slice(&dot4(w, [&xq[t], &xq[t + 1], &xq[t + 2], &xq[t + 3]]));
+                        let v4 = dot4(w, [&xq[t], &xq[t + 1], &xq[t + 2], &xq[t + 3]]);
+                        for j in 0..4 { o[t + j] = v4[j] * sc; }
                         t += 4;
                     }
                 }
-                for t in t..n { o[t] = dot(w, &xq[t]); }
+                for t in t..n { o[t] = dot(w, &xq[t]) * sc; }
             }
         });
         y.par_chunks_mut(m.rows).enumerate().for_each(|(t, y)| {
@@ -499,6 +506,10 @@ pub struct Mat<'a> {
     pub cpu: bool,
     /// Index of the VRAM copy (STRATA_DS_GPU).
     pub gpu: Option<u32>,
+    /// Post-dequant scalar multiplier (from `<stem>.scale` when scalar, or sliced from 1-D `[n_expert]` `.scale`).
+    pub scale: f32,
+    /// Optional 1-D `[n_expert]` F32 `.scale` bytes for a 3-D expert tensor.
+    pub expert_scales: Option<&'a [u8]>,
 }
 
 impl<'a> Mat<'a> {
@@ -509,8 +520,20 @@ impl<'a> Mat<'a> {
         let rows = t.dims[1..].iter().product::<u64>() as usize;
         let cpu = name.contains("_exps");
         let data = g.bytes(t);
-        let gpu = if cpu || t.dims.len() != 2 { None } else { dev::get().and_then(|d| d.lock().unwrap().upload(data, ty, rows, cols)) };
-        Ok(Mat { data, ty, rows, cols, cpu, gpu })
+        let (mut scale, mut expert_scales) = (1.0f32, None);
+        if let Some(stem) = name.strip_suffix(".weight")
+            && let Some(st) = g.tensors.get(&format!("{stem}.scale"))
+            && st.ty == 0
+        {
+            let sb = g.bytes(st);
+            if sb.len() == 4 {
+                scale = f32::from_le_bytes(sb.try_into().unwrap());
+            } else if t.dims.len() == 3 && sb.len() == 4 * t.dims[2] as usize {
+                expert_scales = Some(sb);
+            }
+        }
+        let gpu = if cpu || t.dims.len() != 2 { None } else { dev::get().and_then(|d| d.lock().unwrap().upload(data, ty, rows, cols, scale)) };
+        Ok(Mat { data, ty, rows, cols, cpu, gpu, scale, expert_scales })
     }
 
     /// Like `load` for a matrix used as `n` row groups (grouped output projection): each group gets its own VRAM copy.
@@ -521,7 +544,7 @@ impl<'a> Mat<'a> {
             let (gr, rb) = (m.rows / n, m.ty.row_bytes(m.cols as u64));
             let mut d = d.lock().unwrap();
             let gpu = d.pick(m.data.len());  // the groups get consecutive ids on one GPU
-            let ids: Vec<_> = (0..n).map(|i| d.upload_on(gpu, &m.data[i * gr * rb..(i + 1) * gr * rb], m.ty, gr, m.cols)).collect();
+            let ids: Vec<_> = (0..n).map(|i| d.upload_on(gpu, &m.data[i * gr * rb..(i + 1) * gr * rb], m.ty, gr, m.cols, m.scale)).collect();
             if ids.iter().all(|i| i.is_some()) { m.gpu = ids[0]; }
         }
         Ok(m)
@@ -543,7 +566,7 @@ impl<'a> Mat<'a> {
     /// free room comes back host-only, for the CPU.
     pub fn expert_opt(&self, e: usize, n_expert: usize, evict: bool) -> Mat<'a> {
         let mut m = self.expert_host(e, n_expert);
-        m.gpu = dev::get().and_then(|d| d.lock().unwrap().expert(m.data, m.ty, m.rows, m.cols, evict));
+        m.gpu = dev::get().and_then(|d| d.lock().unwrap().expert(m.data, m.ty, m.rows, m.cols, m.scale, evict));
         m
     }
 
@@ -557,7 +580,11 @@ impl<'a> Mat<'a> {
     pub fn expert_host(&self, e: usize, n_expert: usize) -> Mat<'a> {
         let rows = self.rows / n_expert;
         let sz = rows * self.ty.row_bytes(self.cols as u64);
-        Mat { data: &self.data[e * sz..(e + 1) * sz], ty: self.ty, rows, cols: self.cols, cpu: self.cpu, gpu: None }
+        let scale = match self.expert_scales {
+            Some(sb) if (e + 1) * 4 <= sb.len() => self.scale * f32::from_le_bytes(sb[e * 4..(e + 1) * 4].try_into().unwrap()),
+            _ => self.scale,
+        };
+        Mat { data: &self.data[e * sz..(e + 1) * sz], ty: self.ty, rows, cols: self.cols, cpu: self.cpu, gpu: None, scale, expert_scales: None }
     }
 
     /// Whether this matrix has no VRAM copy and must be read from the mapped file (CPU or staged expert).
@@ -585,6 +612,9 @@ impl<'a> Mat<'a> {
     pub fn row_into(&self, r: usize, out: &mut [f32]) {
         let rb = self.ty.row_bytes(self.cols as u64);
         dequant_row(self.ty, &self.data[r * rb..(r + 1) * rb], out);
+        if self.scale != 1.0 {
+            for v in out.iter_mut() { *v *= self.scale; }
+        }
     }
 
     /// y = W x
@@ -603,15 +633,16 @@ impl<'a> Mat<'a> {
         assert_eq!(x.len(), self.cols);
         assert_eq!(y.len(), self.rows);
         if let (Some(i), Some(d)) = (self.gpu, dev::get()) {
-            return d.lock().unwrap().gemv(i, x, y, (i == dev::STAGED).then_some((self.data, self.ty, self.rows, self.cols)));
+            return d.lock().unwrap().gemv(i, x, y, (i == dev::STAGED).then_some((self.data, self.ty, self.rows, self.cols, self.scale)));
         }
         let rb = self.ty.row_bytes(self.cols as u64);
+        let sc = self.scale;
         if let Some(dot) = self.int_dot() {
             let xq = crate::cpu_moe::quantize_q8k(x);
             y.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
                 for (k, o) in ys.iter_mut().enumerate() {
                     let r = c * 32 + k;
-                    *o = dot(&self.data[r * rb..(r + 1) * rb], &xq);
+                    *o = dot(&self.data[r * rb..(r + 1) * rb], &xq) * sc;
                 }
             });
             return;
@@ -622,7 +653,7 @@ impl<'a> Mat<'a> {
             || vec![0f32; self.cols],
             |tmp, (r, o)| {
                 dequant_row(self.ty, &self.data[r * rb..(r + 1) * rb], tmp);
-                *o = tmp.iter().zip(x).map(|(a, b)| a * b).sum();
+                *o = tmp.iter().zip(x).map(|(a, b)| a * b).sum::<f32>() * sc;
             },
         );
     }
