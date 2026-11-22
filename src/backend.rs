@@ -329,11 +329,23 @@ pub trait Backend: Send {
     ) -> anyhow::Result<()> {
         anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
     }
+    /// Graph-capturable `ink_clip_n`: reads `pos0` from device `i32` pointer `pos_ptr` (`dst_at0 = pos0 % dst_ring`).
+    fn ink_clip_pos(
+        &self, _x: u64, _scale: u64, _w: usize, _rows: usize, _nt: usize,
+        _thr: f32, _eps: f32, _mul: f32,
+        _dst: u64, _dst_ring: usize,
+        _pos_ptr: u64, _log_alpha: f32, _log_floor: f32,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
+    }
     /// Attention of one token over `rows` key and value rows (`nkv * hd` wide in active KV format; the token's own row is `at`, the
     /// row before it `at - 1` modulo `rows`). Logit: q.k / sqrt(hd) + r.bias[distance] (distance < `ext`) - sink, a
     /// softmax with one more logit of 0, times sigmoid(gate). `hd` divides 128. `sc`: `nh * rows.div_ceil(64) * (hd + 2)`
     /// floats of scratch.
     fn ink_attn(&self, _q: u64, _r: u64, _sink: u64, _gate: u64, _k: u64, _v: u64, _bias: u64, _sc: u64, _out: u64, _rows: usize, _at: usize, _nh: usize, _nkv: usize, _hd: usize, _nr: usize, _ext: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
+    /// Graph-capturable `ink_attn`: reads `pos` from device `i32` pointer `pos_ptr`, sets `rows = min(pos + 1, ring)` and `at = pos % ring`,
+    /// dispatching `max_rows.div_ceil(64)` chunks.
+    fn ink_attn_pos(&self, _q: u64, _r: u64, _sink: u64, _gate: u64, _k: u64, _v: u64, _bias: u64, _sc: u64, _out: u64, _max_rows: usize, _ring: usize, _pos_ptr: u64, _nh: usize, _nkv: usize, _hd: usize, _nr: usize, _ext: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
     /// Batched causal Inkling 2 attention over `nt` query tokens starting at position `pos` (`hd` 32/64/128).
     /// When `kc_new != 0`, keys/values for `kp >= pos` read row `kp - pos` of `kc_new`/`vc_new` so SWA history `< pos` in `kc`/`vc` is preserved.
     /// `q`/`gate`/`out`: `[nt][nh][hd]`, `r`: `[nt][nh][nr]`, `sink`: `[nt][nh]`, `bias`: `[ext][nr]`.
