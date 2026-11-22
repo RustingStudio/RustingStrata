@@ -63,3 +63,93 @@ fn chunked_prefill_matches_token_by_token() {
     let limit = if std::env::var("STRATA_DS_GPU").as_deref() == Ok("1") { 3.0 } else { 1e-3 };
     assert!(worst < limit, "chunked prefill logits differ by {worst}");
 }
+
+#[test]
+fn speculative_ngram_and_dspark_match_greedy() {
+    let Some(g) = open() else { return };
+    let _lock = common::gpu_lock();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let eos = tok.eos_ids();
+    let prompt = format!(
+        "{HEAD}Repeat this exact sentence three times: The quick brown fox jumps over the lazy dog.<|end_message|>"
+    );
+    let ids = tok.encode(&prompt).unwrap();
+    let n_gen = 32usize;
+
+    // 1. Baseline greedy token-by-token
+    let mut base = Inkling2Model::new_with_ctx(&g, 2048).unwrap();
+    let logits0 = base.prefill(&ids);
+    let mut want = Vec::with_capacity(n_gen);
+    let mut next = rusting_strata::ops::argmax(&logits0) as u32;
+    for i in 0..n_gen {
+        if eos.contains(&next) { break; }
+        want.push(next);
+        if i + 1 < n_gen { next = base.step_argmax(next); }
+    }
+    drop(base);
+
+    // 2. Speculative ngram-simple (size_n=3 so it triggers on repeated sentences)
+    let mut ng_cfg = rusting_strata::ngram::NgramConfig::default();
+    ng_cfg.types = vec![rusting_strata::ngram::SpecType::NgramSimple];
+    ng_cfg.size_n = 3;
+    ng_cfg.draft_max = 8;
+    ng_cfg.n_vocab = 200058;
+    let mut m_ng = Inkling2Model::new_with_ctx(&g, 2048).unwrap();
+    m_ng.ngram = Some(rusting_strata::ngram::NgramDrafter::new(ng_cfg, Some(&tok)).unwrap());
+    let logits_ng = m_ng.prefill(&ids);
+    let mut got_ng = Vec::with_capacity(n_gen);
+    let mut next_ng = rusting_strata::ops::argmax(&logits_ng) as u32;
+    let mut pending = std::collections::VecDeque::<u32>::new();
+    for i in 0..n_gen {
+        if eos.contains(&next_ng) { break; }
+        got_ng.push(next_ng);
+        if i + 1 < n_gen {
+            if let Some(t) = pending.pop_front() {
+                next_ng = t;
+            } else {
+                pending.extend(m_ng.spec_step_argmax(next_ng, n_gen - (i + 1), &eos));
+                next_ng = pending.pop_front().unwrap();
+            }
+        }
+    }
+    eprintln!("ngram-simple drafts: accepted {}/{}", m_ng.drafts.1, m_ng.drafts.0);
+    assert!(m_ng.drafts.0 > 0, "ngram-simple should propose drafts on repeated sentence");
+    assert_eq!(got_ng, want, "ngram-simple greedy tokens diverged from baseline");
+    drop(m_ng);
+
+    // 3. Speculative DSpark draft model (when present alongside the model)
+    let dspark_path = std::env::var("STRATA_INKLING2_DSPARK")
+        .unwrap_or_else(|_| "/mnt/storage/home-vault/models-local/inkling2-mini/dspark-Inkling-2-Mini-Q8_0.gguf".into());
+    if std::path::Path::new(&dspark_path).exists() {
+        let opts = rusting_strata::inkling2::chat::Inkling2Opts {
+            max_ctx: 2048,
+            draft_model: Some(std::path::PathBuf::from(&dspark_path)),
+            ..Default::default()
+        };
+        let mut m_ds = opts.build_model(&g, &tok).unwrap();
+        let logits_ds = m_ds.prefill(&ids);
+        let mut got_ds = Vec::with_capacity(n_gen);
+        let mut next_ds = rusting_strata::ops::argmax(&logits_ds) as u32;
+        let mut pending = std::collections::VecDeque::<u32>::new();
+        for i in 0..n_gen {
+            if eos.contains(&next_ds) { break; }
+            got_ds.push(next_ds);
+            if i + 1 < n_gen {
+                if let Some(t) = pending.pop_front() {
+                    next_ds = t;
+                } else {
+                    pending.extend(m_ds.spec_step_argmax(next_ds, n_gen - (i + 1), &eos));
+                    next_ds = pending.pop_front().unwrap();
+                }
+            }
+        }
+        eprintln!(
+            "DSpark drafts: accepted {}/{} ({:.1}%)",
+            m_ds.drafts.1,
+            m_ds.drafts.0,
+            100.0 * m_ds.drafts.1 as f64 / m_ds.drafts.0.max(1) as f64
+        );
+        assert!(m_ds.drafts.0 > 0, "DSpark should propose drafts");
+        assert_eq!(got_ds, want, "DSpark greedy tokens diverged from baseline");
+    }
+}

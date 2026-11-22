@@ -374,3 +374,68 @@ fn gemma4v_red_image_predicts_red() {
     eprintln!("generated = {text:?}");
     assert!(text.to_ascii_lowercase().contains("red"), "generated {text:?}");
 }
+
+const INKLING2_MMPROJ: &str = "/mnt/storage/home-vault/models-local/inkling2-mini/mmproj-F16.gguf";
+const INKLING2_MODEL: &str = "/mnt/storage/home-vault/models-local/inkling2-mini/Inkling-2-Mini-IQ4_NL.gguf";
+
+fn inkling2_projector() -> Option<VisionProjector> {
+    let p = std::env::var("STRATA_INKLING2_MMPROJ").unwrap_or_else(|_| INKLING2_MMPROJ.into());
+    if !Path::new(&p).exists() { eprintln!("skip: {p} missing"); return None; }
+    Some(VisionProjector::open(Path::new(&p)).expect("open inkling2 mmproj"))
+}
+
+#[test]
+fn inkling2v_encode_and_pad() {
+    let Some(p) = inkling2_projector() else { return };
+    let c = p.cfg();
+    assert_eq!(c.projector_type, "inkling2v");
+    assert_eq!((c.n_embd, c.projection_dim, c.patch_size, c.n_merge, c.n_layer), (1024, 2304, 20, 2, 23));
+    // 64x64 is not a multiple of 40, so inkling2v pads right/bottom to 80x80 (2x2 merged tokens).
+    let img = image::RgbImage::from_pixel(64, 64, image::Rgb([255, 0, 0]));
+    let pre = p.preprocess(&img).unwrap();
+    assert_eq!((pre.width, pre.height), (80, 80));
+    assert_eq!(p.count_tokens(64, 64).unwrap(), (2, 2));
+    let feats = p.encode(&pre).unwrap();
+    assert_eq!(feats.len(), 4);
+    assert!(feats.iter().all(|r| r.len() == 2304 && r.iter().all(|v| v.is_finite())));
+    // Different colors produce distinct vision embeddings.
+    let img_blue = image::RgbImage::from_pixel(80, 80, image::Rgb([0, 0, 255]));
+    let feats_blue = p.encode(&p.preprocess(&img_blue).unwrap()).unwrap();
+    assert_ne!(feats[0][..8], feats_blue[0][..8]);
+}
+
+#[test]
+fn inkling2v_red_image_predicts_red() {
+    let Some(p) = inkling2_projector() else { return };
+    let path = std::env::var("STRATA_INKLING2_MODEL").unwrap_or_else(|_| INKLING2_MODEL.into());
+    if !Path::new(&path).exists() { eprintln!("skip: {path} missing"); return; }
+    let _l = common::gpu_lock();
+    rusting_strata::inkling2::chat::gpu_defaults();
+    let g = Gguf::open(Path::new(&path)).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let mut m = rusting_strata::inkling2::forward::Inkling2Model::new_with_ctx(&g, 2048).unwrap();
+    let img = image::RgbImage::from_pixel(160, 160, image::Rgb([220, 0, 0]));
+    let pre = p.preprocess(&img).unwrap();
+    let (nx, ny) = p.count_tokens(pre.width, pre.height).unwrap();
+    let feats = p.encode(&pre).unwrap();
+    assert_eq!(feats.len(), nx * ny);
+    let mut msg = rusting_strata::chat::Msg::new("user", "What is the main color of this image? Answer with one word.");
+    msg.images = vec!["red.png".into()];
+    let rendered = rusting_strata::inkling2::chat::render_with_effort(&[msg], &[], "0");
+    let grids = [(nx, ny)];
+    let embs = [feats];
+    let seq = rusting_strata::inkling2::chat::prompt_seq(&tok, &rendered, Some((&grids, &embs))).unwrap();
+    let logits = m.prefill_embds(&seq);
+    assert_eq!(logits.len(), m.cfg.n_vocab);
+    let mut text = String::new();
+    let mut next = ops::argmax(&logits) as u32;
+    let eos = tok.eos_ids();
+    for _ in 0..24 {
+        if eos.contains(&next) { break; }
+        text.push_str(&tok.decode(&[next]).unwrap());
+        if text.to_ascii_lowercase().contains("red") { break; }
+        next = m.step_argmax(next);
+    }
+    eprintln!("inkling2v generated = {text:?}");
+    assert!(text.to_ascii_lowercase().contains("red"), "generated {text:?}");
+}

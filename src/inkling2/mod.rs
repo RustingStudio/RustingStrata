@@ -1,6 +1,6 @@
 //! Inkling 2 (Thinking Machines), the looped text model: GGUF architecture `inkling2_loop`.
-//! ponytail: text only. The vision projector (`inkling2v`) is not read; add it when image input is needed.
 pub mod chat;
+pub mod dspark;
 pub mod forward;
 
 use crate::gguf::Gguf;
@@ -44,6 +44,8 @@ pub struct Inkling2Config {
     pub loop_start: usize,
     pub loop_end: usize,
     pub loop_count: usize,
+    /// Model's native context length (`inkling2_loop.context_length`).
+    pub ctx: usize,
 }
 
 impl Inkling2Config {
@@ -89,6 +91,7 @@ impl Inkling2Config {
             loop_start: u("loop.start")?,
             loop_end: u("loop.end")?,
             loop_count: u("loop.count")?,
+            ctx: g.get(&k("context_length")).ok().and_then(|v| v.as_u64()).map(|x| x as usize).unwrap_or(262_144),
         };
         ensure!(cfg.swa.len() == cfg.n_layer, "sliding_window_pattern: {} entries for {} layers", cfg.swa.len(), cfg.n_layer);
         ensure!(cfg.n_head % cfg.n_head_kv == 0, "head_count {} is not a multiple of head_count_kv {}", cfg.n_head, cfg.n_head_kv);

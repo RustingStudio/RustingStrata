@@ -9,7 +9,7 @@ use std::path::Path;
 
 /// The projector graph named by `clip.projector_type`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProjectorKind { Qwen3Vl, Gemma4V, Gemma4Uv, Glm4V }
+pub enum ProjectorKind { Qwen3Vl, Gemma4V, Gemma4Uv, Glm4V, Inkling2V }
 
 impl ProjectorKind {
     pub fn from_name(s: &str) -> Option<Self> {
@@ -18,6 +18,7 @@ impl ProjectorKind {
             "gemma4v" => Self::Gemma4V,
             "gemma4uv" => Self::Gemma4Uv,
             "glm4v" => Self::Glm4V,
+            "inkling2v" => Self::Inkling2V,
             _ => return None,
         })
     }
@@ -84,7 +85,7 @@ impl ClipConfig {
         let image_size = u("clip.vision.image_size")?;
         let mut patch_size = u("clip.vision.patch_size")?;
         let mut n_merge = match kind {
-            ProjectorKind::Qwen3Vl | ProjectorKind::Glm4V => opt_u("clip.vision.spatial_merge_size").unwrap_or(2),
+            ProjectorKind::Qwen3Vl | ProjectorKind::Glm4V | ProjectorKind::Inkling2V => opt_u("clip.vision.spatial_merge_size").unwrap_or(2),
             ProjectorKind::Gemma4V | ProjectorKind::Gemma4Uv => opt_u("clip.vision.projector.scale_factor").unwrap_or(3),
         };
         if kind == ProjectorKind::Gemma4Uv {
@@ -98,15 +99,27 @@ impl ClipConfig {
         let image_std = arr3_f32(g, "clip.vision.image_std")?;
         let use_gelu = opt_bool("clip.use_gelu");
         let use_silu = opt_bool("clip.use_silu");
-        let ffn = if use_gelu { FfnKind::Gelu } else if use_silu { FfnKind::Silu } else { FfnKind::GeluQuick };
+        let ffn = if kind == ProjectorKind::Inkling2V {
+            FfnKind::GeluErf
+        } else if use_gelu {
+            FfnKind::Gelu
+        } else if use_silu {
+            FfnKind::Silu
+        } else {
+            FfnKind::GeluQuick
+        };
         let (norm_rms, merge, rope_theta) = match kind {
-            ProjectorKind::Qwen3Vl => (false, MergeKind::SpatialReorder, 10_000.0),
+            ProjectorKind::Qwen3Vl | ProjectorKind::Inkling2V => (false, MergeKind::SpatialReorder, 10_000.0),
             ProjectorKind::Gemma4V => (true, MergeKind::AvgPool, 100.0),
             ProjectorKind::Gemma4Uv => (true, MergeKind::None, 100.0),
             ProjectorKind::Glm4V => (true, MergeKind::PatchConv, 10_000.0),
         };
         let patch_area = patch_size * patch_size * n_merge * n_merge;
-        let (min_tok, max_tok) = match kind { ProjectorKind::Gemma4V | ProjectorKind::Gemma4Uv => (40, 280), _ => (8, 4096) };
+        let (min_tok, max_tok) = match kind {
+            ProjectorKind::Gemma4V | ProjectorKind::Gemma4Uv => (40, 280),
+            ProjectorKind::Inkling2V => (1, 4096),
+            _ => (8, 4096),
+        };
         let image_min_pixels = opt_u("clip.vision.image_min_pixels").unwrap_or(min_tok * patch_area);
         let image_max_pixels = opt_u("clip.vision.image_max_pixels").unwrap_or(max_tok * patch_area);
         let deepstack = match g.get("clip.vision.is_deepstack_layers") {

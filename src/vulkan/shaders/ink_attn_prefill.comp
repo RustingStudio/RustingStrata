@@ -1,0 +1,61 @@
+#version 460
+layout(local_size_x = 128) in;
+#include "common.glsl"
+layout(push_constant) uniform P {
+    F32 q; F32 r; F32 sink; F32 gate; U16 kc; U16 vc; U16 kc_new; U16 vc_new; F32 bias; F32 outp;
+    uint pos; uint nt; uint nh; uint nkv; uint nr; uint ext; uint ring; uint win;
+} p;
+layout(constant_id = 1) const uint PER = 4;  // head_dim / 32
+
+// Inkling 2 causal prefill attention with online softmax + virtual sink logit 0.
+// When kc_new != 0 and kp >= pos (SWA chunk prefill without overwriting history < pos), reads kp - pos from kc_new/vc_new.
+// One warp per query token (4 queries per workgroup x, head h = workgroup y).
+void main() {
+    uint t = gl_WorkGroupID.x * 4u + WARP, h = gl_WorkGroupID.y, lane = LANE;
+    if (t >= p.nt) return;
+    uint HD = 32u * PER;
+    uint kh = h / (p.nh / p.nkv), kw = p.nkv * HD;
+    uint q_pos = p.pos + t;
+    uint start = p.win > 0u && q_pos + 1u > p.win ? q_pos + 1u - p.win : 0u;
+    float scale = fdiv(1.0, sqrt_(float(HD)));
+    float q[PER], acc[PER];
+    [[unroll]] for (uint j = 0; j < PER; j++) {
+        q[j] = p.q.v[(t * p.nh + h) * HD + lane + 32u * j] * scale;
+        acc[j] = 0.0;
+    }
+    float sink_val = p.sink.v[t * p.nh + h];
+    float r_reg = (p.nr <= 32u && lane < p.nr) ? p.r.v[(t * p.nh + h) * p.nr + lane] : 0.0;
+    // Virtual sink has logit 0 and value 0 -> m = 0, l = 1.
+    float m = 0.0, l = 1.0;
+    for (uint kp = start; kp <= q_pos; kp++) {
+        bool use_new = uint64_t(p.kc_new) != 0 && kp >= p.pos;
+        U16 kbuf = use_new ? p.kc_new : p.kc;
+        U16 vbuf = use_new ? p.vc_new : p.vc;
+        uint row = use_new ? (kp - p.pos) : (p.win > 0u ? (kp % p.ring) : kp);
+        uint kbase = row * kw + kh * HD;
+        float s = 0.0;
+        [[unroll]] for (uint j = 0; j < PER; j++) s += q[j] * ldkv(kbuf, kbase + lane + 32u * j, HD);
+        s = W64 ? warp_sum(s) : subgroupAdd(s);
+        uint dist = q_pos - kp;
+        float b = 0.0;
+        if (dist < p.ext) {
+            if (p.nr <= 32u) {
+                b = lane < p.nr ? r_reg * p.bias.v[dist * p.nr + lane] : 0.0;
+            } else {
+                for (uint c = lane; c < p.nr; c += 32u) b += p.r.v[(t * p.nh + h) * p.nr + c] * p.bias.v[dist * p.nr + c];
+            }
+            b = W64 ? warp_sum(b) : subgroupAdd(b);
+        }
+        float logit = s + b - sink_val;
+        float mn = max(m, logit), c = expf_(m - mn), e = expf_(logit - mn);
+        l = fma(l, c, e);
+        [[unroll]] for (uint j = 0; j < PER; j++) acc[j] = fma(e, ldkv(vbuf, kbase + lane + 32u * j, HD), acc[j] * c);
+        m = mn;
+    }
+    float inv = fdiv(1.0, l);
+    [[unroll]] for (uint j = 0; j < PER; j++) {
+        uint col = lane + 32u * j;
+        uint idx = (t * p.nh + h) * HD + col;
+        p.outp.v[idx] = acc[j] * inv * sigmoid(p.gate.v[idx]);
+    }
+}

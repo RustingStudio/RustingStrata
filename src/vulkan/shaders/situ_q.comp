@@ -1,0 +1,59 @@
+#version 460
+layout(local_size_x = 32) in;
+#include "common.glsl"
+
+// Inkling's SITU activation directly quantized to int8/per-32-scale layout of quant_xq.
+// y holds rows of 2*n floats (n gates then n ups); q receives rows int8 blocks then rows*(n/32) f32 scales.
+// n must be a multiple of 32. If n % 256 != 0, trailing lanes keep zeroed values so subgroup reductions stay uniform.
+layout(push_constant) uniform P { F32 y; U32 q; F32 s; uint n; float beta; float lb; } p;
+
+void main() {
+    uint t = gl_WorkGroupID.y;
+    uint c = gl_WorkGroupID.x * 256;
+    uint lane = gl_LocalInvocationID.x;
+    uint i = lane * 8;
+    uint col = c + i;
+    bool valid = col < p.n;
+    float v[8], mx = 0.0;
+    if (valid) {
+        uint go = t * 2 * p.n + col;
+        float sc = uint64_t(p.s) != 0ul ? p.s.v[t] : 1.0;
+        [[unroll]] for (uint j = 0; j < 8; j++) {
+            float g = p.y.v[go + j] * sc, u = p.y.v[go + p.n + j] * sc;
+            if (p.lb > 0.0) u = p.lb * tanh(clamp(u / p.lb, -10.0, 10.0));
+            v[j] = p.beta * tanh(clamp(g / p.beta, -10.0, 10.0)) / (1.0 + exp(-g)) * u;
+            mx = max(mx, abs(v[j]));
+        }
+    } else {
+        [[unroll]] for (uint j = 0; j < 8; j++) v[j] = 0.0;
+    }
+    float dd, id;
+    if (LLAMA_Q8) {
+        float sv = 0.0; uint si = 1u << 30;
+        if (valid) {
+            [[unroll]] for (uint j = 0; j < 8; j++) if (abs(v[j]) == mx && si > i + j) { sv = v[j]; si = i + j; }
+        }
+        [[unroll]] for (uint o = 1; o < 32; o <<= 1) {
+            float ov = subgroupShuffleXor(sv, o); uint oi = subgroupShuffleXor(si, o);
+            if (abs(ov) > abs(sv) || (abs(ov) == abs(sv) && oi < si)) { sv = ov; si = oi; }
+        }
+        id = sv != 0.0 ? rcp_d(-127.0, sv) : 0.0;
+        dd = sv != 0.0 ? rcp_d(1.0, id) : 0.0;
+    } else {
+        mx = max(mx, subgroupShuffleXor(mx, 1));
+        mx = max(mx, subgroupShuffleXor(mx, 2));
+        dd = rcp_d(mx, 127.0);
+        id = mx > 0.0 ? rcp_d(127.0, mx) : 0.0;
+    }
+    if (valid) {
+        int r[8];
+        [[unroll]] for (uint j = 0; j < 8; j++) r[j] = int(roundEven(v[j] * id));
+        uint qo = (t * p.n + col) / 4;
+        p.q.v[qo] = pack4(r[0], r[1], r[2], r[3]);
+        p.q.v[qo + 1] = pack4(r[4], r[5], r[6], r[7]);
+        if ((lane & 3) == 0) {
+            F32 d = F32(uint64_t(p.q) + gl_NumWorkGroups.y * p.n);
+            d.v[(t * p.n + col) / 32] = dd;
+        }
+    }
+}
