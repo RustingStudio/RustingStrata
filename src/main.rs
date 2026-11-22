@@ -1348,7 +1348,16 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             if !lora.is_empty() { say!("note: --lora is ignored by calibrate; calibration uses the base model"); }
             let margins = vram_margins(&vram_margin, &device)?.into_iter().map(|mb| mb << 20).collect::<Vec<_>>();
             let split = split_arg(split.as_deref(), device.len())?;
+            // The architecture of a file that runs on its own code path, where nothing reads a calibration file.
+            let own_arch = |p: &std::path::Path| {
+                let arch = Gguf::open(p).ok()?.get("general.architecture").ok()?.as_str()?.to_string();
+                rusting_strata::config::OWN_ARCHS.contains(&arch.as_str()).then_some(arch)
+            };
             if !model.is_dir() {
+                if let Some(arch) = own_arch(&model) {
+                    say!("nothing to calibrate: '{arch}' models run on their own code path, which reads no calibration file. Run chat, generate, bench or serve with this model as it is.");
+                    return Ok(());
+                }
                 return calibrate(&model, draft_model.as_deref().or(mtp_model.as_deref()), ctx, &margins, backend.as_deref(), &device, split);
             }
             anyhow::ensure!(draft_model.is_none() && mtp_model.is_none(), "--mtp-model and --draft-model belong to one model: give --model a file");
@@ -1357,9 +1366,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let mut failed = vec![];
             for (k, (id, path, _)) in list.iter().enumerate() {
                 say!("calibrate {}/{}: {id}", k + 1, list.len());
-                let arch = Gguf::open(path).ok().and_then(|g| g.get("general.architecture").ok().and_then(|v| v.as_str().map(str::to_string)));
-                if arch.as_deref().is_some_and(|a| rusting_strata::config::OWN_ARCHS.contains(&a)) {
-                    say!("calibrate {id}: skipped, calibrate measures the main engine only and '{}' models run on their own code path", arch.unwrap());
+                if let Some(arch) = own_arch(path) {
+                    say!("calibrate {id}: skipped, calibrate measures the main engine only and '{arch}' models run on their own code path");
                     continue;
                 }
                 // One model that fails (too big, not a model) does not stop the others.
