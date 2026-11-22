@@ -214,31 +214,10 @@ fn nvfp4_and_f8_e4m3_blocks() {
         assert_eq!(y4[56 + j], -12.0);
     }
 
-    // Per-expert 1D [n_expert] .scale slicing on Mat::expert_host
-    let mut raw_exps = Vec::new();
-    raw_exps.extend_from_slice(&blk);
-    raw_exps.extend_from_slice(&blk);
-    let mut exp_scales = Vec::new();
-    exp_scales.extend_from_slice(&0.5f32.to_le_bytes());
-    exp_scales.extend_from_slice(&(-2.0f32).to_le_bytes());
-    let mat3d = rusting_strata::deepseek::mat::Mat {
-        data: &raw_exps,
-        ty: GgmlType::NVFP4,
-        rows: 2,
-        cols: 64,
-        cpu: true,
-        gpu: None,
-        scale: 1.0,
-        expert_scales: Some(&exp_scales),
-    };
-    let e0 = mat3d.expert_host(0, 2);
-    let e1 = mat3d.expert_host(1, 2);
-    assert_eq!(e0.scale, 0.5);
-    assert_eq!(e1.scale, -2.0);
-    let mut r0 = [0f32; 64];
+    // A matrix's scalar `.scale` multiplies every row, and an expert cut out of it keeps it.
+    let raw_exps = [&blk[..], &blk[..]].concat();
+    let mat3d = rusting_strata::deepseek::mat::Mat { data: &raw_exps, ty: GgmlType::NVFP4, rows: 2, cols: 64, cpu: true, gpu: None, scale: -2.0 };
     let mut r1 = [0f32; 64];
-    e0.row_into(0, &mut r0);
-    e1.row_into(0, &mut r1);
-    assert_eq!(r0[0], 1.0);
+    mat3d.expert_host(1, 2).row_into(0, &mut r1);
     assert_eq!(r1[0], -4.0);
 }

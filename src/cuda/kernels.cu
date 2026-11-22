@@ -58,12 +58,6 @@ template <> __device__ __forceinline__ void deq8<30>(const u8* b, int sub, float
     u32 w[4] = {q.x, q.y, q.z, q.w};
     for (int i = 0; i < 4; i++) { o[2 * i] = __uint_as_float(w[i] << 16); o[2 * i + 1] = __uint_as_float(w[i] & 0xFFFF0000u); }
 }
-__device__ __forceinline__ float ue4m3_to_f32(u8 x) {
-    if (x == 0 || x == 0x7Fu) return 0.0f;
-    u32 exp = (x >> 3) & 0xFu, man = x & 7u;
-    float raw = exp == 0 ? (float)man * (1.0f / 512.0f) : __uint_as_float(((exp + 120u) << 23) | (man << 20));
-    return raw * 0.5f;
-}
 __device__ __forceinline__ float f8_e4m3_to_f32(u8 x) {
     u32 ax = x & 0x7Fu;
     if (ax == 0 || ax == 0x7Fu) return 0.0f;
@@ -655,23 +649,6 @@ template <> struct QI<20> {  // IQ4_NL, 8 blocks of 18 (2-byte aligned: ld16 onl
         lo = r < 16 ? a.x : a.y; hi = r < 16 ? c.x : c.y;
     }
 };
-template <> struct QI<40> {  // NVFP4: 4 blocks of 36 per 256 (4-byte aligned: ldu32 only)
-    static constexpr bool MIN = false;
-    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
-        const u8* p = b + 36 * (sub >> 3);
-        int s = (sub >> 1) & 3;
-        d = ue4m3_to_f32(p[s]);
-        const u8* q = p + 4 + 8 * s;
-        int2 a = fp4_lut(ldu32(q)), c = fp4_lut(ldu32(q + 4));
-        lo = (sub & 1) ? a.y : a.x;
-        hi = (sub & 1) ? c.y : c.x;
-    }
-};
-template <> __device__ __forceinline__ void deq8<40>(const u8* b, int sub, float* o) {
-    int lo, hi; float d, m;
-    QI<40>::get(b, sub, lo, hi, d, m);
-    for (int i = 0; i < 8; i++) o[i] = d * (float)(signed char)((i < 4 ? lo : hi) >> (8 * (i & 3)));
-}
 
 #ifndef LLAMA_Q8
 #define LLAMA_Q8 0

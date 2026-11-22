@@ -107,7 +107,7 @@ pub struct Hy4Model<'a> {
 /// A table that is only read row by row: never uploaded (the Engram table is 36 GB).
 fn host_mat<'a>(g: &'a Gguf, name: &str) -> Result<Mat<'a>> {
     let t = g.tensors.get(name).with_context(|| format!("missing tensor {name}"))?;
-    Ok(Mat { data: g.bytes(t), ty: GgmlType::from_u32(t.ty)?, rows: t.dims[1] as usize, cols: t.dims[0] as usize, cpu: false, gpu: None, scale: 1.0, expert_scales: None })
+    Ok(Mat { data: g.bytes(t), ty: GgmlType::from_u32(t.ty)?, rows: t.dims[1] as usize, cols: t.dims[0] as usize, cpu: false, gpu: None, scale: 1.0 })
 }
 
 fn sigmoid(x: f32) -> f32 {

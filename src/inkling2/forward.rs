@@ -103,7 +103,7 @@ const PROF: [&str; 8] = ["mix", "proj", "scores", "out-proj", "route", "experts-
 fn host_mat<'a>(g: &'a Gguf, name: &str) -> Result<Mat<'a>> {
     let t = g.tensors.get(name).with_context(|| format!("missing tensor {name}"))?;
     let rows = t.dims[1..].iter().product::<u64>() as usize;
-    Ok(Mat { data: g.bytes(t), ty: GgmlType::from_u32(t.ty)?, rows, cols: t.dims[0] as usize, cpu: false, gpu: None, scale: 1.0, expert_scales: None })
+    Ok(Mat { data: g.bytes(t), ty: GgmlType::from_u32(t.ty)?, rows, cols: t.dims[0] as usize, cpu: false, gpu: None, scale: 1.0 })
 }
 
 /// A small tensor as f32, row-major (`dims[0]` is the row width).

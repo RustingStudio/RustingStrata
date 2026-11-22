@@ -155,12 +155,8 @@ pub(crate) mod dev {
             let Some(p) = victim else { return Some(STAGED) };
             if lfu && self.exs[p].3 > 4.0 { return Some(STAGED); }
             let (i, old, _, _) = self.exs[p];
-            let (ptr, ok) = {
-                let (be, t) = (&self.parts[gpu_of(i)].be, self.tensor(i));
-                (t.ptr, be.htod(data, &Buf::new(t.ptr, data.len(), ()), 0).is_ok())
-            };
-            if !ok { return Some(STAGED); }
-            let _ = ptr;
+            let (be, t) = (&self.parts[gpu_of(i)].be, self.tensor(i));
+            if be.htod(data, &Buf::new(t.ptr, data.len(), ()), 0).is_err() { return Some(STAGED); }
             self.parts[gpu_of(i)].ts[(i & (1 << SHIFT) - 1) as usize].scale = scale;
             self.ex.remove(&old);
             self.ex.insert(k, p);
@@ -529,10 +525,9 @@ pub struct Mat<'a> {
     pub cpu: bool,
     /// Index of the VRAM copy (STRATA_DS_GPU).
     pub gpu: Option<u32>,
-    /// Post-dequant scalar multiplier (from `<stem>.scale` when scalar, or sliced from 1-D `[n_expert]` `.scale`).
+    /// Multiplier of every value: the scalar F32 `<stem>.scale` of the file, else 1. A per-expert `.scale` (one value
+    /// per expert) is not read here: the forward that owns the experts applies it (`inkling2::forward`).
     pub scale: f32,
-    /// Optional 1-D `[n_expert]` F32 `.scale` bytes for a 3-D expert tensor.
-    pub expert_scales: Option<&'a [u8]>,
 }
 
 impl<'a> Mat<'a> {
@@ -543,20 +538,10 @@ impl<'a> Mat<'a> {
         let rows = t.dims[1..].iter().product::<u64>() as usize;
         let cpu = name.contains("_exps");
         let data = g.bytes(t);
-        let (mut scale, mut expert_scales) = (1.0f32, None);
-        if let Some(stem) = name.strip_suffix(".weight")
-            && let Some(st) = g.tensors.get(&format!("{stem}.scale"))
-            && st.ty == 0
-        {
-            let sb = g.bytes(st);
-            if sb.len() == 4 {
-                scale = f32::from_le_bytes(sb.try_into().unwrap());
-            } else if t.dims.len() == 3 && sb.len() == 4 * t.dims[2] as usize {
-                expert_scales = Some(sb);
-            }
-        }
+        let scale = name.strip_suffix(".weight").and_then(|stem| g.tensors.get(&format!("{stem}.scale")))
+            .filter(|st| st.ty == 0).and_then(|st| g.bytes(st).try_into().ok()).map_or(1.0, f32::from_le_bytes);
         let gpu = if cpu || t.dims.len() != 2 { None } else { dev::get().and_then(|d| d.lock().unwrap().upload(data, ty, rows, cols, scale)) };
-        Ok(Mat { data, ty, rows, cols, cpu, gpu, scale, expert_scales })
+        Ok(Mat { data, ty, rows, cols, cpu, gpu, scale })
     }
 
     /// Like `load` for a matrix used as `n` row groups (grouped output projection): each group gets its own VRAM copy.
@@ -603,11 +588,7 @@ impl<'a> Mat<'a> {
     pub fn expert_host(&self, e: usize, n_expert: usize) -> Mat<'a> {
         let rows = self.rows / n_expert;
         let sz = rows * self.ty.row_bytes(self.cols as u64);
-        let scale = match self.expert_scales {
-            Some(sb) if (e + 1) * 4 <= sb.len() => self.scale * f32::from_le_bytes(sb[e * 4..(e + 1) * 4].try_into().unwrap()),
-            _ => self.scale,
-        };
-        Mat { data: &self.data[e * sz..(e + 1) * sz], ty: self.ty, rows, cols: self.cols, cpu: self.cpu, gpu: None, scale, expert_scales: None }
+        Mat { data: &self.data[e * sz..(e + 1) * sz], ty: self.ty, rows, cols: self.cols, cpu: self.cpu, gpu: None, scale: self.scale }
     }
 
     /// Whether this matrix has no VRAM copy and must be read from the mapped file (CPU or staged expert).
