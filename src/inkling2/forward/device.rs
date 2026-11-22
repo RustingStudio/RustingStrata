@@ -43,7 +43,7 @@ struct DSlot { k: Buf, v: Buf, hist: Buf, cap: usize }
 struct Scratch {
     cur: u64, x: u64, blocks: u64, bank: u64, outb: u64, prelude: u64, msg: u64, ins: u64, ins2: u64, gate: u64, nrm: u64, nrm_xq: u64,
     q: u64, r: u64, sink: u64, og: u64, k: u64, v: u64, kp: u64, vp: u64, att: u64, proj: u64, h: u64, h2: u64, hn: u64,
-    y: u64, d: u64, ids: u64, xh: u64, xq: u64, wc: u64, rlogits: u64, amax: u64, acc: u64, logits: u64, end: u64,
+    y: u64, d: u64, ids: u64, xh: u64, xq: u64, wc: u64, rlogits: u64, amax: u64, pos: u64, acc: u64, logits: u64, end: u64,
 }
 
 impl Scratch {
@@ -55,7 +55,7 @@ impl Scratch {
             cur: f(n), x: f(n), blocks: f(4 * n), bank: f(4 * n), outb: f(n), prelude: f(n), msg: f(4 * n), ins: f(3 * n), ins2: f(3 * n),
             gate: f(4 * rank), nrm: f(3 * n), nrm_xq: f(3 * xq_row_floats), q: f(q), r: f(c.n_head * c.n_rel), sink: f(c.n_head), og: f(q), k: f(c.n_head_kv * c.head_dim),
             v: f(c.n_head_kv * c.head_dim), kp: f(c.n_head_kv * c.n_conv), vp: f(c.n_head_kv * c.n_conv), att: f(q), proj: f(n), h: f(n),
-            h2: f(n), hn: f(n), y: f(c.n_used * 2 * c.n_ff_exp), d: f(c.n_used * n), ids: f(3 * c.n_used), xh: f(n), xq: f(c.n_used * c.n_ff_exp), wc: f(c.n_used + n), rlogits: f(c.n_expert), amax: f(16), acc: f(n),
+            h2: f(n), hn: f(n), y: f(c.n_used * 2 * c.n_ff_exp), d: f(c.n_used * n), ids: f(3 * c.n_used), xh: f(n), xq: f(c.n_used * c.n_ff_exp), wc: f(c.n_used + n), rlogits: f(c.n_expert), amax: f(16), pos: f(1), acc: f(n),
             logits: f(vocab), end: a - base,
         }
     }
@@ -153,6 +153,8 @@ pub(super) struct Device {
     s: Scratch,
     rank: usize,
     all_full: bool,
+    /// Key of the recorded `step_fast` graph, by `argmax` (0: none).
+    graph_keys: [u64; 2],
     /// Positions whose rows both sides hold, and whether the device has run tokens after them.
     synced: usize,
     ahead: bool,
@@ -335,7 +337,7 @@ impl Device {
                 eprintln!("inkling2: preloaded {n_full}/{} expert layers ({:.2} GB) as contiguous slabs", c.n_layer, slab_bytes as f64 / 1e9);
             }
             let all_full = layers.iter().all(|l| l.full_exps.is_some());
-            Ok(Device { layers, loops, slots, out_query, out_norm, scr, sc_buf, pf: None, s, rank, all_full, synced: 0, ahead: false })
+            Ok(Device { layers, loops, slots, out_query, out_norm, scr, sc_buf, pf: None, s, rank, all_full, graph_keys: [0; 2], synced: 0, ahead: false })
         })();
         made.inspect_err(|e| eprintln!("inkling2: no room in VRAM for the decode state ({e:#}); the tokens run as prompt chunks do")).ok()
     }
@@ -487,41 +489,58 @@ impl Device {
         (|| -> Result<(Vec<f32>, u32)> {
             if !self.ahead { self.to_device(m, be, pos)?; }
             be.put(&cur, &self.scr, ((self.s.cur - o) / 4) as usize)?;
-            let mut nb = 0usize;
-            for il in 0..c.loop_start {
-                self.layer_attn(be, &d, m, il, il, false, pos, &mut nb)?;
-                self.layer_ffn_gpu(be, m, il, il)?;
-            }
-            be.dtod(&self.scr, (self.s.cur - o) as usize, &self.scr, (self.s.prelude - o) as usize, 4 * n)?;
-            let n_pre = nb;
-            for pass in 0..c.loop_count {
-                let n_bank = nb.saturating_sub(n_pre + 1);
-                if pass > 0 {
-                    let s = self.s;
-                    if n_bank > 0 {
-                        be.dtod(&self.scr, (s.blocks - o) as usize + 4 * (n_pre + 1) * n, &self.scr, (s.bank - o) as usize, 4 * n_bank * n)?;
-                    }
-                    be.dtod(&self.scr, (s.cur - o) as usize, &self.scr, (s.outb - o) as usize, 4 * n)?;
-                    be.dtod(&self.scr, (s.prelude - o) as usize, &self.scr, (s.cur - o) as usize, 4 * n)?;
-                    nb = n_pre;
+            be.put(&[pos as i32], &self.scr, ((self.s.pos - o) / 4) as usize)?;
+            let key = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::hash::DefaultHasher::new();
+                (argmax, pos / 64, self.sc_buf.addr(), self.s.cur).hash(&mut h);
+                for sl in &self.slots { sl.k.addr().hash(&mut h); }
+                0x494E_4B32_0000_0000u64 | (h.finish() & 0x0000_FFFF_FFFF_FFFF)
+            };
+            // The key changes every 64 positions: one graph per kind of step stays (on CUDA a graph holds about
+            // 17 MiB of device memory, and the backend stops recording at 32 of them).
+            let last = std::mem::replace(&mut self.graph_keys[argmax as usize], key);
+            if last != 0 && last != key { be.graph_drop(last)?; }
+            be.graph(key, &mut || {
+                let mut nb = 0usize;
+                for il in 0..c.loop_start {
+                    self.layer_attn(be, &d, m, il, il, false, pos, true, &mut nb)?;
+                    self.layer_ffn_gpu(be, m, il, il)?;
                 }
-                for ip in c.loop_start..c.loop_end {
-                    let il = if pass == 0 { ip } else { c.n_layer + (pass - 1) * core + ip - c.loop_start };
+                be.dtod(&self.scr, (self.s.cur - o) as usize, &self.scr, (self.s.prelude - o) as usize, 4 * n)?;
+                let n_pre = nb;
+                for pass in 0..c.loop_count {
+                    let n_bank = nb.saturating_sub(n_pre + 1);
                     if pass > 0 {
                         let s = self.s;
-                        be.ink_mix(s.bank, n_bank, s.outb, self.loops[ip - c.loop_start].msg_query.addr(), 4, s.msg, n)?;
+                        if n_bank > 0 {
+                            be.dtod(&self.scr, (s.blocks - o) as usize + 4 * (n_pre + 1) * n, &self.scr, (s.bank - o) as usize, 4 * n_bank * n)?;
+                        }
+                        be.dtod(&self.scr, (s.cur - o) as usize, &self.scr, (s.outb - o) as usize, 4 * n)?;
+                        be.dtod(&self.scr, (s.prelude - o) as usize, &self.scr, (s.cur - o) as usize, 4 * n)?;
+                        nb = n_pre;
                     }
-                    self.layer_attn(be, &d, m, il, ip, pass > 0, pos, &mut nb)?;
-                    self.layer_ffn_gpu(be, m, il, ip)?;
+                    for ip in c.loop_start..c.loop_end {
+                        let il = if pass == 0 { ip } else { c.n_layer + (pass - 1) * core + ip - c.loop_start };
+                        if pass > 0 {
+                            let s = self.s;
+                            be.ink_mix(s.bank, n_bank, s.outb, self.loops[ip - c.loop_start].msg_query.addr(), 4, s.msg, n)?;
+                        }
+                        self.layer_attn(be, &d, m, il, ip, pass > 0, pos, true, &mut nb)?;
+                        self.layer_ffn_gpu(be, m, il, ip)?;
+                    }
                 }
-            }
-            for il in c.loop_end..c.n_layer {
-                self.layer_attn(be, &d, m, il, il, false, pos, &mut nb)?;
-                self.layer_ffn_gpu(be, m, il, il)?;
-            }
-            self.finish_logits(be, &d, m, nb)?;
+                for il in c.loop_end..c.n_layer {
+                    self.layer_attn(be, &d, m, il, il, false, pos, true, &mut nb)?;
+                    self.layer_ffn_gpu(be, m, il, il)?;
+                }
+                self.finish_logits(be, &d, m, nb)?;
+                if argmax {
+                    be.argmax_rows(self.s.logits, c.n_vocab, 1, self.s.amax)?;
+                }
+                Ok(())
+            })?;
             if argmax {
-                be.argmax_rows(self.s.logits, c.n_vocab, 1, self.s.amax)?;
                 let id = be.get::<i32>(&self.scr, ((self.s.amax - o) / 4) as usize, 1)?[0] as u32;
                 Ok((Vec::new(), id))
             } else {
@@ -1232,7 +1251,7 @@ impl Device {
         Ok(())
     }
 
-    fn layer_attn(&self, be: &dyn Backend, d: &dev::Dev, m: &Inkling2Model, il: usize, ip: usize, msgs: bool, pos: usize, nb: &mut usize) -> Result<()> {
+    fn layer_attn(&self, be: &dyn Backend, d: &dev::Dev, m: &Inkling2Model, il: usize, ip: usize, msgs: bool, pos: usize, graph: bool, nb: &mut usize) -> Result<()> {
         let (c, ml, l, ds, s, rank) = (&m.cfg, &m.layers[ip], &self.layers[ip], &self.slots[il], self.s, self.rank);
         let (n, hd, nh, nkv, nr, nc) = (c.n_embd, c.head_dim, c.n_head, c.n_head_kv, c.n_rel, c.n_conv);
         let (kw, o) = (nkv * hd, self.scr.addr());
@@ -1286,15 +1305,26 @@ impl Device {
         })?;
         // Log-scaled positions sharpen the full-attention layers in a long context.
         let log_alpha = if ml.swa { 0.0 } else { c.log_alpha };
-        let (rows, at) = if ml.swa { ((pos + 1).min(c.n_swa), pos % c.n_swa) } else { (pos + 1, pos) };
         let ring = ds.cap;
-        be.batch(&mut || {
-            be.ink_clip_n(s.q, l.q_clip.addr(), hd, nh, 1, c.qk_clip, 0.0, 1.0, 0, 0, 1, pos, log_alpha, c.log_floor)?;
-            be.ink_clip_n(s.k, 0, hd, nkv, 1, c.qk_clip, 0.0, 1.0, ds.k.addr(), at, ring, 0, 0.0, 1.0)?;
-            be.ink_clip_n(s.v, 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), at, ring, 0, 0.0, 1.0)?;
-            be.ink_clip_n(s.r, l.rel_clip.addr(), nr, nh, 1, c.rel_clip, 0.0, 1.0, 0, 0, 1, pos, log_alpha, c.log_floor)
-        })?;
-        be.ink_attn(s.q, s.r, s.sink, s.og, ds.k.addr(), ds.v.addr(), l.rel_bias.addr(), self.sc_buf.addr(), s.att, rows, at, nh, nkv, hd, nr, c.rel_extent)?;
+        if graph {
+            let max_rows = ((pos / 64 + 1) * 64).min(ring);
+            be.batch(&mut || {
+                be.ink_clip_pos(s.q, l.q_clip.addr(), hd, nh, 1, c.qk_clip, 0.0, 1.0, 0, 1, s.pos, log_alpha, c.log_floor)?;
+                be.ink_clip_pos(s.k, 0, hd, nkv, 1, c.qk_clip, 0.0, 1.0, ds.k.addr(), ring, s.pos, 0.0, 1.0)?;
+                be.ink_clip_pos(s.v, 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), ring, s.pos, 0.0, 1.0)?;
+                be.ink_clip_pos(s.r, l.rel_clip.addr(), nr, nh, 1, c.rel_clip, 0.0, 1.0, 0, 1, s.pos, log_alpha, c.log_floor)
+            })?;
+            be.ink_attn_pos(s.q, s.r, s.sink, s.og, ds.k.addr(), ds.v.addr(), l.rel_bias.addr(), self.sc_buf.addr(), s.att, max_rows, ring, s.pos, nh, nkv, hd, nr, c.rel_extent)?;
+        } else {
+            let (rows, at) = if ml.swa { ((pos + 1).min(c.n_swa), pos % c.n_swa) } else { (pos + 1, pos) };
+            be.batch(&mut || {
+                be.ink_clip_n(s.q, l.q_clip.addr(), hd, nh, 1, c.qk_clip, 0.0, 1.0, 0, 0, 1, pos, log_alpha, c.log_floor)?;
+                be.ink_clip_n(s.k, 0, hd, nkv, 1, c.qk_clip, 0.0, 1.0, ds.k.addr(), at, ring, 0, 0.0, 1.0)?;
+                be.ink_clip_n(s.v, 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), at, ring, 0, 0.0, 1.0)?;
+                be.ink_clip_n(s.r, l.rel_clip.addr(), nr, nh, 1, c.rel_clip, 0.0, 1.0, 0, 0, 1, pos, log_alpha, c.log_floor)
+            })?;
+            be.ink_attn(s.q, s.r, s.sink, s.og, ds.k.addr(), ds.v.addr(), l.rel_bias.addr(), self.sc_buf.addr(), s.att, rows, at, nh, nkv, hd, nr, c.rel_extent)?;
+        }
         be.gemv(w(&ml.wo), s.att, s.proj)?;
         be.ink_conv(s.proj, l.convs[2].addr(), 0, hist(2), s.x, n, nc, hd)?;
         // The first layer of each block starts a new residual stream; the earlier one joins the mixed blocks.
@@ -1351,7 +1381,7 @@ impl Device {
         {
             let d = lock();
             let be = &*d.parts[0].be;
-            self.layer_attn(be, &d, m, il, ip, msgs, pos, nb).expect("inkling2 device step");
+            self.layer_attn(be, &d, m, il, ip, msgs, pos, false, nb).expect("inkling2 device step");
             if self.layer_ffn_gpu(be, m, il, ip).expect("inkling2 device step") {
                 m.lap(0, t);
                 return;

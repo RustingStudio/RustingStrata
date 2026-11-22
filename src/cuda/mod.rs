@@ -899,6 +899,10 @@ impl Backend for Gpu {
         self.graphs.lock().unwrap().insert(key, Graph(g));
         Ok(())
     }
+    fn graph_drop(&self, key: u64) -> anyhow::Result<()> {
+        self.graphs.lock().unwrap().remove(&key);
+        Ok(())
+    }
 
     /// Pinned host memory mapped into the device address space.
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)> {
@@ -1106,12 +1110,32 @@ impl Backend for Gpu {
         let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
         let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
         launch!(self, "ink_clip", cfg((rows as u32, nt as u32), 128, 0),
-            x, scale, w as i32, thr, eps, mul, dst, dst_at0 as i32, ring as i32, pos0 as i32, log_alpha, fl);
+            x, scale, w as i32, thr, eps, mul, dst, dst_at0 as i32, ring as i32, pos0 as i32, log_alpha, fl, 0u64);
+        Ok(())
+    }
+    fn ink_clip_pos(
+        &self, x: u64, scale: u64, w: usize, rows: usize, nt: usize,
+        thr: f32, eps: f32, mul: f32,
+        dst: u64, dst_ring: usize,
+        pos_ptr: u64, log_alpha: f32, log_floor: f32,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(w <= 128, "ink_clip_pos: w={w} > 128");
+        anyhow::ensure!(kv_mode() == 0 || dst == 0 || w % 32 == 0, "ink_clip_pos: quantized KV requires w % 32 == 0 (got {w})");
+        let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
+        let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
+        launch!(self, "ink_clip", cfg((rows as u32, nt as u32), 128, 0),
+            x, scale, w as i32, thr, eps, mul, dst, 0i32, ring as i32, 0i32, log_alpha, fl, pos_ptr);
         Ok(())
     }
     fn ink_attn(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, rows: usize, at: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
         let chunks = rows.div_ceil(64) as u32;
-        launch!(self, "ink_attn", cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, rows as i32, at as i32, nkv as i32, hd as i32, nr as i32, ext as i32);
+        launch!(self, "ink_attn", cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, rows as i32, at as i32, 1i32, nkv as i32, hd as i32, nr as i32, ext as i32, 0u64);
+        launch!(self, "ink_attn_merge", cfg((nh as u32, 1), 128, 0), sc, gate, out, chunks as i32, hd as i32);
+        Ok(())
+    }
+    fn ink_attn_pos(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, max_rows: usize, ring: usize, pos_ptr: u64, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
+        let chunks = max_rows.div_ceil(64) as u32;
+        launch!(self, "ink_attn", cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, 0i32, 0i32, ring.max(1) as i32, nkv as i32, hd as i32, nr as i32, ext as i32, pos_ptr);
         launch!(self, "ink_attn_merge", cfg((nh as u32, 1), 128, 0), sc, gate, out, chunks as i32, hd as i32);
         Ok(())
     }

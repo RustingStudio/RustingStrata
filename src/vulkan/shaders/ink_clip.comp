@@ -2,7 +2,7 @@
 layout(local_size_x = 128) in;
 #include "common.glsl"
 layout(push_constant) uniform P {
-    F32 x; F32 scale; U16 dst;
+    F32 x; F32 scale; U16 dst; I32 pos_ptr;
     uint w; float thr; float eps; float mul;
     uint dst_at0; uint dst_ring;
     uint pos0; float log_alpha; float log_floor;
@@ -10,6 +10,7 @@ layout(push_constant) uniform P {
 
 // Workgroup (row, tok): rows of w values (w at most 128, multiple of 32 when KV_MODE > 0 and dst != 0).
 // scale is shared across tokens: [gl_NumWorkGroups.x][w]. dst writes KV row (dst_at0 + tok) % dst_ring via kv_put.
+// When pos_ptr != 0, pos0 = uint(pos_ptr.v[0]) and dst_at0 = pos0 % dst_ring.
 void main() {
     uint t = gl_LocalInvocationID.x;
     uint row = gl_WorkGroupID.x, tok = gl_WorkGroupID.y, rows = gl_NumWorkGroups.x;
@@ -20,15 +21,17 @@ void main() {
         if (uint64_t(p.scale) != 0) v *= p.scale.v[sc_at];
     }
     float ss = block_sum(v * v);
+    uint pos0 = uint64_t(p.pos_ptr) != 0ul ? uint(p.pos_ptr.v[0]) : p.pos0;
+    uint dst_at0 = uint64_t(p.pos_ptr) != 0ul ? (pos0 % p.dst_ring) : p.dst_at0;
     float mul = p.mul;
-    if (p.log_alpha != 0.0) mul *= 1.0 + p.log_alpha * log(max(fdiv(float(p.pos0 + tok + 1u), p.log_floor), 1.0));
+    if (p.log_alpha != 0.0) mul *= 1.0 + p.log_alpha * log(max(fdiv(float(pos0 + tok + 1u), p.log_floor), 1.0));
     float f = (p.thr > 0.0 ? min(fdiv(p.thr, sqrt_(ss) + 1e-6), 1.0) : fdiv(1.0, sqrt_(fdiv(ss, float(p.w)) + p.eps))) * mul;
     if (t < p.w) {
         v *= f;
         p.x.v[at] = v;
     }
     if (uint64_t(p.dst) != 0 && t < p.w) {
-        uint dst_pos = (p.dst_at0 + tok) % p.dst_ring;
+        uint dst_pos = (dst_at0 + tok) % p.dst_ring;
         uint dat = (dst_pos * rows + row) * p.w + t;
         kv_put(p.dst, dat, p.w, v);
     }

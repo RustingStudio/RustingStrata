@@ -2470,20 +2470,22 @@ __device__ __forceinline__ float ldkv1(const u16* c, size_t off, int hd) {
 
 // One block of 128 per (row, tok) of w values (w at most 128, w % 32 == 0 when KV_MODE > 0 and dst != 0).
 extern "C" __global__ void ink_clip(float* x, const float* scale, int w, float thr, float eps, float mul, u16* dst,
-                                    int dst_at0, int dst_ring, int pos0, float log_alpha, float log_floor) {
+                                    int dst_at0, int dst_ring, int pos0, float log_alpha, float log_floor, const int* pos_ptr) {
     int t = threadIdx.x, row = blockIdx.x, tok = blockIdx.y, rows = gridDim.x;
     size_t at = ((size_t)tok * rows + row) * w + t, sc_at = (size_t)row * w + t;
     float v = 0.f;
     if (t < w) { v = x[at]; if (scale) v *= scale[sc_at]; }
     float ss = block_sum(v * v);
+    int eff_pos0 = pos_ptr ? *pos_ptr : pos0;
+    int eff_dst_at0 = pos_ptr ? (eff_pos0 % dst_ring) : dst_at0;
     float eff_mul = mul;
-    if (log_alpha != 0.f) eff_mul *= 1.f + log_alpha * logf(fmaxf((float)(pos0 + tok + 1) / log_floor, 1.f));
+    if (log_alpha != 0.f) eff_mul *= 1.f + log_alpha * logf(fmaxf((float)(eff_pos0 + tok + 1) / log_floor, 1.f));
     float f = (thr > 0.f ? fminf(thr / (sqrtf(ss) + 1e-6f), 1.f) : 1.f / sqrtf(ss / (float)w + eps)) * eff_mul;
     if (t < w) {
         v *= f;
         x[at] = v;
         if (dst) {
-            size_t dst_pos = (size_t)((dst_at0 + tok) % dst_ring);
+            size_t dst_pos = (size_t)((eff_dst_at0 + tok) % dst_ring);
             size_t dat = (dst_pos * rows + row) * w + t;
             kv_put(dst, dat, w, v);
         }
@@ -2492,10 +2494,15 @@ extern "C" __global__ void ink_clip(float* x, const float* scale, int w, float t
 
 // Attention of one token in two launches. Supports KV_MODE 0/1/2/3 via ldkv1().
 extern "C" __global__ void ink_attn(const float* q, const float* r, const float* sink, const u16* k, const u16* v,
-                                    const float* bias, float* sc, int rows, int at, int nkv, int hd, int nr, int ext) {
+                                    const float* bias, float* sc, int rows, int at, int ring, int nkv, int hd, int nr, int ext, const int* pos_ptr) {
     __shared__ float qs[128], ps[64], acc[128];
     int h = blockIdx.x, kh = h / (gridDim.x / nkv), kw = nkv * hd, t = threadIdx.x, lane = t & 31;
-    int i0 = blockIdx.y * 64, n = min(64, rows - i0);
+    if (pos_ptr) {
+        int pos = *pos_ptr;
+        rows = min(pos + 1, ring);
+        at = pos % ring;
+    }
+    int i0 = blockIdx.y * 64, n = i0 < rows ? min(64, rows - i0) : 0;
     if (t < hd) qs[t] = q[h * hd + t];
     __syncthreads();
     float scale = 1.f / sqrtf((float)hd);

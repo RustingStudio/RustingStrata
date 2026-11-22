@@ -1226,6 +1226,14 @@ impl Backend for Vk {
         st.graphs.insert(key, c);
         self.0.enqueue_cb(&mut st, Some(c))
     }
+    fn graph_drop(&self, key: u64) -> anyhow::Result<()> {
+        let mut st = self.0.st();
+        let Some(c) = st.graphs.remove(&key) else { return Ok(()) };
+        // The buffer may still be queued or running.
+        self.0.flush(&mut st)?;
+        unsafe { self.0.dev.free_command_buffers(st.gpool, &[c]) };
+        Ok(())
+    }
 
     fn moe_mailbox_optional(&self) -> bool { true }
     fn verify_rows(&self) -> usize { crate::cpu_worker::TMAX }
@@ -1384,13 +1392,33 @@ impl Backend for Vk {
         let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
         let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
         self.run("ink_clip", &[], [rows, nt, 1], &[
-            &x, &scale, &dst, &(w as u32), &thr, &eps, &mul,
+            &x, &scale, &dst, &0u64, &(w as u32), &thr, &eps, &mul,
             &(dst_at0 as u32), &(ring as u32), &(pos0 as u32), &log_alpha, &fl,
+        ])
+    }
+    fn ink_clip_pos(
+        &self, x: u64, scale: u64, w: usize, rows: usize, nt: usize,
+        thr: f32, eps: f32, mul: f32,
+        dst: u64, dst_ring: usize,
+        pos_ptr: u64, log_alpha: f32, log_floor: f32,
+    ) -> anyhow::Result<()> {
+        ensure!(w <= 128, "ink_clip_pos: w={w} > 128");
+        ensure!(self.0.kv_mode == 0 || dst == 0 || w % 32 == 0, "ink_clip_pos: quantized KV requires w % 32 == 0 (got {w})");
+        let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
+        let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
+        self.run("ink_clip", &[], [rows, nt, 1], &[
+            &x, &scale, &dst, &pos_ptr, &(w as u32), &thr, &eps, &mul,
+            &0u32, &(ring as u32), &0u32, &log_alpha, &fl,
         ])
     }
     fn ink_attn(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, rows: usize, at: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
         let chunks = rows.div_ceil(64);
-        self.run("ink_attn", &[], [nh, chunks, 1], &[&q, &r, &sink, &k, &v, &bias, &sc, &(rows as u32), &(at as u32), &(nh as u32), &(nkv as u32), &(hd as u32), &(nr as u32), &(ext as u32)])?;
+        self.run("ink_attn", &[], [nh, chunks, 1], &[&q, &r, &sink, &k, &v, &bias, &sc, &0u64, &(rows as u32), &(at as u32), &1u32, &(nh as u32), &(nkv as u32), &(hd as u32), &(nr as u32), &(ext as u32)])?;
+        self.run("ink_attn_merge", &[], [nh, 1, 1], &[&sc, &gate, &out, &(chunks as u32), &(hd as u32)])
+    }
+    fn ink_attn_pos(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, max_rows: usize, ring: usize, pos_ptr: u64, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
+        let chunks = max_rows.div_ceil(64);
+        self.run("ink_attn", &[], [nh, chunks, 1], &[&q, &r, &sink, &k, &v, &bias, &sc, &pos_ptr, &0u32, &0u32, &(ring.max(1) as u32), &(nh as u32), &(nkv as u32), &(hd as u32), &(nr as u32), &(ext as u32)])?;
         self.run("ink_attn_merge", &[], [nh, 1, 1], &[&sc, &gate, &out, &(chunks as u32), &(hd as u32)])
     }
     fn ink_attn_prefill(

@@ -44,6 +44,12 @@ fn graph_records_once_and_replays() {
         for _ in 0..3 { g.graph(5, &mut || { calls += 1; g.add(x.addr(), y.addr(), 4) }).unwrap(); }
         assert_eq!(calls, 1, "f runs only when recording");
         assert_eq!(g.get::<f32>(&x, 0, 4).unwrap(), [3.0, 6.0, 9.0, 12.0]);
+        // A dropped graph is recorded again, and a drop of an unknown key does nothing.
+        g.graph_drop(5).unwrap();
+        g.graph_drop(6).unwrap();
+        for _ in 0..2 { g.graph(5, &mut || { calls += 1; g.add(x.addr(), y.addr(), 4) }).unwrap(); }
+        assert_eq!(calls, 2, "f runs again after the drop");
+        assert_eq!(g.get::<f32>(&x, 0, 4).unwrap(), [5.0, 10.0, 15.0, 20.0]);
     }
 }
 

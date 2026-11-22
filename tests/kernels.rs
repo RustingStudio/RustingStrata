@@ -2220,6 +2220,49 @@ fn ink_kernels_match_reference() {
     }
 }
 
+#[test]
+fn ink_pos_kernels_match_fixed_pos() {
+    let xs = |n: usize| (0..n).map(|i| ((i as f32 * 0.37).sin() + (i as f32 * 0.13).cos()) * 0.4).collect::<Vec<_>>();
+    let h16 = |v: &[f32]| v.iter().map(|&x| half::f16::from_f32(x).to_bits()).collect::<Vec<_>>();
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        let (ring, nh, nkv, hd, nr, ext) = (100usize, 6usize, 2usize, 64usize, 4usize, 32usize);
+        let q = xs(nh * hd);
+        let k_init = xs(nkv * hd);
+        let (r, sink, g) = (xs(nh * nr + 1)[1..].to_vec(), xs(nh + 2)[2..].to_vec(), xs(nh * hd + 3)[3..].to_vec());
+        let (k, v, bias) = (xs(ring * nkv * hd + 5)[5..].to_vec(), xs(ring * nkv * hd + 6)[6..].to_vec(), xs(ext * nr + 7)[7..].to_vec());
+        let k_scale = xs(nkv * hd + 9)[9..].to_vec();
+
+        let (dq, dk_in_ref, dk_in_pos, dks) = (up(gpu, &q), up(gpu, &k_init), up(gpu, &k_init), up(gpu, &k_scale));
+        let (dr, ds, dg, db) = (up(gpu, &r), up(gpu, &sink), up(gpu, &g), up(gpu, &bias));
+        let (dk_ref, dv_ref) = (up(gpu, &h16(&k)), up(gpu, &h16(&v)));
+        let (dk_pos, dv_pos) = (up(gpu, &h16(&k)), up(gpu, &h16(&v)));
+        let dpos = gpu.zeros::<i32>(1).unwrap();
+        let sc = gpu.zeros::<f32>(nh * 2 * (hd + 2)).unwrap();
+        let (out_ref, out_pos) = (gpu.zeros::<f32>(nh * hd).unwrap(), gpu.zeros::<f32>(nh * hd).unwrap());
+
+        for pos in [0usize, 65usize, 137usize] {
+            let rows = (pos + 1).min(ring);
+            let at = pos % ring;
+            let max_rows = ((pos / 64 + 1) * 64).min(ring);
+
+            gpu.put(&k_init, &dk_in_ref, 0).unwrap();
+            gpu.put(&k_init, &dk_in_pos, 0).unwrap();
+            gpu.put(&[pos as i32], &dpos, 0).unwrap();
+
+            gpu.ink_clip_n(dk_in_ref.addr(), dks.addr(), hd, nkv, 1, 0.0, 1e-5, 1.0, dk_ref.addr(), at, ring, pos, 0.25, 4.0).unwrap();
+            gpu.ink_clip_pos(dk_in_pos.addr(), dks.addr(), hd, nkv, 1, 0.0, 1e-5, 1.0, dk_pos.addr(), ring, dpos.addr(), 0.25, 4.0).unwrap();
+            assert!(rel_l2(&down::<f32>(gpu, &dk_in_pos), &down::<f32>(gpu, &dk_in_ref)) < 1e-6, "{bk} ink_clip_pos k pos={pos}");
+            assert_eq!(down::<u16>(gpu, &dk_pos), down::<u16>(gpu, &dk_ref), "{bk} ink_clip_pos dst pos={pos}");
+
+            gpu.ink_attn(dq.addr(), dr.addr(), ds.addr(), dg.addr(), dk_ref.addr(), dv_ref.addr(), db.addr(), sc.addr(), out_ref.addr(), rows, at, nh, nkv, hd, nr, ext).unwrap();
+            gpu.ink_attn_pos(dq.addr(), dr.addr(), ds.addr(), dg.addr(), dk_pos.addr(), dv_pos.addr(), db.addr(), sc.addr(), out_pos.addr(), max_rows, ring, dpos.addr(), nh, nkv, hd, nr, ext).unwrap();
+            let e = rel_l2(&down::<f32>(gpu, &out_pos), &down::<f32>(gpu, &out_ref));
+            assert!(e < 1e-6, "{bk} ink_attn_pos pos={pos} err={e}");
+        }
+    }
+}
+
 /// Non-unit per-tensor `scale` (NVFP4 `<stem>.scale` / ModelOpt `weight_scale_2`) multiplies dequant, gemv, gemvn,
 /// gemvq2, gemv_rows, and prefill gemm_dense across act = 0, 1 (SwiGLU), and 2 (accumulate).
 #[test]
