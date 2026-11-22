@@ -276,31 +276,85 @@ pub trait Backend: Send {
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()>;
     /// g = silu(g) * u.
     fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()>;
+    /// Beta*tanh(gate/beta) * sigmoid(gate) * lb*tanh(up/lb) as in `situ`, directly quantized as `quant_xq` into `xq`.
+    fn situ_q(&self, _y: u64, _n: usize, _rows: usize, _scale: u64, _beta: f32, _lb: f32, _xq: u64) -> anyhow::Result<()> { anyhow::bail!("{}: situ_q not implemented", self.name()) }
+    /// `x[i] = cap * tanh(x[i] / cap)` for `i < n`.
+    fn softcap(&self, _x: u64, _n: usize, _cap: f32) -> anyhow::Result<()> { anyhow::bail!("{}: softcap not implemented", self.name()) }
     /// Inkling's activation on `rows` rows of 2n floats at `y`, n gates then n ups: each gate becomes
     /// beta*tanh(gate/beta) * sigmoid(gate) * lb*tanh(up/lb) (`lb` not above 0: times the up as it is).
     fn situ(&self, _y: u64, _n: usize, _rows: usize, _scale: u64, _beta: f32, _lb: f32) -> anyhow::Result<()> { anyhow::bail!("{}: SITU not implemented", self.name()) }
-    // Inkling 2's decode token on the device (`inkling2::device`); the host math is in `inkling2::forward`.
+    // Inkling 2's decode token and batched prefill on the device (`inkling2::device`); the host math is in `inkling2::forward`.
     /// Depth mix: `out[j]` (n floats each, j < nq) = the softmax-weighted sum of the RMS-normed states, scored by
     /// query row j of `q`. The states are the `nb` rows of `blocks` (the newest last) and `cur`.
-    fn ink_mix(&self, _blocks: u64, _nb: usize, _cur: u64, _q: u64, _nq: usize, _out: u64, _n: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
+    fn ink_mix(&self, blocks: u64, nb: usize, cur: u64, q: u64, nq: usize, out: u64, n: usize) -> anyhow::Result<()> {
+        self.ink_mix_n(blocks, nb, cur, q, nq, out, n, 1)
+    }
+    /// Batched depth mix across `nt` tokens: `blocks` `[nb][nt][n]`, `cur` `[nt][n]`, `q` `[nq][n]`, `out` `[nq][nt][n]`.
+    fn ink_mix_n(&self, _blocks: u64, _nb: usize, _cur: u64, _q: u64, _nq: usize, _out: u64, _n: usize, _nt: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
+    }
     /// `count` loop controllers: `out[j] = cur_j - tanh(forget)*cur_j + tanh(gain)*msg[j]`, `cur_j` row
     /// `min(j, nins - 1)` of `cur`. `down` (`[rank][2n]`), `gain` and `forget` (`[rank][n]`) are f16, a controller
     /// after another. `gate`: `count * rank` floats of scratch.
-    fn ink_ctrl(&self, _down: u64, _gain: u64, _forget: u64, _cur: u64, _nins: usize, _msg: u64, _gate: u64, _out: u64, _n: usize, _rank: usize, _count: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
+    fn ink_ctrl(&self, down: u64, gain: u64, forget: u64, cur: u64, nins: usize, msg: u64, gate: u64, out: u64, n: usize, rank: usize, count: usize) -> anyhow::Result<()> {
+        self.ink_ctrl_n(down, gain, forget, cur, nins, msg, gate, out, n, rank, count, 1)
+    }
+    /// Batched loop controllers across `nt` tokens: `cur` `[min(nins, count)][nt][n]`, `msg`/`out` `[count][nt][n]`,
+    /// `gate` `[nt][count][rank]`.
+    fn ink_ctrl_n(&self, _down: u64, _gain: u64, _forget: u64, _cur: u64, _nins: usize, _msg: u64, _gate: u64, _out: u64, _n: usize, _rank: usize, _count: usize, _nt: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
+    }
     /// Short causal convolution with a residual, `out` may be `cur`: weights `w` `[channel][lag]`, the last
     /// `n_conv - 1` inputs in `hist` (advanced by `cur`), and input-dependent `taps` `[channel / per][lag]` or 0.
     fn ink_conv(&self, _cur: u64, _w: u64, _taps: u64, _hist: u64, _out: u64, _n: usize, _n_conv: usize, _per: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
+    /// Batched short causal convolution with a residual over `nt` tokens: `cur` and `out` (`[nt][n]`) must not alias;
+    /// `taps` (`[nt][n / per][n_conv]`) may be 0. Advances `hist` by the last `n_conv - 1` inputs across `hist + cur`.
+    fn ink_conv_batch(&self, _cur: u64, _w: u64, _taps: u64, _hist: u64, _out: u64, _n: usize, _n_conv: usize, _per: usize, _nt: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 batched conv not implemented", self.name())
+    }
     /// `rows` rows of `w` (at most 128) floats at `x`, in place: times `scale` (per value, or 0), then each row
     /// scaled to an L2 norm of at most `thr`, or with `thr` 0 to an RMS of 1 (`eps`); then times `mul`. `dst` not 0:
-    /// the result also goes there as f16.
-    fn ink_clip(&self, _x: u64, _scale: u64, _w: usize, _rows: usize, _thr: f32, _eps: f32, _mul: f32, _dst: u64) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
-    /// Attention of one token over `rows` f16 key and value rows (`nkv * hd` wide; the token's own row is `at`, the
+    /// the result also goes there in the active KV layout.
+    fn ink_clip(&self, x: u64, scale: u64, w: usize, rows: usize, thr: f32, eps: f32, mul: f32, dst: u64) -> anyhow::Result<()> {
+        self.ink_clip_n(x, scale, w, rows, 1, thr, eps, mul, dst, 0, 1, 0, 0.0, 1.0)
+    }
+    /// Batched `ink_clip` over `nt` tokens of `rows` rows each (`x`: `[nt][rows][w]`, `scale`: `[rows][w]` or 0).
+    /// When `dst != 0`, stores token `tok` at KV row `(dst_at0 + tok) % dst_ring`. When `log_alpha != 0.0`,
+    /// scales `mul` by `1 + log_alpha * ln(max((pos0 + tok + 1) / log_floor, 1))`.
+    fn ink_clip_n(
+        &self, _x: u64, _scale: u64, _w: usize, _rows: usize, _nt: usize,
+        _thr: f32, _eps: f32, _mul: f32,
+        _dst: u64, _dst_at0: usize, _dst_ring: usize,
+        _pos0: usize, _log_alpha: f32, _log_floor: f32,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
+    }
+    /// Attention of one token over `rows` key and value rows (`nkv * hd` wide in active KV format; the token's own row is `at`, the
     /// row before it `at - 1` modulo `rows`). Logit: q.k / sqrt(hd) + r.bias[distance] (distance < `ext`) - sink, a
     /// softmax with one more logit of 0, times sigmoid(gate). `hd` divides 128. `sc`: `nh * rows.div_ceil(64) * (hd + 2)`
     /// floats of scratch.
     fn ink_attn(&self, _q: u64, _r: u64, _sink: u64, _gate: u64, _k: u64, _v: u64, _bias: u64, _sc: u64, _out: u64, _rows: usize, _at: usize, _nh: usize, _nkv: usize, _hd: usize, _nr: usize, _ext: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
-    /// `acc[c] = cpu[c] + sum over e < ne of wts[e] * d[e * n + c]`.
-    fn ink_ffn_sum(&self, _acc: u64, _d: u64, _wts: u64, _ne: usize, _n: usize, _cpu: u64) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
+    /// Batched causal Inkling 2 attention over `nt` query tokens starting at position `pos` (`hd` 32/64/128).
+    /// When `kc_new != 0`, keys/values for `kp >= pos` read row `kp - pos` of `kc_new`/`vc_new` so SWA history `< pos` in `kc`/`vc` is preserved.
+    /// `q`/`gate`/`out`: `[nt][nh][hd]`, `r`: `[nt][nh][nr]`, `sink`: `[nt][nh]`, `bias`: `[ext][nr]`.
+    fn ink_attn_prefill(
+        &self, _q: u64, _r: u64, _sink: u64, _gate: u64, _kc: u64, _vc: u64, _kc_new: u64, _vc_new: u64, _bias: u64, _out: u64,
+        _pos: usize, _nt: usize, _nh: usize, _nkv: usize, _hd: usize, _nr: usize, _ext: usize, _ring: usize, _win: usize,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 prefill attention not implemented", self.name())
+    }
+    /// `acc[c] = (cpu ? cpu[c] : 0) + sum over e < ne of wts[e] * d[e * n + c]`.
+    fn ink_ffn_sum(&self, acc: u64, d: u64, wts: u64, ne: usize, n: usize, cpu: u64) -> anyhow::Result<()> {
+        self.ink_ffn_sum_n(acc, d, wts, ne, n, 1, cpu)
+    }
+    /// Batched `ink_ffn_sum` over `nt` tokens (`acc`/`cpu`: `[nt][n]`, `d`: `[nt][ne][n]`, `wts`: `[nt][ne]`).
+    fn ink_ffn_sum_n(&self, _acc: u64, _d: u64, _wts: u64, _ne: usize, _n: usize, _nt: usize, _cpu: u64) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
+    }
+    /// Inkling 2 sigmoid top-k router for `rows` tokens: picks top `k` from `logits` (`[rows, n_expert]`) using
+    /// `sigmoid(logit) + bias`, writes indices `[rows, k]` to `ids`, normalized unbiased probs * `exp_scale` (* `dn_sc[id]`
+    /// if non-null) to `wts`, and optional `gu_sc[id]` (or `1.0`) to `gsc_out`.
+    fn ink_route(&self, _logits: u64, _bias: u64, _ids: u64, _wts: u64, _gu_sc: u64, _dn_sc: u64, _gsc_out: u64, _n_expert: usize, _k: usize, _exp_scale: f32, _rows: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 router not implemented", self.name()) }
     /// Gyro files (`config::Hadamard`): each of `rows` rows of n floats at `x` (times silu(x) * u first when `u` is
     /// not 0) becomes H (s x) per `block` values, written to `out`, which may be `x`. `s`: the row's n signs as floats.
     fn hadamard(&self, _x: u64, _u: u64, _s: u64, _out: u64, _n: usize, _block: usize, _rows: usize) -> anyhow::Result<()> {

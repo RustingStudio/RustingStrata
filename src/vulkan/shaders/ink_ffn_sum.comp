@@ -3,11 +3,12 @@ layout(local_size_x = 256) in;
 #include "common.glsl"
 layout(push_constant) uniform P { F32 acc; F32 d; F32 wts; F32 cpu; uint ne; uint n; } p;
 
-// acc = cpu + the sum of the ne rows of d (n floats each) times their weights. CUDA: ink_ffn_sum.
+// acc[tok] = (cpu ? cpu[tok] : 0) + sum_{e < ne} wts[tok, e] * d[(tok * ne + e) * n + c]. Workgroup y = tok. CUDA: ink_ffn_sum.
 void main() {
-    uint c = gl_GlobalInvocationID.x;
+    uint c = gl_GlobalInvocationID.x, tok = gl_WorkGroupID.y;
     if (c >= p.n) return;
-    float o = p.cpu.v[c];
-    for (uint e = 0; e < p.ne; e++) o += p.wts.v[e] * p.d.v[e * p.n + c];
-    p.acc.v[c] = o;
+    float o = uint64_t(p.cpu) != 0 ? p.cpu.v[tok * p.n + c] : 0.0;
+    uint db = tok * p.ne * p.n + c, wb = tok * p.ne;
+    for (uint e = 0; e < p.ne; e++) o += p.wts.v[wb + e] * p.d.v[db + e * p.n];
+    p.acc.v[tok * p.n + c] = o;
 }

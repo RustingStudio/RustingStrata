@@ -314,7 +314,10 @@ pub struct ChatRequest {
     pub tool_calls: bool,
     pub max_tokens: Option<usize>,
     pub stream: bool,
+    pub include_usage: bool,
     pub think: Option<bool>,
+    /// Optional reasoning effort (`"none"|"minimal"|"low"|"medium"|"high"|"xhigh"|"max"` or float in `[0.0, 0.99]`).
+    pub reasoning_effort: Option<String>,
     /// Maximum tokens allowed inside `<think>` before forcing `</think>\n\n` (0 = unlimited).
     pub thinking_budget: Option<usize>,
     /// `chat_template_kwargs.preserve_thinking`; the server's `--preserve-thinking` when absent.
@@ -374,6 +377,21 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
     // Hold checks every prefix of every stop string at each token, so both are bounded.
     if stop.len() > 16 || stop.iter().any(|s| s.len() > 256) { bail!("stop takes at most 16 strings of at most 256 bytes"); }
     let think = v["chat_template_kwargs"]["enable_thinking"].as_bool();
+    let include_usage = v["stream_options"]["include_usage"].as_bool().unwrap_or(false);
+    let raw_effort = if !v["reasoning_effort"].is_null() {
+        &v["reasoning_effort"]
+    } else {
+        &v["chat_template_kwargs"]["reasoning_effort"]
+    };
+    let reasoning_effort = match raw_effort {
+        Value::Null => None,
+        Value::String(s) => Some(s.trim().to_string()),
+        Value::Number(n) => {
+            let f = n.as_f64().context("reasoning_effort must be a finite number")?;
+            Some(if f == 0.0 { "0".into() } else { format!("{f}") })
+        }
+        _ => bail!("reasoning_effort must be a string or a number"),
+    };
     let thinking_budget = match int("thinking_budget", 0)? {
         Some(n) => Some(n as usize),
         None => match &v["chat_template_kwargs"]["thinking_budget"] {
@@ -381,7 +399,7 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
             x => Some(x.as_u64().context("chat_template_kwargs.thinking_budget must be an integer >= 0")? as usize),
         },
     };
-    Ok(ChatRequest { messages, tools, tool_calls, max_tokens, stream: v["stream"].as_bool().unwrap_or(false), think, thinking_budget,
+    Ok(ChatRequest { messages, tools, tool_calls, max_tokens, stream: v["stream"].as_bool().unwrap_or(false), include_usage, think, reasoning_effort, thinking_budget,
         preserve_thinking: v["chat_template_kwargs"]["preserve_thinking"].as_bool(),
         temperature: num("temperature", |f| f >= 0.0, "a number >= 0")?, top_k: int("top_k", 0)?.map(|n| n as usize),
         top_p: num("top_p", |f| f > 0.0 && f <= 1.0, "a number in (0, 1]")?,

@@ -63,3 +63,77 @@ fn chunked_prefill_matches_token_by_token() {
     let limit = if std::env::var("STRATA_DS_GPU").as_deref() == Ok("1") { 3.0 } else { 1e-3 };
     assert!(worst < limit, "chunked prefill logits differ by {worst}");
 }
+
+/// A draft run verifies its rows through the GEMM and the baseline steps through the GEMV, and the expert cache is in
+/// another state, so the logits differ a little (see `chunked_prefill_matches_token_by_token`). The tokens must be
+/// the baseline's up to the first step where the baseline's two candidates are closer than that noise. A rollback
+/// that leaves a rejected draft in the state moves the logits by 10 or more.
+fn same_up_to_tie(what: &str, got: &[u32], want: &[u32], logits: &[Vec<f32>]) {
+    let Some(i) = (0..want.len().min(got.len())).find(|&i| got[i] != want[i]) else {
+        assert_eq!(got.len(), want.len(), "{what}: the run stops at another step than the baseline");
+        return;
+    };
+    let gap = logits[i][want[i] as usize] - logits[i][got[i] as usize];
+    eprintln!("{what}: token {i} differs from the baseline at a logit gap of {gap:.4}");
+    assert!(gap < 1.0, "{what}: token {i} differs from the baseline at a logit gap of {gap}");
+}
+
+/// Greedy decode of `n_gen` tokens through `spec_step_argmax`.
+fn spec_run(m: &mut Inkling2Model, ids: &[u32], n_gen: usize, eos: &[u32]) -> Vec<u32> {
+    let mut next = rusting_strata::ops::argmax(&m.prefill(ids)) as u32;
+    let (mut got, mut pending) = (vec![], std::collections::VecDeque::<u32>::new());
+    for i in 0..n_gen {
+        if eos.contains(&next) { break; }
+        got.push(next);
+        if i + 1 < n_gen {
+            if pending.is_empty() { pending.extend(m.spec_step_argmax(next, n_gen - (i + 1), eos)); }
+            next = pending.pop_front().unwrap();
+        }
+    }
+    got
+}
+
+/// Drafts need the GPU path (a draft batch is verified in one pass there), so this runs with `STRATA_DS_GPU=1`.
+/// `STRATA_INKLING2_DSPARK` (path to a DSpark draft file) adds the draft-model part.
+#[test]
+fn speculative_ngram_and_dspark_match_greedy() {
+    let Some(g) = open() else { return };
+    if std::env::var("STRATA_DS_GPU").as_deref() != Ok("1") { eprintln!("STRATA_DS_GPU is not 1, skipping"); return; }
+    let _lock = common::gpu_lock();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let eos = tok.eos_ids();
+    let ids = tok.encode(&format!("{HEAD}Repeat this exact sentence three times: The quick brown fox jumps over the lazy dog.<|end_message|>")).unwrap();
+    let n_gen = 32usize;
+
+    let mut base = Inkling2Model::new_with_ctx(&g, 2048).unwrap();
+    let (mut want, mut logits) = (vec![], vec![base.prefill(&ids)]);
+    for i in 0..n_gen {
+        let next = rusting_strata::ops::argmax(&logits[i]) as u32;
+        if eos.contains(&next) { break; }
+        want.push(next);
+        if i + 1 < n_gen { logits.push(base.step(next)); }
+    }
+    drop(base);
+
+    // n-grams of 3 tokens: the repeated sentence gives drafts, and most are rejected, so the rollback runs.
+    let mut ng_cfg = rusting_strata::ngram::NgramConfig::default();
+    ng_cfg.types = vec![rusting_strata::ngram::SpecType::NgramSimple];
+    ng_cfg.size_n = 3;
+    ng_cfg.draft_max = 8;
+    ng_cfg.n_vocab = 200058;
+    let mut m = Inkling2Model::new_with_ctx(&g, 2048).unwrap();
+    m.ngram = Some(rusting_strata::ngram::NgramDrafter::new(ng_cfg, Some(&tok)).unwrap());
+    let got = spec_run(&mut m, &ids, n_gen, &eos);
+    eprintln!("ngram-simple drafts: accepted {}/{}", m.drafts.1, m.drafts.0);
+    assert!(m.drafts.0 > 0, "ngram-simple proposed no drafts on a repeated sentence");
+    same_up_to_tie("ngram-simple", &got, &want, &logits);
+    drop(m);
+
+    let Ok(dspark) = std::env::var("STRATA_INKLING2_DSPARK") else { return };
+    let opts = rusting_strata::inkling2::chat::Inkling2Opts { max_ctx: 2048, draft_model: Some(dspark.into()), ..Default::default() };
+    let mut m = opts.build_model(&g, &tok).unwrap();
+    let got = spec_run(&mut m, &ids, n_gen, &eos);
+    eprintln!("DSpark drafts: accepted {}/{}", m.drafts.1, m.drafts.0);
+    assert!(m.drafts.0 > 0, "DSpark proposed no drafts");
+    same_up_to_tie("DSpark", &got, &want, &logits);
+}

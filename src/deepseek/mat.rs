@@ -21,8 +21,28 @@ pub(crate) mod dev {
     const SHIFT: u32 = 24;
     pub fn gpu_of(id: u32) -> usize { (id >> SHIFT) as usize }
     pub(crate) struct Part { pub(crate) be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, stage: Buf, bytes: usize, budget: usize, room: usize }
+    pub struct SlabBuf { buf: Buf, bytes: usize, freed: std::sync::Arc<std::sync::atomic::AtomicUsize> }
+    impl SlabBuf {
+        pub fn addr(&self) -> u64 { self.buf.addr() }
+        pub fn len(&self) -> usize { self.bytes }
+    }
+    impl Drop for SlabBuf {
+        fn drop(&mut self) {
+            self.freed.fetch_add(self.bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     #[derive(Default)]
-    pub struct Dev { pub(crate) parts: Vec<Part>, ex: std::collections::HashMap<usize, usize>, exs: Vec<(u32, usize, u64, f32)>, now: u64, cur: usize, lookups: u64 }
+    pub struct Dev {
+        pub(crate) parts: Vec<Part>,
+        pub ex: std::collections::HashMap<usize, usize>,
+        pub exs: Vec<(u32, usize, u64, f32)>,
+        uploaded: std::collections::HashMap<(usize, usize), u32>,
+        slabs: std::collections::HashMap<(usize, usize), std::sync::Weak<SlabBuf>>,
+        freed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        now: u64,
+        cur: usize,
+        lookups: u64,
+    }
     static DEV: LazyLock<Mutex<Dev>> = LazyLock::new(Default::default);
     /// Whether `DEV` is open: None before the first `get` and after `free`.
     static OPEN: Mutex<Option<bool>> = Mutex::new(None);
@@ -76,16 +96,52 @@ pub(crate) mod dev {
         Some(Dev { parts, ..Default::default() })
     }
     impl Dev {
-        pub fn bytes(&self) -> usize { self.parts.iter().map(|p| p.bytes).sum() }
+        fn reclaim(&mut self) {
+            let n = self.freed.swap(0, std::sync::atomic::Ordering::Relaxed);
+            if n > 0 && let Some(p) = self.parts.first_mut() {
+                p.bytes = p.bytes.saturating_sub(n);
+            }
+        }
+        pub fn bytes(&self) -> usize {
+            self.parts.iter().map(|p| p.bytes).sum::<usize>().saturating_sub(self.freed.load(std::sync::atomic::Ordering::Relaxed))
+        }
         pub fn info(&self) -> (&'static str, usize, usize) { (self.parts[0].be.name(), self.ex.len(), self.bytes()) }
         /// Bytes still available under the expert budget (plain weights already subtracted).
-        pub fn budget_left(&self) -> usize { self.parts.iter().map(|p| p.budget.saturating_sub(p.bytes)).sum() }
+        pub fn budget_left(&self) -> usize {
+            let f = self.freed.load(std::sync::atomic::Ordering::Relaxed);
+            self.parts.iter().enumerate().map(|(i, p)| {
+                let b = if i == 0 { p.bytes.saturating_sub(f) } else { p.bytes };
+                p.budget.saturating_sub(b)
+            }).sum()
+        }
+        /// Allocates and uploads a contiguous buffer inside GPU 0 when both `p.budget` and live `mem_info()` keep the
+        /// given byte reserves free. Static mmap slices with `cache_key` deduplicate across multiple model instances.
+        pub fn alloc_slab(&mut self, data: &[u8], cache_key: Option<(usize, usize)>, budget_reserve: usize, free_reserve: usize) -> Option<std::sync::Arc<SlabBuf>> {
+            self.reclaim();
+            if let Some(k) = cache_key && let Some(hit) = self.slabs.get(&k).and_then(std::sync::Weak::upgrade) {
+                return Some(hit);
+            }
+            let p = self.parts.first_mut()?;
+            if p.bytes + data.len() + budget_reserve > p.budget { return None; }
+            if let Ok((free, _)) = p.be.mem_info() && free < data.len() + free_reserve { return None; }
+            let b = p.be.alloc(data.len()).ok()?;
+            if p.be.htod(data, &b, 0).is_err() { return None; }
+            p.bytes += data.len();
+            let arc = std::sync::Arc::new(SlabBuf { buf: b, bytes: data.len(), freed: self.freed.clone() });
+            if let Some(k) = cache_key {
+                self.slabs.retain(|_, v| v.strong_count() > 0);
+                self.slabs.insert(k, std::sync::Arc::downgrade(&arc));
+            }
+            Some(arc)
+        }
         /// The GPU that takes `len` more bytes of plain weights: the current one while they fit, then the next; the last takes all.
         pub fn pick(&mut self, len: usize) -> usize {
+            self.reclaim();
             while self.cur + 1 < self.parts.len() && self.parts[self.cur].bytes + len > self.parts[self.cur].room { self.cur += 1; }
             self.cur
         }
         pub fn upload_on(&mut self, d: usize, data: &[u8], ty: GgmlType, rows: usize, cols: usize, scale: f32) -> Option<u32> {
+            self.reclaim();
             let p = &mut self.parts[d];
             let t = p.be.upload(&Tensor { ty, cols, rows, data, scale }).ok()?;
             p.bytes += data.len();
@@ -93,8 +149,14 @@ pub(crate) mod dev {
             Some((d as u32) << SHIFT | (p.ts.len() as u32 - 1))
         }
         pub fn upload(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize, scale: f32) -> Option<u32> {
+            let key = (data.as_ptr() as usize, data.len());
+            if let Some(&id) = self.uploaded.get(&key) {
+                return Some(id);
+            }
             let d = self.pick(data.len());
-            self.upload_on(d, data, ty, rows, cols, scale)
+            let id = self.upload_on(d, data, ty, rows, cols, scale)?;
+            self.uploaded.insert(key, id);
+            Some(id)
         }
         pub(crate) fn tensor(&self, i: u32) -> &GpuTensor { &self.parts[gpu_of(i)].ts[(i & (1 << SHIFT) - 1) as usize] }
         /// Free the least recently used expert slots of GPU `d` until `bytes` are freed or none is left, for state
@@ -127,6 +189,7 @@ pub(crate) mod dev {
         /// Whether the expert that starts at `data` has a VRAM slot (no lookup is counted).
         pub fn resident(&self, data: &[u8]) -> bool { self.ex.contains_key(&(data.as_ptr() as usize)) }
         pub fn expert(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize, scale: f32, evict: bool) -> Option<u32> {
+            self.reclaim();
             let k = data.as_ptr() as usize;
             self.now += 1;
             self.lookups += 1;

@@ -5,26 +5,22 @@ layout(push_constant) uniform P { F32 q; F32 r; F32 sink; U16 k; U16 v; F32 bias
                                   uint rows; uint at; uint nh; uint nkv; uint hd; uint nr; uint ext; } p;
 
 // Inkling 2's attention of one token, first of two dispatches: workgroup (head, chunk) of 4 warps takes the 64 rows
-// from chunk * 64, a warp one row at a time. Row i of k and v (f16, nkv * hd wide) is at distance (at - i) mod rows;
-// hd divides 128. Logit: q.k / sqrt(hd) + r.bias[distance] - sink. Writes (max logit, sum of exp, hd sums of exp * v)
-// of each (head, chunk) to sc: nh * chunks * (hd + 2) floats. ink_attn_merge joins them. CUDA: ink_attn.
+// from chunk * 64, a warp one row at a time. Supports KV_MODE 0/1/2/3 via ldkv(). CUDA: ink_attn.
 shared float qs[128];
 shared float ps[64];
 shared float acc[128];
-float half_at(U16 b, uint i) { return unpackHalf2x16(uint(b.v[i])).x; }
 void main() {
     uint h = gl_WorkGroupID.x, kh = h / (p.nh / p.nkv), kw = p.nkv * p.hd, t = gl_LocalInvocationID.x;
     uint i0 = gl_WorkGroupID.y * 64, n = min(64u, p.rows - i0);
     if (t < p.hd) qs[t] = p.q.v[h * p.hd + t];
     barrier();
     float scale = fdiv(1.0, sqrt_(float(p.hd)));
-    // Every invocation runs the same number of passes: the warp sums need all 32 lanes.
     for (uint j = WARP; j < 64; j += 4) {
         uint i = i0 + j, dist = p.at >= i ? p.at - i : p.at + p.rows - i;
         float d = 0.0;
         if (j < n) {
             uint ko = i * kw + kh * p.hd;
-            for (uint c = LANE; c < p.hd; c += 32) d += qs[c] * half_at(p.k, ko + c);
+            for (uint c = LANE; c < p.hd; c += 32) d += qs[c] * ldkv(p.k, ko + c, p.hd);
             d *= scale;
             if (dist < p.ext) for (uint c = LANE; c < p.nr; c += 32) d += p.r.v[h * p.nr + c] * p.bias.v[dist * p.nr + c];
         }
@@ -39,7 +35,7 @@ void main() {
     barrier();
     uint c = t % p.hd, parts = 128 / p.hd;
     float a = 0.0;
-    for (uint j = t / p.hd; j < n; j += parts) a += ps[j] * half_at(p.v, (i0 + j) * kw + kh * p.hd + c);
+    for (uint j = t / p.hd; j < n; j += parts) a += ps[j] * ldkv(p.v, (i0 + j) * kw + kh * p.hd + c, p.hd);
     acc[t] = a;
     barrier();
     uint o = (h * gl_NumWorkGroups.y + gl_WorkGroupID.y) * (p.hd + 2);

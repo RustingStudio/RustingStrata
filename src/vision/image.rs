@@ -208,6 +208,45 @@ pub fn resize_bilinear_antialias_f32(src: &[f32], n_embd: usize, sw: usize, sh: 
     dst
 }
 
+/// Bilinear resize (no antialias, no align-corners) of a `[n_embd][w][h]` (feature-fastest) f32 plane,
+/// matching `ggml_interpolate` with `GGML_SCALE_MODE_BILINEAR`.
+pub fn resize_bilinear_f32(src: &[f32], n_embd: usize, sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f32> {
+    let mut dst = vec![0.0f32; n_embd * dw * dh];
+    if sw == dw && sh == dh { dst.copy_from_slice(src); return dst; }
+    let sf0 = dw as f32 / sw as f32;
+    let sf1 = dh as f32 / sh as f32;
+    let pixel_offset = 0.5f32;
+    for y in 0..dh {
+        let yf = (y as f32 + pixel_offset) / sf1 - pixel_offset;
+        let y0_i = yf.floor() as i64;
+        let y1_i = y0_i + 1;
+        let y0 = y0_i.clamp(0, sh as i64 - 1) as usize;
+        let y1 = y1_i.clamp(0, sh as i64 - 1) as usize;
+        let dy = (yf - y0_i as f32).clamp(0.0, 1.0);
+        for x in 0..dw {
+            let xf = (x as f32 + pixel_offset) / sf0 - pixel_offset;
+            let x0_i = xf.floor() as i64;
+            let x1_i = x0_i + 1;
+            let x0 = x0_i.clamp(0, sw as i64 - 1) as usize;
+            let x1 = x1_i.clamp(0, sw as i64 - 1) as usize;
+            let dx = (xf - x0_i as f32).clamp(0.0, 1.0);
+            let i00 = (x0 + sw * y0) * n_embd;
+            let i10 = (x1 + sw * y0) * n_embd;
+            let i01 = (x0 + sw * y1) * n_embd;
+            let i11 = (x1 + sw * y1) * n_embd;
+            let w00 = (1.0 - dx) * (1.0 - dy);
+            let w10 = dx * (1.0 - dy);
+            let w01 = (1.0 - dx) * dy;
+            let w11 = dx * dy;
+            let dst_off = (x + dw * y) * n_embd;
+            for c in 0..n_embd {
+                dst[dst_off + c] = src[i00 + c] * w00 + src[i10 + c] * w10 + src[i01 + c] * w01 + src[i11 + c] * w11;
+            }
+        }
+    }
+    dst
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

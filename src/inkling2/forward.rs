@@ -62,7 +62,7 @@ struct Loop {
     forget: Vec<Vec<f16>>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Slot {
     /// Key and value rows of the visible positions per key head, the newest last. f16, as llama.cpp keeps them: a
     /// token reads all of them, so the scores run at the speed of the memory.
@@ -72,8 +72,22 @@ struct Slot {
     hist: [Vec<f32>; 4],
 }
 
+/// Snapshot of an `Inkling2Model` at a token boundary (`toks.len()`). Full-attention GPU KV rows `< toks.len()`
+/// are never overwritten by future positions, so a GPU checkpoint only snapshots the conv histories and SWA ring buffers.
+#[derive(Clone)]
+pub struct Checkpoint {
+    pub toks: Vec<u32>,
+    slots: Vec<Slot>,
+    dev_hist: Vec<Vec<f32>>,
+    dev_swa: Vec<Option<(Vec<u16>, Vec<u16>)>>,
+    dev_synced: usize,
+    dev_ahead: bool,
+}
+
 pub struct Inkling2Model<'a> {
     pub cfg: Inkling2Config,
+    /// Active context cap for this instance (`1..=cfg.ctx`).
+    pub max_ctx: usize,
     tok_embd: Mat<'a>,
     tok_norm: Vec<f32>,
     layers: Vec<Layer<'a>>,
@@ -93,6 +107,14 @@ pub struct Inkling2Model<'a> {
     /// The state of `step` in VRAM, made by the first `step`. `no_device`: it cannot be made, `run` does every token.
     device: Option<Box<device::Device>>,
     no_device: bool,
+    /// Optional context-lookup speculative drafter (`--spec-type`).
+    pub ngram: Option<crate::ngram::NgramDrafter>,
+    /// Optional Inkling 2 DSpark speculative draft model (`--draft-model`).
+    pub dspark: Option<super::dspark::DsparkDrafter>,
+    /// Maximum draft tokens per speculative step (`1..=15`, default 3 for DSpark so `nt <= 4` stays on fast `gemvq`).
+    pub spec_draft_max: usize,
+    /// Speculative decoding stats: `(drafts_proposed, drafts_accepted)`.
+    pub drafts: (usize, usize),
 }
 
 /// A token of `device` counts all the device work before the router as "mix": the queue runs while the host waits
@@ -419,6 +441,14 @@ fn run_experts(list: &[(Mat, Mat, f32, f32)], x: &[f32], cfg: &Inkling2Config) -
 
 impl<'a> Inkling2Model<'a> {
     pub fn new(g: &'a Gguf) -> Result<Self> {
+        Self::new_with_ctx(g, 0)
+    }
+
+    /// Load the model with a context limit up to `cfg.ctx`.
+    pub fn new_with_ctx(g: &'a Gguf, max_ctx: usize) -> Result<Self> {
+        if std::env::var_os("STRATA_DS_GPU_FRACTION").is_none() {
+            unsafe { std::env::set_var("STRATA_DS_GPU_FRACTION", "0.90"); }
+        }
         let cfg = Inkling2Config::from_gguf(g)?;
         let has = |n: &str| g.tensors.contains_key(n);
         let mut layers = vec![];
@@ -478,7 +508,9 @@ impl<'a> Inkling2Model<'a> {
             }).collect::<Result<Vec<_>>>();
             loops.push(Loop { msg_query: v("msg_query")?, down: ctrl("down")?, gain: ctrl("gain")?, forget: ctrl("forget")? });
         }
-        Ok(Self {
+        let ctx_cap = if max_ctx == 0 { cfg.n_ctx } else { max_ctx.clamp(1, cfg.n_ctx) };
+        let mut m = Self {
+            max_ctx: ctx_cap,
             tok_embd: host_mat(g, "token_embd.weight")?,
             tok_norm: f32s(g, "token_embd_norm.weight")?,
             layers,
@@ -494,14 +526,54 @@ impl<'a> Inkling2Model<'a> {
             prof: Default::default(),
             device: None,
             no_device: false,
+            ngram: None,
+            dspark: None,
+            spec_draft_max: 3,
+            drafts: (0, 0),
             cfg,
-        })
+        };
+        if !m.trace && std::env::var_os("STRATA_DS_DUMP").is_none() {
+            m.device = device::Device::new(&m).map(Box::new);
+            m.no_device = m.device.is_none();
+        }
+        Ok(m)
     }
 
     pub fn reset(&mut self) {
         for s in &mut self.slots { *s = Slot::default(); }
         self.toks.clear();
         if let Some(d) = &mut self.device { d.forget(); }
+        if let Some(ng) = &mut self.ngram { ng.reset(); }
+        if let Some(ds) = &mut self.dspark { ds.reset(); }
+    }
+
+    pub fn has_spec(&self) -> bool {
+        self.ngram.as_ref().is_some_and(|ng| ng.cfg.is_enabled()) || self.dspark.is_some()
+    }
+
+    /// Look up `tok` in `tok_embd` and RMS-normalize with `tok_norm` (`cfg.eps`), writing `out` (`[n_embd]`).
+    pub fn embed_normed(&self, tok: u32, out: &mut [f32]) {
+        assert!((tok as usize) < self.tok_embd.rows, "token {tok} is outside the vocabulary");
+        let mut emb = vec![0.0f32; self.cfg.n_embd];
+        self.tok_embd.row_into(tok as usize, &mut emb);
+        rms_norm_w(&emb, &self.tok_norm, self.cfg.eps, out);
+    }
+
+    /// Project a single hidden state `h` (`[n_embd]`) through the target LM head (`output.weight`) with optional
+    /// `softcap` and return the greedy argmax token ID (`0..cfg.n_vocab`).
+    pub fn lm_head_argmax(&self, h: &[f32], softcap: f32) -> u32 {
+        if let Some(d) = &self.device
+            && let Ok(id) = d.lm_head_argmax(self, h, softcap)
+        {
+            return id;
+        }
+        let mut logits = vec![0.0f32; self.output.rows];
+        self.output.matvec(h, &mut logits);
+        logits.truncate(self.cfg.n_vocab);
+        if softcap != 0.0 {
+            logits.par_iter_mut().for_each(|v| *v = softcap * (*v / softcap).tanh());
+        }
+        crate::ops::argmax(&logits) as u32
     }
 
     /// Add the time since `t` to part `i` of the profile; returns the time now.
@@ -865,7 +937,12 @@ impl<'a> Inkling2Model<'a> {
     }
 
     /// Run one token. Returns the logits of the next one.
-    pub fn step(&mut self, tok: u32) -> Vec<f32> {
+    fn step_with<T>(
+        &mut self,
+        tok: u32,
+        on_dev: impl FnOnce(&mut device::Device, &Self) -> T,
+        on_host: impl FnOnce(Vec<f32>) -> T,
+    ) -> T {
         let (pos, t0) = (self.toks.len(), std::time::Instant::now());
         if self.device.is_none() && !self.no_device {
             self.device = device::Device::new(self).map(Box::new);
@@ -874,46 +951,371 @@ impl<'a> Inkling2Model<'a> {
         if let Some(mut d) = self.device.take() {
             match d.prepare(self, pos) {
                 Ok(()) => {
-                    let logits = d.step(self, tok);
+                    let out = on_dev(&mut d, self);
                     self.device = Some(d);
                     self.toks.push(tok);
                     self.report(pos, 1, t0);
-                    return logits;
+                    return out;
                 }
                 Err(e) => {
                     eprintln!("inkling2: no room in VRAM for the decode state ({e:#}); the tokens run as prompt chunks do");
-                    d.to_host(&self.cfg, &self.layers, &mut self.slots, pos);
+                    d.to_host(&self.cfg, &self.layers, &mut self.slots, pos, self.max_ctx);
                     self.no_device = true;
                 }
             }
         }
-        self.run(&[tok], true)
+        on_host(self.run(&[tok], true))
     }
 
-    /// Run the prompt tokens in chunks of `STRATA_DS_CHUNK` (default 512; 1 or a tensor dump: token by token).
-    /// Returns the logits after the last one.
+    pub fn step(&mut self, tok: u32) -> Vec<f32> {
+        if self.dspark.is_some() {
+            return self.verify_one(tok);
+        }
+        let out = self.step_with(tok, |d, m| d.step(m, tok), |l| l);
+        if let Some(ng) = &mut self.ngram { ng.accept(&[tok]); }
+        out
+    }
+
+    pub fn step_argmax(&mut self, tok: u32) -> u32 {
+        if self.dspark.is_some() {
+            let l = self.verify_one(tok);
+            return crate::ops::argmax(&l) as u32;
+        }
+        let out = self.step_with(tok, |d, m| d.step_argmax(m, tok), |l| crate::ops::argmax(&l) as u32);
+        if let Some(ng) = &mut self.ngram { ng.accept(&[tok]); }
+        out
+    }
+
+    fn verify_one(&mut self, tok: u32) -> Vec<f32> {
+        let pos0 = self.toks.len();
+        let (mut logits, feats) = self.verify_batch(&[tok], self.dspark.is_some());
+        self.commit_batch(pos0, 1, 1, &[tok], feats.as_deref());
+        logits.pop().unwrap_or_default()
+    }
+
+    fn verify_batch(&mut self, cand: &[u32], capture_dspark: bool) -> (Vec<Vec<f32>>, Option<Vec<f32>>) {
+        let pos0 = self.toks.len();
+        if self.device.is_none() && !self.no_device {
+            self.device = device::Device::new(self).map(Box::new);
+            self.no_device = self.device.is_none();
+        }
+        if let Some(mut d) = self.device.take() {
+            match d.prepare(self, pos0 + cand.len() - 1) {
+                Ok(()) => match d.verify_forward(self, cand, capture_dspark) {
+                    Ok(res) => {
+                        self.device = Some(d);
+                        return res;
+                    }
+                    Err(e) => {
+                        eprintln!("inkling2: GPU verify failed ({e:#}); falling back to host");
+                        d.to_host(&self.cfg, &self.layers, &mut self.slots, pos0, self.max_ctx);
+                        self.no_device = true;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("inkling2: no room in VRAM for verify ({e:#}); falling back to host");
+                    d.to_host(&self.cfg, &self.layers, &mut self.slots, pos0, self.max_ctx);
+                    self.no_device = true;
+                }
+            }
+        }
+        self.host_verify_forward(cand, capture_dspark)
+    }
+
+    fn commit_batch(&mut self, pos0: usize, keep: usize, nt: usize, cand: &[u32], feats: Option<&[f32]>) {
+        if let Some(d) = &self.device {
+            d.commit_verify(self, pos0, keep, nt).expect("inkling2 commit_verify");
+            self.toks.extend_from_slice(&cand[..keep]);
+        }
+        if let Some(ng) = &mut self.ngram {
+            ng.accept(&cand[..keep]);
+        }
+        if let (Some(ds), Some(f)) = (&mut self.dspark, feats) {
+            ds.inject_subset(pos0, keep, nt, f);
+        }
+    }
+
+    fn propose_drafts(&mut self, anchor_tok: u32, max_draft: usize, eos: &[u32]) -> Vec<u32> {
+        // Drafts are verified in one batch on the GPU; without a device there is nothing to gain from them.
+        if self.device.is_none() && self.no_device { return Vec::new(); }
+        let cap_ng = max_draft.min(device::VERIFY_MAX - 1);
+        let cap_ds = max_draft.min(self.spec_draft_max).min(device::VERIFY_MAX - 1);
+        let mut draft = Vec::new();
+        if cap_ng > 0 && let Some(ng) = &mut self.ngram && ng.cfg.is_enabled() {
+            draft = ng.draft(anchor_tok, cap_ng);
+        }
+        if draft.is_empty() && cap_ds > 0 && self.dspark.is_some() {
+            let pos0 = self.toks.len();
+            let ds = self.dspark.take().unwrap();
+            draft = ds.draft(self, anchor_tok, pos0, cap_ds);
+            self.dspark = Some(ds);
+        }
+        if let Some(p) = draft.iter().position(|t| eos.contains(t)) {
+            draft.truncate(p + 1);
+        }
+        draft
+    }
+
+    /// Greedy speculative step from `anchor_tok`: proposes up to `max_draft` draft tokens, verifies `[anchor_tok, drafts..]`
+    /// in one batched pass, commits `[anchor_tok, accepted_drafts..]` into `self.toks`, and returns the newly verified
+    /// tokens `[accepted_drafts.., bonus]` (where `bonus` is the next anchor token, not yet in `self.toks`, unless an
+    /// accepted draft was EOS).
+    pub fn spec_step_argmax(&mut self, anchor_tok: u32, max_draft: usize, eos: &[u32]) -> Vec<u32> {
+        let draft = self.propose_drafts(anchor_tok, max_draft, eos);
+        if draft.is_empty() {
+            return vec![self.step_argmax(anchor_tok)];
+        }
+        let pos0 = self.toks.len();
+        let mut cand = Vec::with_capacity(1 + draft.len());
+        cand.push(anchor_tok);
+        cand.extend_from_slice(&draft);
+        let (logits, feats) = self.verify_batch(&cand, self.dspark.is_some());
+        // The host fallback verifies the anchor only.
+        cand.truncate(logits.len());
+        let (draft, nt) = (&draft[..cand.len() - 1], cand.len());
+        let mut out = Vec::with_capacity(nt);
+        let mut accepted = 0usize;
+        let mut hit_eos = false;
+        let mut bonus = None;
+        for (j, &d_tok) in draft.iter().enumerate() {
+            let want = crate::ops::argmax(&logits[j]) as u32;
+            if want == d_tok {
+                accepted += 1;
+                out.push(d_tok);
+                if eos.contains(&d_tok) {
+                    hit_eos = true;
+                    break;
+                }
+            } else {
+                bonus = Some(want);
+                break;
+            }
+        }
+        if !hit_eos {
+            let b = bonus.unwrap_or_else(|| crate::ops::argmax(&logits[accepted]) as u32);
+            out.push(b);
+        }
+        let keep = 1 + accepted;
+        self.drafts.0 += draft.len();
+        self.drafts.1 += accepted;
+        self.commit_batch(pos0, keep, nt, &cand, feats.as_deref());
+        out
+    }
+
+    /// Speculative step with `Sampler` (supports both greedy/penalized and probabilistic `temp > 0` rejection sampling).
+    pub fn spec_step(
+        &mut self,
+        anchor_tok: u32,
+        max_draft: usize,
+        eos: &[u32],
+        smp: &mut crate::ops::Sampler,
+    ) -> Vec<u32> {
+        let pure_greedy = smp.temp <= 0.0 && smp.repeat == 1.0 && smp.presence == 0.0 && smp.frequency == 0.0 && smp.dry_mult <= 0.0;
+        if pure_greedy {
+            return self.spec_step_argmax(anchor_tok, max_draft, eos);
+        }
+        let draft = self.propose_drafts(anchor_tok, max_draft, eos);
+        if draft.is_empty() {
+            let l = self.step(anchor_tok);
+            let next = smp.pick(&l).unwrap_or_else(|_| crate::ops::argmax(&l)) as u32;
+            return vec![next];
+        }
+        let pos0 = self.toks.len();
+        let mut cand = Vec::with_capacity(1 + draft.len());
+        cand.push(anchor_tok);
+        cand.extend_from_slice(&draft);
+        let (logits, feats) = self.verify_batch(&cand, self.dspark.is_some());
+        // The host fallback verifies the anchor only.
+        cand.truncate(logits.len());
+        let (draft, nt) = (&draft[..cand.len() - 1], cand.len());
+        let mut out = Vec::with_capacity(nt);
+        let mut accepted = 0usize;
+        let mut hit_eos = false;
+        let mut bonus = None;
+        for (j, &d_tok) in draft.iter().enumerate() {
+            if smp.temp <= 0.0 {
+                let want = smp.pick(&logits[j]).unwrap_or_else(|_| crate::ops::argmax(&logits[j])) as u32;
+                if want == d_tok {
+                    accepted += 1;
+                    out.push(d_tok);
+                    if eos.contains(&d_tok) {
+                        hit_eos = true;
+                        break;
+                    }
+                } else {
+                    bonus = Some(want);
+                    break;
+                }
+            } else {
+                match smp.accept(&logits[j], d_tok as usize) {
+                    Ok(None) => {
+                        accepted += 1;
+                        out.push(d_tok);
+                        if eos.contains(&d_tok) {
+                            hit_eos = true;
+                            break;
+                        }
+                    }
+                    Ok(Some(rep)) => {
+                        bonus = Some(rep as u32);
+                        break;
+                    }
+                    Err(_) => {
+                        bonus = Some(crate::ops::argmax(&logits[j]) as u32);
+                        break;
+                    }
+                }
+            }
+        }
+        if !hit_eos {
+            let b = bonus.unwrap_or_else(|| smp.pick(&logits[accepted]).unwrap_or_else(|_| crate::ops::argmax(&logits[accepted])) as u32);
+            out.push(b);
+        }
+        let keep = 1 + accepted;
+        self.drafts.0 += draft.len();
+        self.drafts.1 += accepted;
+        self.commit_batch(pos0, keep, nt, &cand, feats.as_deref());
+        out
+    }
+
+    /// Snapshot the current prefix state so a later turn can roll back generated tokens in milliseconds.
+    pub fn checkpoint(&self) -> Checkpoint {
+        let (dev_hist, dev_swa, dev_synced, dev_ahead) = match &self.device {
+            Some(d) => d.save_checkpoint(&self.cfg),
+            None => (vec![], vec![], 0, false),
+        };
+        Checkpoint {
+            toks: self.toks.clone(),
+            slots: self.slots.clone(),
+            dev_hist,
+            dev_swa,
+            dev_synced,
+            dev_ahead,
+        }
+    }
+
+    /// Roll back the model to a previously saved prefix `Checkpoint`.
+    pub fn restore(&mut self, ckpt: &Checkpoint) {
+        self.toks.clone_from(&ckpt.toks);
+        self.slots.clone_from(&ckpt.slots);
+        if let Some(d) = &mut self.device {
+            d.restore_checkpoint(&ckpt.dev_hist, &ckpt.dev_swa, ckpt.dev_synced, ckpt.dev_ahead);
+        }
+        if let Some(ng) = &mut self.ngram {
+            ng.begin(&self.toks);
+        }
+        if let Some(ds) = &mut self.dspark {
+            ds.truncate(self.toks.len());
+        }
+    }
+
+    /// Run prompt tokens on GPU via batched `Device::prefill_chunk` when available, else on CPU chunks (`STRATA_DS_CHUNK`).
+    /// Returns the logits after the last token (empty when `toks` is empty).
     pub fn prefill(&mut self, toks: &[u32]) -> Vec<f32> {
-        let mut chunk: usize = std::env::var("STRATA_DS_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
-        if self.trace || std::env::var_os("STRATA_DS_DUMP").is_some() { chunk = 1; }
+        let seq: Vec<(u32, Option<&[f32]>)> = toks.iter().map(|&t| (t, None)).collect();
+        self.prefill_embds(&seq)
+    }
+
+    /// Run a sequence of prompt tokens and/or raw vision embeddings (`Some(emb)` skips `tok_norm`, per `inkling2.cpp`).
+    pub fn prefill_embds(&mut self, seq: &[(u32, Option<&[f32]>)]) -> Vec<f32> {
+        if seq.is_empty() { return vec![]; }
+        assert!(self.toks.len() + seq.len() <= self.max_ctx, "context is limited to {} tokens", self.max_ctx);
+        let dump_or_trace = self.trace || std::env::var_os("STRATA_DS_DUMP").is_some();
+        let env_chunk: Option<usize> = std::env::var("STRATA_DS_CHUNK").ok().and_then(|v| v.parse().ok());
+        let cap_ds = self.dspark.is_some();
+        if !dump_or_trace && env_chunk != Some(0) {
+            if self.device.is_none() && !self.no_device {
+                self.device = device::Device::new(self).map(Box::new);
+                self.no_device = self.device.is_none();
+            }
+            if let Some(mut d) = self.device.take() {
+                let target_end = self.toks.len() + seq.len() - 1;
+                match d.prepare(self, target_end) {
+                    Ok(()) => {
+                        let chunk = env_chunk.unwrap_or(256).clamp(1, 256);
+                        let mut logits = vec![];
+                        let mut done = 0usize;
+                        let mut failed = None;
+                        for (i, c) in seq.chunks(chunk).enumerate() {
+                            let want = (i + 1) * chunk >= seq.len();
+                            let pos0 = self.toks.len();
+                            match d.prefill_chunk_seq(self, c, want, cap_ds) {
+                                Ok((l, feats)) => {
+                                    self.toks.extend(c.iter().map(|&(t, _)| t));
+                                    if let (Some(ds), Some(f)) = (&mut self.dspark, &feats) {
+                                        ds.inject_subset(pos0, c.len(), c.len(), f);
+                                    }
+                                    done += c.len();
+                                    if want { logits = l; }
+                                }
+                                Err(e) => { failed = Some(e); break; }
+                            }
+                        }
+                        if let Some(e) = failed {
+                            eprintln!("inkling2: GPU prefill failed ({e:#}); falling back to host chunk path");
+                            let pos = self.toks.len();
+                            d.to_host(&self.cfg, &self.layers, &mut self.slots, pos, self.max_ctx);
+                            self.no_device = true;
+                            for (i, c) in seq[done..].chunks(512).enumerate() {
+                                let want = done + (i + 1) * 512 >= seq.len();
+                                logits = self.run_seq(c, want);
+                            }
+                            if let Some(ng) = &mut self.ngram { ng.begin(&self.toks); }
+                            return logits;
+                        }
+                        self.device = Some(d);
+                        if let Some(ng) = &mut self.ngram { ng.begin(&self.toks); }
+                        return logits;
+                    }
+                    Err(e) => {
+                        eprintln!("inkling2: no room in VRAM for prefill ({e:#}); falling back to host chunk path");
+                        let pos = self.toks.len();
+                        d.to_host(&self.cfg, &self.layers, &mut self.slots, pos, self.max_ctx);
+                        self.no_device = true;
+                    }
+                }
+            }
+        }
+        let mut chunk = env_chunk.unwrap_or(512);
+        if dump_or_trace { chunk = 1; }
         let mut logits = vec![];
-        for (i, c) in toks.chunks(chunk.max(1)).enumerate() { logits = self.run(c, (i + 1) * chunk.max(1) >= toks.len()); }
+        for (i, c) in seq.chunks(chunk.max(1)).enumerate() { logits = self.run_seq(c, (i + 1) * chunk.max(1) >= seq.len()); }
+        if let Some(ng) = &mut self.ngram { ng.begin(&self.toks); }
         logits
+    }
+
+    /// Host fallback for `verify_forward`: saves `slots` before running `cand`, computes all `nt` logits,
+    /// and leaves `commit_batch` to restore/re-run when `keep < nt` (only hit when GPU is disabled).
+    fn host_verify_forward(&mut self, cand: &[u32], _capture_dspark: bool) -> (Vec<Vec<f32>>, Option<Vec<f32>>) {
+        // ponytail: the host forward has no batched verify and no rollback, so it runs the anchor only and the
+        // caller drops the drafts. Token by token it would cost a forward per draft and gain nothing.
+        (vec![self.run(&cand[..1], true)], None)
     }
 
     /// Run a chunk of tokens layer by layer. Returns the logits after the last one when `want`.
     fn run(&mut self, toks: &[u32], want: bool) -> Vec<f32> {
+        let seq: Vec<(u32, Option<&[f32]>)> = toks.iter().map(|&t| (t, None)).collect();
+        self.run_seq(&seq, want)
+    }
+
+    fn run_seq(&mut self, seq: &[(u32, Option<&[f32]>)], want: bool) -> Vec<f32> {
         let cfg = self.cfg.clone();
-        let (pos, nt) = (self.toks.len(), toks.len());
+        let (pos, nt) = (self.toks.len(), seq.len());
         let t0 = std::time::Instant::now();
-        if let Some(d) = &mut self.device { d.to_host(&cfg, &self.layers, &mut self.slots, pos); }
-        assert!(pos + nt <= self.cfg.n_ctx, "context is limited to {} tokens", self.cfg.n_ctx);
+        if let Some(d) = &mut self.device { d.to_host(&cfg, &self.layers, &mut self.slots, pos, self.max_ctx); }
+        assert!(pos + nt <= self.max_ctx, "context is limited to {} tokens", self.max_ctx);
         let n = cfg.n_embd;
-        let mut cur: Vec<Vec<f32>> = toks.iter().map(|&tok| {
-            assert!((tok as usize) < self.tok_embd.rows, "token {tok} is outside the vocabulary");
-            let (mut emb, mut cur) = (vec![0f32; n], vec![0f32; n]);
-            self.tok_embd.row_into(tok as usize, &mut emb);
-            rms_norm_w(&emb, &self.tok_norm, cfg.eps, &mut cur);
-            cur
+        let mut cur: Vec<Vec<f32>> = seq.iter().map(|&(tok, raw_emb)| {
+            if let Some(e) = raw_emb {
+                assert_eq!(e.len(), n, "embedding width mismatch");
+                e.to_vec()
+            } else {
+                assert!((tok as usize) < self.tok_embd.rows, "token {tok} is outside the vocabulary");
+                let (mut emb, mut cur) = (vec![0f32; n], vec![0f32; n]);
+                self.tok_embd.row_into(tok as usize, &mut emb);
+                rms_norm_w(&emb, &self.tok_norm, cfg.eps, &mut cur);
+                cur
+            }
         }).collect();
         let mut blocks: Vec<Vec<Vec<f32>>> = vec![vec![]; nt];
         for il in 0..cfg.loop_start { cur = self.layer(il, il, cur, &mut blocks, None, pos); }
@@ -933,7 +1335,7 @@ impl<'a> Inkling2Model<'a> {
             }
         }
         for il in cfg.loop_end..cfg.n_layer { cur = self.layer(il, il, cur, &mut blocks, None, pos); }
-        self.toks.extend_from_slice(toks);
+        self.toks.extend(seq.iter().map(|&(t, _)| t));
         let t = std::time::Instant::now();
         let mut logits = vec![];
         if want {

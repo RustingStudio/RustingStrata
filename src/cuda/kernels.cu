@@ -1680,6 +1680,54 @@ extern "C" __global__ void situ(float* y, int n, int rows, const float* sc, floa
     *g = beta * tanhf(gv / beta) / (1.f + expf(-gv)) * u;
 }
 
+extern "C" __global__ void situ_q(const float* y, int n, const float* sc, float beta, float lb, signed char* out) {
+    size_t row = blockIdx.y;
+    int c = blockIdx.x * 256, i = threadIdx.x * 8;
+    bool valid = c + i < n;
+    float s = sc ? sc[row] : 1.f;
+    auto act = [=](float gg, float uu) -> float {
+        gg *= s; uu *= s;
+        if (lb > 0.f) uu = lb * tanhf(uu / lb);
+        return beta * tanhf(gg / beta) / (1.f + expf(-gg)) * uu;
+    };
+    float4 ga = make_float4(0.f, 0.f, 0.f, 0.f), gc = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (valid) {
+        const float* g = y + row * 2 * n + c + i;
+        const float* u = g + n;
+        ga = *(const float4*)g; gc = *(const float4*)(g + 4);
+        float4 ua = *(const float4*)u, uc = *(const float4*)(u + 4);
+        ga = make_float4(act(ga.x, ua.x), act(ga.y, ua.y), act(ga.z, ua.z), act(ga.w, ua.w));
+        gc = make_float4(act(gc.x, uc.x), act(gc.y, uc.y), act(gc.z, uc.z), act(gc.w, uc.w));
+    }
+    size_t o = row * n + c;
+    signed char* qs = out + o;
+    float* xd = (float*)(out + (size_t)gridDim.y * n) + o / 32;
+#if LLAMA_Q8
+    float d, id;
+    {
+        float vv[8] = {ga.x, ga.y, ga.z, ga.w, gc.x, gc.y, gc.z, gc.w};
+        float mx = 0.f, sv = 0.f; int si = 1 << 30;
+        for (int j = 0; j < 8; j++) mx = fmaxf(mx, fabsf(vv[j]));
+        if (valid) for (int j = 0; j < 8; j++) if (fabsf(vv[j]) == mx && si > i + j) { sv = vv[j]; si = i + j; }
+        q8k_scale<32>(sv, si, d, id);
+    }
+    if (valid) {
+        int2 q = make_int2(pack4(__float2int_rn(ga.x * id), __float2int_rn(ga.y * id), __float2int_rn(ga.z * id), __float2int_rn(ga.w * id)),
+                           pack4(__float2int_rn(gc.x * id), __float2int_rn(gc.y * id), __float2int_rn(gc.z * id), __float2int_rn(gc.w * id)));
+        *(int2*)(qs + i) = q;
+        if ((threadIdx.x & 3) == 0) xd[i >> 5] = d;
+    }
+#else
+    unsigned m = c + 256 > n ? __ballot_sync(0xffffffff, valid) : 0xffffffff;
+    if (valid) quant8(ga, gc, i, qs, xd, m);
+#endif
+}
+
+extern "C" __global__ void softcap(float* x, int n, float cap) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = cap * tanhf(x[i] / cap);
+}
+
 // ---- Inkling 2's decode token on the device (inkling2::device); the host math is in src/inkling2/forward.rs ----
 
 // Max over the whole block; every thread gets the result. blockDim.x must be a multiple of 32.
@@ -1693,13 +1741,14 @@ __device__ float block_max(float v) {
     return warp_max(lane < nw ? s[lane] : -3.0e38f);
 }
 
-// Depth mix, one block of 256 per query row: the softmax-weighted sum of the RMS-normed states (the nb rows of
-// blocks, then cur; at most 5), scored by state . query / sqrt(n).
-extern "C" __global__ void ink_mix(const float* blocks, int nb, const float* cur, const float* q, float* out, int n) {
-    const float* qr = q + (size_t)blockIdx.x * n;
+// Depth mix, one block of 256 per (query row, token): softmax-weighted sum of the RMS-normed states (the nb blocks
+// of shape [nb][nt][n], then cur [nt][n]; at most 5), scored by state . query / sqrt(n).
+extern "C" __global__ void ink_mix(const float* blocks, int nb, const float* cur, const float* q, float* out, int n, int nt) {
+    int qid = blockIdx.x, tok = blockIdx.y;
+    const float* qr = q + (size_t)qid * n;
     float sc[5], lg[5], mx = -3.0e38f, z = 0.f;
     for (int s = 0; s <= nb; s++) {
-        const float* x = s < nb ? blocks + (size_t)s * n : cur;
+        const float* x = s < nb ? blocks + ((size_t)s * nt + tok) * n : cur + (size_t)tok * n;
         float ss = 0.f, d = 0.f;
         for (int i = threadIdx.x; i < n; i += 256) { ss += x[i] * x[i]; d += x[i] * qr[i]; }
         sc[s] = 1.f / sqrtf(block_sum(ss) / (float)n + 1e-6f);
@@ -1707,44 +1756,52 @@ extern "C" __global__ void ink_mix(const float* blocks, int nb, const float* cur
         mx = fmaxf(mx, lg[s]);
     }
     for (int s = 0; s <= nb; s++) { lg[s] = expf(lg[s] - mx); z += lg[s]; }
+    size_t oo = ((size_t)qid * nt + tok) * n;
     for (int i = threadIdx.x; i < n; i += 256) {
         float o = 0.f;
-        for (int s = 0; s <= nb; s++) o += lg[s] / z * sc[s] * (s < nb ? blocks[(size_t)s * n + i] : cur[i]);
-        out[(size_t)blockIdx.x * n + i] = o;
+        for (int s = 0; s <= nb; s++) {
+            float v = s < nb ? blocks[((size_t)s * nt + tok) * n + i] : cur[(size_t)tok * n + i];
+            o += lg[s] / z * sc[s] * v;
+        }
+        out[oo + i] = o;
     }
 }
 
-// Loop controllers, the gates: block (r, j) is row r of controller j's down matrix (f16, [rank][2n]) on
-// [rms_norm(cur_j) | rms_norm(msg_j)].
-extern "C" __global__ void ink_ctrl_gate(const u16* down, const float* cur, int nins, const float* msg, float* gate, int n, int rank) {
-    int r = blockIdx.x, j = blockIdx.y;
+// Loop controllers, the gates across nt tokens: block (r, j, tok). cur [min(nins, count)][nt][n], msg [count][nt][n].
+extern "C" __global__ void ink_ctrl_gate(const u16* down, const float* cur, int nins, const float* msg, float* gate,
+                                          int n, int rank, int nt) {
+    int r = blockIdx.x, j = blockIdx.y, tok = blockIdx.z, count = gridDim.y;
     const u16* w = down + ((size_t)j * rank + r) * 2 * n;
-    const float* c = cur + (size_t)min(j, nins - 1) * n;
-    const float* m = msg + (size_t)j * n;
+    const float* c = cur + ((size_t)min(j, nins - 1) * nt + tok) * n;
+    const float* m = msg + ((size_t)j * nt + tok) * n;
     float a = 0.f, b = 0.f, sa = 0.f, sb = 0.f;
     for (int i = threadIdx.x; i < n; i += 256) {
         a += h2f(w[i]) * c[i]; b += h2f(w[n + i]) * m[i];
         sa += c[i] * c[i]; sb += m[i] * m[i];
     }
     a = block_sum(a); b = block_sum(b); sa = block_sum(sa); sb = block_sum(sb);
-    if (threadIdx.x == 0) gate[j * rank + r] = a / sqrtf(sa / (float)n + 1e-6f) + b / sqrtf(sb / (float)n + 1e-6f);
+    if (threadIdx.x == 0)
+        gate[((size_t)tok * count + j) * rank + r] = a / sqrtf(sa / (float)n + 1e-6f) + b / sqrtf(sb / (float)n + 1e-6f);
 }
 
-// Loop controllers, the update: out_j = cur_j - tanh(gate_j . forget) * cur_j + tanh(gate_j . gain) * msg_j
-// (gain and forget f16, [rank][n]).
-extern "C" __global__ void ink_ctrl_out(const u16* gain, const u16* forget, const float* gate, const float* cur, int nins, const float* msg,
-                                        float* out, int n, int rank) {
-    int c = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y;
+// Loop controllers, the update across nt tokens: block (x, j, tok).
+extern "C" __global__ void ink_ctrl_out(const u16* gain, const u16* forget, const float* gate, const float* cur, int nins,
+                                         const float* msg, float* out, int n, int rank, int nt) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y, tok = blockIdx.z, count = gridDim.y;
     if (c >= n) return;
     const u16* gw = gain + (size_t)j * rank * n + c;
     const u16* fw = forget + (size_t)j * rank * n + c;
     float g = 0.f, f = 0.f;
     for (int r = 0; r < rank; r++) {
-        float t = gate[j * rank + r];
+        float t = gate[((size_t)tok * count + j) * rank + r];
         g += t * h2f(gw[(size_t)r * n]); f += t * h2f(fw[(size_t)r * n]);
     }
-    float x = cur[(size_t)min(j, nins - 1) * n + c];
-    out[(size_t)j * n + c] = x - tanhf(f) * x + tanhf(g) * msg[(size_t)j * n + c];
+    size_t co = ((size_t)min(j, nins - 1) * nt + tok) * n + c;
+    size_t mo = ((size_t)j * nt + tok) * n + c;
+    float x = cur[co];
+    f = fminf(fmaxf(f, -10.f), 10.f);
+    g = fminf(fmaxf(g, -10.f), 10.f);
+    out[mo] = x - tanhf(f) * x + tanhf(g) * msg[mo];
 }
 
 // Short causal convolution with a residual (nc at most 8; out may be cur): hist holds the last nc - 1 inputs, the
@@ -1761,89 +1818,104 @@ extern "C" __global__ void ink_conv(const float* cur, const float* w, const floa
     for (int k = 0; k + 1 < nc; k++) hist[(size_t)k * n + c] = x[k + 1];
 }
 
-// One block of 128 per row of w values (w at most 128): times scale (may be null), then the row scaled to an L2
-// norm of at most thr, or (thr 0) to an RMS of 1; times mul. dst not null: the result also as f16.
-extern "C" __global__ void ink_clip(float* x, const float* scale, int w, float thr, float eps, float mul, u16* dst) {
-    size_t at = (size_t)blockIdx.x * w + threadIdx.x;
-    float v = 0.f;
-    if (threadIdx.x < w) { v = x[at]; if (scale) v *= scale[at]; }
-    float ss = block_sum(v * v);
-    float f = (thr > 0.f ? fminf(thr / (sqrtf(ss) + 1e-6f), 1.f) : 1.f / sqrtf(ss / (float)w + eps)) * mul;
-    if (threadIdx.x < w) {
-        v *= f;
-        x[at] = v;
-        if (dst) dst[at] = f2h(v);
-    }
-}
-
-// Attention of one token in two launches. ink_attn: block (head, chunk) of 4 warps takes the 64 rows from chunk * 64;
-// a warp takes one row at a time. Row i of k and v (f16, nkv * hd wide) is at distance (at - i) mod rows. hd divides
-// 128. Writes (max logit, sum of exp, hd sums of exp * v) of each (head, chunk) to sc: nh * chunks * (hd + 2) floats.
-// ink_attn_merge: one block of 128 per head joins the chunks with the sink, one more logit of 0 with no value.
-extern "C" __global__ void ink_attn(const float* q, const float* r, const float* sink, const u16* k, const u16* v,
-                                    const float* bias, float* sc, int rows, int at, int nkv, int hd, int nr, int ext) {
-    __shared__ float qs[128], ps[64], acc[128];
-    int h = blockIdx.x, kh = h / (gridDim.x / nkv), kw = nkv * hd, t = threadIdx.x, lane = t & 31;
-    int i0 = blockIdx.y * 64, n = min(64, rows - i0);
-    if (t < hd) qs[t] = q[h * hd + t];
-    __syncthreads();
-    float scale = 1.f / sqrtf((float)hd);
-    for (int j = t >> 5; j < n; j += 4) {
-        int i = i0 + j, dist = at - i < 0 ? at - i + rows : at - i;
-        const u16* kr = k + (size_t)i * kw + kh * hd;
-        float d = 0.f;
-        for (int c = lane; c < hd; c += 32) d += qs[c] * h2f(kr[c]);
-        d *= scale;
-        if (dist < ext) for (int c = lane; c < nr; c += 32) d += r[h * nr + c] * bias[dist * nr + c];
-        d = warp_sum(d);
-        if (lane == 0) ps[j] = d - sink[h];
-    }
-    __syncthreads();
-    float mx = -3.0e38f;
-    for (int j = 0; j < n; j++) mx = fmaxf(mx, ps[j]);
-    __syncthreads();
-    if (t < n) ps[t] = expf(ps[t] - mx);
-    __syncthreads();
-    int c = t % hd, parts = 128 / hd;
-    float a = 0.f;
-    for (int j = t / hd; j < n; j += parts) a += ps[j] * h2f(v[(size_t)(i0 + j) * kw + kh * hd + c]);
-    acc[t] = a;
-    __syncthreads();
-    float* o = sc + ((size_t)h * gridDim.y + blockIdx.y) * (hd + 2);
-    if (t < hd) {
-        float s = 0.f;
-        for (int p = 0; p < parts; p++) s += acc[p * hd + t];
-        o[2 + t] = s;
-    }
-    if (t == 0) {
-        float z = 0.f;
-        for (int j = 0; j < n; j++) z += ps[j];
-        o[0] = mx;
-        o[1] = z;
-    }
-}
-
-extern "C" __global__ void ink_attn_merge(const float* sc, const float* gate, float* out, int chunks, int hd) {
-    int h = blockIdx.x, t = threadIdx.x;
-    const float* p = sc + (size_t)h * chunks * (hd + 2);
-    float mx = 0.f;
-    for (int j = 0; j < chunks; j++) mx = fmaxf(mx, p[j * (hd + 2)]);
-    float z = expf(-mx), o = 0.f;
-    for (int j = 0; j < chunks; j++) {
-        float e = expf(p[j * (hd + 2)] - mx);
-        z += p[j * (hd + 2) + 1] * e;
-        if (t < hd) o += p[j * (hd + 2) + 2 + t] * e;
-    }
-    if (t < hd) out[h * hd + t] = o / z * sigmoid(gate[h * hd + t]);
-}
-
-// acc = cpu + the sum of the ne rows of d (n floats each) times their weights.
-extern "C" __global__ void ink_ffn_sum(float* acc, const float* d, const float* wts, int ne, int n, const float* cpu) {
+// Batched causal short convolution for Inkling 2 prefill (o != cur).
+// mode 0 (grid [ceil(n/256), nt]): writes o[tok, c]; mode 1 (grid [ceil(n/256), 1]): advances hist.
+extern "C" __global__ void ink_conv_batch(const float* cur, const float* w, const float* taps, float* hist, float* o,
+                                          int n, int nc, int per, int nt, int mode) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= n) return;
-    float o = cpu[c];
-    for (int e = 0; e < ne; e++) o += wts[e] * d[(size_t)e * n + c];
-    acc[c] = o;
+    if (mode != 0) {
+        float old[8];
+        for (int k = 0; k + 1 < nc; k++) old[k] = hist[(size_t)k * n + c];
+        for (int k = 0; k + 1 < nc; k++) {
+            int src = nt - (nc - 1) + k;
+            hist[(size_t)k * n + c] = src >= 0 ? cur[(size_t)src * n + c] : old[(nc - 1) + src];
+        }
+        return;
+    }
+    int tok = blockIdx.y;
+    float x[8], acc = 0.f;
+    for (int k = 0; k < nc; k++) {
+        int s = tok - (nc - 1) + k;
+        float xv = s < 0 ? hist[(size_t)((nc - 1) + s) * n + c] : cur[(size_t)s * n + c];
+        x[k] = xv;
+        acc += xv * w[c * nc + k];
+    }
+    if (taps) {
+        int nheads = n / per;
+        size_t tp_base = ((size_t)tok * nheads + c / per) * nc;
+        for (int lag = 0; lag < nc; lag++) acc += x[nc - 1 - lag] * taps[tp_base + lag];
+    }
+    o[(size_t)tok * n + c] = (x[nc - 1] + acc) / sqrtf((float)((taps ? 2 * nc : nc) + 1));
+}
+
+// acc[tok] = (cpu ? cpu[tok] : 0) + sum_{e < ne} wts[tok, e] * d[(tok * ne + e) * n + c]. blockIdx.y = tok.
+extern "C" __global__ void ink_ffn_sum(float* acc, const float* d, const float* wts, int ne, int n, const float* cpu) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x, tok = blockIdx.y;
+    if (c >= n) return;
+    float o = cpu ? cpu[(size_t)tok * n + c] : 0.f;
+    size_t db = (size_t)tok * ne * n + c, wb = (size_t)tok * ne;
+    for (int e = 0; e < ne; e++) o += wts[wb + e] * d[db + (size_t)e * n];
+    acc[(size_t)tok * n + c] = o;
+}
+
+__device__ __forceinline__ unsigned ink_f2key(float x) {
+    unsigned u = __float_as_uint(x == 0.0f ? 0.0f : x);
+    return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
+}
+
+extern "C" __global__ void ink_route(const float* logits, const float* bias, int* ids, float* wts,
+                                     const float* gu_sc, const float* dn_sc, float* gsc_out,
+                                     int n, int k, float exp_scale) {
+    int row = blockIdx.x, lane = threadIdx.x & 31;
+    const int R = 16;
+    float p_arr[R], s_arr[R];
+    for (int r = 0; r < R; r++) {
+        int i = lane + 32 * r;
+        if (i < n) {
+            float pr = 1.0f / (1.0f + expf(-logits[(size_t)row * n + i]));
+            p_arr[r] = pr;
+            s_arr[r] = pr + (bias ? bias[i] : 0.0f);
+        } else {
+            p_arr[r] = 0.0f;
+            s_arr[r] = __int_as_float(0xff800000);
+        }
+    }
+    unsigned taken = 0u;
+    float sum = 0.0f, mine = 0.0f;
+    int id = 0;
+    for (int j = 0; j < k; j++) {
+        unsigned bk = 0u, bi = 0xffffffffu;
+        for (int r = 0; r < R; r++) {
+            int i = lane + 32 * r;
+            if (i < n && ((taken >> r) & 1u) == 0u) {
+                unsigned key = ink_f2key(s_arr[r]);
+                if (key > bk) { bk = key; bi = (unsigned)i; }
+            }
+        }
+        unsigned mk = bk;
+        for (int o = 16; o > 0; o >>= 1) mk = max(mk, __shfl_xor_sync(0xffffffff, mk, o));
+        unsigned cand = (bk == mk) ? bi : 0xffffffffu;
+        for (int o = 16; o > 0; o >>= 1) cand = min(cand, __shfl_xor_sync(0xffffffff, cand, o));
+        unsigned wlane = cand & 31u, wr = cand >> 5;
+        float wp = 0.0f;
+        if ((unsigned)lane == wlane) {
+            taken |= 1u << wr;
+            for (int r = 0; r < R; r++) if (r == (int)wr) wp = p_arr[r];
+        }
+        wp = __shfl_sync(0xffffffff, wp, (int)wlane);
+        if (lane == j) { id = (int)cand; mine = wp; }
+        sum += wp;
+    }
+    float scale = exp_scale / (sum + 1e-20f);
+    if (lane < k) {
+        ids[row * k + lane] = id;
+        float dn = dn_sc ? dn_sc[id] : 1.0f;
+        wts[row * k + lane] = mine * scale * dn;
+        if (gsc_out) {
+            gsc_out[row * k + lane] = gu_sc ? gu_sc[id] : 1.0f;
+        }
+    }
 }
 
 // Gyro files (config::Hadamard): the routed experts read H (s x) in place of x, H the normalized Sylvester-Walsh-
@@ -2368,6 +2440,176 @@ template <int N, int S = N / 2> __device__ __forceinline__ float warp_sum_scatte
 // Slow (one position at a time); for parity runs only.
 #define LLAMA_NTH 6
 __device__ __forceinline__ float rh(float x) { return h2f(f2h(x)); }
+
+// Scalar KV element load matching GLSL ldkv().
+__device__ __forceinline__ float ldkv1(const u16* c, size_t off, int hd) {
+#if KV_MODE == 3
+    int w = off % hd;
+    const unsigned char* r = (const unsigned char*)c + off / hd * (3 * hd / 8);
+    unsigned b = r[w / 4];
+    float d = h2f(*(const u16*)(r + hd / 4 + 2 * (w / 32)));
+    float mn = h2f(*(const u16*)(r + hd / 4 + hd / 16 + 2 * (w / 32)));
+    int q = (b >> (2 * (w & 3))) & 3;
+    return rh(fmaf((float)q, d, mn));
+#elif KV_MODE == 2
+    int w = off % hd;
+    const unsigned char* r = (const unsigned char*)c + off / hd * (hd / 2 + hd / 16);
+    unsigned b = r[w / 2];
+    float d = h2f(*(const u16*)(r + hd / 2 + 2 * (w / 32)));
+    int q = (int)((w & 1) == 0 ? (b & 15u) : (b >> 4)) - 8;
+    return rh((float)q * d);
+#elif KV_MODE == 1
+    int w = off % hd;
+    const signed char* r = (const signed char*)c + off / hd * (hd + hd / 16);
+    float d = h2f(*(const u16*)(r + hd + 2 * (w / 32)));
+    return rh((float)r[w] * d);
+#else
+    return h2f(c[off]);
+#endif
+}
+
+// One block of 128 per (row, tok) of w values (w at most 128, w % 32 == 0 when KV_MODE > 0 and dst != 0).
+extern "C" __global__ void ink_clip(float* x, const float* scale, int w, float thr, float eps, float mul, u16* dst,
+                                    int dst_at0, int dst_ring, int pos0, float log_alpha, float log_floor) {
+    int t = threadIdx.x, row = blockIdx.x, tok = blockIdx.y, rows = gridDim.x;
+    size_t at = ((size_t)tok * rows + row) * w + t, sc_at = (size_t)row * w + t;
+    float v = 0.f;
+    if (t < w) { v = x[at]; if (scale) v *= scale[sc_at]; }
+    float ss = block_sum(v * v);
+    float eff_mul = mul;
+    if (log_alpha != 0.f) eff_mul *= 1.f + log_alpha * logf(fmaxf((float)(pos0 + tok + 1) / log_floor, 1.f));
+    float f = (thr > 0.f ? fminf(thr / (sqrtf(ss) + 1e-6f), 1.f) : 1.f / sqrtf(ss / (float)w + eps)) * eff_mul;
+    if (t < w) {
+        v *= f;
+        x[at] = v;
+        if (dst) {
+            size_t dst_pos = (size_t)((dst_at0 + tok) % dst_ring);
+            size_t dat = (dst_pos * rows + row) * w + t;
+            kv_put(dst, dat, w, v);
+        }
+    }
+}
+
+// Attention of one token in two launches. Supports KV_MODE 0/1/2/3 via ldkv1().
+extern "C" __global__ void ink_attn(const float* q, const float* r, const float* sink, const u16* k, const u16* v,
+                                    const float* bias, float* sc, int rows, int at, int nkv, int hd, int nr, int ext) {
+    __shared__ float qs[128], ps[64], acc[128];
+    int h = blockIdx.x, kh = h / (gridDim.x / nkv), kw = nkv * hd, t = threadIdx.x, lane = t & 31;
+    int i0 = blockIdx.y * 64, n = min(64, rows - i0);
+    if (t < hd) qs[t] = q[h * hd + t];
+    __syncthreads();
+    float scale = 1.f / sqrtf((float)hd);
+    for (int j = t >> 5; j < n; j += 4) {
+        int i = i0 + j, dist = at - i < 0 ? at - i + rows : at - i;
+        size_t ko = (size_t)i * kw + kh * hd;
+        float d = 0.f;
+        for (int c = lane; c < hd; c += 32) d += qs[c] * ldkv1(k, ko + c, hd);
+        d *= scale;
+        if (dist < ext) for (int c = lane; c < nr; c += 32) d += r[h * nr + c] * bias[dist * nr + c];
+        d = warp_sum(d);
+        if (lane == 0) ps[j] = d - sink[h];
+    }
+    __syncthreads();
+    float mx = -3.0e38f;
+    for (int j = 0; j < n; j++) mx = fmaxf(mx, ps[j]);
+    __syncthreads();
+    if (t < n) ps[t] = expf(ps[t] - mx);
+    __syncthreads();
+    int c = t % hd, parts = 128 / hd;
+    float a = 0.f;
+    for (int j = t / hd; j < n; j += parts) a += ps[j] * ldkv1(v, (size_t)(i0 + j) * kw + kh * hd + c, hd);
+    acc[t] = a;
+    __syncthreads();
+    float* o = sc + ((size_t)h * gridDim.y + blockIdx.y) * (hd + 2);
+    if (t < hd) {
+        float s = 0.f;
+        for (int p = 0; p < parts; p++) s += acc[p * hd + t];
+        o[2 + t] = s;
+    }
+    if (t == 0) {
+        float z = 0.f;
+        for (int j = 0; j < n; j++) z += ps[j];
+        o[0] = mx;
+        o[1] = z;
+    }
+}
+
+extern "C" __global__ void ink_attn_merge(const float* sc, const float* gate, float* out, int chunks, int hd) {
+    int h = blockIdx.x, t = threadIdx.x;
+    const float* p = sc + (size_t)h * chunks * (hd + 2);
+    float mx = 0.f;
+    for (int j = 0; j < chunks; j++) mx = fmaxf(mx, p[j * (hd + 2)]);
+    float z = expf(-mx), o = 0.f;
+    for (int j = 0; j < chunks; j++) {
+        float e = expf(p[j * (hd + 2)] - mx);
+        z += p[j * (hd + 2) + 1] * e;
+        if (t < hd) o += p[j * (hd + 2) + 2 + t] * e;
+    }
+    if (t < hd) out[h * hd + t] = o / z * sigmoid(gate[h * hd + t]);
+}
+
+// Inkling 2 causal prefill attention with online softmax + virtual sink logit 0.
+template <int PER>
+__device__ void ink_attn_prefill_t(const float* q, const float* r, const float* sink, const float* gate,
+                                   const u16* kc, const u16* vc, const u16* kc_new, const u16* vc_new,
+                                   const float* bias, float* outp,
+                                   int pos, int nt, int nh, int nkv, int nr, int ext, int ring, int win) {
+    int t = blockIdx.x * 4 + (threadIdx.x >> 5), h = blockIdx.y, lane = threadIdx.x & 31;
+    if (t >= nt) return;
+    constexpr int HD = 32 * PER;
+    int kh = h / (nh / nkv), kw = nkv * HD;
+    int q_pos = pos + t;
+    int start = (win > 0 && q_pos + 1 > win) ? (q_pos + 1 - win) : 0;
+    float scale = 1.f / sqrtf((float)HD);
+    float qv[PER], acc[PER];
+    for (int j = 0; j < PER; j++) {
+        qv[j] = q[((size_t)t * nh + h) * HD + lane + 32 * j] * scale;
+        acc[j] = 0.f;
+    }
+    float sink_val = sink[(size_t)t * nh + h];
+    float r_reg = (nr <= 32 && lane < nr) ? r[((size_t)t * nh + h) * nr + lane] : 0.f;
+    float m = 0.f, l = 1.f;
+    for (int kp = start; kp <= q_pos; kp++) {
+        bool use_new = kc_new && kp >= pos;
+        const u16* kbuf = use_new ? kc_new : kc;
+        const u16* vbuf = use_new ? vc_new : vc;
+        size_t row = use_new ? (size_t)(kp - pos) : (win > 0 ? (size_t)(kp % ring) : (size_t)kp);
+        size_t kbase = row * kw + (size_t)kh * HD;
+        float s = 0.f;
+        for (int j = 0; j < PER; j++) s += qv[j] * ldkv1(kbuf, kbase + lane + 32 * j, HD);
+        s = warp_sum(s);
+        int dist = q_pos - kp;
+        float b = 0.f;
+        if (dist < ext) {
+            if (nr <= 32) {
+                b = lane < nr ? r_reg * bias[dist * nr + lane] : 0.f;
+            } else {
+                for (int c = lane; c < nr; c += 32) b += r[((size_t)t * nh + h) * nr + c] * bias[dist * nr + c];
+            }
+            b = warp_sum(b);
+        }
+        float logit = s + b - sink_val;
+        float mn = fmaxf(m, logit), c = expf(m - mn), e = expf(logit - mn);
+        l = l * c + e;
+        for (int j = 0; j < PER; j++) acc[j] = e * ldkv1(vbuf, kbase + lane + 32 * j, HD) + acc[j] * c;
+        m = mn;
+    }
+    float inv = 1.f / l;
+    for (int j = 0; j < PER; j++) {
+        int col = lane + 32 * j;
+        size_t idx = ((size_t)t * nh + h) * HD + col;
+        outp[idx] = acc[j] * inv * sigmoid(gate[idx]);
+    }
+}
+#define DEF_INK_PREFILL(HD) \
+    extern "C" __global__ void __launch_bounds__(128) ink_attn_prefill_##HD( \
+            const float* q, const float* r, const float* sink, const float* gate, \
+            const u16* kc, const u16* vc, const u16* kc_new, const u16* vc_new, \
+            const float* bias, float* outp, \
+            int pos, int nt, int nh, int nkv, int nr, int ext, int ring, int win) { \
+        ink_attn_prefill_t<HD / 32>(q, r, sink, gate, kc, vc, kc_new, vc_new, bias, outp, pos, nt, nh, nkv, nr, ext, ring, win); \
+    }
+DEF_INK_PREFILL(32) DEF_INK_PREFILL(64) DEF_INK_PREFILL(128)
 template <int HD, int G>
 __device__ void attn_decode_llama(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
                                   const int* sel, int nh, int nkv, float scale, int bx, int win) {

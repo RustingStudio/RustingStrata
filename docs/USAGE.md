@@ -87,6 +87,14 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   output that repeats the prompt (code edits, quoting, structured data). It combines with `--mtp`,
   `--mtp-model` and `--draft-model`: the lookup drafts when it finds a match (next to a DFlash draft, only on a
   long match) and the model drafts otherwise.
+- Inkling 2 drafts with `--draft-model PATH` (a DSpark draft file) and with `--spec-type`; it has no MTP head, so
+  `--mtp` and `--mtp-model` are ignored with a warning. Drafts need the GPU path, and one pass checks at most 16
+  rows. A layer whose experts are not all in VRAM checks its rows one at a time, so on a card that does not hold
+  the whole model a draft model can cost more than it saves. RTX 3060 12 GB, `Inkling-2-Mini-IQ4_NL.gguf`
+  (17.6 GB, 15 of 24 expert layers in VRAM), CUDA, `bench --pp 512 --tg 128`: 29.9 tok/s without drafts, 35.9 with
+  `--spec-type ngram-simple` (the bench text repeats, so every draft is accepted) and 20.9 with the DSpark file
+  (285 of 292 drafts accepted). The batched check rounds differently from one-token decoding, so greedy output
+  can differ at a near tie.
 - `--chunk`, `--threads` prefill chunk size and CPU expert threads. On a GPU `--threads` defaults to the physical
   core count (SMT siblings only add contention; on the 6-core/12-thread reference machine 6 beats 12 by ~20%).
   `rustingstrata calibrate` measures the best chunk and later runs read it from
@@ -114,8 +122,8 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   `--draft-model` file use that count unless `--mtp` is given; runs with another draft file or none do not.
 - `calibrate --model ~/models` calibrates every model in a folder (and its subfolders, as the chat page lists them),
   one after another, with the other flags applied to each. A model that fails is reported and the rest go on; Inkling
-  2, Hy4, GLM, DeepSeek and Gemma 4 models are skipped, they do not read a calibration. `--mtp-model` and
-  `--draft-model` need a single file.
+  2, Hy4, GLM, DeepSeek and Gemma 4 models are skipped: `calibrate` measures the main engine only, and these models
+  run on their own code path, which reads no calibration file. `--mtp-model` and `--draft-model` need a single file.
 - `--thinking-budget N` (`chat` and `serve`) ends the thinking block after `N` tokens by inserting `</think>`,
   so the model goes on to the answer (0, the default, is no limit). A request overrides it with
   `thinking_budget` or `chat_template_kwargs.thinking_budget` (Anthropic: `thinking.budget_tokens`).
@@ -135,8 +143,10 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   profile stay per file.
 - Inkling 2, Hy4, GLM, DeepSeek and Gemma 4 run on their own code path. The server loads them like any other model
   (`serve --model <file>`, or from the chat page of a running server, in either direction), with these limits: one
-  request at a time, greedy, `/v1/chat/completions` only (no `/v1/messages`), and nothing to calibrate. The
-  context limit is `--ctx` (or the page's context setting) when given, else the trained context.
+  request at a time, greedy (Inkling 2 also samples: `temperature`, `top_k`, `top_p`, `seed`; a seed repeats its
+  text only with `STRATA_FIXED_EXPERTS=1`, because the adaptive expert split moves the logits a little),
+  `/v1/chat/completions` only (no `/v1/messages`), and no calibration (`calibrate` does
+  not cover them). The context limit is `--ctx` (or the page's context setting) when given, else the trained context.
 - `--lora PATH:SCALE` applies a LoRA adapter at runtime, see [LORA.md](LORA.md).
 - `--mcp FILE` (`serve` only, or `STRATA_MCP`) lists the MCP servers whose tools the chat page may call, see
   [Tools (MCP)](#tools-mcp).

@@ -286,7 +286,7 @@ tokens, a near tie), on the CPU, CUDA and Vulkan paths. `tests/inkling2_forward.
 32-token greedy text of llama.cpp c622f62 (CUDA, `-ngl 18`) was compared on three prompts: the CPU path matched on two
 and CUDA on two (Vulkan, run on the first prompt only, gave the CUDA text). Each difference starts at a token where llama.cpp's own top two
 log-probabilities are 0.01 and 0.16 apart.
-Caveats: text only (the vision projector `inkling2v` is not read), decoding is greedy only, and prompt plus reply is
+Caveats: image input through `--mmproj` was not checked on this machine (no projector file here), and prompt plus reply is
 limited to `--ctx` (default: the context the model was trained on). The GPU and CPU kernels round differently, so with
 the adaptive split and with chunked prefill the greedy text can differ from run to run at near-ties; chunked and
 token-by-token prefill give the same logits within 1e-3 on the CPU path.

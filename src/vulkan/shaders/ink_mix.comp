@@ -1,17 +1,23 @@
 #version 460
 layout(local_size_x = 256) in;
 #include "common.glsl"
-layout(push_constant) uniform P { F32 blocks; F32 cur; F32 q; F32 o; uint nb; uint n; } p;
+layout(push_constant) uniform P { F32 blocks; F32 cur; F32 q; F32 o; uint nb; uint n; uint nt; } p;
 
-// Inkling 2's depth mix, one workgroup per query row: the softmax-weighted sum of the RMS-normed states (the nb rows
-// of blocks, then cur; at most 5), scored by state . query / sqrt(n). CUDA: ink_mix.
-float state(uint s, uint i) { return s < p.nb ? p.blocks.v[s * p.n + i] : p.cur.v[i]; }
+// Inkling 2's depth mix over nt tokens: workgroup (q_idx, tok). blocks has shape [nb][nt][n], cur [nt][n], o [nq][nt][n].
+float state(uint s, uint tok, uint i) {
+    return s < p.nb ? p.blocks.v[(s * p.nt + tok) * p.n + i] : p.cur.v[tok * p.n + i];
+}
 void main() {
-    uint qo = gl_WorkGroupID.x * p.n;
+    uint qid = gl_WorkGroupID.x, tok = gl_WorkGroupID.y;
+    uint qo = qid * p.n, oo = (qid * p.nt + tok) * p.n;
     float sc[5], lg[5], mx = -3.0e38, z = 0.0;
     for (uint s = 0; s <= p.nb; s++) {
         float ss = 0.0, d = 0.0;
-        for (uint i = gl_LocalInvocationID.x; i < p.n; i += 256) { float x = state(s, i); ss += x * x; d += x * p.q.v[qo + i]; }
+        for (uint i = gl_LocalInvocationID.x; i < p.n; i += 256) {
+            float x = state(s, tok, i);
+            ss += x * x;
+            d += x * p.q.v[qo + i];
+        }
         sc[s] = fdiv(1.0, sqrt_(fdiv(block_sum(ss), float(p.n)) + 1e-6));
         lg[s] = fdiv(block_sum(d) * sc[s], sqrt_(float(p.n)));
         mx = max(mx, lg[s]);
@@ -19,7 +25,7 @@ void main() {
     for (uint s = 0; s <= p.nb; s++) { lg[s] = expf_(lg[s] - mx); z += lg[s]; }
     for (uint i = gl_LocalInvocationID.x; i < p.n; i += 256) {
         float o = 0.0;
-        for (uint s = 0; s <= p.nb; s++) o += fdiv(lg[s], z) * sc[s] * state(s, i);
-        p.o.v[qo + i] = o;
+        for (uint s = 0; s <= p.nb; s++) o += fdiv(lg[s], z) * sc[s] * state(s, tok, i);
+        p.o.v[oo + i] = o;
     }
 }

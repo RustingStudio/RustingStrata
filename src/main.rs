@@ -351,12 +351,13 @@ impl Runner<'_> {
 }
 
 impl Engine {
-    /// Hand `--backend` and `--device` to the DeepSeek, GLM and Gemma 4 paths, which read them from the environment.
+    /// Hand `--backend`, `--device`, and `--kv` to the DeepSeek, GLM, Gemma 4 and Inkling 2 paths.
     fn ds_env(&self) {
         // SAFETY: called at the start of a command, before any thread reads these variables.
         if let Some(b) = &self.backend { unsafe { std::env::set_var("STRATA_DS_BACKEND", b) } }
         if self.device != [0] { unsafe { std::env::set_var("STRATA_DS_DEVICES", self.device.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")) } }
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // Hy4: every expert on the GPU
+        if self.kv != "f16" && std::env::var_os("STRATA_KV").is_none() { set_kv_env(&self.kv); }
     }
 
     /// Fills settings not given on the command line from the model's calibration file, else built-in defaults.
@@ -523,10 +524,15 @@ impl Engine {
     fn mtp(&self) -> usize { self.mtp.unwrap_or(0) }
     fn aux_model_path(&self) -> Option<&Path> { self.draft_model.as_deref().or(self.mtp_model.as_deref()) }
 
-    /// Says that the draft options do nothing for a model outside the main engine (`config::OWN_ARCHS`).
+    /// Says which draft options do nothing for a model outside the main engine (`config::OWN_ARCHS`).
     fn own_warn(&self, g: &Gguf) {
         let Some(arch) = g.get("general.architecture").ok().and_then(|v| v.as_str()) else { return };
-        if rusting_strata::config::OWN_ARCHS.contains(&arch) && (self.mtp.is_some_and(|n| n > 0) || self.aux_model_path().is_some() || self.spec_type != "none") {
+        if !rusting_strata::config::OWN_ARCHS.contains(&arch) { return; }
+        let mtp = self.mtp.is_some_and(|n| n > 0) || self.mtp_model.is_some();
+        // Inkling 2 drafts with a DSpark file (`--draft-model`) and with n-grams (`--spec-type`); it has no MTP head.
+        if arch == "inkling2_loop" {
+            if mtp { eprintln!("warning: '{arch}' models have no MTP drafts: --mtp and --mtp-model are ignored"); }
+        } else if mtp || self.draft_model.is_some() || self.spec_type != "none" {
             eprintln!("warning: '{arch}' models decode without drafts: --mtp, --mtp-model, --draft-model and --spec-type are ignored");
         }
     }
@@ -1150,9 +1156,24 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 return rusting_strata::hy4::chat::generate(&g, &prompt, n);
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::inkling2::ARCH) {
-                anyhow::ensure!(image.is_empty(), "--image is not supported for inkling2_loop");
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
-                return rusting_strata::inkling2::chat::generate(&g, &prompt, n);
+                let max_ctx = 0;
+                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let opts = rusting_strata::inkling2::chat::Inkling2Opts {
+                    max_ctx,
+                    sampler: engine.sampler(),
+                    thinking_budget: engine.thinking_budget,
+                    think_default: engine.think_default,
+                    mmproj: mmproj.clone(),
+                    draft_model: engine.draft_model.clone(),
+                    ngram_cfg: engine.ngram_config()?,
+                };
+                if image.is_empty() {
+                    return rusting_strata::inkling2::chat::generate_opts(&g, &prompt, n, opts);
+                }
+                let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
+                let input = load_images(mmproj, &image)?;
+                return rusting_strata::inkling2::chat::generate_image_opts(&g, &prompt, Some((&input.grids, &input.embeddings)), n, opts);
             }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
@@ -1323,7 +1344,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 eprintln!("calibrate {}/{}: {id}", k + 1, list.len());
                 let arch = Gguf::open(path).ok().and_then(|g| g.get("general.architecture").ok().and_then(|v| v.as_str().map(str::to_string)));
                 if arch.as_deref().is_some_and(|a| rusting_strata::config::OWN_ARCHS.contains(&a)) {
-                    eprintln!("calibrate {id}: skipped, '{}' models have nothing to calibrate", arch.unwrap());
+                    eprintln!("calibrate {id}: skipped, calibrate measures the main engine only and '{}' models run on their own code path", arch.unwrap());
                     continue;
                 }
                 // One model that fails (too big, not a model) does not stop the others.
@@ -1407,8 +1428,27 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 return rusting_strata::hy4::chat::chat(&g, system, n, think);
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::inkling2::ARCH) {
-                anyhow::ensure!(image.is_empty(), "--image is not supported for inkling2_loop");
-                return rusting_strata::inkling2::chat::chat(&g, system, n, think);
+                let max_ctx = 0;
+                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let opts = rusting_strata::inkling2::chat::Inkling2Opts {
+                    max_ctx,
+                    sampler: engine.sampler(),
+                    thinking_budget: engine.thinking_budget,
+                    think_default: think,
+                    mmproj: mmproj.clone(),
+                    draft_model: engine.draft_model.clone(),
+                    ngram_cfg: engine.ngram_config()?,
+                };
+                let input = if image.is_empty() {
+                    None
+                } else {
+                    let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
+                    Some(load_images(mmproj, &image)?)
+                };
+                return match &input {
+                    Some(i) => rusting_strata::inkling2::chat::chat_image_opts(&g, system, n, Some((&i.grids, &i.embeddings)), opts),
+                    None => rusting_strata::inkling2::chat::chat_opts(&g, system, n, opts),
+                };
             }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
@@ -1861,7 +1901,73 @@ fn $name(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out:
     };
 }
 bench_tokenwise!(bench_hy4, rusting_strata::hy4::forward::Hy4Model);
-bench_tokenwise!(bench_inkling2, rusting_strata::inkling2::forward::Inkling2Model);
+
+/// `strata bench` for Inkling 2 (uses GPU argmax decode, plus `--draft-model` DSpark / `--spec-type` context lookup).
+fn bench_inkling2(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {
+    rusting_strata::deepseek::chat::gpu_defaults();
+    let tok = Tokenizer::from_gguf(g)?;
+    let max_ctx = engine.ctx.max(pp.iter().copied().max().unwrap_or(0) + tg + 64);
+    let opts = rusting_strata::inkling2::chat::Inkling2Opts {
+        max_ctx,
+        draft_model: engine.draft_model.clone(),
+        ngram_cfg: engine.ngram_config()?,
+        ..Default::default()
+    };
+    let mut m = opts.build_model(g, &tok)?;
+    let eos = tok.eos_ids();
+    let mut results = Vec::with_capacity(pp.len());
+    for &n in pp {
+        let ids = prose(&tok, n)?;
+        let (mut p, mut d) = (Vec::new(), Vec::new());
+        for _ in 0..reps {
+            m.reset();
+            let t = Instant::now();
+            let logits = m.prefill(&ids);
+            p.push(n as f64 / t.elapsed().as_secs_f64());
+            let t = Instant::now();
+            let mut next = ops::argmax(&logits) as u32;
+            let mut pending = std::collections::VecDeque::<u32>::new();
+            let mut k = 0;
+            for i in 0..tg {
+                if eos.contains(&next) { break; }
+                k += 1;
+                if i + 1 < tg {
+                    if let Some(t) = pending.pop_front() {
+                        next = t;
+                    } else if m.has_spec() {
+                        let rem = tg - (i + 1);
+                        pending.extend(m.spec_step_argmax(next, rem, &eos));
+                        next = pending.pop_front().unwrap();
+                    } else {
+                        next = m.step_argmax(next);
+                    }
+                }
+            }
+            d.push(k as f64 / t.elapsed().as_secs_f64());
+        }
+        let (prefill, decode_stat) = (Stat::of(&p), Stat::of(&d));
+        println!("pp {n:6}: prefill {} tok/s | tg {tg}: decode {} tok/s", prefill.text(), decode_stat.text());
+        results.push(BenchResult { pp: n, prefill, decode: decode_stat, bytes_per_token: 0, decode_median: 0.0 });
+    }
+    if m.drafts.0 > 0 {
+        eprintln!("speculative drafts accepted {}/{} ({:.1}%)", m.drafts.1, m.drafts.0, 100.0 * m.drafts.1 as f64 / m.drafts.0 as f64);
+    }
+    let expert = big_expert_stats(m.cfg.n_layer, m.cfg.n_expert);
+    let backend = rusting_strata::deepseek::mat::dev_info().map_or("cpu", |i| i.0);
+    let meta = BenchMeta {
+        backend,
+        backend_arg: engine.backend.as_deref(),
+        device: if backend == "cpu" { &[] } else { &engine.device },
+        model,
+        ctx: engine.ctx,
+        chunk: 1,
+        kv: &engine.kv,
+        mtp: 0,
+        tg,
+        reps,
+    };
+    write_bench_json(json_out, &meta, &results, expert.as_ref())
+}
 
 /// `strata bench` for GLM-5.3-Flash (chunked reference forward, GPU matvecs when enabled).
 fn bench_glm(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {
@@ -2633,7 +2739,9 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
             "glm5-next" => rusting_strata::glm::serve(&g, &tok, &name)?,
             "deepseek41" => rusting_strata::deepseek::chat::serve(&g, &tok, &name)?,
             rusting_strata::hy4::ARCH => rusting_strata::hy4::chat::serve(&g, &tok, &name)?,
-            _ => rusting_strata::inkling2::chat::serve(&g, &tok, &name)?,
+            _ => rusting_strata::inkling2::chat::serve(&g, &tok, &name, rusting_strata::inkling2::chat::Inkling2Opts {
+                max_ctx: 0, sampler: engine.sampler(), thinking_budget: engine.thinking_budget, think_default: engine.think_default,
+                mmproj, draft_model: engine.draft_model.clone(), ngram_cfg: engine.ngram_config()? })?,
         })
     } else {
         aux_g = open_mtp_gguf(engine.aux_model_path())?;

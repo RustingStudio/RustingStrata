@@ -53,12 +53,15 @@ const SPV: &[(&str, &[u8])] = &[
     ("hc_write", include_bytes!("spv/hc_write.spv")),
     ("ink_attn", include_bytes!("spv/ink_attn.spv")),
     ("ink_attn_merge", include_bytes!("spv/ink_attn_merge.spv")),
+    ("ink_attn_prefill", include_bytes!("spv/ink_attn_prefill.spv")),
     ("ink_clip", include_bytes!("spv/ink_clip.spv")),
     ("ink_conv", include_bytes!("spv/ink_conv.spv")),
+    ("ink_conv_batch", include_bytes!("spv/ink_conv_batch.spv")),
     ("ink_ctrl_gate", include_bytes!("spv/ink_ctrl_gate.spv")),
     ("ink_ctrl_out", include_bytes!("spv/ink_ctrl_out.spv")),
     ("ink_ffn_sum", include_bytes!("spv/ink_ffn_sum.spv")),
     ("ink_mix", include_bytes!("spv/ink_mix.spv")),
+    ("ink_route", include_bytes!("spv/ink_route.spv")),
     ("kv_store", include_bytes!("spv/kv_store.spv")),
     ("l2_norm", include_bytes!("spv/l2_norm.spv")),
     ("moe_combine", include_bytes!("spv/moe_combine.spv")),
@@ -80,6 +83,8 @@ const SPV: &[(&str, &[u8])] = &[
     ("router_topk", include_bytes!("spv/router_topk.spv")),
     ("ssm_gates", include_bytes!("spv/ssm_gates.spv")),
     ("situ", include_bytes!("spv/situ.spv")),
+    ("situ_q", include_bytes!("spv/situ_q.spv")),
+    ("softcap", include_bytes!("spv/softcap.spv")),
     ("swiglu", include_bytes!("spv/swiglu.spv")),
     // quant_xq under another name, so that it gets no barrier inside a batch: its output is read after the batch.
     ("swiglu_q", include_bytes!("spv/quant_xq.spv")),
@@ -1345,26 +1350,65 @@ impl Backend for Vk {
     fn situ(&self, y: u64, n: usize, rows: usize, scale: u64, beta: f32, lb: f32) -> anyhow::Result<()> {
         self.run("situ", &[], [(n * rows).div_ceil(256), 1, 1], &[&y, &scale, &(n as u32), &(rows as u32), &beta, &lb])
     }
-    fn ink_mix(&self, blocks: u64, nb: usize, cur: u64, q: u64, nq: usize, out: u64, n: usize) -> anyhow::Result<()> {
-        self.run("ink_mix", &[], [nq, 1, 1], &[&blocks, &cur, &q, &out, &(nb as u32), &(n as u32)])
+    fn situ_q(&self, y: u64, n: usize, rows: usize, s: u64, beta: f32, lb: f32, xq: u64) -> anyhow::Result<()> {
+        ensure!(n % 32 == 0, "situ_q: n ({n}) must be a multiple of 32");
+        self.run("situ_q", &[self.0.llama], [n.div_ceil(256), rows, 1], &[&y, &xq, &s, &(n as u32), &beta, &lb])
     }
-    fn ink_ctrl(&self, down: u64, gain: u64, forget: u64, cur: u64, nins: usize, msg: u64, gate: u64, out: u64, n: usize, rank: usize, count: usize) -> anyhow::Result<()> {
-        self.run("ink_ctrl_gate", &[], [rank, count, 1], &[&down, &cur, &msg, &gate, &(nins as u32), &(n as u32), &(rank as u32)])?;
-        self.run("ink_ctrl_out", &[], [n.div_ceil(256), count, 1], &[&gain, &forget, &gate, &cur, &msg, &out, &(nins as u32), &(n as u32), &(rank as u32)])
+    fn softcap(&self, x: u64, n: usize, cap: f32) -> anyhow::Result<()> {
+        self.run("softcap", &[], [n.div_ceil(256), 1, 1], &[&x, &(n as u32), &cap])
+    }
+    fn ink_mix_n(&self, blocks: u64, nb: usize, cur: u64, q: u64, nq: usize, out: u64, n: usize, nt: usize) -> anyhow::Result<()> {
+        self.run("ink_mix", &[], [nq, nt, 1], &[&blocks, &cur, &q, &out, &(nb as u32), &(n as u32), &(nt as u32)])
+    }
+    fn ink_ctrl_n(&self, down: u64, gain: u64, forget: u64, cur: u64, nins: usize, msg: u64, gate: u64, out: u64, n: usize, rank: usize, count: usize, nt: usize) -> anyhow::Result<()> {
+        self.run("ink_ctrl_gate", &[], [rank, count, nt], &[&down, &cur, &msg, &gate, &(nins as u32), &(n as u32), &(rank as u32), &(nt as u32)])?;
+        self.run("ink_ctrl_out", &[], [n.div_ceil(256), count, nt], &[&gain, &forget, &gate, &cur, &msg, &out, &(nins as u32), &(n as u32), &(rank as u32), &(nt as u32)])
     }
     fn ink_conv(&self, cur: u64, w: u64, taps: u64, hist: u64, out: u64, n: usize, n_conv: usize, per: usize) -> anyhow::Result<()> {
         self.run("ink_conv", &[], [n.div_ceil(256), 1, 1], &[&cur, &w, &taps, &hist, &out, &(n as u32), &(n_conv as u32), &(per as u32)])
     }
-    fn ink_clip(&self, x: u64, scale: u64, w: usize, rows: usize, thr: f32, eps: f32, mul: f32, dst: u64) -> anyhow::Result<()> {
-        self.run("ink_clip", &[], [rows, 1, 1], &[&x, &scale, &dst, &(w as u32), &thr, &eps, &mul])
+    fn ink_conv_batch(&self, cur: u64, w: u64, taps: u64, hist: u64, out: u64, n: usize, n_conv: usize, per: usize, nt: usize) -> anyhow::Result<()> {
+        ensure!(cur != out, "ink_conv_batch: out must not alias cur");
+        ensure!(n_conv <= 8, "ink_conv_batch: n_conv={n_conv} > 8");
+        self.run("ink_conv_batch", &[], [n.div_ceil(256), nt, 1], &[&cur, &w, &taps, &hist, &out, &(n as u32), &(n_conv as u32), &(per as u32), &(nt as u32), &0u32])?;
+        self.run("ink_conv_batch", &[], [n.div_ceil(256), 1, 1], &[&cur, &w, &taps, &hist, &out, &(n as u32), &(n_conv as u32), &(per as u32), &(nt as u32), &1u32])
+    }
+    fn ink_clip_n(
+        &self, x: u64, scale: u64, w: usize, rows: usize, nt: usize,
+        thr: f32, eps: f32, mul: f32,
+        dst: u64, dst_at0: usize, dst_ring: usize,
+        pos0: usize, log_alpha: f32, log_floor: f32,
+    ) -> anyhow::Result<()> {
+        ensure!(w <= 128, "ink_clip_n: w={w} > 128");
+        ensure!(self.0.kv_mode == 0 || dst == 0 || w % 32 == 0, "ink_clip_n: quantized KV requires w % 32 == 0 (got {w})");
+        let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
+        let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
+        self.run("ink_clip", &[], [rows, nt, 1], &[
+            &x, &scale, &dst, &(w as u32), &thr, &eps, &mul,
+            &(dst_at0 as u32), &(ring as u32), &(pos0 as u32), &log_alpha, &fl,
+        ])
     }
     fn ink_attn(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, rows: usize, at: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
         let chunks = rows.div_ceil(64);
         self.run("ink_attn", &[], [nh, chunks, 1], &[&q, &r, &sink, &k, &v, &bias, &sc, &(rows as u32), &(at as u32), &(nh as u32), &(nkv as u32), &(hd as u32), &(nr as u32), &(ext as u32)])?;
         self.run("ink_attn_merge", &[], [nh, 1, 1], &[&sc, &gate, &out, &(chunks as u32), &(hd as u32)])
     }
-    fn ink_ffn_sum(&self, acc: u64, d: u64, wts: u64, ne: usize, n: usize, cpu: u64) -> anyhow::Result<()> {
-        self.run("ink_ffn_sum", &[], [n.div_ceil(256), 1, 1], &[&acc, &d, &wts, &cpu, &(ne as u32), &(n as u32)])
+    fn ink_attn_prefill(
+        &self, q: u64, r: u64, sink: u64, gate: u64, kc: u64, vc: u64, kc_new: u64, vc_new: u64, bias: u64, out: u64,
+        pos: usize, nt: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize, ring: usize, win: usize,
+    ) -> anyhow::Result<()> {
+        ensure!(hd > 0 && hd <= 128 && hd % 32 == 0, "ink_attn_prefill: unsupported hd={hd}");
+        self.run("ink_attn_prefill", &[0, (hd / 32) as u32], [nt.div_ceil(4), nh, 1], &[
+            &q, &r, &sink, &gate, &kc, &vc, &kc_new, &vc_new, &bias, &out,
+            &(pos as u32), &(nt as u32), &(nh as u32), &(nkv as u32), &(nr as u32), &(ext as u32), &(ring.max(1) as u32), &(win as u32),
+        ])
+    }
+    fn ink_ffn_sum_n(&self, acc: u64, d: u64, wts: u64, ne: usize, n: usize, nt: usize, cpu: u64) -> anyhow::Result<()> {
+        self.run("ink_ffn_sum", &[], [n.div_ceil(256), nt, 1], &[&acc, &d, &wts, &cpu, &(ne as u32), &(n as u32)])
+    }
+    fn ink_route(&self, logits: u64, bias: u64, ids: u64, wts: u64, gu_sc: u64, dn_sc: u64, gsc_out: u64, n_expert: usize, k: usize, exp_scale: f32, rows: usize) -> anyhow::Result<()> {
+        ensure!(n_expert <= 512 && k <= 32, "ink_route: n_expert={n_expert} k={k}");
+        self.run("ink_route", &[], [rows, 1, 1], &[&logits, &bias, &ids, &wts, &gu_sc, &dn_sc, &gsc_out, &(n_expert as u32), &(k as u32), &exp_scale])
     }
     fn hadamard(&self, x: u64, u: u64, s: u64, out: u64, n: usize, block: usize, rows: usize) -> anyhow::Result<()> {
         // ponytail: a block is one workgroup, and 128 invocations is what every Vulkan device takes; a larger block

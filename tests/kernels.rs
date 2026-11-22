@@ -2315,3 +2315,320 @@ fn tensor_scale_applies_to_all_gpu_ops() {
         }
     }
 }
+
+#[test]
+fn situ_q_and_softcap_match_reference() {
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        // Include n = 1152 (n % 256 != 0) as well as 256-aligned widths, both lb == 0 and lb > 0, and both null & per-row scale.
+        for (n, rows, beta, lb, scaled) in [
+            (1152usize, 8usize, 6.0f32, 0.0f32, false),
+            (1024, 5, 4.0, 12.0, false),
+            (1152, 4, 4.0, 12.0, true),
+        ] {
+            let y = xs(rows * 2 * n);
+            let qbytes = rows * n + rows * (n / 32) * 4;
+            let (dy1, dy2) = (up(gpu, &y), up(gpu, &y));
+            let sc_buf = scaled.then(|| up(gpu, &(0..rows).map(|r| 0.35 + 0.4 * r as f32).collect::<Vec<_>>()));
+            let sc_addr = sc_buf.as_ref().map_or(0, |b| b.addr());
+            let (dq1, dq2) = (gpu.zeros::<u8>(qbytes).unwrap(), gpu.zeros::<u8>(qbytes).unwrap());
+            gpu.situ(dy1.addr(), n, rows, sc_addr, beta, lb).unwrap();
+            gpu.quant_xq(dy1.addr(), 2 * n, n, rows, dq1.addr()).unwrap();
+            gpu.situ_q(dy2.addr(), n, rows, sc_addr, beta, lb, dq2.addr()).unwrap();
+            assert_eq!(down::<u8>(gpu, &dq1), down::<u8>(gpu, &dq2), "{bk} situ_q mismatch n={n} rows={rows} lb={lb} scaled={scaled}");
+        }
+        let logits: Vec<f32> = xs(4097).into_iter().map(|v| v * 500.0).collect();
+        let cap = 30.0f32;
+        let want: Vec<f32> = logits.iter().map(|&v| cap * (v / cap).tanh()).collect();
+        let dl = up(gpu, &logits);
+        gpu.softcap(dl.addr(), logits.len(), cap).unwrap();
+        let e = rel_l2(&down::<f32>(gpu, &dl), &want);
+        assert!(e < 1e-6, "{bk} softcap rel_l2 {e}");
+
+        // Inkling 2 router (positive + negative biases, exact ties, multi-row) & ink_ffn_sum with cpu = 0.
+        let (ne_r, k_r, rows_r, exp_scale) = (128usize, 8usize, 3usize, 2.5f32);
+        let mut rlogits = xs(rows_r * ne_r);
+        let mut bias: Vec<f32> = xs(ne_r + 17)[17..].iter().map(|&v| v * 3.0).collect();
+        // Force an exact score tie between expert 5 and expert 42 on row 1 (lowest index 5 must win).
+        rlogits[ne_r + 5] = 0.25;
+        rlogits[ne_r + 42] = 0.25;
+        bias[5] = -0.35;
+        bias[42] = -0.35;
+        let (dl_r, db_r) = (up(gpu, &rlogits), up(gpu, &bias));
+        let gu_sc: Vec<f32> = (0..ne_r).map(|i| 0.5 + (i % 7) as f32 * 0.25).collect();
+        let dn_sc: Vec<f32> = (0..ne_r).map(|i| 0.75 + (i % 5) as f32 * 0.3).collect();
+        let (d_gu_sc, d_dn_sc) = (up(gpu, &gu_sc), up(gpu, &dn_sc));
+        let (d_ids, d_wts, d_gsc) = (
+            gpu.zeros::<i32>(rows_r * k_r).unwrap(),
+            gpu.zeros::<f32>(rows_r * k_r).unwrap(),
+            gpu.zeros::<f32>(rows_r * k_r).unwrap(),
+        );
+        for with_scales in [false, true] {
+            gpu.ink_route(
+                dl_r.addr(), db_r.addr(), d_ids.addr(), d_wts.addr(),
+                if with_scales { d_gu_sc.addr() } else { 0 },
+                if with_scales { d_dn_sc.addr() } else { 0 },
+                if with_scales { d_gsc.addr() } else { 0 },
+                ne_r, k_r, exp_scale, rows_r,
+            ).unwrap();
+            let got_ids = down::<i32>(gpu, &d_ids);
+            let got_wts = down::<f32>(gpu, &d_wts);
+            let got_gsc = down::<f32>(gpu, &d_gsc);
+            for r in 0..rows_r {
+                let probs: Vec<f32> = rlogits[r * ne_r..][..ne_r].iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect();
+                let mut sel: Vec<usize> = (0..ne_r).collect();
+                sel.sort_by(|&a, &b| (probs[b] + bias[b]).partial_cmp(&(probs[a] + bias[a])).unwrap().then(a.cmp(&b)));
+                sel.truncate(k_r);
+                let sum = sel.iter().map(|&e| probs[e]).sum::<f32>() + 1e-20;
+                let want_ids: Vec<i32> = sel.iter().map(|&e| e as i32).collect();
+                let want_wts: Vec<f32> = sel.iter().map(|&e| probs[e] / sum * exp_scale * if with_scales { dn_sc[e] } else { 1.0 }).collect();
+                assert_eq!(&got_ids[r * k_r..][..k_r], &want_ids[..], "{bk} ink_route ids row {r} scaled={with_scales}");
+                assert!(rel_l2(&got_wts[r * k_r..][..k_r], &want_wts) < 1e-5, "{bk} ink_route wts row {r} scaled={with_scales}");
+                if with_scales {
+                    let want_gsc: Vec<f32> = sel.iter().map(|&e| gu_sc[e]).collect();
+                    assert_eq!(&got_gsc[r * k_r..][..k_r], &want_gsc[..], "{bk} ink_route gsc row {r}");
+                }
+            }
+        }
+
+        // ink_ffn_sum with cpu = 0 (100%-GPU MoE path).
+        let (ne_s, n_s) = (8usize, 256usize);
+        let (d_s, w_s) = (xs(ne_s * n_s), xs(ne_s + 5)[5..].to_vec());
+        let want_s: Vec<f32> = (0..n_s).map(|c| (0..ne_s).map(|e| w_s[e] * d_s[e * n_s + c]).sum::<f32>()).collect();
+        let (dd_s, dw_s, acc_s) = (up(gpu, &d_s), up(gpu, &w_s), gpu.zeros::<f32>(n_s).unwrap());
+        gpu.ink_ffn_sum(acc_s.addr(), dd_s.addr(), dw_s.addr(), ne_s, n_s, 0).unwrap();
+        assert!(rel_l2(&down::<f32>(gpu, &acc_s), &want_s) < 1e-6, "{bk} ink_ffn_sum null cpu");
+    }
+}
+
+/// Every batched prefill Inkling 2 kernel (`ink_mix_n`, `ink_ctrl_n`, `ink_conv_batch` for nt = 1..10,
+/// `ink_clip_n` with log-scale + ring KV write, `ink_ffn_sum_n`, `ink_attn_prefill` full + SWA) matches
+/// token-by-token decode kernels.
+#[test]
+fn ink_prefill_and_batch_match_decode() {
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+
+        // 1. ink_mix_n ([nb][nt][n]) vs per-token ink_mix ([nb][n])
+        let (nb, nq, n, nt) = (3usize, 4usize, 128usize, 5usize);
+        let blocks = xs(nb * nt * n);
+        let cur = xs(nt * n + 11)[11..].to_vec();
+        let q = xs(nq * n + 3)[3..].to_vec();
+        let mut want_mix = vec![0.0f32; nq * nt * n];
+        for tok in 0..nt {
+            let mut b1 = Vec::with_capacity(nb * n);
+            for s in 0..nb { b1.extend_from_slice(&blocks[(s * nt + tok) * n..(s * nt + tok + 1) * n]); }
+            let (db1, dc1, dq, do1) = (up(gpu, &b1), up(gpu, &cur[tok * n..(tok + 1) * n]), up(gpu, &q), gpu.zeros::<f32>(nq * n).unwrap());
+            gpu.ink_mix(db1.addr(), nb, dc1.addr(), dq.addr(), nq, do1.addr(), n).unwrap();
+            let o1 = down::<f32>(gpu, &do1);
+            for qid in 0..nq {
+                want_mix[(qid * nt + tok) * n..(qid * nt + tok + 1) * n].copy_from_slice(&o1[qid * n..(qid + 1) * n]);
+            }
+        }
+        let (db, dc, dq, dout) = (up(gpu, &blocks), up(gpu, &cur), up(gpu, &q), gpu.zeros::<f32>(nq * nt * n).unwrap());
+        gpu.ink_mix_n(db.addr(), nb, dc.addr(), dq.addr(), nq, dout.addr(), n, nt).unwrap();
+        assert!(rel_l2(&down::<f32>(gpu, &dout), &want_mix) < 1e-6, "{bk} ink_mix_n");
+
+        // 2. ink_ctrl_n for both nins=1 and nins=count
+        let (rank, count) = (4usize, 3usize);
+        let down_w: Vec<u16> = xs(count * rank * 2 * n + 7)[7..].iter().map(|&v| half::f16::from_f32(v * 0.25).to_bits()).collect();
+        let gain_w: Vec<u16> = xs(count * rank * n + 13)[13..].iter().map(|&v| half::f16::from_f32(v * 0.25).to_bits()).collect();
+        let forget_w: Vec<u16> = xs(count * rank * n + 19)[19..].iter().map(|&v| half::f16::from_f32(v * 0.25).to_bits()).collect();
+        let msg = xs(count * nt * n + 23)[23..].to_vec();
+        for nins in [1usize, count] {
+            let cur_c = xs(nins * nt * n + 31)[31..].to_vec();
+            let mut want_ctrl = vec![0.0f32; count * nt * n];
+            let (dd, dg, df) = (up(gpu, &down_w), up(gpu, &gain_w), up(gpu, &forget_w));
+            let dgate1 = gpu.zeros::<f32>(count * rank).unwrap();
+            for tok in 0..nt {
+                let mut c1 = Vec::with_capacity(nins * n);
+                for j in 0..nins { c1.extend_from_slice(&cur_c[(j * nt + tok) * n..(j * nt + tok + 1) * n]); }
+                let mut m1 = Vec::with_capacity(count * n);
+                for j in 0..count { m1.extend_from_slice(&msg[(j * nt + tok) * n..(j * nt + tok + 1) * n]); }
+                let (dc1, dm1, do1) = (up(gpu, &c1), up(gpu, &m1), gpu.zeros::<f32>(count * n).unwrap());
+                gpu.ink_ctrl(dd.addr(), dg.addr(), df.addr(), dc1.addr(), nins, dm1.addr(), dgate1.addr(), do1.addr(), n, rank, count).unwrap();
+                let o1 = down::<f32>(gpu, &do1);
+                for j in 0..count {
+                    want_ctrl[(j * nt + tok) * n..(j * nt + tok + 1) * n].copy_from_slice(&o1[j * n..(j + 1) * n]);
+                }
+            }
+            let (dcc, dmm, dgg, doo) = (up(gpu, &cur_c), up(gpu, &msg), gpu.zeros::<f32>(nt * count * rank).unwrap(), gpu.zeros::<f32>(count * nt * n).unwrap());
+            gpu.ink_ctrl_n(dd.addr(), dg.addr(), df.addr(), dcc.addr(), nins, dmm.addr(), dgg.addr(), doo.addr(), n, rank, count, nt).unwrap();
+            assert!(rel_l2(&down::<f32>(gpu, &doo), &want_ctrl) < 1e-6, "{bk} ink_ctrl_n nins={nins}");
+        }
+
+        // 3. ink_conv_batch across nt = 1..=10 (checks short nt < nc - 1 and long nt >= nc - 1 + hist advance)
+        let (cn, nc, per) = (256usize, 4usize, 32usize);
+        let nheads = cn / per;
+        let cw = xs(cn * nc + 5)[5..].to_vec();
+        let init_hist = xs((nc - 1) * cn + 9)[9..].to_vec();
+        let (dcw, dhist_ref, dhist_bat) = (up(gpu, &cw), up(gpu, &init_hist), up(gpu, &init_hist));
+        for bat_nt in [1usize, 2, 3, 5, 10] {
+            let x_b = xs(bat_nt * cn + bat_nt * 7)[bat_nt * 7..].to_vec();
+            let taps_b = xs(bat_nt * nheads * nc + bat_nt * 13)[bat_nt * 13..].to_vec();
+            let mut want_conv = Vec::with_capacity(bat_nt * cn);
+            for tok in 0..bat_nt {
+                let dcur = up(gpu, &x_b[tok * cn..(tok + 1) * cn]);
+                let dtap = up(gpu, &taps_b[tok * nheads * nc..(tok + 1) * nheads * nc]);
+                let dout = gpu.zeros::<f32>(cn).unwrap();
+                gpu.ink_conv(dcur.addr(), dcw.addr(), dtap.addr(), dhist_ref.addr(), dout.addr(), cn, nc, per).unwrap();
+                want_conv.extend_from_slice(&down::<f32>(gpu, &dout));
+            }
+            let (dx_b, dtaps_b, dout_b) = (up(gpu, &x_b), up(gpu, &taps_b), gpu.zeros::<f32>(bat_nt * cn).unwrap());
+            gpu.ink_conv_batch(dx_b.addr(), dcw.addr(), dtaps_b.addr(), dhist_bat.addr(), dout_b.addr(), cn, nc, per, bat_nt).unwrap();
+            assert!(rel_l2(&down::<f32>(gpu, &dout_b), &want_conv) < 1e-6, "{bk} ink_conv_batch nt={bat_nt}");
+            assert!(rel_l2(&down::<f32>(gpu, &dhist_bat), &down::<f32>(gpu, &dhist_ref)) < 1e-6, "{bk} ink_conv_batch hist nt={bat_nt}");
+        }
+
+        // 4. ink_clip_n with log_alpha + ring KV write + ink_attn_prefill (full & SWA) vs CPU & decode ink_attn
+        let (nh, nkv, hd, nr, ext, kv_nt, pos0, win) = (4usize, 2usize, 64usize, 16usize, 8usize, 6usize, 3usize, 4usize);
+        let q_clip_in = xs(kv_nt * nh * hd + 17)[17..].to_vec();
+        let k_clip_in = xs(kv_nt * nkv * hd + 29)[29..].to_vec();
+        let q_scale = xs(nh * hd + 41)[41..].to_vec();
+        let (log_alpha, log_floor) = (0.35f32, 2.0f32);
+        let (thr, eps, mul) = (0.0f32, 1e-6f32, 0.7f32);
+
+        // Full ring >= pos0 + kv_nt
+        let full_ring = 16usize;
+        let dq_bat = up(gpu, &q_clip_in);
+        let dk_bat = up(gpu, &k_clip_in);
+        let dqs = up(gpu, &q_scale);
+        let dk_kv_bat = gpu.zeros::<u16>(full_ring * nkv * hd).unwrap();
+        let dq_ref = up(gpu, &q_clip_in);
+        let dk_ref = up(gpu, &k_clip_in);
+        let dk_kv_ref = gpu.zeros::<u16>(full_ring * nkv * hd).unwrap();
+        gpu.ink_clip_n(dq_bat.addr(), dqs.addr(), hd, nh, kv_nt, thr, eps, mul, 0, 0, 1, pos0, log_alpha, log_floor).unwrap();
+        gpu.ink_clip_n(dk_bat.addr(), 0, hd, nkv, kv_nt, 8.0, 0.0, 1.0, dk_kv_bat.addr(), pos0, full_ring, 0, 0.0, 1.0).unwrap();
+        for tok in 0..kv_nt {
+            let tm = 1.0 + log_alpha * (((pos0 + tok + 1) as f32) / log_floor).max(1.0).ln();
+            gpu.ink_clip(dq_ref.addr() + (tok * nh * hd * 4) as u64, dqs.addr(), hd, nh, thr, eps, mul * tm, 0).unwrap();
+            gpu.ink_clip(dk_ref.addr() + (tok * nkv * hd * 4) as u64, 0, hd, nkv, 8.0, 0.0, 1.0, dk_kv_ref.addr() + ((pos0 + tok) * nkv * hd * 2) as u64).unwrap();
+        }
+        assert!(rel_l2(&down::<f32>(gpu, &dq_bat), &down::<f32>(gpu, &dq_ref)) < 1e-6, "{bk} ink_clip_n q log");
+        assert!(rel_l2(&down::<f32>(gpu, &dk_bat), &down::<f32>(gpu, &dk_ref)) < 1e-6, "{bk} ink_clip_n k");
+        assert_eq!(down::<u16>(gpu, &dk_kv_bat), down::<u16>(gpu, &dk_kv_ref), "{bk} ink_clip_n kv");
+
+        // Compare ink_attn_prefill against token-by-token ink_attn (seed prefill positions 0..pos0 too).
+        let seed_q = xs(pos0 * nh * hd + 53)[53..].to_vec();
+        let seed_r = xs(pos0 * nh * nr + 59)[59..].to_vec();
+        let seed_k = xs(pos0 * nkv * hd + 61)[61..].to_vec();
+        let seed_v = xs(pos0 * nkv * hd + 67)[67..].to_vec();
+        let r_in = xs(kv_nt * nh * nr + 71)[71..].to_vec();
+        let sink_in = xs(kv_nt * nh + 73)[73..].to_vec();
+        let gate_in = xs(kv_nt * nh * hd + 79)[79..].to_vec();
+        let bias_in = xs(ext * nr + 83)[83..].to_vec();
+        let v_clip_in = xs(kv_nt * nkv * hd + 89)[89..].to_vec();
+
+        // Full attention test: seed [0..pos0] then prefill [pos0..pos0+kv_nt]
+        let kc_full = gpu.zeros::<u16>(full_ring * nkv * hd).unwrap();
+        let vc_full = gpu.zeros::<u16>(full_ring * nkv * hd).unwrap();
+        let dk_seed = up(gpu, &seed_k);
+        let dv_seed = up(gpu, &seed_v);
+        gpu.ink_clip_n(dk_seed.addr(), 0, hd, nkv, pos0, 8.0, 0.0, 1.0, kc_full.addr(), 0, full_ring, 0, 0.0, 1.0).unwrap();
+        gpu.ink_clip_n(dv_seed.addr(), 0, hd, nkv, pos0, 0.0, 1e-6, 1.0, vc_full.addr(), 0, full_ring, 0, 0.0, 1.0).unwrap();
+        gpu.ink_clip_n(up(gpu, &k_clip_in).addr(), 0, hd, nkv, kv_nt, 8.0, 0.0, 1.0, kc_full.addr(), pos0, full_ring, 0, 0.0, 1.0).unwrap();
+        gpu.ink_clip_n(up(gpu, &v_clip_in).addr(), 0, hd, nkv, kv_nt, 0.0, 1e-6, 1.0, vc_full.addr(), pos0, full_ring, 0, 0.0, 1.0).unwrap();
+
+        let (dr, dsink, dgate, dbias) = (up(gpu, &r_in), up(gpu, &sink_in), up(gpu, &gate_in), up(gpu, &bias_in));
+        let dout_pre = gpu.zeros::<f32>(kv_nt * nh * hd).unwrap();
+        gpu.ink_attn_prefill(
+            dq_bat.addr(), dr.addr(), dsink.addr(), dgate.addr(), kc_full.addr(), vc_full.addr(), 0, 0, dbias.addr(), dout_pre.addr(),
+            pos0, kv_nt, nh, nkv, hd, nr, ext, full_ring, 0,
+        ).unwrap();
+        let dsc = gpu.zeros::<f32>(nh * full_ring.div_ceil(64) * (hd + 2)).unwrap();
+        let mut want_pre = Vec::with_capacity(kv_nt * nh * hd);
+        for tok in 0..kv_nt {
+            let at = pos0 + tok;
+            let dout1 = gpu.zeros::<f32>(nh * hd).unwrap();
+            gpu.ink_attn(
+                dq_bat.addr() + (tok * nh * hd * 4) as u64,
+                dr.addr() + (tok * nh * nr * 4) as u64,
+                dsink.addr() + (tok * nh * 4) as u64,
+                dgate.addr() + (tok * nh * hd * 4) as u64,
+                kc_full.addr(), vc_full.addr(), dbias.addr(), dsc.addr(), dout1.addr(),
+                at + 1, at, nh, nkv, hd, nr, ext,
+            ).unwrap();
+            want_pre.extend_from_slice(&down::<f32>(gpu, &dout1));
+        }
+        assert!(rel_l2(&down::<f32>(gpu, &dout_pre), &want_pre) < 1e-6, "{bk} ink_attn_prefill full");
+
+        // SWA wrap test: ring = win, seed [0..pos0] in kc_swab/vc_swab, prefill [pos0..pos0+kv_nt] in kc_new/vc_new, then ring copy!
+        let _ = (seed_q, seed_r);
+        let kc_swa = gpu.zeros::<u16>(win * nkv * hd).unwrap();
+        let vc_swa = gpu.zeros::<u16>(win * nkv * hd).unwrap();
+        let kc_swab = gpu.zeros::<u16>(win * nkv * hd).unwrap();
+        let vc_swab = gpu.zeros::<u16>(win * nkv * hd).unwrap();
+        gpu.ink_clip_n(up(gpu, &seed_k).addr(), 0, hd, nkv, pos0, 8.0, 0.0, 1.0, kc_swab.addr(), 0, win, 0, 0.0, 1.0).unwrap();
+        gpu.ink_clip_n(up(gpu, &seed_v).addr(), 0, hd, nkv, pos0, 0.0, 1e-6, 1.0, vc_swab.addr(), 0, win, 0, 0.0, 1.0).unwrap();
+        let kc_new = gpu.zeros::<u16>(kv_nt * nkv * hd).unwrap();
+        let vc_new = gpu.zeros::<u16>(kv_nt * nkv * hd).unwrap();
+        gpu.ink_clip_n(up(gpu, &k_clip_in).addr(), 0, hd, nkv, kv_nt, 8.0, 0.0, 1.0, kc_new.addr(), 0, kv_nt, 0, 0.0, 1.0).unwrap();
+        gpu.ink_clip_n(up(gpu, &v_clip_in).addr(), 0, hd, nkv, kv_nt, 0.0, 1e-6, 1.0, vc_new.addr(), 0, kv_nt, 0, 0.0, 1.0).unwrap();
+        let dout_swa = gpu.zeros::<f32>(kv_nt * nh * hd).unwrap();
+        gpu.ink_attn_prefill(
+            dq_bat.addr(), dr.addr(), dsink.addr(), dgate.addr(), kc_swab.addr(), vc_swab.addr(), kc_new.addr(), vc_new.addr(), dbias.addr(), dout_swa.addr(),
+            pos0, kv_nt, nh, nkv, hd, nr, ext, win, win,
+        ).unwrap();
+        // Copy last keep = min(kv_nt, win) rows from kc_new/vc_new into kc_swab/vc_swab at (pos0 + kv_nt - keep) % win.
+        let keep = kv_nt.min(win);
+        let src0 = kv_nt - keep;
+        let dst0 = (pos0 + src0) % win;
+        let first = keep.min(win - dst0);
+        let rb = 2 * gpu.kv_words(nkv * hd);
+        gpu.dtod(&kc_new, src0 * rb, &kc_swab, dst0 * rb, first * rb).unwrap();
+        gpu.dtod(&vc_new, src0 * rb, &vc_swab, dst0 * rb, first * rb).unwrap();
+        if first < keep {
+            gpu.dtod(&kc_new, (src0 + first) * rb, &kc_swab, 0, (keep - first) * rb).unwrap();
+            gpu.dtod(&vc_new, (src0 + first) * rb, &vc_swab, 0, (keep - first) * rb).unwrap();
+        }
+        let mut want_swa = Vec::with_capacity(kv_nt * nh * hd);
+        let all_k = [seed_k, k_clip_in].concat();
+        let all_v = [seed_v, v_clip_in].concat();
+        for abs_p in 0..pos0 + kv_nt {
+            let dk1 = up(gpu, &all_k[abs_p * nkv * hd..(abs_p + 1) * nkv * hd]);
+            let dv1 = up(gpu, &all_v[abs_p * nkv * hd..(abs_p + 1) * nkv * hd]);
+            let at = abs_p % win;
+            gpu.ink_clip(dk1.addr(), 0, hd, nkv, 8.0, 0.0, 1.0, kc_swa.addr() + (at * nkv * hd * 2) as u64).unwrap();
+            gpu.ink_clip(dv1.addr(), 0, hd, nkv, 0.0, 1e-6, 1.0, vc_swa.addr() + (at * nkv * hd * 2) as u64).unwrap();
+            if abs_p >= pos0 {
+                let tok = abs_p - pos0;
+                let rows = (abs_p + 1).min(win);
+                let dout1 = gpu.zeros::<f32>(nh * hd).unwrap();
+                gpu.ink_attn(
+                    dq_bat.addr() + (tok * nh * hd * 4) as u64,
+                    dr.addr() + (tok * nh * nr * 4) as u64,
+                    dsink.addr() + (tok * nh * 4) as u64,
+                    dgate.addr() + (tok * nh * hd * 4) as u64,
+                    kc_swa.addr(), vc_swa.addr(), dbias.addr(), dsc.addr(), dout1.addr(),
+                    rows, at, nh, nkv, hd, nr, ext,
+                ).unwrap();
+                want_swa.extend_from_slice(&down::<f32>(gpu, &dout1));
+            }
+        }
+        assert!(rel_l2(&down::<f32>(gpu, &dout_swa), &want_swa) < 1e-6, "{bk} ink_attn_prefill swa");
+        assert_eq!(down::<u16>(gpu, &kc_swab), down::<u16>(gpu, &kc_swa), "{bk} swa ring copy k");
+        assert_eq!(down::<u16>(gpu, &vc_swab), down::<u16>(gpu, &vc_swa), "{bk} swa ring copy v");
+
+        // 5. ink_ffn_sum_n (with non-zero cpu and null cpu)
+        let (fne, fn_dim, fnt) = (8usize, 256usize, 4usize);
+        let fd = xs(fnt * fne * fn_dim + 97)[97..].to_vec();
+        let fw = xs(fnt * fne + 101)[101..].to_vec();
+        let fcpu = xs(fnt * fn_dim + 103)[103..].to_vec();
+        let mut want_sum = vec![0.0f32; fnt * fn_dim];
+        let mut want_sum_null = vec![0.0f32; fnt * fn_dim];
+        for tok in 0..fnt {
+            for c in 0..fn_dim {
+                let s: f32 = (0..fne).map(|e| fw[tok * fne + e] * fd[(tok * fne + e) * fn_dim + c]).sum();
+                want_sum[tok * fn_dim + c] = fcpu[tok * fn_dim + c] + s;
+                want_sum_null[tok * fn_dim + c] = s;
+            }
+        }
+        let (dfd, dfw, dfc) = (up(gpu, &fd), up(gpu, &fw), up(gpu, &fcpu));
+        let dacc1 = gpu.zeros::<f32>(fnt * fn_dim).unwrap();
+        let dacc0 = gpu.zeros::<f32>(fnt * fn_dim).unwrap();
+        gpu.ink_ffn_sum_n(dacc1.addr(), dfd.addr(), dfw.addr(), fne, fn_dim, fnt, dfc.addr()).unwrap();
+        gpu.ink_ffn_sum_n(dacc0.addr(), dfd.addr(), dfw.addr(), fne, fn_dim, fnt, 0).unwrap();
+        assert!(rel_l2(&down::<f32>(gpu, &dacc1), &want_sum) < 1e-6, "{bk} ink_ffn_sum_n cpu");
+        assert!(rel_l2(&down::<f32>(gpu, &dacc0), &want_sum_null) < 1e-6, "{bk} ink_ffn_sum_n null");
+    }
+}
