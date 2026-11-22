@@ -17,12 +17,13 @@ const QTYPES: [GgmlType; 29] = {
     use GgmlType::*;
     [F32, BF16, F8E4M3, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_1, Q5_1, Q4_0, Q5_0, NVFP4]
 };
-const KERNELS: [&str; 54] = [
+const KERNELS: [&str; 57] = [
     "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "situ_q", "softcap", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "dflash2_conv", "hadamard",
     "ink_mix", "ink_ctrl_gate", "ink_ctrl_out", "ink_conv", "ink_conv_batch", "ink_clip", "ink_attn", "ink_attn_merge",
+    "ink_clip_dyn", "ink_attn_dyn", "ink_attn_merge_dyn",
     "ink_attn_prefill_32", "ink_attn_prefill_64", "ink_attn_prefill_128", "ink_ffn_sum", "ink_route",
 ];
 
@@ -127,6 +128,10 @@ struct Tune {
 /// Graphs kept by `Gpu::graph`.
 /// The graphs kept: the Qwen forward keys one per combination of slots, and Inkling 2 one per layer run and part.
 const GRAPHS_MAX: usize = 128;
+
+/// Blocks of `ink_attn_dyn` in y: it walks its chunks with a stride, so the grid (and the captured graph) does not
+/// change with the position. Past this many chunks of 64 rows a block takes more than one.
+const INK_ATTN_BLOCKS: u32 = 512;
 
 impl Tune {
     /// The shipped values: `GEMM_BK = 64`, no minimum-block hint, the byte-for-byte `QI` load widths.
@@ -929,6 +934,10 @@ impl Backend for Gpu {
         Ok(())
     }
 
+    /// Drop every captured graph: their ops hold device addresses, so a buffer they read must not be reallocated
+    /// under them (the caller re-captures on next use).
+    fn drop_graphs(&self) { self.graphs.lock().unwrap().clear(); }
+
     /// Pinned host memory mapped into the device address space.
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)> {
         let n = words.max(1);
@@ -1138,12 +1147,37 @@ impl Backend for Gpu {
             x, scale, w as i32, thr, eps, mul, dst, dst_at0 as i32, ring as i32, pos0 as i32, log_alpha, fl);
         Ok(())
     }
+    /// `ink_clip_n` with the position in device memory (`dyn`), so a captured graph replays it: the ring slot the row
+    /// goes to follows from it (`n_swa` 0: full attention).
+    fn ink_clip_dyn(
+        &self, x: u64, scale: u64, w: usize, rows: usize, nt: usize,
+        thr: f32, eps: f32, mul: f32,
+        dst: u64, dst_ring: usize, n_swa: usize, dynp: u64,
+        log_alpha: f32, log_floor: f32,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(w <= 128, "ink_clip_dyn: w={w} > 128");
+        anyhow::ensure!(kv_mode() == 0 || dst == 0 || w % 32 == 0, "ink_clip_dyn: quantized KV requires w % 32 == 0 (got {w})");
+        let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
+        let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
+        launch!(self, "ink_clip_dyn", cfg((rows as u32, nt as u32), 128, 0),
+            x, scale, w as i32, thr, eps, mul, dst, ring as i32, n_swa as i32, dynp, log_alpha, fl);
+        Ok(())
+    }
     fn ink_attn(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, rows: usize, at: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
         let chunks = rows.div_ceil(64) as u32;
         launch!(self, "ink_attn", cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, rows as i32, at as i32, nkv as i32, hd as i32, nr as i32, ext as i32);
         launch!(self, "ink_attn_merge", cfg((nh as u32, 1), 128, 0), sc, gate, out, chunks as i32, hd as i32);
         Ok(())
     }
+    /// `ink_attn` with `rows` and `at` in device memory (`dynp`), so one captured graph serves every position: the
+    /// grid has a fixed height and block y walks the chunks it covers.
+    fn ink_attn_dyn(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize, n_swa: usize, dynp: u64) -> anyhow::Result<()> {
+        launch!(self, "ink_attn_dyn", cfg((nh as u32, INK_ATTN_BLOCKS), 128, 0),
+            q, r, sink, k, v, bias, sc, nkv as i32, hd as i32, nr as i32, ext as i32, n_swa as i32, dynp);
+        launch!(self, "ink_attn_merge_dyn", cfg((nh as u32, 1), 128, 0), sc, gate, out, n_swa as i32, dynp, hd as i32);
+        Ok(())
+    }
+    fn ink_pos_dyn(&self) -> bool { true }
     fn ink_attn_prefill(
         &self, q: u64, r: u64, sink: u64, gate: u64, kc: u64, vc: u64, kc_new: u64, vc_new: u64, bias: u64, out: u64,
         pos: usize, nt: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize, ring: usize, win: usize,
@@ -1507,8 +1541,8 @@ mod tests {
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 370);
-        assert_eq!(sm70.len(), 324);
+        assert_eq!(sm80.len(), 373);
+        assert_eq!(sm70.len(), 327);
         assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmis")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());

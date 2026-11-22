@@ -2469,8 +2469,8 @@ __device__ __forceinline__ float ldkv1(const u16* c, size_t off, int hd) {
 }
 
 // One block of 128 per (row, tok) of w values (w at most 128, w % 32 == 0 when KV_MODE > 0 and dst != 0).
-extern "C" __global__ void ink_clip(float* x, const float* scale, int w, float thr, float eps, float mul, u16* dst,
-                                    int dst_at0, int dst_ring, int pos0, float log_alpha, float log_floor) {
+__device__ inline void ink_clip_body(float* x, const float* scale, int w, float thr, float eps, float mul, u16* dst,
+                                     int dst_at0, int dst_ring, int pos0, float log_alpha, float log_floor) {
     int t = threadIdx.x, row = blockIdx.x, tok = blockIdx.y, rows = gridDim.x;
     size_t at = ((size_t)tok * rows + row) * w + t, sc_at = (size_t)row * w + t;
     float v = 0.f;
@@ -2490,14 +2490,26 @@ extern "C" __global__ void ink_clip(float* x, const float* scale, int w, float t
     }
 }
 
+extern "C" __global__ void ink_clip(float* x, const float* scale, int w, float thr, float eps, float mul, u16* dst,
+                                    int dst_at0, int dst_ring, int pos0, float log_alpha, float log_floor) {
+    ink_clip_body(x, scale, w, thr, eps, mul, dst, dst_at0, dst_ring, pos0, log_alpha, log_floor);
+}
+
+// `pos` comes from device memory, so a captured graph replays it: `dyn[0]` is the token's position, and the ring
+// slot it writes follows from it (`n_swa` 0: full attention, the slot is the position itself).
+extern "C" __global__ void ink_clip_dyn(float* x, const float* scale, int w, float thr, float eps, float mul, u16* dst,
+                                        int dst_ring, int n_swa, const int* dyn, float log_alpha, float log_floor) {
+    int pos0 = dyn[0];
+    ink_clip_body(x, scale, w, thr, eps, mul, dst, n_swa ? pos0 % n_swa : pos0, dst_ring, pos0, log_alpha, log_floor);
+}
+
 // Attention of one token in two launches. Supports KV_MODE 0/1/2/3 via ldkv1().
-extern "C" __global__ void ink_attn(const float* q, const float* r, const float* sink, const u16* k, const u16* v,
-                                    const float* bias, float* sc, int rows, int at, int nkv, int hd, int nr, int ext) {
-    __shared__ float qs[128], ps[64], acc[128];
+// One chunk of 64 rows; `qs` holds this head's query, loaded and synced by the caller.
+__device__ inline void ink_attn_chunk(const float* q, const float* r, const float* sink, const u16* k, const u16* v,
+                                      const float* bias, float* sc, int rows, int at, int nkv, int hd, int nr, int ext,
+                                      int ch, int chunks, float* qs, float* ps, float* acc) {
     int h = blockIdx.x, kh = h / (gridDim.x / nkv), kw = nkv * hd, t = threadIdx.x, lane = t & 31;
-    int i0 = blockIdx.y * 64, n = min(64, rows - i0);
-    if (t < hd) qs[t] = q[h * hd + t];
-    __syncthreads();
+    int i0 = ch * 64, n = min(64, rows - i0);
     float scale = 1.f / sqrtf((float)hd);
     for (int j = t >> 5; j < n; j += 4) {
         int i = i0 + j, dist = at - i < 0 ? at - i + rows : at - i;
@@ -2520,7 +2532,7 @@ extern "C" __global__ void ink_attn(const float* q, const float* r, const float*
     for (int j = t / hd; j < n; j += parts) a += ps[j] * ldkv1(v, (size_t)(i0 + j) * kw + kh * hd + c, hd);
     acc[t] = a;
     __syncthreads();
-    float* o = sc + ((size_t)h * gridDim.y + blockIdx.y) * (hd + 2);
+    float* o = sc + ((size_t)h * chunks + ch) * (hd + 2);
     if (t < hd) {
         float s = 0.f;
         for (int p = 0; p < parts; p++) s += acc[p * hd + t];
@@ -2534,7 +2546,33 @@ extern "C" __global__ void ink_attn(const float* q, const float* r, const float*
     }
 }
 
-extern "C" __global__ void ink_attn_merge(const float* sc, const float* gate, float* out, int chunks, int hd) {
+extern "C" __global__ void ink_attn(const float* q, const float* r, const float* sink, const u16* k, const u16* v,
+                                    const float* bias, float* sc, int rows, int at, int nkv, int hd, int nr, int ext) {
+    __shared__ float qs[128], ps[64], acc[128];
+    int t = threadIdx.x;
+    if (t < hd) qs[t] = q[blockIdx.x * hd + t];
+    __syncthreads();
+    ink_attn_chunk(q, r, sink, k, v, bias, sc, rows, at, nkv, hd, nr, ext, blockIdx.y, gridDim.y, qs, ps, acc);
+}
+
+// Same, with `rows` and `at` from device memory (`dyn[0]` is the token's position) and a grid of a fixed height:
+// block y walks the chunks it covers, so one captured graph serves every position.
+extern "C" __global__ void ink_attn_dyn(const float* q, const float* r, const float* sink, const u16* k, const u16* v,
+                                        const float* bias, float* sc, int nkv, int hd, int nr, int ext, int n_swa,
+                                        const int* dyn) {
+    __shared__ float qs[128], ps[64], acc[128];
+    int t = threadIdx.x, pos = dyn[0];
+    int rows = n_swa ? min(pos + 1, n_swa) : pos + 1, at = n_swa ? pos % n_swa : pos;
+    int chunks = (rows + 63) >> 6;
+    if (t < hd) qs[t] = q[blockIdx.x * hd + t];
+    __syncthreads();
+    for (int ch = blockIdx.y; ch < chunks; ch += gridDim.y) {
+        ink_attn_chunk(q, r, sink, k, v, bias, sc, rows, at, nkv, hd, nr, ext, ch, chunks, qs, ps, acc);
+        __syncthreads();  // the next chunk reuses ps and acc
+    }
+}
+
+__device__ inline void ink_attn_merge_body(const float* sc, const float* gate, float* out, int chunks, int hd) {
     int h = blockIdx.x, t = threadIdx.x;
     const float* p = sc + (size_t)h * chunks * (hd + 2);
     float mx = 0.f;
@@ -2546,6 +2584,16 @@ extern "C" __global__ void ink_attn_merge(const float* sc, const float* gate, fl
         if (t < hd) o += p[j * (hd + 2) + 2 + t] * e;
     }
     if (t < hd) out[h * hd + t] = o / z * sigmoid(gate[h * hd + t]);
+}
+
+extern "C" __global__ void ink_attn_merge(const float* sc, const float* gate, float* out, int chunks, int hd) {
+    ink_attn_merge_body(sc, gate, out, chunks, hd);
+}
+
+extern "C" __global__ void ink_attn_merge_dyn(const float* sc, const float* gate, float* out, int n_swa, const int* dyn,
+                                              int hd) {
+    int pos = dyn[0], rows = n_swa ? min(pos + 1, n_swa) : pos + 1;
+    ink_attn_merge_body(sc, gate, out, (rows + 63) >> 6, hd);
 }
 
 // Inkling 2 causal prefill attention with online softmax + virtual sink logit 0.

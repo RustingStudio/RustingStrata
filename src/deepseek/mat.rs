@@ -19,6 +19,13 @@ pub(crate) mod dev {
     pub const SCRATCH: usize = 5_000_000;
     /// A tensor id holds its GPU in the top 8 bits (so STAGED, GPU 255, is never a real id) and its index there below.
     const SHIFT: u32 = 24;
+    /// Which slot of the expert cache to overwrite: by how often it was used (LFU, the default) or by how long ago
+    /// (LRU, `STRATA_DS_LRU`). A prompt revisits the same experts layer after layer, so frequency keeps them: it
+    /// prefills faster and decodes the same. In LFU a slot used more than 4 times is never taken; the expert is
+    /// staged up per use instead, which costs a copy but not a cache of the wrong experts.
+    static LFU: LazyLock<bool> = LazyLock::new(|| std::env::var_os("STRATA_DS_LRU").is_none());
+    /// `STRATA_DS_NOEVICT`: never overwrite a slot (a miss with no free room runs on the CPU).
+    static NOEVICT: LazyLock<bool> = LazyLock::new(|| std::env::var_os("STRATA_DS_NOEVICT").is_some());
     pub fn gpu_of(id: u32) -> usize { (id >> SHIFT) as usize }
     pub(crate) struct Part { pub(crate) be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, stage: Buf, bytes: usize, budget: usize, room: usize }
     pub struct SlabBuf { buf: Buf, bytes: usize, freed: std::sync::Arc<std::sync::atomic::AtomicUsize> }
@@ -209,8 +216,8 @@ pub(crate) mod dev {
                 self.exs.push((i, k, now, 1.0));
                 return Some(i);
             }
-            if !evict || self.parts.iter().all(|p| p.budget == 0) || data.len() > STAGE || std::env::var_os("STRATA_DS_NOEVICT").is_some() { return None; }
-            let lfu = std::env::var_os("STRATA_DS_LFU").is_some();
+            if !evict || self.parts.iter().all(|p| p.budget == 0) || data.len() > STAGE || *NOEVICT { return None; }
+            let lfu = *LFU;
             let victim = self.exs.iter().enumerate()
                 .filter(|(_, e)| e.2 + 96 <= now && { let t = self.tensor(e.0); t.ty == ty && t.rows == rows && t.cols == cols })
                 .min_by(|(_, a), (_, b)| if lfu { a.3.total_cmp(&b.3).then(a.2.cmp(&b.2)) } else { a.2.cmp(&b.2) })

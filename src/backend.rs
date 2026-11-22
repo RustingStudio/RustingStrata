@@ -119,6 +119,9 @@ pub trait Backend: Send {
     /// Run the ops `f` queues as the graph recorded under `key`, recording it on first use. `f` runs only when
     /// recording, so its ops must read per-call values from device memory.
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()>;
+    /// Drop every captured graph: their ops hold device addresses, so a buffer they read must not be reallocated
+    /// under them. The caller re-captures on next use.
+    fn drop_graphs(&self) {}
     /// Queue the ops of `f`, none of which reads what another writes, with no ordering among them (Vulkan: no
     /// barriers between them); ops after the batch see all their results.
     fn batch(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> { f() }
@@ -334,6 +337,20 @@ pub trait Backend: Send {
     /// softmax with one more logit of 0, times sigmoid(gate). `hd` divides 128. `sc`: `nh * rows.div_ceil(64) * (hd + 2)`
     /// floats of scratch.
     fn ink_attn(&self, _q: u64, _r: u64, _sink: u64, _gate: u64, _k: u64, _v: u64, _bias: u64, _sc: u64, _out: u64, _rows: usize, _at: usize, _nh: usize, _nkv: usize, _hd: usize, _nr: usize, _ext: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
+    /// `ink_clip_n` with the position in device memory (`dynp`), so a captured graph replays it.
+    fn ink_clip_dyn(
+        &self, _x: u64, _scale: u64, _w: usize, _rows: usize, _nt: usize,
+        _thr: f32, _eps: f32, _mul: f32,
+        _dst: u64, _dst_ring: usize, _n_swa: usize, _dynp: u64,
+        _log_alpha: f32, _log_floor: f32,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
+    }
+    /// `ink_attn` with the position in device memory (`dynp`) and a grid of a fixed height.
+    fn ink_attn_dyn(&self, _q: u64, _r: u64, _sink: u64, _gate: u64, _k: u64, _v: u64, _bias: u64, _sc: u64, _out: u64, _nh: usize, _nkv: usize, _hd: usize, _nr: usize, _ext: usize, _n_swa: usize, _dynp: u64) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
+    /// Whether `ink_clip_dyn` and `ink_attn_dyn` read the position from device memory, which is what lets a captured
+    /// graph serve every position. Else a layer run calls `ink_clip_n` and `ink_attn` with the position as an argument.
+    fn ink_pos_dyn(&self) -> bool { false }
     /// Batched causal Inkling 2 attention over `nt` query tokens starting at position `pos` (`hd` 32/64/128).
     /// When `kc_new != 0`, keys/values for `kp >= pos` read row `kp - pos` of `kc_new`/`vc_new` so SWA history `< pos` in `kc`/`vc` is preserved.
     /// `q`/`gate`/`out`: `[nt][nh][hd]`, `r`: `[nt][nh][nr]`, `sink`: `[nt][nh]`, `bias`: `[ext][nr]`.

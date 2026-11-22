@@ -10,6 +10,7 @@ use crate::backend::{Backend, Buf, GpuTensor};
 use crate::deepseek::mat::dev::{self, SlabBuf};
 use crate::quant::GgmlType;
 use half::slice::HalfBitsSliceExt;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 
 /// Contiguous all-expert weights + F32 router uploaded once for a layer, enabling zero-round-trip GPU MoE.
@@ -149,6 +150,10 @@ pub(super) struct Device {
     out_norm: Buf,
     scr: Buf,
     sc_buf: Buf,
+    /// The token's position, read by the kernels of the captured attention graph (`ink_clip_dyn`, `ink_attn_dyn`).
+    dynp: Buf,
+    /// The position `dynp` holds, so a token writes it once (`usize::MAX` before the first).
+    dyn_pos: AtomicUsize,
     pf: Option<PrefillScratch>,
     s: Scratch,
     rank: usize,
@@ -256,7 +261,7 @@ impl Device {
             room(&mut d, 4 * rows * row_words + sc_bytes(c, full) + Scratch::at(0, c, rank, m.output.rows).end as usize + (512 << 20));
         }
         let made = (|| -> Result<Self> {
-            let (mut layers, loops, slots, out_query, out_norm, scr, sc_buf) = {
+            let (mut layers, loops, slots, out_query, out_norm, scr, sc_buf, dynp) = {
                 let d = dev::get().unwrap().lock().unwrap();
                 let be = &*d.parts[0].be;
                 let layers = m.layers.iter().map(|l| Ok(DLayer {
@@ -281,8 +286,9 @@ impl Device {
                     Ok(DSlot { k: be.alloc(2 * rows * row_words)?, v: be.alloc(2 * rows * row_words)?, hist: be.zeros::<f32>(hists(c).1)?, cap: rows })
                 }).collect::<Result<Vec<_>>>()?;
                 let sc_buf = be.alloc(sc_bytes(c, (pos + 1).max(64)))?;
+                let dynp = be.alloc(16)?;
                 let (out_query, out_norm, scr) = (up(be, &m.out_query)?, up(be, &m.out_norm)?, be.alloc(Scratch::at(0, c, rank, m.output.rows).end as usize)?);
-                (layers, loops, slots, out_query, out_norm, scr, sc_buf)
+                (layers, loops, slots, out_query, out_norm, scr, sc_buf, dynp)
             };
             let s = Scratch::at(scr.addr(), c, rank, m.output.rows);
 
@@ -335,7 +341,7 @@ impl Device {
                 eprintln!("inkling2: preloaded {n_full}/{} expert layers ({:.2} GB) as contiguous slabs", c.n_layer, slab_bytes as f64 / 1e9);
             }
             let all_full = layers.iter().all(|l| l.full_exps.is_some());
-            Ok(Device { layers, loops, slots, out_query, out_norm, scr, sc_buf, pf: None, s, rank, all_full, synced: 0, ahead: false })
+            Ok(Device { layers, loops, slots, out_query, out_norm, scr, sc_buf, dynp, dyn_pos: AtomicUsize::new(usize::MAX), pf: None, s, rank, all_full, synced: 0, ahead: false })
         })();
         made.inspect_err(|e| eprintln!("inkling2: no room in VRAM for the decode state ({e:#}); the tokens run as prompt chunks do")).ok()
     }
@@ -405,6 +411,12 @@ impl Device {
         }
         let be = &*d.parts[0].be;
         let need_sc = sc_bytes(c, need);
+        // The captured attention graphs hold the addresses of `sc_buf` and of the KV rows: a reallocation drops them,
+        // and they are captured again on next use.
+        if self.sc_buf.len() < need_sc || self.slots.iter().enumerate().any(|(il, s)| !c.swa[layer_of(c, il)] && need > s.cap) {
+            be.sync()?;
+            be.drop_graphs();
+        }
         if self.sc_buf.len() < need_sc {
             be.sync()?;
             self.sc_buf = be.alloc(need_sc)?;
@@ -1239,13 +1251,27 @@ impl Device {
         let norm_xq = |j: usize| s.nrm_xq + j.min(n_n - 1) as u64 * xq_step;
         let inp = |j: usize| s.nrm + f(j.min(n_n - 1) * n);
         let taps = if ml.conv_proj.is_some() { [s.kp, s.vp] } else { [0, 0] };
-        // Every pointer and every argument here is the same on every token at this layer run, so one launch
-        // (a CUDA graph) replaces the ~16 this part costs otherwise; a launch costs 9.5 us on Windows and the
-        // card does the work in 0.26. The clips and the attention in between stay direct: their rows, ring
-        // position and log scale follow `pos`.
-        let key = 0x494E_0000_0000_0000u64 | (il as u64) << 1;
-        be.graph(key, &mut || {
-            if let Some(q) = &l.res_query { be.ink_mix(s.blocks, *nb, s.cur, q.addr(), n_in, ins, n)?; }
+        // Log-scaled positions sharpen the full-attention layers in a long context.
+        let log_alpha = if ml.swa { 0.0 } else { c.log_alpha };
+        let n_swa = if ml.swa { c.n_swa } else { 0 };
+        let ring = ds.cap;
+        // The block the earlier layer runs joins here; `nb` is host bookkeeping, so it moves outside the graph.
+        let (nb_in, nb_out) = (*nb, *nb + (ip % c.block_size == 0) as usize);
+        // Every pointer and every argument here is the same on every token at this layer run, and the one value that
+        // changes -- the position, and the row count and ring slot that follow from it -- the kernels read from
+        // device memory (`dynp`). So one launch (a CUDA graph) replaces the ~22 this layer run costs otherwise: a
+        // launch is 9.5 us on Windows and the card does the work in 0.26. A backend whose kernels take the position
+        // as an argument (`ink_pos_dyn`) runs the same ops uncaptured.
+        let dyn_path = be.ink_pos_dyn();
+        let dp = if dyn_path { self.dynp.addr() } else { 0 };
+        let kv_at = if ml.swa { pos % c.n_swa } else { pos };
+        let rows = if ml.swa { (pos + 1).min(c.n_swa) } else { pos + 1 };
+        if dyn_path && self.dyn_pos.load(Relaxed) != pos {
+            be.put(&[pos as i32], &self.dynp, 0)?;
+            self.dyn_pos.store(pos, Relaxed);
+        }
+        let mut body = || -> Result<()> {
+            if let Some(q) = &l.res_query { be.ink_mix(s.blocks, nb_in, s.cur, q.addr(), n_in, ins, n)?; }
             if msgs {
                 be.ink_ctrl(lp.down.addr(), lp.gain.addr(), lp.forget.addr(), ins, n_in, s.msg, s.gate, s.ins2, n, rank, 3)?;
             }
@@ -1278,25 +1304,25 @@ impl Device {
             be.batch(&mut || {
                 be.ink_conv(s.k, l.convs[0].addr(), taps[0], hist(0), s.k, kw, nc, hd)?;
                 be.ink_conv(s.v, l.convs[1].addr(), taps[1], hist(1), s.v, kw, nc, hd)
-            })
-        })?;
-        // Log-scaled positions sharpen the full-attention layers in a long context.
-        let log_alpha = if ml.swa { 0.0 } else { c.log_alpha };
-        let (rows, at) = if ml.swa { ((pos + 1).min(c.n_swa), pos % c.n_swa) } else { (pos + 1, pos) };
-        let ring = ds.cap;
-        let t = std::time::Instant::now();
-        be.batch(&mut || {
-            be.ink_clip_n(s.q, l.q_clip.addr(), hd, nh, 1, c.qk_clip, 0.0, 1.0, 0, 0, 1, pos, log_alpha, c.log_floor)?;
-            be.ink_clip_n(s.k, 0, hd, nkv, 1, c.qk_clip, 0.0, 1.0, ds.k.addr(), at, ring, 0, 0.0, 1.0)?;
-            be.ink_clip_n(s.v, 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), at, ring, 0, 0.0, 1.0)?;
-            be.ink_clip_n(s.r, l.rel_clip.addr(), nr, nh, 1, c.rel_clip, 0.0, 1.0, 0, 0, 1, pos, log_alpha, c.log_floor)
-        })?;
-        let t = m.lap(8, t);
-        be.ink_attn(s.q, s.r, s.sink, s.og, ds.k.addr(), ds.v.addr(), l.rel_bias.addr(), self.sc_buf.addr(), s.att, rows, at, nh, nkv, hd, nr, c.rel_extent)?;
-        m.lap(9, t);
-        // The block the earlier layer runs joins here; `nb` is host bookkeeping, so it moves outside the graph.
-        let (nb_in, nb_out) = (*nb, *nb + (ip % c.block_size == 0) as usize);
-        be.graph(key | 1, &mut || {
+            })?;
+            be.batch(&mut || {
+                if dyn_path {
+                    be.ink_clip_dyn(s.q, l.q_clip.addr(), hd, nh, 1, c.qk_clip, 0.0, 1.0, 0, 1, n_swa, dp, log_alpha, c.log_floor)?;
+                    be.ink_clip_dyn(s.k, 0, hd, nkv, 1, c.qk_clip, 0.0, 1.0, ds.k.addr(), ring, n_swa, dp, 0.0, 1.0)?;
+                    be.ink_clip_dyn(s.v, 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), ring, n_swa, dp, 0.0, 1.0)?;
+                    be.ink_clip_dyn(s.r, l.rel_clip.addr(), nr, nh, 1, c.rel_clip, 0.0, 1.0, 0, 1, n_swa, dp, log_alpha, c.log_floor)
+                } else {
+                    be.ink_clip_n(s.q, l.q_clip.addr(), hd, nh, 1, c.qk_clip, 0.0, 1.0, 0, 0, 1, pos, log_alpha, c.log_floor)?;
+                    be.ink_clip_n(s.k, 0, hd, nkv, 1, c.qk_clip, 0.0, 1.0, ds.k.addr(), kv_at, ring, 0, 0.0, 1.0)?;
+                    be.ink_clip_n(s.v, 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), kv_at, ring, 0, 0.0, 1.0)?;
+                    be.ink_clip_n(s.r, l.rel_clip.addr(), nr, nh, 1, c.rel_clip, 0.0, 1.0, 0, 0, 1, pos, log_alpha, c.log_floor)
+                }
+            })?;
+            if dyn_path {
+                be.ink_attn_dyn(s.q, s.r, s.sink, s.og, ds.k.addr(), ds.v.addr(), l.rel_bias.addr(), self.sc_buf.addr(), s.att, nh, nkv, hd, nr, c.rel_extent, n_swa, dp)?;
+            } else {
+                be.ink_attn(s.q, s.r, s.sink, s.og, ds.k.addr(), ds.v.addr(), l.rel_bias.addr(), self.sc_buf.addr(), s.att, rows, kv_at, nh, nkv, hd, nr, c.rel_extent)?;
+            }
             be.gemv(w(&ml.wo), s.att, s.proj)?;
             be.ink_conv(s.proj, l.convs[2].addr(), 0, hist(2), s.x, n, nc, hd)?;
             if ip % c.block_size == 0 {
@@ -1312,7 +1338,14 @@ impl Device {
                 h = s.h2;
             }
             be.rms_norm_q(h, n, l.ffn_norm.addr(), s.hn, n, n, 1, c.eps, s.xh, 0)
-        })?;
+        };
+        let t = std::time::Instant::now();
+        if dyn_path {
+            be.graph(0x494E_0000_0000_0000u64 | il as u64, &mut body)?;
+        } else {
+            body()?;
+        }
+        m.lap(8, t);
         *nb = nb_out;
         Ok(())
     }

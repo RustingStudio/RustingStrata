@@ -119,7 +119,7 @@ pub struct Inkling2Model<'a> {
 
 /// A token of `device` counts all the device work before the router as "mix": the queue runs while the host waits
 /// for the router's input.
-const PROF: [&str; 10] = ["mix", "sync", "scores", "out-proj", "route", "experts-gpu", "experts-cpu", "logits", "clips", "attn"];
+const PROF: [&str; 9] = ["mix", "sync", "scores", "out-proj", "route", "experts-gpu", "experts-cpu", "logits", "attn"];
 
 /// A tensor read from the mapped file only: never uploaded.
 fn host_mat<'a>(g: &'a Gguf, name: &str) -> Result<Mat<'a>> {
