@@ -803,7 +803,10 @@ impl<'a> Inkling2Model<'a> {
             }
         }
         self.lap(4, t);
-        let (share, fixed) = self.share(&self.chunk_share);
+        // A draft check is a few rows with nearly no shared experts, so it splits like single tokens and leaves the
+        // split of the prefill chunks alone.
+        let cell = if xs.len() <= device::VERIFY_MAX { &self.cpu_share } else { &self.chunk_share };
+        let (share, fixed) = self.share(cell);
         let on = |m: &Mat<'a>, e: usize| { let x = m.expert_opt(e, ne, share == 0.0); if x.gpu.is_some() { x } else { x.staged() } };
         let gus: Vec<(usize, Mat)> = by_e.keys().map(|&e| (e, l.gate_up.expert_opt(e, ne, share == 0.0))).collect();
         let n_miss = gus.iter().filter(|g| g.1.gpu.is_none()).count();
@@ -853,7 +856,7 @@ impl<'a> Inkling2Model<'a> {
         };
         let (((sum, a), tg), (b, tc)) = rayon::join(gpu_side, cpu_side);
         // A layer with few misses says nothing of the split: the GPU side is then the experts it holds.
-        self.balance(&self.chunk_share, !fixed && 2 * n_miss >= by_e.len(), tg, tc);
+        self.balance(cell, !fixed && 2 * n_miss >= by_e.len(), tg, tc);
         // Each token sums its experts in its own selection order, as `ffn` does (after the sum made on the device).
         let mut ds: Vec<Vec<&[f32]>> = sels.iter().map(|s| vec![&[][..]; s.len()]).collect();
         for (e, dy) in a.iter().chain(&b) {

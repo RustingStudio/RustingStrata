@@ -1203,70 +1203,16 @@ impl Device {
             }
         };
         if !has_full_exps {
-            if verify_mode {
-                let s = self.s;
-                let o = self.scr.addr();
-                for t in 0..nt {
-                    let hn: Vec<f32> = {
-                        let d = dev::get().unwrap().lock().unwrap();
-                        let be = &*d.parts[0].be;
-                        be.rms_norm_q(p.h2.max(p.h) - (p.h2.max(p.h) - if msgs { p.h2 } else { p.h }) + f(t * n), n, l.ffn_norm.addr(), s.hn, n, n, 1, c.eps, s.xh, 0)?;
-                        be.get(&self.scr, ((s.hn - o) / 4) as usize, n)?
-                    };
-                    let (on_gpu, on_cpu, _) = m.plan(ip, &hn);
-                    let list = Inkling2Model::resident(ml, c.n_expert, &on_gpu);
-                    {
-                        let d = dev::get().unwrap().lock().unwrap();
-                        let (part, mut owned) = (&d.parts[0], vec![]);
-                        if let Some((gu, dn, ..)) = list.first() {
-                            let (ke, gs) = (list.len(), list.iter().map(|e| e.3).collect::<Vec<f32>>());
-                            let mut ptrs = |down: bool| list.iter().map(|e| d.weight(part, if down { &e.1 } else { &e.0 }, &mut owned).map(|t| t.ptr)).collect::<Option<Vec<u64>>>();
-                            let (pg, pd) = (ptrs(false).unwrap(), ptrs(true).unwrap());
-                            match (slab(&pg), slab(&pd)) {
-                                (Some((bg, sg, ig)), Some((bd, sd, id))) => {
-                                    part.be.put(&[ig, id].concat(), &self.scr, ((s.ids - o) / 4) as usize)?;
-                                    part.be.put(&gs, &self.scr, ((s.ids - o) / 4) as usize + 2 * ke)?;
-                                    part.be.moe_gemv(gu.ty, gu.rows, gu.cols, bg, sg, s.ids, ke, s.hn, n, ke, s.y, None, s.xh)?;
-                                    if dn.ty.float_x() {
-                                        part.be.situ(s.y, nf, ke, s.ids + f(2 * ke), c.situ_beta, c.situ_linear_beta)?;
-                                        part.be.moe_gemv(dn.ty, dn.rows, dn.cols, bd, sd, s.ids + 4 * ke as u64, ke, s.y, 2 * nf, 1, s.d, None, 0)?;
-                                    } else {
-                                        part.be.situ_q(s.y, nf, ke, s.ids + f(2 * ke), c.situ_beta, c.situ_linear_beta, s.xq)?;
-                                        part.be.moe_gemv(dn.ty, dn.rows, dn.cols, bd, sd, s.ids + 4 * ke as u64, ke, s.y, 2 * nf, 1, s.d, None, s.xq)?;
-                                    }
-                                }
-                                _ => {
-                                    let gt = |mat: &Mat, at: u64| crate::backend::GpuTensor::new(mat.ty, mat.rows, mat.cols, Buf::new(at, mat.data.len(), ()));
-                                    for i in 0..ke { part.be.gemv(&gt(gu, pg[i]), s.hn, s.y + f(i * 2 * nf))?; }
-                                    part.be.put(&gs, &self.scr, ((s.ids - o) / 4) as usize + 2 * ke)?;
-                                    part.be.situ(s.y, nf, ke, s.ids + f(2 * ke), c.situ_beta, c.situ_linear_beta)?;
-                                    for i in 0..ke { part.be.gemv(&gt(dn, pd[i]), s.y + f(i * 2 * nf), s.d + f(i * n))?; }
-                                }
-                            }
-                            if !owned.is_empty() { part.be.sync()?; }
-                        }
-                    }
-                    let cpu = super::run_experts(&on_cpu, &hn, c);
-                    let wc: Vec<f32> = (0..c.n_used).map(|i| on_gpu.get(i).map_or(0.0, |e| e.2)).chain(cpu).collect();
-                    let d = dev::get().unwrap().lock().unwrap();
-                    let be = &*d.parts[0].be;
-                    be.put(&wc, &self.scr, ((s.wc - o) / 4) as usize)?;
-                    be.ink_ffn_sum(pf.acc_buf.addr() + f(t * n), s.d, s.wc, on_gpu.len(), n, s.wc + f(c.n_used))?;
-                }
-            } else {
-                let hn_flat: Vec<f32> = {
-                    let d = dev::get().unwrap().lock().unwrap();
-                    d.parts[0].be.get(&pf.buf, ((p.hn - buf_o) / 4) as usize, nt * n)?
-                };
-                let hn_rows: Vec<Vec<f32>> = hn_flat.chunks_exact(n).map(|r| r.to_vec()).collect();
-                let ys = m.ffn_batch(ip, &hn_rows);
-                let y_flat: Vec<f32> = ys.into_iter().flatten().collect();
+            let hn_flat: Vec<f32> = {
                 let d = dev::get().unwrap().lock().unwrap();
-                let be = &*d.parts[0].be;
-                be.put(&y_flat, &pf.acc_buf, 0)?;
-            }
+                d.parts[0].be.get(&pf.buf, ((p.hn - buf_o) / 4) as usize, nt * n)?
+            };
+            let hn_rows: Vec<Vec<f32>> = hn_flat.chunks_exact(n).map(|r| r.to_vec()).collect();
+            let ys = m.ffn_batch(ip, &hn_rows);
+            let y_flat: Vec<f32> = ys.into_iter().flatten().collect();
             let d = dev::get().unwrap().lock().unwrap();
             let be = &*d.parts[0].be;
+            be.put(&y_flat, &pf.acc_buf, 0)?;
             if verify_mode {
                 be.dtod(&pf.acc_buf, 0, &pf.conv_log, log_base + 4 * VERIFY_MAX * (2 * kw + n), 4 * nt * n)?;
             }

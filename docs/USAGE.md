@@ -89,12 +89,13 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   long match) and the model drafts otherwise.
 - Inkling 2 drafts with `--draft-model PATH` (a DSpark draft file) and with `--spec-type`; it has no MTP head, so
   `--mtp` and `--mtp-model` are ignored with a warning. Drafts need the GPU path, and one pass checks at most 16
-  rows. A layer whose experts are not all in VRAM checks its rows one at a time, so on a card that does not hold
-  the whole model a draft model can cost more than it saves. RTX 3060 12 GB, `Inkling-2-Mini-IQ4_NL.gguf`
-  (17.6 GB, 15 of 24 expert layers in VRAM), CUDA, `bench --pp 512 --tg 128`: 29.9 tok/s without drafts, 35.9 with
-  `--spec-type ngram-simple` (the bench text repeats, so every draft is accepted) and 20.9 with the DSpark file
-  (285 of 292 drafts accepted). The batched check rounds differently from one-token decoding, so greedy output
-  can differ at a near tie.
+  rows. In a layer whose experts are not all in VRAM the rows of a check share few experts, so on a card that does
+  not hold the whole model a draft model gains little. RTX 3060 12 GB, `Inkling-2-Mini-IQ4_NL.gguf` (17.6 GB, 15
+  of 24 expert layers in VRAM on CUDA, 16 on Vulkan), `bench --pp 512 --tg 128`, two runs of each: CUDA 31.1 and
+  35.2 tok/s without drafts, 48.5 and 52.4 with `--spec-type ngram-simple` (the bench text repeats, so nearly
+  every draft is accepted), 35.1 and 35.6 with the DSpark file (285 of 294 drafts accepted); Vulkan 22.8 and 27.0
+  without drafts, 51.1 and 56.2 with the lookup, 29.2 and 30.4 with the DSpark file. The batched check rounds
+  differently from one-token decoding, so greedy output can differ at a near tie.
 - `--chunk`, `--threads` prefill chunk size and CPU expert threads. On a GPU `--threads` defaults to the physical
   core count (SMT siblings only add contention; on the 6-core/12-thread reference machine 6 beats 12 by ~20%).
   `rustingstrata calibrate` measures the best chunk and later runs read it from
