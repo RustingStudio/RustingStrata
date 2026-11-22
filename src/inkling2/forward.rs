@@ -570,20 +570,17 @@ impl<'a> Inkling2Model<'a> {
         rms_norm_w(&emb, &self.tok_norm, self.cfg.eps, out);
     }
 
-    /// Project a single hidden state `h` (`[n_embd]`) through the target LM head (`output.weight`) with optional
-    /// `softcap` and return the greedy argmax token ID (`0..cfg.n_vocab`).
-    pub fn lm_head_argmax(&self, h: &[f32], softcap: f32) -> u32 {
+    /// Project a single hidden state `h` (`[n_embd]`) through the target LM head (`output.weight`) and return the
+    /// greedy argmax token ID (`0..cfg.n_vocab`) of the logits before the softcap. For drafts.
+    pub fn lm_head_argmax(&self, h: &[f32]) -> u32 {
         if let Some(d) = &self.device
-            && let Ok(id) = d.lm_head_argmax(self, h, softcap)
+            && let Ok(id) = d.lm_head_argmax(self, h)
         {
             return id;
         }
         let mut logits = vec![0.0f32; self.output.rows];
         self.output.matvec(h, &mut logits);
         logits.truncate(self.cfg.n_vocab);
-        if softcap != 0.0 {
-            logits.par_iter_mut().for_each(|v| *v = softcap * (*v / softcap).tanh());
-        }
         crate::ops::argmax(&logits) as u32
     }
 

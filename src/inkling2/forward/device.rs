@@ -672,18 +672,17 @@ impl Device {
         Err(last_err.unwrap())
     }
 
-    /// Project a single corrected hidden vector `h_corr` (`[n_embd]`) through the target's LM head on GPU,
-    /// apply optional `softcap`, and return the argmax token ID (`0..c.n_vocab`).
-    pub(super) fn lm_head_argmax(&self, m: &Inkling2Model, h_corr: &[f32], softcap: f32) -> Result<u32> {
+    /// Project a single corrected hidden vector `h_corr` (`[n_embd]`) through the target's LM head on GPU
+    /// and return the argmax token ID (`0..c.n_vocab`). No softcap: `softcap * tanh(x / softcap)` keeps the
+    /// order of the logits (two that differ by a few ulp may become equal), and the token is a draft that
+    /// the target checks.
+    pub(super) fn lm_head_argmax(&self, m: &Inkling2Model, h_corr: &[f32]) -> Result<u32> {
         let c = &m.cfg;
         let (s, o) = (self.s, self.scr.addr());
         let d = dev::get().unwrap().lock().unwrap();
         let be = &*d.parts[0].be;
         be.put(h_corr, &self.scr, ((s.hn - o) / 4) as usize)?;
         be.gemvq(d.tensor(m.output.gpu.unwrap()), s.hn, c.n_embd, 0, s.logits, c.n_vocab, 1)?;
-        if softcap != 0.0 {
-            be.softcap(s.logits, c.n_vocab, softcap)?;
-        }
         be.argmax_rows(s.logits, c.n_vocab, 1, s.amax)?;
         let id = be.get::<i32>(&self.scr, ((s.amax - o) / 4) as usize, 1)?[0] as u32;
         Ok(id)

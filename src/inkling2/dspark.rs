@@ -49,7 +49,6 @@ pub struct DsparkDrafter {
     pub n_swa: usize,
     pub eps: f32,
     pub rope_theta: f32,
-    pub softcap: f32,
     pub target_layers: [usize; 4],
     fuse: Vec<f32>,
     dspark_norm: Vec<f32>,
@@ -103,7 +102,6 @@ impl DsparkDrafter {
         let eps = f("dflash.attention.layer_norm_rms_epsilon").unwrap_or(1e-6);
         let block_size = u("dflash.block_size").unwrap_or(8);
         let n_swa = u("dflash.attention.sliding_window").unwrap_or(1024);
-        let softcap = f("dflash.final_logit_softcapping").unwrap_or(30.0);
         let swa: Vec<bool> = g_ref
             .get("dflash.attention.sliding_window_pattern")?
             .as_arr()
@@ -171,7 +169,6 @@ impl DsparkDrafter {
             n_swa,
             eps,
             rope_theta,
-            softcap,
             target_layers,
             fuse,
             dspark_norm,
@@ -401,7 +398,7 @@ impl DsparkDrafter {
                 *c = *c + b + h_v;
             }
 
-            prev = target.lm_head_argmax(&corr, self.softcap);
+            prev = target.lm_head_argmax(&corr);
             drafts.push(prev);
         }
         drafts
