@@ -1,4 +1,5 @@
-//! Inkling 2 (Thinking Machines), the looped text model: GGUF architecture `inkling2_loop`.
+//! Inkling 2 (Thinking Machines), the looped text model: GGUF architecture `inkling2_loop` (llama.cpp), or
+//! `inkling2` with `num_loops` (the layout of llama.cpp PR #32695, which Unsloth's files use).
 pub mod chat;
 pub mod dspark;
 pub mod forward;
@@ -7,6 +8,13 @@ use crate::gguf::Gguf;
 use anyhow::{Context, ensure};
 
 pub const ARCH: &str = "inkling2_loop";
+/// The same model in the layout of llama.cpp PR #32695: the keys and the loop tensors have other names, and the
+/// per-layer arrays have one entry per layer run (prelude, every pass of the core, then the rest).
+pub const ARCH_RUNS: &str = "inkling2";
+
+pub fn is_arch(arch: &str) -> bool {
+    arch == ARCH || arch == ARCH_RUNS
+}
 
 #[derive(Debug, Clone)]
 pub struct Inkling2Config {
@@ -50,7 +58,9 @@ pub struct Inkling2Config {
 
 impl Inkling2Config {
     pub fn from_gguf(g: &Gguf) -> anyhow::Result<Self> {
-        let k = |s: &str| format!("{ARCH}.{s}");
+        let runs = g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(ARCH_RUNS);
+        let arch = if runs { ARCH_RUNS } else { ARCH };
+        let k = |s: &str| format!("{arch}.{s}");
         let u = |s: &str| -> anyhow::Result<usize> { Ok(g.get(&k(s))?.as_u64().with_context(|| k(s))? as usize) };
         let f = |s: &str| -> anyhow::Result<f32> { g.get(&k(s))?.as_f32().with_context(|| k(s)) };
         let arr = |s: &str| -> anyhow::Result<Vec<usize>> {
@@ -62,9 +72,21 @@ impl Inkling2Config {
             ensure!(!v.is_empty() && v.iter().all(|&x| x == v[0]), "{}: layers differ", k(s));
             Ok(v[0])
         };
+        let (loop_start, loop_end, loop_count) = if runs {
+            (u("loop.core_start")?, u("loop.core_end")?, u("num_loops").context("inkling2 files without a looped core are not supported")?)
+        } else {
+            (u("loop.start")?, u("loop.end")?, u("loop.count")?)
+        };
+        ensure!(loop_start < loop_end && loop_count >= 1, "bad loop range");
+        // `runs`: the file counts layer runs, and the later passes of the core sit between the core and the rest.
+        let extra = if runs { (loop_count - 1) * (loop_end - loop_start) } else { 0 };
+        let n_layer = u("block_count")?.checked_sub(extra).context("block_count is below the layer runs of the loop")?;
+        let mut swa: Vec<bool> = arr("attention.sliding_window_pattern")?.into_iter().map(|v| v != 0).collect();
+        ensure!(swa.len() == n_layer + extra, "sliding_window_pattern: {} entries for {} layers", swa.len(), n_layer + extra);
+        swa.drain(loop_end..loop_end + extra);
         let cfg = Self {
             n_ctx: crate::ctx_limit(u("context_length")?),
-            n_layer: u("block_count")?,
+            n_layer,
             n_embd: u("embedding_length")?,
             n_head: same("attention.head_count")?,
             n_head_kv: same("attention.head_count_kv")?,
@@ -75,7 +97,7 @@ impl Inkling2Config {
             n_vocab: u("vocab_size_unpadded").or_else(|_| u("vocab_size"))?,
             eps: f("attention.layer_norm_rms_epsilon")?,
             n_swa: u("attention.sliding_window")?,
-            swa: arr("attention.sliding_window_pattern")?.into_iter().map(|v| v != 0).collect(),
+            swa,
             n_conv: u("shortconv.l_cache")?,
             exp_scale: f("expert_weights_scale")?,
             situ_beta: f("activation.situ_beta")?,
@@ -88,14 +110,13 @@ impl Inkling2Config {
             rel_clip: f("attention.relative_clip")?,
             log_floor: u("attention.log_scale_floor")? as f32,
             log_alpha: f("attention.log_scale_alpha")?,
-            loop_start: u("loop.start")?,
-            loop_end: u("loop.end")?,
-            loop_count: u("loop.count")?,
+            loop_start,
+            loop_end,
+            loop_count,
             ctx: g.get(&k("context_length")).ok().and_then(|v| v.as_u64()).map(|x| x as usize).unwrap_or(262_144),
         };
-        ensure!(cfg.swa.len() == cfg.n_layer, "sliding_window_pattern: {} entries for {} layers", cfg.swa.len(), cfg.n_layer);
         ensure!(cfg.n_head % cfg.n_head_kv == 0, "head_count {} is not a multiple of head_count_kv {}", cfg.n_head, cfg.n_head_kv);
-        ensure!(cfg.loop_start < cfg.loop_end && cfg.loop_end <= cfg.n_layer && cfg.loop_count >= 1, "bad loop range");
+        ensure!(cfg.loop_end <= cfg.n_layer, "bad loop range");
         ensure!(cfg.n_conv >= 2 && cfg.block_size >= 1 && cfg.rel_extent >= 1 && cfg.n_swa >= 1, "bad shortconv, block or window size");
         ensure!(u("attention.value_length")? == cfg.head_dim, "key and value head widths differ");
         ensure!(g.meta.get(&k("loop.varying")).and_then(|v| v.as_u64()).unwrap_or(0) == 0, "loop.varying is not supported");

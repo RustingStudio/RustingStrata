@@ -494,10 +494,13 @@ impl<'a> Inkling2Model<'a> {
             });
         }
         let mut loops = vec![];
+        // The `inkling2` layout: the message queries of all core layers are two tensors, (Q, FFN) and (K, V) per layer.
+        let runs = has("loop_res_query.weight");
+        let pairs = if runs { Some([f32s(g, "loop_res_query.weight")?, f32s(g, "loop_kv_res_query.weight")?]) } else { None };
         for il in cfg.loop_start..cfg.loop_end {
             let v = |s: &str| f32s(g, &format!("blk.{il}.loop_{s}.weight"));
-            let ctrl = |kind: &str| ["q", "k", "v", "ffn"].iter().map(|c| {
-                let mut w = v(&format!("{c}_ctrl_{kind}"))?;
+            let ctrl = |kind: &str| [("q", "attn"), ("k", "k"), ("v", "v"), ("ffn", "mlp")].iter().map(|(c, r)| {
+                let mut w = v(&if runs { format!("{r}_{kind}") } else { format!("{c}_ctrl_{kind}") })?;
                 if kind != "down" {
                     let (n, rank) = (cfg.n_embd, w.len() / cfg.n_embd);
                     w = (0..w.len()).map(|i| w[i % n * rank + i / n]).collect();
@@ -506,7 +509,15 @@ impl<'a> Inkling2Model<'a> {
                 h.convert_from_f32_slice(&w);
                 Ok(h)
             }).collect::<Result<Vec<_>>>();
-            loops.push(Loop { msg_query: v("msg_query")?, down: ctrl("down")?, gain: ctrl("gain")?, forget: ctrl("forget")? });
+            let msg_query = match &pairs {
+                Some([qf, kv]) => {
+                    let (n, at) = (cfg.n_embd, 2 * (il - cfg.loop_start) * cfg.n_embd);
+                    ensure!(qf.len() >= at + 2 * n && kv.len() >= at + 2 * n, "loop_res_query: too few rows for the core layers");
+                    [&qf[at..at + n], &kv[at..at + n], &kv[at + n..at + 2 * n], &qf[at + n..at + 2 * n]].concat()
+                }
+                None => v("msg_query")?,
+            };
+            loops.push(Loop { msg_query, down: ctrl("down")?, gain: ctrl("gain")?, forget: ctrl("forget")? });
         }
         let ctx_cap = if max_ctx == 0 { cfg.n_ctx } else { max_ctx.clamp(1, cfg.n_ctx) };
         let mut m = Self {

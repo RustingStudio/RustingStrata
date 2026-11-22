@@ -886,7 +886,7 @@ impl Device {
             let out_w = d.tensor(m.output.gpu.unwrap());
             let vrows = m.output.rows;
             be.ink_mix_n(pf.p.blocks, nb, cur_a, self.out_query.addr(), 1, pf.p.h, n, nt)?;
-            if nt <= VERIFY_MAX {
+            if Self::small(be, nt, true) {
                 be.rms_norm_q(pf.p.h, n, self.out_norm.addr(), pf.p.hn, n, n, nt, c.eps, pf.p.nrm_xq, 0)?;
                 be.gemvq(out_w, pf.p.hn, n, pf.p.nrm_xq, pf.logits_buf.addr(), vrows, nt)?;
             } else {
@@ -954,8 +954,16 @@ impl Device {
         Ok(())
     }
 
-    fn proj_n(be: &dyn Backend, w: &GpuTensor, nt: usize, x: u64, xq: u64, y: u64, act: i32) -> Result<()> {
-        if nt <= VERIFY_MAX {
+    /// Whether a draft check of `nt` rows runs the matvec kernels (`gemvq`, `moe_gemv`) and not the GEMM. Measured on
+    /// an RTX 3060: on CUDA a check of 7 rows or more is faster through the GEMM (16 rows take 184 ms against 254 ms),
+    /// on Vulkan the matvec kernels are faster up to `VERIFY_MAX` rows. A prompt chunk keeps the old limit, so the
+    /// logits of a plain run are unchanged.
+    fn small(be: &dyn Backend, nt: usize, verify: bool) -> bool {
+        nt <= if verify && be.name() == "cuda" { 6 } else { VERIFY_MAX }
+    }
+
+    fn proj_n(be: &dyn Backend, w: &GpuTensor, small: bool, nt: usize, x: u64, xq: u64, y: u64, act: i32) -> Result<()> {
+        if small {
             be.gemvq(w, x, w.cols, xq, y, w.rows, nt)
         } else {
             be.gemm_dense(w, nt, x, w.cols, y, w.rows, act)
@@ -980,6 +988,7 @@ impl Device {
             let d = dev::get().unwrap().lock().unwrap();
             let be = &*d.parts[0].be;
             let w = |x: &Mat| d.tensor(x.gpu.unwrap());
+            let small = Self::small(be, nt, verify_mode);
             let (mut ins, mut n_in) = (*cur_a, 1);
             if let Some(q) = &l.res_query {
                 (ins, n_in) = (p.ins, q.len() / (4 * n));
@@ -997,7 +1006,7 @@ impl Device {
                 let xj = ins + f(j.min(n_in - 1) * nt * n);
                 let wj = l.norms.addr() + f(j.min(n_w - 1) * n);
                 let oj = p.nrm + f(j * nt * n);
-                if nt <= VERIFY_MAX {
+                if small {
                     be.rms_norm_q(xj, n, wj, oj, n, n, nt, c.eps, norm_xq(j), 0)?;
                 } else {
                     be.rms_norm(xj, n, wj, oj, n, n, nt, c.eps)?;
@@ -1005,18 +1014,18 @@ impl Device {
             }
             let inp = |j: usize| p.nrm + f(j.min(n_n - 1) * nt * n);
             let sx = crate::backend::SAME_X;
-            Self::proj_n(be, w(&ml.wq), nt, inp(0), norm_xq(0), p.q, 0)?;
-            Self::proj_n(be, w(&ml.gate), nt, inp(0), norm_xq(0), p.og, sx)?;
-            Self::proj_n(be, w(&ml.rel), nt, inp(0), norm_xq(0), p.r, sx)?;
-            Self::proj_n(be, w(&ml.sink), nt, inp(0), norm_xq(0), p.sink, sx)?;
+            Self::proj_n(be, w(&ml.wq), small, nt, inp(0), norm_xq(0), p.q, 0)?;
+            Self::proj_n(be, w(&ml.gate), small, nt, inp(0), norm_xq(0), p.og, sx)?;
+            Self::proj_n(be, w(&ml.rel), small, nt, inp(0), norm_xq(0), p.r, sx)?;
+            Self::proj_n(be, w(&ml.sink), small, nt, inp(0), norm_xq(0), p.sink, sx)?;
             let k_sx = if n_n == 1 { sx } else { 0 };
-            Self::proj_n(be, w(&ml.wk), nt, inp(1), norm_xq(1), p.k, k_sx)?;
+            Self::proj_n(be, w(&ml.wk), small, nt, inp(1), norm_xq(1), p.k, k_sx)?;
             if let Some([kp, _]) = &ml.conv_proj {
-                Self::proj_n(be, w(kp), nt, inp(1), norm_xq(1), p.kp, sx)?;
+                Self::proj_n(be, w(kp), small, nt, inp(1), norm_xq(1), p.kp, sx)?;
             }
-            Self::proj_n(be, w(&ml.wv), nt, inp(2), norm_xq(2), p.v, k_sx)?;
+            Self::proj_n(be, w(&ml.wv), small, nt, inp(2), norm_xq(2), p.v, k_sx)?;
             if let Some([_, vp]) = &ml.conv_proj {
-                Self::proj_n(be, w(vp), nt, inp(2), norm_xq(2), p.vp, sx)?;
+                Self::proj_n(be, w(vp), small, nt, inp(2), norm_xq(2), p.vp, sx)?;
             }
             if verify_mode {
                 be.dtod(&pf.buf, (p.k - buf_o) as usize, &pf.conv_log, log_base, 4 * nt * kw)?;
@@ -1081,7 +1090,7 @@ impl Device {
                     }
                 }
             }
-            Self::proj_n(be, w(&ml.wo), nt, p.att, 0, p.proj, 0)?;
+            Self::proj_n(be, w(&ml.wo), small, nt, p.att, 0, p.proj, 0)?;
             if verify_mode {
                 be.dtod(&pf.buf, (p.proj - buf_o) as usize, &pf.conv_log, log_base + 4 * VERIFY_MAX * 2 * kw, 4 * nt * n)?;
             }
@@ -1100,7 +1109,7 @@ impl Device {
                 h = p.h2;
             }
             if let Some(fe) = &l.full_exps {
-                let use_gemm = nt > 16 && fe.gu_cols % 64 == 0 && fe.dn_cols % 64 == 0;
+                let use_gemm = !small && fe.gu_cols % 64 == 0 && fe.dn_cols % 64 == 0;
                 if use_gemm || fe.gu_ty.float_x() {
                     be.rms_norm(h, n, l.ffn_norm.addr(), p.hn, n, n, nt, c.eps)?;
                 } else {
@@ -1108,7 +1117,7 @@ impl Device {
                 }
                 m.lap(0, t_prep);
                 let t_gpu = std::time::Instant::now();
-                Self::proj_n(be, &fe.gate_inp, nt, p.hn, 0, p.rlogits, 0)?;
+                Self::proj_n(be, &fe.gate_inp, small, nt, p.hn, 0, p.rlogits, 0)?;
                 let gu_sc = fe.gu_scale.as_ref().map_or(0, |b| b.addr());
                 let dn_sc = fe.dn_scale.as_ref().map_or(0, |b| b.addr());
                 let gsc_out = if gu_sc != 0 { p.gsc } else { 0 };

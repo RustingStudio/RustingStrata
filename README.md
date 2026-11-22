@@ -1,7 +1,7 @@
 # RustingStrata
 
 A pure-Rust inference engine for Qwen GGUF models: Qwen3.5/3.6 (`qwen35moe`, `qwen35`), Qwen3-Next (`qwen3next`),
-Qwen3.8-Flash-Next (`qwen4exp`), Qwen3 (`qwen3`, `qwen3moe`), DeepSeek-V4.1-Flash (`deepseek41`), GLM-5.3-Flash (`glm5-next`), Hy4-flash (`hy_v4_flash`), Inkling 2 Mini (`inkling2_loop`) and Recursive Flint (`flint`). CUDA kernels are
+Qwen3.8-Flash-Next (`qwen4exp`), Qwen3 (`qwen3`, `qwen3moe`), DeepSeek-V4.1-Flash (`deepseek41`), GLM-5.3-Flash (`glm5-next`), Hy4-flash (`hy_v4_flash`), Inkling 2 Mini (`inkling2_loop`, `inkling2`) and Recursive Flint (`flint`). CUDA kernels are
 compiled at run time with NVRTC through cudarc, and the same kernels also run on Vulkan (`--backend vulkan`): no C++
 build step, no ggml. Experts that do not fit in VRAM run on the CPU at the same time as the GPU work, and the expert
 placement adapts to the routing it sees.
@@ -236,7 +236,7 @@ token-by-token prefill give the same logits within 1e-3 on the CPU path. `tests/
 
 ## Inkling 2 Mini (IQ4_NL, 17.6 GB)
 
-`chat`, `generate`, `serve` and `bench` detect the `inkling2_loop` architecture (Thinking Machines Inkling 2: 24
+`chat`, `generate`, `serve` and `bench` detect the `inkling2_loop` and `inkling2` architectures (Thinking Machines Inkling 2: 24
 layers of which layers 6-17 run three times with message controllers between the passes, so a token is 48 layer runs;
 sliding-window attention with a relative bias and sinks, full attention on every sixth layer; 128 experts, 8 used) and
 run the forward in `src/inkling2/`, with the matvecs and an expert cache on the GPU (no `--gpu` flag needed).
@@ -251,7 +251,8 @@ rustingstrata serve    --model $M --addr 127.0.0.1:8080 [--api-key K]
 Unsloth's quants load as well: the files in the `Mainline_Support` folder of `unsloth/Inkling-2-Mini-GGUF`
 (architecture `inkling2_loop`), whose experts are NVFP4 with a per-expert `ffn_gate_up_exps.scale` and
 `ffn_down_exps.scale`. If a file is named `.gguf_file`, rename it to `.gguf` so the chat page lists it. The files at
-the top of that repo use the architecture name `inkling2` and another tensor layout, and do not load yet.
+the top of that repo use the architecture name `inkling2` and the tensor layout of llama.cpp PR #32695 (one array
+entry per layer run, the message queries in `loop_res_query` and `loop_kv_res_query`); they load as well.
 
 The backend, device and expert options are those of Hy4-flash above: CUDA when an NVIDIA card and driver are present
 and Vulkan otherwise, `--backend vulkan` or `--backend cuda` to pick one, `STRATA_DS_GPU=0` for the CPU only, and
