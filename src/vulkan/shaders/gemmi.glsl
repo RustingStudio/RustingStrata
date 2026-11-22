@@ -20,7 +20,7 @@ layout(local_size_x = 256) in;
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64 { uint64_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer UV4 { uvec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer UV2 { uvec2 v[]; };
-layout(push_constant) uniform P { U64 tiles; uint64_t wd; U32 x; I32 xrow; F32 y; uint nd; uint ys; uint rows; uint nk; uint act; } p;  // nk: K steps of 64 (cols / 64)
+layout(push_constant) uniform P { U64 tiles; uint64_t wd; U32 x; I32 xrow; F32 y; uint nd; uint ys; uint rows; uint nk; uint act; float sc; } p;  // nk: K steps of 64 (cols / 64)
 #ifndef SM
 #define SM 0
 #endif
@@ -229,7 +229,7 @@ void main() {
                 uint r = bm + 16 * mt + RI(i), n = n0 + bn + 16 * nt + CI(i);
                 if (r >= cnt || n >= p.rows) continue;
                 uint o = (m0 + r) * p.ys + n;
-                float v = acc[mt][nt][i];
+                float v = acc[mt][nt][i] * p.sc;
                 p.y.v[o] = p.act == 0 ? v : p.act == 1 ? silu(p.y.v[o]) * v : p.y.v[o] + v;
             }
 }

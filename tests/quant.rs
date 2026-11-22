@@ -1,5 +1,5 @@
 mod common;
-use rusting_strata::quant::{GgmlType, dequant_row};
+use rusting_strata::quant::{GgmlType, dequant_row, f8_e4m3_to_f32, ue4m3};
 
 fn check(name: &str, ty: GgmlType) {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
@@ -162,4 +162,83 @@ fn f16_and_q2_0_blocks() {
     let mut y = [0f32; 64];
     dequant_row(GgmlType::Q2_0, &blk, &mut y);
     for (j, v) in y.iter().enumerate() { assert_eq!(*v, [-0.5, 0.0, 0.5, 1.0][j % 4], "j={j}"); }
+}
+
+#[test]
+fn nvfp4_and_f8_e4m3_blocks() {
+    assert_eq!(GgmlType::from_u32(40).unwrap(), GgmlType::NVFP4);
+    assert_eq!(GgmlType::from_u32(43).unwrap(), GgmlType::F8E4M3);
+    assert_eq!(GgmlType::NVFP4.row_bytes(64), 36);
+    assert_eq!(GgmlType::F8E4M3.row_bytes(8), 8);
+    assert!(!GgmlType::NVFP4.float_x() && GgmlType::F8E4M3.float_x());
+    assert!(GgmlType::NVFP4.gpu("vulkan") && GgmlType::NVFP4.gpu("cuda"));
+    assert!(GgmlType::F8E4M3.gpu("vulkan") && GgmlType::F8E4M3.gpu("cuda"));
+
+    assert_eq!(ue4m3(0), 0.0);
+    assert_eq!(ue4m3(0x7F), 0.0);
+    assert_eq!(ue4m3(0x01), 1.0 / 1024.0);
+    assert_eq!(ue4m3(0x38), 0.5);
+    assert_eq!(ue4m3(0x40), 1.0);
+
+    assert_eq!(f8_e4m3_to_f32(0), 0.0);
+    assert_eq!(f8_e4m3_to_f32(0x7F), 0.0);
+    assert_eq!(f8_e4m3_to_f32(0xFF), 0.0);
+    assert_eq!(f8_e4m3_to_f32(0x01), 1.0 / 512.0);
+    assert_eq!(f8_e4m3_to_f32(0x38), 1.0);
+    assert_eq!(f8_e4m3_to_f32(0xBC), -1.5);
+
+    let mut y8 = [0f32; 4];
+    dequant_row(GgmlType::F8E4M3, &[0x00, 0x38, 0xBC, 0x7F], &mut y8);
+    assert_eq!(y8, [0.0, 1.0, -1.5, 0.0]);
+
+    // NVFP4 block: 4 sub-blocks of 16 elems. Sub-block 0 scale=0x40 (d=1.0), sub-block 1 scale=0x38 (d=0.5),
+    // sub-block 2 scale=0x7F (d=0.0), sub-block 3 scale=0x40 (d=1.0).
+    let mut blk = vec![0u8; 36];
+    blk[0..4].copy_from_slice(&[0x40, 0x38, 0x7F, 0x40]);
+    for j in 0..8 {
+        blk[4 + j] = 0x92;        // lo=2 (+2), hi=9 (-1) -> *1.0 = [2, -1]
+        blk[12 + j] = 0x73;       // lo=3 (+3), hi=7 (+12) -> *0.5 = [1.5, 6.0]
+        blk[20 + j] = 0xFE;       // scaled by 0 -> [0.0, 0.0]
+        blk[28 + j] = 0xFA;       // lo=10 (-2), hi=15 (-12) -> *1.0 = [-2.0, -12.0]
+    }
+    let mut y4 = [0f32; 64];
+    dequant_row(GgmlType::NVFP4, &blk, &mut y4);
+    for j in 0..8 {
+        assert_eq!(y4[j], 2.0);
+        assert_eq!(y4[8 + j], -1.0);
+        assert_eq!(y4[16 + j], 1.5);
+        assert_eq!(y4[24 + j], 6.0);
+        assert_eq!(y4[32 + j], 0.0);
+        assert_eq!(y4[40 + j], 0.0);
+        assert_eq!(y4[48 + j], -2.0);
+        assert_eq!(y4[56 + j], -12.0);
+    }
+
+    // Per-expert 1D [n_expert] .scale slicing on Mat::expert_host
+    let mut raw_exps = Vec::new();
+    raw_exps.extend_from_slice(&blk);
+    raw_exps.extend_from_slice(&blk);
+    let mut exp_scales = Vec::new();
+    exp_scales.extend_from_slice(&0.5f32.to_le_bytes());
+    exp_scales.extend_from_slice(&(-2.0f32).to_le_bytes());
+    let mat3d = rusting_strata::deepseek::mat::Mat {
+        data: &raw_exps,
+        ty: GgmlType::NVFP4,
+        rows: 2,
+        cols: 64,
+        cpu: true,
+        gpu: None,
+        scale: 1.0,
+        expert_scales: Some(&exp_scales),
+    };
+    let e0 = mat3d.expert_host(0, 2);
+    let e1 = mat3d.expert_host(1, 2);
+    assert_eq!(e0.scale, 0.5);
+    assert_eq!(e1.scale, -2.0);
+    let mut r0 = [0f32; 64];
+    let mut r1 = [0f32; 64];
+    e0.row_into(0, &mut r0);
+    e1.row_into(0, &mut r1);
+    assert_eq!(r0[0], 1.0);
+    assert_eq!(r1[0], -4.0);
 }

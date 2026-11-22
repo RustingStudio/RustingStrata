@@ -1517,6 +1517,7 @@ fn random_tensor(ty: GgmlType, rows: usize, cols: usize, seed: u32) -> Vec<u8> {
         GgmlType::F32 => (0..rows * cols).flat_map(|_| ((rnd() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()).collect(),
         GgmlType::F16 => (0..rows * cols).flat_map(|_| half::f16::from_f32((rnd() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()).collect(),
         GgmlType::BF16 => (0..rows * cols).flat_map(|_| half::bf16::from_f32((rnd() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()).collect(),
+        GgmlType::F8E4M3 => (0..rows * cols).map(|_| ((0x28 + (rnd() % 24)) as u8) | (((rnd() & 1) as u8) << 7)).collect(),
         _ => {
             let (bb, n) = (ty.block_bytes(), rows * (cols / ty.block_elems()));
             (0..n).flat_map(|_| {
@@ -1579,12 +1580,12 @@ fn all_types() -> Vec<GgmlType> {
 fn gemv_partial_superblocks_and_q2_0() {
     for (bk, gpu) in common::backends_except(&[]) {
         let gpu = &*gpu;
-        for ty in [GgmlType::Q2_0, GgmlType::TQ1_0, GgmlType::TQ2_0, GgmlType::TQ2T, GgmlType::TQK6, GgmlType::TQK7, GgmlType::Q8_0, GgmlType::IQ4NL, GgmlType::NVFP4, GgmlType::Q4_0, GgmlType::Q5_0, GgmlType::Q4_1, GgmlType::Q5_1, GgmlType::BF16, GgmlType::F32] {
+        for ty in [GgmlType::Q2_0, GgmlType::TQ1_0, GgmlType::TQ2_0, GgmlType::TQ2T, GgmlType::TQK6, GgmlType::TQK7, GgmlType::Q8_0, GgmlType::IQ4NL, GgmlType::NVFP4, GgmlType::Q4_0, GgmlType::Q5_0, GgmlType::Q4_1, GgmlType::Q5_1, GgmlType::BF16, GgmlType::F8E4M3, GgmlType::F32] {
             for cols in [640, 320, 2560] {
                 if cols % ty.block_elems() != 0 { continue; }
                 let (rows, nt, ne) = (40, 3, 4);  // ne experts of `rows` rows for moe_gemv
                 let data = random_tensor(ty, ne * rows, cols, cols as u32 + ty as u32);
-                let all = Tensor { ty, cols, rows: ne * rows, data: &data };
+                let all = Tensor { ty, cols, rows: ne * rows, data: &data, scale: 1.0 };
                 let t = Tensor { rows, data: &data[..ty.row_bytes(cols as u64) * rows], ..all };
                 // Raw bytes, as experts are uploaded.
                 let raw = |t: &Tensor| { let b = gpu.alloc(t.data.len()).unwrap(); gpu.htod(t.data, &b, 0).unwrap(); GpuTensor::new(t.ty, t.rows, t.cols, b) };
@@ -1669,7 +1670,7 @@ fn vulkan_type_matrix() {
     let gpu: &dyn Backend = &g;
     let not_impl = |e: &anyhow::Error| format!("{e:#}").contains("not implemented");
     let types = all_types();
-    assert_eq!(types.len(), 29, "GgmlType variants");
+    assert_eq!(types.len(), 30, "GgmlType variants");
     let (rows, ne, cols, nt) = (40, 4, 256, 3);
     let mut failures = 0;
     for ty in types {
@@ -1694,7 +1695,7 @@ fn vulkan_type_matrix() {
             note = format!("{note}{}f16 GEMM inputs truncate (Volta OpFConvert); reference matches", if note.is_empty() { "" } else { "; " });
         }
         let data = random_tensor(ty, ne * rows, cols, cols as u32 + ty as u32);
-        let all = Tensor { ty, cols, rows: ne * rows, data: &data };
+        let all = Tensor { ty, cols, rows: ne * rows, data: &data, scale: 1.0 };
         let t = Tensor { rows, data: &data[..ty.row_bytes(cols as u64) * rows], ..all };
         // Raw bytes, as experts are uploaded.
         let raw = |t: &Tensor| {
@@ -1910,7 +1911,7 @@ fn f16_weight_uploads_as_f32() {
     let (rows, cols) = (96, 512);
     let w: Vec<f32> = xs(rows * cols).iter().map(|v| v * 3.0).collect();
     let data: Vec<u8> = w.iter().flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes()).collect();
-    let t = Tensor { ty: GgmlType::F16, rows, cols, data: &data };
+    let t = Tensor { ty: GgmlType::F16, rows, cols, data: &data, scale: 1.0 };
     let wf: Vec<f32> = w.iter().map(|v| half::f16::from_f32(*v).to_f32()).collect();
     let nt = 40;
     let x = xs(nt * cols);
@@ -2216,5 +2217,101 @@ fn ink_kernels_match_reference() {
         gpu.ink_ffn_sum(acc.addr(), dd.addr(), dw.addr(), ne, n, dc.addr()).unwrap();
         let e = rel_l2(&down::<f32>(gpu, &acc), &want);
         assert!(e < 1e-6, "{bk} ink_ffn_sum {e}");
+    }
+}
+
+/// Non-unit per-tensor `scale` (NVFP4 `<stem>.scale` / ModelOpt `weight_scale_2`) multiplies dequant, gemv, gemvn,
+/// gemvq2, gemv_rows, and prefill gemm_dense across act = 0, 1 (SwiGLU), and 2 (accumulate).
+#[test]
+fn tensor_scale_applies_to_all_gpu_ops() {
+    let (rows, cols, nt, m) = (64usize, 256usize, 3usize, 130usize);
+    for (bk, gpu) in common::backends() {
+        let g = &*gpu;
+        for (ty, scale_a, scale_b) in [(GgmlType::NVFP4, 0.375f32, -1.25f32), (GgmlType::F8E4M3, -0.625f32, 1.75f32)] {
+            let da = random_tensor(ty, rows, cols, 100 + ty as u32);
+            let db = random_tensor(ty, rows, cols, 200 + ty as u32);
+            let ta = Tensor { ty, rows, cols, data: &da, scale: scale_a };
+            let tb = Tensor { ty, rows, cols, data: &db, scale: scale_b };
+            let ga = g.upload(&ta).unwrap();
+            let gb = g.upload(&tb).unwrap();
+            assert_eq!(ga.scale, scale_a, "{bk} {} upload scale", ty.name());
+
+            // 1. dequant
+            let dq = g.zeros::<f32>(rows * cols).unwrap();
+            g.dequant(&ga, rows, dq.addr()).unwrap();
+            let got = down::<f32>(g, &dq);
+            let mut want = vec![0f32; rows * cols];
+            for (r, out) in want.chunks_exact_mut(cols).enumerate() { ta.row(r, out); }
+            let diff = got.iter().zip(&want).fold(0f32, |mx, (a, b)| mx.max((a - b).abs()));
+            assert!(diff <= 1e-5, "{bk} {} dequant scaled max diff {diff}", ty.name());
+
+            // 2. gemv & gemvn
+            let x = xs(nt * cols + 7)[7..].to_vec();
+            let dx = up(g, &x);
+            let dy = g.zeros::<f32>(rows).unwrap();
+            g.gemv(&ga, dx.addr(), dy.addr()).unwrap();
+            let mut wy0 = vec![0f32; rows];
+            ta.matvec(&as_seen(ty, &x[..cols]), &mut wy0);
+            assert!(rel_l2(&down::<f32>(g, &dy), &wy0) <= 1e-4, "{bk} {} gemv scaled", ty.name());
+
+            let dyn_ = g.zeros::<f32>(nt * rows).unwrap();
+            g.gemvn(&ga, dx.addr(), cols, dyn_.addr(), rows, nt).unwrap();
+            let got_n = down::<f32>(g, &dyn_);
+            for t_idx in 0..nt {
+                let mut wt = vec![0f32; rows];
+                ta.matvec(&as_seen(ty, &x[t_idx * cols..(t_idx + 1) * cols]), &mut wt);
+                assert!(rel_l2(&got_n[t_idx * rows..(t_idx + 1) * rows], &wt) <= 1e-4, "{bk} {} gemvn scaled t={t_idx}", ty.name());
+            }
+
+            // 3. gemvq2 (paired matrices with distinct scales)
+            let dya = g.zeros::<f32>(nt * rows).unwrap();
+            let dyb = g.zeros::<f32>(nt * rows).unwrap();
+            g.gemvq2(&ga, &gb, dx.addr(), cols, 0, dya.addr(), dyb.addr(), nt).unwrap();
+            let (gota, gotb) = (down::<f32>(g, &dya), down::<f32>(g, &dyb));
+            for t_idx in 0..nt {
+                let (mut wa, mut wb) = (vec![0f32; rows], vec![0f32; rows]);
+                ta.matvec(&as_seen(ty, &x[t_idx * cols..(t_idx + 1) * cols]), &mut wa);
+                tb.matvec(&as_seen(ty, &x[t_idx * cols..(t_idx + 1) * cols]), &mut wb);
+                assert!(rel_l2(&gota[t_idx * rows..(t_idx + 1) * rows], &wa) <= 1e-4, "{bk} {} gemvq2 a scaled", ty.name());
+                assert!(rel_l2(&gotb[t_idx * rows..(t_idx + 1) * rows], &wb) <= 1e-4, "{bk} {} gemvq2 b scaled", ty.name());
+            }
+
+            // 4. gemv_rows (non-float quantized path)
+            if g.supports_gemv_rows() && !ty.float_x() {
+                let ids = [3i32, 0, 17, 63];
+                let (di, dr) = (up(g, &ids), g.zeros::<f32>(ids.len()).unwrap());
+                g.gemv_rows(&ga, dx.addr(), di.addr(), ids.len(), dr.addr()).unwrap();
+                let want_r: Vec<f32> = ids.iter().map(|&r| wy0[r as usize]).collect();
+                assert!(rel_l2(&down::<f32>(g, &dr), &want_r) <= 1e-4, "{bk} {} gemv_rows scaled", ty.name());
+            }
+
+            // 5. gemm_dense for act = 0, act = 1 (SwiGLU: silu(y) * (W x * scale)), act = 2 (y += W x * scale)
+            let xm = xs(m * cols + 11)[11..].to_vec();
+            let dxm = up(g, &xm);
+            let mut base_y = vec![0f32; m * rows];
+            let mut wr = vec![0f32; cols];
+            for r in 0..rows {
+                ta.row(r, &mut wr);
+                for (i, xv) in xm.chunks(cols).enumerate() {
+                    base_y[i * rows + r] = if g.mmq(ty) && cols % 128 == 0 {
+                        wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum()
+                    } else {
+                        wr.iter().zip(xv).map(|(a, b)| f16_in(bk, *a) * f16_in(bk, *b)).sum()
+                    };
+                }
+            }
+            for act in [0i32, 1, 2] {
+                let init: Vec<f32> = xs(m * rows + 3)[3..].to_vec();
+                let dym = up(g, &init);
+                g.gemm_dense(&ga, m, dxm.addr(), cols, dym.addr(), rows, act).unwrap();
+                let got_m = down::<f32>(g, &dym);
+                let want_m: Vec<f32> = base_y.iter().zip(&init).map(|(&v, &y0)| match act {
+                    0 => v,
+                    1 => (y0 / (1.0 + (-y0).exp())) * v,
+                    _ => y0 + v,
+                }).collect();
+                assert!(rel_l2(&got_m, &want_m) <= 5e-4, "{bk} {} gemm_dense act={act} scaled", ty.name());
+            }
+        }
     }
 }

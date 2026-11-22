@@ -6,7 +6,7 @@ layout(local_size_x_id = 6) in;
 #include "common.glsl"
 #include "deq.glsl"
 
-layout(push_constant) uniform P { U8 w; F32 x; F32 y; uint xs; uint ys; uint cols; uint rows; } p;
+layout(push_constant) uniform P { U8 w; F32 x; F32 y; uint xs; uint ys; uint cols; uint rows; float sc; } p;
 layout(constant_id = 5) const uint NT = 1;
 
 void step(uint row, uint lane, uint s, inout float acc[NT]) {
@@ -31,6 +31,6 @@ void main() {
     if ((p.cols & 255) > lane * 8) step(row, lane, nsb, acc);
     [[unroll]] for (uint t = 0; t < NT; t++) {
         float a = warp_sum(acc[t]);
-        if (lane == 0) p.y.v[t * p.ys + row] = a;
+        if (lane == 0) p.y.v[t * p.ys + row] = a * p.sc;
     }
 }

@@ -978,7 +978,7 @@ impl Vk {
 
     /// `gemm` over a tile list, or (tiles = 0) the dense matrix `wd` over positions 0 .. nd; as `gemm_raw` in
     /// src/cuda/mod.rs, with the same choice of f16 or int8 products (`Gpu::mmq`).
-    fn gemm_raw(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, wd: u64, nd: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
+    fn gemm_raw(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, wd: u64, nd: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32, w_scale: f32) -> anyhow::Result<()> {
         // Partial super-blocks (Q2_0's 640 columns, BF16's 320) are fine: K steps are 64 deep.
         ensure!(cols % 64 == 0, "{} matrix with {cols} columns: GEMM needs a multiple of 64", ty.name());
         if n_tiles == 0 { return Ok(()); }
@@ -995,11 +995,11 @@ impl Vk {
         // workgroup (as on CUDA).
         let sm = tiles == 0 && grid[0] * grid[1] < 112 && if f { self.0.coop } else { self.0.coop_i8 != 0 };
         let grid = if sm { [grid[0], nd.div_ceil(32), 1] } else { grid };
-        let tail = [&(rows as u32) as &dyn Arg, &nk, &act];
+        let tail = [&(rows as u32) as &dyn Arg, &nk, &act, &w_scale];
         // gemmi loads q8 rows 16 bytes at a time: their stride (cols * 11 / 8) is aligned only for cols % 128 == 0.
         if f {
             if !same { q8.1 = None; }
-            let args: [&dyn Arg; 11] = [&tiles, &wd, &x, &xrow, &y, &(nd as u32), &(x_stride as u32), &(y_stride as u32), tail[0], tail[1], tail[2]];
+            let args: [&dyn Arg; 12] = [&tiles, &wd, &x, &xrow, &y, &(nd as u32), &(x_stride as u32), &(y_stride as u32), tail[0], tail[1], tail[2], tail[3]];
             self.run(if !self.0.coop { "gemm_f_dp" } else if sm { "gemm_fs" } else { "gemm_f" }, &spec, grid, &args)?;
             // Tile lists: gemm_f skips the tiles of at most 32 positions, which gemm_fs takes (as gemms_* on CUDA).
             if self.0.coop && tiles != 0 { self.run("gemm_fs", &spec, grid, &args)?; }
@@ -1008,7 +1008,7 @@ impl Vk {
         // Only SAME_X promises that x still holds what was quantized (as on CUDA).
         if !same { q8.1 = None; }
         let xq = self.q8_x(&mut q8, ty, cols, n_x, x, x_stride)?.expect("int8 GEMM without a quantized x");
-        let args: [&dyn Arg; 10] = [&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2]];
+        let args: [&dyn Arg; 11] = [&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2], tail[3]];
         let (gk, gks) = match self.0.coop_i8 { 32 => ("gemmi", "gemmi_s"), 16 => ("gemmi_16", "gemmi_s_16"), _ => ("gemmi_dp", "gemmi_dp") };
         self.run(if self.0.coop_i8 == 0 { "gemmi_dp" } else if sm { gks } else { gk }, &spec, grid, &args)?;
         if self.0.coop_i8 != 0 && tiles != 0 { self.run(gks, &spec, grid, &args)?; }
@@ -1236,10 +1236,10 @@ impl Backend for Vk {
     }
 
     fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
-        self.gemm_raw(ty, rows, cols, tiles, n_tiles, 0, 0, x, x_stride, n_x, xrow, y, y_stride, act)
+        self.gemm_raw(ty, rows, cols, tiles, n_tiles, 0, 0, x, x_stride, n_x, xrow, y, y_stride, act, 1.0f32)
     }
     fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
-        self.gemm_raw(w.ty, w.rows, w.cols, 0, n.div_ceil(128), w.ptr, n, x, x_stride, n, 0, y, y_stride, act)
+        self.gemm_raw(w.ty, w.rows, w.cols, 0, n.div_ceil(128), w.ptr, n, x, x_stride, n, 0, y, y_stride, act, w.scale)
     }
     fn int8_gemm(&self, ty: GgmlType) -> bool { crate::cuda::Gpu::mmq(ty) }
 
@@ -1259,14 +1259,14 @@ impl Backend for Vk {
             // Rows per workgroup as CUDA gemv_cfg: 8 for tall matrices, else 1 (hc_attn_up 10240 x 320).
             let wpb = if w.rows >= 4096 { 8 } else { 1 };
             let spec = [&spec[..], &[32 * wpb as u32]].concat();
-            return self.run("gemv_f", &spec, [w.rows.div_ceil(wpb), 1, 1], &[&w.ptr, &x, &y, &(x_stride as u32), &(y_stride as u32), &nc, &(w.rows as u32)]);
+            return self.run("gemv_f", &spec, [w.rows.div_ceil(wpb), 1, 1], &[&w.ptr, &x, &y, &(x_stride as u32), &(y_stride as u32), &nc, &(w.rows as u32), &w.scale]);
         }
         let xq = if xq != 0 { xq } else {
             ensure!(nt * w.cols * 9 / 8 <= XQ, "gemv: {nt} x {} inputs do not fit the quantized-x buffer", w.cols);
             self.quant_xq(x, x_stride, w.cols, nt, self.1.addr())?;
             self.1.addr()
         };
-        self.run("gemv_q", &spec, [w.rows.div_ceil(8), 1, 1], &[&w.ptr, &xq, &y, &0u64, &0u64, &0u64, &(y_stride as u32), &(w.rows as u32), &0u32, &nc])
+        self.run("gemv_q", &spec, [w.rows.div_ceil(8), 1, 1], &[&w.ptr, &xq, &y, &0u64, &0u64, &0u64, &(y_stride as u32), &(w.rows as u32), &0u32, &nc, &w.scale, &1.0f32])
     }
     fn gemvq2(&self, a: &GpuTensor, b: &GpuTensor, x: u64, x_stride: usize, xq: u64, ya: u64, yb: u64, nt: usize) -> anyhow::Result<()> {
         if a.ty != b.ty || a.cols != b.cols || a.ty.float_x() {
@@ -1281,7 +1281,7 @@ impl Backend for Vk {
             self.1.addr()
         };
         self.run("gemv_q", &spec, [(a.rows + b.rows).div_ceil(8), 1, 1],
-            &[&a.ptr, &xq, &ya, &b.ptr, &yb, &0u64, &(a.rows as u32), &(a.rows as u32), &(b.rows as u32), &nc])
+            &[&a.ptr, &xq, &ya, &b.ptr, &yb, &0u64, &(a.rows as u32), &(a.rows as u32), &(b.rows as u32), &nc, &a.scale, &b.scale])
     }
     fn supports_gemv_rows(&self) -> bool { true }
     fn gemv_rows(&self, w: &GpuTensor, x: u64, ids: u64, n_rows: usize, y: u64) -> anyhow::Result<()> {
@@ -1296,13 +1296,13 @@ impl Backend for Vk {
             self.quant_xq(x, x_stride, w.cols, nt, self.1.addr())?;
             self.1.addr()
         };
-        self.run("gemv_q", &spec, [n_rows.div_ceil(8), 1, 1], &[&w.ptr, &xq, &y, &0u64, &0u64, &ids, &(n_rows as u32), &(n_rows as u32), &0u32, &nc])
+        self.run("gemv_q", &spec, [n_rows.div_ceil(8), 1, 1], &[&w.ptr, &xq, &y, &0u64, &0u64, &ids, &(n_rows as u32), &(n_rows as u32), &0u32, &nc, &w.scale, &1.0f32])
     }
     fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()> {
         self.moe_gemv_nm(ty, rows, cols, w, stride, ids, k, x, x_stride, xg, y, pair, xq, k / xg.max(1))
     }
     fn dequant(&self, w: &GpuTensor, rows: usize, out: u64) -> anyhow::Result<()> {
-        self.run("dequant", &self.wspec(w.ty), [rows, 1, 1], &[&w.ptr, &out, &gemv_cols(0, w.ty, w.cols)?])
+        self.run("dequant", &self.wspec(w.ty), [rows, 1, 1], &[&w.ptr, &out, &gemv_cols(0, w.ty, w.cols)?, &w.scale])
     }
     fn quant_xq(&self, x: u64, x_stride: usize, n: usize, nt: usize, out: u64) -> anyhow::Result<()> {
         self.run("quant_xq", &[self.0.llama], [n.div_ceil(256), nt, 1], &[&x, &out, &0u64, &(x_stride as u32), &(n as u32)])

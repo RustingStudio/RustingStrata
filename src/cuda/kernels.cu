@@ -58,6 +58,23 @@ template <> __device__ __forceinline__ void deq8<30>(const u8* b, int sub, float
     u32 w[4] = {q.x, q.y, q.z, q.w};
     for (int i = 0; i < 4; i++) { o[2 * i] = __uint_as_float(w[i] << 16); o[2 * i + 1] = __uint_as_float(w[i] & 0xFFFF0000u); }
 }
+__device__ __forceinline__ float ue4m3_to_f32(u8 x) {
+    if (x == 0 || x == 0x7Fu) return 0.0f;
+    u32 exp = (x >> 3) & 0xFu, man = x & 7u;
+    float raw = exp == 0 ? (float)man * (1.0f / 512.0f) : __uint_as_float(((exp + 120u) << 23) | (man << 20));
+    return raw * 0.5f;
+}
+__device__ __forceinline__ float f8_e4m3_to_f32(u8 x) {
+    u32 ax = x & 0x7Fu;
+    if (ax == 0 || ax == 0x7Fu) return 0.0f;
+    u32 exp = ax >> 3, man = ax & 7u;
+    float mag = exp == 0 ? (float)man * (1.0f / 512.0f) : __uint_as_float(((exp + 120u) << 23) | (man << 20));
+    return (x & 0x80u) ? -mag : mag;
+}
+template <> __device__ __forceinline__ void deq8<43>(const u8* b, int sub, float* o) {  // F8_E4M3
+    const u8* p = b + 8 * sub;
+    for (int i = 0; i < 8; i++) o[i] = f8_e4m3_to_f32(p[i]);
+}
 template <> __device__ __forceinline__ void deq8<8>(const u8* b, int sub, float* o) {  // Q8_0, 8 blocks of 34
     const u8* p = b + 34 * (sub >> 2);
     float d = ldh(p);
@@ -306,7 +323,7 @@ template <> __device__ __forceinline__ void deq8<146>(const u8* b, int sub, floa
 // each weight load; output t goes to y + t * yst.
 template <int T, int SBB, bool P, int NT = 1>
 __device__ __forceinline__ void gemv_row(const u8* __restrict__ w, const float* __restrict__ x, float* y, int row, int cols,
-                                         int xst = 0, int yst = 0) {
+                                         int xst = 0, int yst = 0, float sc = 1.0f) {
     int lane = threadIdx.x & 31;
     float acc[NT] = {}, v[8];
     auto sb = [&](int s) {
@@ -324,7 +341,7 @@ __device__ __forceinline__ void gemv_row(const u8* __restrict__ w, const float* 
 #pragma unroll
     for (int t = 0; t < NT; t++) {
         float a = warp_sum(acc[t]);
-        if (lane == 0) y[(size_t)t * yst + row] = a;
+        if (lane == 0) y[(size_t)t * yst + row] = a * sc;
     }
 }
 
@@ -638,6 +655,23 @@ template <> struct QI<20> {  // IQ4_NL, 8 blocks of 18 (2-byte aligned: ld16 onl
         lo = r < 16 ? a.x : a.y; hi = r < 16 ? c.x : c.y;
     }
 };
+template <> struct QI<40> {  // NVFP4: 4 blocks of 36 per 256 (4-byte aligned: ldu32 only)
+    static constexpr bool MIN = false;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        const u8* p = b + 36 * (sub >> 3);
+        int s = (sub >> 1) & 3;
+        d = ue4m3_to_f32(p[s]);
+        const u8* q = p + 4 + 8 * s;
+        int2 a = fp4_lut(ldu32(q)), c = fp4_lut(ldu32(q + 4));
+        lo = (sub & 1) ? a.y : a.x;
+        hi = (sub & 1) ? c.y : c.x;
+    }
+};
+template <> __device__ __forceinline__ void deq8<40>(const u8* b, int sub, float* o) {
+    int lo, hi; float d, m;
+    QI<40>::get(b, sub, lo, hi, d, m);
+    for (int i = 0; i < 8; i++) o[i] = d * (float)(signed char)((i < 4 ? lo : hi) >> (8 * (i & 3)));
+}
 
 #ifndef LLAMA_Q8
 #define LLAMA_Q8 0
@@ -786,7 +820,7 @@ template <> struct QS<12> : QI<12> {
 #endif
 
 template <int T, int SBB, bool P, class Q = QI<T>>
-__device__ __forceinline__ void gemv_row_q(const u8* __restrict__ w, const signed char* qs, const float* xd, float* y, int row, int cols) {
+__device__ __forceinline__ void gemv_row_q(const u8* __restrict__ w, const signed char* qs, const float* xd, float* y, int row, int cols, float sc = 1.0f) {
     int lane = threadIdx.x & 31;
     float acc = 0.0f;
     auto sb = [&](int s) {
@@ -801,13 +835,13 @@ __device__ __forceinline__ void gemv_row_q(const u8* __restrict__ w, const signe
     for (int s = 0; s < cols >> 8; s++) sb(s);
     if (P && (cols & 255) > lane * 8) sb(cols >> 8);
     acc = warp_sum(acc);
-    if (lane == 0) y[row] = acc;
+    if (lane == 0) y[row] = acc * sc;
 }
 
 // gemv_row_q for nt <= 4 inputs: x t is qs + t * cols with scales xd + t * cols / 32; y t is y + t * ys.
 template <int T, int SBB, bool P, int NT>
 __device__ __forceinline__ void gemv_row_qn(const u8* __restrict__ w, const signed char* qs, const float* xd, float* y, int ys,
-                                            int row, int cols) {
+                                            int row, int cols, float sc = 1.0f) {
     int lane = threadIdx.x & 31;
     float acc[NT] = {};
     auto sb = [&](int s) {
@@ -827,21 +861,25 @@ __device__ __forceinline__ void gemv_row_qn(const u8* __restrict__ w, const sign
 #pragma unroll
     for (int t = 0; t < NT; t++) {
         float a = warp_sum(acc[t]);
-        if (lane == 0) y[(size_t)t * ys + row] = a;
+        if (lane == 0) y[(size_t)t * ys + row] = a * sc;
     }
 }
 
-#define FTYPES(X) X(0, f32, 1024) X(30, bf16, 512) X(144, tq2_t, 68) X(145, tqk6, 52) X(146, tqk7, 60)
+#define FTYPES(X) X(0, f32, 1024) X(30, bf16, 512) X(43, f8_e4m3, 256) X(144, tq2_t, 68) X(145, tqk6, 52) X(146, tqk7, 60)
 #define ITYPES(X) X(8, q8_0, 272) X(10, q2_k, 84) X(11, q3_k, 110) X(12, q4_k, 144) X(13, q5_k, 176) X(14, q6_k, 210) \
     X(19, iq1_s, 50) X(29, iq1_m, 56) X(16, iq2_xxs, 66) X(17, iq2_xs, 74) X(22, iq2_s, 82) X(18, iq3_xxs, 98) X(21, iq3_s, 110) X(23, iq4_xs, 136) X(20, iq4_nl, 144) X(42, q2_0, 72) X(34, tq1_0, 54) X(35, tq2_0, 66) X(2, q4_0, 144) X(6, q5_0, 176) \
     X(3, q4_1, 160) X(7, q5_1, 192) X(40, nvfp4, 144)
 #define QTYPES(X) FTYPES(X) ITYPES(X)
 
 #define DEF_DEQUANT(T, NAME, SBB)                                                                                 \
-    extern "C" __global__ void dequant_##NAME(const u8* w, float* out, int cols) {                                \
+    extern "C" __global__ void dequant_##NAME(const u8* w, float* out, int cols, float sc) {                      \
         const u8* r = w + blockIdx.x * ROWB(cols, SBB);                                                         \
-        for (int s = threadIdx.x; s < cols / 8; s += blockDim.x)                                                \
-            deq8<T>(r + (size_t)(s >> 5) * SBB, s & 31, out + (size_t)blockIdx.x * cols + s * 8);               \
+        for (int s = threadIdx.x; s < cols / 8; s += blockDim.x) {                                              \
+            float v[8];                                                                                         \
+            deq8<T>(r + (size_t)(s >> 5) * SBB, s & 31, v);                                                     \
+            float* dst = out + (size_t)blockIdx.x * cols + s * 8;                                               \
+            for (int i = 0; i < 8; i++) dst[i] = v[i] * sc;                                                     \
+        }                                                                                                       \
     }
 QTYPES(DEF_DEQUANT)
 
@@ -849,10 +887,12 @@ QTYPES(DEF_DEQUANT)
 #define DEF_FGEMV(T, NAME, SBB) DEF_FGEMV_(T, NAME, SBB, false) DEF_FGEMV_(T, NAME##_p, SBB, true)
 #define DEF_FGEMV_(T, NAME, SBB, P)                                                                                   \
     extern "C" __global__ void gemv_##NAME(const u8* w, const float* x, float* y, int rows, int cols, int,     \
-                                           const signed char*, long long w2, long long y2, int rows2) {        \
+                                           const signed char*, long long w2, long long y2, int rows2,           \
+                                           float sc1, float sc2) {                                              \
         int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;                                                 \
+        float sc = blockIdx.z ? sc2 : sc1;                                                                      \
         w += blockIdx.z * w2; y = (float*)((char*)y + blockIdx.z * y2); if (blockIdx.z) rows = rows2;           \
-        if (row < rows) gemv_row<T, SBB, P>(w + row * ROWB(cols, SBB), x, y, row, cols);                         \
+        if (row < rows) gemv_row<T, SBB, P>(w + row * ROWB(cols, SBB), x, y, row, cols, 0, 0, sc);              \
     }                                                                                                           \
     extern "C" __global__ void moe_gemv_##NAME(const u8* w, const int* ids, long long stride, const float* x,  \
                                                int x_stride, int xg, float* y, int rows, int cols, int,         \
@@ -864,15 +904,17 @@ QTYPES(DEF_DEQUANT)
                              y + (size_t)k * rows, row, cols);                                                   \
     }                                                                                                           \
     extern "C" __global__ void gemvn_##NAME(const u8* w, const float* x, int xs, float* y, int ys, int rows, int cols, \
-                                            int, int nt, const signed char*, long long w2, long long y2, int rows2) { \
+                                            int, int nt, const signed char*, long long w2, long long y2, int rows2, \
+                                            float sc1, float sc2) {                                             \
         int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;                                                 \
+        float sc = blockIdx.z ? sc2 : sc1;                                                                      \
         w += blockIdx.z * w2; y = (float*)((char*)y + blockIdx.z * y2); if (blockIdx.z) rows = ys = rows2;      \
         if (row >= rows) return;                                                                                \
         const u8* wr = w + row * ROWB(cols, SBB);                                                             \
-        if (nt == 2) gemv_row<T, SBB, P, 2>(wr, x, y, row, cols, xs, ys);                                           \
-        else if (nt == 3) gemv_row<T, SBB, P, 3>(wr, x, y, row, cols, xs, ys);                                      \
-        else if (nt == 4) gemv_row<T, SBB, P, 4>(wr, x, y, row, cols, xs, ys);                                      \
-        else gemv_row<T, SBB, P, 1>(wr, x, y, row, cols, xs, ys);                                                   \
+        if (nt == 2) gemv_row<T, SBB, P, 2>(wr, x, y, row, cols, xs, ys, sc);                                   \
+        else if (nt == 3) gemv_row<T, SBB, P, 3>(wr, x, y, row, cols, xs, ys, sc);                              \
+        else if (nt == 4) gemv_row<T, SBB, P, 4>(wr, x, y, row, cols, xs, ys, sc);                              \
+        else gemv_row<T, SBB, P, 1>(wr, x, y, row, cols, xs, ys, sc);                                           \
     }
 FTYPES(DEF_FGEMV)
 
@@ -884,17 +926,19 @@ FTYPES(DEF_FGEMV)
 #define DEF_IGEMV(T, NAME, SBB) DEF_IGEMV_(T, NAME, SBB, false) DEF_IGEMV_(T, NAME##_p, SBB, true)
 #define DEF_IGEMV_(T, NAME, SBB, P)                                                                                   \
     extern "C" __global__ void gemv_##NAME(const u8* w, const float* x, float* y, int rows, int cols, int rpw,   \
-                                           const signed char* xq, long long w2, long long y2, int rows2) {     \
+                                           const signed char* xq, long long w2, long long y2, int rows2,        \
+                                           float sc1, float sc2) {                                              \
         extern __shared__ __align__(16) signed char sx[];                                                       \
         const signed char* xs = xq ? xq : sx;                                                                   \
         const float* xd = (const float*)(xs + cols);                                                       \
         QS<T>::load();                                                                                          \
         if (!xq) quant_x<P>(x, cols, sx, (float*)(sx + cols));                                           \
         else if (QS<T>::SH) __syncthreads();                                                                    \
+        float sc = blockIdx.z ? sc2 : sc1;                                                                      \
         w += blockIdx.z * w2; y = (float*)((char*)y + blockIdx.z * y2); if (blockIdx.z) rows = rows2;           \
         int nw = blockDim.x >> 5, warp = threadIdx.x >> 5;                                                      \
         int r0 = blockIdx.x * nw * rpw + warp, r1 = min(rows, r0 - warp + nw * rpw);                            \
-        for (int row = r0; row < r1; row += nw) gemv_row_q<T, SBB, P, QS<T>>(w + row * ROWB(cols, SBB), xs, xd, y, row, cols); \
+        for (int row = r0; row < r1; row += nw) gemv_row_q<T, SBB, P, QS<T>>(w + row * ROWB(cols, SBB), xs, xd, y, row, cols, sc); \
     }                                                                                                           \
     extern "C" __global__ void moe_gemv_##NAME(const u8* w, const int* ids, long long stride, const float* x,  \
                                                int x_stride, int xg, float* y, int rows, int cols, int rpw,      \
@@ -929,9 +973,10 @@ ITYPES(DEF_IGEMV)
 #define DEF_IGEMVN_(T, NAME, SBB, P)                                                                                  \
     extern "C" __global__ void gemvn_##NAME(const u8* w, const float* x, int xs_, float* y, int ys, int rows, int cols, \
                                             int rpw, int nt, const signed char* xq, long long w2, long long y2, \
-                                            int rows2) {                                                        \
+                                            int rows2, float sc1, float sc2) {                                  \
         extern __shared__ __align__(16) signed char sx[];                                                       \
         const signed char* xs = xq ? xq : sx;                                                                   \
+        float sc = blockIdx.z ? sc2 : sc1;                                                                      \
         w += blockIdx.z * w2; y = (float*)((char*)y + blockIdx.z * y2); if (blockIdx.z) rows = ys = rows2;      \
         const float* xd = (const float*)(xs + nt * cols);                                                  \
         if (!xq) for (int t = 0; t < nt; t++)                                                                   \
@@ -940,10 +985,10 @@ ITYPES(DEF_IGEMV)
         int r0 = blockIdx.x * nw * rpw + warp, r1 = min(rows, r0 - warp + nw * rpw);                            \
         for (int row = r0; row < r1; row += nw) {                                                               \
             const u8* wr = w + row * ROWB(cols, SBB);                                                         \
-            if (nt == 2) gemv_row_qn<T, SBB, P, 2>(wr, xs, xd, y, ys, row, cols);                                    \
-            else if (nt == 3) gemv_row_qn<T, SBB, P, 3>(wr, xs, xd, y, ys, row, cols);                               \
-            else if (nt == 4) gemv_row_qn<T, SBB, P, 4>(wr, xs, xd, y, ys, row, cols);                               \
-            else gemv_row_qn<T, SBB, P, 1>(wr, xs, xd, y, ys, row, cols);                                            \
+            if (nt == 2) gemv_row_qn<T, SBB, P, 2>(wr, xs, xd, y, ys, row, cols, sc);                           \
+            else if (nt == 3) gemv_row_qn<T, SBB, P, 3>(wr, xs, xd, y, ys, row, cols, sc);                      \
+            else if (nt == 4) gemv_row_qn<T, SBB, P, 4>(wr, xs, xd, y, ys, row, cols, sc);                      \
+            else gemv_row_qn<T, SBB, P, 1>(wr, xs, xd, y, ys, row, cols, sc);                                   \
         }                                                                                                       \
     }
 ITYPES(DEF_IGEMVN)
@@ -1084,7 +1129,7 @@ __device__ __forceinline__ u32 h2pack(float a, float b) { return (u32)f2h(a) | (
 // same products in the same order either way. (A runtime branch in one kernel costs the big tiles a third.)
 template <int T, int SBB, int BM, int BK, bool SM>
 __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int nd, const float* __restrict__ x, int x_stride,
-                                       const int* xrow, float* y, int y_stride, int rows, int n64, int act) {
+                                       const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc) {
     constexpr int P = BK + 8, NT = BM * 2, SUBS = BK / 8, XM = SM ? 32 : BM;  // smem pitch in halves (padding: conflict-free fragments)
     __shared__ __align__(16) u16 xs[XM * P], ws[64 * P];
     GemmTile tl = tiles ? tiles[blockIdx.y] : GemmTile{wd, (int)blockIdx.y * XM, min(XM, nd - (int)blockIdx.y * XM)};
@@ -1201,7 +1246,7 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
                 #pragma unroll
                 for (int e = 0; e < 2; e++) {
                     if (n + e >= rows) break;
-                    float v = accv[j][4 * p4 + 2 * p2 + e];
+                    float v = accv[j][4 * p4 + 2 * p2 + e] * sc;
                     yr[n + e] = act == 0 ? v : act == 1 ? silu(yr[n + e]) * v : yr[n + e] + v;
                 }
             }
@@ -1218,7 +1263,7 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
                 #pragma unroll
                 for (int e = 0; e < 2; e++) {
                     if (n + e >= rows) break;
-                    float v = acc[mt][nt][2 * h + e];
+                    float v = acc[mt][nt][2 * h + e] * sc;
                     yr[n + e] = act == 0 ? v : act == 1 ? silu(yr[n + e]) * v : yr[n + e] + v;
                 }
             }
@@ -1244,12 +1289,12 @@ static_assert((64 * (GEMM_BK / 8)) % (2 * GEMM_BM) == 0, "whole W groups per thr
 #endif
 #define DEF_GEMM(T, NAME, SBB)                                                                                    \
     extern "C" __global__ void GEMM_LAUNCH_BOUNDS gemm_##NAME(const GemmTile* tiles, const u8* wd, int nd,         \
-            const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act) {  \
-        gemm_q<T, SBB, GEMM_BM, GEMM_BK, false>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act); \
+            const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc) {  \
+        gemm_q<T, SBB, GEMM_BM, GEMM_BK, false>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act, sc); \
     }                                                                                                             \
     extern "C" __global__ void GEMM_LAUNCH_BOUNDS gemms_##NAME(const GemmTile* tiles, const u8* wd, int nd,        \
-            const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act) {  \
-        gemm_q<T, SBB, GEMM_BM, GEMM_BK, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act);  \
+            const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc) {  \
+        gemm_q<T, SBB, GEMM_BM, GEMM_BK, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act, sc);  \
     }
 QTYPES(DEF_GEMM)
 
@@ -1377,7 +1422,7 @@ template <int N> __device__ __forceinline__ void cp_async_wait() {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 template <int T, int SBB, int BM, bool SM>
 __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int nd, const u8* __restrict__ x,
-                                        const int* xrow, float* y, int y_stride, int rows, int n64, int act) {
+                                        const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc) {
     constexpr int P = 80, XM = SM ? 32 : BM;  // smem pitch in bytes: 64 int8 + padding (conflict-free fragments, 16-byte aligned rows)
     static_assert(BM == 128, "one X row half per thread");
     __shared__ __align__(16) signed char xq[2][XM * P], wq[64 * P];
@@ -1502,7 +1547,7 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
                 #pragma unroll
                 for (int e = 0; e < 2; e++) {
                     if (n + e >= rows) break;
-                    float v = acc[mt][nt][2 * h + e];
+                    float v = acc[mt][nt][2 * h + e] * sc;
                     yr[n + e] = act == 0 ? v : act == 1 ? silu(yr[n + e]) * v : yr[n + e] + v;
                 }
             }
@@ -1510,12 +1555,12 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
 
 #define DEF_GEMMI(T, NAME, SBB)                                                                                   \
     extern "C" __global__ void __launch_bounds__(256, 2) gemmi_##NAME(const GemmTile* tiles, const u8* wd, int nd,    \
-            const u8* x, const int* xrow, float* y, int y_stride, int rows, int n64, int act) {                    \
-        gemmi_q<T, SBB, 128, false>(tiles, wd, nd, x, xrow, y, y_stride, rows, n64, act);                       \
+            const u8* x, const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc) {          \
+        gemmi_q<T, SBB, 128, false>(tiles, wd, nd, x, xrow, y, y_stride, rows, n64, act, sc);                   \
     }                                                                                                             \
     extern "C" __global__ void __launch_bounds__(256) gemmis_##NAME(const GemmTile* tiles, const u8* wd, int nd,   \
-            const u8* x, const int* xrow, float* y, int y_stride, int rows, int n64, int act) {                    \
-        gemmi_q<T, SBB, 128, true>(tiles, wd, nd, x, xrow, y, y_stride, rows, n64, act);                        \
+            const u8* x, const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc) {          \
+        gemmi_q<T, SBB, 128, true>(tiles, wd, nd, x, xrow, y, y_stride, rows, n64, act, sc);                    \
     }
 ITYPES(DEF_GEMMI)
 #endif

@@ -35,12 +35,14 @@ pub struct GpuTensor {
     pub rows: usize,
     pub cols: usize,
     pub ptr: u64,
+    pub scale: f32,
     _buf: Buf,
 }
 
 impl GpuTensor {
     /// `rows` x `cols` of `ty` stored in `buf` from its start.
-    pub fn new(ty: GgmlType, rows: usize, cols: usize, buf: Buf) -> GpuTensor { GpuTensor { ty, rows, cols, ptr: buf.addr, _buf: buf } }
+    pub fn new(ty: GgmlType, rows: usize, cols: usize, buf: Buf) -> GpuTensor { GpuTensor { ty, rows, cols, ptr: buf.addr, scale: 1.0, _buf: buf } }
+    pub fn with_scale(mut self, scale: f32) -> GpuTensor { self.scale = scale; self }
     pub fn bytes(&self) -> usize { self.ty.row_bytes(self.cols as u64) * self.rows }
 }
 
@@ -153,26 +155,27 @@ pub trait Backend: Send {
     fn preflight(&self, _types: &[GgmlType], _verbose: bool) -> anyhow::Result<()> { Ok(()) }
 
     fn upload(&self, t: &Tensor) -> anyhow::Result<GpuTensor> {
-        match upload_type(t.ty) {
+        let gt = match upload_type(t.ty) {
             GgmlType::F32 if t.ty == GgmlType::F16 => {
                 let mut f = vec![0f32; t.rows * t.cols];
                 crate::quant::dequant_row(GgmlType::F16, t.data, &mut f);
                 let b = self.alloc(4 * f.len())?;
                 self.htod(&f.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), &b, 0)?;
-                Ok(GpuTensor::new(GgmlType::F32, t.rows, t.cols, b))
+                GpuTensor::new(GgmlType::F32, t.rows, t.cols, b)
             }
             ty => {
                 let b = self.alloc(t.data.len())?;
                 self.htod(t.data, &b, 0)?;
-                Ok(GpuTensor::new(ty, t.rows, t.cols, b))
+                GpuTensor::new(ty, t.rows, t.cols, b)
             }
-        }
+        };
+        Ok(gt.with_scale(t.scale))
     }
 
     fn upload_raw(&self, t: &Tensor) -> anyhow::Result<GpuTensor> {
         let b = self.alloc(t.data.len())?;
         self.htod(t.data, &b, 0)?;
-        Ok(GpuTensor::new(t.ty, t.rows, t.cols, b))
+        Ok(GpuTensor::new(t.ty, t.rows, t.cols, b).with_scale(t.scale))
     }
 
     /// u16 words of a KV cache for `n` values: f16, or q8 with one f16 scale per 32 values.

@@ -878,8 +878,8 @@ pub fn load_lora(path: &str, scale: f32) -> anyhow::Result<Lora> {
     for base in bases {
         let a_info = g.tensors.get(&format!("{base}.lora_a")).context("missing lora_a")?;
         let b_info = g.tensors.get(&format!("{base}.lora_b")).context("missing lora_b")?;
-        let a_t = Tensor { ty: GgmlType::from_u32(a_info.ty)?, cols: a_info.dims[0] as usize, rows: a_info.dims[1..].iter().product::<u64>() as usize, data: g.bytes(a_info) };
-        let b_t = Tensor { ty: GgmlType::from_u32(b_info.ty)?, cols: b_info.dims[0] as usize, rows: b_info.dims[1..].iter().product::<u64>() as usize, data: g.bytes(b_info) };
+        let a_t = Tensor { ty: GgmlType::from_u32(a_info.ty)?, cols: a_info.dims[0] as usize, rows: a_info.dims[1..].iter().product::<u64>() as usize, data: g.bytes(a_info), scale: 1.0 };
+        let b_t = Tensor { ty: GgmlType::from_u32(b_info.ty)?, cols: b_info.dims[0] as usize, rows: b_info.dims[1..].iter().product::<u64>() as usize, data: g.bytes(b_info), scale: 1.0 };
         let a_flat = a_t.to_f32();
         let b_flat = b_t.to_f32();
         let a_dims = &a_info.dims;
