@@ -62,6 +62,18 @@ pub(crate) mod dev {
         *DEV.lock().unwrap() = Dev::default();
         *on = None;
     }
+    /// The share of `free` bytes of VRAM that `STRATA_DS_GPU_FRACTION` gives to the weights: one value, or
+    /// `small,large` with `small` for a card that has less than 8 GB free.
+    fn gpu_fraction(v: &str, free: usize) -> f64 {
+        let f: Vec<f64> = v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+        match f[..] { [small, large] => if free < 8 << 30 { small } else { large }, [v] => v, _ => 0.8 }
+    }
+    #[test]
+    fn gpu_fraction_takes_one_value_or_a_pair() {
+        let gb = |n: usize| n << 30;
+        assert_eq!([gpu_fraction("", gb(4)), gpu_fraction("0.9", gb(4)), gpu_fraction("x", gb(4))], [0.8, 0.9, 0.8]);
+        assert_eq!([gpu_fraction("0.6,0.9", gb(4)), gpu_fraction("0.6, 0.9", gb(11))], [0.6, 0.9]);
+    }
     fn open() -> Option<Dev> {
         // Unset or 0: every matvec runs on the CPU.
         if std::env::var("STRATA_DS_GPU").map_or(true, |v| v == "0") { return None; }
@@ -70,9 +82,11 @@ pub(crate) mod dev {
             .map(|v| v.split(',').filter_map(|d| d.trim().parse().ok()).collect()).filter(|v: &Vec<usize>| !v.is_empty()).unwrap_or(vec![0]);
         // `STRATA_DS_GPU_EXPERTS` is the absolute weight budget in GB (plain weights and expert cache). Unset:
         // `STRATA_DS_GPU_FRACTION` of free VRAM (80% by default, 90% for GLM), which keeps the old defaults on a
-        // 12 GB card and uses most of an 80 GB one.
+        // 12 GB card and uses most of an 80 GB one. A pair `small,large` gives a card with less than 8 GB free its
+        // own share: Inkling 2 sets 0.6,0.9, because at 0.9 such a card has no room left to stage a routed expert.
         let gb: Option<f64> = std::env::var("STRATA_DS_GPU_EXPERTS").ok().and_then(|v| v.parse().ok());
-        let frac: f64 = std::env::var("STRATA_DS_GPU_FRACTION").ok().and_then(|v| v.parse().ok()).unwrap_or(0.8);
+        let fracs = std::env::var("STRATA_DS_GPU_FRACTION").unwrap_or_default();
+        let frac = |free: usize| gpu_fraction(&fracs, free);
         let mut bes = vec![];
         for d in ids {
             match crate::backend::open(kind.as_deref(), d) {
@@ -87,7 +101,7 @@ pub(crate) mod dev {
             let (x, y, stage) = (be.alloc(4 * SCRATCH).ok()?, be.alloc(4 * SCRATCH).ok()?, be.alloc(STAGE).ok()?);
             let budget = match gb {
                 Some(g) => (g * 1e9 * f as f64 / total as f64) as usize,
-                None => (f.saturating_sub(56 << 20) as f64 * frac) as usize,
+                None => (f.saturating_sub(56 << 20) as f64 * frac(f)) as usize,
             };
             // Room for the plain weights before moving on to the next GPU: what is free, less the expert cache and a margin.
             let room = f.saturating_sub(budget + (768 << 20));

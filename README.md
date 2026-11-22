@@ -257,8 +257,8 @@ entry per layer run, the message queries in `loop_res_query` and `loop_kv_res_qu
 The backend, device and expert options are those of Hy4-flash above: CUDA when an NVIDIA card and driver are present
 and Vulkan otherwise, `--backend vulkan` or `--backend cuda` to pick one, `STRATA_DS_GPU=0` for the CPU only, and
 `--fixed-experts` for the same text on every run. The prompt runs layer by layer in chunks of `STRATA_DS_CHUNK` tokens
-(default 512). The weights take `STRATA_DS_GPU_FRACTION` of the free VRAM (default 0.8); the experts that do not fit
-run on the CPU.
+(default 512). The weights take `STRATA_DS_GPU_FRACTION` of the free VRAM (default 0.9, and 0.6 on a card with less than 8 GB
+free; a pair such as `0.6,0.9` sets both); the experts that do not fit run on the CPU.
 
 On an RTX 3060 12 GB with 30 GB RAM and a Ryzen 5 7600X, `bench --pp 64,512,2048 --tg 64 --reps 2` measured (mean of
 the two runs, and the two runs):

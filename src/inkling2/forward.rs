@@ -447,7 +447,7 @@ impl<'a> Inkling2Model<'a> {
     /// Load the model with a context limit up to `cfg.ctx`.
     pub fn new_with_ctx(g: &'a Gguf, max_ctx: usize) -> Result<Self> {
         if std::env::var_os("STRATA_DS_GPU_FRACTION").is_none() {
-            unsafe { std::env::set_var("STRATA_DS_GPU_FRACTION", "0.90"); }
+            unsafe { std::env::set_var("STRATA_DS_GPU_FRACTION", "0.6,0.9"); }
         }
         let cfg = Inkling2Config::from_gguf(g)?;
         let has = |n: &str| g.tensors.contains_key(n);
@@ -776,6 +776,13 @@ impl<'a> Inkling2Model<'a> {
     fn resident(l: &Layer<'a>, ne: usize, on_gpu: &[(Mat<'a>, usize, f32)]) -> Vec<(Mat<'a>, Mat<'a>, f32, f32)> {
         let on = |m: &Mat<'a>, e: usize| { let x = m.expert_opt(e, ne, true); if x.gpu.is_some() { x } else { x.staged() } };
         on_gpu.iter().map(|&(gu, e, w)| (if gu.gpu.is_some() { gu } else { on(&l.gate_up, e) }, on(&l.down, e), w, l.gu_scale[e])).collect()
+    }
+
+    /// The experts `plan` gave to the GPU, on the host: for a card with no room left to stage a routed weight.
+    pub(super) fn experts_host(&self, ip: usize, on_gpu: &[(Mat<'a>, usize, f32)], x: &[f32]) -> Vec<f32> {
+        let (l, ne) = (&self.layers[ip], self.cfg.n_expert);
+        let list: Vec<_> = on_gpu.iter().map(|&(_, e, w)| (l.gate_up.expert_host(e, ne), l.down.expert_host(e, ne), w, l.gu_scale[e])).collect();
+        run_experts(&list, x, &self.cfg)
     }
 
     /// MoE of one token with the weights of layer `ip`.

@@ -73,7 +73,7 @@ const DONE: &str = "<|content_model_end_sampling|>";
 
 pub fn gpu_defaults() {
     crate::deepseek::chat::gpu_defaults();
-    if std::env::var_os("STRATA_DS_GPU_FRACTION").is_none() { unsafe { std::env::set_var("STRATA_DS_GPU_FRACTION", "0.90") } }
+    if std::env::var_os("STRATA_DS_GPU_FRACTION").is_none() { unsafe { std::env::set_var("STRATA_DS_GPU_FRACTION", "0.6,0.9") } }
 }
 
 /// The template's `tojson(sort_keys=true, separators=(",", ":"))`.
