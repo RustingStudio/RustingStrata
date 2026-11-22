@@ -128,6 +128,9 @@ target/release/rustingstrata chat --model $M --mmproj $MMPROJ --image photo.jpg 
 STRATA_API_KEY=secret target/release/rustingstrata serve --model $M --gpu --addr 127.0.0.1:8080
 ```
 
+`rustingstrata interface` asks for the model, the mode (terminal chat, chat page, API server, speed test), GPU or CPU,
+the context length and the address, prints the command these make and runs it.
+
 Without `--gpu` everything runs on the CPU reference, which is slow and meant for checking. Flags, the OpenAI and
 Anthropic APIs, tool calls, caching and multi-GPU are in [docs/USAGE.md](docs/USAGE.md).
 

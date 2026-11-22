@@ -235,7 +235,7 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
     let mut m = forward::GlmModel::new(g)?;
     let eos = tok.eos_ids();
     let ids = tok.encode(prompt)?;
-    if std::env::var_os("STRATA_GLM_TRACE").is_some() { eprintln!("prompt ids {ids:?}"); }
+    if std::env::var_os("STRATA_GLM_TRACE").is_some() { crate::say!("prompt ids {ids:?}"); }
     let mut logits = m.prefill(&ids);
     let (mut out, mut shown) = (vec![], 0);
     // STRATA_GLM_FORCE=<file of comma-separated token ids>: teacher-force those tokens (compare top-5 per step with a reference run).
@@ -248,7 +248,7 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
             let mut idx: Vec<usize> = (0..logits.len()).collect();
             idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
             let t: Vec<String> = idx[..5].iter().map(|&k| format!("{k}:{:.4}", logits[k] as f64 - lz)).collect();
-            eprintln!("TOP5 {i} {}", t.join(" "));
+            crate::say!("TOP5 {i} {}", t.join(" "));
         }
         if let Some(&f) = forced.get(i) { next = f; }
         if eos.contains(&next) { break; }
@@ -388,7 +388,7 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize) -> anyhow::Result<()> {
     let stop = stop_ids(g, &tok);
     let mut msgs: Vec<(String, String)> = system.into_iter().map(|s| ("system".to_string(), s)).collect();
     loop {
-        print!("> ");
+        print!("{}", crate::term::prompt());
         std::io::stdout().flush()?;
         let mut line = String::new();
         if std::io::stdin().lock().read_line(&mut line)? == 0 { break; }
@@ -396,7 +396,7 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize) -> anyhow::Result<()> {
         msgs.push(("user".into(), line.trim_end().into()));
         let view: Vec<(&str, &str)> = msgs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
         let ids = tok.encode(&chat_prompt(&view))?;
-        if ids.len() >= ctx_limit(&m) { eprintln!("context full ({} tokens)", ids.len()); break; }
+        if ids.len() >= ctx_limit(&m) { crate::say!("context full ({} tokens)", ids.len()); break; }
         let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
         let logits = m.prefill(&ids[keep..]);
         let room = n.min(ctx_limit(&m) - ids.len());

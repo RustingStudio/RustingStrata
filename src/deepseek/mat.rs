@@ -91,7 +91,7 @@ pub(crate) mod dev {
         for d in ids {
             match crate::backend::open(kind.as_deref(), d) {
                 Ok(be) => bes.push(be),
-                Err(e) => { eprintln!("GPU {d}: {e:#}; running without it"); return None; }
+                Err(e) => { crate::say!("GPU {d}: {e:#}; running without it"); return None; }
             }
         }
         let free: Vec<usize> = bes.iter().map(|b| b.mem_info().map_or(1, |m| m.0.max(1))).collect();

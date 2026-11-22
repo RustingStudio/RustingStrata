@@ -112,7 +112,7 @@ impl GpuModel<'_> {
             let t0 = std::time::Instant::now();
             let (logits, reused) = self.prefill_cached(tokens, 0, tokens.len() - 1)?;
             if reused > 0 {
-                eprintln!(
+                crate::say!(
                     "warm start: reused {reused}/{} prompt tokens from cache (TTFT {:.1} ms)",
                     tokens.len(),
                     t0.elapsed().as_secs_f64() * 1e3
@@ -204,7 +204,7 @@ impl GpuModel<'_> {
             self.save_state()?;
             (self.saved_ids, self.saved_owner) = (tokens[..keep].to_vec(), self.owner);
             if let Err(e) = self.sync_saved_to_prompt_cache() {
-                eprintln!("warning: could not save prompt cache: {e:#}");
+                crate::say!("warning: could not save prompt cache: {e:#}");
             }
         }
         let logits = self.prefill_with(&tokens[keep..], between)?;
@@ -697,7 +697,7 @@ impl GpuModel<'_> {
                 }
             }
             probe(&mut tr, "| ffn", &pf.slab, x, d, t)?;
-            if trace { eprintln!("nan-trace pos {} layer {il}:{tr}", self.pos); tr.clear(); }
+            if trace { crate::say!("nan-trace pos {} layer {il}:{tr}", self.pos); tr.clear(); }
             if il < c.n_layer {
                 if let (Some(dff), Some(df)) = (&pf.dflash_feat, self.dflash.as_ref()) {
                     if let Some(idx) = df.cfg.target_layer_ids.iter().position(|&tl| tl == il) {

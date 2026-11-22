@@ -226,12 +226,12 @@ impl<'a> Weights<'a> {
             for (name, entry) in &lora.entries {
                 if name.ends_with("ffn_down_exps.weight") { continue; }
                 if entry.n_expert != 1 {
-                    eprintln!("lora: target {name} has {} experts, expected 1; skipping", entry.n_expert);
+                    crate::say!("lora: target {name} has {} experts, expected 1; skipping", entry.n_expert);
                     continue;
                 }
-                let base = match self.get(name) { Ok(t) => t, Err(_) => { eprintln!("lora: target {name} not found, skipping"); continue; } };
+                let base = match self.get(name) { Ok(t) => t, Err(_) => { crate::say!("lora: target {name} not found, skipping"); continue; } };
                 if base.cols != entry.in_dim || base.rows != entry.out_dim {
-                    eprintln!("lora: target {name} is {}x{}, adapter is {}x{}; skipping", base.rows, base.cols, entry.out_dim, entry.in_dim);
+                    crate::say!("lora: target {name} is {}x{}, adapter is {}x{}; skipping", base.rows, base.cols, entry.out_dim, entry.in_dim);
                     continue;
                 }
                 let mut w = base.to_f32();

@@ -98,7 +98,7 @@ impl ExpertCache {
             .map(|b| b.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect::<Vec<_>>())
             .unwrap_or_default();
         if let Some(p) = profile.as_ref().filter(|_| frac < 1.0) {
-            eprintln!("expert profile: {}{}", p.display(), if counts.is_empty() { " (none yet: written when the run ends)" } else { "" });
+            crate::say!("expert profile: {}{}", p.display(), if counts.is_empty() { " (none yet: written when the run ends)" } else { "" });
         }
         let mut long = counts;
         long.resize(n_layers * n, 0.0);
@@ -117,7 +117,7 @@ impl ExpertCache {
             match r {
                 Ok(p) => break p,
                 Err(e) if frac > 0.01 => {
-                    eprintln!("expert slots: {e:#}; trying {:.0} MB", 0.9 * frac * total as f64 / 1048576.0);
+                    crate::say!("expert slots: {e:#}; trying {:.0} MB", 0.9 * frac * total as f64 / 1048576.0);
                     frac *= 0.9;
                 }
                 Err(e) => return Err(e),

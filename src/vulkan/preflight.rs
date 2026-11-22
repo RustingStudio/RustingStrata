@@ -32,10 +32,10 @@ impl Vk {
             if !checked.insert((name, spec.clone())) { continue; }
             let bytes = spv_smem::check_shared_memory(name, &spec, self.0.kv_mode, self.0.smem_limit)?;
             n += 1;
-            if verbose { eprintln!("vulkan: preflight {name} {spec:?}: {bytes} bytes"); }
+            if verbose { crate::say!("vulkan: preflight {name} {spec:?}: {bytes} bytes"); }
             if bytes > worst.0 { worst = (bytes, name, spec); }
         }
-        eprintln!("vulkan: shared-memory preflight: {n} (kernel, specialization) pairs checked, largest {} bytes \
+        crate::say!("vulkan: shared-memory preflight: {n} (kernel, specialization) pairs checked, largest {} bytes \
             ({}) of {} allowed, {:.1} ms", worst.0, worst.1, self.0.smem_limit, t0.elapsed().as_secs_f64() * 1e3);
         if !verbose {
             let mut st = self.0.st();

@@ -1,6 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use anyhow::Context;
 use rusting_strata::memory;
+use rusting_strata::{say, term};
 use rusting_strata::model::{Model, State};
 use rusting_strata::{backend, gpu_model::GpuModel};
 use rusting_strata::{config::ModelConfig, gguf::Gguf, hf, ops, ops::Sampler, quant::GgmlType, serve, tokenizer::Tokenizer};
@@ -331,19 +332,19 @@ impl Runner<'_> {
                 } else {
                     "MTP"
                 };
-                eprintln!("{kind} drafts accepted {}/{} ({:.1}%)", g.drafts.1, g.drafts.0, 100.0 * g.drafts.1 as f64 / g.drafts.0 as f64);
+                say!("{kind} drafts accepted {}/{} ({:.1}%)", g.drafts.1, g.drafts.0, 100.0 * g.drafts.1 as f64 / g.drafts.0 as f64);
             }
-            eprintln!("expert hit rate {:.1}% ({} misses), cache swaps {}", 100.0 * st.hits as f64 / (st.hits + st.misses).max(1) as f64, st.misses, st.swaps);
+            say!("expert hit rate {:.1}% ({} misses), cache swaps {}", 100.0 * st.hits as f64 / (st.hits + st.misses).max(1) as f64, st.misses, st.swaps);
             // Issue #34 R1: printed on every run, so a fully resident run reads as a measured 0 in the log instead of
             // an absent line. `tokens` counts the token forwards the worker could have been asked about.
             let tokens = sum(&|p| p.tokens);
             let busy: f64 = g.parts().map(|p| p.cpu_time.as_secs_f64()).sum();
             let stalls = sum(&|p| p.resumed.get());
-            eprintln!("worker busy {:.1} µs/token, worker stalls {stalls}", if tokens > 0 { 1e6 * busy / tokens as f64 } else { 0.0 });
+            say!("worker busy {:.1} µs/token, worker stalls {stalls}", if tokens > 0 { 1e6 * busy / tokens as f64 } else { 0.0 });
             let mode = if !st.cached { "no expert cache".to_string() }
                 else if st.all_fast { format!("fast path on, {}/{} experts resident", st.resident, st.total) }
                 else { format!("fast path off, {}/{} experts resident", st.resident, st.total) };
-            eprintln!("mailbox traffic: {} GPU writes, {} host routing reads ({mode})", sum(&|p| p.mailbox_writes.get()), sum(&|p| p.mailbox_reads.get()));
+            say!("mailbox traffic: {} GPU writes, {} host routing reads ({mode})", sum(&|p| p.mailbox_writes.get()), sum(&|p| p.mailbox_reads.get()));
             for p in g.parts() { if let Some(c) = &p.cache { c.save_profile()?; } }
         }
         Ok(())
@@ -387,7 +388,7 @@ impl Engine {
             let want = (self.cache_ram as u64) << 20;
             let room = cap - used;
             if want > room {
-                eprintln!("RAM cap: clamping --cache-ram from {} MB to {} MB", self.cache_ram, room >> 20);
+                say!("RAM cap: clamping --cache-ram from {} MB to {} MB", self.cache_ram, room >> 20);
                 self.cache_ram = (room >> 20) as usize;
             }
         }
@@ -395,25 +396,25 @@ impl Engine {
         set_kv_env(&self.kv);  // read by Gpu::new and Vk::new
         let open = || self.device.iter().map(|&d| backend::open(self.backend.as_deref(), d)).collect::<anyhow::Result<Vec<_>>>();
         let bk = match self.gpu.then(open).transpose() {
-            Err(e) if self.cpu_fallback => { eprintln!("no GPU backend ({e:#}), running on the CPU"); None }
+            Err(e) if self.cpu_fallback => { say!("no GPU backend ({e:#}), running on the CPU"); None }
             r => r?,
         };
         let path = calibration_path(model, bk.as_ref().map_or("cuda", |b| b[0].name()), &self.device);
         let mut v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         if let Some(gpu) = bk.as_ref().map(|b| b[0].device()).filter(|gpu| !calibration_fits(&v, gpu)) {
-            eprintln!("warning: {} was measured on {}, not on {gpu}: ignored", path.display(), v["gpu"]);
+            say!("warning: {} was measured on {}, not on {gpu}: ignored", path.display(), v["gpu"]);
             v = serde_json::Value::Null;
         }
         if let Some(n) = v["bytes"].as_u64().filter(|&n| std::fs::metadata(model).is_ok_and(|m| m.len() != n)) {
-            eprintln!("warning: {} was measured on another file with this name ({n} bytes): ignored", path.display());
+            say!("warning: {} was measured on another file with this name ({n} bytes): ignored", path.display());
             v = serde_json::Value::Null;
         }
-        if !v.is_null() { eprintln!("calibration: {}", path.display()); }
-        else if bk.is_some() { eprintln!("warning: not calibrated on this machine, so the prefill chunk, MTP drafts and the short-prompt threshold are defaults: run `rustingstrata calibrate --model {}` (a few minutes, once per model)", model.display()); }
+        if !v.is_null() { say!("calibration: {}", path.display()); }
+        else if bk.is_some() { say!("warning: not calibrated on this machine, so the prefill chunk, MTP drafts and the short-prompt threshold are defaults: run `rustingstrata calibrate --model {}` (a few minutes, once per model)", model.display()); }
         let get = |k: &str| v[k].as_u64().map(|x| x as usize);
         if let Some(dp) = &self.draft_model {
             anyhow::ensure!(dp.exists(), "draft model path does not exist: {}", dp.display());
-            eprintln!("draft model socket: registered candidate {}", dp.display());
+            say!("draft model socket: registered candidate {}", dp.display());
         }
         let mut ngram_cfg = self.ngram_config()?;
         ngram_cfg.n_vocab = m.cfg.n_vocab;
@@ -446,12 +447,12 @@ impl Engine {
         let aux_heads = m.cfg.n_nextn.max(usize::from(m.cfg.dflash.is_some() || m.draft_model.is_some()));
         let Some(bk) = bk else {
             let (notes, _, mtp) = resolve_flags(false, self.parallel, self.mtp(), aux_heads)?;
-            for n in notes { eprintln!("{n}"); }
+            for n in notes { say!("{n}"); }
             self.mtp = Some(mtp);
             return Ok(Runner::Cpu(m, State::new(&m.cfg)));
         };
         let (notes, parallel, mtp) = resolve_flags(true, self.parallel, self.mtp(), aux_heads)?;
-        for n in notes { eprintln!("{n}"); }
+        for n in notes { say!("{n}"); }
         (self.parallel, self.mtp) = (parallel, Some(mtp));
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
         // Before the first weight is uploaded: fail if a pipeline these weight types need does not fit the device's
@@ -492,7 +493,7 @@ impl Engine {
                 g.cache_ram = 2048 << 20;
             }
             if let Err(e) = g.load_prompt_cache(p) {
-                eprintln!("warning: could not load prompt cache {}: {e:#}", p.display());
+                say!("warning: could not load prompt cache {}: {e:#}", p.display());
             }
         }
         Ok(Runner::Gpu(Box::new(g)))
@@ -531,9 +532,9 @@ impl Engine {
         let mtp = self.mtp.is_some_and(|n| n > 0) || self.mtp_model.is_some();
         // Inkling 2 drafts with a DSpark file (`--draft-model`) and with n-grams (`--spec-type`); it has no MTP head.
         if rusting_strata::inkling2::is_arch(arch) {
-            if mtp { eprintln!("warning: '{arch}' models have no MTP drafts: --mtp and --mtp-model are ignored"); }
+            if mtp { say!("warning: '{arch}' models have no MTP drafts: --mtp and --mtp-model are ignored"); }
         } else if mtp || self.draft_model.is_some() || self.spec_type != "none" {
-            eprintln!("warning: '{arch}' models decode without drafts: --mtp, --mtp-model, --draft-model and --spec-type are ignored");
+            say!("warning: '{arch}' models decode without drafts: --mtp, --mtp-model, --draft-model and --spec-type are ignored");
         }
     }
 }
@@ -620,7 +621,7 @@ fn load_images(mmproj: &Path, images: &[String]) -> anyhow::Result<ImageInput> {
         let img = vision::load_image(src)?;
         let t0 = Instant::now();
         let (feats, nx, ny) = vision::encode_image(&projector, &img)?;
-        eprintln!("image: {nx}x{ny} tokens encoded in {:.1} s", t0.elapsed().as_secs_f64());
+        say!("image: {nx}x{ny} tokens encoded in {:.1} s", t0.elapsed().as_secs_f64());
         grids.push((nx, ny));
         embeddings.push(feats);
     }
@@ -1036,6 +1037,12 @@ enum Cmd {
         #[command(flatten)]
         engine: Engine,
     },
+    /// Ask for the model, the mode and the main settings in the terminal, then run the command they make.
+    Interface {
+        /// Folder of .gguf models to list, as `--models-dir` of `serve`.
+        #[arg(long)]
+        models_dir: Option<PathBuf>,
+    },
     /// Text generation (greedy unless --temp).
     Generate {
         #[arg(long)]
@@ -1054,7 +1061,14 @@ enum Cmd {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
+    if let Err(e) = start() {
+        say!("error: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+fn start() -> anyhow::Result<()> {
     let m = <Cli as clap::CommandFactory>::command().get_matches();
     if let Some((_, sm)) = m.subcommand() && let Ok(Some(&n)) = sm.try_get_one::<usize>("ctx")
         && sm.value_source("ctx") == Some(clap::parser::ValueSource::CommandLine) {
@@ -1066,8 +1080,9 @@ fn main() -> anyhow::Result<()> {
         engine.cpu_fallback = true;
         let r = run(Cmd::Serve { model, models_dir, addr, api_key, mcp, open, host, engine });
         if let Err(e) = &r {
-            eprintln!("error: {e:#}\npress Enter to close");
+            say!("error: {e:#}\npress Enter to close");
             let _ = std::io::stdin().read_line(&mut String::new());
+            std::process::exit(1);
         }
         return r;
     };
@@ -1079,7 +1094,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
     // .cargo/config.toml's target-cpu=native) runs MoE experts that miss the VRAM cache about 10x slower (#44).
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
     if std::arch::is_x86_feature_detected!("avx2") {
-        eprintln!("warning: this binary was built without AVX2 but this CPU has it: CPU work is about 10x slower. Rebuild with \
+        say!("warning: this binary was built without AVX2 but this CPU has it: CPU work is about 10x slower. Rebuild with \
                    RUSTFLAGS=\"-C target-cpu=native\" (or x86-64-v3), or use a release binary.");
     }
     match cmd {
@@ -1206,13 +1221,13 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut engine.sampler(), logits, cap, think_cap, &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
             let (pp, tg) = ((t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
             if out.len() == cap && cap < n { eprint!("\n(stopped: the context is full at {} tokens; raise --ctx)", engine.ctx); }
-            eprintln!("\nprompt {} tok {:.2} tok/s | gen {} tok {:.2} tok/s", n_prompt, n_prompt as f64 / pp, out.len(), out.len() as f64 / tg);
-            if engine.gpu { eprintln!("CPU expert compute, share of gen time: {:.1}%", 100.0 * (r.cpu_secs() - cpu0) / tg); }
+            say!("\nprompt {} tok {:.2} tok/s | gen {} tok {:.2} tok/s", n_prompt, n_prompt as f64 / pp, out.len(), out.len() as f64 / tg);
+            if engine.gpu { say!("CPU expert compute, share of gen time: {:.1}%", 100.0 * (r.cpu_secs() - cpu0) / tg); }
             let ms = |s: f64| 1e3 * s / out.len().max(1) as f64;
             for (i, ((a, b), (a0, b0))) in r.split_secs().into_iter().zip(split0).enumerate() {
-                eprintln!("device {i}: {:.2} ms/token forward, {:.2} ms/token copy to the next device", ms(a - a0), ms(b - b0));
+                say!("device {i}: {:.2} ms/token forward, {:.2} ms/token copy to the next device", ms(a - a0), ms(b - b0));
             }
-            if !r.split_secs().is_empty() { eprintln!("gen total {:.2} ms/token", ms(tg)); }
+            if !r.split_secs().is_empty() { say!("gen total {:.2} ms/token", ms(tg)); }
             r.finish()?;
         }
         Cmd::Perplexity { model, file, ctx_len: n, chunks, kld_base, mut engine } => {
@@ -1300,7 +1315,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let eb = r.expert_bytes_per_token();
                 let mid = if eb > 0 {
                     let mid = { let mut v = d.clone(); v.sort_by(f64::total_cmp); v[v.len() / 2] };
-                    eprintln!("expert traffic: {:.1} MB/token -> {:.1} GB/s at {mid:.1} tok/s", eb as f64 / 1048576.0, eb as f64 * mid / 1e9);
+                    say!("expert traffic: {:.1} MB/token -> {:.1} GB/s at {mid:.1} tok/s", eb as f64 / 1048576.0, eb as f64 * mid / 1e9);
                     mid
                 } else { 0.0 };
                 results.push(BenchResult { pp: n, prefill, decode: decode_stat, bytes_per_token: eb, decode_median: mid });
@@ -1330,7 +1345,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Calibrate { model, ctx, vram_margin, backend, device, split, kv, lora, gpu: _, mtp_model, draft_model } => {
             set_kv_env(&kv);  // read by Gpu::new and Vk::new
-            if !lora.is_empty() { eprintln!("note: --lora is ignored by calibrate; calibration uses the base model"); }
+            if !lora.is_empty() { say!("note: --lora is ignored by calibrate; calibration uses the base model"); }
             let margins = vram_margins(&vram_margin, &device)?.into_iter().map(|mb| mb << 20).collect::<Vec<_>>();
             let split = split_arg(split.as_deref(), device.len())?;
             if !model.is_dir() {
@@ -1341,15 +1356,15 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             anyhow::ensure!(!list.is_empty(), "no .gguf models in {}", model.display());
             let mut failed = vec![];
             for (k, (id, path, _)) in list.iter().enumerate() {
-                eprintln!("calibrate {}/{}: {id}", k + 1, list.len());
+                say!("calibrate {}/{}: {id}", k + 1, list.len());
                 let arch = Gguf::open(path).ok().and_then(|g| g.get("general.architecture").ok().and_then(|v| v.as_str().map(str::to_string)));
                 if arch.as_deref().is_some_and(|a| rusting_strata::config::OWN_ARCHS.contains(&a)) {
-                    eprintln!("calibrate {id}: skipped, calibrate measures the main engine only and '{}' models run on their own code path", arch.unwrap());
+                    say!("calibrate {id}: skipped, calibrate measures the main engine only and '{}' models run on their own code path", arch.unwrap());
                     continue;
                 }
                 // One model that fails (too big, not a model) does not stop the others.
                 if let Err(e) = calibrate(path, None, ctx, &margins, backend.as_deref(), &device, split.clone()) {
-                    eprintln!("calibrate {id}: failed: {e:#}");
+                    say!("calibrate {id}: failed: {e:#}");
                     failed.push(id.as_str());
                 }
             }
@@ -1394,10 +1409,26 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let types = rusting_strata::gpu_model::gpu_weight_types(&g);
             let b = backend::open(backend.as_deref(), device)?;
             if b.name() != "vulkan" {
-                eprintln!("check: the shared-memory preflight is Vulkan-only; nothing to check on {}", b.name());
+                say!("check: the shared-memory preflight is Vulkan-only; nothing to check on {}", b.name());
                 return Ok(());
             }
             b.preflight(&types, true)?;
+        }
+        Cmd::Interface { models_dir } => {
+            println!("{}", term::paint(term::out(), "1", concat!("RustingStrata ", env!("CARGO_PKG_VERSION"))));
+            let mut models = serve::list_models(&models_dir.clone().unwrap_or_else(models_dir_default));
+            for m in serve::cached_models() { if !models.iter().any(|x| x.1 == m.1) { models.push(m); } }
+            let mut args = interface_args(&mut std::io::stdin().lock(), models)?;
+            if let Some(d) = models_dir.filter(|_| args[0] == "serve") { args.extend(["--models-dir".into(), d.to_string_lossy().into()]); }
+            let shown: Vec<_> = args.iter().map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() }).collect();
+            println!("\n{} rustingstrata {}\n", term::paint(term::out(), "2", "running:"), shown.join(" "));
+            // The same process image runs the command, so it behaves as if it were typed.
+            let mut cmd = std::process::Command::new(std::env::current_exe()?);
+            cmd.args(&args);
+            #[cfg(unix)]
+            return Err(std::os::unix::process::CommandExt::exec(&mut cmd).into());
+            #[cfg(not(unix))]
+            std::process::exit(cmd.status()?.code().unwrap_or(1));
         }
         Cmd::Chat { model, system, n, image, mut engine } => {
             let think = engine.think_default;
@@ -1464,7 +1495,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let mut msgs: Vec<Msg> = system.iter().map(|s| Msg::new("system", s)).collect();
             let stdin = std::io::stdin();
             loop {
-                print!("> ");
+                print!("{}", rusting_strata::term::prompt());
                 std::io::stdout().flush()?;
                 let mut line = String::new();
                 if stdin.lock().read_line(&mut line)? == 0 { break; }
@@ -1485,8 +1516,15 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 };
                 let think_cap = Some((prompt.trim_end().ends_with("<think>"), engine.thinking_budget));
                 (smp.seen.clear(), smp.hist.clear());  // the penalties count this reply only, not the earlier turns
-                let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut smp, logits, room(&engine, ids.len(), n), think_cap, &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
-                println!();
+                // The reasoning is dim on a terminal; it starts in the prompt when the template opens the block itself.
+                let dim = term::out();
+                if dim && think_cap.is_some_and(|c| c.0) { print!("\x1b[2m"); }
+                let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut smp, logits, room(&engine, ids.len(), n), think_cap, &mut |t| {
+                    if dim { print!("{}", t.replace("<think>", "\x1b[2m<think>").replace("</think>", "</think>\x1b[0m")); } else { print!("{t}"); }
+                    std::io::stdout().flush()?;
+                    Ok(false)
+                })?;
+                println!("{}", if dim { "\x1b[0m" } else { "" });
                 msgs.push(Msg::new("assistant", &answer(&tok.decode(&out)?)));
             }
             r.finish()?;
@@ -1547,11 +1585,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 std::thread::sleep(Duration::from_millis(200));
                 if !stop.load(Relaxed) { continue; }
                 let n = oc.load(Relaxed);
-                if n == 0 { std::thread::sleep(Duration::from_millis(200)); if oc.load(Relaxed) == 0 { std::thread::sleep(Duration::from_secs(3)); eprintln!("stopped"); std::process::exit(0); } }
-                else { eprintln!("stopping: {n} requests to finish"); std::thread::sleep(Duration::from_secs(5)); }
+                if n == 0 { std::thread::sleep(Duration::from_millis(200)); if oc.load(Relaxed) == 0 { std::thread::sleep(Duration::from_secs(3)); say!("stopped"); std::process::exit(0); } }
+                else { say!("stopping: {n} requests to finish"); std::thread::sleep(Duration::from_secs(5)); }
             });
             std::thread::spawn(move || for (i, conn) in listener.incoming().enumerate() {
-                let mut c = match conn { Ok(c) => c, Err(e) => { eprintln!("request {i}: {e:#}"); continue } };
+                let mut c = match conn { Ok(c) => c, Err(e) => { say!("request {i}: {e:#}"); continue } };
                 if stop.load(Relaxed) {
                     let b = json!({"error": {"message": "server is stopping, retry later", "type": "overloaded_error"}}).to_string();
                     let _ = c.set_write_timeout(Some(Duration::from_secs(5)));
@@ -1562,7 +1600,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 // ponytail: one cap on connections read or queued (each may hold an 8 MB body), not one per key.
                 if open_conns.fetch_add(1, Relaxed) >= max_waiting {
                     open_conns.fetch_sub(1, Relaxed);
-                    eprintln!("request {i}: {max_waiting} requests already waiting, answered 503");
+                    say!("request {i}: {max_waiting} requests already waiting, answered 503");
                     let b = json!({"error": {"message": "server busy, retry later", "type": "overloaded_error"}}).to_string();
                     let _ = c.set_write_timeout(Some(Duration::from_secs(5)));
                     let _ = write!(c, "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
@@ -1574,11 +1612,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     keys_time = Some(t);
                     let mut kw = k.write().unwrap();
                     match std::fs::read_to_string(f).map_err(Into::into).and_then(|t| serve::Keys::parse(&t)) {
-                        Ok(u) if u.iter().any(|u| kw.admin.as_ref() == Some(&u.1)) => eprintln!("{}: the admin key is also a customer key, keeping the old keys", f.display()),
+                        Ok(u) if u.iter().any(|u| kw.admin.as_ref() == Some(&u.1)) => say!("{}: the admin key is also a customer key, keeping the old keys", f.display()),
                         // An empty file (or one caught mid-write) would leave the server open.
-                        Ok(u) if u.is_empty() && kw.admin.is_none() => eprintln!("{}: no keys, keeping the old keys", f.display()),
-                        Ok(u) => { eprintln!("{}: {} keys", f.display(), u.len()); kw.users = u; }
-                        Err(e) => eprintln!("{}: {e:#}, keeping the old keys", f.display()),
+                        Ok(u) if u.is_empty() && kw.admin.is_none() => say!("{}: no keys, keeping the old keys", f.display()),
+                        Ok(u) => { say!("{}: {} keys", f.display(), u.len()); kw.users = u; }
+                        Err(e) => say!("{}: {e:#}, keeping the old keys", f.display()),
                     }
                 }
                 let (tx, oc, st, a, k, allowed, held, hub) = (tx.clone(), open_conns.clone(), st.clone(), a.clone(), k.clone(), allowed.clone(), held.clone(), hub.clone());
@@ -1632,10 +1670,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         if route != "/api/mcp/call" { return reply(hub.list(r.method == "POST"), "200 OK"); }
                         let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap_or_default();
                         let (server, tool) = (v["server"].as_str().unwrap_or_default(), v["tool"].as_str().unwrap_or_default());
-                        eprintln!("request {i}: mcp {server} {tool}");
+                        say!("request {i}: mcp {server} {tool}");
                         return match hub.call(server, tool, if v["arguments"].is_object() { v["arguments"].clone() } else { json!({}) }) {
                             Ok(v) => reply(v, "200 OK"),
-                            Err(e) => { eprintln!("request {i}: mcp {server} {tool}: {e:#}"); reply(json!({"error": {"message": format!("{e:#}"), "type": "server_error"}}), "502 Bad Gateway") }
+                            Err(e) => { say!("request {i}: mcp {server} {tool}: {e:#}"); reply(json!({"error": {"message": format!("{e:#}"), "type": "server_error"}}), "502 Bad Gateway") }
                         };
                     }
                     // A malformed request, a wrong key, the page and the model list are answered here, not in the queue,
@@ -1645,7 +1683,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     let who = q.as_ref().ok().and_then(|r| k.read().unwrap().who(&r.auth));
                     match &q {
                         Err(e) => {
-                            eprintln!("request {i}: {e:#}");
+                            say!("request {i}: {e:#}");
                             return reply(json!({"error": {"message": format!("{e:#}"), "type": "invalid_request_error"}}), "400 Bad Request");
                         }
                         Ok(r) if r.method == "GET" && r.path == "/" && (k.read().unwrap().any() || serve::host_ok(&r.host, &a, &allowed)) => {
@@ -1674,7 +1712,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         (Some(w), Some(cap)) if !w.admin => match serve::Hold::take(&held, w.id, cap) {
                             Some(h) => Some(h),
                             None => {
-                                eprintln!("request {i}: {} already has {cap} requests open, answered 429", w.name);
+                                say!("request {i}: {} already has {cap} requests open, answered 429", w.name);
                                 let b = json!({"error": {"message": format!("this key already has {cap} requests open, retry later"), "type": "rate_limit_error"}}).to_string();
                                 let _ = write!(&c, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
                                 oc.fetch_sub(1, Relaxed);
@@ -1690,7 +1728,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 dl: Default::default(), stats, opts: Default::default(), idle: host.auto_unload.map(Duration::from_secs), asleep: Default::default(), parked: Default::default(), alias: host.alias };
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
-            eprintln!("listening on {url} (models folder: {})", s.dir.display());
+            say!("listening on {} (models folder: {})", term::hl(&url), s.dir.display());
             // Chats wait while a model loads; the page shows at once.
             if open { open_browser(&url); }
             loop {
@@ -1728,14 +1766,14 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     // `--auto-unload`: `serve_model` has freed the model. Its name stays in the model list, as a chat
                     // loads it again.
                     Ok(Next::Idle) => {
-                        eprintln!("unloaded {} after {} s without a chat request", p.display(), s.idle.map_or(0, |d| d.as_secs()));
+                        say!("unloaded {} after {} s without a chat request", p.display(), s.idle.map_or(0, |d| d.as_secs()));
                         s.sleep(p, engine.ctx);
                     }
                     Ok(_) => return Ok(()),
                     // The load after `--auto-unload` failed (another program may hold the VRAM now): the chat that
                     // asked for it gets the error and the next one tries again.
                     Err(e) if s.parked.lock().unwrap().is_some() => {
-                        eprintln!("loading {}: {e:#}", p.display());
+                        say!("loading {}: {e:#}", p.display());
                         let (mut c, ..) = s.parked.lock().unwrap().take().unwrap();
                         s.waiting.fetch_sub(1, Relaxed);
                         let b = json!({"error": {"message": format!("loading the model again: {e:#}"), "type": "server_error"}}).to_string();
@@ -1748,7 +1786,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         rusting_strata::CTX.store(old_ctx, Relaxed);
                         set_kv_env(&engine.kv);
                         s.stats.lock().unwrap().unload(None);
-                        eprintln!("loading {}: {e:#}", p.display());
+                        say!("loading {}: {e:#}", p.display());
                         let b = json!({"error": {"message": format!("{e:#}"), "type": "server_error"}}).to_string();
                         let _ = write!(w.unwrap(), "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
                     }
@@ -1950,7 +1988,7 @@ fn bench_inkling2(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, 
         results.push(BenchResult { pp: n, prefill, decode: decode_stat, bytes_per_token: 0, decode_median: 0.0 });
     }
     if m.drafts.0 > 0 {
-        eprintln!("speculative drafts accepted {}/{} ({:.1}%)", m.drafts.1, m.drafts.0, 100.0 * m.drafts.1 as f64 / m.drafts.0 as f64);
+        say!("speculative drafts accepted {}/{} ({:.1}%)", m.drafts.1, m.drafts.0, 100.0 * m.drafts.1 as f64 / m.drafts.0 as f64);
     }
     let expert = big_expert_stats(m.cfg.n_layer, m.cfg.n_expert);
     let backend = rusting_strata::deepseek::mat::dev_info().map_or("cpu", |i| i.0);
@@ -2043,10 +2081,10 @@ fn calibrate(model: &Path, aux: Option<&Path>, ctx: usize, margin: &[usize], kin
     let mut chunk = (0, 0.0);
     for c in [512, 1024, 2048, 4096].into_iter().filter(|&c| c <= ctx) {
         // A larger chunk's prefill scratch may not fit beside a long --ctx: keep the chunks measured so far.
-        let mut gm = match load(c, split.as_deref()) { Ok(gm) => gm, Err(e) if chunk.0 > 0 => { eprintln!("chunk {c:5}: {e:#}"); break } Err(e) => return Err(e) };
+        let mut gm = match load(c, split.as_deref()) { Ok(gm) => gm, Err(e) if chunk.0 > 0 => { say!("chunk {c:5}: {e:#}"); break } Err(e) => return Err(e) };
         let t = best(&mut || { gm.reset()?; gm.prefill(&pf).map(drop) })?;
         let tps = n_pf as f64 / t;
-        eprintln!("chunk {c:5}: prefill {n_pf} tok {tps:.0} tok/s");
+        say!("chunk {c:5}: prefill {n_pf} tok {tps:.0} tok/s");
         if tps > chunk.1 { chunk = (c, tps); }
     }
 
@@ -2072,7 +2110,7 @@ fn calibrate(model: &Path, aux: Option<&Path>, ctx: usize, margin: &[usize], kin
             Ok((layers, n_pf as f64 / tp, toks as f64 / td))
         };
         let (base, mut bp, mut bd) = measure(None)?;
-        eprintln!("split {base:?} (by free VRAM): prefill {bp:.0} tok/s, decode {bd:.1} tok/s");
+        say!("split {base:?} (by free VRAM): prefill {bp:.0} tok/s, decode {bd:.1} tok/s");
         // ponytail: a fixed step of 15% of the layers and three rounds; a finer search if a report shows the best
         // split lies between two steps.
         let step = (m.cfg.n_layer * 3 / 20).max(1);
@@ -2084,11 +2122,11 @@ fn calibrate(model: &Path, aux: Option<&Path>, ctx: usize, margin: &[usize], kin
                 seen.push(c.clone());
                 match measure(Some(&c.iter().map(|&x| x as f64).collect::<Vec<_>>())) {
                     Ok((_, p, d)) => {
-                        eprintln!("split {c:?}: prefill {p:.0} tok/s, decode {d:.1} tok/s, prefill x decode {:.3} of the best so far", p * d / (bp * bd));
+                        say!("split {c:?}: prefill {p:.0} tok/s, decode {d:.1} tok/s, prefill x decode {:.3} of the best so far", p * d / (bp * bd));
                         // Prefill and decode count the same; 3% over the best so far, above the run-to-run spread.
                         if p * d > 1.03 * bp * bd { (bp, bd, better) = (p, d, Some(c)); }
                     }
-                    Err(e) => eprintln!("split {c:?}: {e:#}"),
+                    Err(e) => say!("split {c:?}: {e:#}"),
                 }
             }
             match better { Some(c) => cur = c, None => break }
@@ -2107,7 +2145,7 @@ fn calibrate(model: &Path, aux: Option<&Path>, ctx: usize, margin: &[usize], kin
         let ts = best(&mut || { gm.reset()?; gm.prefill(p).map(drop) })?;
         gm.short = 0;
         let tb = best(&mut || { gm.reset()?; gm.prefill(p).map(drop) })?;
-        eprintln!("prompt {n:4}: steps {:.1} ms, batched {:.1} ms", ts * 1e3, tb * 1e3);
+        say!("prompt {n:4}: steps {:.1} ms, batched {:.1} ms", ts * 1e3, tb * 1e3);
         if tb < ts && short == usize::MAX { short = n; }
     }
     if short == usize::MAX { short = 256; }
@@ -2127,7 +2165,7 @@ fn calibrate(model: &Path, aux: Option<&Path>, ctx: usize, margin: &[usize], kin
         })?;
         // `best` times prefill too; it is the same for every k, so the ranking holds.
         let tps = toks as f64 / t;
-        eprintln!("mtp {k}: decode {toks} tok {tps:.1} tok/s");
+        say!("mtp {k}: decode {toks} tok {tps:.1} tok/s");
         if tps > mtp.1 { mtp = (k, tps); }
     }
 
@@ -2248,13 +2286,75 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
     Ok((out, stopped))
 }
 
+/// The answers `interface` asks for, as the arguments of the command to run: the model (a number from `models`, or
+/// the last row and then a path to a file or to a folder to list), the mode, GPU or CPU, the context length and, for a server, the
+/// address. An empty answer takes the default in brackets.
+fn interface_args(input: &mut impl BufRead, mut models: Vec<(String, PathBuf, u64)>) -> anyhow::Result<Vec<String>> {
+    let on = term::out();
+    let mut ask = |q: &str, default: &str| -> anyhow::Result<String> {
+        if default.is_empty() { print!("{q}: "); } else { print!("{q} {}: ", term::paint(on, "2", &format!("[{default}]"))); }
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        anyhow::ensure!(input.read_line(&mut line)? > 0, "no answer (end of input)");
+        Ok(match line.trim() { "" => default.to_string(), a => a.to_string() })
+    };
+    let head = |s: &str| println!("\n{}", term::paint(on, "1", s));
+    let row = |k: usize, name: &str, note: &str| println!("  {}  {name}{}", term::paint(on, "36", &format!("{k:2}")), if note.is_empty() { String::new() } else { format!("  {}", term::paint(on, "2", note)) });
+
+    let model = loop {
+        head("Model");
+        let w = models.iter().map(|m| m.0.len()).max().unwrap_or(0);
+        for (k, (name, _, bytes)) in models.iter().enumerate() { row(k + 1, &format!("{name:w$}"), &format!("{:5.1} GB", *bytes as f64 / 1e9)); }
+        // The last row asks for a path; a path typed in place of a number is taken as well.
+        let other = models.len() + 1;
+        if !models.is_empty() { row(other, "another folder or .gguf file", ""); }
+        let mut a = if models.is_empty() { String::new() } else { ask("number", "1")? };
+        if let Ok(k) = a.parse::<usize>() {
+            if k != other {
+                match models.get(k.wrapping_sub(1)) { Some(m) => break m.1.clone(), None => println!("no model {k}") }
+                continue;
+            }
+            a.clear();
+        }
+        if a.is_empty() { a = ask("path to a folder of .gguf files or to one file", "")?; }
+        if a.is_empty() { continue; }
+        // A path dragged into a Windows console arrives in quotes; a typed `~/` is not expanded by a shell here.
+        let a = a.trim_matches(['"', '\'']);
+        let p = match (a.strip_prefix("~/"), std::env::var_os("HOME")) { (Some(rest), Some(h)) => PathBuf::from(h).join(rest), _ => PathBuf::from(a) };
+        if p.is_file() { break p; }
+        if !p.is_dir() { println!("{a}: not a file or a folder"); continue; }
+        models = serve::list_models(&p);
+        if models.is_empty() { println!("{a}: no .gguf files"); }
+    };
+
+    head("Mode");
+    for (k, m) in ["chat in this terminal", "chat page in the browser", "API server (OpenAI-compatible)", "speed test"].iter().enumerate() { row(k + 1, m, ""); }
+    let mode = loop { match ask("number", "1")?.parse::<usize>() { Ok(k @ 1..=4) => break k, _ => println!("a number from 1 to 4") } };
+
+    head("Settings");
+    let gpu = !ask("run on the GPU (y/n)", "y")?.to_lowercase().starts_with('n');
+    let ctx = loop {
+        let a = ask("context length in tokens", "default")?;
+        if a == "default" || a.parse::<usize>().is_ok_and(|n| n > 0) { break a; }
+        println!("a number of tokens, such as 8192");
+    };
+    let addr = if matches!(mode, 2 | 3) { ask("address", "127.0.0.1:8080")? } else { String::new() };
+
+    let mut args: Vec<String> = vec![["chat", "serve", "serve", "bench"][mode - 1].into(), "--model".into(), model.to_string_lossy().into()];
+    if gpu { args.push("--gpu".into()); }
+    if ctx != "default" { args.extend(["--ctx".into(), ctx]); }
+    if !addr.is_empty() { args.extend(["--addr".into(), addr]); }
+    if mode == 2 { args.push("--open".into()); }
+    Ok(args)
+}
+
 /// Tokens left for a reply: `n`, capped by the context after a `used`-token prompt.
 fn room(e: &Engine, used: usize, n: usize) -> usize { n.min(e.ctx.saturating_sub(used)) }
 
 /// The chat format from the GGUF's `tokenizer.chat_template`.
 fn template(g: &Gguf) -> Template {
     let t = Template::detect(g.meta.get("tokenizer.chat_template").and_then(|v| v.as_str()));
-    eprintln!("chat template: {t:?}");
+    say!("chat template: {t:?}");
     t
 }
 
@@ -2342,7 +2442,7 @@ impl Serving {
             let parked = self.parked.lock().unwrap().take();
             let (c, q, i, hold) = match parked.map_or_else(|| rx.recv_timeout(Duration::from_millis(200)), Ok) {
                 Ok(x) => x,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if self.stopped() => { eprintln!("stopped"); return Next::Stop }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if self.stopped() => { say!("stopped"); return Next::Stop }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) if l.is_some() && self.idle.is_some_and(|d| last.elapsed() >= d) => return Next::Idle,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Next::Stop,
@@ -2356,7 +2456,7 @@ impl Serving {
             let res = handle(c, q, l.as_deref_mut(), e, self, i, &mut next);
             self.waiting.fetch_sub(1, Relaxed);
             if chat { last = Instant::now(); }
-            if let Err(e) = res { eprintln!("request {i}: {e:#}"); serve::exit_if_gpu_dead(&e); }
+            if let Err(e) = res { say!("request {i}: {e:#}"); serve::exit_if_gpu_dead(&e); }
             if let Some((p, w)) = next { return Next::Load(p, w); }
         }
     }
@@ -2562,7 +2662,7 @@ impl Serving {
                                     .unwrap_or_else(|_| Err(anyhow::anyhow!("panicked")));
                                 drop((l, hold));
                                 self.waiting.fetch_sub(1, Relaxed);
-                                if let Err(e) = res { eprintln!("request {i}: {e:#}"); serve::exit_if_gpu_dead(&e); }
+                                if let Err(e) = res { say!("request {i}: {e:#}"); serve::exit_if_gpu_dead(&e); }
                                 if nx.is_some() { *next.lock().unwrap() = nx; }
                                 if chat { *last.lock().unwrap() = Instant::now(); }
                                 live.fetch_sub(1, Relaxed);
@@ -2572,7 +2672,7 @@ impl Serving {
                         Err(TryRecvError::Disconnected) => open = false,
                     }
                 }
-                if open && self.stopped() { eprintln!("stopped"); open = false; }
+                if open && self.stopped() { say!("stopped"); open = false; }
                 if (!open || next.lock().unwrap().is_some()) && live.load(Relaxed) == 0 { break; }
                 // A request that comes now stays in the queue and loads the model again.
                 if live.load(Relaxed) == 0 && self.idle.is_some_and(|d| last.lock().unwrap().elapsed() >= d) { idle = true; break; }
@@ -2698,10 +2798,10 @@ fn open_mtp_gguf(path: Option<&Path>) -> anyhow::Result<Option<Gguf>> {
         && cfg.exists()
     {
         if is_dflash {
-            eprintln!("note: native Rust DFlash conversion {} -> {}", st.display(), gguf.display());
+            say!("note: native Rust DFlash conversion {} -> {}", st.display(), gguf.display());
             rusting_strata::gguf::convert_safetensors_dflash_to_gguf(&st, &cfg, &gguf, 40)?;
         } else {
-            eprintln!("note: native Rust EAGLE3 conversion {} -> {}", st.display(), gguf.display());
+            say!("note: native Rust EAGLE3 conversion {} -> {}", st.display(), gguf.display());
             rusting_strata::gguf::convert_safetensors_eagle3_to_gguf(&st, &cfg, &gguf, 48)?;
         }
     }
@@ -2716,7 +2816,7 @@ fn open_mtp_gguf(path: Option<&Path>) -> anyhow::Result<Option<Gguf>> {
 /// Loads `model`, answers `w` (the /api/load request that asked for it) and serves until another model is asked
 /// for or `--auto-unload` ends it. The model and its GPU memory are freed on return.
 fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<TcpStream>) -> anyhow::Result<Next> {
-    eprintln!("loading {}", model.display());
+    say!("loading {}", model.display());
     let name = s.name(model);
     {
         let mut st = s.stats.lock().unwrap();
@@ -2761,7 +2861,7 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
         gpu_stats(&r, &mut st);
     }
     let mut l = Loaded { r, tok: &tok, tpl: if _own.is_some() { Template::Xml } else { template(&g) }, name: name.clone(), path: model.to_path_buf() };
-    eprintln!("loaded {}", l.name);
+    say!("loaded {}", l.name);
     if let Some(mut w) = w.take() {
         let b = json!({"loaded": l.name}).to_string();
         let _ = write!(w, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
@@ -2769,7 +2869,7 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
     let next = s.serve(Some(&mut l), &engine);
     s.stats.lock().unwrap().unload(None);
     // A failed profile save must not stop the server between two models.
-    if let Err(e) = l.r.finish() { eprintln!("{e:#}"); }
+    if let Err(e) = l.r.finish() { say!("{e:#}"); }
     Ok(next)
 }
 
@@ -2822,7 +2922,7 @@ fn open_browser(url: &str) {
     let r = std::process::Command::new("open").arg(url).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
     let r = std::process::Command::new("xdg-open").arg(url).spawn();
-    if let Err(e) = r { eprintln!("could not open a browser ({e}); open {url}"); }
+    if let Err(e) = r { say!("could not open a browser ({e}); open {url}"); }
 }
 
 /// One Messages API stream event.
@@ -2943,7 +3043,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let (dl, dir) = (s.dl.clone(), s.dir.clone());
             std::thread::spawn(move || {
                 let r = hf::download(&repo, &file, &dir, &dl);
-                if let Err(e) = &r { eprintln!("download {repo} {file}: {e:#}"); } else { eprintln!("downloaded {repo} {file}"); }
+                if let Err(e) = &r { say!("download {repo} {file}: {e:#}"); } else { say!("downloaded {repo} {file}"); }
                 let mut g = dl.lock().unwrap();
                 (g.running, g.error) = (false, r.err().map(|e| format!("{e:#}")));
             });
@@ -2988,20 +3088,20 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 let new_prompt = last.prompt_tokens.saturating_sub(last.cached_tokens);
                 let decode_tps = if decode_s > 0.0 { last.completion_tokens as f64 / decode_s } else { 0.0 };
                 let prefill_tps = if prefill_s > 0.0 { new_prompt as f64 / prefill_s } else { 0.0 };
-                eprintln!("done: key={key_name} model={} prompt={} tok ({} cached) -> {} tok in {decode_s:.2} s, \
+                say!("done: key={key_name} model={} prompt={} tok ({} cached) -> {} tok in {decode_s:.2} s, \
                     decode {decode_tps:.1} tok/s, prefill {prefill_tps:.1} tok/s, finish={}",
                     last.model, last.prompt_tokens, last.cached_tokens, last.completion_tokens, last.finish);
                 if let Some(f) = &s.usage {
                     let mut v = json!(last);
                     v["key"] = who.name.clone().into();
                     // A failed write must not fail the reply; it is reported.
-                    if let Err(err) = writeln!(f.lock().unwrap(), "{v}") { eprintln!("usage log: {err}"); }
+                    if let Err(err) = writeln!(f.lock().unwrap(), "{v}") { say!("usage log: {err}"); }
                 }
             };
             // A model outside the main engine answers the request itself (greedy; it fails before it writes).
             if let Runner::Own(chat) = r {
                 if s.max_tokens < usize::MAX { req.max_tokens = Some(req.max_tokens.unwrap_or(s.max_tokens).min(s.max_tokens)); }
-                eprintln!("request: {method} {p} key={key_name} model={name} messages={} stream={} tools={}", req.messages.len(), req.stream, req.tools.len());
+                say!("request: {method} {p} key={key_name} model={name} messages={} stream={} tools={}", req.messages.len(), req.stream, req.tools.len());
                 s.stats.lock().unwrap().busy += 1;
                 let t = Instant::now();
                 let res = chat(&mut w, &req);
@@ -3018,7 +3118,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                         Ok(())
                     }
                     Err(err) => {
-                        eprintln!("request: {err:#}");
+                        say!("request: {err:#}");
                         send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}}))
                     }
                 };
@@ -3044,7 +3144,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             };
             let ids = match &vision_prompt { Some(p) => p.ids.clone(), None => tok.encode(&prompt)? };
             // One line per chat request, and one when it finishes (see `log` above).
-            eprintln!("request: {method} {p} key={key_name} model={name} prompt={} tok stream={} tools={}",
+            say!("request: {method} {p} key={key_name} model={name} prompt={} tok stream={} tools={}",
                 ids.len(), req.stream, req.tools.len());
             let mut smp = e.sampler();
             smp.temp = req.temperature.unwrap_or(smp.temp);
@@ -3059,7 +3159,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             smp.dry_allowed = req.dry_allowed_length.unwrap_or(smp.dry_allowed);
             if smp.dry_mult > 0.0 { smp.dry_breakers = dry_breakers(tok, name); }
             smp.tool_tags = tok.token_id("<tool_call>").zip(tok.token_id("</tool_call>")).map(|(a, b)| (a as usize, b as usize));
-            eprintln!("sampling: temp={} top_k={} top_p={} presence={} frequency={} repeat={}/{} dry={}/{}/{}", smp.temp, smp.top_k, smp.top_p,
+            say!("sampling: temp={} top_k={} top_p={} presence={} frequency={} repeat={}/{} dry={}/{}/{}", smp.temp, smp.top_k, smp.top_p,
                 smp.presence, smp.frequency, smp.repeat, smp.last_n, smp.dry_mult, smp.dry_base, smp.dry_allowed);
             if req.seed.is_some() { smp.rng = seed(req.seed); }
             let n = room(e, ids.len(), req.max_tokens.unwrap_or(usize::MAX).min(s.max_tokens));
@@ -3228,6 +3328,22 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             }
         }
         _ => send(&mut w, "404 Not Found", json!({"error": {"message": format!("no route {method} {path}"), "type": "not_found"}})),
+    }
+}
+
+#[cfg(test)]
+mod interface_tests {
+    #[test]
+    fn answers_become_the_arguments_of_the_command() {
+        let models = vec![("a.gguf".to_string(), "/m/a.gguf".into(), 1), ("b.gguf".to_string(), "/m/b.gguf".into(), 2)];
+        // Model 9 does not exist, row 3 asks for a path and /no/such is not one, and mode 7 does not exist: each is
+        // asked again. Then model 2, API server, GPU, 8192, default address.
+        let args = super::interface_args(&mut &b"9\n3\n/no/such\n2\n7\n3\n\nmany\n8192\n\n"[..], models.clone()).unwrap();
+        assert_eq!(args, ["serve", "--model", "/m/b.gguf", "--gpu", "--ctx", "8192", "--addr", "127.0.0.1:8080"]);
+        // Every default, on the CPU: chat with the first model.
+        let args = super::interface_args(&mut &b"\n\nn\n\n"[..], models.clone()).unwrap();
+        assert_eq!(args, ["chat", "--model", "/m/a.gguf"]);
+        assert!(super::interface_args(&mut &b"1\n"[..], models).is_err(), "the input ended before the last answer");
     }
 }
 

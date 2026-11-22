@@ -406,7 +406,7 @@ fn ptx(src: &str, arch: &'static str, cc: (i32, i32)) -> anyhow::Result<Ptx> {
     // "CUDA init" lets `backend::open` fall back to Vulkan.
     if !nvrtc::present() { return Err(nvrtc::missing()).context("CUDA init"); }
     prune_ptx(&dir, std::time::Duration::from_secs(7 * 86400));
-    eprintln!("compiling CUDA kernels for {arch} with NVRTC {tag} (first run only, ~15 s)");
+    crate::say!("compiling CUDA kernels for {arch} with NVRTC {tag} (first run only, ~15 s)");
     let b = nvrtc::cubin(src, arch)?;
     let _ = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &b));
     Ok(Ptx::from_binary(b))
@@ -480,7 +480,7 @@ impl Gpu {
             .unwrap_or(48 << 10).max(48 << 10) as u32;
         let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
         let gemm_fma = gemm_fma();
-        eprintln!("{}", device_log(device, &ctx.name().unwrap_or_default(), arch, (maj, min), gemm_fma));
+        crate::say!("{}", device_log(device, &ctx.name().unwrap_or_default(), arch, (maj, min), gemm_fma));
         let stream = ctx.new_stream()?;
         let module = ctx.load_module(ptx(&source(kv_mode, !gemm_fma && (maj, min) < (7, 5)), arch, (maj, min))?).context("load cubin")?;
         let i8_gemm = int8_gemm_arch((maj, min));
@@ -518,7 +518,7 @@ impl Gpu {
             }
             fns.insert(n, f);
         }
-        for (family, (stat, set, co)) in &smem { eprintln!("{}", smem_log(family, optin, *stat, *set, *co)); }
+        for (family, (stat, set, co)) in &smem { crate::say!("{}", smem_log(family, optin, *stat, *set, *co)); }
         let q8 = std::sync::Mutex::new((stream.alloc_zeros::<u8>(1)?, None));
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
@@ -1350,7 +1350,7 @@ mod tests {
     #[test]
     fn nvrtc_version_is_detected() {
         if !super::nvrtc::present() {
-            eprintln!("skipping: NVRTC library not present");
+            crate::say!("skipping: NVRTC library not present");
             return;
         }
         assert!(super::nvrtc::version().is_some_and(|v| v.0 >= 12), "{:?}", super::nvrtc::version());
@@ -1370,13 +1370,13 @@ mod tests {
     #[test]
     fn nvrtc_compiles_full_source_for_sm70() {
         if !super::nvrtc::present() {
-            eprintln!("skipping: NVRTC library not present");
+            crate::say!("skipping: NVRTC library not present");
             return;
         }
         match super::nvrtc::version() {
             Some((12, _)) => {}
             v => {
-                eprintln!("skipping: NVRTC {v:?} is not 12.x; CUDA 13.x cannot target sm_70 and its diagnostics differ");
+                crate::say!("skipping: NVRTC {v:?} is not 12.x; CUDA 13.x cannot target sm_70 and its diagnostics differ");
                 return;
             }
         }

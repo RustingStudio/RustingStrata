@@ -265,7 +265,7 @@ pub fn copy_err(err: &anyhow::Error) -> anyhow::Error {
 /// every later request failing on a server that looks healthy.
 pub fn exit_if_gpu_dead(err: &anyhow::Error) {
     if gpu_dead(err) {
-        eprintln!("the GPU device is lost and this process cannot use it again: exiting with status 1 (restart the server)");
+        crate::say!("the GPU device is lost and this process cannot use it again: exiting with status 1 (restart the server)");
         std::process::exit(1);
     }
 }

@@ -629,8 +629,8 @@ impl<'a> GpuModel<'a> {
         let share = split.map_or_else(|| free.clone(), <[f64]>::to_vec);
         let total: f64 = share.iter().sum();
         // ponytail: EAGLE3/DFlash read features across multiple layers into one device's buffers; no drafts when split.
-        let k = if gpus.len() > 1 && m.cfg.eagle3.is_some() { eprintln!("EAGLE3 draft head: not available with a multi-GPU layer split, decoding without drafts"); 0 }
-            else if gpus.len() > 1 && m.cfg.dflash.is_some() { eprintln!("DFlash draft model: not available with a multi-GPU layer split, decoding without drafts"); 0 }
+        let k = if gpus.len() > 1 && m.cfg.eagle3.is_some() { crate::say!("EAGLE3 draft head: not available with a multi-GPU layer split, decoding without drafts"); 0 }
+            else if gpus.len() > 1 && m.cfg.dflash.is_some() { crate::say!("DFlash draft model: not available with a multi-GPU layer split, decoding without drafts"); 0 }
             else { k };
         let ends = split_ends(&share, n);
         // The PLE layers share one history ring, which lives on one device.
@@ -640,7 +640,7 @@ impl<'a> GpuModel<'a> {
             let r = ends[i]..ends[i + 1];
             ensure!(!r.is_empty(), "device {i} gets no layers ({:.0}% of {n}, free VRAM {:.0} MB; see --split)", 100.0 * share[i] / total, free[i] / 1048576.0);
             ensure!(ple.iter().all(|il| r.contains(il)) || !ple.iter().any(|il| r.contains(il)), "the PLE layers would be split across devices");
-            eprintln!("device {i} ({}): layers {}..{}, host-to-VRAM copy {:.0} MB/s", gpu.name(), r.start, r.end, rates[i]);
+            crate::say!("device {i} ({}): layers {}..{}, host-to-VRAM copy {:.0} MB/s", gpu.name(), r.start, r.end, rates[i]);
             parts.push(Self::load_part(m, gpu, ctx, chunk, vram_margin[i], k, r, ns)?);
         }
         // One draft length for every part: each caps it by its own backend's verify rows.
@@ -844,7 +844,7 @@ impl<'a> GpuModel<'a> {
                 let conv_dyn_len = if dc.conv_kernel_size > 0 && dc.conv_group_size > 0 {
                     TMAX * 2 * dc.conv_kernel_size * (dc.n_embd / dc.conv_group_size)
                 } else { 1 };
-                eprintln!(
+                crate::say!(
                     "DFlash{} block-diffusion drafter loaded: {} layers (SWA={swa_cnt}, full={}), block_size={}, k={k}, w={}, target_layers={:?}",
                     if selector.is_some() { "2" } else { "" },
                     dc.n_layer,
@@ -1089,7 +1089,7 @@ impl<'a> GpuModel<'a> {
                 .and_then(|v| v.parse::<usize>().ok())
             {
                 Some(mb) => {
-                    eprintln!("note: STRATA_EXPERT_MB={mb} override active (reported free device heap: {} MB)", free1 >> 20);
+                    crate::say!("note: STRATA_EXPERT_MB={mb} override active (reported free device heap: {} MB)", free1 >> 20);
                     mb << 20
                 }
                 None => free1.saturating_sub(vram_margin),
@@ -1102,12 +1102,12 @@ impl<'a> GpuModel<'a> {
         // where the small L2 cache causes prefetching to evict active lines and hurt decode throughput.
         let want_prefetch = std::env::var("STRATA_MOE_PREFETCH").is_ok_and(|v| v != "0");
         if c.is_moe() && want_prefetch && !gpu.moe_prefetch_supported() {
-            eprintln!("note: STRATA_MOE_PREFETCH ignored on {} (gfx11xx/iGPU L2 cache too small for MoE expert prefetch)", gpu.device());
+            crate::say!("note: STRATA_MOE_PREFETCH ignored on {} (gfx11xx/iGPU L2 cache too small for MoE expert prefetch)", gpu.device());
         }
         let prefetch = c.is_moe() && gpu.moe_prefetch_supported() && want_prefetch;
         let pids = if prefetch { Some(gpu.zeros::<i32>((c.n_layer + 1) * c.n_expert_used)?) } else { None };
         let mb = |b: usize| b as f64 / 1048576.0;
-        eprintln!(
+        crate::say!(
             "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {ctx} tokens{}, prefill {:.0} MB), expert slots {:.0} MB, resident experts {}/{}",
             mb(free0.saturating_sub(free1)), mb(2 * 2 * gpu.kv_words(ctx * kv) * c.layers[range.clone()].iter().filter(|&&k| k == LayerKind::Attn).count()),
             if ns > 1 { format!(" in each of {ns} slots") } else { String::new() }, mb(pf.as_ref().map_or(0, |p| p.bytes())),
@@ -1119,7 +1119,7 @@ impl<'a> GpuModel<'a> {
         if let Some(ca) = &cache {
             let k = c.n_expert_used;
             let per = (0..ca.layers_len()).map(|il| ca.active_set_bytes(il, k)).max().unwrap_or(0);
-            eprintln!("expert traffic: {:.1} MB per layer active set (top-{k}), {:.1} MB per token over {} MoE layers{}",
+            crate::say!("expert traffic: {:.1} MB per layer active set (top-{k}), {:.1} MB per token over {} MoE layers{}",
                 mb(per), mb(ca.token_bytes(k)), ca.total_experts() / c.n_expert.max(1),
                 if prefetch { ", next-layer L2 prefetch on (STRATA_MOE_PREFETCH)" } else { "" });
         }
@@ -1429,7 +1429,7 @@ impl<'a> GpuModel<'a> {
         self.after_forward(1)?;
         if let (Some(t0), Some(t1), Some(t2), Some(t3)) = (t0, t1, t2, t3) {
             let t4 = std::time::Instant::now();
-            eprintln!("step_prof pos={}: embed_htod={:.1}us pass_submit={:.1}us gpu_wait_dtoh={:.1}us after_experts={:.1}us total={:.1}us",
+            crate::say!("step_prof pos={}: embed_htod={:.1}us pass_submit={:.1}us gpu_wait_dtoh={:.1}us after_experts={:.1}us total={:.1}us",
                 self.pos, (t1 - t0).as_secs_f64() * 1e6, (t2 - t1).as_secs_f64() * 1e6, (t3 - t2).as_secs_f64() * 1e6, (t4 - t3).as_secs_f64() * 1e6, (t4 - t0).as_secs_f64() * 1e6);
         }
         Ok(logits)
@@ -1480,7 +1480,7 @@ impl<'a> GpuModel<'a> {
         self.after_forward(nt)?;
         if let (Some(t0), Some(t1), Some(t2), Some(t3)) = (t0, t1, t2, t3) {
             let t4 = std::time::Instant::now();
-            eprintln!("greedy_prof pos={}: embed_htod={:.1}us pass_submit={:.1}us gpu_wait_dtoh={:.1}us after_experts={:.1}us total={:.1}us",
+            crate::say!("greedy_prof pos={}: embed_htod={:.1}us pass_submit={:.1}us gpu_wait_dtoh={:.1}us after_experts={:.1}us total={:.1}us",
                 self.pos, (t1 - t0).as_secs_f64() * 1e6, (t2 - t1).as_secs_f64() * 1e6, (t3 - t2).as_secs_f64() * 1e6, (t4 - t3).as_secs_f64() * 1e6, (t4 - t0).as_secs_f64() * 1e6);
         }
         Ok((n, am[n]))
@@ -1598,7 +1598,7 @@ impl<'a> GpuModel<'a> {
             self.insert_parked(pk);
             if self.prompt_cache_path.is_some() {
                 if let Err(e) = self.save_prompt_cache() {
-                    eprintln!("warning: could not save prompt cache: {e:#}");
+                    crate::say!("warning: could not save prompt cache: {e:#}");
                 }
             }
         }
@@ -1759,7 +1759,7 @@ impl<'a> GpuModel<'a> {
             self.insert_parked(pk);
         }
         if !self.parked.is_empty() {
-            eprintln!(
+            crate::say!(
                 "warm start: loaded {} cached prefix state(s) ({total_toks} tokens, {:.1} MB) from {}",
                 self.parked.len(),
                 total_bytes as f64 / 1048576.0,

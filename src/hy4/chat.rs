@@ -132,10 +132,10 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
     let max_ctx = m.cfg.n_ctx;
     let ids = tok.encode(prompt)?;
     anyhow::ensure!(!ids.is_empty() && ids.len() < max_ctx, "prompt is {} tokens, the limit is {max_ctx}", ids.len());
-    if std::env::var_os("STRATA_DS_TRACE").is_some() { eprintln!("prompt tokens: {ids:?}"); }
+    if std::env::var_os("STRATA_DS_TRACE").is_some() { crate::say!("prompt tokens: {ids:?}"); }
     let logits = m.prefill(&ids);
     let (out, _) = decode(&mut m, &tok, logits, n.min(max_ctx - ids.len()), show);
-    if std::env::var_os("STRATA_DS_TRACE").is_some() { eprintln!("\noutput tokens: {out:?}"); }
+    if std::env::var_os("STRATA_DS_TRACE").is_some() { crate::say!("\noutput tokens: {out:?}"); }
     println!();
     Ok(())
 }
@@ -147,7 +147,7 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
     let max_ctx = m.cfg.n_ctx;
     let stdin = std::io::stdin();
     loop {
-        print!("> ");
+        print!("{}", crate::term::prompt());
         std::io::stdout().flush()?;
         let mut line = String::new();
         if stdin.lock().read_line(&mut line)? == 0 { break; }

@@ -1,4 +1,5 @@
 pub mod memory;
+pub mod term;
 
 /// `--ctx` when it was given on the command line, else 0. The models outside the main engine (Inkling 2, Hy4, GLM,
 /// DeepSeek, Gemma 4) read it through [`ctx_limit`].

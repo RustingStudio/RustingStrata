@@ -130,7 +130,7 @@ pub fn generate_image(
     gpu_defaults();
     let tok = crate::tokenizer::Tokenizer::from_gguf(g)?;
     let seq = prompt_seq(&tok, prompt, Some((grids, embeddings)))?;
-    if std::env::var_os("STRATA_G4_TRACE").is_some() { eprintln!("prompt ids {} tokens", seq.len()); }
+    if std::env::var_os("STRATA_G4_TRACE").is_some() { crate::say!("prompt ids {} tokens", seq.len()); }
     let mut m = forward::Gemma4Model::new(g)?;
     let logits = feed(&mut m, &seq)?;
     decode(&tok, &mut m, logits, n)
@@ -224,7 +224,7 @@ pub fn chat(
     let mut msgs: Vec<(String, String)> = system.into_iter().map(|s| ("system".to_string(), s)).collect();
     let mut first_user = true;
     loop {
-        print!("> ");
+        print!("{}", crate::term::prompt());
         std::io::stdout().flush()?;
         let mut line = String::new();
         if std::io::stdin().lock().read_line(&mut line)? == 0 { break; }
@@ -241,7 +241,7 @@ pub fn chat(
         let seq = prompt_seq(&tok, &chat_prompt(&view, think), images)?;
         let ids: Vec<u32> = seq.iter().map(|(id, _)| *id).collect();
         if ids.len() >= ctx {
-            eprintln!("context full ({} tokens)", ids.len());
+            crate::say!("context full ({} tokens)", ids.len());
             break;
         }
         let mut keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
@@ -358,7 +358,7 @@ fn decode(tok: &crate::tokenizer::Tokenizer, m: &mut forward::Gemma4Model, mut l
             let mut idx: Vec<usize> = (0..logits.len()).collect();
             idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
             let t: Vec<String> = idx[..5].iter().map(|&k| format!("{k}:{:.4}", logits[k] as f64 - lz)).collect();
-            eprintln!("TOP5 {i} {}", t.join(" "));
+            crate::say!("TOP5 {i} {}", t.join(" "));
         }
         if let Some(&f) = forced.get(i) { next = f; }
         if eos.contains(&next) { break; }
@@ -374,8 +374,8 @@ fn decode(tok: &crate::tokenizer::Tokenizer, m: &mut forward::Gemma4Model, mut l
     println!();
     if std::env::var_os("STRATA_G4_PROF").is_some() {
         let p: Vec<f64> = forward::PROF.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6).collect();
-        eprintln!("PROF decode {:.1} ms/token over {n} tokens", t_dec.elapsed().as_secs_f64() * 1e3 / n as f64);
-        eprintln!("PROF ms attn={:.0} ffn(total)={:.0} head={:.0} prefetch={:.0} gpu_exp={:.0} cpu_exp={:.0}", p[0], p[1], p[2], p[3], p[4], p[5]);
+        crate::say!("PROF decode {:.1} ms/token over {n} tokens", t_dec.elapsed().as_secs_f64() * 1e3 / n as f64);
+        crate::say!("PROF ms attn={:.0} ffn(total)={:.0} head={:.0} prefetch={:.0} gpu_exp={:.0} cpu_exp={:.0}", p[0], p[1], p[2], p[3], p[4], p[5]);
     }
     Ok(())
 }

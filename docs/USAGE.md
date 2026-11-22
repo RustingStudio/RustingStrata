@@ -3,6 +3,19 @@
 Everything here applies to `rustingstrata chat`, `generate`, `bench` and `serve` unless noted. See the
 [README](../README.md) for install and a quick start, and [HOSTING.md](HOSTING.md) for running a server for other people.
 
+## Terminal
+
+`rustingstrata interface` is a short set of questions in the terminal: the model (a numbered list of the models
+folder and of the Hugging Face and llama.cpp caches; its last row takes a path to one file, or to a folder whose
+models it then lists), the mode (chat in the terminal,
+chat page in the browser, API server, speed test), GPU or CPU, the context length and, for a server, the address.
+Enter takes the default in brackets. It prints the command the answers make and runs it, so the command can be
+copied for the next time. `--models-dir DIR` lists another folder.
+
+On a terminal the engine's notes on stderr are dim, `warning` and `error` are coloured, and the terminal chats show
+the prompt in colour and the reasoning dim. Output that goes to a pipe or a file has no escape codes; `NO_COLOR=1`
+turns them off on a terminal too. A failed command prints one `error: ...` line and exits with status 1.
+
 ## Chat page
 
 `rustingstrata` with no arguments starts the server on http://127.0.0.1:8080 and opens a chat page. The page keeps chats in

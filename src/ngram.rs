@@ -948,7 +948,7 @@ impl NgramDrafter {
         let pruned = ngram_cache_filter_vocab(&mut nc_static, cfg.n_vocab)
             + ngram_cache_filter_vocab(&mut nc_dynamic, cfg.n_vocab);
         if pruned > 0 {
-            eprintln!(
+            crate::say!(
                 "note: pruned {pruned} out-of-vocabulary entries (n_vocab={}) from ngram lookup cache",
                 cfg.n_vocab
             );

@@ -113,7 +113,7 @@ impl<'a> Model<'a> {
         // A DFlash draft given on the command line replaces the target's own MTP head; without this the draft was
         // ignored without a word for a target GGUF that carries one.
         if cfg.n_nextn > 0 && aux.is_some_and(|ag| ag.tensors.contains_key("dflash.fc.weight")) {
-            eprintln!("note: DFlash draft model given: the target's own MTP head is not used");
+            crate::say!("note: DFlash draft model given: the target's own MTP head is not used");
             cfg.n_nextn = 0;
         }
         let is_standalone_draft = aux.is_some_and(|ag| {
@@ -134,7 +134,7 @@ impl<'a> Model<'a> {
                 dm.cfg.n_vocab,
                 cfg.n_vocab
             );
-            eprintln!(
+            crate::say!(
                 "note: loaded standalone external draft model (arch={}, layers={}, embd={}, vocab={})",
                 dm.cfg.arch, dm.cfg.n_layer, dm.cfg.n_embd, dm.cfg.n_vocab
             );
@@ -186,7 +186,7 @@ impl<'a> Model<'a> {
                     extract_layers, n_ff, n_head, n_head_kv, head_dim, n_rot, rope_base, eps,
                     draft_vocab, norm_before_residual, rope_neox, d2t,
                 });
-                eprintln!(
+                crate::say!(
                     "note: loaded standalone EAGLE3 draft head (extract_layers={extract_layers:?}, heads={n_head}x{head_dim}, kv={n_head_kv}, ff={n_ff}, draft_vocab={draft_vocab})"
                 );
             } else if aux.is_some_and(|ag| ag.tensors.contains_key("dflash.fc.weight")) {
@@ -241,17 +241,17 @@ impl<'a> Model<'a> {
                     selector_rank,
                     selector_top_k,
                 });
-                eprintln!(
+                crate::say!(
                     "note: loaded standalone DFlash{} draft model (layers={n_layer}, block={block_size}, mask={mask_token_id}, target_layers={target_layer_ids:?}, heads={n_head}x{head_dim}, kv={n_head_kv}, ff={n_ff})",
                     if selector_rank > 0 { "2" } else { "" }
                 );
             } else if aux.is_some_and(|ag| ag.tensors.contains_key(&format!("blk.{}.nextn.eh_proj.weight", cfg.n_layer))) {
                 cfg.n_nextn = 1;
-                eprintln!("note: loaded standalone MTP draft head from companion GGUF (layer {})", cfg.n_layer);
+                crate::say!("note: loaded standalone MTP draft head from companion GGUF (layer {})", cfg.n_layer);
             }
         }
         if !w.validate(cfg.n_layer)? && cfg.n_nextn > 0 {
-            eprintln!("note: the MTP (nextn) layer has a quant type this engine does not support; loading without MTP");
+            crate::say!("note: the MTP (nextn) layer has a quant type this engine does not support; loading without MTP");
             cfg.n_nextn = 0;
         }
         let emb_t = w.get("token_embd.weight")?;
@@ -1406,7 +1406,7 @@ mod tests {
                 gpu_logits = gm.step(tok).unwrap();
             }
             let max_err = cpu_logits.iter().zip(&gpu_logits).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-            eprintln!("sensenova_loop decode vs cpu max_err = {max_err}");
+            crate::say!("sensenova_loop decode vs cpu max_err = {max_err}");
             assert!(max_err < 1e-2, "sensenova_loop CPU vs GPU decode max_err = {max_err} (cpu={cpu_logits:?}, gpu={gpu_logits:?})");
 
             if let Ok(bk2) = crate::backend::open(None, 0) {
@@ -1415,7 +1415,7 @@ mod tests {
                 let pf_logits = gm_pf.prefill(&[1u32, 3, 2, 4]).unwrap();
                 let max_err_pf = cpu_logits.iter().zip(&pf_logits).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
                 let max_err_gpu = gpu_logits.iter().zip(&pf_logits).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-                eprintln!("sensenova_loop prefill vs cpu max_err = {max_err_pf}, prefill vs gpu_decode max_err = {max_err_gpu}");
+                crate::say!("sensenova_loop prefill vs cpu max_err = {max_err_pf}, prefill vs gpu_decode max_err = {max_err_gpu}");
                 assert!(max_err_pf < 1e-2, "sensenova_loop CPU vs GPU chunked prefill max_err = {max_err_pf} (cpu={cpu_logits:?}, pf={pf_logits:?})");
             }
         }

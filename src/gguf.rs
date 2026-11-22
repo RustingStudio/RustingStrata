@@ -109,7 +109,7 @@ impl Gguf {
         // pages are not mapped into the process, so its resident size does not grow.
         #[cfg(target_os = "linux")]
         if crate::weights::fits_ram() {
-            eprintln!("page cache: reading {} MB of {} in the background (it shows as buff/cache, not as used memory)",
+            crate::say!("page cache: reading {} MB of {} in the background (it shows as buff/cache, not as used memory)",
                 g.files.iter().map(|(m, _)| m.0.len()).sum::<usize>() >> 20, path.file_name().and_then(|s| s.to_str()).unwrap_or("the model"));
         }
         Ok(g)
@@ -472,7 +472,7 @@ pub fn convert_safetensors_eagle3_to_gguf(
     push_gguf_kv(&mut kvs, &mut nkv, "eagle3.target_layers", GGUF_TYPE_ARRAY, &tl_payload);
 
     write_gguf_file(out_gguf, &kvs, nkv, &prepared)?;
-    eprintln!(
+    crate::say!(
         "converted EAGLE3 safetensors -> {} ({:.1} MiB, extract_layers={extract_layers:?}, heads={n_head}x{head_dim}, kv={n_head_kv}, ff={n_ff}, draft_vocab={draft_vocab})",
         out_gguf.display(),
         std::fs::metadata(out_gguf).map(|m| m.len() as f64 / 1048576.0).unwrap_or(0.0),
@@ -617,7 +617,7 @@ pub fn convert_safetensors_dflash_to_gguf(
     push_gguf_kv(&mut kvs, &mut nkv, "dflash.attention.sliding_window_pattern", GGUF_TYPE_ARRAY, &sw_payload);
 
     write_gguf_file(out_gguf, &kvs, nkv, &prepared)?;
-    eprintln!(
+    crate::say!(
         "converted DFlash safetensors -> {} ({:.1} MiB, layers={n_layer}, block={block_size}, mask={mask_token_id}, target_layers={target_layers:?}, heads={n_head}x{head_dim}, kv={n_head_kv}, ff={n_ff}, Q8_0)",
         out_gguf.display(),
         std::fs::metadata(out_gguf).map(|m| m.len() as f64 / 1048576.0).unwrap_or(0.0),

@@ -386,7 +386,7 @@ pub fn generate_image_opts(
     let trace = std::env::var_os("STRATA_DS_TRACE").is_some();
     if trace {
         let ids: Vec<u32> = seq.iter().map(|&(t, _)| t).collect();
-        eprintln!("prompt tokens: {ids:?}");
+        crate::say!("prompt tokens: {ids:?}");
     }
     let logits = m.prefill_embds(&seq);
     let (eos, mut out, mut shown) = (tok.eos_ids(), vec![], 0);
@@ -423,9 +423,9 @@ pub fn generate_image_opts(
         }
     }
     if m.drafts.0 > 0 {
-        eprintln!("\nspeculative drafts accepted {}/{} ({:.1}%)", m.drafts.1, m.drafts.0, 100.0 * m.drafts.1 as f64 / m.drafts.0 as f64);
+        crate::say!("\nspeculative drafts accepted {}/{} ({:.1}%)", m.drafts.1, m.drafts.0, 100.0 * m.drafts.1 as f64 / m.drafts.0 as f64);
     }
-    if trace { eprintln!("\noutput tokens: {out:?}"); }
+    if trace { crate::say!("\noutput tokens: {out:?}"); }
     println!();
     Ok(())
 }
@@ -458,7 +458,7 @@ pub fn chat_image_opts(
     let stdin = std::io::stdin();
     let mut ended = true;
     loop {
-        print!("> ");
+        print!("{}", crate::term::prompt());
         std::io::stdout().flush()?;
         let mut line = String::new();
         if stdin.lock().read_line(&mut line)? == 0 { break; }
@@ -486,13 +486,14 @@ pub fn chat_image_opts(
         let mut smp = opts.sampler.clone();
         (_, ended) = decode_with(&mut m, &tok, logits, n.min(left), &mut smp, opts.thinking_budget, &[], |p, start, s| {
             if start && p != last {
-                print!("{}", match p { Part::Think => "\x1b[2m", _ if last == Part::Think => "\x1b[0m\n", _ => "\n" });
+                let on = crate::term::out();
+                print!("{}", match p { Part::Think if on => "\x1b[2m", Part::Think => "", _ if last == Part::Think && on => "\x1b[0m\n", _ => "\n" });
                 last = p;
             }
             print!("{s}");
             std::io::stdout().flush().is_ok()
         });
-        println!("{}", if last == Part::Think { "\x1b[0m" } else { "" });
+        println!("{}", if last == Part::Think && crate::term::out() { "\x1b[0m" } else { "" });
     }
     Ok(())
 }
