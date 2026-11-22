@@ -91,9 +91,8 @@ pub fn device_order<T: PartialEq>(cuda: &[Option<T>], vk: &[T]) -> Vec<Option<us
 pub const SAME_X: i32 = 4;
 
 /// The weight type `Backend::upload` stores a tensor of type `ty` as: F16 as F32 (no F16 kernels; F32 holds every F16
-/// value exactly) and Q4_0/Q5_0 as Q8_0 (which holds their values exactly). Expert tensors are copied raw by
-/// `GpuModel::load_part`, not through `upload`, so they keep their type.
-pub fn upload_type(ty: GgmlType) -> GgmlType { match ty { GgmlType::F16 => GgmlType::F32, GgmlType::Q4_0 | GgmlType::Q5_0 => GgmlType::Q8_0, ty => ty } }
+/// value exactly). Expert tensors are copied raw by `GpuModel::load_part`, not through `upload`.
+pub fn upload_type(ty: GgmlType) -> GgmlType { if ty == GgmlType::F16 { GgmlType::F32 } else { ty } }
 
 pub trait Backend: Send {
     /// "cuda" or "vulkan".
@@ -161,12 +160,6 @@ pub trait Backend: Send {
                 let b = self.alloc(4 * f.len())?;
                 self.htod(&f.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), &b, 0)?;
                 Ok(GpuTensor::new(GgmlType::F32, t.rows, t.cols, b))
-            }
-            GgmlType::Q8_0 if matches!(t.ty, GgmlType::Q4_0 | GgmlType::Q5_0) => {
-                let q = crate::quant::to_q8_0(t.ty, t.data);
-                let b = self.alloc(q.len())?;
-                self.htod(&q, &b, 0)?;
-                Ok(GpuTensor::new(GgmlType::Q8_0, t.rows, t.cols, b))
             }
             ty => {
                 let b = self.alloc(t.data.len())?;

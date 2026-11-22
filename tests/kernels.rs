@@ -1586,7 +1586,7 @@ fn gemv_partial_superblocks_and_q2_0() {
                 let data = random_tensor(ty, ne * rows, cols, cols as u32 + ty as u32);
                 let all = Tensor { ty, cols, rows: ne * rows, data: &data };
                 let t = Tensor { rows, data: &data[..ty.row_bytes(cols as u64) * rows], ..all };
-                // Raw bytes, as experts are uploaded (`Backend::upload` turns Q4_0 / Q5_0 into Q8_0).
+                // Raw bytes, as experts are uploaded.
                 let raw = |t: &Tensor| { let b = gpu.alloc(t.data.len()).unwrap(); gpu.htod(t.data, &b, 0).unwrap(); GpuTensor::new(t.ty, t.rows, t.cols, b) };
                 let (dt, dall) = (raw(&t), raw(&all));
                 let what = format!("{bk} {} cols {cols}", ty.name());
@@ -1661,7 +1661,7 @@ fn gemv_partial_superblocks_and_q2_0() {
 
 /// Per-type Vulkan pass/fail matrix over all `GgmlType` variants: dequant, GEMV/GEMV-N/GEMV-Q, MoE GEMV, dense
 /// and tiled GEMM, plus each type's largest shared-memory request. Synthetic raw blocks bypass `Backend::upload`, so
-/// native kernels run even for the types the loader converts (F16, Q4_0, Q5_0). Vulkan only: run it with
+/// native kernels run even for F16, which the loader converts. Vulkan only: run it with
 /// `STRATA_TEST_BACKENDS=vulkan`. Prints one `MATRIX ty=...` line per type for `docs/V100-results.md`.
 #[test]
 fn vulkan_type_matrix() {
@@ -1688,7 +1688,7 @@ fn vulkan_type_matrix() {
         }
         let (mut dequant, mut gemv, mut gemvn, mut gemvq, mut moe_gemv, mut gemm_dense, mut gemm) =
             ("pass", "pass", "pass", "pass", "pass", "pass", "pass");
-        let mut note = if matches!(ty, GgmlType::Q4_0 | GgmlType::Q5_0) { "native bytes; loader uploads Q8_0".to_string() } else { String::new() };
+        let mut note = String::new();
         // The f16 GEMM path converts its operands with packFloat2x16; on this Volta driver OpFConvert truncates.
         if ty.float_x() || matches!(ty, GgmlType::IQ2XS | GgmlType::IQ2S) {
             note = format!("{note}{}f16 GEMM inputs truncate (Volta OpFConvert); reference matches", if note.is_empty() { "" } else { "; " });

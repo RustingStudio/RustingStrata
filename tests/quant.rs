@@ -38,7 +38,7 @@ fn names_the_gyro_l_types() {
 #[test] fn tqk7() { check("TQK7", GgmlType::TQK7) }
 
 /// One Q4_0 block (value = (q - 8) d) and one Q5_0 block (32 high bits after d; value = (q - 16) d): element j is
-/// the low nibble of byte j, j + 16 the high nibble. Converted to Q8_0 they give the same values.
+/// the low nibble of byte j, j + 16 the high nibble.
 #[test]
 fn q4_0_and_q5_0_blocks() {
     let d = half::f16::from_f32(0.25).to_le_bytes();
@@ -52,10 +52,9 @@ fn q4_0_and_q5_0_blocks() {
     ] {
         let ty = GgmlType::from_u32(id).unwrap();
         assert_eq!(ty.row_bytes(32), b.len());
-        let (mut y, mut y8) = ([0f32; 32], [0f32; 32]);
+        let mut y = [0f32; 32];
         dequant_row(ty, &b, &mut y);
-        dequant_row(GgmlType::Q8_0, &rusting_strata::quant::to_q8_0(ty, &b), &mut y8);
-        for j in 0..32 { assert_eq!((y[j], y8[j]), (0.25 * want[j], 0.25 * want[j]), "{} element {j}", ty.name()); }
+        for j in 0..32 { assert_eq!(y[j], 0.25 * want[j], "{} element {j}", ty.name()); }
     }
 }
 

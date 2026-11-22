@@ -38,9 +38,9 @@ mod prefill;
 /// A tensor `GpuModel::load_part` never uploads: the PLE table stays on the CPU.
 fn cpu_only(name: &str) -> bool { name == "per_layer_token_embd.weight" }
 
-/// A tensor `GpuModel::load_part` converts on upload (`Backend::upload`): F16 to F32, Q4_0/Q5_0 to Q8_0. Expert
-/// tensors (`*_exps.`) are copied raw and keep their type.
-fn f32_up(name: &str, ty: GgmlType) -> bool { matches!(ty, GgmlType::F16 | GgmlType::Q4_0 | GgmlType::Q5_0) && !name.contains("_exps.") && !name.starts_with("dflash.") }
+/// A tensor `GpuModel::load_part` converts on upload (`Backend::upload`): F16 to F32. Expert tensors (`*_exps.`) are
+/// copied raw and keep their type.
+fn f32_up(name: &str, ty: GgmlType) -> bool { ty == GgmlType::F16 && !name.contains("_exps.") && !name.starts_with("dflash.") }
 
 /// The weight types a GPU load of `g` leaves for the kernels, in the order first seen: `cpu_only` tensors skipped,
 /// `f32_up` tensors rewritten as `backend::upload_type` stores them, and tensors `load_part`'s gate rejects left out

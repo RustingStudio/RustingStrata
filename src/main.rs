@@ -522,6 +522,14 @@ impl Engine {
     fn chunk(&self) -> usize { self.chunk.unwrap_or(4096) }
     fn mtp(&self) -> usize { self.mtp.unwrap_or(0) }
     fn aux_model_path(&self) -> Option<&Path> { self.draft_model.as_deref().or(self.mtp_model.as_deref()) }
+
+    /// Says that the draft options do nothing for a model outside the main engine (`config::OWN_ARCHS`).
+    fn own_warn(&self, g: &Gguf) {
+        let Some(arch) = g.get("general.architecture").ok().and_then(|v| v.as_str()) else { return };
+        if rusting_strata::config::OWN_ARCHS.contains(&arch) && (self.mtp.is_some_and(|n| n > 0) || self.aux_model_path().is_some() || self.spec_type != "none") {
+            eprintln!("warning: '{arch}' models decode without drafts: --mtp, --mtp-model, --draft-model and --spec-type are ignored");
+        }
+    }
 }
 
 /// Per-device VRAM margins in MB from `--vram-margin`: one value for every device, one per device like `512,256`,
@@ -1117,6 +1125,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Generate { model, prompt, n, image, mut engine } => {
             engine.ds_env();
             let g = Gguf::open(&model)?;
+            engine.own_warn(&g);
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 if image.is_empty() { return rusting_strata::gemma4::generate(&g, &prompt, n); }
@@ -1228,6 +1237,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let _ = BENCH_TEXT.set(text);
             }
             let g = Gguf::open(&model)?;
+            engine.own_warn(&g);
             engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
             if let Some(arch) = g.get("general.architecture").ok().and_then(|v| v.as_str()) {
                 if arch == "deepseek41" || arch == "glm5-next" || arch == rusting_strata::hy4::ARCH || arch == rusting_strata::inkling2::ARCH {
@@ -1372,6 +1382,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let think = engine.think_default;
             engine.ds_env();
             let g = Gguf::open(&model)?;
+            engine.own_warn(&g);
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
                 let input = if image.is_empty() { None } else {
                     let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
@@ -2608,6 +2619,7 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
         st.ram_cap = engine.ram_cap();
     }
     let g = Gguf::open(model)?;
+    engine.own_warn(&g);
     let arch = g.get("general.architecture")?.as_str().context("general.architecture")?;
     s.stats.lock().unwrap().ctx_train = g.meta.get(&format!("{arch}.context_length")).and_then(|v| v.as_u64());
     let tok = Tokenizer::from_gguf(&g)?;

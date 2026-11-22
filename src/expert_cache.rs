@@ -97,6 +97,9 @@ impl ExpertCache {
             .filter(|b| b.len() >= 4 * c.n_layer * n)
             .map(|b| b.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect::<Vec<_>>())
             .unwrap_or_default();
+        if let Some(p) = profile.as_ref().filter(|_| frac < 1.0) {
+            eprintln!("expert profile: {}{}", p.display(), if counts.is_empty() { " (none yet: written when the run ends)" } else { "" });
+        }
         let mut long = counts;
         long.resize(n_layers * n, 0.0);
         // `counts` start from the profile at the size routing gives them in steady state (k experts per token, an

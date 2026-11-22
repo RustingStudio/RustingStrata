@@ -388,14 +388,6 @@ fn q5_codes(ty: GgmlType, b: &[u8]) -> [i8; 32] {
     q
 }
 
-/// Q4_0 or Q5_0 bytes as Q8_0 with the same scales: every value stays exact.
-pub fn to_q8_0(ty: GgmlType, src: &[u8]) -> Vec<u8> {
-    src.chunks_exact(ty.block_bytes()).flat_map(|b| {
-        let q = q5_codes(ty, b);
-        [b[0], b[1]].into_iter().chain(q.into_iter().map(|v| v as u8))
-    }).collect()
-}
-
 fn iq4nl(b: &[u8], y: &mut [f32]) {
     let d = h(b, 0);
     for j in 0..16 {
