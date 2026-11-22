@@ -353,9 +353,16 @@ __device__ __forceinline__ int2 lut16(u32 q, u32 t0, u32 t1, u32 t2, u32 t3) {
     u32 b = __byte_perm(lo, hi, hs >> 16);
     return make_int2((int)__byte_perm(a, b, 0x6420), (int)__byte_perm(a, b, 0x7531));
 }
-__device__ __forceinline__ int2 iq4nl_lut(u32 q) { return lut16(q, 0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594535u); }  // -127 .. -65, ..., 53 .. 113
+// One half of lut16 for a caller that uses 4 of the 8 values: .x of lut16(q) with sh = 0, .y with sh = 4.
+__device__ __forceinline__ int lut16h(u32 q, u32 sh, u32 t0, u32 t1, u32 t2, u32 t3) {
+    q = (q >> sh) & 0x0F0F0F0Fu;
+    q = __byte_perm(q | (q >> 4), 0, 0x4420);  // the 4 nibbles in the low 16 bits
+    return (int)__byte_perm(__byte_perm(t0, t1, q), __byte_perm(t2, t3, q), 0x3210u | ((q & 0x8888u) >> 1));
+}
+#define IQ4NL_T 0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594535u  // -127 .. -65, ..., 53 .. 113
+__device__ __forceinline__ int2 iq4nl_lut(u32 q) { return lut16(q, IQ4NL_T); }
 // kvalues_fp4 (E2M1 values times 2: 0 1 2 3 4 6 8 12, then the same negated) in the same form.
-__device__ __forceinline__ int2 fp4_lut(u32 q) { return lut16(q, 0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu); }
+#define FP4_T 0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu
 // An unsigned E4M3 scale halved (llama.cpp ggml_ue4m3_to_fp32, which pairs it with the doubled kvalues_fp4); 0x7F is 0.
 __device__ __forceinline__ float ue4m3(u32 x) {
     u32 e = (x >> 3) & 15, m = x & 7;
@@ -628,9 +635,9 @@ template <> struct QI<40> {  // NVFP4, 4 blocks of 36: 4 UE4M3 scales (one per 1
         // Values 16 s + j and 16 s + 8 + j of a block are the low and high nibbles of code byte 8 s + j.
         const u8* p = b + 36 * (sub >> 3);
         int s = (sub & 7) >> 1;
+        u32 sh = 4 * (sub & 1);
         d = ue4m3(p[s]);
-        int2 a = fp4_lut(ldu32(p + 4 + 8 * s)), c = fp4_lut(ldu32(p + 8 + 8 * s));
-        lo = sub & 1 ? a.y : a.x; hi = sub & 1 ? c.y : c.x;
+        lo = lut16h(ldu32(p + 4 + 8 * s), sh, FP4_T); hi = lut16h(ldu32(p + 8 + 8 * s), sh, FP4_T);
     }
 };
 template <> __device__ __forceinline__ void deq8<40>(const u8* b, int sub, float* o) {
@@ -645,8 +652,8 @@ template <> struct QI<20> {  // IQ4_NL, 8 blocks of 18 (2-byte aligned: ld16 onl
         int r = (sub & 3) * 8;
         d = ldh(p);
         const u8* q = p + 2 + (r & 15);
-        int2 a = iq4nl_lut(ld16(q) | (ld16(q + 2) << 16)), c = iq4nl_lut(ld16(q + 4) | (ld16(q + 6) << 16));
-        lo = r < 16 ? a.x : a.y; hi = r < 16 ? c.x : c.y;
+        u32 sh = r < 16 ? 0 : 4;
+        lo = lut16h(ld16(q) | (ld16(q + 2) << 16), sh, IQ4NL_T); hi = lut16h(ld16(q + 4) | (ld16(q + 6) << 16), sh, IQ4NL_T);
     }
 };
 
@@ -724,6 +731,16 @@ __shared__ u64 s_iq2xs_grid[512];
 __shared__ u32 s_iq3xxs_grid[256];
 __shared__ u8 s_ksigns_iq2xs[128];
 template <int T> struct QS : QI<T> { static constexpr bool SH = false; __device__ static void load() {} };
+// NVFP4 for the GEMV with its 256 scale values in shared memory: the table costs one load, ue4m3 a chain of selects.
+__shared__ float s_ue4m3[256];
+template <> struct QS<40> : QI<40> {
+    static constexpr bool SH = true;
+    __device__ static void load() { for (int i = threadIdx.x; i < 256; i += blockDim.x) s_ue4m3[i] = ue4m3(i); }
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        QI<40>::get(b, sub, lo, hi, d, m);
+        d = s_ue4m3[b[36 * (sub >> 3) + ((sub & 7) >> 1)]];
+    }
+};
 __device__ __forceinline__ void load_ksigns() { for (int i = threadIdx.x; i < 128; i += blockDim.x) s_ksigns_iq2xs[i] = ksigns_iq2xs[i]; }
 template <> struct QS<17> : QI<17> {
     static constexpr bool SH = true;
