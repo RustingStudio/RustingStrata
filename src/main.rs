@@ -1582,6 +1582,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let waiting = open_conns.clone();
             let stats = std::sync::Arc::new(std::sync::Mutex::new(serve::Stats::default()));
             let (st, a, k, allowed, t0) = (stats.clone(), addr.clone(), keys.clone(), allowed_hosts.clone(), Instant::now());
+            let (dir, extra) = (models_dir.unwrap_or_else(models_dir_default), std::sync::Arc::<std::sync::Mutex<Vec<PathBuf>>>::default());
+            let offer = std::sync::Arc::new((dir.clone(), model.clone(), extra.clone()));
             let (per_key, held) = (host.max_per_key, serve::Open::default());
             let stop = on_sigterm();
             // SIGTERM (systemctl stop or restart): new requests get 503, the requests accepted before it finish, then
@@ -1627,7 +1629,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         Err(e) => say!("{}: {e:#}, keeping the old keys", f.display()),
                     }
                 }
-                let (tx, oc, st, a, k, allowed, held, hub) = (tx.clone(), open_conns.clone(), st.clone(), a.clone(), k.clone(), allowed.clone(), held.clone(), hub.clone());
+                let (tx, oc, st, a, k, allowed, held, hub, offer) = (tx.clone(), open_conns.clone(), st.clone(), a.clone(), k.clone(), allowed.clone(), held.clone(), hub.clone(), offer.clone());
                 std::thread::spawn(move || {
                     let q = c.set_read_timeout(Some(Duration::from_secs(30))).and_then(|_| c.set_write_timeout(Some(Duration::from_secs(30))))
                         .map_err(Into::into).and_then(|_| serve::read_request(&mut BufReader::new(&c)));
@@ -1704,14 +1706,25 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         // Clients list the models often; a model still loading is listed, as its chats wait for the load.
                         Ok(r) if r.method == "GET" && r.path.split('?').next() == Some("/v1/models") && (k.read().unwrap().any() || serve::host_ok(&r.host, &a, &allowed)) => {
                             let created = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                            let (m, n_ctx, n_ctx_train) = {
+                            let (m, file, n_ctx, n_ctx_train) = {
                                 let state = st.lock().unwrap();
-                                (state.model.clone(), state.ctx, state.ctx_train)
+                                (state.model.clone(), state.file.clone(), state.ctx, state.ctx_train)
                             };
-                            return reply(json!({"object": "list", "data": m.map(|id| json!([{
+                            let mut data: Vec<_> = m.iter().map(|id| json!({
                                 "id": id, "object": "model", "created": created, "owned_by": "strata",
                                 "meta": {"n_ctx": n_ctx, "n_ctx_train": n_ctx_train}
-                            }])).unwrap_or(json!([]))}), "200 OK");
+                            })).collect();
+                            // An admin key also sees the other models the server offers, by file name: a chat request
+                            // that names one loads it (`Serving::other`). Customer keys may not load models.
+                            // ponytail: the folders are read for every list; cache the names if a client polls hard.
+                            if who.as_ref().is_some_and(|w| w.admin) {
+                                let mut seen: Vec<String> = m.into_iter().chain([file]).collect();
+                                for (_, p, _) in offered(&offer.0, offer.1.as_ref(), &offer.2.lock().unwrap()) {
+                                    let id = stem(&p);
+                                    if !seen.contains(&id) { data.push(json!({"id": id, "object": "model", "created": created, "owned_by": "strata"})); seen.push(id); }
+                                }
+                            }
+                            return reply(json!({"object": "list", "data": data}), "200 OK");
                         }
                         _ => {}
                     }
@@ -1732,7 +1745,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     let _ = tx.send((c, q, i, hold));
                 });
             });
-            let s = Serving { rx: rx.into(), waiting, stop, addr, allowed_hosts, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(), extra: Default::default(),
+            let s = Serving { rx: rx.into(), waiting, stop, addr, allowed_hosts, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir, model: model.clone(), extra,
                 dl: Default::default(), stats, opts: Default::default(), idle: host.auto_unload.map(Duration::from_secs), asleep: Default::default(), parked: Default::default(), alias: host.alias };
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
@@ -1771,6 +1784,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 } else { Ok(()) };
                 match cal.and_then(|()| serve_model(&p, engine.clone(), &s, &mut w)) {
                     Ok(Next::Load(p, w)) => next = Some((p, Some(w))),
+                    // A chat request named another model. This one comes back with the next chat if that load fails.
+                    Ok(Next::Wake(q)) => { *s.asleep.lock().unwrap() = Some(p); next = Some((q, None)); }
                     // `--auto-unload`: `serve_model` has freed the model. Its name stays in the model list, as a chat
                     // loads it again.
                     Ok(Next::Idle) => {
@@ -1778,15 +1793,17 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         s.sleep(p, engine.ctx);
                     }
                     Ok(_) => return Ok(()),
-                    // The load after `--auto-unload` failed (another program may hold the VRAM now): the chat that
-                    // asked for it gets the error and the next one tries again.
-                    Err(e) if s.parked.lock().unwrap().is_some() => {
+                    // The load for a chat request failed (after `--auto-unload` another program may hold the VRAM now):
+                    // the chat that asked for it gets the error. The next chat loads the model that was there before
+                    // (the one `--auto-unload` freed, or the one the request replaced); with none, no model is loaded.
+                    Err(e) if w.is_none() && s.parked.lock().unwrap().is_some() => {
                         say!("loading {}: {e:#}", p.display());
                         let (mut c, ..) = s.parked.lock().unwrap().take().unwrap();
                         s.waiting.fetch_sub(1, Relaxed);
-                        let b = json!({"error": {"message": format!("loading the model again: {e:#}"), "type": "server_error"}}).to_string();
+                        let b = json!({"error": {"message": format!("loading {}: {e:#}", stem(&p)), "type": "server_error"}}).to_string();
                         let _ = write!(c, "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 10\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
-                        s.sleep(p, engine.ctx);
+                        let back = s.asleep.lock().unwrap().take();
+                        match back { Some(a) => s.sleep(a, engine.ctx), None => s.stats.lock().unwrap().unload(None) }
                     }
                     Err(e) if w.is_none() => return Err(e),
                     Err(e) => {
@@ -2397,7 +2414,7 @@ struct Serving {
     alias: Option<String>,
     model: Option<PathBuf>,
     /// GGUF files outside the models folder that `/api/load` was given as `path`, offered until the server stops.
-    extra: std::sync::Mutex<Vec<PathBuf>>,
+    extra: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
     /// The Hugging Face download running on its own thread, or the last one.
     dl: std::sync::Arc<std::sync::Mutex<hf::Progress>>,
     stats: std::sync::Arc<std::sync::Mutex<serve::Stats>>,
@@ -2405,7 +2422,8 @@ struct Serving {
     opts: std::sync::Mutex<serde_json::Value>,
     /// `--auto-unload`: the model is freed after this long without a chat request.
     idle: Option<Duration>,
-    /// The model `--auto-unload` freed, and the chat request that asked for it again (answered once it has loaded).
+    /// The model `--auto-unload` freed (while another loads for a chat request: the model to go back to if that load
+    /// fails), and the chat request that waits for a load (answered once the model has loaded).
     asleep: std::sync::Mutex<Option<PathBuf>>,
     parked: std::sync::Mutex<Option<Queued>>,
 }
@@ -2419,7 +2437,8 @@ enum Next {
     Load(PathBuf, TcpStream),
     /// `--auto-unload`: no chat request for that long. The caller frees the model.
     Idle,
-    /// A chat request came for the model that `--auto-unload` freed; it waits in `Serving::parked`.
+    /// A chat request came for the model that `--auto-unload` freed, or named another model the server offers; it
+    /// waits in `Serving::parked`.
     Wake(PathBuf),
     /// The listener is gone, or SIGTERM came and the accepted requests are answered.
     Stop,
@@ -2442,6 +2461,7 @@ impl Serving {
     /// Answers requests until one asks for a model to be loaded, or until the model is to be freed or loaded again
     /// for `--auto-unload`.
     fn serve(&self, mut l: Option<&mut Loaded>, e: &Engine) -> Next {
+        if l.is_some() { *self.asleep.lock().unwrap() = None; }
         if let Some(l) = l.as_deref_mut() && matches!(&l.r, Runner::Gpu(g) if g.slots() > 1) { return self.serve_slots(l, e); }
         let rx = self.rx.lock().unwrap();
         let mut last = Instant::now();
@@ -2456,7 +2476,8 @@ impl Serving {
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Next::Stop,
             };
             let chat = self.wants_model(&q);
-            if chat && l.is_none() && let Some(p) = self.asleep.lock().unwrap().take() {
+            // The model the request names, else the one `--auto-unload` freed.
+            if chat && let Some(p) = self.other(&q, l.as_deref().map(|l| l.path.as_path())).or_else(|| self.asleep.lock().unwrap().clone().filter(|_| l.is_none())) {
                 *self.parked.lock().unwrap() = Some((c, q, i, hold));
                 return Next::Wake(p);
             }
@@ -2473,7 +2494,7 @@ impl Serving {
     fn sleep(&self, model: PathBuf, ctx: usize) {
         let mut st = self.stats.lock().unwrap();
         st.unload(None);
-        (st.model, st.unloaded, st.ctx) = (Some(self.name(&model)), true, ctx);
+        (st.model, st.file, st.unloaded, st.ctx) = (Some(self.name(&model)), stem(&model), true, ctx);
         *self.asleep.lock().unwrap() = Some(model);
     }
     /// A request for the model that `handle` does not refuse for its Host, key or content type. Only these count as
@@ -2488,18 +2509,22 @@ impl Serving {
     /// is saved and the server exits.
     fn stopped(&self) -> bool { self.stop.load(Relaxed) && self.waiting.load(Relaxed) == 0 }
     /// The model's name in `/v1/models` and the replies: `--alias`, else the file name without `.gguf`.
-    fn name(&self, p: &Path) -> String {
-        self.alias.clone().unwrap_or_else(|| p.file_stem().and_then(|n| n.to_str()).unwrap_or("strata").to_string())
-    }
-    /// The models the page offers: the models folder, the Hugging Face and llama.cpp caches, then --model if it is
-    /// elsewhere.
-    fn models(&self) -> Vec<(String, PathBuf, u64)> {
-        let mut v = serve::list_models(&self.dir);
-        for m in serve::cached_models() { if !v.iter().any(|x| x.1 == m.1) { v.push(m); } }
-        for p in self.model.iter().chain(self.extra.lock().unwrap().iter()) {
-            if !v.iter().any(|x| &x.1 == p) { v.push((p.display().to_string(), p.clone(), std::fs::metadata(p).map_or(0, |m| m.len()))); }
-        }
-        v
+    fn name(&self, p: &Path) -> String { self.alias.clone().unwrap_or_else(|| stem(p)) }
+    fn models(&self) -> Vec<(String, PathBuf, u64)> { offered(&self.dir, self.model.as_ref(), &self.extra.lock().unwrap()) }
+    /// The model a chat request names when it is not `loaded` and the server offers it (by file name, as
+    /// `/v1/models` lists it, or by its name in the page's list): the server loads it for the request, as the page's
+    /// model switch does. Only an admin key may (customer keys may not load models), and a name that no offered
+    /// model has is answered by the loaded model.
+    fn other(&self, q: &anyhow::Result<serve::Request>, loaded: Option<&Path>) -> Option<PathBuf> {
+        #[derive(serde::Deserialize)]
+        struct Named { model: Option<String> }
+        let Ok(r) = q else { return None };
+        if !self.wants_model(q) || !self.keys.read().unwrap().who(&r.auth).is_some_and(|w| w.admin) { return None; }
+        let want = serde_json::from_slice::<Named>(&r.body).ok()?.model?;
+        // Before the folders are read: most requests name the loaded model.
+        if loaded.is_some_and(|p| want == self.name(p) || want == stem(p)) { return None; }
+        // ponytail: two files with one name in different folders: the first of the list is meant.
+        self.models().into_iter().find(|(id, p, _)| want == stem(p) || want == *id).map(|m| m.1).filter(|p| Some(p.as_path()) != loaded)
     }
 
     /// Adds a GGUF file from anywhere on this computer to the list (`/api/load` with `path`). Only the file's
@@ -2646,7 +2671,7 @@ impl Serving {
         let (tx, jobs) = channel::<Job>();
         let (next, live) = (std::sync::Mutex::new(None), std::sync::atomic::AtomicUsize::new(0));
         // `--auto-unload`: when the last chat request ended, and whether the loop ended for it.
-        let (last, mut idle) = (std::sync::Mutex::new(Instant::now()), false);
+        let (last, mut idle, mut wake) = (std::sync::Mutex::new(Instant::now()), false, None);
         let rx = self.rx.lock().unwrap();
         let n = g.slots();
         std::thread::scope(|sc| {
@@ -2655,9 +2680,11 @@ impl Serving {
             let (jobs, mut s) = (jobs, Sched { held: vec![false; n], freed: vec![0; n], who: vec![0; n], ..Default::default() });
             let mut open = true;
             loop {
-                while open && next.lock().unwrap().is_none() {
+                while open && wake.is_none() && next.lock().unwrap().is_none() {
                     let parked = self.parked.lock().unwrap().take();
                     match parked.map_or_else(|| rx.try_recv(), Ok) {
+                        // A chat request names another model: it waits while the replies in progress end.
+                        Ok(x) if let Some(p) = self.other(&x.1, Some(path)) => { *self.parked.lock().unwrap() = Some(x); wake = Some(p); }
                         Ok((c, q, i, hold)) => {
                             live.fetch_add(1, Relaxed);
                             let (tx, tok, tpl, name, path, next, live, last) = (tx.clone(), &**tok, *tpl, name.clone(), path.clone(), &next, &live, &last);
@@ -2681,7 +2708,7 @@ impl Serving {
                     }
                 }
                 if open && self.stopped() { say!("stopped"); open = false; }
-                if (!open || next.lock().unwrap().is_some()) && live.load(Relaxed) == 0 { break; }
+                if (!open || wake.is_some() || next.lock().unwrap().is_some()) && live.load(Relaxed) == 0 { break; }
                 // A request that comes now stays in the queue and loads the model again.
                 if live.load(Relaxed) == 0 && self.idle.is_some_and(|d| last.lock().unwrap().elapsed() >= d) { idle = true; break; }
                 s.take(&jobs, s.wait());
@@ -2751,7 +2778,7 @@ impl Serving {
                 if s.ready() { s.run(g); }
             }
         });
-        match next.into_inner().unwrap() { Some((p, w)) => Next::Load(p, w), None if idle => Next::Idle, None => Next::Stop }
+        match (next.into_inner().unwrap(), wake) { (Some((p, w)), _) => Next::Load(p, w), (None, Some(p)) => Next::Wake(p), (None, None) if idle => Next::Idle, _ => Next::Stop }
     }
 }
 
@@ -2823,12 +2850,27 @@ fn open_mtp_gguf(path: Option<&Path>) -> anyhow::Result<Option<Gguf>> {
 
 /// Loads `model`, answers `w` (the /api/load request that asked for it) and serves until another model is asked
 /// for or `--auto-unload` ends it. The model and its GPU memory are freed on return.
+/// A model file's name without `.gguf`: its name in `/v1/models` and in the replies unless `--alias` gives one.
+fn stem(p: &Path) -> String { p.file_stem().and_then(|n| n.to_str()).unwrap_or("strata").to_string() }
+
+/// The models the server offers: the models folder, the Hugging Face and llama.cpp caches, then `--model` and the
+/// files `/api/load` was given by path, if they are elsewhere.
+fn offered(dir: &Path, model: Option<&PathBuf>, extra: &[PathBuf]) -> Vec<(String, PathBuf, u64)> {
+    let mut v = serve::list_models(dir);
+    for m in serve::cached_models() { if !v.iter().any(|x| x.1 == m.1) { v.push(m); } }
+    for p in model.into_iter().chain(extra) {
+        if !v.iter().any(|x| &x.1 == p) { v.push((p.display().to_string(), p.clone(), std::fs::metadata(p).map_or(0, |m| m.len()))); }
+    }
+    v
+}
+
 fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<TcpStream>) -> anyhow::Result<Next> {
     say!("loading {}", model.display());
     let name = s.name(model);
     {
         let mut st = s.stats.lock().unwrap();
         st.unload(Some(name.clone()));
+        st.file = stem(model);
         st.ctx = engine.ctx;
         st.ram_cap = engine.ram_cap();
     }

@@ -135,13 +135,15 @@ chunk.
 
 - **Admin key** (`--api-key`, or `STRATA_API_KEY` to keep it out of the process list). It can use every route: the
   chat APIs, the chat page's stats, loading another model (`/api/load`, from the models folder
-  or by the path of any GGUF file the server can read) and downloading models (`/api/download`). Keep it for
+  or by the path of any GGUF file the server can read; or a chat request whose `model` is another name of
+  `GET /v1/models`) and downloading models (`/api/download`). Keep it for
   yourself.
 - **Customer keys** (`--api-keys FILE`). One `name key` pair a line, `#` starts a comment (so a key cannot contain
   `#`). Keys must be at least 16 characters, names and keys must not repeat, and the admin key must not be among
   them. A customer key reaches only `POST /v1/chat/completions`,
-  `POST /v1/messages`, `POST /v1/messages/count_tokens` and `GET /v1/models`; other routes answer `403`. The name
-  goes into the usage log.
+  `POST /v1/messages`, `POST /v1/messages/count_tokens` and `GET /v1/models`; other routes answer `403`. It sees
+  only the loaded model in `/v1/models`, and the `model` of its requests never loads another one. The name goes into
+  the usage log.
 - **Changing the key file.** The server reads the file again when it changes, and the next request uses the new
   keys; replies being generated go on. A file that cannot be read or does not parse keeps the old keys (the server
   log says why). A file with no keys removes all customer keys when there is an admin key; without one it is refused,

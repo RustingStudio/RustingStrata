@@ -448,6 +448,21 @@ fn serve_without_a_model() {
     assert!(!s.contains("200"), "{s} {b}");
     let (s, b) = req("GET", "/api/models", "root-0123456789abcdef");
     assert!(s.contains("200") && b.contains(far.file_name().unwrap().to_str().unwrap()), "{s} {b}");
+    // `/v1/models` lists it for the admin key only. A chat request with the admin key that names it makes the server
+    // load it: the load fails, the chat gets the error and the server has no model, as before. A customer key loads
+    // nothing.
+    let name = far.file_stem().unwrap().to_str().unwrap();
+    assert!(req("GET", "/v1/models", "root-0123456789abcdef").1.contains(&format!(r#""id":"{name}""#)));
+    assert!(req("GET", "/v1/models", "acme-0123456789abcdef").1.contains(r#""data":[]"#));
+    let chat = |key: &str| {
+        let body = serde_json::json!({"model": name, "messages": [{"role": "user", "content": "hi"}]}).to_string();
+        get(&format!("POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()))
+    };
+    let (s, b) = chat("root-0123456789abcdef");
+    assert!(s.contains("503") && b.contains(&format!("loading {name}")), "{s} {b}");
+    let (s, b) = chat("acme-0123456789abcdef");
+    assert!(s.contains("503") && b.contains("no model loaded"), "{s} {b}");
+    assert!(req("GET", "/health", "").1.contains("no model"));
     let _ = std::fs::remove_file(&far);
     #[cfg(unix)]
     {

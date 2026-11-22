@@ -421,6 +421,9 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
 pub struct Stats {
     /// The loaded model's name, or the one loading.
     pub model: Option<String>,
+    /// The file name of `model` without `.gguf`, which `--alias` hides.
+    #[serde(skip)]
+    pub file: String,
     pub loading: bool,
     /// `--auto-unload` freed `model`; a chat request loads it again.
     pub unloaded: bool,

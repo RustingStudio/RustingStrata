@@ -169,6 +169,13 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 
 `serve` speaks the OpenAI chat completions API (`POST /v1/chat/completions`, streamed or not, `GET /v1/models`).
 
+- `GET /v1/models` lists the loaded model first, then every other model the chat page offers (the models folder, the
+  Hugging Face and llama.cpp caches), each by its file name without `.gguf`. A chat request whose `model` is one of
+  these names makes the server load that model in place of the loaded one, and is answered after the load; so a
+  server started without `--model` serves whichever model the client picks. The replies in progress end first. A
+  `model` that no listed file has is answered by the loaded model. If the load fails, the request gets `503` with
+  the reason and the next chat request loads the model that was there before. With API keys only the admin key sees
+  the other models and switches; a customer key sees and gets the loaded model.
 - It runs one request at a time; `--parallel N` (GPU) decodes up to N together (4 requests: 164 tok/s in total on the
   RTX 3060, 41 each; see [HOSTING.md](HOSTING.md)). From 8 requests decoding at once (`STRATA_BATCH_MIN` sets the
   count), a dense model without MTP, LoRA or recurrent layers on CUDA runs them in one batched forward, and the
