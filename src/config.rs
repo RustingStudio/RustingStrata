@@ -1,7 +1,7 @@
 //! Model hyperparameters read from GGUF metadata, plus the per-architecture table.
 
 use crate::gguf::Gguf;
-use anyhow::{Context, bail};
+use anyhow::{Context, bail, ensure};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayerKind { Delta, Attn }
@@ -261,10 +261,15 @@ pub struct ModelConfig {
     pub dflash: Option<DFlashConfig>,
 }
 
+/// Architectures with their own forward and server outside `ModelConfig` (`src/main.rs` dispatches on them).
+pub const OWN_ARCHS: [&str; 5] = ["gemma4", "glm5-next", "deepseek41", crate::hy4::ARCH, crate::inkling2::ARCH];
+
 impl ModelConfig {
     pub fn from_gguf(g: &Gguf) -> anyhow::Result<ModelConfig> {
         let arch = g.get("general.architecture")?.as_str().context("general.architecture")?.to_string();
         let Some(a) = self::arch(&arch) else {
+            ensure!(!OWN_ARCHS.contains(&arch.as_str()), "'{arch}' models run with chat, generate, bench and `rustingstrata serve --model <file>`; \
+                a server started without that model cannot switch to them");
             bail!("unsupported architecture '{arch}' (supported: qwen3, qwen3moe, qwen3next, qwen35, qwen35moe, qwen4exp, flint, sensenova_loop)")
         };
         let opt = |k: &str| g.meta.get(&format!("{arch}.{k}")).and_then(|v| v.as_u64()).unwrap_or(0) as usize;

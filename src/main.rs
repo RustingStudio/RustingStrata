@@ -394,10 +394,14 @@ impl Engine {
             Err(e) if self.cpu_fallback => { eprintln!("no GPU backend ({e:#}), running on the CPU"); None }
             r => r?,
         };
-        let path = calibration_path(model, bk.as_ref().map_or("cuda", |b| b[0].name()));
+        let path = calibration_path(model, bk.as_ref().map_or("cuda", |b| b[0].name()), &self.device);
         let mut v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         if let Some(gpu) = bk.as_ref().map(|b| b[0].device()).filter(|gpu| !calibration_fits(&v, gpu)) {
             eprintln!("warning: {} was measured on {}, not on {gpu}: ignored", path.display(), v["gpu"]);
+            v = serde_json::Value::Null;
+        }
+        if let Some(n) = v["bytes"].as_u64().filter(|&n| std::fs::metadata(model).is_ok_and(|m| m.len() != n)) {
+            eprintln!("warning: {} was measured on another file with this name ({n} bytes): ignored", path.display());
             v = serde_json::Value::Null;
         }
         if !v.is_null() { eprintln!("calibration: {}", path.display()); }
@@ -673,10 +677,12 @@ fn resolve_flags(gpu: bool, parallel: usize, mtp: usize, n_nextn: usize) -> anyh
     Ok((notes, p, k))
 }
 
-/// Calibration file for `model` on `backend`; CUDA keeps the original name.
-fn calibration_path(model: &Path, backend: &str) -> PathBuf {
+/// Calibration file for `model` on `backend` and `devices`; CUDA keeps the original name, and a run on several
+/// devices has its own file (`-dev0-1`), so it does not replace the one-GPU calibration.
+fn calibration_path(model: &Path, backend: &str, devices: &[usize]) -> PathBuf {
     let stem = model.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
-    let sfx = if backend == "cuda" { String::new() } else { format!("-{backend}") };
+    let mut sfx = if backend == "cuda" { String::new() } else { format!("-{backend}") };
+    if devices.len() > 1 { sfx += &format!("-dev{}", devices.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("-")); }
     rusting_strata::expert_cache::cache_dir().join(format!("strata-{stem}{sfx}.json"))
 }
 
@@ -924,6 +930,8 @@ enum Cmd {
     /// Measure prefill chunk, MTP drafts per step and the short-prompt threshold on this machine (GPU) and write
     /// them to the model's calibration file, which later runs read unless flags override.
     Calibrate {
+        /// The GGUF to calibrate, or a folder: every model in it (and its subfolders, as the chat page lists them)
+        /// is calibrated in turn.
         #[arg(long)]
         model: PathBuf,
         /// GPU context length used while measuring and assumed for the results.
@@ -1290,7 +1298,28 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             set_kv_env(&kv);  // read by Gpu::new and Vk::new
             if !lora.is_empty() { eprintln!("note: --lora is ignored by calibrate; calibration uses the base model"); }
             let margins = vram_margins(&vram_margin, &device)?.into_iter().map(|mb| mb << 20).collect::<Vec<_>>();
-            calibrate(&model, draft_model.as_deref().or(mtp_model.as_deref()), ctx, &margins, backend.as_deref(), &device, split_arg(split.as_deref(), device.len())?)?
+            let split = split_arg(split.as_deref(), device.len())?;
+            if !model.is_dir() {
+                return calibrate(&model, draft_model.as_deref().or(mtp_model.as_deref()), ctx, &margins, backend.as_deref(), &device, split);
+            }
+            anyhow::ensure!(draft_model.is_none() && mtp_model.is_none(), "--mtp-model and --draft-model belong to one model: give --model a file");
+            let list = rusting_strata::serve::list_models(&model);
+            anyhow::ensure!(!list.is_empty(), "no .gguf models in {}", model.display());
+            let mut failed = vec![];
+            for (k, (id, path, _)) in list.iter().enumerate() {
+                eprintln!("calibrate {}/{}: {id}", k + 1, list.len());
+                let arch = Gguf::open(path).ok().and_then(|g| g.get("general.architecture").ok().and_then(|v| v.as_str().map(str::to_string)));
+                if arch.as_deref().is_some_and(|a| rusting_strata::config::OWN_ARCHS.contains(&a)) {
+                    eprintln!("calibrate {id}: skipped, '{}' models have nothing to calibrate", arch.unwrap());
+                    continue;
+                }
+                // One model that fails (too big, not a model) does not stop the others.
+                if let Err(e) = calibrate(path, None, ctx, &margins, backend.as_deref(), &device, split.clone()) {
+                    eprintln!("calibrate {id}: failed: {e:#}");
+                    failed.push(id.as_str());
+                }
+            }
+            anyhow::ensure!(failed.is_empty(), "calibration failed for {}", failed.join(", "));
         }
         Cmd::Check { model, backend, device } => {
             let g = Gguf::open(&model)?;
@@ -1413,7 +1442,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             anyhow::ensure!(host.auto_unload != Some(0), "--auto-unload must be at least 1 second");
             // The four architectures below have their own servers, which keep the model for as long as they run.
             let arch = model.as_deref().and_then(Gguf::arch);
-            if host.auto_unload.is_some() && let Some(a) = arch.as_deref() && ["gemma4", "glm5-next", "deepseek41", rusting_strata::hy4::ARCH, rusting_strata::inkling2::ARCH].contains(&a) {
+            if host.auto_unload.is_some() && let Some(a) = arch.as_deref() && rusting_strata::config::OWN_ARCHS.contains(&a) {
                 anyhow::bail!("--auto-unload is not available for {a} models");
             }
             if let Some(mp) = &model && arch.as_deref() == Some("gemma4") {
@@ -1973,7 +2002,7 @@ fn calibrate(model: &Path, aux: Option<&Path>, ctx: usize, margin: &[usize], kin
                 seen.push(c.clone());
                 match measure(Some(&c.iter().map(|&x| x as f64).collect::<Vec<_>>())) {
                     Ok((_, p, d)) => {
-                        eprintln!("split {c:?}: prefill {p:.0} tok/s, decode {d:.1} tok/s");
+                        eprintln!("split {c:?}: prefill {p:.0} tok/s, decode {d:.1} tok/s, prefill x decode {:.3} of the best so far", p * d / (bp * bd));
                         // Prefill and decode count the same; 3% over the best so far, above the run-to-run spread.
                         if p * d > 1.03 * bp * bd { (bp, bd, better) = (p, d, Some(c)); }
                     }
@@ -2021,9 +2050,10 @@ fn calibrate(model: &Path, aux: Option<&Path>, ctx: usize, margin: &[usize], kin
     }
 
     let Runner::Gpu(g) = &r else { unreachable!() };
-    let path = calibration_path(model, g.gpu.name());
+    let path = calibration_path(model, g.gpu.name(), device);
     std::fs::create_dir_all(path.parent().unwrap())?;
-    let mut v = json!({"chunk": chunk.0, "mtp": mtp.0, "short": short, "ctx": ctx, "gpu": g.gpu.device(),
+    // The file size tells another file of the same name (another repo or quant source) from this one.
+    let mut v = json!({"chunk": chunk.0, "mtp": mtp.0, "short": short, "ctx": ctx, "gpu": g.gpu.device(), "bytes": std::fs::metadata(model)?.len(),
         "measured": {"prefill_tok_s": chunk.1.round(), "decode_tok_s": (mtp.1 * 10.0).round() / 10.0}});
     if let Some(a) = aux.and_then(|a| a.file_name()) { v["aux"] = a.to_string_lossy().into(); }
     // Only a split that was measured as faster, or given by hand: without one, later runs split by the free VRAM
@@ -2739,7 +2769,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let options = json!({"ctx": e.ctx, "kv": e.kv, "cache_ram": e.cache_ram, "vram_margin": e.vram_margin.join(","), "mtp": e.mtp, "chunk": e.chunk,
                 "gpu": e.gpu, "ctx_train": s.stats.lock().unwrap().ctx_train,
                 // false: a GPU model with no calibration file (the page offers to calibrate it).
-                "calibrated": l.as_ref().filter(|_| e.gpu).map(|l| calibration_path(&l.path, &s.stats.lock().unwrap().backend).exists())});
+                "calibrated": l.as_ref().filter(|_| e.gpu).map(|l| calibration_path(&l.path, &s.stats.lock().unwrap().backend, &e.device).exists())});
             send(&mut w, "200 OK", json!({"dir": s.dir, "models": models, "options": options}))
         }
         // Answered once the model has loaded (or failed to).
@@ -3070,6 +3100,16 @@ mod flag_tests {
         assert!(!super::calibration_fits(&v, "NVIDIA GeForce RTX 3060"));
         assert!(super::calibration_fits(&serde_json::json!({"chunk": 4096}), "NVIDIA GeForce RTX 3060"));  // older file
         assert!(super::calibration_fits(&v, ""));  // the driver gave no name
+    }
+
+    #[test]
+    fn calibration_file_per_backend_and_device_set() {
+        let name = |b, d: &[usize]| super::calibration_path(std::path::Path::new("/m/Q-8B.gguf"), b, d).file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name("cuda", &[0]), "strata-Q-8B.json");
+        assert_eq!(name("cuda", &[1]), "strata-Q-8B.json");
+        assert_eq!(name("vulkan", &[0]), "strata-Q-8B-vulkan.json");
+        assert_eq!(name("vulkan", &[0, 1]), "strata-Q-8B-vulkan-dev0-1.json");
+        assert_eq!(name("cuda", &[1, 0]), "strata-Q-8B-dev1-0.json");
     }
     #[cfg(target_os = "linux")]
     use super::cpu_topology_groups;

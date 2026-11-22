@@ -278,88 +278,45 @@ pub fn serve(
     let projector = mmproj.map(crate::vision::VisionProjector::open).transpose()?;
     let stop = stop_ids(&tok);
     let ctx = crate::ctx_limit(m.cfg.n_ctx_train);
-    let l = std::net::TcpListener::bind(addr)?;
-    eprintln!("gemma4 serve on http://{addr}/ model {name}");
-    for c in l.incoming() {
-        let Ok(mut c) = c else { continue };
-        let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-        let _ = c.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-        let Ok(r) = crate::serve::read_request(&mut std::io::BufReader::new(&c)) else { continue };
-        let send = |c: &mut std::net::TcpStream, status: &str, ty: &str, b: &str| {
-            let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
-        };
-        let path = r.path.split('?').next().unwrap_or("");
-        if path != "/health" && api_key.is_none() && !crate::serve::host_ok(&r.host, addr, &[]) {
-            send(&mut c, "403 Forbidden", "application/json", r#"{"error":{"message":"bad Host header"}}"#);
-            continue;
-        }
-        if crate::serve::side_page(&mut c, &r.method, path, name, api_key.is_none_or(|k| crate::serve::key_ok(&r.auth, k))) { continue; }
-        if path != "/health" && api_key.is_some_and(|k| !crate::serve::key_ok(&r.auth, k)) {
-            send(&mut c, "401 Unauthorized", "application/json", r#"{"error":{"message":"missing or wrong API key","type":"invalid_api_key"}}"#);
-            continue;
-        }
-        match (r.method.as_str(), path) {
-            ("GET", "/health") => send(&mut c, "200 OK", "application/json", r#"{"status":"ok"}"#),
-            ("GET", "/v1/models") => send(&mut c, "200 OK", "application/json", &json!({"object": "list", "data": [{"id": name, "object": "model", "owned_by": "strata"}]}).to_string()),
-            ("POST", "/v1/chat/completions") => {
-                let q = match crate::serve::chat_request(&r.body) {
-                    Ok(q) => q,
-                    Err(e) => { send(&mut c, "400 Bad Request", "application/json", &json!({"error": {"message": format!("{e:#}"), "type": "invalid_request_error"}}).to_string()); continue }
-                };
-                if !q.tools.is_empty() || q.messages.iter().any(|m| m.role == "tool") {
-                    send(&mut c, "400 Bad Request", "application/json", r#"{"error":{"message":"tools are not supported for gemma4","type":"invalid_request_error"}}"#);
-                    continue;
-                }
-                let encoded = (|| -> anyhow::Result<(Vec<(usize, usize)>, Vec<Vec<Vec<f32>>>)> {
-                    let mut grids = vec![];
-                    let mut embs = vec![];
-                    for msg in &q.messages {
-                        for src in &msg.images {
-                            let p = projector.as_ref().context("this server has no --mmproj")?;
-                            let img = crate::vision::load_image(src)?;
-                            let (feats, nx, ny) = crate::vision::encode_image(p, &img)?;
-                            grids.push((nx, ny));
-                            embs.push(feats);
-                        }
-                    }
-                    Ok((grids, embs))
-                })();
-                let (grids, embs) = match encoded {
-                    Ok(v) => v,
-                    Err(e) => { send(&mut c, "400 Bad Request", "application/json", &json!({"error": {"message": format!("{e:#}"), "type": "invalid_request_error"}}).to_string()); continue }
-                };
-                let view: Vec<(&str, &str)> = q.messages.iter().map(|m| (m.role.as_str(), m.content.as_str())).collect();
-                let images = if grids.is_empty() { None } else { Some((&grids[..], &embs[..])) };
-                let seq = match prompt_seq(&tok, &chat_prompt(&view, q.think.unwrap_or(false)), images) {
-                    Ok(s) => s,
-                    Err(e) => { send(&mut c, "400 Bad Request", "application/json", &json!({"error": {"message": format!("{e:#}"), "type": "invalid_request_error"}}).to_string()); continue }
-                };
-                let ids: Vec<u32> = seq.iter().map(|(id, _)| *id).collect();
-                if ids.len() >= ctx {
-                    send(&mut c, "400 Bad Request", "application/json", &json!({"error": {"message": format!("prompt is {} tokens, the limit is {}", ids.len(), ctx - 1), "type": "invalid_request_error"}}).to_string());
-                    continue;
-                }
-                let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
-                let logits = feed(&mut m, &seq[keep..])?;
-                let n = q.max_tokens.unwrap_or(256).min(ctx - ids.len());
-                if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
-                let stream = q.stream;
-                let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
-                let (out, done) = decode_greedy(&tok, &mut m, &stop, logits, n, &mut |t| {
-                    !stream || t.is_empty() || write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok()
-                });
-                if stream {
-                    let _ = write!(c, "data: {}\n\ndata: [DONE]\n\n", chunk(json!({}), Some(done)));
-                } else {
-                    let b = json!({"object": "chat.completion", "model": name, "choices": [{"index": 0, "message": {"role": "assistant", "content": tok.decode(&out)?}, "finish_reason": done}],
-                        "usage": {"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len()}});
-                    send(&mut c, "200 OK", "application/json", &b.to_string());
-                }
+    crate::serve::own(name, addr, api_key, "gemma4", |c, q| {
+        anyhow::ensure!(q.tools.is_empty() && !q.messages.iter().any(|m| m.role == "tool"), "tools are not supported for gemma4");
+        let mut grids = vec![];
+        let mut embs = vec![];
+        for msg in &q.messages {
+            for src in &msg.images {
+                let p = projector.as_ref().context("this server has no --mmproj")?;
+                let img = crate::vision::load_image(src)?;
+                let (feats, nx, ny) = crate::vision::encode_image(p, &img)?;
+                grids.push((nx, ny));
+                embs.push(feats);
             }
-            _ => send(&mut c, "404 Not Found", "application/json", r#"{"error":{"message":"not found"}}"#),
         }
-    }
-    Ok(())
+        let view: Vec<(&str, &str)> = q.messages.iter().map(|m| (m.role.as_str(), m.content.as_str())).collect();
+        let images = if grids.is_empty() { None } else { Some((&grids[..], &embs[..])) };
+        let seq = prompt_seq(&tok, &chat_prompt(&view, q.think.unwrap_or(false)), images)?;
+        let ids: Vec<u32> = seq.iter().map(|(id, _)| *id).collect();
+        anyhow::ensure!(ids.len() < ctx, "prompt is {} tokens, the limit is {}", ids.len(), ctx - 1);
+        let t = std::time::Instant::now();
+        let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
+        // A failed feed leaves part of the prompt in the cache, so the next request starts over.
+        let logits = match feed(&mut m, &seq[keep..]) { Ok(l) => l, Err(e) => { m.reset(); return Err(e) } };
+        let prefill_s = t.elapsed().as_secs_f64();
+        let n = q.max_tokens.unwrap_or(256).min(ctx - ids.len());
+        if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
+        let stream = q.stream;
+        let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
+        let (out, done) = decode_greedy(&tok, &mut m, &stop, logits, n, &mut |t| {
+            !stream || t.is_empty() || write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok()
+        });
+        if stream {
+            let _ = write!(c, "data: {}\n\ndata: [DONE]\n\n", chunk(json!({}), Some(done)));
+        } else {
+            let b = json!({"object": "chat.completion", "model": name, "choices": [{"index": 0, "message": {"role": "assistant", "content": tok.decode(&out)?}, "finish_reason": done}],
+                "usage": {"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len()}});
+            crate::serve::send(c, "200 OK", "application/json", &b.to_string());
+        }
+        Ok(crate::serve::Done { prompt: ids.len(), cached: keep, completion: out.len(), prefill_s, finish: done })
+    })
 }
 
 /// EOS plus the end-of-turn token that llama.cpp treats as EOG for gemma4.

@@ -94,7 +94,10 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   `XDG_CACHE_HOME` moves that folder to `$XDG_CACHE_HOME/rusting_strata` (on Windows it is
   `%LOCALAPPDATA%\rusting_strata`). In a container, set it to a mounted path: `docker run --rm` otherwise discards
   the file on exit, and the next container runs uncalibrated. The file names the GPU it was measured on, and a file
-  measured on another GPU is ignored with a warning.
+  measured on another GPU is ignored with a warning. It also holds the size of the GGUF file: another file with the
+  same name (from another repo or quantizer) does not use it, and a warning asks to calibrate again. Vulkan adds
+  `-vulkan` to the name, and a run on several cards adds the devices in `--device` order (`-dev0-1`), so a two-card
+  calibration does not replace the one-card one.
 - `STRATA_AVX512=1` uses the AVX-512 kernels for experts that run on the CPU, in a build for a CPU that has
   AVX-512 VNNI and VBMI (a `target-cpu=native` build on such a machine; the release binaries do not have them). Their
   results differ from the default kernels in the last bits, so greedy output can change at a near tie.
@@ -109,6 +112,10 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 - `calibrate --mtp-model PATH` or `--draft-model PATH` measures with that draft file loaded, so the chunk and the
   expert placement see the VRAM it takes, and picks the draft count. Runs with the same `--mtp-model` or
   `--draft-model` file use that count unless `--mtp` is given; runs with another draft file or none do not.
+- `calibrate --model ~/models` calibrates every model in a folder (and its subfolders, as the chat page lists them),
+  one after another, with the other flags applied to each. A model that fails is reported and the rest go on; Inkling
+  2, Hy4, GLM, DeepSeek and Gemma 4 models are skipped, they do not read a calibration. `--mtp-model` and
+  `--draft-model` need a single file.
 - `--thinking-budget N` (`chat` and `serve`) ends the thinking block after `N` tokens by inserting `</think>`,
   so the model goes on to the answer (0, the default, is no limit). A request overrides it with
   `thinking_budget` or `chat_template_kwargs.thinking_budget` (Anthropic: `thinking.budget_tokens`).
@@ -126,6 +133,8 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 - `--alias prism` (`serve`) is the model name in `/v1/models` and in the replies, whatever file is loaded (default: the
   file name), so clients set up for `prism` keep working when another model is loaded. Calibration and the expert
   profile stay per file.
+- Inkling 2, Hy4, GLM, DeepSeek and Gemma 4 have their own server: start it with `serve --model <file>`. It serves
+  that one model (greedy), and the chat page of a server started with another model, or with none, cannot load them.
 - `--lora PATH:SCALE` applies a LoRA adapter at runtime, see [LORA.md](LORA.md).
 - `--mcp FILE` (`serve` only, or `STRATA_MCP`) lists the MCP servers whose tools the chat page may call, see
   [Tools (MCP)](#tools-mcp).
@@ -192,11 +201,13 @@ integrated ones. The load prints the card of every index (`cuda device 1: ...` o
 The split by free VRAM does not know which card is faster or which sits on a slow PCIe link (x1 riser, x4 slot).
 `rustingstrata calibrate --model M.gguf --device 0,1` measures it: it times prefill and decode with the split by free
 VRAM, then with layers moved from one card to the other in steps of 15% of the layers, and follows the faster
-direction for up to three rounds. A split that is more than 3% faster (prefill tok/s times decode tok/s) is written to
-the calibration file as layers per card, and later runs with the same cards in the same `--device` order load with it.
+direction for up to three rounds. A split that is more than 3% faster (prefill tok/s times decode tok/s; each split line prints this product as
+a share of the best one so far) is written to the calibration file as layers per card, and later runs with the same
+cards in the same `--device` order load with it.
 A card with fewer layers keeps more of their experts in VRAM, so fewer are uploaded to it during prefill, and the other
 card then keeps fewer of its own: the timings decide. The order of the cards is not searched: to compare, calibrate
-`--device 1,0` too and calibrate the faster order last (the file holds the last calibration).
+`--device 1,0` too. Each order has its own file (`strata-<model>-dev0-1.json`, `-dev1-0.json`), and a run uses the
+file of the order it is given.
 
 `--split 30,70` (or `STRATA_SPLIT=30,70`) sets the share of the layers per card by hand, in `--device` order, and
 takes precedence over the calibrated split; `calibrate --split 30,70` measures chunk and drafts with that split and

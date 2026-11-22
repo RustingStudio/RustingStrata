@@ -179,88 +179,53 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
 /// ponytail: greedy only, no stop strings; thinking (`"think": true`) arrives inside `content` up to `</think:opensource>`;
 /// the KV cache is reused only when the new prompt extends the last sequence.
 pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow::Result<()> {
+    use anyhow::Context;
     use serde_json::json;
     gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
     let mut m = Hy4Model::new(g)?;
     let max_ctx = m.cfg.n_ctx;
-    let l = std::net::TcpListener::bind(addr)?;
-    eprintln!("hy4 serve on http://{addr}/ model {name}");
-    for c in l.incoming() {
-        let Ok(mut c) = c else { continue };
-        let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-        let _ = c.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-        let Ok(r) = crate::serve::read_request(&mut std::io::BufReader::new(&c)) else { continue };
-        let send = |c: &mut std::net::TcpStream, status: &str, b: &str| {
-            let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+    crate::serve::own(name, addr, api_key, "hy4", |c, q| {
+        let ids = tok.encode(&render(&q.messages, &q.tools, q.think.unwrap_or(false), q.preserve_thinking)).ok().filter(|i| !i.is_empty()).context("cannot encode prompt")?;
+        anyhow::ensure!(ids.len() < max_ctx, "prompt is {} tokens, the limit is {max_ctx}", ids.len());
+        let t = std::time::Instant::now();
+        let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
+        let logits = m.prefill(&ids[keep..]);
+        let prefill_s = t.elapsed().as_secs_f64();
+        let n = q.max_tokens.unwrap_or(256).min(max_ctx - ids.len());
+        if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
+        let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
+        let tools = q.tool_calls && !q.tools.is_empty();
+        let mut hold = crate::chat::Hold::new(tools, vec![]).tagged(CALLS);
+        let (out, stopped) = decode(&mut m, &tok, logits, n, |p| {
+            let t = hold.push(p);
+            !q.stream || t.is_empty() || write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok()
+        });
+        let calls = if tools { parse_calls(&hold.text) } else { None };
+        let done = if calls.is_some() { "tool_calls" } else if stopped { "stop" } else { "length" };
+        let calls_json = |(content, calls): &(String, Vec<(String, String)>), stream: bool| {
+            let c: Vec<_> = calls.iter().enumerate().map(|(k, (f, a))| {
+                let mut c = json!({"id": format!("call_{k}"), "type": "function", "function": {"name": f, "arguments": a}});
+                if stream { c["index"] = k.into(); }
+                c
+            }).collect();
+            if stream { json!({"tool_calls": c}) } else { json!({"role": "assistant", "content": if content.is_empty() { None } else { Some(content) }, "tool_calls": c}) }
         };
-        let bad = |c: &mut std::net::TcpStream, msg: String| send(c, "400 Bad Request", &json!({"error": {"message": msg, "type": "invalid_request_error"}}).to_string());
-        let path = r.path.split('?').next().unwrap_or("");
-        // /health stays open for load balancers. Without a key the Host check stops DNS rebinding, as in the main server.
-        if path != "/health" && api_key.is_none() && !crate::serve::host_ok(&r.host, addr, &[]) {
-            send(&mut c, "403 Forbidden", r#"{"error":{"message":"bad Host header"}}"#);
-            continue;
-        }
-        if crate::serve::side_page(&mut c, &r.method, path, name, api_key.is_none_or(|k| crate::serve::key_ok(&r.auth, k))) { continue; }
-        if path != "/health" && api_key.is_some_and(|k| !crate::serve::key_ok(&r.auth, k)) {
-            send(&mut c, "401 Unauthorized", r#"{"error":{"message":"missing or wrong API key","type":"invalid_api_key"}}"#);
-            continue;
-        }
-        match (r.method.as_str(), path) {
-            ("GET", "/health") => send(&mut c, "200 OK", r#"{"status":"ok"}"#),
-            ("GET", "/v1/models") => send(&mut c, "200 OK", &json!({"object": "list", "data": [{"id": name, "object": "model", "owned_by": "strata"}]}).to_string()),
-            ("POST", "/v1/chat/completions") => {
-                let q = match crate::serve::chat_request(&r.body) {
-                    Ok(q) => q,
-                    Err(e) => { bad(&mut c, format!("{e:#}")); continue }
-                };
-                let ids = match tok.encode(&render(&q.messages, &q.tools, q.think.unwrap_or(false), q.preserve_thinking)) {
-                    Ok(i) if !i.is_empty() => i,
-                    _ => { bad(&mut c, "cannot encode prompt".into()); continue }
-                };
-                if ids.len() >= max_ctx {
-                    bad(&mut c, format!("prompt is {} tokens, the limit is {max_ctx}", ids.len()));
-                    continue;
-                }
-                let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
-                let logits = m.prefill(&ids[keep..]);
-                let n = q.max_tokens.unwrap_or(256).min(max_ctx - ids.len());
-                if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
-                let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
-                let tools = q.tool_calls && !q.tools.is_empty();
-                let mut hold = crate::chat::Hold::new(tools, vec![]).tagged(CALLS);
-                let (out, stopped) = decode(&mut m, &tok, logits, n, |p| {
-                    let t = hold.push(p);
-                    !q.stream || t.is_empty() || write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok()
-                });
-                let calls = if tools { parse_calls(&hold.text) } else { None };
-                let done = if calls.is_some() { "tool_calls" } else if stopped { "stop" } else { "length" };
-                let calls_json = |(content, calls): &(String, Vec<(String, String)>), stream: bool| {
-                    let c: Vec<_> = calls.iter().enumerate().map(|(k, (f, a))| {
-                        let mut c = json!({"id": format!("call_{k}"), "type": "function", "function": {"name": f, "arguments": a}});
-                        if stream { c["index"] = k.into(); }
-                        c
-                    }).collect();
-                    if stream { json!({"tool_calls": c}) } else { json!({"role": "assistant", "content": if content.is_empty() { None } else { Some(content) }, "tool_calls": c}) }
-                };
-                if q.stream {
-                    match &calls {
-                        Some(x) => { let _ = write!(c, "data: {}\n\n", chunk(calls_json(x, true), None)); }
-                        None if !hold.rest().is_empty() => { let _ = write!(c, "data: {}\n\n", chunk(json!({"content": hold.rest()}), None)); }
-                        None => {}
-                    }
-                    let _ = write!(c, "data: {}\n\ndata: [DONE]\n\n", chunk(json!({}), Some(done)));
-                } else {
-                    let message = match &calls { Some(x) => calls_json(x, false), None => json!({"role": "assistant", "content": hold.text}) };
-                    let b = json!({"object": "chat.completion", "model": name, "choices": [{"index": 0, "message": message, "finish_reason": done}],
-                        "usage": {"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len()}});
-                    send(&mut c, "200 OK", &b.to_string());
-                }
+        if q.stream {
+            match &calls {
+                Some(x) => { let _ = write!(c, "data: {}\n\n", chunk(calls_json(x, true), None)); }
+                None if !hold.rest().is_empty() => { let _ = write!(c, "data: {}\n\n", chunk(json!({"content": hold.rest()}), None)); }
+                None => {}
             }
-            _ => send(&mut c, "404 Not Found", r#"{"error":{"message":"not found"}}"#),
+            let _ = write!(c, "data: {}\n\ndata: [DONE]\n\n", chunk(json!({}), Some(done)));
+        } else {
+            let message = match &calls { Some(x) => calls_json(x, false), None => json!({"role": "assistant", "content": hold.text}) };
+            let b = json!({"object": "chat.completion", "model": name, "choices": [{"index": 0, "message": message, "finish_reason": done}],
+                "usage": {"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len()}});
+            crate::serve::send(c, "200 OK", "application/json", &b.to_string());
         }
-    }
-    Ok(())
+        Ok(crate::serve::Done { prompt: ids.len(), cached: keep, completion: out.len(), prefill_s, finish: done })
+    })
 }
 
 #[test]

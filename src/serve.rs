@@ -115,6 +115,65 @@ pub fn side_page(c: &mut impl std::io::Write, method: &str, path: &str, name: &s
     true
 }
 
+/// What a chat of a model outside the main engine did, for the `done:` line of [`own`].
+pub struct Done { pub prompt: usize, pub cached: usize, pub completion: usize, pub prefill_s: f64, pub finish: &'static str }
+
+/// Writes one response with a body.
+pub fn send(c: &mut impl std::io::Write, status: &str, ty: &str, b: &str) {
+    let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+}
+
+/// The server of a model outside the main engine (Gemma 4, GLM, DeepSeek, Hy4, Inkling 2): one model, no loading.
+/// It checks the Host and the key as the main server does, answers the page (`side_page`), /health and /v1/models,
+/// and passes each POST /v1/chat/completions to `chat`, which writes the reply and returns what it did. An error
+/// from `chat` is answered with a 400 (it fails before it writes anything). Logs a `request:` and a `done:` line per
+/// chat, like the main server.
+pub fn own(name: &str, addr: &str, api_key: Option<&str>, arch: &str,
+    mut chat: impl FnMut(&mut std::net::TcpStream, &ChatRequest) -> anyhow::Result<Done>) -> anyhow::Result<()> {
+    use serde_json::json;
+    let l = std::net::TcpListener::bind(addr)?;
+    eprintln!("{arch} serve on http://{addr}/ model {name}");
+    for c in l.incoming() {
+        let Ok(mut c) = c else { continue };
+        let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+        let _ = c.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+        let Ok(r) = read_request(&mut std::io::BufReader::new(&c)) else { continue };
+        let path = r.path.split('?').next().unwrap_or("");
+        // /health stays open for load balancers, like the main server.
+        // Without a key the Host check stops DNS rebinding, as in the main server.
+        if path != "/health" && api_key.is_none() && !host_ok(&r.host, addr, &[]) {
+            send(&mut c, "403 Forbidden", "application/json", r#"{"error":{"message":"bad Host header"}}"#);
+            continue;
+        }
+        if side_page(&mut c, &r.method, path, name, api_key.is_none_or(|k| key_ok(&r.auth, k))) { continue; }
+        if path != "/health" && api_key.is_some_and(|k| !key_ok(&r.auth, k)) {
+            send(&mut c, "401 Unauthorized", "application/json", r#"{"error":{"message":"missing or wrong API key","type":"invalid_api_key"}}"#);
+            continue;
+        }
+        let bad = |c: &mut std::net::TcpStream, e: anyhow::Error| send(c, "400 Bad Request", "application/json", &json!({"error": {"message": format!("{e:#}"), "type": "invalid_request_error"}}).to_string());
+        match (r.method.as_str(), path) {
+            ("GET", "/health") => send(&mut c, "200 OK", "application/json", r#"{"status":"ok"}"#),
+            ("GET", "/v1/models") => send(&mut c, "200 OK", "application/json", &json!({"object": "list", "data": [{"id": name, "object": "model", "owned_by": "strata"}]}).to_string()),
+            ("POST", "/v1/chat/completions") => {
+                let q = match chat_request(&r.body) { Ok(q) => q, Err(e) => { bad(&mut c, e); continue } };
+                let key = if api_key.is_some() { "key" } else { "open" };
+                eprintln!("request: POST {path} key={key} model={name} messages={} stream={} tools={}", q.messages.len(), q.stream, q.tools.len());
+                let t = std::time::Instant::now();
+                match chat(&mut c, &q) {
+                    Ok(d) => {
+                        let decode_s = (t.elapsed().as_secs_f64() - d.prefill_s).max(1e-9);
+                        eprintln!("done: key={key} model={name} prompt={} tok ({} cached) -> {} tok in {decode_s:.2} s, decode {:.1} tok/s, prefill {:.1} tok/s, finish={}",
+                            d.prompt, d.cached, d.completion, d.completion as f64 / decode_s, (d.prompt - d.cached) as f64 / d.prefill_s.max(1e-9), d.finish);
+                    }
+                    Err(e) => { eprintln!("request: {e:#}"); bad(&mut c, e) }
+                }
+            }
+            _ => send(&mut c, "404 Not Found", "application/json", r#"{"error":{"message":"not found"}}"#),
+        }
+    }
+    Ok(())
+}
+
 pub fn key_ok(auth: &str, key: &str) -> bool {
     if key.is_empty() { return false; }
     let a = auth.strip_prefix("Bearer ").unwrap_or("").as_bytes();
