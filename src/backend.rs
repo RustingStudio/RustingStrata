@@ -205,8 +205,11 @@ pub trait Backend: Send {
         Ok(GpuTensor::new(t.ty, t.rows, t.cols, b).with_scale(t.scale))
     }
 
-    /// u16 words of a KV cache for `n` values: f16, or q8 with one f16 scale per 32 values.
+    /// u16 words of a KV cache row for `n` values in the K format (and, separately, the V format).
+    /// `kv_row_words` is the size of one K row plus one V row.
     fn kv_words(&self, n: usize) -> usize;
+    fn kv_words_v(&self, n: usize) -> usize { self.kv_words(n) }
+    fn kv_row_words(&self, n: usize) -> usize { self.kv_words(n) + self.kv_words_v(n) }
     /// GEMM over a tile list: for each tile, positions m0 .. m0 + cnt get y[m, 0..rows] = W_tile x[xrow[m]] (x row m
     /// when `xrow` is 0). `tiles` is a device array of [w, m0 | cnt << 32]. `act`: 0 stores, 1 computes
     /// y = silu(y) * result (SwiGLU with the gate already in y), 2 adds to y; `| SAME_X` as below. `n_x`: rows of x

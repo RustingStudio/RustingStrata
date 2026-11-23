@@ -45,8 +45,9 @@ pub struct Gpu {
     /// `gemmd_*` scratch for a GEMM that two blocks share the columns of: a slot per stream (see `GEMMD_SLOT`),
     /// allocated by the first such GEMM.
     gd: std::sync::OnceLock<CudaSlice<u8>>,
-    /// The kernels were compiled for KV cache mode (0 = f16, 1 = q8, 2 = q4).
-    pub kv_mode: u32,
+    /// The kernels were compiled for these independent K and V cache modes.
+    pub kv_k_mode: u32,
+    pub kv_v_mode: u32,
     /// The GPU has int8 tensor-core mma (sm_80+). Turing runs the prefill GEMM on the f16 path instead.
     pub int8_mma: bool,
     /// sm_75: m16n8k8 mma, 64 KB of shared memory a block (no int8 mma, unlike sm_80+; unlike sm_70 it has no m8n8k4).
@@ -95,22 +96,52 @@ unsafe impl Send for Graph {}
 /// and run attention as its CPU flash attention does (LLAMA_Q8 in kernels.cu).
 pub fn llama_numerics() -> bool { std::env::var_os("STRATA_LLAMA_NUMERICS").is_some() }
 
-/// KV cache mode: `0 = f16`, `1 = q8`, `2 = q4`, `3 = q2`, `4..9 = TurboQuant (K bits, V bits)`.
-/// Modes: 4=4/4, 5=4/3, 6=4/2, 7=3/3, 8=2/2, 9=3/2.
-pub fn kv_mode() -> u32 {
-    if let Ok(v) = std::env::var("STRATA_KV") {
-        return match v.as_str() {
-            "q2" => 3, "q4" => 2, "q8" => 1,
-            "turbo4" | "turboquant" => 4,
-            "turbo4-3" | "turbo4v3" => 5,
-            "turbo4-2" | "turbo4v2" => 6,
-            "turbo3" => 7,
-            "turbo2" => 8,
-            "turbo3-2" | "turbo3v2" => 9,
-            _ => 0,
+/// Independent per-side cache modes: `0 = f16`, `1 = q8`, `2 = q4`, `3 = q2`,
+/// `4 = turbo4`, `5 = turbo3`, `6 = turbo2`. The K and V halves may differ.
+fn parse_kv_mode(s: &str) -> u32 {
+    match s {
+        "q2" => 3, "q4" => 2, "q8" => 1,
+        "turbo4" | "turboquant" => 4,
+        "turbo3" => 5,
+        "turbo2" => 6,
+        _ => 0,
+    }
+}
+
+pub fn kv_k_mode() -> u32 {
+    if let Ok(s) = std::env::var("STRATA_KV_K") { return parse_kv_mode(&s); }
+    if let Ok(s) = std::env::var("STRATA_KV") {
+        return match s.as_str() {
+            "turbo4-3" | "turbo4v3" => 4, "turbo4-2" | "turbo4v2" => 4,
+            "turbo3-2" | "turbo3v2" => 5,
+            other => parse_kv_mode(other),
         };
     }
     u32::from(std::env::var_os("STRATA_KV_Q8").is_some())
+}
+
+pub fn kv_v_mode() -> u32 {
+    if let Ok(s) = std::env::var("STRATA_KV_V") { return parse_kv_mode(&s); }
+    if let Ok(s) = std::env::var("STRATA_KV") {
+        return match s.as_str() {
+            "turbo4-3" | "turbo4v3" => 5, "turbo4-2" | "turbo4v2" => 6,
+            "turbo3-2" | "turbo3v2" => 6,
+            other => parse_kv_mode(other),
+        };
+    }
+    u32::from(std::env::var_os("STRATA_KV_Q8").is_some())
+}
+
+/// Legacy symmetric view: the shared mode when K and V match, 10 for a mixed layout.
+/// Callers that only care about "is the cache quantized at all" keep working.
+pub fn kv_mode() -> u32 {
+    let (k, v) = (kv_k_mode(), kv_v_mode());
+    if k == v { k } else { 10 }
+}
+
+/// u16 words a cache row of `n` values occupies in mode `m`.
+fn kv_mode_words(m: u32, n: usize) -> usize {
+    match m { 1 => n * 17 / 32, 2 | 4..=6 => n * 9 / 32, 3 => n * 3 / 16, _ => n }
 }
 
 /// `--kv q8`: KV cache rows in ggml q8_0 form (`kv_mode() == 1`).
@@ -185,9 +216,10 @@ pub(crate) fn gemv_block_from(global: Option<&str>, family: Option<&str>) -> u32
         .unwrap_or(256)
 }
 
-fn source(kv_mode: u32, gemm_tc: bool) -> String { source_with(kv_mode, gemm_tc, Tune::from_env()) }
+fn source(k_mode: u32, v_mode: u32, gemm_tc: bool) -> String { source_with(k_mode, v_mode, gemm_tc, Tune::from_env()) }
 
-fn source_with(kv_mode: u32, gemm_tc: bool, tune: Tune) -> String {
+fn source_with(k_mode: u32, v_mode: u32, gemm_tc: bool, tune: Tune) -> String {
+    let tq_bits = |m: u32| match m { 5 => 3, 6 => 2, _ => 4 };
     let join = |v: Vec<String>| v.join(",");
     format!(
         "__device__ const unsigned long long iq2xs_grid[512] = {{{}}};\n\
@@ -199,7 +231,7 @@ fn source_with(kv_mode: u32, gemm_tc: bool, tune: Tune) -> String {
          __device__ const unsigned char ksigns_iq2xs[128] = {{{}}};\n\
          __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n\
          __device__ const float tq_lut[4096] = {{{}}};\n\
-          #define LLAMA_Q8 {}\n#define KV_MODE {}\n#define TQ_KBITS {}\n#define TQ_VBITS {}\n#define GEMM_TC {}\n\
+          #define LLAMA_Q8 {}\n#define KV_MODE {}\n#define K_MODE {}\n#define V_MODE {}\n#define TQ_KBITS {}\n#define TQ_VBITS {}\n#define GEMM_TC {}\n\
          #define GEMM_BM {}\n#define GEMM_BK {}\n#define GEMM_MIN_BLOCKS {}\n#define GEMV_LOADW {}\n\
          #define FA_BQ {}\n#define FA_BK {}\n{}",
         join(IQ2XS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
@@ -212,9 +244,11 @@ fn source_with(kv_mode: u32, gemm_tc: bool, tune: Tune) -> String {
         join(KVALUES_IQ4NL.iter().map(|v| v.to_string()).collect()),
         join(crate::quant::TQ_LUT.iter().flatten().map(|v| format!("{v:e}f")).collect()),
         llama_numerics() as u8,
-        kv_mode as u8,
-        match kv_mode { 5 | 6 => 4, 7 | 9 => 3, 8 => 2, _ => 4 },
-        match kv_mode { 5 => 3, 6 | 9 => 2, _ => 4 },
+        k_mode as u8,  // legacy KV_MODE alias: the K half, for code not yet split
+        k_mode as u8,
+        v_mode as u8,
+        tq_bits(k_mode),
+        tq_bits(v_mode),
         gemm_tc as u8,
         GEMM_BM,
         tune.gemm_bk,
@@ -488,8 +522,8 @@ pub fn device_uuids() -> Vec<Option<[u8; 16]>> {
 
 impl Gpu {
     pub fn new(device: usize) -> anyhow::Result<Gpu> {
-        let kv_mode = kv_mode();
-        anyhow::ensure!(!(kv_mode > 0 && llama_numerics()), "--kv q8/q4 does not combine with --llama-numerics (its attention reads f16 KV)");
+        let (kv_k_mode, kv_v_mode) = (kv_k_mode(), kv_v_mode());
+        anyhow::ensure!(!((kv_k_mode > 0 || kv_v_mode > 0) && llama_numerics()), "--kv q8/q4 does not combine with --llama-numerics (its attention reads f16 KV)");
         if !unsafe { sys::is_culib_present() } {
             return Err(anyhow::anyhow!(if cfg!(windows) { "no NVIDIA driver (nvcuda.dll)" } else { "no NVIDIA driver (libcuda.so)" })).context("CUDA init");
         }
@@ -507,7 +541,7 @@ impl Gpu {
         let gemm_fma = gemm_fma();
         crate::say!("{}", device_log(device, &ctx.name().unwrap_or_default(), arch, (maj, min), gemm_fma));
         let stream = ctx.new_stream()?;
-        let module = ctx.load_module(ptx(&source(kv_mode, !gemm_fma && (maj, min) < (7, 5)), arch, (maj, min))?).context("load cubin")?;
+        let module = ctx.load_module(ptx(&source(kv_k_mode, kv_v_mode, !gemm_fma && (maj, min) < (7, 5)), arch, (maj, min))?).context("load cubin")?;
         let i8_gemm = int8_gemm_arch((maj, min));
         let turing = !int8_mma && (maj, min) >= (7, 5);
         // The per-block dynamic shared memory ceiling the driver reports: 96 KiB on Volta per the roadmap, but
@@ -548,7 +582,7 @@ impl Gpu {
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = ctx.new_event(None)?;
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, gd: Default::default(), kv_mode, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default(), cs: Default::default() })
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, gd: Default::default(), kv_k_mode, kv_v_mode, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default(), cs: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -788,7 +822,7 @@ impl Gpu {
         // attn_decode_gqa with the f16 cache at head_dim 128 or 256 also holds 2 chunks of K and V for its cp.async,
         // attn_decode_gqa4_128 one. Turing (sm_75) has 64 KB of shared memory a block: the head_dim 256 chunks do
         // not fit, so it loads them through registers instead (kernels.cu ATT_RUN_CP).
-        let cp = self.kv_mode == 0 && (hd == 128 || (hd == 256 && self.int8_mma));
+        let cp = self.kv_k_mode == 0 && self.kv_v_mode == 0 && (hd == 128 || (hd == 256 && self.int8_mma));
         let g4 = cp && g == 4 && hd == 128;
         let (name, cp) = if g4 { ("attn_decode_gqa4_128".to_string(), 2 * 32 * hd * 2) } else { (format!("attn_decode_gqa_{hd}"), if cp { 2 * 2 * 32 * hd * 2 } else { 0 }) };
         if gq_min != i32::MAX { launch!(self, &name, cfg(((nh / g * nt) as u32, ns as u32), 256, (8 * hd * 4 + cp) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32, sink, win as i32, kvt); }
@@ -826,7 +860,8 @@ impl Backend for Gpu {
             i8_gemm: self.i8_gemm,
             q8,
             gd: Default::default(),
-            kv_mode: self.kv_mode,
+            kv_k_mode: self.kv_k_mode,
+            kv_v_mode: self.kv_v_mode,
             int8_mma: self.int8_mma,
             turing: self.turing,
             max_smem: self.max_smem,
@@ -1343,15 +1378,14 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    fn kv_words(&self, n: usize) -> usize {
-        match self.kv_mode { 0 => n, 1 => n * 17 / 32, 2 | 4..=9 => n * 9 / 32, 3 => n * 3 / 16, _ => unreachable!() }
-    }
+    fn kv_words(&self, n: usize) -> usize { kv_mode_words(self.kv_k_mode, n) }
+    fn kv_words_v(&self, n: usize) -> usize { kv_mode_words(self.kv_v_mode, n) }
 
     fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()> {
         // q8/q4: each warp quantizes one 32-value block of one row.
-        anyhow::ensure!(self.kv_mode == 0 || (hd % 32 == 0 && n % hd == 0), "quantized KV cache: head_dim {hd} is not a multiple of 32");
-        if self.kv_mode >= 4 {
-            anyhow::ensure!(hd == 128, "TurboQuant KV needs head_dim 128, got {hd}");
+        anyhow::ensure!((self.kv_k_mode == 0 && self.kv_v_mode == 0) || (hd % 32 == 0 && n % hd == 0), "quantized KV cache: head_dim {hd} is not a multiple of 32");
+        if self.kv_k_mode >= 4 || self.kv_v_mode >= 4 {
+            anyhow::ensure!(hd % 128 == 0, "TurboQuant KV needs head_dim divisible by 128, got {hd}");
             launch!(self, "kv_store_turbo", cfg(((n * t / 128) as u32, 1), 128, 0),
                 k, v, kc, vc, n as i32, (n * t) as i32, step, hd as i32);
         } else {
@@ -1457,16 +1491,16 @@ mod tests {
                 return;
             }
         }
-        let src = super::source(0, true);
+        let src = super::source(0, 0, true);
         super::nvrtc::cubin(&src, "sm_70").unwrap_or_else(|e| panic!("sm_70 must compile: M1-T4 removed the last blocker: {e:#}"));
         super::nvrtc::cubin(&src, "sm_80").expect("the sm_80 path must keep compiling (cubin for sm_80)");
         // Same sm_70 source with the FMA fallback selected: both variants must produce a cubin (M2-T1).
-        super::nvrtc::cubin(&super::source(0, false), "sm_70").expect("the STRATA_GEMM_FMA sm_70 source must compile");
+        super::nvrtc::cubin(&super::source(0, 0, false), "sm_70").expect("the STRATA_GEMM_FMA sm_70 source must compile");
         // M2-T3 candidates C2 (`__launch_bounds__(·, 2)`) and C3 (`GEMM_BK = 32`) must compile before the window.
-        let c23 = super::source_with(0, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2, ..super::Tune::def() });
+        let c23 = super::source_with(0, 0, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2, ..super::Tune::def() });
         super::nvrtc::cubin(&c23, "sm_70").expect("the C2/C3 candidate tiles must compile for sm_70");
         // M2-T5 load-width candidate: one 16-byte Q4_K header load in the GEMV path must compile for both arches.
-        let lw = super::source_with(0, true, super::Tune { gemv_loadw: 1, ..super::Tune::def() });
+        let lw = super::source_with(0, 0, true, super::Tune { gemv_loadw: 1, ..super::Tune::def() });
         super::nvrtc::cubin(&lw, "sm_70").expect("the GEMV_LOADW candidate must compile for sm_70");
         super::nvrtc::cubin(&lw, "sm_80").expect("the GEMV_LOADW candidate must compile for sm_80");
     }
@@ -1475,11 +1509,11 @@ mod tests {
     #[test]
     fn nvrtc_compiles_full_source_for_sm75() {
         if !super::nvrtc::present() { return; }
-        super::nvrtc::cubin(&super::source(0, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 must compile: {e:#}"));
-        super::nvrtc::cubin(&super::source(1, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q8 must compile: {e:#}"));
-        super::nvrtc::cubin(&super::source(2, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q4 must compile: {e:#}"));
-        super::nvrtc::cubin(&super::source(3, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q2 must compile: {e:#}"));
-        super::nvrtc::cubin(&super::source(4, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_turbo4 must compile: {e:#}"));
+        super::nvrtc::cubin(&super::source(0, 0, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 must compile: {e:#}"));
+        super::nvrtc::cubin(&super::source(1, 1, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q8 must compile: {e:#}"));
+        super::nvrtc::cubin(&super::source(2, 2, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q4 must compile: {e:#}"));
+        super::nvrtc::cubin(&super::source(3, 3, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q2 must compile: {e:#}"));
+        super::nvrtc::cubin(&super::source(4, 4, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_turbo4 must compile: {e:#}"));
     }
 
     #[test]
@@ -1653,17 +1687,17 @@ mod tests {
     /// kernel; the C2/C3 window candidates only change the injected values.
     #[test]
     fn source_injects_tiles() {
-        let src = super::source_with(0, true, super::Tune::def());
+        let src = super::source_with(0, 0, true, super::Tune::def());
         for define in [
             "#define GEMM_BM 128", "#define GEMM_BK 64", "#define GEMM_MIN_BLOCKS 1", "#define GEMV_LOADW 0",
             "#define FA_BQ 64", "#define FA_BK 32",
         ] {
             assert!(src.contains(define), "source is missing `{define}`");
         }
-        let c23 = super::source_with(0, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2, ..super::Tune::def() });
+        let c23 = super::source_with(0, 0, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2, ..super::Tune::def() });
         assert!(c23.contains("#define GEMM_BK 32"));
         assert!(c23.contains("#define GEMM_MIN_BLOCKS 2"));
-        let lw = super::source_with(0, true, super::Tune { gemv_loadw: 1, ..super::Tune::def() });
+        let lw = super::source_with(0, 0, true, super::Tune { gemv_loadw: 1, ..super::Tune::def() });
         assert!(lw.contains("#define GEMV_LOADW 1"));
     }
 

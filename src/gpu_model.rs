@@ -760,7 +760,7 @@ impl<'a> GpuModel<'a> {
                     qn: lt(il, "attn_q_norm.weight")?, kn: lt(il, "attn_k_norm.weight")?, o: lt(il, "attn_output.weight")?,
                     sink: if c.attn_sinks { Some(lt(il, "attn_sinks.weight")?) } else { None },
                     kc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words(ctx * kv))).collect::<anyhow::Result<_>>()?,
-                    vc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words(ctx * kv))).collect::<anyhow::Result<_>>()?,
+                    vc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words_v(ctx * kv))).collect::<anyhow::Result<_>>()?,
                     qsa: if qsa_on && il < c.n_layer && m.w.layer(il, "indexer.k_proj.weight").is_ok() {
                         Some(Qsa {
                             kp: lt(il, "indexer.k_proj.weight")?, qp: lt(il, "indexer.q_proj.weight")?,
@@ -837,7 +837,7 @@ impl<'a> GpuModel<'a> {
                             Some(DFlashConv { base: df_lt("mlp_conv_base")?, proj: df_lt("mlp_conv_proj")? })
                         } else { None },
                         kc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words(ctx * df_kv))).collect::<anyhow::Result<_>>()?,
-                        vc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words(ctx * df_kv))).collect::<anyhow::Result<_>>()?,
+                        vc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words_v(ctx * df_kv))).collect::<anyhow::Result<_>>()?,
                         is_swa: dc.layer_swa.get(il).copied().unwrap_or(false),
                     });
                 }
@@ -922,7 +922,7 @@ impl<'a> GpuModel<'a> {
                         kn: lt(il, "nextn.hnorm.weight")?,
                         o: lt(il, "attn_output.weight")?,
                         kc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words(ctx * eg_kv))).collect::<anyhow::Result<_>>()?,
-                        vc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words(ctx * eg_kv))).collect::<anyhow::Result<_>>()?,
+                        vc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words_v(ctx * eg_kv))).collect::<anyhow::Result<_>>()?,
                         qsa: None,
                         sink: None,
                     },
@@ -1128,7 +1128,7 @@ impl<'a> GpuModel<'a> {
         let mb = |b: usize| b as f64 / 1048576.0;
         crate::say!(
             "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {ctx} tokens{}, prefill {:.0} MB), expert slots {:.0} MB, resident experts {}/{}",
-            mb(free0.saturating_sub(free1)), mb(2 * 2 * gpu.kv_words(ctx * kv) * c.layers[range.clone()].iter().filter(|&&k| k == LayerKind::Attn).count()),
+            mb(free0.saturating_sub(free1)), mb((gpu.kv_words(ctx * kv) + gpu.kv_words_v(ctx * kv)) * 2 * c.layers[range.clone()].iter().filter(|&&k| k == LayerKind::Attn).count()),
             if ns > 1 { format!(" in each of {ns} slots") } else { String::new() }, mb(pf.as_ref().map_or(0, |p| p.bytes())),
             mb(cache.as_ref().map_or(0, |x| x.slot_bytes_total())),
             cache.as_ref().map_or(0, |x| x.resident_count()), cache.as_ref().map_or(0, |x| x.total_experts()),

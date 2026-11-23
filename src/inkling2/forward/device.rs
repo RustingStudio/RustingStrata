@@ -122,7 +122,7 @@ impl PrefillScratch {
         let p = PrefillLayout::at(buf.addr(), c, rank, max_nt);
         let acc_buf = be.alloc(4 * max_nt * c.n_embd)?;
         let kw = c.n_head_kv * c.head_dim;
-        let rb = 2 * be.kv_words(kw);
+        let rb = be.kv_row_words(kw);
         let kv_bytes = max_nt * rb;
         let (kc_tmp, vc_tmp) = (be.alloc(kv_bytes)?, be.alloc(kv_bytes)?);
         let max_np = max_nt * c.n_used;
@@ -258,8 +258,8 @@ impl Device {
                 [l.wq, l.wk, l.wv, l.wo, l.gate, l.rel, l.sink].iter().chain(l.conv_proj.iter().flatten()).all(dense)
             }) { return None; }
             let rows: usize = (0..c.n_slot()).map(|il| if c.swa[layer_of(c, il)] { c.n_swa } else { full }).sum();
-            let row_words = d.parts[0].be.kv_words(kw);
-            room(&mut d, 4 * rows * row_words + sc_bytes(c, full) + Scratch::at(0, c, rank, m.output.rows).end as usize + (512 << 20));
+            let kv_bytes = 2 * rows * d.parts[0].be.kv_row_words(kw);
+            room(&mut d, kv_bytes + sc_bytes(c, full) + Scratch::at(0, c, rank, m.output.rows).end as usize + (512 << 20));
         }
         let made = (|| -> Result<Self> {
             let (mut layers, loops, slots, out_query, out_norm, scr, sc_buf) = {
@@ -281,10 +281,10 @@ impl Device {
                 let loops = m.loops.iter().map(|l| {
                     Ok(DLoop { msg_query: up(be, &l.msg_query)?, down: half(&l.down)?, gain: half(&l.gain)?, forget: half(&l.forget)? })
                 }).collect::<Result<Vec<_>>>()?;
-                let row_words = be.kv_words(kw);
+                let (kwk, kwv) = (be.kv_words(kw), be.kv_words_v(kw));
                 let slots = (0..c.n_slot()).map(|il| {
                     let rows = if c.swa[layer_of(c, il)] { c.n_swa } else { full };
-                    Ok(DSlot { k: be.alloc(2 * rows * row_words)?, v: be.alloc(2 * rows * row_words)?, hist: be.zeros::<f32>(hists(c).1)?, cap: rows })
+                    Ok(DSlot { k: be.alloc(2 * rows * kwk)?, v: be.alloc(2 * rows * kwv)?, hist: be.zeros::<f32>(hists(c).1)?, cap: rows })
                 }).collect::<Result<Vec<_>>>()?;
                 let sc_buf = be.alloc(sc_bytes(c, (pos + 1).max(64)))?;
                 let (out_query, out_norm, scr) = (up(be, &m.out_query)?, up(be, &m.out_norm)?, be.alloc(Scratch::at(0, c, rank, m.output.rows).end as usize)?);
@@ -358,14 +358,14 @@ impl Device {
         let be = &*d.parts[0].be;
         let len = hists(c).1;
         let kw = c.n_head_kv * c.head_dim;
-        let swa_words = c.n_swa * be.kv_words(kw);
+        let (swa_k, swa_v) = (c.n_swa * be.kv_words(kw), c.n_swa * be.kv_words_v(kw));
         let mut dev_hist = Vec::with_capacity(self.slots.len());
         let mut dev_swa = Vec::with_capacity(self.slots.len());
         for (il, ds) in self.slots.iter().enumerate() {
             dev_hist.push(be.get(&ds.hist, 0, len).expect("inkling2 save_checkpoint hist"));
             if c.swa[layer_of(c, il)] {
-                let k: Vec<u16> = be.get(&ds.k, 0, swa_words).expect("inkling2 save_checkpoint swa k");
-                let v: Vec<u16> = be.get(&ds.v, 0, swa_words).expect("inkling2 save_checkpoint swa v");
+                let k: Vec<u16> = be.get(&ds.k, 0, swa_k).expect("inkling2 save_checkpoint swa k");
+                let v: Vec<u16> = be.get(&ds.v, 0, swa_v).expect("inkling2 save_checkpoint swa v");
                 dev_swa.push(Some((k, v)));
             } else {
                 dev_swa.push(None);
@@ -401,13 +401,13 @@ impl Device {
         let need = need_pos + 1;
         ensure!(need <= m.max_ctx, "context is limited to {} tokens", m.max_ctx);
         let mut d = dev::get().unwrap().lock().unwrap();
-        let row_words = d.parts[0].be.kv_words(kw);
+        let row_words = d.parts[0].be.kv_row_words(kw);
         let full_cap = self.slots.iter().enumerate().find(|&(il, _)| !c.swa[layer_of(c, il)]).map(|(_, s)| s.cap);
         if let Some(cap) = full_cap && need > cap {
             let new_cap = grown(need, m.max_ctx);
             let n = (0..c.n_slot()).filter(|&il| !c.swa[layer_of(c, il)]).count();
             // The margin is the one of `new`: the prompt scratch and the graphs of the reply come after this.
-            let bytes = 4 * n * new_cap * row_words + sc_bytes(c, new_cap) + (512 << 20);
+            let bytes = 2 * n * new_cap * row_words + sc_bytes(c, new_cap) + (512 << 20);
             room(&mut d, bytes);
             // The expert cache was not enough: whole layers of experts go, the last loaded first. Their experts
             // then run through the expert cache or on the CPU, which costs less than a model without its device state.
@@ -1000,7 +1000,7 @@ impl Device {
         let d = dev::get().unwrap().lock().unwrap();
         let be = &*d.parts[0].be;
         let pf = self.pf.as_ref().unwrap();
-        let rb = 2 * be.kv_words(kw);
+        let rb = be.kv_row_words(kw);
         for (il, ds) in self.slots.iter().enumerate() {
             let ip = layer_of(c, il);
             if m.layers[ip].swa {
@@ -1112,7 +1112,7 @@ impl Device {
             be.ink_conv_batch(p.k, l.convs[0].addr(), taps[0], hist(0), p.k2, kw, nc, hd, nt)?;
             be.ink_conv_batch(p.v, l.convs[1].addr(), taps[1], hist(1), p.v2, kw, nc, hd, nt)?;
             let log_alpha = if ml.swa { 0.0 } else { c.log_alpha };
-            let rb = 2 * be.kv_words(kw);
+            let rb = be.kv_row_words(kw);
             be.ink_clip_n(p.q, l.q_clip.addr(), hd, nh, nt, c.qk_clip, 0.0, 1.0, 0, 0, 1, pos0, log_alpha, c.log_floor)?;
             be.ink_clip_n(p.r, l.rel_clip.addr(), nr, nh, nt, c.rel_clip, 0.0, 1.0, 0, 0, 1, pos0, log_alpha, c.log_floor)?;
             if verify_mode {
