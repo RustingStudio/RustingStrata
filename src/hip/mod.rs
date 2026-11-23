@@ -305,7 +305,17 @@ impl Gpu {
     /// `pair.1` (token stride `pair.2`).
     fn gemvq_pair(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize,
                   pair: (i64, i64, i32, f32), z: u32) -> anyhow::Result<()> {
-        if !(1..=4).contains(&nt) { bail!("gemvn: {nt} inputs (1 to 4)"); }
+        // gemvn takes 4 inputs at most; a larger batch (Inkling 2's draft verify, up to 16 rows) runs 4 at a time and
+        // quantizes x itself, since xq holds the scales of all nt rows after all the rows (as on CUDA).
+        if nt > 4 {
+            for t0 in (0..nt).step_by(4) {
+                let (xt, yt) = (x + 4 * (t0 * x_stride) as u64, y + 4 * (t0 * y_stride) as u64);
+                let y2 = if z == 2 { pair.1 + 4 * t0 as i64 * (pair.2 as i64 - y_stride as i64) } else { 0 };
+                self.gemvq_pair(w, xt, x_stride, 0, yt, y_stride, (nt - t0).min(4), (pair.0, y2, pair.2, pair.3), z)?;
+            }
+            return Ok(());
+        }
+        if nt == 0 { bail!("gemvn: no inputs"); }
         let (ncols, k1) = Self::gemv_cols("gemv", w.ty, w.cols)?;
         let (mut c, rpw) = Self::gemv_cfg(w.ty, w.rows, w.cols, 1);
         let per = c.shared_mem_bytes;
@@ -750,6 +760,121 @@ impl Backend for Gpu {
     fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> {
         launch!(self, "conv_seq", Self::grid(t * ch), qkv, state, w, y, ch as i32, kw as i32, t as i32);
         launch!(self, "conv_state", Self::grid(ch), qkv, state, ch as i32, kw as i32, t as i32, snap, nsnap as i32);
+        Ok(())
+    }
+    fn graph_drop(&self, key: u64) -> anyhow::Result<()> {
+        self.graphs.lock().unwrap().remove(&key);
+        Ok(())
+    }
+
+    fn situ(&self, y: u64, n: usize, rows: usize, scale: u64, beta: f32, lb: f32) -> anyhow::Result<()> {
+        launch!(self, "situ", Self::grid(n * rows), y, n as i32, rows as i32, scale, beta, lb);
+        Ok(())
+    }
+
+    fn situ_q(&self, y: u64, n: usize, rows: usize, s: u64, beta: f32, lb: f32, xq: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(n % 32 == 0, "situ_q: n ({n}) must be a multiple of 32");
+        launch!(self, "situ_q", cfg((n.div_ceil(256) as u32, rows as u32), 32, 0), y, n as i32, s, beta, lb, xq);
+        Ok(())
+    }
+
+    fn softcap(&self, x: u64, n: usize, cap: f32) -> anyhow::Result<()> {
+        launch!(self, "softcap", Self::grid(n), x, n as i32, cap);
+        Ok(())
+    }
+
+    fn hadamard(&self, x: u64, u: u64, s: u64, out: u64, n: usize, block: usize, rows: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(block <= 1024, "prism.hadamard.block_size {block}: at most 1024 on the GPU");
+        launch!(self, "hadamard", cfg(((rows * n / block) as u32, 1), block as u32, 0), x, u, s, out, n as i32, block as i32, 1.0 / (block as f32).sqrt());
+        Ok(())
+    }
+
+    // ---- Inkling 2 (the same kernels and launch shapes as src/cuda) ----
+
+    fn ink_mix_n(&self, blocks: u64, nb: usize, cur: u64, q: u64, nq: usize, out: u64, n: usize, nt: usize) -> anyhow::Result<()> {
+        launch!(self, "ink_mix", cfg((nq as u32, nt as u32), 256, 0), blocks, nb as i32, cur, q, out, n as i32, nt as i32);
+        Ok(())
+    }
+
+    fn ink_ctrl_n(&self, down: u64, gain: u64, forget: u64, cur: u64, nins: usize, msg: u64, gate: u64, out: u64, n: usize, rank: usize, count: usize, nt: usize) -> anyhow::Result<()> {
+        let g1 = LaunchConfig { grid_dim: (rank as u32, count as u32, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let g2 = LaunchConfig { grid_dim: (n.div_ceil(256) as u32, count as u32, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        launch!(self, "ink_ctrl_gate", g1, down, cur, nins as i32, msg, gate, n as i32, rank as i32, nt as i32);
+        launch!(self, "ink_ctrl_out", g2, gain, forget, gate, cur, nins as i32, msg, out, n as i32, rank as i32, nt as i32);
+        Ok(())
+    }
+
+    fn ink_conv(&self, cur: u64, w: u64, taps: u64, hist: u64, out: u64, n: usize, n_conv: usize, per: usize) -> anyhow::Result<()> {
+        launch!(self, "ink_conv", Self::grid(n), cur, w, taps, hist, out, n as i32, n_conv as i32, per as i32);
+        Ok(())
+    }
+
+    fn ink_conv_batch(&self, cur: u64, w: u64, taps: u64, hist: u64, out: u64, n: usize, n_conv: usize, per: usize, nt: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(cur != out, "ink_conv_batch: out must not alias cur");
+        anyhow::ensure!(n_conv <= 8, "ink_conv_batch: n_conv={n_conv} > 8");
+        launch!(self, "ink_conv_batch", cfg((n.div_ceil(256) as u32, nt as u32), 256, 0), cur, w, taps, hist, out, n as i32, n_conv as i32, per as i32, nt as i32, 0i32);
+        launch!(self, "ink_conv_batch", Self::grid(n), cur, w, taps, hist, out, n as i32, n_conv as i32, per as i32, nt as i32, 1i32);
+        Ok(())
+    }
+
+    fn ink_clip_n(&self, x: u64, scale: u64, w: usize, rows: usize, nt: usize, thr: f32, eps: f32, mul: f32,
+                  dst: u64, dst_at0: usize, dst_ring: usize, pos0: usize, log_alpha: f32, log_floor: f32) -> anyhow::Result<()> {
+        anyhow::ensure!(w <= 128, "ink_clip_n: w={w} > 128");
+        anyhow::ensure!(crate::cuda::kv_mode() == 0 || dst == 0 || w % 32 == 0, "ink_clip_n: quantized KV requires w % 32 == 0 (got {w})");
+        let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
+        let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
+        launch!(self, "ink_clip", cfg((rows as u32, nt as u32), 128, 0),
+            x, scale, w as i32, thr, eps, mul, dst, dst_at0 as i32, ring as i32, pos0 as i32, log_alpha, fl, 0u64);
+        Ok(())
+    }
+
+    fn ink_clip_pos(&self, x: u64, scale: u64, w: usize, rows: usize, nt: usize, thr: f32, eps: f32, mul: f32,
+                    dst: u64, dst_ring: usize, pos_ptr: u64, log_alpha: f32, log_floor: f32) -> anyhow::Result<()> {
+        anyhow::ensure!(w <= 128, "ink_clip_pos: w={w} > 128");
+        anyhow::ensure!(crate::cuda::kv_mode() == 0 || dst == 0 || w % 32 == 0, "ink_clip_pos: quantized KV requires w % 32 == 0 (got {w})");
+        let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
+        let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
+        launch!(self, "ink_clip", cfg((rows as u32, nt as u32), 128, 0),
+            x, scale, w as i32, thr, eps, mul, dst, 0i32, ring as i32, 0i32, log_alpha, fl, pos_ptr);
+        Ok(())
+    }
+
+    fn ink_attn(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, rows: usize, at: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
+        let chunks = rows.div_ceil(64) as u32;
+        launch!(self, "ink_attn", cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, rows as i32, at as i32, 1i32, nkv as i32, hd as i32, nr as i32, ext as i32, 0u64);
+        launch!(self, "ink_attn_merge", cfg((nh as u32, 1), 128, 0), sc, gate, out, chunks as i32, hd as i32);
+        Ok(())
+    }
+
+    fn ink_attn_pos(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, max_rows: usize, ring: usize, pos_ptr: u64, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
+        let chunks = max_rows.div_ceil(64) as u32;
+        launch!(self, "ink_attn", cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, 0i32, 0i32, ring.max(1) as i32, nkv as i32, hd as i32, nr as i32, ext as i32, pos_ptr);
+        launch!(self, "ink_attn_merge", cfg((nh as u32, 1), 128, 0), sc, gate, out, chunks as i32, hd as i32);
+        Ok(())
+    }
+
+    fn ink_attn_prefill(&self, q: u64, r: u64, sink: u64, gate: u64, kc: u64, vc: u64, kc_new: u64, vc_new: u64, bias: u64, out: u64,
+                        pos: usize, nt: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize, ring: usize, win: usize) -> anyhow::Result<()> {
+        let kn = match hd {
+            32 => "ink_attn_prefill_32",
+            64 => "ink_attn_prefill_64",
+            128 => "ink_attn_prefill_128",
+            _ => bail!("ink_attn_prefill: unsupported hd={hd}"),
+        };
+        launch!(self, kn, cfg((nt.div_ceil(4) as u32, nh as u32), 128, 0),
+            q, r, sink, gate, kc, vc, kc_new, vc_new, bias, out,
+            pos as i32, nt as i32, nh as i32, nkv as i32, nr as i32, ext as i32, ring.max(1) as i32, win as i32);
+        Ok(())
+    }
+
+    fn ink_ffn_sum_n(&self, acc: u64, d: u64, wts: u64, ne: usize, n: usize, nt: usize, cpu: u64) -> anyhow::Result<()> {
+        launch!(self, "ink_ffn_sum", cfg((n.div_ceil(256) as u32, nt as u32), 256, 0), acc, d, wts, ne as i32, n as i32, cpu);
+        Ok(())
+    }
+
+    fn ink_route(&self, logits: u64, bias: u64, ids: u64, wts: u64, gu_sc: u64, dn_sc: u64, gsc_out: u64, n_expert: usize, k: usize, exp_scale: f32, rows: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(n_expert <= 512 && k <= 32, "ink_route: n_expert={n_expert} k={k}");
+        launch!(self, "ink_route", cfg((rows as u32, 1), 32, 0), logits, bias, ids, wts, gu_sc, dn_sc, gsc_out, n_expert as i32, k as i32, exp_scale);
         Ok(())
     }
 
