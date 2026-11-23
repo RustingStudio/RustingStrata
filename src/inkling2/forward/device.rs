@@ -411,8 +411,9 @@ impl Device {
                 }
             }
             if std::env::var_os("STRATA_DS_PROF").is_some() {
-                crate::say!("inkling2: preloaded {n_full}/{} expert layers ({:.2} GB: {:.2} on GPU 0, {:.2} on GPU 1) as contiguous slabs",
-                    c.n_layer, slab_bytes as f64 / 1e9, per_part[0] as f64 / 1e9, per_part[1] as f64 / 1e9);
+                crate::say!("inkling2: preloaded {n_full}/{} expert layers ({:.2} GB: {:.2} on GPU 0, {:.2} on GPU 1) as contiguous slabs; {} experts, {} used, core {}..{} x{}, budget left {:.2} GB",
+                    c.n_layer, slab_bytes as f64 / 1e9, per_part[0] as f64 / 1e9, per_part[1] as f64 / 1e9,
+                    c.n_expert, c.n_used, c.loop_start, c.loop_end, c.loop_count, crate::deepseek::mat::budget_left() as f64 / 1e9);
             }
             let all_full = rem.is_none() && layers.iter().all(|l| l.full_exps.is_some());
             let core = c.loop_end - c.loop_start;
@@ -1781,7 +1782,7 @@ impl Device {
         let be = &*d.parts[0].be;
         match gpu {
             Some(tg) => {
-                m.balance(&m.cpu_share, adapt, tg, tc);
+                m.balance_split(adapt, tg, tc);
                 // `cpu` and `r` are per-dimension sums (`run_experts` returns the weighted mix), not per-expert
                 // weights: both have length `n`, and the elementwise add is the host total.
                 debug_assert_eq!(cpu.len(), n);
