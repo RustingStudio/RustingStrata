@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 /// Contiguous all-expert weights + F32 router uploaded once for a layer, enabling zero-round-trip GPU MoE.
 struct FullExps {
+    /// The GPU of the slabs: 0, or 1 when GPU 0 had no room (the FFN of that layer runs there, see `Remote`).
+    part: usize,
     _gi: Arc<SlabBuf>,
     gate_inp: GpuTensor,
     bias: Arc<SlabBuf>,
@@ -37,6 +39,15 @@ struct DLoop { msg_query: Buf, down: Buf, gain: Buf, forget: Buf }
 /// Attention rows as f16 `[row][key head][channel]` and the four convolution histories, one after another. A
 /// sliding-window slot is a ring of `n_swa` rows (position p in row p % n_swa); the others grow.
 struct DSlot { k: Buf, v: Buf, hist: Buf, cap: usize }
+
+/// What GPU 1 needs to run the FFN of the layers whose experts live there: a decode scratch (`s`) and, from the first
+/// prompt chunk on, a prefill scratch. The activations come over the host once per layer run (about 10 KB per token).
+struct Remote { part: usize, scr: Buf, s: Scratch, pf: Option<PrefillScratch> }
+
+/// Tokens of one prompt chunk on the device: `STRATA_DS_PF_TOKENS` (default 512, at most 2048).
+pub(super) fn pf_tokens() -> usize {
+    std::env::var("STRATA_DS_PF_TOKENS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(512).clamp(1, 2048)
+}
 
 /// Device addresses of the regions of the decode scratch buffer (`sc` lives in `Device::sc_buf` so `--ctx` scales dynamically).
 #[derive(Clone, Copy)]
@@ -116,23 +127,38 @@ struct PrefillScratch {
 }
 
 impl PrefillScratch {
-    fn alloc(be: &dyn Backend, c: &Inkling2Config, rank: usize, vocab_rows: usize, max_nt: usize) -> Result<Self> {
+    /// Bytes `alloc` takes (plus a little for the allocator).
+    fn bytes(be: &dyn Backend, c: &Inkling2Config, rank: usize, vocab_rows: usize, max_nt: usize, light: bool) -> usize {
+        let (kw, n_slot) = (c.n_head_kv * c.head_dim, c.n_slot());
+        let rb = 2 * be.kv_words(kw);
+        let lay = PrefillLayout::at(0, c, rank, max_nt).end as usize;
+        let swa = (n_slot * VERIFY_MAX * rb).max(1024);
+        let extra = if light { 0 } else {
+            2 * max_nt * rb + 4 * VERIFY_MAX * vocab_rows + 16 * max_nt * c.n_embd + 4 * n_slot * hists(c).1
+                + 4 * n_slot * VERIFY_MAX * (2 * kw + 2 * c.n_embd) + 2 * swa
+        };
+        lay + 4 * max_nt * c.n_embd + (40 * max_nt * c.n_used).max(1024) + extra + (16 << 20)
+    }
+
+    /// `light`: only what the routed experts of a layer need (GPU 1 runs nothing else): the attention logs are tiny.
+    fn alloc(be: &dyn Backend, c: &Inkling2Config, rank: usize, vocab_rows: usize, max_nt: usize, light: bool) -> Result<Self> {
         let lay0 = PrefillLayout::at(0, c, rank, max_nt);
         let buf = be.alloc(lay0.end as usize)?;
         let p = PrefillLayout::at(buf.addr(), c, rank, max_nt);
         let acc_buf = be.alloc(4 * max_nt * c.n_embd)?;
         let kw = c.n_head_kv * c.head_dim;
         let rb = 2 * be.kv_words(kw);
-        let kv_bytes = max_nt * rb;
+        let kv_bytes = if light { 256 } else { max_nt * rb };
         let (kc_tmp, vc_tmp) = (be.alloc(kv_bytes)?, be.alloc(kv_bytes)?);
         let max_np = max_nt * c.n_used;
         let meta = be.alloc((40 * max_np).max(1024))?;
-        let logits_buf = be.alloc(4 * VERIFY_MAX * vocab_rows)?;
-        let dspark_buf = be.alloc(4 * 4 * max_nt * c.n_embd)?;
+        let lt = |b: usize| if light { 256 } else { b };
+        let logits_buf = be.alloc(lt(4 * VERIFY_MAX * vocab_rows))?;
+        let dspark_buf = be.alloc(lt(4 * 4 * max_nt * c.n_embd))?;
         let n_slot = c.n_slot();
-        let hist_bak = be.alloc(4 * n_slot * hists(c).1)?;
-        let conv_log = be.alloc(4 * n_slot * VERIFY_MAX * (2 * kw + 2 * c.n_embd))?;
-        let swa_log_bytes = (n_slot * VERIFY_MAX * rb).max(1024);
+        let hist_bak = be.alloc(lt(4 * n_slot * hists(c).1))?;
+        let conv_log = be.alloc(lt(4 * n_slot * VERIFY_MAX * (2 * kw + 2 * c.n_embd)))?;
+        let swa_log_bytes = lt((n_slot * VERIFY_MAX * rb).max(1024));
         let (swa_kc_log, swa_vc_log) = (be.alloc(swa_log_bytes)?, be.alloc(swa_log_bytes)?);
         Ok(Self {
             max_nt, buf, acc_buf, kc_tmp, vc_tmp, meta, logits_buf, dspark_buf,
@@ -153,6 +179,12 @@ pub(super) struct Device {
     s: Scratch,
     rank: usize,
     all_full: bool,
+    /// GPU 1's share of the FFN layers (None when every layer's experts are on GPU 0).
+    rem: Option<Remote>,
+    /// With `rem`: the loop layers are all on GPU 0, so the loop runs as one graph, and the layers around it launch one by one.
+    seg_graph: bool,
+    /// Blocks in the depth mix after the loop (what `layer_attn` counted when the loop graph was recorded).
+    loop_nb: usize,
     /// Key of the recorded `step_fast` graph, by `argmax` (0: none).
     graph_keys: [u64; 2],
     /// Positions whose rows both sides hold, and whether the device has run tokens after them.
@@ -248,8 +280,9 @@ impl Device {
         let full = (2 * (pos + 1)).clamp(4096.min(m.max_ctx), m.max_ctx);
         {
             let mut d = dev::get()?.lock().unwrap();
-            if d.parts.len() != 1 { return None; }
-            let dense = |x: &Mat| !x.host_only();
+            // Local patch: several GPUs are fine as long as the plain weights are on GPU 0 (see STRATA_DS_PLAIN_FIRST); the
+            // experts that live on another GPU run as a third share in `layer`.
+            let dense = |x: &Mat| !x.host_only() && d.on_first(x);
             if !dense(&m.output) || !m.layers.iter().all(|l| {
                 [l.wq, l.wk, l.wv, l.wo, l.gate, l.rel, l.sink].iter().chain(l.conv_proj.iter().flatten()).all(dense)
             }) { return None; }
@@ -289,38 +322,63 @@ impl Device {
             let s = Scratch::at(scr.addr(), c, rank, m.output.rows);
 
             // Preload full-layer expert slabs so selected layers skip CPU routing, uploads, and host syncs.
-            // Core loop layers run 3x per token (75% of FFN compute), so prioritize them first.
+            // Core loop layers run 3x per token (75% of FFN compute), so they go first, and to GPU 0, where the attention is.
+            // Local patch: with two GPUs the layers that run once (outside the loop) prefer GPU 1, and a layer that does not
+            // fit on its GPU goes to the other one: every layer's experts end up in VRAM, and the FFN of a layer on GPU 1
+            // runs there (`Remote`). GPU 0 keeps free what the state still needs: prompt chunk scratch and KV growth.
             let cpu_share = std::env::var("STRATA_DS_CPU_SHARE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
-            let (mut n_full, mut slab_bytes) = (0usize, 0usize);
+            let (mut n_full, mut slab_bytes, mut per_part) = (0usize, 0usize, [0usize; 2]);
+            let mut rem: Option<Remote> = None;
             if cpu_share <= 0.0 && c.n_expert <= 512 && c.n_used <= 32 {
                 let (b_res, f_res) = (64 << 20, 384 << 20);
-                let order = (c.loop_start..c.loop_end).chain(0..c.loop_start).chain(c.loop_end..c.n_layer);
+                let (n_parts, pf_cap, vocab) = (dev::get().unwrap().lock().unwrap().parts.len().min(2), pf_tokens(), m.output.rows);
+                let (res0, res1) = {
+                    let d = dev::get().unwrap().lock().unwrap();
+                    let be0 = &*d.parts[0].be;
+                    // The KV rows GPU 0 must still be able to take: all of `--ctx` unless STRATA_DS_KV_TOKENS says less (a
+                    // lower value frees room for more expert slabs on GPU 0, at the price of a host fallback past it).
+                    let kv_rows = std::env::var("STRATA_DS_KV_TOKENS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(m.max_ctx)
+                        .min(m.max_ctx).max(full);
+                    let n_att = (0..c.n_slot()).filter(|&il| !c.swa[layer_of(c, il)]).count();
+                    let kv = 4 * n_att * kv_rows * be0.kv_words(kw) + sc_bytes(c, kv_rows);
+                    let pf0 = PrefillScratch::bytes(be0, c, rank, vocab, pf_cap, false);
+                    let pf1 = if n_parts > 1 { PrefillScratch::bytes(&*d.parts[1].be, c, rank, vocab, pf_cap, true) } else { 0 };
+                    (f_res + pf0 + kv, (192 << 20) + pf1 + Scratch::at(0, c, rank, 0).end as usize)
+                };
                 let key = |s: &[u8]| Some((s.as_ptr() as usize, s.len()));
+                let on_loop = |ip: usize| (c.loop_start..c.loop_end).contains(&ip);
+                let order = (c.loop_start..c.loop_end).chain(0..c.loop_start).chain(c.loop_end..c.n_layer);
                 for ip in order {
                     let ml = &m.layers[ip];
                     let gi_bytes: Vec<u8> = ml.gate_inp.iter().flat_map(|x| x.to_le_bytes()).collect();
                     let bias_bytes: Vec<u8> = ml.bias.iter().flat_map(|x| x.to_le_bytes()).collect();
                     let gs_bytes: Vec<u8> = ml.gu_scale.iter().flat_map(|x| x.to_le_bytes()).collect();
                     let ds_bytes: Vec<u8> = ml.down_scale.iter().flat_map(|x| x.to_le_bytes()).collect();
-                    let Some((gu, dn, gi_slab, bias, gu_scale, dn_scale)) = (|| -> Option<_> {
+                    let place = |part: usize| -> Option<(usize, Arc<SlabBuf>, Arc<SlabBuf>, Arc<SlabBuf>, Arc<SlabBuf>, Option<Arc<SlabBuf>>, Option<Arc<SlabBuf>>)> {
                         let mut d = dev::get().unwrap().lock().unwrap();
-                        let gu = d.alloc_slab(ml.gate_up.data, key(ml.gate_up.data), b_res, f_res)?;
-                        let dn = d.alloc_slab(ml.down.data, key(ml.down.data), b_res, f_res)?;
-                        let gi = d.alloc_slab(&gi_bytes, None, b_res, f_res)?;
-                        let bi = d.alloc_slab(&bias_bytes, None, b_res, f_res)?;
-                        let gs = if gs_bytes.is_empty() { None } else { Some(d.alloc_slab(&gs_bytes, None, b_res, f_res)?) };
-                        let ds = if ds_bytes.is_empty() { None } else { Some(d.alloc_slab(&ds_bytes, None, b_res, f_res)?) };
-                        Some((gu, dn, gi, bi, gs, ds))
-                    })() else {
+                        let fr = if part == 0 { res0 } else { res1 };
+                        let gu = d.alloc_slab_on(part, ml.gate_up.data, key(ml.gate_up.data), b_res, fr)?;
+                        let dn = d.alloc_slab_on(part, ml.down.data, key(ml.down.data), b_res, fr)?;
+                        let gi = d.alloc_slab_on(part, &gi_bytes, None, b_res, fr)?;
+                        let bi = d.alloc_slab_on(part, &bias_bytes, None, b_res, fr)?;
+                        let gs = if gs_bytes.is_empty() { None } else { Some(d.alloc_slab_on(part, &gs_bytes, None, b_res, fr)?) };
+                        let ds = if ds_bytes.is_empty() { None } else { Some(d.alloc_slab_on(part, &ds_bytes, None, b_res, fr)?) };
+                        Some((part, gu, dn, gi, bi, gs, ds))
+                    };
+                    let prefs: &[usize] = match (n_parts > 1, on_loop(ip)) { (false, _) => &[0], (true, true) => &[0, 1], (true, false) => &[1, 0] };
+                    let Some((part, gu, dn, gi_slab, bias, gu_scale, dn_scale)) = prefs.iter().find_map(|&p| place(p)) else {
                         break;
                     };
-                    slab_bytes += gu.len() + dn.len() + gi_slab.len() + bias.len()
+                    let bytes = gu.len() + dn.len() + gi_slab.len() + bias.len()
                         + gu_scale.as_ref().map_or(0, |b| b.len())
                         + dn_scale.as_ref().map_or(0, |b| b.len());
+                    slab_bytes += bytes;
+                    per_part[part] += bytes;
                     n_full += 1;
                     let (gu_rows, gu_cols) = (ml.gate_up.rows / c.n_expert, ml.gate_up.cols);
                     let (dn_rows, dn_cols) = (ml.down.rows / c.n_expert, ml.down.cols);
                     layers[ip].full_exps = Some(FullExps {
+                        part,
                         gate_inp: GpuTensor::new(GgmlType::F32, c.n_expert, c.n_embd, Buf::new(gi_slab.addr(), gi_slab.len(), ())),
                         _gi: gi_slab,
                         bias,
@@ -332,12 +390,26 @@ impl Device {
                         dn_scale,
                     });
                 }
+                if layers.iter().any(|l| l.full_exps.as_ref().is_some_and(|fe| fe.part == 1)) {
+                    let d = dev::get().unwrap().lock().unwrap();
+                    let be1 = &*d.parts[1].be;
+                    let r_scr = be1.alloc(Scratch::at(0, c, rank, 0).end as usize)?;
+                    let r_s = Scratch::at(r_scr.addr(), c, rank, 0);
+                    let pf = PrefillScratch::alloc(be1, c, rank, vocab, pf_cap, true).ok();
+                    rem = Some(Remote { part: 1, scr: r_scr, s: r_s, pf });
+                }
             }
             if std::env::var_os("STRATA_DS_PROF").is_some() {
-                eprintln!("inkling2: preloaded {n_full}/{} expert layers ({:.2} GB) as contiguous slabs", c.n_layer, slab_bytes as f64 / 1e9);
+                eprintln!("inkling2: preloaded {n_full}/{} expert layers ({:.2} GB: {:.2} on GPU 0, {:.2} on GPU 1) as contiguous slabs",
+                    c.n_layer, slab_bytes as f64 / 1e9, per_part[0] as f64 / 1e9, per_part[1] as f64 / 1e9);
             }
-            let all_full = layers.iter().all(|l| l.full_exps.is_some());
-            Ok(Device { layers, loops, slots, out_query, out_norm, scr, sc_buf, pf: None, s, rank, all_full, graph_keys: [0; 2], synced: 0, ahead: false })
+            let all_full = rem.is_none() && layers.iter().all(|l| l.full_exps.is_some());
+            let core = c.loop_end - c.loop_start;
+            let seg_graph = rem.is_some() && std::env::var_os("STRATA_DS_NO_SEG_GRAPH").is_none()
+                && layers.iter().all(|l| l.full_exps.is_some())
+                && (c.loop_start..c.loop_end).all(|ip| layers[ip].full_exps.as_ref().is_some_and(|fe| fe.part == 0))
+                && (c.loop_count * core) % 2 == 0;
+            Ok(Device { layers, loops, slots, out_query, out_norm, scr, sc_buf, pf: None, s, rank, all_full, rem, seg_graph, loop_nb: 0, graph_keys: [0; 2], synced: 0, ahead: false })
         })();
         made.inspect_err(|e| eprintln!("inkling2: no room in VRAM for the decode state ({e:#}); the tokens run as prompt chunks do")).ok()
     }
@@ -501,45 +573,97 @@ impl Device {
             // 17 MiB of device memory, and the backend stops recording at 32 of them).
             let last = std::mem::replace(&mut self.graph_keys[argmax as usize], key);
             if last != 0 && last != key { be.graph_drop(last)?; }
-            be.graph(key, &mut || {
+            if !self.seg_graph {
+                be.graph(key, &mut || {
+                    let mut nb = 0usize;
+                    for il in 0..c.loop_start {
+                        self.layer_attn(be, &d, m, il, il, false, pos, true, &mut nb)?;
+                        self.layer_ffn_gpu(be, m, il, il)?;
+                    }
+                    be.dtod(&self.scr, (self.s.cur - o) as usize, &self.scr, (self.s.prelude - o) as usize, 4 * n)?;
+                    let n_pre = nb;
+                    for pass in 0..c.loop_count {
+                        let n_bank = nb.saturating_sub(n_pre + 1);
+                        if pass > 0 {
+                            let s = self.s;
+                            if n_bank > 0 {
+                                be.dtod(&self.scr, (s.blocks - o) as usize + 4 * (n_pre + 1) * n, &self.scr, (s.bank - o) as usize, 4 * n_bank * n)?;
+                            }
+                            be.dtod(&self.scr, (s.cur - o) as usize, &self.scr, (s.outb - o) as usize, 4 * n)?;
+                            be.dtod(&self.scr, (s.prelude - o) as usize, &self.scr, (s.cur - o) as usize, 4 * n)?;
+                            nb = n_pre;
+                        }
+                        for ip in c.loop_start..c.loop_end {
+                            let il = if pass == 0 { ip } else { c.n_layer + (pass - 1) * core + ip - c.loop_start };
+                            if pass > 0 {
+                                let s = self.s;
+                                be.ink_mix(s.bank, n_bank, s.outb, self.loops[ip - c.loop_start].msg_query.addr(), 4, s.msg, n)?;
+                            }
+                            self.layer_attn(be, &d, m, il, ip, pass > 0, pos, true, &mut nb)?;
+                            self.layer_ffn_gpu(be, m, il, ip)?;
+                        }
+                    }
+                    for il in c.loop_end..c.n_layer {
+                        self.layer_attn(be, &d, m, il, il, false, pos, true, &mut nb)?;
+                        self.layer_ffn_gpu(be, m, il, il)?;
+                    }
+                    self.finish_logits(be, &d, m, nb)?;
+                    if argmax {
+                        be.argmax_rows(self.s.logits, c.n_vocab, 1, self.s.amax)?;
+                    }
+                    Ok(())
+                })?;
+            } else {
+                // Local patch: layers 0..loop_start and loop_end.. launch one by one (their FFN may be on GPU 1, which needs
+                // the host between the attention and the experts); the loop between them is one graph.
+                let prof = std::env::var_os("STRATA_DS_PROF").is_some();
+                let mut tt = std::time::Instant::now();
                 let mut nb = 0usize;
                 for il in 0..c.loop_start {
                     self.layer_attn(be, &d, m, il, il, false, pos, true, &mut nb)?;
-                    self.layer_ffn_gpu(be, m, il, il)?;
+                    if !self.layer_ffn_remote(&d, m, il, il)? { self.layer_ffn_gpu(be, m, il, il)?; }
                 }
-                be.dtod(&self.scr, (self.s.cur - o) as usize, &self.scr, (self.s.prelude - o) as usize, 4 * n)?;
+                if prof { be.sync()?; m.lap(1, tt); tt = std::time::Instant::now(); }
                 let n_pre = nb;
-                for pass in 0..c.loop_count {
-                    let n_bank = nb.saturating_sub(n_pre + 1);
-                    if pass > 0 {
-                        let s = self.s;
-                        if n_bank > 0 {
-                            be.dtod(&self.scr, (s.blocks - o) as usize + 4 * (n_pre + 1) * n, &self.scr, (s.bank - o) as usize, 4 * n_bank * n)?;
-                        }
-                        be.dtod(&self.scr, (s.cur - o) as usize, &self.scr, (s.outb - o) as usize, 4 * n)?;
-                        be.dtod(&self.scr, (s.prelude - o) as usize, &self.scr, (s.cur - o) as usize, 4 * n)?;
-                        nb = n_pre;
-                    }
-                    for ip in c.loop_start..c.loop_end {
-                        let il = if pass == 0 { ip } else { c.n_layer + (pass - 1) * core + ip - c.loop_start };
+                be.graph(key, &mut || {
+                    let mut nb = n_pre;
+                    be.dtod(&self.scr, (self.s.cur - o) as usize, &self.scr, (self.s.prelude - o) as usize, 4 * n)?;
+                    for pass in 0..c.loop_count {
+                        let n_bank = nb.saturating_sub(n_pre + 1);
                         if pass > 0 {
                             let s = self.s;
-                            be.ink_mix(s.bank, n_bank, s.outb, self.loops[ip - c.loop_start].msg_query.addr(), 4, s.msg, n)?;
+                            if n_bank > 0 {
+                                be.dtod(&self.scr, (s.blocks - o) as usize + 4 * (n_pre + 1) * n, &self.scr, (s.bank - o) as usize, 4 * n_bank * n)?;
+                            }
+                            be.dtod(&self.scr, (s.cur - o) as usize, &self.scr, (s.outb - o) as usize, 4 * n)?;
+                            be.dtod(&self.scr, (s.prelude - o) as usize, &self.scr, (s.cur - o) as usize, 4 * n)?;
+                            nb = n_pre;
                         }
-                        self.layer_attn(be, &d, m, il, ip, pass > 0, pos, true, &mut nb)?;
-                        self.layer_ffn_gpu(be, m, il, ip)?;
+                        for ip in c.loop_start..c.loop_end {
+                            let il = if pass == 0 { ip } else { c.n_layer + (pass - 1) * core + ip - c.loop_start };
+                            if pass > 0 {
+                                let s = self.s;
+                                be.ink_mix(s.bank, n_bank, s.outb, self.loops[ip - c.loop_start].msg_query.addr(), 4, s.msg, n)?;
+                            }
+                            self.layer_attn(be, &d, m, il, ip, pass > 0, pos, true, &mut nb)?;
+                            self.layer_ffn_gpu(be, m, il, ip)?;
+                        }
                     }
-                }
+                    self.loop_nb = nb;
+                    Ok(())
+                })?;
+                if prof { be.sync()?; m.lap(2, tt); tt = std::time::Instant::now(); }
+                let mut nb = self.loop_nb;
                 for il in c.loop_end..c.n_layer {
                     self.layer_attn(be, &d, m, il, il, false, pos, true, &mut nb)?;
-                    self.layer_ffn_gpu(be, m, il, il)?;
+                    if !self.layer_ffn_remote(&d, m, il, il)? { self.layer_ffn_gpu(be, m, il, il)?; }
                 }
+                if prof { be.sync()?; m.lap(3, tt); }
                 self.finish_logits(be, &d, m, nb)?;
                 if argmax {
                     be.argmax_rows(self.s.logits, c.n_vocab, 1, self.s.amax)?;
                 }
-                Ok(())
-            })?;
+            }
             if argmax {
                 let id = be.get::<i32>(&self.scr, ((self.s.amax - o) / 4) as usize, 1)?[0] as u32;
                 Ok((Vec::new(), id))
@@ -609,7 +733,7 @@ impl Device {
         let pos = m.toks.len();
         assert!(pos < m.max_ctx, "context is limited to {} tokens", m.max_ctx);
         assert!((tok as usize) < m.tok_embd.rows, "token {tok} is outside the vocabulary");
-        if self.all_full {
+        if self.all_full || self.seg_graph {
             let t = std::time::Instant::now();
             let (logits, _) = self.step_fast(m, tok, false);
             m.lap(7, t);
@@ -633,7 +757,7 @@ impl Device {
         let pos = m.toks.len();
         assert!(pos < m.max_ctx, "context is limited to {} tokens", m.max_ctx);
         assert!((tok as usize) < m.tok_embd.rows, "token {tok} is outside the vocabulary");
-        if self.all_full {
+        if self.all_full || self.seg_graph {
             let t = std::time::Instant::now();
             let (_, id) = self.step_fast(m, tok, true);
             m.lap(7, t);
@@ -659,17 +783,28 @@ impl Device {
             be.sync()?;
             self.pf = None;
         }
-        let target = need_nt.max(256).min(256);
+        let target = need_nt.max(pf_tokens());
         let mut tries = vec![target];
         if need_nt < target { tries.push(need_nt.max(128)); tries.push(need_nt.max(64)); tries.push(need_nt); }
         let mut last_err = None;
         for cap in tries {
-            match PrefillScratch::alloc(be, c, self.rank, vocab_rows, cap) {
+            match PrefillScratch::alloc(be, c, self.rank, vocab_rows, cap, false) {
                 Ok(pf) => { self.pf = Some(pf); return Ok(()); }
                 Err(e) => last_err = Some(e),
             }
         }
         Err(last_err.unwrap())
+    }
+
+    /// GPU 1's prefill scratch for `need_nt` rows, when some layer's experts live there.
+    fn ensure_pf_remote(&mut self, d: &dev::Dev, c: &Inkling2Config, vocab_rows: usize, need_nt: usize) -> Result<()> {
+        let rank = self.rank;
+        let Some(r) = &mut self.rem else { return Ok(()) };
+        if r.pf.as_ref().is_some_and(|pf| pf.max_nt >= need_nt) { return Ok(()); }
+        let be1 = &*d.parts[r.part].be;
+        if r.pf.is_some() { be1.sync()?; r.pf = None; }
+        r.pf = Some(PrefillScratch::alloc(be1, c, rank, vocab_rows, need_nt.max(pf_tokens()), true)?);
+        Ok(())
     }
 
     /// Project a single corrected hidden vector `h_corr` (`[n_embd]`) through the target's LM head on GPU
@@ -726,6 +861,7 @@ impl Device {
             let d = dev::get().unwrap().lock().unwrap();
             let be = &*d.parts[0].be;
             self.ensure_pf(be, c, m.output.rows, nt)?;
+            self.ensure_pf_remote(&d, c, m.output.rows, nt)?;
             if !self.ahead { self.to_device(m, be, pos0)?; }
             let pf = self.pf.as_ref().unwrap();
             be.put(&cur_host, &pf.buf, 0)?;
@@ -839,6 +975,7 @@ impl Device {
             let d = dev::get().unwrap().lock().unwrap();
             let be = &*d.parts[0].be;
             self.ensure_pf(be, c, m.output.rows, nt)?;
+            self.ensure_pf_remote(&d, c, m.output.rows, nt)?;
             if !self.ahead { self.to_device(m, be, pos0)?; }
             let pf = self.pf.as_ref().unwrap();
             for (il, ds) in self.slots.iter().enumerate() {
@@ -1127,7 +1264,7 @@ impl Device {
                 h = p.h2;
             }
             if let Some(fe) = &l.full_exps {
-                let use_gemm = !small && fe.gu_cols % 64 == 0 && fe.dn_cols % 64 == 0;
+                let use_gemm = (!small || fe.part != 0) && fe.gu_cols % 64 == 0 && fe.dn_cols % 64 == 0;
                 if use_gemm || fe.gu_ty.float_x() {
                     be.rms_norm(h, n, l.ffn_norm.addr(), p.hn, n, n, nt, c.eps)?;
                 } else {
@@ -1135,86 +1272,24 @@ impl Device {
                 }
                 m.lap(0, t_prep);
                 let t_gpu = std::time::Instant::now();
-                Self::proj_n(be, &fe.gate_inp, small, nt, p.hn, 0, p.rlogits, 0)?;
-                let gu_sc = fe.gu_scale.as_ref().map_or(0, |b| b.addr());
-                let dn_sc = fe.dn_scale.as_ref().map_or(0, |b| b.addr());
-                let gsc_out = if gu_sc != 0 { p.gsc } else { 0 };
-                be.ink_route(p.rlogits, fe.bias.addr(), p.ids, p.wts, gu_sc, dn_sc, gsc_out, c.n_expert, k, c.exp_scale, nt)?;
-                if !use_gemm {
-                    // Process up to 16 tokens per moe_gemv batch so zero host sync is needed (exact decode speed for nt <= 16).
-                    for tok0 in (0..nt).step_by(16) {
-                        let bt = (nt - tok0).min(16);
-                        let np = bt * k;
-                        let xh_tok_floats = (n + n.div_ceil(32) * 4).div_ceil(16) * 4;
-                        let ids_a = p.ids + (4 * tok0 * k) as u64;
-                        let wts_a = p.wts + f(tok0 * k);
-                        let gsc_a = if gu_sc != 0 { p.gsc + f(tok0 * k) } else { 0 };
-                        let hn_a = p.hn + f(tok0 * n);
-                        let xh_a = p.xh + f(tok0 * xh_tok_floats);
-                        let y_a = p.y;
-                        let d_a = p.d;
-                        let acc_a = pf.acc_buf.addr() + f(tok0 * n);
-                        be.moe_gemv(fe.gu_ty, fe.gu_rows, fe.gu_cols, fe.gu.addr(), fe.gu_stride, ids_a, np, hn_a, n, k, y_a, None, xh_a)?;
-                        if fe.dn_ty.float_x() || nf % 32 != 0 {
-                            be.situ(y_a, nf, np, gsc_a, c.situ_beta, c.situ_linear_beta)?;
-                            be.moe_gemv(fe.dn_ty, fe.dn_rows, fe.dn_cols, fe.dn.addr(), fe.dn_stride, ids_a, np, y_a, 2 * nf, 1, d_a, None, 0)?;
-                        } else {
-                            be.situ_q(y_a, nf, np, gsc_a, c.situ_beta, c.situ_linear_beta, p.xq)?;
-                            be.moe_gemv(fe.dn_ty, fe.dn_rows, fe.dn_cols, fe.dn.addr(), fe.dn_stride, ids_a, np, y_a, 2 * nf, 1, d_a, None, p.xq)?;
-                        }
-                        be.ink_ffn_sum_n(acc_a, d_a, wts_a, k, n, bt, 0)?;
-                    }
+                if fe.part == 0 {
+                    Self::pf_ffn_core(be, m, ip, fe, pf, nt, small, use_gemm)?;
                 } else {
-                    use crate::backend::GEMM_BM;
-                    let ids: Vec<i32> = be.get(&pf.buf, ((p.ids - buf_o) / 4) as usize, nt * k)?;
-                    let mut by_e: Vec<Vec<(usize, usize)>> = vec![vec![]; c.n_expert];
-                    for (t, row) in ids.chunks_exact(k).enumerate() {
-                        for (j, &e) in row.iter().enumerate() { by_e[e as usize].push((t, j)); }
+                    // Experts on GPU 1: the normed rows cross over, the experts run there, the sum comes back.
+                    let r = self.rem.as_ref().ok_or_else(|| anyhow::anyhow!("experts on GPU 1 without a scratch there"))?;
+                    let pf1 = r.pf.as_ref().ok_or_else(|| anyhow::anyhow!("no prefill scratch on GPU 1"))?;
+                    let be1 = &*d.parts[r.part].be;
+                    let (o0, o1) = (buf_o, pf1.buf.addr());
+                    let hn: Vec<f32> = be.get(&pf.buf, ((p.hn - o0) / 4) as usize, nt * n)?;
+                    be1.put(&hn, &pf1.buf, ((pf1.p.hn - o1) / 4) as usize)?;
+                    if !use_gemm && !fe.gu_ty.float_x() {
+                        let xw = (n + n.div_ceil(32) * 4).div_ceil(16) * 4;
+                        let xh: Vec<f32> = be.get(&pf.buf, ((p.xh - o0) / 4) as usize, nt * xw)?;
+                        be1.put(&xh, &pf1.buf, ((pf1.p.xh - o1) / 4) as usize)?;
                     }
-                    let np = nt * k;
-                    let mut tiles_gu: Vec<u64> = Vec::with_capacity(2 * (c.n_expert + np / GEMM_BM));
-                    let mut tiles_dn: Vec<u64> = Vec::with_capacity(2 * (c.n_expert + np / GEMM_BM));
-                    let mut xrow: Vec<i32> = Vec::with_capacity(np);
-                    let mut inv: Vec<i32> = vec![0i32; nt * k];
-                    let mut gsc_rows: Vec<f32> = if ml.gu_scale.is_empty() { Vec::new() } else { Vec::with_capacity(np) };
-                    let mut m0 = 0usize;
-                    for e in 0..c.n_expert {
-                        if by_e[e].is_empty() { continue; }
-                        let wg = fe.gu.addr() + (e * fe.gu_stride) as u64;
-                        let wd = fe.dn.addr() + (e * fe.dn_stride) as u64;
-                        for at in (0..by_e[e].len()).step_by(GEMM_BM) {
-                            let cnt = GEMM_BM.min(by_e[e].len() - at) as u64;
-                            tiles_gu.extend([wg, (m0 + at) as u64 | (cnt << 32)]);
-                            tiles_dn.extend([wd, (m0 + at) as u64 | (cnt << 32)]);
-                        }
-                        for &(t, j) in &by_e[e] {
-                            inv[t * k + j] = xrow.len() as i32;
-                            xrow.push(t as i32);
-                            if !ml.gu_scale.is_empty() { gsc_rows.push(ml.gu_scale[e]); }
-                        }
-                        m0 += by_e[e].len();
-                    }
-                    let n_tiles = tiles_gu.len() / 2;
-                    let dn_off = 8 * tiles_gu.len();
-                    let xr_off = dn_off + 8 * tiles_dn.len();
-                    let inv_off = xr_off + 4 * np;
-                    ensure!(inv_off + 4 * nt * k <= pf.meta.len(), "prefill meta overflow");
-                    be.put(&tiles_gu, &pf.meta, 0)?;
-                    be.put(&tiles_dn, &pf.meta, dn_off / 8)?;
-                    be.put(&xrow, &pf.meta, xr_off / 4)?;
-                    be.put(&inv, &pf.meta, inv_off / 4)?;
-                    let gsc_a = if !gsc_rows.is_empty() {
-                        be.put(&gsc_rows, &pf.buf, ((p.gsc - buf_o) / 4) as usize)?;
-                        p.gsc
-                    } else {
-                        0
-                    };
-                    let ma = pf.meta.addr();
-                    be.gemm(fe.gu_ty, fe.gu_rows, fe.gu_cols, ma, n_tiles, p.hn, n, nt, ma + xr_off as u64, p.y, 2 * nf, 0)?;
-                    be.situ(p.y, nf, np, gsc_a, c.situ_beta, c.situ_linear_beta)?;
-                    be.gemm(fe.dn_ty, fe.dn_rows, fe.dn_cols, ma + dn_off as u64, n_tiles, p.y, 2 * nf, np, 0, p.d, n, 0)?;
-                    be.memset(&pf.acc_buf)?;
-                    be.moe_combine_seq(pf.acc_buf.addr(), p.d, p.wts, ma + inv_off as u64, k, 0, 0, n, nt)?;
+                    Self::pf_ffn_core(be1, m, ip, fe, pf1, nt, small, use_gemm)?;
+                    let acc: Vec<f32> = be1.get(&pf1.acc_buf, 0, nt * n)?;
+                    be.put(&acc, &pf.acc_buf, 0)?;
                 }
                 if verify_mode {
                     be.dtod(&pf.acc_buf, 0, &pf.conv_log, log_base + 4 * VERIFY_MAX * (2 * kw + n), 4 * nt * n)?;
@@ -1247,6 +1322,97 @@ impl Device {
             be.add(*x_a, p.acc2, nt * n)?;
         }
         std::mem::swap(cur_a, x_a);
+        Ok(())
+    }
+
+    /// The routed experts of a prompt chunk on the GPU `be` runs on: from the normed rows in `pf.p.hn` (and, below the
+    /// GEMM size, their quantized copy in `pf.p.xh`) to the weighted sum in `pf.acc_buf`.
+    #[allow(clippy::too_many_arguments)]
+    fn pf_ffn_core(be: &dyn Backend, m: &Inkling2Model, ip: usize, fe: &FullExps, pf: &PrefillScratch, nt: usize, small: bool, use_gemm: bool) -> Result<()> {
+        let (c, ml) = (&m.cfg, &m.layers[ip]);
+        let (n, nf, k) = (c.n_embd, c.n_ff_exp, c.n_used);
+        let (p, buf_o) = (pf.p, pf.buf.addr());
+        Self::proj_n(be, &fe.gate_inp, small, nt, p.hn, 0, p.rlogits, 0)?;
+        let gu_sc = fe.gu_scale.as_ref().map_or(0, |b| b.addr());
+        let dn_sc = fe.dn_scale.as_ref().map_or(0, |b| b.addr());
+        let gsc_out = if gu_sc != 0 { p.gsc } else { 0 };
+        be.ink_route(p.rlogits, fe.bias.addr(), p.ids, p.wts, gu_sc, dn_sc, gsc_out, c.n_expert, k, c.exp_scale, nt)?;
+        if !use_gemm {
+            // Process up to 16 tokens per moe_gemv batch so zero host sync is needed (exact decode speed for nt <= 16).
+            for tok0 in (0..nt).step_by(16) {
+                let bt = (nt - tok0).min(16);
+                let np = bt * k;
+                let xh_tok_floats = (n + n.div_ceil(32) * 4).div_ceil(16) * 4;
+                let ids_a = p.ids + (4 * tok0 * k) as u64;
+                let wts_a = p.wts + f(tok0 * k);
+                let gsc_a = if gu_sc != 0 { p.gsc + f(tok0 * k) } else { 0 };
+                let hn_a = p.hn + f(tok0 * n);
+                let xh_a = p.xh + f(tok0 * xh_tok_floats);
+                let y_a = p.y;
+                let d_a = p.d;
+                let acc_a = pf.acc_buf.addr() + f(tok0 * n);
+                be.moe_gemv(fe.gu_ty, fe.gu_rows, fe.gu_cols, fe.gu.addr(), fe.gu_stride, ids_a, np, hn_a, n, k, y_a, None, xh_a)?;
+                if fe.dn_ty.float_x() || nf % 32 != 0 {
+                    be.situ(y_a, nf, np, gsc_a, c.situ_beta, c.situ_linear_beta)?;
+                    be.moe_gemv(fe.dn_ty, fe.dn_rows, fe.dn_cols, fe.dn.addr(), fe.dn_stride, ids_a, np, y_a, 2 * nf, 1, d_a, None, 0)?;
+                } else {
+                    be.situ_q(y_a, nf, np, gsc_a, c.situ_beta, c.situ_linear_beta, p.xq)?;
+                    be.moe_gemv(fe.dn_ty, fe.dn_rows, fe.dn_cols, fe.dn.addr(), fe.dn_stride, ids_a, np, y_a, 2 * nf, 1, d_a, None, p.xq)?;
+                }
+                be.ink_ffn_sum_n(acc_a, d_a, wts_a, k, n, bt, 0)?;
+            }
+        } else {
+            use crate::backend::GEMM_BM;
+            let ids: Vec<i32> = be.get(&pf.buf, ((p.ids - buf_o) / 4) as usize, nt * k)?;
+            let mut by_e: Vec<Vec<(usize, usize)>> = vec![vec![]; c.n_expert];
+            for (t, row) in ids.chunks_exact(k).enumerate() {
+                for (j, &e) in row.iter().enumerate() { by_e[e as usize].push((t, j)); }
+            }
+            let np = nt * k;
+            let mut tiles_gu: Vec<u64> = Vec::with_capacity(2 * (c.n_expert + np / GEMM_BM));
+            let mut tiles_dn: Vec<u64> = Vec::with_capacity(2 * (c.n_expert + np / GEMM_BM));
+            let mut xrow: Vec<i32> = Vec::with_capacity(np);
+            let mut inv: Vec<i32> = vec![0i32; nt * k];
+            let mut gsc_rows: Vec<f32> = if ml.gu_scale.is_empty() { Vec::new() } else { Vec::with_capacity(np) };
+            let mut m0 = 0usize;
+            for e in 0..c.n_expert {
+                if by_e[e].is_empty() { continue; }
+                let wg = fe.gu.addr() + (e * fe.gu_stride) as u64;
+                let wd = fe.dn.addr() + (e * fe.dn_stride) as u64;
+                for at in (0..by_e[e].len()).step_by(GEMM_BM) {
+                    let cnt = GEMM_BM.min(by_e[e].len() - at) as u64;
+                    tiles_gu.extend([wg, (m0 + at) as u64 | (cnt << 32)]);
+                    tiles_dn.extend([wd, (m0 + at) as u64 | (cnt << 32)]);
+                }
+                for &(t, j) in &by_e[e] {
+                    inv[t * k + j] = xrow.len() as i32;
+                    xrow.push(t as i32);
+                    if !ml.gu_scale.is_empty() { gsc_rows.push(ml.gu_scale[e]); }
+                }
+                m0 += by_e[e].len();
+            }
+            let n_tiles = tiles_gu.len() / 2;
+            let dn_off = 8 * tiles_gu.len();
+            let xr_off = dn_off + 8 * tiles_dn.len();
+            let inv_off = xr_off + 4 * np;
+            ensure!(inv_off + 4 * nt * k <= pf.meta.len(), "prefill meta overflow");
+            be.put(&tiles_gu, &pf.meta, 0)?;
+            be.put(&tiles_dn, &pf.meta, dn_off / 8)?;
+            be.put(&xrow, &pf.meta, xr_off / 4)?;
+            be.put(&inv, &pf.meta, inv_off / 4)?;
+            let gsc_a = if !gsc_rows.is_empty() {
+                be.put(&gsc_rows, &pf.buf, ((p.gsc - buf_o) / 4) as usize)?;
+                p.gsc
+            } else {
+                0
+            };
+            let ma = pf.meta.addr();
+            be.gemm(fe.gu_ty, fe.gu_rows, fe.gu_cols, ma, n_tiles, p.hn, n, nt, ma + xr_off as u64, p.y, 2 * nf, 0)?;
+            be.situ(p.y, nf, np, gsc_a, c.situ_beta, c.situ_linear_beta)?;
+            be.gemm(fe.dn_ty, fe.dn_rows, fe.dn_cols, ma + dn_off as u64, n_tiles, p.y, 2 * nf, np, 0, p.d, n, 0)?;
+            be.memset(&pf.acc_buf)?;
+            be.moe_combine_seq(pf.acc_buf.addr(), p.d, p.wts, ma + inv_off as u64, k, 0, 0, n, nt)?;
+        }
         Ok(())
     }
 
@@ -1343,11 +1509,10 @@ impl Device {
         be.rms_norm_q(h, n, l.ffn_norm.addr(), s.hn, n, n, 1, c.eps, s.xh, 0)
     }
 
-    fn layer_ffn_gpu(&mut self, be: &dyn Backend, m: &Inkling2Model, il: usize, ip: usize) -> Result<bool> {
-        let Some(fe) = &self.layers[ip].full_exps else { return Ok(false) };
-        let (c, ds, s) = (&m.cfg, &self.slots[il], self.s);
-        let (n, hd, nc, nf, k) = (c.n_embd, c.head_dim, c.n_conv, c.n_ff_exp, c.n_used);
-        let hist3 = ds.hist.addr() + f(hists(c).0[3]);
+    /// The routed experts of one token on the GPU `be` runs on, from the normed input in `s.hn` (and its quantized
+    /// copy `s.xh`) to the weighted sum in `s.acc`. All of it stays on that device.
+    fn ffn_core(be: &dyn Backend, c: &Inkling2Config, s: Scratch, fe: &FullExps) -> Result<()> {
+        let (n, nf, k) = (c.n_embd, c.n_ff_exp, c.n_used);
         be.gemv(&fe.gate_inp, s.hn, s.rlogits)?;
         let gu_sc = fe.gu_scale.as_ref().map_or(0, |b| b.addr());
         let dn_sc = fe.dn_scale.as_ref().map_or(0, |b| b.addr());
@@ -1361,10 +1526,44 @@ impl Device {
             be.situ_q(s.y, nf, k, gsc_a, c.situ_beta, c.situ_linear_beta, s.xq)?;
             be.moe_gemv(fe.dn_ty, fe.dn_rows, fe.dn_cols, fe.dn.addr(), fe.dn_stride, s.ids, k, s.y, 2 * nf, 1, s.d, None, s.xq)?;
         }
-        be.ink_ffn_sum(s.acc, s.d, s.wc, k, n, 0)?;
+        be.ink_ffn_sum(s.acc, s.d, s.wc, k, n, 0)
+    }
+
+    /// What follows the experts of a layer run: the short convolution, the residual add, and the swap of the streams.
+    fn ffn_tail(&mut self, be: &dyn Backend, m: &Inkling2Model, il: usize, ip: usize) -> Result<()> {
+        let (c, ds, s) = (&m.cfg, &self.slots[il], self.s);
+        let (n, hd, nc) = (c.n_embd, c.head_dim, c.n_conv);
+        let hist3 = ds.hist.addr() + f(hists(c).0[3]);
         be.ink_conv(s.acc, self.layers[ip].convs[3].addr(), 0, hist3, s.acc, n, nc, hd)?;
         be.add(s.x, s.acc, n)?;
         (self.s.cur, self.s.x) = (s.x, s.cur);
+        Ok(())
+    }
+
+    fn layer_ffn_gpu(&mut self, be: &dyn Backend, m: &Inkling2Model, il: usize, ip: usize) -> Result<bool> {
+        let Some(fe) = &self.layers[ip].full_exps else { return Ok(false) };
+        Self::ffn_core(be, &m.cfg, self.s, fe)?;
+        self.ffn_tail(be, m, il, ip)?;
+        Ok(true)
+    }
+
+    /// `layer_ffn_gpu` for a layer whose experts are on GPU 1: the normed input crosses to it through the host, the
+    /// experts run there, and the sum comes back (two small copies and two syncs per layer run). False: not that kind of layer.
+    fn layer_ffn_remote(&mut self, d: &dev::Dev, m: &Inkling2Model, il: usize, ip: usize) -> Result<bool> {
+        let (Some(fe), Some(r)) = (&self.layers[ip].full_exps, &self.rem) else { return Ok(false) };
+        if fe.part == 0 { return Ok(false) }
+        let (c, s, rs) = (&m.cfg, self.s, r.s);
+        let (be0, be1) = (&*d.parts[0].be, &*d.parts[r.part].be);
+        let (n, o0, o1) = (c.n_embd, self.scr.addr(), r.scr.addr());
+        let xh_words = (n + n.div_ceil(32) * 4).div_ceil(16) * 4;
+        let hn: Vec<f32> = be0.get(&self.scr, ((s.hn - o0) / 4) as usize, n)?;
+        let xh: Vec<f32> = be0.get(&self.scr, ((s.xh - o0) / 4) as usize, xh_words)?;
+        be1.put(&hn, &r.scr, ((rs.hn - o1) / 4) as usize)?;
+        be1.put(&xh, &r.scr, ((rs.xh - o1) / 4) as usize)?;
+        Self::ffn_core(be1, c, rs, fe)?;
+        let acc: Vec<f32> = be1.get(&r.scr, ((rs.acc - o1) / 4) as usize, n)?;
+        be0.put(&acc, &self.scr, ((s.acc - o0) / 4) as usize)?;
+        self.ffn_tail(be0, m, il, ip)?;
         Ok(true)
     }
 
@@ -1381,7 +1580,7 @@ impl Device {
             let d = lock();
             let be = &*d.parts[0].be;
             self.layer_attn(be, &d, m, il, ip, msgs, pos, false, nb).expect("inkling2 device step");
-            if self.layer_ffn_gpu(be, m, il, ip).expect("inkling2 device step") {
+            if self.layer_ffn_remote(&d, m, il, ip).expect("inkling2 device step remote") || self.layer_ffn_gpu(be, m, il, ip).expect("inkling2 device step") {
                 m.lap(0, t);
                 return;
             }
@@ -1390,9 +1589,12 @@ impl Device {
         m.lap(0, t);
         // The experts: those of the GPU read the device's copy of the input and leave their outputs there.
         let (on_gpu, on_cpu, adapt) = m.plan(ip, &hn);
+        // Local patch: an expert with a matrix on another GPU cannot run in this GPU's queue; `remote` runs through
+        // `run_experts` (each matrix where it lives), next to the CPU share.
+        let on_first = |x: &Mat| x.gpu.is_none_or(|i| i == dev::STAGED || dev::gpu_of(i) == 0);
+        let (list, remote): (Vec<_>, Vec<_>) = Inkling2Model::resident(ml, c.n_expert, &on_gpu).into_iter().partition(|e| on_first(&e.0) && on_first(&e.1));
         let gpu_side = || -> Option<f32> {
             let t = std::time::Instant::now();
-            let list = Inkling2Model::resident(ml, c.n_expert, &on_gpu);
             let d = lock();
             let (p, mut owned) = (&d.parts[0], vec![]);
             (|| -> Option<()> {
@@ -1435,15 +1637,17 @@ impl Device {
             let t = std::time::Instant::now();
             (run_experts(&on_cpu, &hn, c), t.elapsed().as_secs_f32())
         };
-        let (gpu, (cpu, tc)) = rayon::join(gpu_side, cpu_side);
+        let remote_side = || (!remote.is_empty()).then(|| run_experts(&remote, &hn, c));
+        let (gpu, ((cpu, tc), rem)) = rayon::join(gpu_side, || rayon::join(cpu_side, remote_side));
         let d = lock();
         let be = &*d.parts[0].be;
         match gpu {
             Some(tg) => {
                 m.balance(&m.cpu_share, adapt, tg, tc);
-                let wc: Vec<f32> = (0..c.n_used).map(|i| on_gpu.get(i).map_or(0.0, |e| e.2)).chain(cpu).collect();
+                let host: Vec<f32> = match rem { Some(r) => cpu.iter().zip(&r).map(|(a, b)| a + b).collect(), None => cpu };
+                let wc: Vec<f32> = (0..c.n_used).map(|i| list.get(i).map_or(0.0, |e| e.2)).chain(host).collect();
                 be.put(&wc, &self.scr, ((s.wc - o) / 4) as usize).expect("inkling2 device step");
-                be.ink_ffn_sum(s.acc, s.d, s.wc, on_gpu.len(), n, s.wc + f(c.n_used)).expect("inkling2 device step");
+                be.ink_ffn_sum(s.acc, s.d, s.wc, list.len(), n, s.wc + f(c.n_used)).expect("inkling2 device step");
             }
             None => {
                 // No room to stage a routed weight (a card with little free VRAM): the experts of the GPU run on
