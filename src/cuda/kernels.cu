@@ -7,6 +7,7 @@ typedef unsigned int u32;
 typedef unsigned long long u64;
 
 __device__ __forceinline__ float h2f(u16 h) { float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f; }
+__device__ __forceinline__ float2 ink_h2f2(unsigned w) { return make_float2(h2f((u16)(w & 0xFFFFu)), h2f((u16)(w >> 16))); }
 __device__ __forceinline__ u16 f2h(float f) { u16 h; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f)); return h; }
 __device__ __forceinline__ u32 ld16(const u8* p) { return *(const u16*)p; }  // 2-aligned only (every quant field is)
 __device__ __forceinline__ u32 ld32(const u8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((u32)p[3] << 24); }
@@ -2679,6 +2680,76 @@ extern "C" __global__ void ink_attn(const float* q, const float* r, const float*
         o[1] = z;
     }
 }
+
+#if KV_MODE == 0
+// Decode attention for head_dim 128, one query per head, restructured for bandwidth. A 128-thread block owns 128 key
+// positions and stages their K rows in shared memory with coalesced 16-byte loads; lane i of warp w scores key
+// 32w + i with sixteen 16-byte loads and 128 FMAs, so there is no shuffle per key (one block max and one block sum
+// per 128 keys), and V is read 8 bytes a lane, one key at a time, which is coalesced as it is. The kernel above walks
+// one key at a time through ldkv1 (a 2-byte load per lane per element) and reads K/V at about 95 GB/s of the card's
+// 360: 8.4 ms a token at 24.5k positions, and most of the 21 ms it takes at 200k.
+extern "C" __global__ void __launch_bounds__(128) ink_attn_128(const float* q, const float* r, const float* sink,
+        const u16* k, const u16* v, const float* bias, float* sc, int rows, int at, int ring, int nkv, int hd,
+        int nr, int ext, const int* pos_ptr) {
+    constexpr int HD = 128, PQ = HD + 8;
+    __shared__ __align__(16) float qs[HD], rs[32], lg[128], ac[4][HD];
+    __shared__ __align__(16) u16 ks[128 * PQ];
+    int h = blockIdx.x, kh = h / (gridDim.x / nkv), kw = nkv * HD;
+    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    if (pos_ptr) { int pos = *pos_ptr; rows = min(pos + 1, ring); at = pos % ring; }
+    int i0 = blockIdx.y * 128, n = i0 < rows ? min(128, rows - i0) : 0;
+    float* o = sc + ((size_t)h * gridDim.y + blockIdx.y) * (HD + 2);
+    if (n == 0) {  // a chunk past the keys: a neutral partial for the merge (exp(-3e38) is 0)
+        if (tid < HD) o[2 + tid] = 0.f;
+        if (tid == 0) { o[0] = -3.0e38f; o[1] = 0.f; }
+        return;
+    }
+    if (tid < HD) qs[tid] = q[h * HD + tid] * rsqrtf((float)HD);
+    if (tid < nr) rs[tid] = r[h * nr + tid];
+    for (int i = tid; i < 128 * 16; i += 128) {
+        int row = i >> 4, part = i & 15;
+        uint4 x = make_uint4(0u, 0u, 0u, 0u);
+        if (row < n) x = *(const uint4*)(k + (size_t)(i0 + row) * kw + kh * HD + part * 8);
+        *(uint4*)(ks + row * PQ + part * 8) = x;
+    }
+    __syncthreads();
+    int i = i0 + warp * 32 + lane;
+    float l = -3.0e38f;
+    if (i < i0 + n) {
+        const u16* kr = ks + (warp * 32 + lane) * PQ;
+        float d = 0.f;
+        for (int m = 0; m < HD / 8; m++) {
+            uint4 w = *(const uint4*)(kr + 8 * m);
+            float2 a = ink_h2f2(w.x), b = ink_h2f2(w.y), c = ink_h2f2(w.z), e = ink_h2f2(w.w);
+            d += qs[8 * m + 0] * a.x + qs[8 * m + 1] * a.y + qs[8 * m + 2] * b.x + qs[8 * m + 3] * b.y
+               + qs[8 * m + 4] * c.x + qs[8 * m + 5] * c.y + qs[8 * m + 6] * e.x + qs[8 * m + 7] * e.y;
+        }
+        int dist = at - i; if (dist < 0) dist += rows;
+        if (dist < ext) for (int c = 0; c < nr; c++) d += rs[c] * bias[(size_t)dist * nr + c];
+        l = d - sink[h];
+    }
+    float mx = block_max(l);
+    float p = i < i0 + n ? expf(l - mx) : 0.f;
+    lg[tid] = p;
+    float z = block_sum(p);
+    __syncthreads();
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    for (int j = warp; j < n; j += 4) {
+        float pj = lg[j];
+        uint2 vw = *(const uint2*)(v + (size_t)(i0 + j) * kw + kh * HD + 4 * lane);
+        float2 v01 = ink_h2f2(vw.x), v23 = ink_h2f2(vw.y);
+        a0 += pj * v01.x; a1 += pj * v01.y; a2 += pj * v23.x; a3 += pj * v23.y;
+    }
+    *(float4*)&ac[warp][4 * lane] = make_float4(a0, a1, a2, a3);
+    __syncthreads();
+    if (tid < HD) o[2 + tid] = ac[0][tid] + ac[1][tid] + ac[2][tid] + ac[3][tid];
+    if (tid == 0) { o[0] = mx; o[1] = z; }
+}
+#else
+// A quantized KV cache keeps the scalar kernel: this entry point is never selected (see ink_attn in cuda/mod.rs).
+extern "C" __global__ void __launch_bounds__(128) ink_attn_128(const float*, const float*, const float*, const u16*,
+        const u16*, const float*, float*, int, int, int, int, int, int, int, const int*) { __trap(); }
+#endif
 
 extern "C" __global__ void ink_attn_merge(const float* sc, const float* gate, float* out, int chunks, int hd) {
     int h = blockIdx.x, t = threadIdx.x;
