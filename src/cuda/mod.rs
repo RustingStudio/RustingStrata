@@ -17,12 +17,12 @@ const QTYPES: [GgmlType; 29] = {
     use GgmlType::*;
     [F32, BF16, F8E4M3, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_1, Q5_1, Q4_0, Q5_0, NVFP4]
 };
-const KERNELS: [&str; 54] = [
+const KERNELS: [&str; 56] = [
     "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "situ_q", "softcap", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "dflash2_conv", "hadamard",
-    "ink_mix", "ink_ctrl_gate", "ink_ctrl_out", "ink_conv", "ink_conv_batch", "ink_clip", "ink_attn", "ink_attn_merge",
+    "ink_mix", "ink_ctrl_gate", "ink_ctrl_out", "ink_ctrl_gate_b", "ink_ctrl_out_b", "ink_conv", "ink_conv_batch", "ink_clip", "ink_attn", "ink_attn_merge",
     "ink_attn_prefill_32", "ink_attn_prefill_64", "ink_attn_prefill_128", "ink_ffn_sum", "ink_route",
 ];
 
@@ -1082,6 +1082,17 @@ impl Backend for Gpu {
         Ok(())
     }
     fn ink_ctrl_n(&self, down: u64, gain: u64, forget: u64, cur: u64, nins: usize, msg: u64, gate: u64, out: u64, n: usize, rank: usize, count: usize, nt: usize) -> anyhow::Result<()> {
+        // A prompt chunk uses the tiled pair (a weight row is read once per 64 tokens); a decoded token the
+        // per-token pair, which has no tile to reuse. Both pairs read and write the same gate layout.
+        // STRATA_CTRL_TILE=0 forces the per-token pair, to compare the two on the same text.
+        let tiled = nt >= 64 && rank <= 64 && n % 64 == 0 && std::env::var("STRATA_CTRL_TILE").map_or(true, |v| v != "0");
+        if tiled {
+            let g1 = cfg((count as u32, nt.div_ceil(64) as u32), 256, 0);
+            let g2 = LaunchConfig { grid_dim: (count as u32, n.div_ceil(64) as u32, nt.div_ceil(64) as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            launch!(self, "ink_ctrl_gate_b", g1, down, cur, nins as i32, msg, gate, n as i32, rank as i32, nt as i32);
+            launch!(self, "ink_ctrl_out_b", g2, gain, forget, gate, cur, nins as i32, msg, out, n as i32, rank as i32, nt as i32);
+            return Ok(());
+        }
         let g1 = LaunchConfig { grid_dim: (rank as u32, count as u32, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
         let g2 = LaunchConfig { grid_dim: (n.div_ceil(256) as u32, count as u32, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
         launch!(self, "ink_ctrl_gate", g1, down, cur, nins as i32, msg, gate, n as i32, rank as i32, nt as i32);
@@ -1502,8 +1513,8 @@ mod tests {
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 370);
-        assert_eq!(sm70.len(), 324);
+        assert_eq!(sm80.len(), 372);
+        assert_eq!(sm70.len(), 326);
         assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmis")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());

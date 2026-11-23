@@ -1821,6 +1821,128 @@ extern "C" __global__ void ink_ctrl_out(const u16* gain, const u16* forget, cons
     out[mo] = x - tanhf(f) * x + tanhf(g) * msg[mo];
 }
 
+// The same two controllers for a prompt chunk, tiled over tokens: a block holds 64 tokens of one controller and all
+// `rank` rows (a 64 x 64 output tile), so a weight row is read once per 64 tokens where the per-token kernels above
+// read it once per token (32x the traffic of the tile, and a block reduction per output). 16 x 16 threads, 4 x 4
+// outputs each; both read and write the layout of the per-token pair, so nothing outside these four kernels changes.
+extern "C" __global__ void __launch_bounds__(256) ink_ctrl_gate_b(const u16* down, const float* cur, int nins,
+                                                                  const float* msg, float* gate, int n, int rank, int nt) {
+    constexpr int BT = 64;
+    __shared__ __align__(16) float xs[BT][65];
+    __shared__ __align__(16) u16 ws[BT][65];
+    __shared__ float sc[BT][2];
+    const int j = blockIdx.x, t0 = blockIdx.y * BT, tw = 2 * n, count = gridDim.x;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float* ccur = cur + (size_t)min(j, nins - 1) * nt * n;
+    const float* cmsg = msg + (size_t)j * nt * n;
+    // The RMS of both inputs of each token, one warp a token: the per-token kernel folds this into its one dot.
+    for (int tt = warp; tt < BT; tt += 8) {
+        const int t = t0 + tt;
+        float sa = 0.f, sb = 0.f;
+        if (t < nt) {
+            const float* c = ccur + (size_t)t * n;
+            const float* m = cmsg + (size_t)t * n;
+            for (int i = lane; i < n; i += 32) { sa += c[i] * c[i]; sb += m[i] * m[i]; }
+        }
+        sa = warp_sum(sa); sb = warp_sum(sb);
+        if (lane == 0) { sc[tt][0] = rsqrtf(sa / (float)n + 1e-6f); sc[tt][1] = rsqrtf(sb / (float)n + 1e-6f); }
+    }
+    __syncthreads();
+    const int ty = tid >> 4, tx = tid & 15;
+    float acc[4][4];
+    for (int i = 0; i < 4; i++) for (int r = 0; r < 4; r++) acc[i][r] = 0.f;
+    for (int k0 = 0; k0 < tw; k0 += 64) {
+        for (int i = tid; i < BT * 64; i += 256) {
+            const int tt = i >> 6, kk = i & 63, t = t0 + tt, k = k0 + kk;
+            float v = 0.f;
+            if (t < nt) {
+                const float* c = ccur + (size_t)t * n;
+                const float* m = cmsg + (size_t)t * n;
+                v = k < n ? c[k] * sc[tt][0] : m[k - n] * sc[tt][1];
+            }
+            xs[tt][kk] = v;
+        }
+        for (int i = tid; i < 64 * 64; i += 256) {
+            const int r = i >> 6, kk = i & 63;
+            ws[r][kk] = r < rank && k0 + kk < tw ? down[((size_t)j * rank + r) * tw + k0 + kk] : (u16)0;
+        }
+        __syncthreads();
+        for (int k = 0; k < 64; k++) {
+            float xv[4], wv[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) xv[i] = xs[ty * 4 + i][k];
+#pragma unroll
+            for (int r = 0; r < 4; r++) wv[r] = h2f(ws[tx * 4 + r][k]);
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+#pragma unroll
+                for (int r = 0; r < 4; r++) acc[i][r] = fmaf(xv[i], wv[r], acc[i][r]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int t = t0 + ty * 4 + i;
+        if (t >= nt) break;
+#pragma unroll
+        for (int r = 0; r < 4; r++) {
+            if (tx * 4 + r < rank) gate[((size_t)t * count + j) * rank + tx * 4 + r] = acc[i][r];
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) ink_ctrl_out_b(const u16* gain, const u16* forget, const float* gate,
+                                                                 const float* cur, int nins, const float* msg, float* out,
+                                                                 int n, int rank, int nt) {
+    constexpr int BT = 64;
+    __shared__ __align__(16) float gs[BT][65];
+    __shared__ __align__(16) u16 ws[2][BT][65];
+    const int j = blockIdx.x, c0 = blockIdx.y * BT, t0 = blockIdx.z * BT, count = gridDim.x;
+    const int tid = threadIdx.x;
+    for (int i = tid; i < BT * 64; i += 256) {
+        const int tt = i >> 6, r = i & 63, t = t0 + tt;
+        gs[tt][r] = t < nt && r < rank ? gate[((size_t)t * count + j) * rank + r] : 0.f;
+    }
+    for (int i = tid; i < BT * 64; i += 256) {
+        const int r = i >> 6, cc = i & 63, c = c0 + cc;
+        const bool in = r < rank && c < n;
+        const size_t at = ((size_t)j * rank + r) * n + c;
+        ws[0][r][cc] = in ? gain[at] : (u16)0;
+        ws[1][r][cc] = in ? forget[at] : (u16)0;
+    }
+    __syncthreads();
+    const int ty = tid >> 4, tx = tid & 15;
+    float ag[4][4], af[4][4];
+    for (int i = 0; i < 4; i++) for (int cc = 0; cc < 4; cc++) { ag[i][cc] = 0.f; af[i][cc] = 0.f; }
+    for (int r = 0; r < rank; r++) {
+        float gv[4], wg[4], wf[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) gv[i] = gs[ty * 4 + i][r];
+#pragma unroll
+        for (int cc = 0; cc < 4; cc++) { wg[cc] = h2f(ws[0][r][tx * 4 + cc]); wf[cc] = h2f(ws[1][r][tx * 4 + cc]); }
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+#pragma unroll
+            for (int cc = 0; cc < 4; cc++) { ag[i][cc] = fmaf(gv[i], wg[cc], ag[i][cc]); af[i][cc] = fmaf(gv[i], wf[cc], af[i][cc]); }
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        const int t = t0 + ty * 4 + i;
+        if (t >= nt) break;
+        const int c = c0 + tx * 4;
+        if (c >= n) continue;
+        float* o = out + ((size_t)j * nt + t) * n + c;
+        const float* x = cur + ((size_t)min(j, nins - 1) * nt + t) * n + c;
+        const float* m = msg + ((size_t)j * nt + t) * n + c;
+        const int cnt = min(4, n - c);
+        for (int cc = 0; cc < cnt; cc++) {
+            const float f = fminf(fmaxf(af[i][cc], -10.f), 10.f), g = fminf(fmaxf(ag[i][cc], -10.f), 10.f);
+            o[cc] = x[cc] - tanhf(f) * x[cc] + tanhf(g) * m[cc];
+        }
+    }
+}
+
 // Short causal convolution with a residual (nc at most 8; out may be cur): hist holds the last nc - 1 inputs, the
 // oldest first, and is advanced by cur. taps ([c / per][lag], lag 0 the current input) may be null.
 extern "C" __global__ void ink_conv(const float* cur, const float* w, const float* taps, float* hist, float* out, int n, int nc, int per) {
