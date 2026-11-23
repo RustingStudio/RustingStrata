@@ -37,6 +37,13 @@ struct DsparkLayer {
     ffn_down: Mat<'static>,
 }
 
+enum MarkovHead {
+    /// Legacy Unsloth DSpark: projects `latent` (`[rank]`) to hidden space (`[n_embd]`), adds `h_row`, then runs target LM head.
+    HiddenOut { weight: Mat<'static>, bias: Vec<f32> },
+    /// Mainline llama.cpp DSpark: adds low-rank logit delta `markov_w2 @ latent + bias` onto batched target LM head logits.
+    Logits { w2: Mat<'static>, bias: Vec<f32> },
+}
+
 pub struct DsparkDrafter {
     pub n_layer: usize,
     pub n_embd: usize,
@@ -52,13 +59,13 @@ pub struct DsparkDrafter {
     pub target_layers: [usize; 4],
     fuse: Vec<f32>,
     dspark_norm: Vec<f32>,
+    token_embd_norm: Option<Vec<f32>>,
     mask_embd: Vec<f32>,
     output_norm: Vec<f32>,
     markov_w1: Mat<'static>,
     joint_proj: Mat<'static>,
     joint_proj_b: Vec<f32>,
-    hidden_out: Mat<'static>,
-    hidden_out_b: Vec<f32>,
+    markov_head: MarkovHead,
     layers: Vec<DsparkLayer>,
     k_cache: Vec<Vec<f32>>,
     v_cache: Vec<Vec<f32>>,
@@ -122,24 +129,61 @@ impl DsparkDrafter {
 
         let markov_w1 = host_mat(g_ref, "markov_w1.weight")?;
         let rank = markov_w1.cols;
-        let fuse = f32s(g_ref, "dspark_fuse.weight")?;
-        ensure!(fuse.len() == 4 * (n_layer + 1), "dspark_fuse.weight len {} != {}", fuse.len(), 4 * (n_layer + 1));
-        let dspark_norm = f32s(g_ref, "dspark_norm.weight")?;
+        let fuse = if g_ref.tensors.contains_key("dspark_fuse.weight") {
+            let f = f32s(g_ref, "dspark_fuse.weight")?;
+            ensure!(f.len() == 4 * (n_layer + 1), "dspark_fuse.weight len {} != {}", f.len(), 4 * (n_layer + 1));
+            f
+        } else {
+            let mut f = Vec::with_capacity(4 * (n_layer + 1));
+            for il in 0..n_layer {
+                let row = f32s(g_ref, &format!("blk.{il}.ctx_mix.weight"))?;
+                ensure!(row.len() == 4, "blk.{il}.ctx_mix.weight len {} != 4", row.len());
+                f.extend_from_slice(&row);
+            }
+            let row = f32s(g_ref, "markov_ctx_mix.weight")?;
+            ensure!(row.len() == 4, "markov_ctx_mix.weight len {} != 4", row.len());
+            f.extend_from_slice(&row);
+            f
+        };
+        let dspark_norm = if g_ref.tensors.contains_key("dspark_norm.weight") {
+            f32s(g_ref, "dspark_norm.weight")?
+        } else {
+            f32s(g_ref, "markov_ctx_norm.weight")?
+        };
+        let token_embd_norm = if g_ref.tensors.contains_key("token_embd_norm.weight") {
+            Some(f32s(g_ref, "token_embd_norm.weight")?)
+        } else {
+            None
+        };
         let mask_embd = f32s(g_ref, "mask_embd.weight")?;
         let output_norm = f32s(g_ref, "output_norm.weight")?;
         let joint_proj = host_mat(g_ref, "joint_proj.weight")?;
         let joint_proj_b = f32s(g_ref, "joint_proj.bias")?;
-        let hidden_out = host_mat(g_ref, "dspark_hidden_out.weight")?;
-        let hidden_out_b = f32s(g_ref, "dspark_hidden_out.bias")?;
+        let markov_head = if g_ref.tensors.contains_key("markov_w2.weight") {
+            MarkovHead::Logits {
+                w2: host_mat(g_ref, "markov_w2.weight")?,
+                bias: f32s(g_ref, "markov_w2.bias")?,
+            }
+        } else {
+            MarkovHead::HiddenOut {
+                weight: host_mat(g_ref, "dspark_hidden_out.weight")?,
+                bias: f32s(g_ref, "dspark_hidden_out.bias")?,
+            }
+        };
 
         let mut layers = Vec::with_capacity(n_layer);
         for il in 0..n_layer {
             let p = |s: &str| format!("blk.{il}.{s}");
             let m = |s: &str| Mat::load(g_ref, &p(s));
             let v = |s: &str| f32s(g_ref, &p(s));
+            let dflare_norm = if g_ref.tensors.contains_key(&p("dflare_norm.weight")) {
+                v("dflare_norm.weight")?
+            } else {
+                v("ctx_norm.weight")?
+            };
             layers.push(DsparkLayer {
                 swa: swa[il],
-                dflare_norm: v("dflare_norm.weight")?,
+                dflare_norm,
                 attn_k_ctx: m("attn_k_ctx.weight")?,
                 attn_v_ctx: m("attn_v_ctx.weight")?,
                 attn_k_ctx_norm: v("attn_k_ctx_norm.weight")?,
@@ -172,13 +216,13 @@ impl DsparkDrafter {
             target_layers,
             fuse,
             dspark_norm,
+            token_embd_norm,
             mask_embd,
             output_norm,
             markov_w1,
             joint_proj,
             joint_proj_b,
-            hidden_out,
-            hidden_out_b,
+            markov_head,
             layers,
             k_cache: vec![Vec::new(); n_layer],
             v_cache: vec![Vec::new(); n_layer],
@@ -270,9 +314,17 @@ impl DsparkDrafter {
 
         // 1. Build 8-token input: slot 0 is normed target token embedding of `anchor_tok`, slots 1..8 are `mask_embd`.
         let mut inp = vec![0.0f32; bs * n];
-        target.embed_normed(anchor_tok, &mut inp[..n]);
+        if let Some(norm_w) = &self.token_embd_norm {
+            let mut emb = vec![0.0f32; n];
+            target.embed_raw(anchor_tok, &mut emb);
+            rms_norm_w(&emb, norm_w, self.eps, &mut inp[..n]);
+        } else {
+            target.embed_normed(anchor_tok, &mut inp[..n]);
+        }
+        let per_pos_mask = self.mask_embd.len() >= (bs - 1) * n;
         for i in 1..bs {
-            inp[i * n..(i + 1) * n].copy_from_slice(&self.mask_embd);
+            let src = if per_pos_mask { &self.mask_embd[(i - 1) * n..i * n] } else { &self.mask_embd[..n] };
+            inp[i * n..(i + 1) * n].copy_from_slice(src);
         }
 
         // 2. Run the 3 non-causal DSpark transformer layers over the 8-token block.
@@ -372,34 +424,74 @@ impl DsparkDrafter {
         joint_in[2 * r + n..].copy_from_slice(ctx_feat);
         let mut joint = vec![0.0f32; 3 * r];
         let mut latent = vec![0.0f32; r];
-        let mut corr = vec![0.0f32; n];
         let mut prev = anchor_tok;
         let mut drafts = Vec::with_capacity(count);
 
-        for step in 0..count {
-            let h_row = &hidden[(step + 1) * n..(step + 2) * n];
-            self.markov_w1.row_into(prev as usize, &mut prev_embd);
-            joint_in[..r].copy_from_slice(&state);
-            joint_in[r..2 * r].copy_from_slice(&prev_embd);
-            joint_in[2 * r..2 * r + n].copy_from_slice(h_row);
+        match &self.markov_head {
+            MarkovHead::HiddenOut { weight, bias } => {
+                let mut corr = vec![0.0f32; n];
+                for step in 0..count {
+                    let h_row = &hidden[(step + 1) * n..(step + 2) * n];
+                    self.markov_w1.row_into(prev as usize, &mut prev_embd);
+                    joint_in[..r].copy_from_slice(&state);
+                    joint_in[r..2 * r].copy_from_slice(&prev_embd);
+                    joint_in[2 * r..2 * r + n].copy_from_slice(h_row);
 
-            self.joint_proj.matvec(&joint_in, &mut joint);
-            for (v, &b) in joint.iter_mut().zip(&self.joint_proj_b) { *v += b; }
+                    self.joint_proj.matvec(&joint_in, &mut joint);
+                    for (v, &b) in joint.iter_mut().zip(&self.joint_proj_b) { *v += b; }
 
-            for k in 0..r {
-                let gate = crate::ops::sigmoid(joint[k]);
-                let cand = joint[r + k].tanh();
-                state[k] = cand + gate * (state[k] - cand);
-                latent[k] = joint[2 * r + k].tanh();
+                    for k in 0..r {
+                        let gate = crate::ops::sigmoid(joint[k]);
+                        let cand = joint[r + k].tanh();
+                        state[k] = cand + gate * (state[k] - cand);
+                        latent[k] = joint[2 * r + k].tanh();
+                    }
+
+                    weight.matvec(&latent, &mut corr);
+                    for ((c, &b), &h_v) in corr.iter_mut().zip(bias).zip(h_row) {
+                        *c = *c + b + h_v;
+                    }
+
+                    prev = target.lm_head_argmax(&corr);
+                    drafts.push(prev);
+                }
             }
+            MarkovHead::Logits { w2, bias } => {
+                let n_vocab = target.cfg.n_vocab;
+                let base_logits = target.lm_head_batch(&hidden[n..(1 + count) * n], count);
+                let mut delta = vec![0.0f32; w2.rows];
+                for step in 0..count {
+                    let h_row = &hidden[(step + 1) * n..(step + 2) * n];
+                    self.markov_w1.row_into(prev as usize, &mut prev_embd);
+                    joint_in[..r].copy_from_slice(&state);
+                    joint_in[r..2 * r].copy_from_slice(&prev_embd);
+                    joint_in[2 * r..2 * r + n].copy_from_slice(h_row);
 
-            self.hidden_out.matvec(&latent, &mut corr);
-            for ((c, &b), &h_v) in corr.iter_mut().zip(&self.hidden_out_b).zip(h_row) {
-                *c = *c + b + h_v;
+                    self.joint_proj.matvec(&joint_in, &mut joint);
+                    for (v, &b) in joint.iter_mut().zip(&self.joint_proj_b) { *v += b; }
+
+                    for k in 0..r {
+                        let gate = crate::ops::sigmoid(joint[k]);
+                        let cand = joint[r + k].tanh();
+                        state[k] = cand + gate * (state[k] - cand);
+                        latent[k] = joint[2 * r + k].tanh();
+                    }
+
+                    w2.matvec(&latent, &mut delta);
+                    let base = &base_logits[step * n_vocab..(step + 1) * n_vocab];
+                    let nv = n_vocab.min(w2.rows).min(bias.len());
+                    let (mut best_i, mut best_v) = (0usize, f32::NEG_INFINITY);
+                    for i in 0..nv {
+                        let v = base[i] + delta[i] + bias[i];
+                        if v > best_v {
+                            best_v = v;
+                            best_i = i;
+                        }
+                    }
+                    prev = best_i as u32;
+                    drafts.push(prev);
+                }
             }
-
-            prev = target.lm_head_argmax(&corr);
-            drafts.push(prev);
         }
         drafts
     }

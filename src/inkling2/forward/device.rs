@@ -688,6 +688,29 @@ impl Device {
         Ok(id)
     }
 
+    /// Project `nt` hidden vectors (`[nt, n_embd]`) through the target's LM head on GPU in one batched matvec
+    /// and return `[nt, c.n_vocab]` logits (before softcap).
+    pub(super) fn lm_head_batch(&mut self, m: &Inkling2Model, h_rows: &[f32], nt: usize) -> Result<Vec<f32>> {
+        let c = &m.cfg;
+        let vrows = m.output.rows;
+        let d = dev::get().unwrap().lock().unwrap();
+        let be = &*d.parts[0].be;
+        self.ensure_pf(be, c, vrows, nt)?;
+        let pf = self.pf.as_ref().unwrap();
+        let o = pf.buf.addr();
+        be.put(h_rows, &pf.buf, ((pf.p.hn - o) / 4) as usize)?;
+        be.gemvq(d.tensor(m.output.gpu.unwrap()), pf.p.hn, c.n_embd, 0, pf.logits_buf.addr(), vrows, nt)?;
+        let raw = be.get::<f32>(&pf.logits_buf, 0, nt * vrows)?;
+        if vrows == c.n_vocab {
+            return Ok(raw);
+        }
+        let mut out = Vec::with_capacity(nt * c.n_vocab);
+        for row in raw.chunks_exact(vrows) {
+            out.extend_from_slice(&row[..c.n_vocab]);
+        }
+        Ok(out)
+    }
+
     fn record_dspark_visit(&self, visit: usize, cur_a: u64, nt: usize, n: usize) -> Result<()> {
         let Some(k) = DSPARK_VISITS.iter().position(|&v| v == visit) else { return Ok(()) };
         let d = dev::get().unwrap().lock().unwrap();
