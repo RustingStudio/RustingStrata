@@ -589,6 +589,25 @@ impl<'a> Inkling2Model<'a> {
         rms_norm_w(&emb, &self.tok_norm, self.cfg.eps, out);
     }
 
+    /// Project `nt` hidden states (`[nt, n_embd]`) through the target LM head on GPU, keeping the logits on device.
+    pub(super) fn lm_head_batch_gpu(&mut self, h_rows: &[f32], nt: usize) -> bool {
+        if let Some(mut d) = self.device.take() {
+            let ok = d.lm_head_batch_gpu(self, h_rows, nt).is_ok();
+            self.device = Some(d);
+            return ok;
+        }
+        false
+    }
+
+    /// Add `w2 @ latent + bias` onto `pf.logits_buf[step]` on GPU and return the argmax token ID.
+    pub(super) fn markov_w2_argmax_gpu(
+        &self, w2: &crate::backend::GpuTensor, bias_addr: u64, latent: &[f32], step: usize,
+    ) -> Option<u32> {
+        self.device.as_ref()?.markov_w2_argmax_gpu(self, w2, bias_addr, latent, step).ok()
+    }
+
+    pub(super) fn output_rows(&self) -> usize { self.output.rows }
+
     /// Project `nt` hidden states (`[nt, n_embd]`) through the target LM head (`output.weight`) and return
     /// `[nt, cfg.n_vocab]` logits before softcap.
     pub fn lm_head_batch(&mut self, h_rows: &[f32], nt: usize) -> Vec<f32> {

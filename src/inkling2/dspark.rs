@@ -37,11 +37,16 @@ struct DsparkLayer {
     ffn_down: Mat<'static>,
 }
 
+struct MarkovW2Gpu {
+    w2: crate::backend::GpuTensor,
+    bias: crate::backend::Buf,
+}
+
 enum MarkovHead {
     /// Legacy Unsloth DSpark: projects `latent` (`[rank]`) to hidden space (`[n_embd]`), adds `h_row`, then runs target LM head.
     HiddenOut { weight: Mat<'static>, bias: Vec<f32> },
     /// Mainline llama.cpp DSpark: adds low-rank logit delta `markov_w2 @ latent + bias` onto batched target LM head logits.
-    Logits { w2: Mat<'static>, bias: Vec<f32> },
+    Logits { w2: Mat<'static>, bias: Vec<f32>, gpu: std::sync::OnceLock<Option<MarkovW2Gpu>> },
 }
 
 pub struct DsparkDrafter {
@@ -163,6 +168,7 @@ impl DsparkDrafter {
             MarkovHead::Logits {
                 w2: host_mat(g_ref, "markov_w2.weight")?,
                 bias: f32s(g_ref, "markov_w2.bias")?,
+                gpu: std::sync::OnceLock::new(),
             }
         } else {
             MarkovHead::HiddenOut {
@@ -456,40 +462,89 @@ impl DsparkDrafter {
                     drafts.push(prev);
                 }
             }
-            MarkovHead::Logits { w2, bias } => {
-                let n_vocab = target.cfg.n_vocab;
-                let base_logits = target.lm_head_batch(&hidden[n..(1 + count) * n], count);
-                let mut delta = vec![0.0f32; w2.rows];
-                for step in 0..count {
-                    let h_row = &hidden[(step + 1) * n..(step + 2) * n];
-                    self.markov_w1.row_into(prev as usize, &mut prev_embd);
-                    joint_in[..r].copy_from_slice(&state);
-                    joint_in[r..2 * r].copy_from_slice(&prev_embd);
-                    joint_in[2 * r..2 * r + n].copy_from_slice(h_row);
-
-                    self.joint_proj.matvec(&joint_in, &mut joint);
-                    for (v, &b) in joint.iter_mut().zip(&self.joint_proj_b) { *v += b; }
-
-                    for k in 0..r {
-                        let gate = crate::ops::sigmoid(joint[k]);
-                        let cand = joint[r + k].tanh();
-                        state[k] = cand + gate * (state[k] - cand);
-                        latent[k] = joint[2 * r + k].tanh();
+            MarkovHead::Logits { w2, bias, gpu } => {
+                let gpu_w2 = gpu.get_or_init(|| {
+                    if w2.rows > target.output_rows() || w2.cols > n {
+                        return None;
                     }
+                    let dm = crate::deepseek::mat::dev::get()?;
+                    let d = dm.lock().ok()?;
+                    let be = &*d.parts[0].be;
+                    let w2_gpu = be.upload(&crate::weights::Tensor {
+                        ty: w2.ty,
+                        rows: w2.rows,
+                        cols: w2.cols,
+                        data: w2.data,
+                        scale: w2.scale,
+                    }).ok()?;
+                    let bias_buf = be.alloc(bias.len() * 4).ok()?;
+                    be.put(bias, &bias_buf, 0).ok()?;
+                    Some(MarkovW2Gpu { w2: w2_gpu, bias: bias_buf })
+                });
+                let use_gpu = gpu_w2.is_some()
+                    && target.lm_head_batch_gpu(&hidden[n..(1 + count) * n], count);
+                if use_gpu {
+                    let g = gpu_w2.as_ref().unwrap();
+                    let bias_addr = g.bias.addr();
+                    for step in 0..count {
+                        let h_row = &hidden[(step + 1) * n..(step + 2) * n];
+                        self.markov_w1.row_into(prev as usize, &mut prev_embd);
+                        joint_in[..r].copy_from_slice(&state);
+                        joint_in[r..2 * r].copy_from_slice(&prev_embd);
+                        joint_in[2 * r..2 * r + n].copy_from_slice(h_row);
 
-                    w2.matvec(&latent, &mut delta);
-                    let base = &base_logits[step * n_vocab..(step + 1) * n_vocab];
-                    let nv = n_vocab.min(w2.rows).min(bias.len());
-                    let (mut best_i, mut best_v) = (0usize, f32::NEG_INFINITY);
-                    for i in 0..nv {
-                        let v = base[i] + delta[i] + bias[i];
-                        if v > best_v {
-                            best_v = v;
-                            best_i = i;
+                        self.joint_proj.matvec(&joint_in, &mut joint);
+                        for (v, &b) in joint.iter_mut().zip(&self.joint_proj_b) { *v += b; }
+
+                        for k in 0..r {
+                            let gate = crate::ops::sigmoid(joint[k]);
+                            let cand = joint[r + k].tanh();
+                            state[k] = cand + gate * (state[k] - cand);
+                            latent[k] = joint[2 * r + k].tanh();
+                        }
+
+                        if let Some(id) = target.markov_w2_argmax_gpu(&g.w2, bias_addr, &latent, step) {
+                            prev = id;
+                            drafts.push(prev);
+                        } else {
+                            break;
                         }
                     }
-                    prev = best_i as u32;
-                    drafts.push(prev);
+                } else {
+                    let n_vocab = target.cfg.n_vocab;
+                    let base_logits = target.lm_head_batch(&hidden[n..(1 + count) * n], count);
+                    let mut delta = vec![0.0f32; w2.rows];
+                    for step in 0..count {
+                        let h_row = &hidden[(step + 1) * n..(step + 2) * n];
+                        self.markov_w1.row_into(prev as usize, &mut prev_embd);
+                        joint_in[..r].copy_from_slice(&state);
+                        joint_in[r..2 * r].copy_from_slice(&prev_embd);
+                        joint_in[2 * r..2 * r + n].copy_from_slice(h_row);
+
+                        self.joint_proj.matvec(&joint_in, &mut joint);
+                        for (v, &b) in joint.iter_mut().zip(&self.joint_proj_b) { *v += b; }
+
+                        for k in 0..r {
+                            let gate = crate::ops::sigmoid(joint[k]);
+                            let cand = joint[r + k].tanh();
+                            state[k] = cand + gate * (state[k] - cand);
+                            latent[k] = joint[2 * r + k].tanh();
+                        }
+
+                        w2.matvec(&latent, &mut delta);
+                        let base = &base_logits[step * n_vocab..(step + 1) * n_vocab];
+                        let nv = n_vocab.min(w2.rows).min(bias.len());
+                        let (mut best_i, mut best_v) = (0usize, f32::NEG_INFINITY);
+                        for i in 0..nv {
+                            let v = base[i] + delta[i] + bias[i];
+                            if v > best_v {
+                                best_v = v;
+                                best_i = i;
+                            }
+                        }
+                        prev = best_i as u32;
+                        drafts.push(prev);
+                    }
                 }
             }
         }
