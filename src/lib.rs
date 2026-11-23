@@ -37,3 +37,4 @@ pub mod hy4;
 pub mod kolibri;
 pub mod inkling2;
 pub mod ngram;
+pub mod kv_turbo;

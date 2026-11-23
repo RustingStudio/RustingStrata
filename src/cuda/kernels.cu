@@ -2643,6 +2643,80 @@ extern "C" __global__ void ple_conv(float* r, const float* gated, const float* n
 // KV cache rows (one per position and KV head) hold hd f16 values (KV_MODE 0), hd int8 values followed by hd / 32 f16 scales
 // (KV_MODE 1, `--kv q8`), hd / 2 packed uint4 nibbles + hd / 32 f16 scales (KV_MODE 2, `--kv q4`), or affine 2-bit
 // codes (hd / 4 B) + hd / 32 f16 scales + hd / 32 f16 mins (KV_MODE 3, `--kv q2`). Offsets below count values.
+// KV_MODE 4 (`--kv turbo4`) stores the WHT-128-rotated vector in the q4 nibble layout with an fp16 norm:
+// Lloyd-Max 4-bit centroids, so the rows hold rotated values. Q is rotated by the same WHT in the attention
+// kernels and only the attention output is inverse-rotated (TheTom's llama-cpp-turboquant design), which avoids
+// per-load de-rotation. This path is used by Inkling 2; other models keep the q4/q2 paths.
+#if KV_MODE == 4
+// TurboQuant follows TheTom's llama-cpp-turboquant: unit-L2 normalize, WHT, Lloyd-Max, store the
+// reconstruction-corrected norm; K/V stay rotated and only the attention output is de-rotated.
+static __constant__ unsigned TQ_S1[4] = {0xE46A0359u, 0x42F85949u, 0xA4C63BBBu, 0x49F250A9u};
+static __constant__ unsigned TQ_S2[4] = {0x16ACEE90u, 0x3F628FDCu, 0xB7A5357Au, 0xBEA56562u};
+static __constant__ float TQ_C4[16] = {
+    -0.241529f,-0.182877f,-0.143016f,-0.111036f,-0.083292f,-0.058050f,-0.034299f,-0.011349f,
+     0.011349f, 0.034299f, 0.058050f, 0.083292f, 0.111036f, 0.143016f, 0.182877f, 0.241529f};
+static __constant__ float TQ_M4[15] = {
+    -0.212203f,-0.162947f,-0.127026f,-0.097164f,-0.070671f,-0.046174f,-0.022824f,0.0f,
+     0.022824f, 0.046174f, 0.070671f, 0.097164f, 0.127026f, 0.162947f, 0.212203f};
+__device__ __forceinline__ float tq_flip(float x, unsigned b) { return __uint_as_float(__float_as_uint(x) ^ (b << 31)); }
+__device__ __forceinline__ unsigned tq_bits(const unsigned* s, int lane) { return s[lane >> 3] >> (4 * (lane & 7)); }
+__device__ __forceinline__ void tq_wht4(float4& v, int lane, bool inv) {
+    unsigned a = tq_bits(inv ? TQ_S2 : TQ_S1, lane);
+    v.x = tq_flip(v.x, a & 1u); v.y = tq_flip(v.y, (a >> 1) & 1u);
+    v.z = tq_flip(v.z, (a >> 2) & 1u); v.w = tq_flip(v.w, (a >> 3) & 1u);
+    { float x = v.x, y = v.y; v.x = x + y; v.y = x - y;
+      float z = v.z, w = v.w; v.z = z + w; v.w = z - w; }
+    { float x = v.x, z = v.z; v.x = x + z; v.z = x - z;
+      float y = v.y, w = v.w; v.y = y + w; v.w = y - w; }
+#define TQ_STAGE(m) { \
+    float px = __shfl_xor_sync(0xffffffff, v.x, (m)), py = __shfl_xor_sync(0xffffffff, v.y, (m)); \
+    float pz = __shfl_xor_sync(0xffffffff, v.z, (m)), pw = __shfl_xor_sync(0xffffffff, v.w, (m)); \
+    bool hi = (lane & (m)) != 0; \
+    v.x = hi ? px - v.x : v.x + px; v.y = hi ? py - v.y : v.y + py; \
+    v.z = hi ? pz - v.z : v.z + pz; v.w = hi ? pw - v.w : v.w + pw; }
+    TQ_STAGE(1) TQ_STAGE(2) TQ_STAGE(4) TQ_STAGE(8) TQ_STAGE(16)
+#undef TQ_STAGE
+    constexpr float k = 0.08838834764831845f;
+    unsigned b = tq_bits(inv ? TQ_S1 : TQ_S2, lane);
+    v.x = tq_flip(v.x * k, b & 1u); v.y = tq_flip(v.y * k, (b >> 1) & 1u);
+    v.z = tq_flip(v.z * k, (b >> 2) & 1u); v.w = tq_flip(v.w * k, (b >> 3) & 1u);
+}
+__device__ __forceinline__ unsigned tq_bit(const unsigned* s, int e) { return (s[e >> 5] >> (e & 31)) & 1u; }
+__device__ __forceinline__ void tq_wht2(float2& v, int lane, bool inv) {
+    const unsigned* sa = inv ? TQ_S2 : TQ_S1;
+    unsigned a = tq_bit(sa, 2 * lane) | (tq_bit(sa, 2 * lane + 1) << 1);
+    v.x = tq_flip(v.x, a & 1u); v.y = tq_flip(v.y, (a >> 1) & 1u);
+    { float x = v.x, y = v.y; v.x = x + y; v.y = x - y; }
+#define TQ_STAGE2(m) { \
+    float px = __shfl_xor_sync(0xffffffff, v.x, (m)), py = __shfl_xor_sync(0xffffffff, v.y, (m)); \
+    bool hi = (lane & (m)) != 0; v.x = hi ? px - v.x : v.x + px; v.y = hi ? py - v.y : v.y + py; }
+    TQ_STAGE2(1) TQ_STAGE2(2) TQ_STAGE2(4) TQ_STAGE2(8) TQ_STAGE2(16)
+#undef TQ_STAGE2
+    const unsigned* sb = inv ? TQ_S1 : TQ_S2;
+    unsigned b = tq_bit(sb, 2 * lane) | (tq_bit(sb, 2 * lane + 1) << 1);
+    constexpr float k = 0.125f;
+    v.x = tq_flip(v.x * k, b & 1u); v.y = tq_flip(v.y * k, (b >> 1) & 1u);
+}
+__device__ __forceinline__ int tq_nearest4(float v) {
+    int i = 0;
+#pragma unroll
+    for (; i < 15; i++) if (v < TQ_M4[i]) break;
+    return i;
+}
+__device__ __forceinline__ void kv_put_tq(u16* c, size_t e, int hd, float x, float norm) {
+    int q = tq_nearest4(x / norm);
+    unsigned nib = (unsigned)q;
+    unsigned pair = nib | (__shfl_xor_sync(0xffffffff, nib, 1) << 4);
+    int w = e % hd;
+    unsigned char* r = (unsigned char*)c + e / hd * (hd / 2 + hd / 16);
+    if ((w & 1) == 0) r[w / 2] = (unsigned char)pair;
+    // The reference stores norm / ||reconstructed centroids||; without it dequant is systematically low.
+    float cs = TQ_C4[q] * TQ_C4[q];
+    __syncthreads();
+    float recon = sqrtf(block_sum(cs));
+    if (w == 0) *(u16*)(r + hd / 2) = f2h(norm / fmaxf(recon, 1e-6f));
+}
+#endif
 #if KV_MODE == 3
 __device__ __forceinline__ float warp_min(float v) {
     for (int o = 16; o > 0; o >>= 1) v = fminf(v, __shfl_xor_sync(0xffffffff, v, o));
@@ -2776,7 +2850,17 @@ template <int PER> __device__ __forceinline__ void ldh_raw(const u16* p, unsigne
 }
 // PER consecutive cache values from value offset off (off a multiple of PER, PER <= 32) as f16 words, like ldh_raw.
 template <int PER> __device__ __forceinline__ void ldkv(const u16* c, size_t off, int hd, unsigned* o) {
-#if KV_MODE == 3
+#if KV_MODE == 4
+    // Dequantize to the rotated domain; Q is rotated in attention, so no inverse here.
+    int w = off % hd;
+    const unsigned char* r = (const unsigned char*)c + off / hd * (hd / 2 + hd / 16);
+    float norm = h2f(*(const u16*)(r + hd / 2));
+    for (int i = 0; i < PER / 2; i++) {
+        unsigned b = r[w / 2 + i];
+        int q0 = b & 15, q1 = b >> 4;
+        o[i] = (unsigned)f2h(TQ_C4[q0] * norm) | ((unsigned)f2h(TQ_C4[q1] * norm) << 16);
+    }
+#elif KV_MODE == 3
     int w = off % hd;
     const unsigned char* r = (const unsigned char*)c + off / hd * (3 * hd / 8);
     float d = h2f(*(const u16*)(r + hd / 4 + 2 * (w / 32)));
@@ -2868,7 +2952,14 @@ __device__ __forceinline__ float rh(float x) { return h2f(f2h(x)); }
 
 // Scalar KV element load matching GLSL ldkv().
 __device__ __forceinline__ float ldkv1(const u16* c, size_t off, int hd) {
-#if KV_MODE == 3
+#if KV_MODE == 4
+    int w = off % hd;
+    const unsigned char* r = (const unsigned char*)c + off / hd * (hd / 2 + hd / 16);
+    float norm = h2f(*(const u16*)(r + hd / 2));
+    unsigned b = r[w / 2];
+    int q = (w & 1) == 0 ? (int)(b & 15u) : (int)(b >> 4);
+    return rh(TQ_C4[q] * norm);
+#elif KV_MODE == 3
     int w = off % hd;
     const unsigned char* r = (const unsigned char*)c + off / hd * (3 * hd / 8);
     unsigned b = r[w / 4];
@@ -2896,6 +2987,9 @@ __device__ __forceinline__ float ldkv1(const u16* c, size_t off, int hd) {
 // One block of 128 per (row, tok) of w values (w at most 128, w % 32 == 0 when KV_MODE > 0 and dst != 0).
 extern "C" __global__ void ink_clip(float* x, const float* scale, int w, float thr, float eps, float mul, u16* dst,
                                     int dst_at0, int dst_ring, int pos0, float log_alpha, float log_floor, const int* pos_ptr) {
+#if KV_MODE == 4
+    __shared__ float tq[128];
+#endif
     int t = threadIdx.x, row = blockIdx.x, tok = blockIdx.y, rows = gridDim.x;
     size_t at = ((size_t)tok * rows + row) * w + t, sc_at = (size_t)row * w + t;
     float v = 0.f;
@@ -2912,6 +3006,20 @@ extern "C" __global__ void ink_clip(float* x, const float* scale, int w, float t
         if (dst) {
             size_t dst_pos = (size_t)((eff_dst_at0 + tok) % dst_ring);
             size_t dat = (dst_pos * rows + row) * w + t;
+#if KV_MODE == 4
+            if (w == 128) {
+                tq[t] = v;
+                __syncthreads();
+                if (t < 32) {
+                    if (w == 128) { float4 q = make_float4(tq[4*t], tq[4*t+1], tq[4*t+2], tq[4*t+3]); tq_wht4(q, t, false); tq[4*t]=q.x; tq[4*t+1]=q.y; tq[4*t+2]=q.z; tq[4*t+3]=q.w; }
+                    else { float2 q = make_float2(tq[2*t], tq[2*t+1]); tq_wht2(q, t, false); tq[2*t]=q.x; tq[2*t+1]=q.y; }
+                }
+                __syncthreads();
+                // Centroids are for N(0, 1/128) (unit-L2 vectors); ss was measured before the clip scale f,
+                // so the rotated vector's L2 is sqrt(ss)*f and x / L2 matches the centroid distribution.
+                kv_put_tq(dst, dat, w, tq[t], sqrtf(ss) * f);
+            } else
+#endif
             kv_put(dst, dat, w, v);
         }
     }
@@ -2930,6 +3038,12 @@ extern "C" __global__ void ink_attn(const float* q, const float* r, const float*
     int i0 = blockIdx.y * 64, n = i0 < rows ? min(64, rows - i0) : 0;
     if (t < hd) qs[t] = q[h * hd + t];
     __syncthreads();
+#if KV_MODE == 4
+    // Rotate Q into the KV domain; the scores below are <R q, R k> = <q, k>.
+    if (hd == 128 && t < 32) { float4 v = make_float4(qs[4*t], qs[4*t+1], qs[4*t+2], qs[4*t+3]); tq_wht4(v, t, false); qs[4*t]=v.x; qs[4*t+1]=v.y; qs[4*t+2]=v.z; qs[4*t+3]=v.w; }
+    if (hd == 64 && t < 32) { float2 v = make_float2(qs[2*t], qs[2*t+1]); tq_wht2(v, t, false); qs[2*t]=v.x; qs[2*t+1]=v.y; }
+    __syncthreads();
+#endif
     float scale = 1.f / sqrtf((float)hd);
     for (int j = t >> 5; j < n; j += 4) {
         int i = i0 + j, dist = at - i < 0 ? at - i + rows : at - i;
@@ -2953,11 +3067,24 @@ extern "C" __global__ void ink_attn(const float* q, const float* r, const float*
     acc[t] = a;
     __syncthreads();
     float* o = sc + ((size_t)h * gridDim.y + blockIdx.y) * (hd + 2);
+#if KV_MODE == 4
+    if (t < hd) {
+        float s = 0.f;
+        for (int p = 0; p < parts; p++) s += acc[p * hd + t];
+        acc[t] = s;
+    }
+    __syncthreads();
+    // Only the attention output is inverse-rotated: one WHT per head instead of one per KV load.
+    if (hd == 128 && t < 32) { float4 v = make_float4(acc[4*t], acc[4*t+1], acc[4*t+2], acc[4*t+3]); tq_wht4(v, t, true); o[2+4*t]=v.x; o[2+4*t+1]=v.y; o[2+4*t+2]=v.z; o[2+4*t+3]=v.w; }
+    else if (hd == 64 && t < 32) { float2 v = make_float2(acc[2*t], acc[2*t+1]); tq_wht2(v, t, true); o[2+2*t]=v.x; o[2+2*t+1]=v.y; }
+    else if (t < hd) o[2 + t] = acc[t];
+#else
     if (t < hd) {
         float s = 0.f;
         for (int p = 0; p < parts; p++) s += acc[p * hd + t];
         o[2 + t] = s;
     }
+#endif
     if (t == 0) {
         float z = 0.f;
         for (int j = 0; j < n; j++) z += ps[j];
@@ -2995,9 +3122,14 @@ __device__ void ink_attn_prefill_t(const float* q, const float* r, const float* 
     float scale = 1.f / sqrtf((float)HD);
     float qv[PER], acc[PER];
     for (int j = 0; j < PER; j++) {
-        qv[j] = q[((size_t)t * nh + h) * HD + lane + 32 * j] * scale;
+        // Keep the values in contiguous element order 4*lane+j so tq_wht4's sign bits match the elements.
+        qv[j] = q[((size_t)t * nh + h) * HD + 4 * lane + j] * scale;
         acc[j] = 0.f;
     }
+#if KV_MODE == 4
+    if (PER == 4) { float4 v = {qv[0], qv[1], qv[2], qv[3]}; tq_wht4(v, lane, false); qv[0]=v.x; qv[1]=v.y; qv[2]=v.z; qv[3]=v.w; }
+    else if (PER == 2) { float2 v = {qv[0], qv[1]}; tq_wht2(v, lane, false); qv[0]=v.x; qv[1]=v.y; }
+#endif
     float sink_val = sink[(size_t)t * nh + h];
     float r_reg = (nr <= 32 && lane < nr) ? r[((size_t)t * nh + h) * nr + lane] : 0.f;
     float m = 0.f, l = 1.f;
@@ -3011,7 +3143,7 @@ __device__ void ink_attn_prefill_t(const float* q, const float* r, const float* 
         if (++old_row == ring) old_row = 0;
         size_t kbase = row * kw + (size_t)kh * HD;
         float s = 0.f;
-        for (int j = 0; j < PER; j++) s += qv[j] * ldkv1(kbuf, kbase + lane + 32 * j, HD);
+        for (int j = 0; j < PER; j++) s += qv[j] * ldkv1(kbuf, kbase + 4 * lane + j, HD);
         s = warp_sum(s);
         int dist = q_pos - kp;
         float b = 0.f;
@@ -3026,14 +3158,20 @@ __device__ void ink_attn_prefill_t(const float* q, const float* r, const float* 
         float logit = s + b - sink_val;
         float mn = fmaxf(m, logit), c = expf(m - mn), e = expf(logit - mn);
         l = l * c + e;
-        for (int j = 0; j < PER; j++) acc[j] = e * ldkv1(vbuf, kbase + lane + 32 * j, HD) + acc[j] * c;
+        for (int j = 0; j < PER; j++) acc[j] = e * ldkv1(vbuf, kbase + 4 * lane + j, HD) + acc[j] * c;
         m = mn;
     }
     float inv = 1.f / l;
+    float ov[PER];
+    for (int j = 0; j < PER; j++) ov[j] = acc[j] * inv;
+#if KV_MODE == 4
+    if (PER == 4) { float4 v = {ov[0], ov[1], ov[2], ov[3]}; tq_wht4(v, lane, true); ov[0]=v.x; ov[1]=v.y; ov[2]=v.z; ov[3]=v.w; }
+    else if (PER == 2) { float2 v = {ov[0], ov[1]}; tq_wht2(v, lane, true); ov[0]=v.x; ov[1]=v.y; }
+#endif
     for (int j = 0; j < PER; j++) {
-        int col = lane + 32 * j;
+        int col = 4 * lane + j;
         size_t idx = ((size_t)t * nh + h) * HD + col;
-        outp[idx] = acc[j] * inv * sigmoid(gate[idx]);
+        outp[idx] = ov[j] * sigmoid(gate[idx]);
     }
 }
 #define DEF_INK_PREFILL(HD) \

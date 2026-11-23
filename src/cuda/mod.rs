@@ -101,6 +101,7 @@ pub fn kv_mode() -> u32 {
         if v == "q2" { return 3; }
         if v == "q4" { return 2; }
         if v == "q8" { return 1; }
+        if v == "turbo4" || v == "turboquant" { return 4; }
         return 0;
     }
     u32::from(std::env::var_os("STRATA_KV_Q8").is_some())
@@ -1335,7 +1336,7 @@ impl Backend for Gpu {
     }
 
     fn kv_words(&self, n: usize) -> usize {
-        match self.kv_mode { 0 => n, 1 => n * 17 / 32, 2 => n * 9 / 32, 3 => n * 3 / 16, _ => unreachable!() }
+        match self.kv_mode { 0 => n, 1 => n * 17 / 32, 2 | 4 => n * 9 / 32, 3 => n * 3 / 16, _ => unreachable!() }
     }
 
     fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()> {
@@ -1464,6 +1465,7 @@ mod tests {
         super::nvrtc::cubin(&super::source(1, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q8 must compile: {e:#}"));
         super::nvrtc::cubin(&super::source(2, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q4 must compile: {e:#}"));
         super::nvrtc::cubin(&super::source(3, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q2 must compile: {e:#}"));
+        super::nvrtc::cubin(&super::source(4, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_turbo4 must compile: {e:#}"));
     }
 
     #[test]

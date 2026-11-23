@@ -148,7 +148,7 @@ struct Engine {
     thinking_budget: usize,
     /// KV cache format (GPU): f16, q8 (q8_0, half KV memory), q4 (q4_0, quarter KV memory), or q2 (2-bit affine,
     /// 5.3x smaller KV memory for 512k-1M ctx; numerics differ from f16).
-    #[arg(long, default_value = "f16", value_parser = ["f16", "q8", "q4", "q2"])]
+    #[arg(long, default_value = "f16", value_parser = ["f16", "q8", "q4", "q2", "turbo4"])]
     kv: String,
     /// GPU backend: cuda, vulkan or hip [default: cuda if it loads, else vulkan].
     #[arg(long)]
@@ -177,7 +177,7 @@ struct Engine {
 
 fn set_kv_env(kv: &str) {
     match kv {
-        "q8" | "q4" | "q2" => {
+        "q8" | "q4" | "q2" | "turbo4" => {
             unsafe { std::env::set_var("STRATA_KV", kv) };
             if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") }; }
             else { unsafe { std::env::remove_var("STRATA_KV_Q8") }; }
@@ -428,6 +428,8 @@ impl Engine {
     }
 
     fn runner<'a>(&mut self, m: &'a Model<'a>, model: &Path) -> anyhow::Result<Runner<'a>> {
+        anyhow::ensure!(rusting_strata::cuda::kv_mode() != 4 || matches!(m.cfg.arch.as_str(), "inkling2" | "inkling2_loop"),
+            "--kv turbo4 supports only Inkling 2 models (its K/V rotation is in the Inkling 2 attention kernels)");
         if let Some(cap) = self.ram_cap() {
             let used = m.ram_estimate() as u64;
             anyhow::ensure!(used <= cap, "model needs ~{} MB of host RAM (baked tensors, LoRA), over the {} MB cap; lower --ram-margin or raise --max-ram", used >> 20, cap >> 20);

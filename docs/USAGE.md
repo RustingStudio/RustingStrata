@@ -135,6 +135,11 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   contexts. Attention then reads rounded keys and values, so the output can differ from f16; q2 differs most.
   The head size must be a multiple of 32, and `--llama-numerics` needs the f16 cache. `calibrate` takes the
   same `--kv` value as the runs that will use it.
+- `--kv turbo4` (Inkling 2 only, CUDA) uses TurboQuant: each 128-value K/V block is signed-Walsh rotated,
+  quantized with 4-bit Lloyd-Max centroids, and stored in about 28% of the f16 cache size. Q is rotated by the
+  same transform in attention and only the attention output is de-rotated. In an A/B benchmark on an RTX 3050
+  Laptop with Inkling 2 Mini Q3_K_XL (pp128/tg32) it decoded at 8.5 tok/s against 8.2 for f16 and prefilled at
+  44.8 against 43.8 tok/s; text is not byte-identical to f16 because attention reads rounded keys and values.
 - `calibrate --mtp-model PATH` or `--draft-model PATH` measures with that draft file loaded, so the chunk and the
   expert placement see the VRAM it takes, and picks the draft count. Runs with the same `--mtp-model` or
   `--draft-model` file use that count unless `--mtp` is given; runs with another draft file or none do not.
