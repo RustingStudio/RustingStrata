@@ -1,6 +1,10 @@
 use clap::{Args, Parser, Subcommand};
 use anyhow::Context;
 use rusting_strata::memory;
+use rusting_strata::calibrate::{self, KnobSpec, Knobs, Measurement, Objective, SearchConfig, Workload};
+use std::cell::RefCell;
+use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicUsize;
 use rusting_strata::{say, term};
 use rusting_strata::model::{Model, State};
 use rusting_strata::{backend, gpu_model::GpuModel};
@@ -361,6 +365,28 @@ impl Engine {
         if self.kv != "f16" && std::env::var_os("STRATA_KV").is_none() { set_kv_env(&self.kv); }
     }
 
+    /// Models on their own code path never call `Engine::runner`, the only place that reads a calibration file.
+    /// Apply the measured chunk through the environment those engines actually read. Context and threads are not
+    /// searched (they are memory choices), so this never touches the global CTX: doing that once made an explicit
+    /// --ctx look implicit to the main engine's runner.
+    fn own_calib(&self, model: &Path) {
+        let Ok(g) = Gguf::open(model) else { return };
+        let arch = g.get("general.architecture").ok().and_then(|v| v.as_str()).unwrap_or("");
+        if !rusting_strata::config::OWN_ARCHS.contains(&arch) { return; }
+        let path = calibration_path(model, self.backend.as_deref().unwrap_or("cuda"), &self.device);
+        let (Ok(bytes), Some(&d)) = (std::fs::read(&path), self.device.first()) else { return };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return };
+        let gpu = backend::open(self.backend.as_deref(), d).ok().map(|b| b.device().to_string()).unwrap_or_default();
+        if !calibration_fits(&v, &gpu) { return; }
+        if v["bytes"].as_u64().is_some_and(|n| std::fs::metadata(model).is_ok_and(|m| m.len() != n)) { return; }
+        // GLM reads its own variable, Gemma 4 its own, the others read STRATA_DS_CHUNK. Explicit values win.
+        if let Some(n) = v["chunk"].as_u64() {
+            for (k, value) in chunk_env_updates(n as usize, |k| std::env::var_os(k).is_some()) {
+                unsafe { std::env::set_var(k, value); }
+            }
+        }
+    }
+
     /// Fills settings not given on the command line from the model's calibration file, else built-in defaults.
     fn ram_cap(&self) -> Option<u64> { memory::ram_cap((self.ram_margin as u64) << 20, (self.max_ram as u64) << 20) }
     /// A copy with the load options of an `/api/load` body applied (`ctx`, `kv`, `cache_ram`, `vram_margin`, `mtp`,
@@ -410,7 +436,7 @@ impl Engine {
             v = serde_json::Value::Null;
         }
         if !v.is_null() { say!("calibration: {}", path.display()); }
-        else if bk.is_some() { say!("warning: not calibrated on this machine, so the prefill chunk, MTP drafts and the short-prompt threshold are defaults: run `rustingstrata calibrate --model {}` (a few minutes, once per model)", model.display()); }
+        else if bk.is_some() { say!("warning: not calibrated on this machine, so the prefill chunk, MTP drafts and the short-prompt threshold are defaults: run `rustingstrata calibrate --model {}` (once per model; `--samples` bounds the run)", model.display()); }
         let get = |k: &str| v[k].as_u64().map(|x| x as usize);
         if let Some(dp) = &self.draft_model {
             anyhow::ensure!(dp.exists(), "draft model path does not exist: {}", dp.display());
@@ -720,26 +746,20 @@ fn calibrated_split(v: &serde_json::Value, devices: &[usize], gpus: &[String]) -
     (l.len() == devices.len()).then_some(l)
 }
 
-/// The splits one move away from `cur` (layers per device): `step` layers moved between two neighbouring devices,
-/// each device keeping at least one layer.
-fn split_moves(cur: &[usize], step: usize) -> Vec<Vec<usize>> {
-    let mut v = vec![];
-    for i in 0..cur.len().saturating_sub(1) {
-        for (a, b) in [(i, i + 1), (i + 1, i)] {
-            if cur[a] > step {
-                let mut c = cur.to_vec();
-                (c[a], c[b]) = (c[a] - step, c[b] + step);
-                v.push(c);
-            }
-        }
-    }
-    v
-}
-
 /// Whether calibration file `v` may be used on `gpu` (`Backend::device`). A file names the GPU it was measured on;
 /// one without a name (written before that was recorded, or the driver gave none) is accepted.
 fn calibration_fits(v: &serde_json::Value, gpu: &str) -> bool {
     v["gpu"].as_str().is_none_or(|g| g.is_empty() || gpu.is_empty() || g == gpu)
+}
+
+/// Values a calibrated chunk may write to the environment. An explicit value set by the user must win, so the
+/// caller skips names that are already present.
+fn chunk_env_updates(n: usize, present: impl Fn(&str) -> bool) -> Vec<(&'static str, String)> {
+    if !(1..=(1 << 20)).contains(&n) { return vec![]; }
+    ["STRATA_DS_CHUNK", "STRATA_GLM_CHUNK", "STRATA_G4_CHUNK"].into_iter()
+        .filter(|k| !present(k))
+        .map(|k| (k, n.to_string()))
+        .collect()
 }
 
 impl Engine {
@@ -845,6 +865,7 @@ fn bench_record(meta: &BenchMeta, results: &[BenchResult], expert: Option<&Exper
             "pp": r.pp,
             "prefill_tok_s": {"mean": r.prefill.mean, "min": r.prefill.min, "max": r.prefill.max},
             "decode_tok_s": {"mean": r.decode.mean, "min": r.decode.min, "max": r.decode.max},
+
         });
         if r.bytes_per_token > 0 {
             o["expert"] = json!({
@@ -945,13 +966,13 @@ enum Cmd {
         #[command(flatten)]
         engine: Engine,
     },
-    /// Measure prefill chunk, MTP drafts per step and the short-prompt threshold on this machine (GPU) and write
-    /// them to the model's calibration file, which later runs read unless flags override.
+    /// Benchmark a budgeted search over prefill chunk, MTP drafts and the short-prompt threshold on this machine,
+    /// and write the best point to the model's calibration file, which later runs read unless flags override.
     Calibrate {
         /// The GGUF to calibrate, or a folder: every model in it (and its subfolders, as the chat page lists them)
-        /// is calibrated in turn.
+        /// is calibrated in turn. With the `spec` subcommand this may be omitted in favour of its own --model.
         #[arg(long)]
-        model: PathBuf,
+        model: Option<PathBuf>,
         /// GPU context length used while measuring and assumed for the results.
         #[arg(long, default_value_t = 4096)]
         ctx: usize,
@@ -983,6 +1004,44 @@ enum Cmd {
         /// calibrate the drafts with it.
         #[arg(long)]
         draft_model: Option<PathBuf>,
+
+        /// Hard cap on benchmark samples: the search stops when this many have been taken, or earlier when it has
+        /// converged. One sample benchmarks the whole workload matrix (all --pp lengths of one task).
+        #[arg(long, default_value_t = 24)]
+        samples: usize,
+        /// Benchmark repetitions inside each sample; their mean is used and run-to-run spread is reported.
+        #[arg(long, default_value_t = 3)]
+        reps: usize,
+        /// Extra discarded run before each sample (off by default: it loads the model a second time).
+        #[arg(long, default_value_t = 0)]
+        warmup: usize,
+        /// Prompt depths of the workload matrix, comma-separated.
+        #[arg(long, value_delimiter = ',', default_value = "128,512,2048")]
+        pp: Vec<usize>,
+        /// Tokens greedily decoded per workload.
+        #[arg(long, default_value_t = 128)]
+        tg: usize,
+        /// Prefill chunk sizes to search, comma-separated. [default: 256,512,1024,2048,4096]
+        #[arg(long, value_delimiter = ',')]
+        chunk_values: Option<Vec<usize>>,
+        /// Extra task corpus: `user:PATH` (a prompt file), `coding` or `prose`. Repeatable.
+        #[arg(long)]
+        task: Vec<String>,
+        /// Deterministic seed for the low-discrepancy coarse sweep and the search.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Print the derived knob space, workload matrix and sample plan, then exit without benchmarking.
+        #[arg(long)]
+        dry_run: bool,
+        /// Per-sample time limit in seconds (0 = no limit). A timeout is recorded as a failed sample.
+        #[arg(long, default_value_t = 0)]
+        timeout: u64,
+        /// Keep the full benchmark report and sample trace in this directory.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Sweep spec-type and draft settings for different tasks instead of tuning the engine knobs.
+        #[command(subcommand)]
+        sub: Option<CalibrateSub>,
     },
     /// Check that every Vulkan pipeline this model needs fits the device's `maxComputeSharedMemorySize`, naming the
     /// kernel, specialization, bytes needed and limit when one does not; exits non-zero on overflow. No model is
@@ -1058,6 +1117,60 @@ enum Cmd {
         image: Vec<String>,
         #[command(flatten)]
         engine: Engine,
+    },
+}
+
+/// `rustingstrata calibrate spec …`: sweep speculative-decoding settings per task.
+#[derive(Subcommand, Clone, Debug)]
+enum CalibrateSub {
+    /// Measure every combination of spec type, draft count and n-gram size on each task corpus, and store the best
+    /// per task in the calibration file. Inkling 2 uses these with (or instead of) a DSpark draft; the main engine
+    /// combines them with its MTP head.
+    Spec {
+        /// The model to sweep (a folder is not accepted: the sweep writes one calibration file).
+        #[arg(long)]
+        model: PathBuf,
+        /// Tasks: `prose`, `coding`, `user:PATH` (a prompt file). Repeatable.
+        #[arg(long, value_delimiter = ',', default_value = "prose,coding")]
+        tasks: Vec<String>,
+        /// Spec types: none, suffix, ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod, ngram-cache.
+        #[arg(long, value_delimiter = ',', default_value = "none,ngram-simple,ngram-mod,ngram-cache")]
+        spec_types: Vec<String>,
+        /// Maximum drafts verified per step.
+        #[arg(long, value_delimiter = ',', default_value = "4,8,16")]
+        draft_max: Vec<usize>,
+        /// N-gram lookup key lengths.
+        #[arg(long, value_delimiter = ',', default_value = "3,6,12")]
+        ngram_n: Vec<usize>,
+        /// MTP draft counts to combine with the lookup (main engine only).
+        #[arg(long, value_delimiter = ',', default_value = "0,2")]
+        mtp: Vec<usize>,
+        #[arg(long)]
+        draft_model: Option<PathBuf>,
+        #[arg(long)]
+        backend: Option<String>,
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        device: Vec<usize>,
+        #[arg(long, default_value_t = 4096)]
+        ctx: usize,
+        #[arg(long, default_value = "512")]
+        vram_margin: Vec<String>,
+        #[arg(long, value_parser = ["f16", "q8", "q4", "q2"], default_value = "f16")]
+        kv: String,
+        #[arg(long, default_value_t = 512)]
+        pp: usize,
+        #[arg(long, default_value_t = 128)]
+        tg: usize,
+        #[arg(long, default_value_t = 3)]
+        reps: usize,
+        #[arg(long, default_value_t = 24)]
+        samples: usize,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1144,6 +1257,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             println!("{}", serde_json::json!({"argmax": argmax, "top5": top5}));
         }
         Cmd::Generate { model, prompt, n, image, mut engine } => {
+            engine.own_calib(&model);
             engine.ds_env();
             let g = Gguf::open(&model)?;
             engine.own_warn(&g);
@@ -1276,12 +1390,14 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             engine.own_warn(&g);
             engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
             if let Some(arch) = g.get("general.architecture").ok().and_then(|v| v.as_str()) {
-                if arch == "deepseek41" || arch == "glm5-next" || arch == rusting_strata::hy4::ARCH || rusting_strata::inkling2::is_arch(arch) {
+                if arch == "deepseek41" || arch == "glm5-next" || arch == "gemma4" || arch == rusting_strata::hy4::ARCH || rusting_strata::inkling2::is_arch(arch) {
                     engine.ds_env();
                     // A --ctx below the test grows to fit it, as on the main engine.
                     if rusting_strata::CTX.load(std::sync::atomic::Ordering::Relaxed) != 0 { rusting_strata::CTX.store(engine.ctx, std::sync::atomic::Ordering::Relaxed); }
                     return if arch == "deepseek41" {
                         bench_deepseek(&g, &model, &pp, tg, reps, json_out, &mut engine)
+                    } else if arch == "gemma4" {
+                        bench_gemma4(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else if arch == rusting_strata::hy4::ARCH {
                         bench_hy4(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else if rusting_strata::inkling2::is_arch(arch) {
@@ -1346,38 +1462,48 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 std::fs::write(&path, line).with_context(|| format!("writing the JSON record to {}", path.display()))?;
             }
         }
-        Cmd::Calibrate { model, ctx, vram_margin, backend, device, split, kv, lora, gpu: _, mtp_model, draft_model } => {
+        Cmd::Calibrate { model, ctx, vram_margin, backend, device, split, kv, lora, gpu: _, mtp_model, draft_model,
+                         samples, reps, warmup, pp, tg, chunk_values, task, seed,
+                         dry_run, timeout, out, sub } => {
             set_kv_env(&kv);  // read by Gpu::new and Vk::new
             if !lora.is_empty() { say!("note: --lora is ignored by calibrate; calibration uses the base model"); }
-            let margins = vram_margins(&vram_margin, &device)?.into_iter().map(|mb| mb << 20).collect::<Vec<_>>();
-            let split = split_arg(split.as_deref(), device.len())?;
-            // The architecture of a file that runs on its own code path, where nothing reads a calibration file.
-            let own_arch = |p: &std::path::Path| {
-                let arch = Gguf::open(p).ok()?.get("general.architecture").ok()?.as_str()?.to_string();
-                rusting_strata::config::OWN_ARCHS.contains(&arch.as_str()).then_some(arch)
-            };
-            if !model.is_dir() {
-                if let Some(arch) = own_arch(&model) {
-                    say!("nothing to calibrate: '{arch}' models run on their own code path, which reads no calibration file. Run chat, generate, bench or serve with this model as it is.");
-                    return Ok(());
-                }
-                return calibrate(&model, draft_model.as_deref().or(mtp_model.as_deref()), ctx, &margins, backend.as_deref(), &device, split);
+            if split.is_some() { say!("note: --split is ignored by calibrate; measurements use the free-VRAM split"); }
+
+            if let Some(CalibrateSub::Spec { model, tasks, spec_types, draft_max, ngram_n, mtp, draft_model, backend,
+                                             device, ctx, vram_margin, kv, pp, tg, reps, samples, seed, out, dry_run }) = sub {
+                let mut s = CalibSettings::new(model);
+                s.backend = backend; s.device = device; s.vram_margin = vram_margin; s.kv = kv;
+                s.ctx = ctx; s.tasks = tasks; s.spec_types = spec_types; s.draft_max = draft_max; s.ngram_n = ngram_n;
+                s.mtp_values = mtp; s.pp = vec![pp]; s.tg = tg; s.reps = reps; s.samples = samples;
+                s.seed = seed; s.out = out; s.dry_run = dry_run;
+                s.aux = draft_model.map(|p| ("--draft-model", p));
+                ensure_spec_defaults(&mut s);
+                return calibrate_spec(&s);
             }
-            anyhow::ensure!(draft_model.is_none() && mtp_model.is_none(), "--mtp-model and --draft-model belong to one model: give --model a file");
+
+            let Some(model) = model else { anyhow::bail!("--model PATH is required (or use `calibrate spec --model PATH`)") };
+            let mut settings = CalibSettings::new(model.clone());
+            settings.backend = backend;
+            settings.device = device;
+            settings.vram_margin = vram_margin;
+            settings.kv = kv;
+            settings.chunk_values = chunk_values.unwrap_or_else(|| vec![256, 512, 1024, 2048, 4096]);
+            settings.ctx = ctx;
+            settings.aux = draft_model.map(|p| ("--draft-model", p)).or_else(|| mtp_model.map(|p| ("--mtp-model", p)));
+            settings.samples = samples; settings.reps = reps; settings.warmup = warmup; settings.pp = pp;
+            settings.tg = tg; settings.tasks = task;
+            settings.seed = seed; settings.dry_run = dry_run; settings.timeout = timeout; settings.out = out;
+            if settings.pp.is_empty() || settings.pp.iter().any(|&n| n == 0) { anyhow::bail!("--pp needs at least one positive prompt depth"); }
+            if settings.samples == 0 { anyhow::bail!("--samples must be positive"); }
+            if !model.is_dir() { return calibrate_v2(&settings); }
             let list = rusting_strata::serve::list_models(&model);
             anyhow::ensure!(!list.is_empty(), "no .gguf models in {}", model.display());
+            anyhow::ensure!(settings.aux.is_none(), "--mtp-model and --draft-model belong to one model: give --model a file");
             let mut failed = vec![];
             for (k, (id, path, _)) in list.iter().enumerate() {
                 say!("calibrate {}/{}: {id}", k + 1, list.len());
-                if let Some(arch) = own_arch(path) {
-                    say!("calibrate {id}: skipped, calibrate measures the main engine only and '{arch}' models run on their own code path");
-                    continue;
-                }
-                // One model that fails (too big, not a model) does not stop the others.
-                if let Err(e) = calibrate(path, None, ctx, &margins, backend.as_deref(), &device, split.clone()) {
-                    say!("calibrate {id}: failed: {e:#}");
-                    failed.push(id.as_str());
-                }
+                settings.model = path.clone();
+                if let Err(e) = calibrate_v2(&settings) { say!("calibrate {id}: failed: {e:#}"); failed.push(id.as_str()); }
             }
             anyhow::ensure!(failed.is_empty(), "calibration failed for {}", failed.join(", "));
         }
@@ -1443,6 +1569,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Chat { model, system, n, image, mut engine } => {
             let think = engine.think_default;
+            engine.own_calib(&model);
             engine.ds_env();
             let g = Gguf::open(&model)?;
             engine.own_warn(&g);
@@ -1968,6 +2095,54 @@ fn $name(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out:
 }
 bench_tokenwise!(bench_hy4, rusting_strata::hy4::forward::Hy4Model);
 
+/// `strata bench` for Gemma 4. Its `gpu_defaults` is private to the module, so mirror the three variables its
+/// generate/chat paths set; the timing loop is otherwise the shared token-by-token one.
+fn bench_gemma4(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {
+    // Use the engine's own defaults so the bench measures the same configuration as chat and generate.
+    rusting_strata::gemma4::gpu_defaults();
+    let tok = Tokenizer::from_gguf(g)?;
+    let mut m = rusting_strata::gemma4::forward::Gemma4Model::new(g)?;
+    let eos = tok.eos_ids();
+    let mut results = Vec::with_capacity(pp.len());
+    for &n in pp {
+        let ids = prose(&tok, n)?;
+        let (mut p, mut d) = (Vec::new(), Vec::new());
+        for _ in 0..reps {
+            m.reset();
+            let t = Instant::now();
+            let logits = m.prefill(&ids);
+            p.push(n as f64 / t.elapsed().as_secs_f64());
+            let t = Instant::now();
+            let k = decode_greedy_big(&mut |t| m.step(t), logits, &eos, tg);
+            d.push(k as f64 / t.elapsed().as_secs_f64());
+        }
+        let (prefill, decode_stat) = (Stat::of(&p), Stat::of(&d));
+        println!("pp {n:6}: prefill {} tok/s | tg {tg}: decode {} tok/s", prefill.text(), decode_stat.text());
+        results.push(BenchResult { pp: n, prefill, decode: decode_stat, bytes_per_token: 0, decode_median: 0.0 });
+    }
+    let expert = big_expert_stats(m.cfg.n_layer, m.cfg.n_expert);
+    let backend = rusting_strata::deepseek::mat::dev_info().map_or("cpu", |i| i.0);
+    let meta = BenchMeta {
+        backend,
+        backend_arg: engine.backend.as_deref(),
+        device: if backend == "cpu" { &[] } else { &engine.device },
+        model,
+        ctx: engine.ctx,
+        // The chunk bench_sample applied through STRATA_G4_CHUNK, not the old token-at-a-time placeholder.
+        chunk: gemma_bench_chunk(std::env::var("STRATA_G4_CHUNK").ok().as_deref()),
+        kv: &engine.kv,
+        mtp: 0,
+        tg,
+        reps,
+    };
+    write_bench_json(json_out, &meta, &results, expert.as_ref())
+}
+
+/// The Gemma 4 prefill chunk used by this process; 256 is the engine's default.
+fn gemma_bench_chunk(v: Option<&str>) -> usize {
+    v.and_then(|s| s.parse().ok()).unwrap_or(256)
+}
+
 /// `strata bench` for Inkling 2 (uses GPU argmax decode, plus `--draft-model` DSpark / `--spec-type` context lookup).
 fn bench_inkling2(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {
     rusting_strata::deepseek::chat::gpu_defaults();
@@ -2076,144 +2251,524 @@ fn bench_glm(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_
     write_bench_json(json_out, &meta, &results, expert.as_ref())
 }
 
-/// Best (lowest) of three timings of `f`, in seconds.
-fn best(f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<f64> {
-    let mut b = f64::INFINITY;
-    for _ in 0..3 {
-        let t = Instant::now();
-        f()?;
-        b = b.min(t.elapsed().as_secs_f64());
-    }
-    Ok(b)
+/// Settings shared by the v2 calibration workflow and its `spec` subcommand.
+#[derive(Clone, Debug)]
+struct CalibSettings {
+    model: PathBuf,
+    backend: Option<String>,
+    device: Vec<usize>,
+    vram_margin: Vec<String>,
+    kv: String,
+    /// (flag, path): an MTP head or a draft model used for every measurement.
+    aux: Option<(&'static str, PathBuf)>,
+    ctx: usize,
+    samples: usize,
+    reps: usize,
+    warmup: usize,
+    pp: Vec<usize>,
+    tg: usize,
+    chunk_values: Vec<usize>,
+    tasks: Vec<String>,
+    seed: u64,
+    dry_run: bool,
+    timeout: u64,
+    out: Option<PathBuf>,
+    /// Only used by the `spec` subcommand.
+    spec_types: Vec<String>,
+    draft_max: Vec<usize>,
+    ngram_n: Vec<usize>,
+    mtp_values: Vec<usize>,
 }
 
-/// With `aux` (`--mtp-model`/`--draft-model`) the drafts are measured with that file, and runs given the same file use
-/// the measured draft count.
-fn calibrate(model: &Path, aux: Option<&Path>, ctx: usize, margin: &[usize], kind: Option<&str>, device: &[usize], mut split: Option<Vec<f64>>) -> anyhow::Result<()> {
-    backend::check_devices(kind, device)?;  // before the GGUF is read: a bad --device fails here, not after the load
-    let g = Gguf::open(model)?;
-    let aux_g = open_mtp_gguf(aux)?;
-    let m = Model::load_with_aux(&g, aux_g.as_ref(), &[])?;
-    // Most drafts per step to measure: a DFlash block, else as many as the runs default to.
-    let kload = m.cfg.dflash.as_ref().map_or(if m.draft_model.is_some() { 4 } else { 3 }, |d| d.block_size.saturating_sub(1).max(1));
-    let tok = Tokenizer::from_gguf(&g)?;
-    let n_pf = 4096.min(ctx.saturating_sub(256));
-    anyhow::ensure!(n_pf >= 512, "--ctx too small to calibrate");
-    let pf = prose(&tok, n_pf)?;
-    let load = |chunk: usize, split: Option<&[f64]>| -> anyhow::Result<GpuModel> {
-        let bk = backend::open_all(kind, device)?;
-        let mut gm = GpuModel::load_split_margins(&m, bk, ctx, chunk, margin, split, kload, 1).context(LOAD_HINT)?;
-        gm.adapt_every = 0; // fixed placement: steadier timings
-        Ok(gm)
-    };
-
-    let mut chunk = (0, 0.0);
-    for c in [512, 1024, 2048, 4096].into_iter().filter(|&c| c <= ctx) {
-        // A larger chunk's prefill scratch may not fit beside a long --ctx: keep the chunks measured so far.
-        let mut gm = match load(c, split.as_deref()) { Ok(gm) => gm, Err(e) if chunk.0 > 0 => { say!("chunk {c:5}: {e:#}"); break } Err(e) => return Err(e) };
-        let t = best(&mut || { gm.reset()?; gm.prefill(&pf).map(drop) })?;
-        let tps = n_pf as f64 / t;
-        say!("chunk {c:5}: prefill {n_pf} tok {tps:.0} tok/s");
-        if tps > chunk.1 { chunk = (c, tps); }
+impl CalibSettings {
+    fn new(model: PathBuf) -> Self {
+        Self {
+            model, backend: None, device: vec![0], vram_margin: vec!["512".into()], kv: "f16".into(),
+            aux: None, ctx: 4096, samples: 24, reps: 3, warmup: 0, pp: vec![128, 512, 2048], tg: 128,
+            chunk_values: vec![256, 512, 1024, 2048, 4096], tasks: vec!["prose".into()],
+            seed: 1, dry_run: false, timeout: 0, out: None,
+            spec_types: vec![], draft_max: vec![], ngram_n: vec![], mtp_values: vec![],
+        }
     }
+}
 
-    let dec = tok.encode("Write a long story about a dragon.")?;
-    // Several devices and no split given by hand: measure other layer splits and keep the fastest. The split by free
-    // VRAM does not know a card's speed or its PCIe link; the timings do. A card with fewer layers keeps more of
-    // their experts in VRAM (fewer uploads over its link in prefill), and the other cards then keep fewer.
-    if device.len() > 1 && split.is_none() {
-        // Prefill of the long prompt and decode after the short one, in tok/s, with the layers per device.
-        let measure = |s: Option<&[f64]>| -> anyhow::Result<(Vec<usize>, f64, f64)> {
-            let mut gm = load(chunk.0, s)?;
-            gm.k = 1;
-            let layers = gm.part_layers();
-            let mut r = Runner::Gpu(Box::new(gm));
-            let tp = best(&mut || { r.reset()?; r.prefill(&pf).map(drop) })?;
-            let mut toks = 0;
-            let td = best(&mut || {
-                r.reset()?;
-                let l = r.prefill(&dec)?;
-                toks = decode(&mut r, &tok, false, &mut Sampler::greedy(), l, 64, None, &mut |_| Ok(false))?.0.len();
-                Ok(())
-            })?;
-            Ok((layers, n_pf as f64 / tp, toks as f64 / td))
-        };
-        let (base, mut bp, mut bd) = measure(None)?;
-        say!("split {base:?} (by free VRAM): prefill {bp:.0} tok/s, decode {bd:.1} tok/s");
-        // ponytail: a fixed step of 15% of the layers and three rounds; a finer search if a report shows the best
-        // split lies between two steps.
-        let step = (m.cfg.n_layer * 3 / 20).max(1);
-        let (mut cur, mut seen) = (base.clone(), vec![base.clone()]);
-        for _ in 0..3 {
-            let mut better = None;
-            for c in split_moves(&cur, step) {
-                if seen.contains(&c) { continue; }
-                seen.push(c.clone());
-                match measure(Some(&c.iter().map(|&x| x as f64).collect::<Vec<_>>())) {
-                    Ok((_, p, d)) => {
-                        say!("split {c:?}: prefill {p:.0} tok/s, decode {d:.1} tok/s, prefill x decode {:.3} of the best so far", p * d / (bp * bd));
-                        // Prefill and decode count the same; 3% over the best so far, above the run-to-run spread.
-                        if p * d > 1.03 * bp * bd { (bp, bd, better) = (p, d, Some(c)); }
-                    }
-                    Err(e) => say!("split {c:?}: {e:#}"),
+fn calib_work_dir() -> anyhow::Result<PathBuf> {
+    let d = rusting_strata::expert_cache::cache_dir().join("calibrate");
+    std::fs::create_dir_all(&d)?;
+    Ok(d)
+}
+
+static CALIB_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// A short, fixed coding corpus for the built-in `coding` task. The prose paragraph routes few experts; real code
+/// repeats punctuation and identifiers, which changes both n-gram acceptance and the prefill cost.
+const CALIB_CODE: &str = r#"fn parse_config(path: &str) -> Result<Config, Error> {
+    let text = std::fs::read_to_string(path)?;
+    let mut config = Config::default();
+    for (line_no, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let mut parts = line.splitn(2, '=');
+        let key = parts.next().unwrap().trim();
+        let value = parts.next().ok_or(Error::Syntax(line_no))?.trim();
+        match key {
+            "threads" => config.threads = value.parse()?,
+            "chunk" => config.chunk = value.parse()?,
+            "kv" => config.kv = value.to_string(),
+            _ => return Err(Error::UnknownKey(line_no)),
+        }
+    }
+    Ok(config)
+}
+"#;
+
+/// Resolve a task label to a prompt file. `None` means the built-in prose (no `--prompt-file`).
+fn calib_prompt(task: &str, dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    match task {
+        "prose" => Ok(None),
+        "coding" => {
+            let p = dir.join("task-coding.txt");
+            std::fs::write(&p, CALIB_CODE)?;
+            Ok(Some(p))
+        }
+        t if t.starts_with("user:") => {
+            let p = PathBuf::from(&t[5..]);
+            anyhow::ensure!(p.is_file(), "task prompt file {} does not exist", p.display());
+            Ok(Some(p))
+        }
+        other => anyhow::bail!("unknown task {other:?} (expected prose, coding or user:PATH)"),
+    }
+}
+
+struct BenchSample {
+    measurements: Vec<Measurement>,
+    backend: String,
+}
+
+struct CappedOutput {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run a child with a time limit. Output goes to files rather than pipes: polling a piped child without draining
+/// it can deadlock once the pipe fills, and a bench failure prints a stack trace and a usage block.
+fn run_capped(mut c: Command, secs: u64, dir: &Path, id: usize) -> anyhow::Result<CappedOutput> {
+    let out = dir.join(format!("calib-{id}-out.txt"));
+    let err = dir.join(format!("calib-{id}-err.txt"));
+    c.stdout(Stdio::from(std::fs::File::create(&out)?)).stderr(Stdio::from(std::fs::File::create(&err)?));
+    let mut child = c.spawn()?;
+    if secs > 0 {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            if child.try_wait()?.is_some() { break; }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait(); // reap the child before returning the error
+                let _ = std::fs::remove_file(&out);
+                let _ = std::fs::remove_file(&err);
+                anyhow::bail!("sample timed out after {secs}s");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    let status = child.wait()?;
+    let stdout = std::fs::read_to_string(&out).unwrap_or_default();
+    let stderr = std::fs::read_to_string(&err).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&err);
+    Ok(CappedOutput { success: status.success(), stdout, stderr })
+}
+
+/// Draft counts are in the main engine's bench JSON; the arch-specific benchners print them. Accept both.
+fn parse_drafts(v: &serde_json::Value, stdout: &str) -> (usize, usize) {
+    let made = v["drafts"]["made"].as_u64();
+    let accepted = v["drafts"]["accepted"].as_u64();
+    if let (Some(a), Some(b)) = (made, accepted) { return (a as usize, b as usize); }
+    if let Some(pos) = stdout.find("drafts accepted ") {
+        let rest = &stdout[pos + "drafts accepted ".len()..];
+        if let Some(tok) = rest.split_whitespace().next() {
+            let mut it = tok.split('/');
+            if let (Some(a), Some(b)) = (it.next(), it.next()) {
+                if let (Ok(accepted), Ok(made)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                    return (made, accepted);
                 }
             }
-            match better { Some(c) => cur = c, None => break }
-        }
-        if cur != base {
-            chunk.1 = bp;
-            split = Some(cur.iter().map(|&x| x as f64).collect());
         }
     }
+    (0, 0)
+}
 
-    let mut gm = load(chunk.0, split.as_deref())?;
-    let mut short = usize::MAX;
-    for n in [8, 16, 32, 64, 128] {
-        let p = &pf[..n];
-        gm.short = usize::MAX;
-        let ts = best(&mut || { gm.reset()?; gm.prefill(p).map(drop) })?;
-        gm.short = 0;
-        let tb = best(&mut || { gm.reset()?; gm.prefill(p).map(drop) })?;
-        say!("prompt {n:4}: steps {:.1} ms, batched {:.1} ms", ts * 1e3, tb * 1e3);
-        if tb < ts && short == usize::MAX { short = n; }
-    }
-    if short == usize::MAX { short = 256; }
+/// One measurement sample: run `bench` as a child process with the candidate knobs applied, then read its JSON.
+/// Using the public bench command as the measurement channel is what makes calibration work with every architecture:
+/// there is one code path that times a prompt and a decode, and calibration never duplicates it.
+fn bench_sample(s: &CalibSettings, knobs: &Knobs, task: &str, pps: &[usize]) -> anyhow::Result<BenchSample> {
+    let dir = calib_work_dir()?;
+    let id = CALIB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let json = dir.join(format!("bench-{}-{id}.json", std::process::id()));
+    let prompt = calib_prompt(task, &dir)?;
+    let exe = std::env::current_exe().context("finding this executable")?;
+    let chunk = knobs.i("chunk").unwrap_or(4096);
+    let short = knobs.i("short").unwrap_or(32);
+    // In a spec sweep the mtp knob holds an index into --mtp; in the main search it is the value itself.
+    let mtp = if s.mtp_values.is_empty() { knobs.i("mtp").unwrap_or(0) }
+              else { s.mtp_values[knobs.i("mtp").unwrap_or(0).min(s.mtp_values.len() - 1)] };
 
-    let drafts = m.cfg.n_nextn > 0 || m.cfg.dflash.is_some() || m.cfg.eagle3.is_some() || m.draft_model.is_some();
-    let kmax = if drafts { gm.k } else { 0 };
-    let mut r = Runner::Gpu(Box::new(gm));
-    let mut mtp = (0, 0.0);
-    for k in (0..=kmax).filter(|&k| k <= 4 || k % 2 == 0 || k == kmax) {
-        if let Runner::Gpu(g) = &mut r { g.k = k.max(1); }
-        let mut toks = 0;
-        let t = best(&mut || {
-            r.reset()?;
-            let l = r.prefill(&dec)?;
-            toks = decode(&mut r, &tok, k > 0, &mut Sampler::greedy(), l, 128, None, &mut |_| Ok(false))?.0.len();
-            Ok(())
-        })?;
-        // `best` times prefill too; it is the same for every k, so the ranking holds.
-        let tps = toks as f64 / t;
-        say!("mtp {k}: decode {toks} tok {tps:.1} tok/s");
-        if tps > mtp.1 { mtp = (k, tps); }
+    let build = |reps: usize| {
+        let mut c = Command::new(&exe);
+        c.arg("bench")
+            .arg("--model").arg(&s.model)
+            .arg("--gpu")
+            .arg("--pp").arg(pps.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","))
+            .arg("--tg").arg(s.tg.to_string())
+            .arg("--reps").arg(reps.to_string())
+            .arg("--ctx").arg(s.ctx.to_string())
+            .arg("--kv").arg(&s.kv)
+            .arg("--chunk").arg(chunk.to_string())
+            .arg("--mtp").arg(mtp.to_string())
+            .arg("--short").arg(short.to_string())
+            .arg("--device").arg(s.device.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(","))
+            .arg("--json-out").arg(&json);
+        if let Some(b) = &s.backend { c.arg("--backend").arg(b); }
+        if let Some((flag, p)) = &s.aux { c.arg(flag).arg(p); }
+        if let Some(p) = &prompt { c.arg("--prompt-file").arg(p); }
+        if !s.vram_margin.is_empty() { c.arg("--vram-margin").arg(s.vram_margin.join(",")); }
+        // The architectures outside the main engine read their chunk from the environment at prefill time.
+        c.env("STRATA_DS_CHUNK", chunk.to_string());
+        c.env("STRATA_GLM_CHUNK", chunk.to_string());
+        c.env("STRATA_G4_CHUNK", chunk.to_string());
+        if !s.spec_types.is_empty() {
+            let ti = knobs.i("spec_type").unwrap_or(0).min(s.spec_types.len() - 1);
+            let di = knobs.i("draft_max").unwrap_or(0).min(s.draft_max.len() - 1);
+            let ni = knobs.i("ngram_n").unwrap_or(0).min(s.ngram_n.len() - 1);
+            c.arg("--spec-type").arg(s.spec_types[ti].clone());
+            c.arg("--spec-draft-n-max").arg(s.draft_max[di].to_string());
+            c.arg("--spec-ngram-size-n").arg(s.ngram_n[ni].to_string());
+        }
+        c
+    };
+    if s.warmup > 0 { let _ = run_capped(build(1), s.timeout, &dir, id)?; }
+    let out = run_capped(build(s.reps), s.timeout, &dir, id + 1)?;
+    if !out.success {
+        let _ = std::fs::remove_file(&json);
+        anyhow::bail!("bench failed: {}{}", out.stdout, out.stderr);
     }
+    let text = std::fs::read_to_string(&json).with_context(|| format!("reading {}", json.display()))?;
+    let v: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => { let _ = std::fs::remove_file(&json); return Err(e.into()); }
+    };
+    if v["schema"] != "strata.bench.v1" {
+        let _ = std::fs::remove_file(&json);
+        anyhow::bail!("bench wrote an unexpected schema");
+    }
+    let rows = v["results"].as_array().context("bench JSON has no results")?;
+    let (made, accepted) = parse_drafts(&v, &out.stdout);
+    let mut ms = Vec::with_capacity(pps.len());
+    for &pp in pps {
+        let r = rows.iter().find(|r| r["pp"].as_u64() == Some(pp as u64))
+            .with_context(|| format!("bench JSON has no pp {pp}"))?;
+        let rate = |key: &str| -> anyhow::Result<f64> {
+            r[key]["mean"].as_f64().with_context(|| format!("bench JSON pp {pp} has no {key}.mean"))
+        };
+        ms.push(Measurement {
+            prefill_tok_s: rate("prefill_tok_s")?,
+            decode_tok_s: rate("decode_tok_s")?,
+            drafts_offered: made,
+            drafts_accepted: accepted,
+        });
+    }
+    let _ = std::fs::remove_file(&json);
+    Ok(BenchSample { measurements: ms, backend: v["backend"].as_str().unwrap_or("cuda").to_string() })
+}
 
-    let Runner::Gpu(g) = &r else { unreachable!() };
-    let path = calibration_path(model, g.gpu.name(), device);
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    // The file size tells another file of the same name (another repo or quant source) from this one.
-    let mut v = json!({"chunk": chunk.0, "mtp": mtp.0, "short": short, "ctx": ctx, "gpu": g.gpu.device(), "bytes": std::fs::metadata(model)?.len(),
-        "measured": {"prefill_tok_s": chunk.1.round(), "decode_tok_s": (mtp.1 * 10.0).round() / 10.0}});
-    if let Some(a) = aux.and_then(|a| a.file_name()) { v["aux"] = a.to_string_lossy().into(); }
-    // Only a split that was measured as faster, or given by hand: without one, later runs split by the free VRAM
-    // they find.
-    if split.is_some() {
-        v["split"] = json!({"devices": device, "gpus": g.parts().map(|p| p.gpu.device()).collect::<Vec<_>>(), "layers": g.part_layers()});
+/// Group workloads by task, keeping their order, so one sample can benchmark several prompt depths of a corpus in a
+/// single child process while different corpora use different `--prompt-file`s.
+fn workload_groups(ws: &[Workload]) -> Vec<(String, Vec<(usize, Workload)>)> {
+    let mut out: Vec<(String, Vec<(usize, Workload)>)> = Vec::new();
+    for (i, w) in ws.iter().enumerate() {
+        if let Some(g) = out.iter_mut().find(|g| g.0 == w.task) { g.1.push((i, w.clone())); }
+        else { out.push((w.task.clone(), vec![(i, w.clone())])); }
     }
-    std::fs::write(&path, serde_json::to_string_pretty(&v)?)?;
-    println!("{v}\nwritten to {}", path.display());
+    out
+}
+
+fn measure_fn<'a>(s: &'a CalibSettings, backend: &'a RefCell<String>) -> impl FnMut(&Knobs, &[Workload]) -> anyhow::Result<Vec<Measurement>> + 'a {
+    move |knobs, ws| {
+        let mut out: Vec<(usize, Measurement)> = Vec::with_capacity(ws.len());
+        for (task, group) in workload_groups(ws) {
+            let pps: Vec<usize> = group.iter().map(|(_, w)| w.pp).collect();
+            let sample = bench_sample(s, knobs, &task, &pps)?;
+            if backend.borrow().is_empty() { *backend.borrow_mut() = sample.backend.clone(); }
+            for ((i, _), m) in group.into_iter().zip(sample.measurements) { out.push((i, m)); }
+        }
+        // Restore the caller's workload order: the JSON report indexes both arrays by the same position.
+        out.sort_by_key(|(i, _)| *i);
+        Ok(out.into_iter().map(|(_, m)| m).collect())
+    }
+}
+
+/// A failed baseline (typically OOM at the default chunk) must not abort the run: the search can still find a
+/// working point. Returning no baseline makes `search` use its neutral fallback for scoring.
+fn baseline_samples(r: anyhow::Result<Vec<Measurement>>) -> (Vec<Measurement>, bool) {
+    match r { Ok(v) => (v, true), Err(_) => (vec![], false) }
+}
+
+/// Whether the model has a draft head: an MTP head in the file, a DFlash/EAGLE3 head, or an auxiliary draft.
+fn model_has_mtp(g: &Gguf, aux: bool) -> bool {
+    if aux { return true; }
+    let arch = g.get("general.architecture").ok().and_then(|v| v.as_str()).unwrap_or("");
+    let nextn = g.get(&format!("{arch}.nextn_predict_layers")).ok().and_then(|v| v.as_u64()).unwrap_or(0);
+    nextn > 0 || g.meta.keys().any(|k| k.starts_with("dflash.") || k.starts_with("eagle3."))
+}
+
+/// The search space. Context and KV format are deliberately absent: they are memory choices the user makes, not
+/// speed knobs to be silently changed by a calibration. An own-arch model only has its chunk (read from the
+/// environment at prefill time); main-engine models also have MTP drafts and the short-prompt threshold.
+fn build_space(arch: &str, s: &CalibSettings, has_mtp: bool) -> Vec<KnobSpec> {
+    let own = rusting_strata::config::OWN_ARCHS.contains(&arch);
+    // A chunk larger than the context cannot be used: drop it instead of spending samples on guaranteed failures.
+    let mut chunks: Vec<f64> = s.chunk_values.iter().map(|n| *n as f64).filter(|&c| c <= s.ctx as f64).collect();
+    if s.ctx >= 4096 && !chunks.contains(&4096.0) { chunks.push(4096.0); } // today's default is the baseline
+    if chunks.is_empty() { chunks.push(s.ctx as f64); }
+    let mut space = vec![KnobSpec::new("chunk", chunks, false)];
+    if !own {
+        let mtp: Vec<f64> = if has_mtp { vec![0.0, 1.0, 2.0, 4.0] } else { vec![0.0] };
+        let short: Vec<f64> = vec![16.0, 32.0, 64.0, 128.0];
+        debug_assert!(short.contains(&32.0));
+        space.push(KnobSpec::new("mtp", mtp, false));
+        space.push(KnobSpec::new("short", short, false));
+    }
+    space
+}
+
+/// A prompt plus its reply must fit the context the measurement will run at; the old calibrate checked this and the
+/// diagnostic is much more useful than a run of failed samples ending in "no successful measurement".
+fn check_workload_ctx(s: &CalibSettings) -> anyhow::Result<()> {
+    for &pp in &s.pp {
+        anyhow::ensure!(pp + s.tg <= s.ctx, "--pp {pp} + --tg {} exceeds --ctx {}; raise --ctx or shorten the workload", s.tg, s.ctx);
+    }
     Ok(())
 }
+
+/// The baseline must be what a user runs today without a calibration file: chunk 4096, short 32, all the physical
+/// cores (left to the engine's own default), and no drafts. Not the first point of the search space.
+fn baseline_knobs(space: &[KnobSpec]) -> Knobs {
+    let mut k = Knobs::default();
+    for s in space {
+        let v = match s.name.as_str() {
+            "chunk" => 4096.0,
+            "short" => 32.0,
+            "mtp" => 0.0,
+            _ => s.values.first().copied().unwrap_or(0.0),
+        };
+        k.set(&s.name, if s.values.contains(&v) { v } else { s.values[0] });
+    }
+    k
+}
+
+/// Write the small file that later runs read, keeping every key of the v1 format. The full trace is written beside it
+/// when `--out` is given, so a calibration can be audited or reproduced from its seed.
+/// Readers of the calibration file use the --backend flag, or "cuda" when it is absent. Write under that same name:
+/// the backend reported by a bench child (e.g. vulkan) would produce a file no run ever looks for.
+fn calib_backend_name(s: &CalibSettings) -> String {
+    s.backend.clone().unwrap_or_else(|| "cuda".into())
+}
+
+/// The physical device the search measured on, for the v1 `gpu` compatibility check.
+fn calib_gpu_name(s: &CalibSettings) -> String {
+    s.device.first().and_then(|&d| backend::open(s.backend.as_deref(), d).ok())
+        .map(|b| b.device().to_string()).unwrap_or_default()
+}
+
+fn write_report(s: &CalibSettings, result: &calibrate::SearchResult) -> anyhow::Result<()> {
+    if let Some(out) = &s.out {
+        std::fs::create_dir_all(out)?;
+        let stem = s.model.file_stem().and_then(|x| x.to_str()).unwrap_or("model");
+        let report = out.join(format!("strata-{stem}-calib-report.json"));
+        std::fs::write(&report, serde_json::to_string_pretty(result)?)?;
+        say!("full benchmark report: {}", report.display());
+    }
+    Ok(())
+}
+
+/// The v2 search does not measure a layer split, so a stale v1 `split` must not survive into the file it rewrites.
+fn drop_split(v: &mut serde_json::Value) {
+    if let Some(o) = v.as_object_mut() { o.remove("split"); }
+}
+
+fn write_calibration(s: &CalibSettings, result: &calibrate::SearchResult, workloads: &[Workload], arch: &str, backend: &str, gpu: &str) -> anyhow::Result<PathBuf> {
+    let path = calibration_path(&s.model, backend, &s.device);
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let mut v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    drop_split(&mut v);
+    let best = &result.best;
+    let first = best.measurements.first().cloned().unwrap_or_default();
+    v["schema"] = json!(2);
+    v["arch"] = json!(arch);
+    v["chunk"] = json!(best.knobs.i("chunk").unwrap_or(4096));
+    v["mtp"] = json!(best.knobs.i("mtp").unwrap_or(0));
+    v["short"] = json!(best.knobs.i("short").unwrap_or(32));
+    v["ctx"] = json!(s.ctx); // the context the measurement ran at; never a recommendation to apply later
+    v["gpu"] = json!(gpu);
+    v["bytes"] = json!(std::fs::metadata(&s.model)?.len());
+    v["measured"] = json!({
+        "prefill_tok_s": round1(first.prefill_tok_s),
+        "decode_tok_s": round1(first.decode_tok_s),
+    });
+    v["best"] = serde_json::to_value(&best.knobs)?;
+    v["search"] = json!({
+        "samples_used": result.samples_used,
+        "score": round1(result.best.score * 1000.0) / 1000.0,
+        "stop_reason": result.stop_reason,
+        "elapsed_ms": result.elapsed_ms,
+        "seed": result.seed,
+    });
+    v["workloads"] = serde_json::to_value(workloads)?;
+    if let Some(a) = &s.aux { if let Some(name) = a.1.file_name() { v["aux"] = name.to_string_lossy().into(); } }
+    std::fs::write(&path, serde_json::to_string_pretty(&v)?)?;
+    write_report(s, result)?;
+    Ok(path)
+}
+
+/// Pure merge used by a spec sweep: it must not replace the engine knobs measured by a previous run.
+fn merge_spec_calibration(mut old: serde_json::Value, spec: &serde_json::Value, arch: &str, gpu: &str, bytes: u64) -> serde_json::Value {
+    old["schema"] = json!(2);
+    old["arch"] = json!(arch);
+    old["gpu"] = json!(gpu);
+    old["bytes"] = json!(bytes);
+    old["spec"] = spec.clone();
+    old
+}
+
+/// A spec sweep only adds its `spec` section: it must not replace the engine knobs measured by a previous run.
+fn write_spec_calibration(s: &CalibSettings, result: &calibrate::SearchResult, arch: &str, backend: &str, gpu: &str, spec: &serde_json::Value) -> anyhow::Result<PathBuf> {
+    let path = calibration_path(&s.model, backend, &s.device);
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let old: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let mut v = merge_spec_calibration(old, spec, arch, gpu, std::fs::metadata(&s.model)?.len());
+    v["spec_search"] = json!({"samples_used": result.samples_used,
+                              "score": round1(result.best.score * 1000.0) / 1000.0,
+                              "stop_reason": result.stop_reason, "seed": result.seed});
+    std::fs::write(&path, serde_json::to_string_pretty(&v)?)?;
+    write_report(s, result)?;
+    Ok(path)
+}
+
+/// The universal calibration workflow. Every supported architecture goes through here; the measurement is delegated
+/// to `bench`, so there is no arch-specific timing code to keep in sync.
+fn calibrate_v2(s: &CalibSettings) -> anyhow::Result<()> {
+    check_workload_ctx(s)?;
+    let g = Gguf::open(&s.model)?;
+    let arch = g.get("general.architecture").ok().and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+    let has_mtp = model_has_mtp(&g, s.aux.is_some());
+    let space = build_space(&arch, s, has_mtp);
+    let tasks: Vec<String> = if s.tasks.is_empty() { vec!["prose".into()] } else { s.tasks.clone() };
+    let workloads: Vec<Workload> = tasks.iter().flat_map(|task| {
+        s.pp.iter().map(move |&pp| Workload::new(pp, s.tg, task))
+    }).collect();
+    say!("calibrate {arch}: {} workloads, {}-sample budget, scoring prefill and decode equally", workloads.len(), s.samples);
+    for w in &workloads { say!("  {}", w.label()); }
+    say!("knobs: {}", space.iter().map(|k| format!("{}=[{}]", k.name, k.values.iter().map(|v| format!("{v:.0}")).collect::<Vec<_>>().join(","))).collect::<Vec<_>>().join("  "));
+    say!("baseline (current defaults): {}", baseline_knobs(&space).label());
+    if s.dry_run { say!("dry run: no measurements taken"); return Ok(()); }
+
+    let backend = RefCell::new(String::new());
+    let mut measure = measure_fn(s, &backend);
+    let base_knobs = baseline_knobs(&space);
+    say!("baseline (current defaults): {}", base_knobs.label());
+    let (baseline, ok) = baseline_samples(measure(&base_knobs, &workloads));
+    if !ok { say!("warning: baseline failed (e.g. OOM at chunk 4096); searching from a neutral reference"); }
+    let cfg = SearchConfig { samples: s.samples, coarse: (s.samples / 3).min(8), starts: 3, patience: 2, seed: s.seed };
+    let result = calibrate::search(&space, &workloads, &cfg, &Objective::balanced(), baseline, &mut measure)?;
+    anyhow::ensure!(result.best.error.is_none(), "no successful measurement; calibration not written");
+    say!("best {}: score {:.3} vs baseline ({:.1} samples, {}, {:.1}s)", result.best.knobs.label(), result.best.score,
+        result.samples_used, result.stop_reason, result.elapsed_ms as f64 / 1000.0);
+    let path = write_calibration(s, &result, &workloads, &arch, &calib_backend_name(s), &calib_gpu_name(s))?;
+    println!("{}\nwritten to {}", serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&path)?)?)?, path.display());
+    Ok(())
+}
+
+/// Every spec knob is stored as an index into the flag's value list: the search only sees small contiguous ranges
+/// and `bench_sample` can index the list directly.
+fn spec_space(s: &CalibSettings) -> Vec<KnobSpec> {
+    vec![
+        KnobSpec::new("spec_type", (0..s.spec_types.len()).map(|i| i as f64), false),
+        KnobSpec::new("draft_max", (0..s.draft_max.len()).map(|i| i as f64), false),
+        KnobSpec::new("ngram_n", (0..s.ngram_n.len()).map(|i| i as f64), false),
+        KnobSpec::new("mtp", (0..s.mtp_values.len()).map(|i| i as f64), false),
+    ]
+}
+
+/// The baseline can only be the current defaults if those defaults are in the candidate lists.
+fn ensure_spec_defaults(s: &mut CalibSettings) {
+    if !s.spec_types.iter().any(|t| t == "none") { s.spec_types.push("none".into()); }
+    if !s.draft_max.contains(&16) { s.draft_max.push(16); }
+    if !s.ngram_n.contains(&12) { s.ngram_n.push(12); }
+    if !s.mtp_values.contains(&0) { s.mtp_values.push(0); }
+}
+
+/// The spec settings a user gets without a calibration file, expressed as indices into the --lists.
+fn spec_baseline(s: &CalibSettings) -> Knobs {
+    let mut k = Knobs::default();
+    k.set("spec_type", s.spec_types.iter().position(|t| t == "none").unwrap_or(0) as f64);
+    k.set("draft_max", s.draft_max.iter().position(|&n| n == 16).unwrap_or(0) as f64);
+    k.set("ngram_n", s.ngram_n.iter().position(|&n| n == 12).unwrap_or(0) as f64);
+    k.set("mtp", s.mtp_values.iter().position(|&n| n == 0).unwrap_or(0) as f64);
+    k
+}
+
+/// The `spec` subcommand: one task-specific sweep of speculative settings, written under `spec` in the calibration
+/// file. It uses the same budgeted search, with each task as its own workload so acceptance can differ by corpus.
+fn calibrate_spec(s: &CalibSettings) -> anyhow::Result<()> {
+    check_workload_ctx(s)?;
+    let g = Gguf::open(&s.model)?;
+    let arch = g.get("general.architecture").ok().and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+    let space = spec_space(s);
+    let workloads: Vec<Workload> = s.tasks.iter().map(|t| Workload::new(s.pp[0], s.tg, t)).collect();
+    say!("spec sweep {arch}: {} tasks x {} types x {} drafts x {} n-grams x {} mtp", workloads.len(), s.spec_types.len(), s.draft_max.len(), s.ngram_n.len(), s.mtp_values.len());
+    if s.dry_run { say!("dry run: no measurements taken"); return Ok(()); }
+    let backend = RefCell::new(String::new());
+    let mut measure = measure_fn(s, &backend);
+    let (baseline, ok) = baseline_samples(measure(&spec_baseline(s), &workloads));
+    if !ok { say!("warning: baseline failed; searching from a neutral reference"); }
+    say!("baseline (current defaults): {}", spec_baseline(s).label());
+    let cfg = SearchConfig { samples: s.samples, coarse: (s.samples / 3).min(8), starts: 3, patience: 2, seed: s.seed };
+    let result = calibrate::search(&space, &workloads, &cfg, &Objective::balanced(), baseline, &mut measure)?;
+    anyhow::ensure!(result.best.error.is_none(), "no successful spec measurement; calibration not written");
+    let idx = |name: &str, len: usize| result.best.knobs.i(name).unwrap_or(0).min(len.saturating_sub(1));
+    let mut spec = serde_json::Map::new();
+    for (i, w) in workloads.iter().enumerate() {
+        let m = result.best.measurements.get(i).cloned().unwrap_or_default();
+        let share = if m.drafts_offered > 0 { round1(10000.0 * m.drafts_accepted as f64 / m.drafts_offered as f64) / 100.0 } else { 0.0 };
+        spec.insert(w.task.clone(), json!({
+            "spec_type": s.spec_types[idx("spec_type", s.spec_types.len())],
+            "draft_max": s.draft_max[idx("draft_max", s.draft_max.len())],
+            "ngram_n": s.ngram_n[idx("ngram_n", s.ngram_n.len())],
+            "mtp": s.mtp_values[idx("mtp", s.mtp_values.len())],
+            "decode_tok_s": round1(m.decode_tok_s),
+            "acceptance_pct": share,
+        }));
+    }
+    let path = write_spec_calibration(s, &result, &arch, &calib_backend_name(s), &calib_gpu_name(s), &serde_json::Value::Object(spec))?;
+    say!("spec sweep written to {}", path.display());
+    Ok(())
+}
+
+/// Compatibility wrapper used by the chat page's calibrate button and by any code calling the old six-argument
+/// function. It maps the previous defaults onto the v2 workflow.
+fn calibrate(model: &Path, aux: Option<&Path>, ctx: usize, margin: &[usize], kind: Option<&str>, device: &[usize], _split: Option<Vec<f64>>) -> anyhow::Result<()> {
+    let mut s = CalibSettings::new(model.to_path_buf());
+    s.aux = aux.map(|p| ("--draft-model", p.to_path_buf()));
+    s.ctx = ctx;
+    s.backend = kind.map(str::to_string);
+    s.device = device.to_vec();
+    s.vram_margin = margin.iter().map(|m| (m >> 20).to_string()).collect();
+    s.samples = 12;
+    s.pp = vec![512];
+    calibrate_v2(&s)
+}
+
 
 /// Which tokens end a DRY match: those whose text has a newline, colon, double quote or asterisk (llama.cpp's
 /// default breakers). Built once per model, as decoding the whole vocabulary takes a moment.
@@ -2878,6 +3433,7 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
         st.ctx = engine.ctx;
         st.ram_cap = engine.ram_cap();
     }
+    engine.own_calib(model);
     let g = Gguf::open(model)?;
     engine.own_warn(&g);
     let arch = g.get("general.architecture")?.as_str().context("general.architecture")?;
@@ -3404,7 +3960,7 @@ mod interface_tests {
 
 #[cfg(test)]
 mod flag_tests {
-    use super::{calibrated_split, resolve_flags, split_moves, vram_margins};
+    use super::{calibrated_split, resolve_flags, vram_margins};
 
     #[test]
     fn calibrated_split_needs_the_same_devices_in_the_same_order() {
@@ -3415,14 +3971,6 @@ mod flag_tests {
         assert_eq!(calibrated_split(&v, &[0, 1], &names(&["A", "C"])), None);
         assert_eq!(calibrated_split(&v, &[0], &names(&["A"])), None);
         assert_eq!(calibrated_split(&serde_json::json!({"chunk": 4096}), &[0, 1], &names(&["A", "B"])), None);
-    }
-
-    #[test]
-    fn split_moves_shift_layers_between_neighbours() {
-        assert_eq!(split_moves(&[20, 20], 6), [vec![14, 26], vec![26, 14]]);
-        assert_eq!(split_moves(&[4, 36], 6), [vec![10, 30]]);
-        assert_eq!(split_moves(&[15, 15, 10], 6), [vec![9, 21, 10], vec![21, 9, 10], vec![15, 9, 16], vec![15, 21, 4]]);
-        assert!(split_moves(&[40], 6).is_empty());
     }
 
     #[test]
@@ -3691,5 +4239,216 @@ mod bench_tests {
         let e = Cli::try_parse_from(["rustingstrata", "bench", "--model", "m.gguf", "--json-out", "-"]).err().unwrap();
         assert!(e.to_string().contains("stdout carries the text block"), "{e}");
         assert!(Cli::try_parse_from(["rustingstrata", "bench", "--model", "m.gguf", "--json-out", "/tmp/x.json"]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod calibrate_cli_tests {
+    use super::*;
+
+    #[test]
+    fn a_failing_baseline_does_not_abort_the_search_setup() {
+        let (ms, ok) = baseline_samples(Ok(vec![Measurement { prefill_tok_s: 10.0, decode_tok_s: 5.0, ..Default::default() }]));
+        assert!(ok);
+        assert_eq!(ms.len(), 1);
+        let (ms, ok) = baseline_samples(Err::<Vec<Measurement>, _>(anyhow::anyhow!("out of memory")));
+        assert!(!ok);
+        assert!(ms.is_empty());
+    }
+
+    #[test]
+    fn spec_defaults_are_added_when_the_lists_omit_them() {
+        let mut s = CalibSettings::new(PathBuf::from("m.gguf"));
+        s.spec_types = vec!["ngram-simple".into()];
+        s.draft_max = vec![4, 8];
+        s.ngram_n = vec![3, 6];
+        s.mtp_values = vec![2, 0];
+        ensure_spec_defaults(&mut s);
+        assert!(s.spec_types.contains(&"none".to_string()));
+        assert!(s.draft_max.contains(&16));
+        assert!(s.ngram_n.contains(&12));
+        let b = spec_baseline(&s);
+        // The mtp knob is an index: index 1 is the value 0, not the value 1.
+        assert_eq!(b.i("mtp"), Some(1));
+        assert_eq!(s.mtp_values[b.i("mtp").unwrap()], 0);
+    }
+
+    #[test]
+    fn the_calibration_file_is_named_like_the_reader_looks_for_it() {
+        let mut s = CalibSettings::new(PathBuf::from("m.gguf"));
+        assert_eq!(calib_backend_name(&s), "cuda");
+        s.backend = Some("vulkan".into());
+        assert_eq!(calib_backend_name(&s), "vulkan");
+    }
+
+    #[test]
+    fn gemma_bench_reports_the_chunk_it_actually_used() {
+        assert_eq!(gemma_bench_chunk(Some("512")), 512);
+        assert_eq!(gemma_bench_chunk(Some("nonsense")), 256);
+        assert_eq!(gemma_bench_chunk(None), 256);
+    }
+
+    #[test]
+    fn a_new_calibration_clears_the_stale_v1_split() {
+        let mut v = serde_json::json!({"chunk": 4096, "split": {"devices": [0, 1], "layers": [12, 28]}, "gpu": "RTX"});
+        drop_split(&mut v);
+        assert!(v.get("split").is_none());
+        assert_eq!(v["chunk"], 4096);
+        assert_eq!(v["gpu"], "RTX");
+    }
+
+    #[test]
+    fn explicit_chunk_environment_variables_are_not_overwritten() {
+        let all = chunk_env_updates(512, |_| false);
+        assert_eq!(all.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+                   vec!["STRATA_DS_CHUNK", "STRATA_GLM_CHUNK", "STRATA_G4_CHUNK"]);
+        assert!(all.iter().all(|(_, v)| v == "512"));
+        let kept = chunk_env_updates(512, |k| k == "STRATA_DS_CHUNK");
+        assert_eq!(kept.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+                   vec!["STRATA_GLM_CHUNK", "STRATA_G4_CHUNK"]);
+        assert!(chunk_env_updates(512, |_| true).is_empty());
+    }
+
+    #[test]
+    fn workloads_must_fit_the_context_being_measured() {
+        let mut s = CalibSettings::new(PathBuf::from("m.gguf"));
+        s.ctx = 2048; s.pp = vec![128, 4096]; s.tg = 16;
+        let e = check_workload_ctx(&s).unwrap_err();
+        assert!(e.to_string().contains("exceeds --ctx 2048"), "{e}");
+        s.pp = vec![128, 512];
+        assert!(check_workload_ctx(&s).is_ok());
+    }
+
+    #[test]
+    fn cli_parses_the_v2_calibration_flags() {
+        let cli = Cli::try_parse_from([
+            "rustingstrata", "calibrate", "--model", "m.gguf", "--samples", "7", "--reps", "2",
+            "--pp", "128,512", "--tg", "16", "--chunk-values", "1024,2048", "--task", "user:prompts.txt",
+            "--seed", "9", "--dry-run",
+        ]).unwrap();
+        match cli.cmd.unwrap() {
+            Cmd::Calibrate { samples, reps, pp, tg, chunk_values, task, seed, dry_run, sub, .. } => {
+                assert_eq!((samples, reps, tg, seed), (7, 2, 16, 9));
+                assert_eq!(pp, vec![128, 512]);
+                assert_eq!(chunk_values, Some(vec![1024, 2048]));
+                assert_eq!(task, vec!["user:prompts.txt"]);
+                assert!(dry_run);
+                assert!(sub.is_none());
+            }
+            _other => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_the_spec_subcommand() {
+        let cli = Cli::try_parse_from([
+            "rustingstrata", "calibrate", "spec", "--model", "m.gguf", "--tasks", "prose,coding",
+            "--spec-types", "none,ngram-simple,ngram-mod", "--draft-max", "4,8", "--ngram-n", "3,6",
+            "--samples", "5", "--dry-run",
+        ]).unwrap();
+        match cli.cmd.unwrap() {
+            Cmd::Calibrate { sub: Some(CalibrateSub::Spec { model, tasks, spec_types, draft_max, ngram_n, samples, dry_run, .. }), .. } => {
+                assert_eq!(model, PathBuf::from("m.gguf"));
+                assert_eq!(tasks, vec!["prose", "coding"]);
+                assert_eq!(spec_types, vec!["none", "ngram-simple", "ngram-mod"]);
+                assert_eq!((draft_max, ngram_n, samples), (vec![4, 8], vec![3, 6], 5));
+                assert!(dry_run);
+            }
+            _other => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn draft_counts_are_read_from_both_json_and_stdout() {
+        let v = serde_json::json!({"drafts": {"made": 300, "accepted": 285}});
+        assert_eq!(parse_drafts(&v, ""), (300, 285));
+        // The arch-specific benchners print "accepted <accepted>/<made>".
+        assert_eq!(parse_drafts(&serde_json::Value::Null, "speculative drafts accepted 285/300 (95.0%)"), (300, 285));
+        assert_eq!(parse_drafts(&serde_json::Value::Null, "no drafts here"), (0, 0));
+    }
+
+    #[test]
+    fn workload_groups_keep_task_and_depth_order() {
+        let ws = vec![
+            Workload::new(128, 16, "prose"), Workload::new(512, 16, "coding"),
+            Workload::new(2048, 16, "prose"), Workload::new(96, 16, "coding"),
+        ];
+        let g = workload_groups(&ws);
+        assert_eq!(g.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), vec!["prose", "coding"]);
+        assert_eq!(g[0].1.iter().map(|(_, w)| w.pp).collect::<Vec<_>>(), vec![128, 2048]);
+        assert_eq!(g[1].1.iter().map(|(_, w)| w.pp).collect::<Vec<_>>(), vec![512, 96]);
+        assert_eq!(g[0].1[0].0, 0);
+        assert_eq!(g[0].1[1].0, 2);
+    }
+
+    #[test]
+    fn spec_space_stores_indices_not_actual_values() {
+        let mut s = CalibSettings::new(PathBuf::from("m.gguf"));
+        s.spec_types = vec!["none".into(), "ngram-simple".into(), "ngram-mod".into(), "ngram-cache".into()];
+        s.draft_max = vec![4, 8, 16];
+        s.ngram_n = vec![3, 6, 12];
+        s.mtp_values = vec![0, 2];
+        let space = spec_space(&s);
+        assert_eq!(space[0].values, vec![0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(space[1].values, vec![0.0, 1.0, 2.0]);
+        assert_eq!(space[2].values, vec![0.0, 1.0, 2.0]);
+        assert_eq!(space[3].values, vec![0.0, 1.0]);
+    }
+
+    #[test]
+    fn a_spec_sweep_preserves_the_engine_calibration() {
+        let old = serde_json::json!({"chunk": 2048, "mtp": 2, "ctx": 8192, "short": 32, "threads": 6,
+                                     "measured": {"prefill_tok_s": 100}, "best": {"chunk": 2048}});
+        let spec = serde_json::json!({"prose": {"spec_type": "ngram-mod"}});
+        let v = merge_spec_calibration(old, &spec, "inkling2_loop", "RTX", 1234);
+        assert_eq!(v["chunk"], 2048);
+        assert_eq!(v["mtp"], 2);
+        assert_eq!(v["ctx"], 8192);
+        assert_eq!(v["measured"]["prefill_tok_s"], 100);
+        assert_eq!(v["spec"]["prose"]["spec_type"], "ngram-mod");
+        assert_eq!(v["gpu"], "RTX");
+        assert_eq!(v["bytes"], 1234);
+    }
+
+    #[test]
+    fn knob_space_is_only_chunk_mtp_and_short() {
+        let s = CalibSettings::new(PathBuf::from("m.gguf"));
+        let main = build_space("qwen35moe", &s, true);
+        let names: Vec<_> = main.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(names, vec!["chunk", "mtp", "short"]);
+        let base = baseline_knobs(&main);
+        assert_eq!((base.i("chunk"), base.i("mtp"), base.i("short")), (Some(4096), Some(0), Some(32)));
+
+        // No MTP head: don't spend samples on drafts that the engine cannot use.
+        let no_head = build_space("qwen35moe", &s, false);
+        assert_eq!(no_head[1].values, vec![0.0]);
+
+        // Own-arch models have only the chunk knob.
+        let own = build_space("inkling2_loop", &s, false);
+        assert_eq!(own.iter().map(|k| k.name.as_str()).collect::<Vec<_>>(), vec!["chunk"]);
+    }
+
+    #[test]
+    fn chunks_larger_than_the_context_are_dropped() {
+        let mut s = CalibSettings::new(PathBuf::from("m.gguf"));
+        s.ctx = 2048;
+        let space = build_space("qwen35moe", &s, true);
+        let chunks = &space[0].values;
+        assert!(chunks.iter().all(|&c| c <= 2048.0), "{chunks:?}");
+        assert!(!chunks.contains(&4096.0));
+        assert!(!chunks.is_empty());
+        s.ctx = 4096;
+        assert!(build_space("qwen35moe", &s, true)[0].values.contains(&4096.0));
+    }
+
+    #[test]
+    fn spec_baseline_uses_current_defaults_not_first_list_values() {
+        let mut s = CalibSettings::new(PathBuf::from("m.gguf"));
+        s.spec_types = vec!["ngram-simple".into(), "none".into()];
+        s.draft_max = vec![4, 8, 16];
+        s.ngram_n = vec![3, 6, 12];
+        let b = spec_baseline(&s);
+        assert_eq!((b.i("spec_type"), b.i("draft_max"), b.i("ngram_n"), b.i("mtp")),
+                   (Some(1), Some(2), Some(2), Some(0)));
     }
 }
