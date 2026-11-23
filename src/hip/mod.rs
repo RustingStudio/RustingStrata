@@ -458,6 +458,19 @@ fn compile_cached(rtc: &ffi::Rtc, src: &str, arch: &str, tag: &str) -> anyhow::R
     Ok(b)
 }
 
+/// Free VRAM as the kernel driver counts it, for the amdgpu card whose VRAM size is `total` (to 256 MiB). `hipMemGetInfo` counts
+/// only compute allocations, so the desktop and other graphics clients look free to it and a budget taken from it
+/// squeezes them out (the compositor then fails to pin its framebuffer). Vulkan's memory budget already counts them.
+fn drm_free(total: usize) -> Option<usize> {
+    let read = |p: std::path::PathBuf| std::fs::read_to_string(p).ok()?.trim().parse::<usize>().ok();
+    std::fs::read_dir("/sys/class/drm").ok()?.flatten().find_map(|e| {
+        let dev = e.path().join("device");
+        let t = read(dev.join("mem_info_vram_total"))?;
+        if t.abs_diff(total) > 256 << 20 { return None }
+        Some(t.saturating_sub(read(dev.join("mem_info_vram_used"))?))
+    })
+}
+
 /// The kernel names to load: `cuda::kernel_names(false)` has no int8-mma GEMM, which needs no separate list here.
 fn kernel_names() -> Vec<String> { crate::cuda::kernel_names(false) }
 
@@ -527,7 +540,7 @@ impl Backend for Gpu {
     fn mem_info(&self) -> anyhow::Result<(usize, usize)> {
         let (mut free, mut total) = (0usize, 0usize);
         self.hip.check(unsafe { (self.hip.mem_get_info)(&mut free, &mut total) }, "hipMemGetInfo")?;
-        Ok((free, total))
+        Ok((free.min(drm_free(total).unwrap_or(usize::MAX)), total))
     }
 
     fn sync(&self) -> anyhow::Result<()> { self.wait() }
