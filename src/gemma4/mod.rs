@@ -99,9 +99,11 @@ fn strip_thinking(text: &str) -> String {
     out.trim().to_string()
 }
 
+/// GPU on, the weights in 90% of the free VRAM (a fixed 11 GB overcommitted a 12 GB card that other programs
+/// use, and left a larger card half empty).
 fn gpu_defaults() {
     if std::env::var_os("STRATA_G4_CPU").is_some() { return; }
-    for (k, v) in [("STRATA_DS_GPU", "1"), ("STRATA_DS_GPU_EXPERTS", "11"), ("STRATA_DS_NOEVICT", "1")] {
+    for (k, v) in [("STRATA_DS_GPU", "1"), ("STRATA_DS_GPU_FRACTION", "0.9"), ("STRATA_DS_NOEVICT", "1")] {
         if std::env::var_os(k).is_none() { unsafe { std::env::set_var(k, v) } }
     }
 }
@@ -191,18 +193,12 @@ fn feed(m: &mut forward::Gemma4Model, seq: &[(u32, Option<&[f32]>)]) -> anyhow::
         anyhow::ensure!(e.len() == m.cfg.n_embd,
             "projector produces {} features but the text model expects {}", e.len(), m.cfg.n_embd);
     }
-    let (head, last) = seq.split_at(seq.len() - 1);
-    for &(id, emb) in head {
-        match emb {
-            Some(e) => { m.step_embed_opt(id, e, false); }
-            None => { m.step_opt_pub(id, false); }
-        }
+    let t = std::time::Instant::now();
+    let logits = m.prefill_seq(seq);
+    if std::env::var_os("STRATA_G4_PROF").is_some() {
+        crate::say!("PROF prefill {} tokens in {:.2} s ({:.1} tok/s)", seq.len(), t.elapsed().as_secs_f64(), seq.len() as f64 / t.elapsed().as_secs_f64());
     }
-    let (id, emb) = last[0];
-    Ok(match emb {
-        Some(e) => m.step_embed_opt(id, e, true),
-        None => m.step_opt_pub(id, true),
-    })
+    Ok(logits)
 }
 
 /// `rustingstrata chat` for gemma4: greedy, KV kept across turns while the history extends it.
@@ -375,7 +371,7 @@ fn decode(tok: &crate::tokenizer::Tokenizer, m: &mut forward::Gemma4Model, mut l
     if std::env::var_os("STRATA_G4_PROF").is_some() {
         let p: Vec<f64> = forward::PROF.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6).collect();
         crate::say!("PROF decode {:.1} ms/token over {n} tokens", t_dec.elapsed().as_secs_f64() * 1e3 / n as f64);
-        crate::say!("PROF ms attn={:.0} ffn(total)={:.0} head={:.0} prefetch={:.0} gpu_exp={:.0} cpu_exp={:.0}", p[0], p[1], p[2], p[3], p[4], p[5]);
+        crate::say!("PROF ms attn={:.0} (prep={:.0} qkv={:.0} core={:.0} wo={:.0}) ffn={:.0} (router={:.0} card={:.0} cpu_exp={:.0}) head={:.0}", p[0], p[11], p[6], p[7], p[8], p[1], p[10], p[4], p[5], p[2]);
     }
     Ok(())
 }

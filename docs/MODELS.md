@@ -15,7 +15,7 @@ The engine picks the code path from `general.architecture` in the file.
 | Qwen3.8-Flash-Next | `qwen4exp` | same |
 | SenseNova-Loop | `sensenova_loop` | same |
 | Recursive Flint | `flint` | same |
-| Gemma 4 | `gemma4` | own forward in `src/gemma4/` |
+| [Gemma 4](#gemma-4-26b-a4b-ud-q4_k_xl-17-gb) | `gemma4` | own forward, matvecs and expert cache on the card, attention on the CPU |
 | [DeepSeek-V4.1-Flash](#deepseek-v41-flash-iq2_xxs-249-gb) | `deepseek41` | own forward, matvecs and expert cache on the CUDA card, greedy only |
 | [GLM-5.3-Flash](#glm-53-flash-ud-q2_k_xl-119-gb) | `glm5-next` | own forward, matvecs and expert cache on the CUDA card, greedy only |
 | [Hy4-flash](#hy4-flash-iq2_siq2_xxs-85-gb) | `hy_v4_flash` | own forward, matvecs and expert cache on CUDA or Vulkan, greedy only |
@@ -50,6 +50,25 @@ The Gyro files of agentionai load too. Their names say TQ1_0 and TQ2_0, but the 
 types and read inputs rotated by a Hadamard transform (`prism.hadamard.*`). `Gyro-S-TQ1_0` (TQK6, TQK7) is tested on
 CPU, CUDA and Vulkan. `Gyro-M-TQ2_0` (TQ2_T) has the same layout and only supported types, but was not run here.
 Gyro-L (TQP5 to TQP7, PTQ1_0) is not supported yet.
+
+## Gemma 4 (26B-A4B UD-Q4_K_XL, 17 GB)
+
+`chat`, `generate` and `serve` detect the `gemma4` architecture and run its own forward: the matrix products and the
+routed experts that fit run on the card, attention and the experts that do not fit run on the CPU. The weights take
+90% of the free VRAM (`STRATA_DS_GPU_FRACTION`; `STRATA_DS_GPU_EXPERTS=<GB>` sets an absolute budget). `--kv`,
+`--chunk`, `--parallel` and `--cache-ram` have no effect on it. The prompt goes through the layers in chunks of 256
+tokens (`STRATA_G4_CHUNK`; 1 is token by token). `STRATA_G4_PROF=1` prints the prefill and decode times.
+
+Reference machine (RTX 3060 12 GB), a 595-token prompt and 64 reply tokens, warm page cache:
+
+| | 1.3.0 | now |
+|---|---|---|
+| Prefill | about 30 tok/s | 109-114 tok/s |
+| Decode | 45-49 ms/token (20-22 tok/s) | 34 ms/token (29 tok/s) |
+
+The 1.3.0 prefill is the wall time less the load and the decode; it had no timer of its own. Decode still pays a
+host round trip for each group of matrix products of each layer, and no llama.cpp run was made on this machine; the
+report in issue #81 has llama.cpp well ahead on an RTX 4070 SUPER.
 
 ## DeepSeek-V4.1-Flash (IQ2_XXS, 249 GB)
 
