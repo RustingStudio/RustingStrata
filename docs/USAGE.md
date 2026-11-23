@@ -111,8 +111,9 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   differently from one-token decoding, so greedy output can differ at a near tie.
 - `--chunk`, `--threads` prefill chunk size and CPU expert threads. On a GPU `--threads` defaults to the physical
   core count (SMT siblings only add contention; on the 6-core/12-thread reference machine 6 beats 12 by ~20%).
-  `rustingstrata calibrate` measures the best chunk and later runs read it from
-  `~/.cache/rusting_strata/strata-<model>.json` unless flags override.
+  `rustingstrata calibrate` measures the best chunk, context size and draft count and later runs read them from
+  `~/.cache/rusting_strata/strata-<model>.json` unless flags override. See [CALIBRATION.md](CALIBRATION.md) for the
+  budgeted search, the objective profiles and the `calibrate spec` sweep.
   `XDG_CACHE_HOME` moves that folder to `$XDG_CACHE_HOME/rusting_strata` (on Windows it is
   `%LOCALAPPDATA%\rusting_strata`). In a container, set it to a mounted path: `docker run --rm` otherwise discards
   the file on exit, and the next container runs uncalibrated. The file names the GPU it was measured on, and a file
@@ -135,9 +136,9 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   expert placement see the VRAM it takes, and picks the draft count. Runs with the same `--mtp-model` or
   `--draft-model` file use that count unless `--mtp` is given; runs with another draft file or none do not.
 - `calibrate --model ~/models` calibrates every model in a folder (and its subfolders, as the chat page lists them),
-  one after another, with the other flags applied to each. A model that fails is reported and the rest go on; Inkling
-  2, Hy4, GLM, DeepSeek and Gemma 4 models are skipped: `calibrate` measures the main engine only, and these models
-  run on their own code path, which reads no calibration file. `--mtp-model` and `--draft-model` need a single file.
+  one after another, with the other flags applied to each. A model that fails is reported and the rest go on. All
+  architectures are included: Inkling 2, Hy4, GLM, DeepSeek and Gemma 4 are measured through their own `bench` path.
+  `--mtp-model` and `--draft-model` need a single model file.
 - `--thinking-budget N` (`chat` and `serve`) ends the thinking block after `N` tokens by inserting `</think>`,
   so the model goes on to the answer (0, the default, is no limit). A request overrides it with
   `thinking_budget` or `chat_template_kwargs.thinking_budget` (Anthropic: `thinking.budget_tokens`).

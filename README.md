@@ -63,7 +63,8 @@ With flags:
 ```sh
 M=path/to/model.gguf
 
-rustingstrata calibrate --model $M     # once per model and machine: best chunk size, MTP drafts
+rustingstrata calibrate --model $M --dry-run  # preview the workload matrix and knob space
+rustingstrata calibrate --model $M     # once per model and machine: best chunk, context, MTP drafts
 rustingstrata chat --model $M --gpu    # --think for thinking mode, --temp 0.7 to sample
 rustingstrata generate --model $M --gpu --prompt "Write a haiku about rivers." -n 128
 rustingstrata serve --model $M --gpu --addr 127.0.0.1:8080
@@ -77,6 +78,8 @@ Inkling 2 open the GPU by themselves.
 
 - [USAGE.md](docs/USAGE.md): flags, the chat page and MCP tools, the OpenAI and Anthropic APIs, prompt caching,
   several GPUs.
+- [CALIBRATION.md](docs/CALIBRATION.md): the budgeted search, objective profiles, task corpora, the `spec` sweep and
+  the JSON file.
 - [MODELS.md](docs/MODELS.md): supported architectures and GGUF types, notes and caveats for each model.
 - [BENCHMARKS.md](docs/BENCHMARKS.md): every model against llama.cpp; older runs are in the
   [benchmark history](docs/README.md#benchmark-history).

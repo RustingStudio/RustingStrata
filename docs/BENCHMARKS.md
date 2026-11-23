@@ -275,6 +275,49 @@ used part of the GPU during that run. Alternating runs of the old and new build 
 CUDA 25.4 to 33.5 tok/s, Vulkan 16.6 to 25.4 tok/s, prefill unchanged (within 1-4%). Most of the Vulkan gain is the
 IQ4_NL expert matvec (105 to 270 GB/s on 8 experts of 2304x2304).
 
+## Calibration v2 validation (RTX 3050 Laptop 4 GB)
+
+The v2 `calibrate` command measures through `bench`, so its baseline and best trials are the benchmark. Two target
+models, page cache warmed by the baseline, one child process per sample with `--reps 1`, greedy, built-in prose,
+`--tg 16`, seed 1. Numbers are the mean of one sample (not a range); this is a search-validation run, not a
+top-speed record. Full traces are in the JSON files under the cache directory and in the report written by `--out`.
+
+### Tiel-Coder-35B-A3B-MTP-UD-IQ3_XXS (`qwen35moe`, 13.6 GB)
+
+Command: `rustingstrata calibrate --model … --samples 10 --pp 128,512 --tg 16 --chunk-values 1024,2048,4096
+--ctx-values 2048,4096 --seed 1`. Baseline knobs: chunk 1024, ctx 2048, mtp 0, short 16, threads 3. Best knobs:
+**chunk 4096, ctx 2048, mtp 1, short 16, threads 3**, score 1.299 vs baseline (10 samples, 114.5 s, 0 failures).
+
+| workload | prefill: baseline → best | decode: baseline → best | TTFT: baseline → best |
+|---|---|---|---|
+| 128-token prompt | 109.8 → **126.8** tok/s | 17.3 → **28.6** tok/s | 1165.8 → **1009.5** ms |
+| 512-token prompt | 230.3 → **306.3** tok/s | 20.1 → **24.4** tok/s | 2223.2 → **1671.6** ms |
+
+The gain is mostly the MTP draft head (accepted at 128 tokens) plus a larger chunk; the search found it jointly
+rather than by optimizing drafts and prefill in separate sweeps. The old v1 calibration file for this model recorded
+chunk 4096 and mtp 0.
+
+### Inkling-2-Mini-UD-Q3_K_XL (`inkling2_loop`, 13.6 GB)
+
+Command: `rustingstrata calibrate --model … --samples 8 --pp 128,512 --tg 16 --chunk-values 256,512,1024,2048
+--ctx-values 2048,4096 --seed 1`. Baseline knobs: chunk 256, ctx 2048, threads 6. Best knobs: **chunk 256,
+ctx 4096, threads 6**, score 1.166 vs baseline (8 samples, 314.2 s, 0 failures). This model used to be skipped by
+`calibrate` entirely; it is now measured through its own `bench` path and its chunk/context are applied at load time.
+
+| workload | prefill: baseline → best | decode: baseline → best | TTFT: baseline → best |
+|---|---|---|---|
+| 128-token prompt | 23.1 → **29.3** tok/s | 7.2 → **8.3** tok/s | 5541 → **4369** ms |
+| 512-token prompt | 45.2 → **50.4** tok/s | 7.4 → 8.1 tok/s | 11327 → **10159** ms |
+
+### `calibrate spec` on Inkling 2
+
+Command: `rustingstrata calibrate spec --model … --tasks prose,coding --spec-types none,ngram-simple,ngram-mod,
+ngram-cache --draft-max 4,8 --ngram-n 3,6 --mtp 0 --pp 128 --tg 16 --samples 8 --seed 1` (8 samples, score 1.077
+vs baseline). Winner for both tasks: `ngram-cache`, 4 drafts, n-gram size 6. Decode: prose 8.5 tok/s, coding
+6.5 tok/s. The sweep only added its `spec` section: the engine calibration above (chunk 256, ctx 4096) is still
+in the file. Acceptance is reported as 0% because the short verbose prompt produced no drafts to accept in these
+samples; the timing gain comes from the lookup path, not from accepted drafts.
+
 ## Not yet measured
 
 - Qwen3-Next against llama.cpp in one table.
