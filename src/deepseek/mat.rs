@@ -47,6 +47,8 @@ pub(crate) mod dev {
         /// Local patch: stacked expert tensor base address -> GPU that holds all of its experts; bytes promised per GPU.
         aff: std::collections::HashMap<usize, usize>,
         aff_bytes: Vec<usize>,
+        /// Use counts of expert matrices that missed, keyed like `ex` and halved with the slots' counts (see `admit`).
+        seen: std::collections::HashMap<usize, f32>,
     }
     static DEV: LazyLock<Mutex<Dev>> = LazyLock::new(Default::default);
     /// Whether `DEV` is open: None before the first `get` and after `free`.
@@ -282,7 +284,10 @@ pub(crate) mod dev {
             self.now += 1;
             self.lookups += 1;
             let now = self.now;
-            if self.lookups % 4096 == 0 { for e in &mut self.exs { e.3 *= 0.5; } }
+            if self.lookups % 4096 == 0 {
+                for e in &mut self.exs { e.3 *= 0.5; }
+                self.seen.retain(|_, c| { *c *= 0.5; *c >= 0.25 });
+            }
             if let Some(&p) = self.ex.get(&k) {
                 self.exs[p].2 = now;
                 self.exs[p].3 += 1.0;
@@ -318,6 +323,49 @@ pub(crate) mod dev {
             self.ex.remove(&old);
             self.ex.insert(k, p);
             self.exs[p] = (i, k, now, 1.0);
+            Some(i)
+        }
+        /// Count one use of each candidate (an expert's matrices that are not all in VRAM, given as
+        /// `(data, type, rows, cols, scale)`), then copy the most used of them into the slots of the least used resident
+        /// expert when it has been used more often (by more than one). One expert at most a call: a copy over PCIe costs
+        /// as much as the CPU takes for several experts, so a slot changes hands only for a lasting difference.
+        /// The victim's slots were not touched in the last 96 lookups and the caller has synchronised the queue, so no
+        /// kernel still reads them. Returns the index of the candidate that now is resident.
+        pub fn admit(&mut self, cands: &[[(&[u8], GgmlType, usize, usize, f32); 2]]) -> Option<usize> {
+            // One GPU only: on a split, a layer's experts belong to one GPU (`affinity`), and a victim slot could be on the other.
+            if self.parts.len() > 1 { return None; }
+            self.reclaim();
+            let mut best: Option<(usize, f32)> = None;
+            for (i, c) in cands.iter().enumerate() {
+                let n = self.seen.entry(c[0].0.as_ptr() as usize).or_insert(0.0);
+                *n += 1.0;
+                if best.is_none_or(|b| *n > b.1) { best = Some((i, *n)); }
+            }
+            let (i, count) = best?;
+            let now = self.now;
+            // The coldest slot of each matrix's shape that is free to overwrite.
+            let victim = |s: &Self, ty: GgmlType, rows: usize, cols: usize, not: Option<usize>| s.exs.iter().enumerate()
+                .filter(|&(p, e)| e.2 + 96 <= now && Some(p) != not && { let t = s.tensor(e.0); t.ty == ty && t.rows == rows && t.cols == cols })
+                .min_by(|a, b| a.1.3.total_cmp(&b.1.3)).map(|(p, e)| (p, e.3));
+            let mut plan = vec![];
+            for &(data, ty, rows, cols, _) in &cands[i] {
+                if self.ex.contains_key(&(data.as_ptr() as usize)) { continue; }
+                let (p, c) = victim(self, ty, rows, cols, plan.first().map(|&(p, _)| p))?;
+                if count <= c + 1.0 { return None; }
+                plan.push((p, data));
+            }
+            for (p, data) in plan {
+                let (id, old, _, c) = self.exs[p];
+                let (be, t) = (&self.parts[gpu_of(id)].be, self.tensor(id));
+                if data.len() > t.bytes() || be.htod(data, &Buf::new(t.ptr, data.len(), ()), 0).is_err() { return None; }
+                let scale = cands[i].iter().find(|m| std::ptr::eq(m.0, data)).unwrap().4;
+                self.parts[gpu_of(id)].ts[(id & (1 << SHIFT) - 1) as usize].scale = scale;
+                self.ex.remove(&old);
+                self.seen.insert(old, c);
+                let k = data.as_ptr() as usize;
+                self.ex.insert(k, p);
+                self.exs[p] = (id, k, now, self.seen.remove(&k).unwrap_or(count));
+            }
             Some(i)
         }
         pub fn gemv(&self, i: u32, x: &[f32], y: &mut [f32], staged: Option<(&[u8], GgmlType, usize, usize, f32)>) {

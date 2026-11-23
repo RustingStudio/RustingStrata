@@ -124,7 +124,8 @@ pub struct Inkling2Model<'a> {
 /// A token of `device` counts all the device work before the router as "mix": the queue runs while the host waits
 /// for the router's input.
 /// Per-token expert counters of `plan` for STRATA_DS_PROF: CPU bytes, CPU experts, GPU experts copied up for one
-/// use, GPU experts.
+/// use, GPU experts; and the experts `Dev::admit` moved into VRAM.
+static ADMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HYB: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 const PROF: [&str; 8] = ["mix", "proj", "scores", "out-proj", "route", "experts-gpu", "experts-cpu", "logits"];
 
@@ -821,7 +822,28 @@ impl<'a> Inkling2Model<'a> {
         // share; 0 (also `--fixed-experts`) runs every expert on the GPU: the same numerics on every run.
         self.lap(4, t);
         let (share, fixed) = self.share(&self.cpu_share);
-        let gus: Vec<Mat> = sel.iter().map(|s| l.gate_up.expert_opt_in(s.0, ne, share == 0.0, &l.gate_up, l.down.data.len())).collect();
+        let mut gus: Vec<Mat> = sel.iter().map(|s| l.gate_up.expert_opt_in(s.0, ne, share == 0.0, &l.gate_up, l.down.data.len())).collect();
+        if !fixed && let Some(d) = crate::deepseek::mat::dev::get() {
+            // An expert runs on the GPU when both its matrices are in VRAM. The most used of the others may take the
+            // slots of a less used one (`Dev::admit`): the cache follows what this text routes to.
+            let mut d = d.lock().unwrap();
+            let mat = |m: &Mat<'a>| (m.data, m.ty, m.rows, m.cols, m.scale);
+            let mut miss = vec![];
+            for (gu, &(e, _)) in gus.iter_mut().zip(&sel) {
+                let dn = l.down.expert_host(e, ne);
+                if gu.gpu.is_some() && d.resident(dn.data) { continue; }
+                gu.gpu = None;
+                miss.push((e, [mat(&l.gate_up.expert_host(e, ne)), mat(&dn)]));
+            }
+            let cands: Vec<_> = miss.iter().map(|m| m.1).collect();
+            if let Some(i) = d.admit(&cands) {
+                let e = miss[i].0;
+                let j = sel.iter().position(|s| s.0 == e).unwrap();
+                gus[j] = l.gate_up.expert_host(e, ne);
+                gus[j].gpu = d.ex.get(&(gus[j].data.as_ptr() as usize)).map(|&p| d.exs[p].0);
+                ADMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         let n_miss = gus.iter().filter(|m| m.gpu.is_none()).count();
         let n_stage = if fixed { n_miss - (share * n_miss as f32).round() as usize } else { self.stage_count(n_miss) };
         let mut left = n_miss - n_stage;
@@ -1484,9 +1506,9 @@ impl<'a> Inkling2Model<'a> {
             use std::sync::atomic::Ordering::Relaxed;
             let ex = &crate::deepseek::mat::EX_LOOKUPS;
             let parts: Vec<String> = PROF.iter().zip(&self.prof).map(|(n, c)| format!("{n} {:.1}", c.replace(0.0) * 1e3)).collect();
-            eprintln!("PROF pos {pos}, {nt} tokens: {:.1} ms ({}), expert cache hit {} miss {}, expert ms cpu {:.2} copy {:.2}, chunk share {:.2}, CPU experts {} MB in {}, copied up {} of the GPU's {}",
+            eprintln!("PROF pos {pos}, {nt} tokens: {:.1} ms ({}), expert cache hit {} miss {}, expert ms cpu {:.2} copy {:.2}, chunk share {:.2}, CPU experts {} MB in {}, copied up {} of the GPU's {}, admitted {}",
                 t0.elapsed().as_secs_f64() * 1e3, parts.join(", "), ex[0].swap(0, Relaxed), ex[1].swap(0, Relaxed), self.split_cost.get()[0] * 1e3, self.split_cost.get()[1] * 1e3, self.chunk_share.get(),
-                HYB[0].swap(0, Relaxed) >> 20, HYB[1].swap(0, Relaxed), HYB[2].swap(0, Relaxed), HYB[3].swap(0, Relaxed));
+                HYB[0].swap(0, Relaxed) >> 20, HYB[1].swap(0, Relaxed), HYB[2].swap(0, Relaxed), HYB[3].swap(0, Relaxed), ADMITS.swap(0, Relaxed));
         }
     }
 }
