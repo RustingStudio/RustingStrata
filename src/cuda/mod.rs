@@ -17,9 +17,9 @@ pub(crate) const QTYPES: [GgmlType; 29] = {
     use GgmlType::*;
     [F32, BF16, F8E4M3, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_1, Q5_1, Q4_0, Q5_0, NVFP4]
 };
-pub(crate) const KERNELS: [&str; 59] = [
+pub(crate) const KERNELS: [&str; 60] = [
     "rope_freq", "rope_cs", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "situ_q", "softcap", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
-    "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
+    "kv_store", "kv_store_turbo", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "dflash2_conv", "hadamard",
     "ink_mix", "ink_ctrl_gate", "ink_ctrl_out", "ink_conv", "ink_conv_batch", "ink_clip", "ink_attn", "ink_attn_merge",
@@ -95,14 +95,20 @@ unsafe impl Send for Graph {}
 /// and run attention as its CPU flash attention does (LLAMA_Q8 in kernels.cu).
 pub fn llama_numerics() -> bool { std::env::var_os("STRATA_LLAMA_NUMERICS").is_some() }
 
-/// KV cache mode (`0 = f16`, `1 = q8`, `2 = q4`, `3 = q2`): read once by Gpu::new and Vk::new.
+/// KV cache mode: `0 = f16`, `1 = q8`, `2 = q4`, `3 = q2`, `4..9 = TurboQuant (K bits, V bits)`.
+/// Modes: 4=4/4, 5=4/3, 6=4/2, 7=3/3, 8=2/2, 9=3/2.
 pub fn kv_mode() -> u32 {
     if let Ok(v) = std::env::var("STRATA_KV") {
-        if v == "q2" { return 3; }
-        if v == "q4" { return 2; }
-        if v == "q8" { return 1; }
-        if v == "turbo4" || v == "turboquant" { return 4; }
-        return 0;
+        return match v.as_str() {
+            "q2" => 3, "q4" => 2, "q8" => 1,
+            "turbo4" | "turboquant" => 4,
+            "turbo4-3" | "turbo4v3" => 5,
+            "turbo4-2" | "turbo4v2" => 6,
+            "turbo3" => 7,
+            "turbo2" => 8,
+            "turbo3-2" | "turbo3v2" => 9,
+            _ => 0,
+        };
     }
     u32::from(std::env::var_os("STRATA_KV_Q8").is_some())
 }
@@ -193,7 +199,7 @@ fn source_with(kv_mode: u32, gemm_tc: bool, tune: Tune) -> String {
          __device__ const unsigned char ksigns_iq2xs[128] = {{{}}};\n\
          __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n\
          __device__ const float tq_lut[4096] = {{{}}};\n\
-         #define LLAMA_Q8 {}\n#define KV_MODE {}\n#define GEMM_TC {}\n\
+          #define LLAMA_Q8 {}\n#define KV_MODE {}\n#define TQ_KBITS {}\n#define TQ_VBITS {}\n#define GEMM_TC {}\n\
          #define GEMM_BM {}\n#define GEMM_BK {}\n#define GEMM_MIN_BLOCKS {}\n#define GEMV_LOADW {}\n\
          #define FA_BQ {}\n#define FA_BK {}\n{}",
         join(IQ2XS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
@@ -207,6 +213,8 @@ fn source_with(kv_mode: u32, gemm_tc: bool, tune: Tune) -> String {
         join(crate::quant::TQ_LUT.iter().flatten().map(|v| format!("{v:e}f")).collect()),
         llama_numerics() as u8,
         kv_mode as u8,
+        match kv_mode { 5 | 6 => 4, 7 | 9 => 3, 8 => 2, _ => 4 },
+        match kv_mode { 5 => 3, 6 | 9 => 2, _ => 4 },
         gemm_tc as u8,
         GEMM_BM,
         tune.gemm_bk,
@@ -370,7 +378,7 @@ fn smem_log(family: &str, optin: usize, stat: usize, set: Option<usize>, carveou
 
 /// The kernel names to load from the cubin: the full list on sm_80+, without the int8 GEMM (`gemmi_*`, `gemmis_*` and
 /// `gemmd_*`, 23 non-float types x 3 fewer names) on a device where that code is not compiled in. Pure so a CPU test can pin
-/// both lists (393 / 324 names).
+/// both lists (394 / 325 names).
 pub(crate) fn kernel_names(sm80: bool) -> Vec<String> {
     let int8 = move |&&t: &&GgmlType| sm80 && !t.float_x();
     KERNELS.iter().map(|s| s.to_string())
@@ -1336,13 +1344,19 @@ impl Backend for Gpu {
     }
 
     fn kv_words(&self, n: usize) -> usize {
-        match self.kv_mode { 0 => n, 1 => n * 17 / 32, 2 | 4 => n * 9 / 32, 3 => n * 3 / 16, _ => unreachable!() }
+        match self.kv_mode { 0 => n, 1 => n * 17 / 32, 2 | 4..=9 => n * 9 / 32, 3 => n * 3 / 16, _ => unreachable!() }
     }
 
     fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()> {
         // q8/q4: each warp quantizes one 32-value block of one row.
         anyhow::ensure!(self.kv_mode == 0 || (hd % 32 == 0 && n % hd == 0), "quantized KV cache: head_dim {hd} is not a multiple of 32");
-        launch!(self, "kv_store", Self::grid(n * t), k, v, kc, vc, n as i32, (n * t) as i32, step, hd as i32);
+        if self.kv_mode >= 4 {
+            anyhow::ensure!(hd == 128, "TurboQuant KV needs head_dim 128, got {hd}");
+            launch!(self, "kv_store_turbo", cfg(((n * t / 128) as u32, 1), 128, 0),
+                k, v, kc, vc, n as i32, (n * t) as i32, step, hd as i32);
+        } else {
+            launch!(self, "kv_store", Self::grid(n * t), k, v, kc, vc, n as i32, (n * t) as i32, step, hd as i32);
+        }
         Ok(())
     }
 

@@ -366,6 +366,7 @@ fn features<'a>(f11: &'a mut vk::PhysicalDeviceVulkan11Features<'static>, f12: &
 impl Vk {
     /// The usable GPU with index `device` (`backend::device_order`). Fails with "Vulkan init" (and the reasons) when there is none.
     pub fn new(device: usize) -> anyhow::Result<Vk> {
+        ensure!(crate::cuda::kv_mode() <= 3, "--kv turbo* needs the CUDA backend");
         ensure!(!(crate::cuda::kv_mode() > 0 && crate::cuda::llama_numerics()), "--kv q8/q4 does not combine with --llama-numerics (its attention reads f16 KV)");
         // RADV hides VK_AMD_device_coherent_memory on RDNA4 (RX 9000) unless this driconf option is set, and without
         // it the GPU caches the CPU expert mailbox: MoE combines miss the worker's answer and wait until they give up.

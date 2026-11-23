@@ -148,8 +148,14 @@ struct Engine {
     thinking_budget: usize,
     /// KV cache format (GPU): f16, q8 (q8_0, half KV memory), q4 (q4_0, quarter KV memory), or q2 (2-bit affine,
     /// 5.3x smaller KV memory for 512k-1M ctx; numerics differ from f16).
-    #[arg(long, default_value = "f16", value_parser = ["f16", "q8", "q4", "q2", "turbo4"])]
+    #[arg(long, default_value = "f16", value_parser = ["f16", "q8", "q4", "q2", "turbo4", "turbo4-3", "turbo4-2", "turbo3", "turbo2", "turbo3-2"])]
     kv: String,
+    /// K cache type; overrides the K half of `--kv`. Supported: f16, q8, q4, q2, turbo4, turbo3, turbo2.
+    #[arg(long, value_parser = ["f16", "q8", "q4", "q2", "turbo4", "turbo3", "turbo2"])]
+    k: Option<String>,
+    /// V cache type; overrides the V half of `--kv`. Supported: f16, q8, q4, q2, turbo4, turbo3, turbo2.
+    #[arg(long, value_parser = ["f16", "q8", "q4", "q2", "turbo4", "turbo3", "turbo2"])]
+    v: Option<String>,
     /// GPU backend: cuda, vulkan or hip [default: cuda if it loads, else vulkan].
     #[arg(long)]
     backend: Option<String>,
@@ -175,9 +181,28 @@ struct Engine {
     mmproj: Option<PathBuf>,
 }
 
+fn effective_kv(kv: &str, k: Option<&str>, v: Option<&str>) -> anyhow::Result<String> {
+    let (k, v) = match (k, v) {
+        (None, None) => return Ok(kv.to_string()),
+        (Some(k), None) => (k, k),
+        (None, Some(v)) => (v, v),
+        (Some(k), Some(v)) => (k, v),
+    };
+    Ok(match (k, v) {
+        ("turbo4", "turbo4") => "turbo4",
+        ("turbo4", "turbo3") => "turbo4-3",
+        ("turbo4", "turbo2") => "turbo4-2",
+        ("turbo3", "turbo3") => "turbo3",
+        ("turbo2", "turbo2") => "turbo2",
+        ("turbo3", "turbo2") => "turbo3-2",
+        (a, b) if a == b => a,
+        _ => anyhow::bail!("unsupported --k/--v combination {k}/{v}; use matching types or turbo4/turbo3/turbo2 pairs"),
+    }.to_string())
+}
+
 fn set_kv_env(kv: &str) {
     match kv {
-        "q8" | "q4" | "q2" | "turbo4" => {
+        "q8" | "q4" | "q2" | "turbo4" | "turbo4-3" | "turbo4-2" | "turbo3" | "turbo2" | "turbo3-2" => {
             unsafe { std::env::set_var("STRATA_KV", kv) };
             if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") }; }
             else { unsafe { std::env::remove_var("STRATA_KV_Q8") }; }
@@ -428,8 +453,6 @@ impl Engine {
     }
 
     fn runner<'a>(&mut self, m: &'a Model<'a>, model: &Path) -> anyhow::Result<Runner<'a>> {
-        anyhow::ensure!(rusting_strata::cuda::kv_mode() != 4 || matches!(m.cfg.arch.as_str(), "inkling2" | "inkling2_loop"),
-            "--kv turbo4 supports only Inkling 2 models (its K/V rotation is in the Inkling 2 attention kernels)");
         if let Some(cap) = self.ram_cap() {
             let used = m.ram_estimate() as u64;
             anyhow::ensure!(used <= cap, "model needs ~{} MB of host RAM (baked tensors, LoRA), over the {} MB cap; lower --ram-margin or raise --max-ram", used >> 20, cap >> 20);
@@ -1300,6 +1323,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Generate { model, prompt, n, image, mut engine } => {
             engine.own_calib(&model);
+            engine.kv = effective_kv(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
             engine.ds_env();
             let g = Gguf::open(&model)?;
             engine.own_warn(&g);
@@ -1428,6 +1452,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             r.finish()?;
         }
         Cmd::Bench { model, pp, tg, reps, json_out, prompt_file, mut engine } => {
+            engine.kv = effective_kv(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
             if let Some(f) = &prompt_file {
                 let text = std::fs::read_to_string(f).with_context(|| format!("--prompt-file {}", f.display()))?;
                 anyhow::ensure!(!text.trim().is_empty(), "--prompt-file {} is empty", f.display());
@@ -1636,6 +1661,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             std::process::exit(cmd.status()?.code().unwrap_or(1));
         }
         Cmd::Chat { model, system, n, image, mut engine } => {
+            engine.kv = effective_kv(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
             let think = engine.think_default;
             engine.own_calib(&model);
             engine.ds_env();
@@ -1740,6 +1766,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             r.finish()?;
         }
         Cmd::Serve { model, models_dir, addr, api_key, mcp, open, host, mut engine } => {
+            engine.kv = effective_kv(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
             engine.ds_env();
             anyhow::ensure!(host.auto_unload != Some(0), "--auto-unload must be at least 1 second");
             engine.parallel = host.parallel;
