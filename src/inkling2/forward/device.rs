@@ -190,8 +190,8 @@ pub(super) struct Device {
     seg_graph: bool,
     /// Blocks in the depth mix after the loop (what `layer_attn` counted when the loop graph was recorded).
     loop_nb: usize,
-    /// Key of the recorded `step_fast` graph, by `argmax` (0: none).
-    graph_keys: [u64; 2],
+    /// Keys of the recorded `step_fast` graphs, by `argmax`, and of `core_graph` (0: none).
+    graph_keys: [u64; 3],
     /// Positions whose rows both sides hold, and whether the device has run tokens after them.
     synced: usize,
     ahead: bool,
@@ -420,7 +420,7 @@ impl Device {
                 && layers.iter().all(|l| l.full_exps.is_some())
                 && (c.loop_start..c.loop_end).all(|ip| layers[ip].full_exps.as_ref().is_some_and(|fe| fe.part == 0))
                 && (c.loop_count * core) % 2 == 0;
-            Ok(Device { layers, loops, slots, out_query, out_norm, scr, sc_buf, pf: None, s, rank, all_full, rem, seg_graph, loop_nb: 0, graph_keys: [0; 2], synced: 0, ahead: false })
+            Ok(Device { layers, loops, slots, out_query, out_norm, scr, sc_buf, pf: None, s, rank, all_full, rem, seg_graph, loop_nb: 0, graph_keys: [0; 3], synced: 0, ahead: false })
         })();
         made.inspect_err(|e| crate::say!("inkling2: no room in VRAM for the decode state ({e:#}); the tokens run as prompt chunks do")).ok()
     }
@@ -704,6 +704,71 @@ impl Device {
         })().expect("inkling2 device fast step")
     }
 
+    /// The core passes as one HIP/CUDA graph when every core layer has its experts in VRAM: about 1100 launches a
+    /// token that would otherwise each leave the card idle for a few microseconds. Recorded again every 64
+    /// positions (the attention's row bound) and when a buffer moves. False: the caller runs the layers one by one.
+    fn core_graph(&mut self, m: &Inkling2Model, pos: usize, nb: &mut usize) -> bool {
+        let c = &m.cfg;
+        if !(c.loop_start..c.loop_end).all(|ip| self.layers[ip].full_exps.as_ref().is_some_and(|fe| fe.part == 0)) { return false; }
+        let (n, core, o) = (c.n_embd, c.loop_end - c.loop_start, self.scr.addr());
+        let n_pre = *nb;
+        // The block count after the last pass: the passes after the first start again from the prelude's.
+        let nb_end = n_pre + (c.loop_start..c.loop_end).filter(|ip| ip % c.block_size == 0).count();
+        let swaps = core * c.loop_count;
+        let d = dev::get().unwrap().lock().unwrap();
+        let be = &*d.parts[0].be;
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::hash::DefaultHasher::new();
+            (pos / 64, n_pre, self.sc_buf.addr(), self.s.cur).hash(&mut h);
+            for sl in &self.slots { sl.k.addr().hash(&mut h); }
+            0x494E_4B43_0000_0000u64 | (h.finish() & 0x0000_FFFF_FFFF_FFFF)
+        };
+        let last = std::mem::replace(&mut self.graph_keys[2], key);
+        let s0 = self.s;
+        (|| -> Result<()> {
+            if last != 0 && last != key { be.graph_drop(last)?; }
+            be.put(&[pos as i32], &self.scr, ((self.s.pos - o) / 4) as usize)?;
+            let mut ran = false;
+            be.graph(key, &mut || {
+                ran = true;
+                self.s = s0;
+                let mut nb = n_pre;
+                for pass in 0..c.loop_count {
+                    let n_bank = nb.saturating_sub(n_pre + 1);
+                    if pass > 0 {
+                        let s = self.s;
+                        if n_bank > 0 {
+                            be.dtod(&self.scr, (s.blocks - o) as usize + 4 * (n_pre + 1) * n, &self.scr, (s.bank - o) as usize, 4 * n_bank * n)?;
+                        }
+                        be.dtod(&self.scr, (s.cur - o) as usize, &self.scr, (s.outb - o) as usize, 4 * n)?;
+                        be.dtod(&self.scr, (s.prelude - o) as usize, &self.scr, (s.cur - o) as usize, 4 * n)?;
+                        nb = n_pre;
+                    }
+                    for ip in c.loop_start..c.loop_end {
+                        let il = if pass == 0 { ip } else { c.n_layer + (pass - 1) * core + ip - c.loop_start };
+                        if pass > 0 {
+                            let s = self.s;
+                            be.ink_mix(s.bank, n_bank, s.outb, self.loops[ip - c.loop_start].msg_query.addr(), 4, s.msg, n)?;
+                        }
+                        self.layer_attn(be, &d, m, il, ip, pass > 0, pos, true, &mut nb)?;
+                        self.layer_ffn_gpu(be, m, il, ip)?;
+                    }
+                }
+                anyhow::ensure!(nb == nb_end, "inkling2 core graph: {nb} blocks, expected {nb_end}");
+                Ok(())
+            })?;
+            // A replay runs nothing here: put the scratch roles where the layers would have left them.
+            if !ran {
+                self.s = s0;
+                if swaps % 2 == 1 { (self.s.cur, self.s.x) = (s0.x, s0.cur); }
+            }
+            Ok(())
+        })().expect("inkling2 device core graph");
+        *nb = nb_end;
+        true
+    }
+
     fn step_layers(&mut self, m: &Inkling2Model, tok: u32) -> usize {
         let (c, pos) = (&m.cfg, m.toks.len());
         let (n, core, o) = (c.n_embd, c.loop_end - c.loop_start, self.scr.addr());
@@ -723,6 +788,10 @@ impl Device {
         // Every pass of the core starts from the prelude output.
         copy(&*lock().parts[0].be, &self.scr, self.s.cur, self.s.prelude);
         let n_pre = nb;
+        if self.core_graph(m, pos, &mut nb) {
+            for il in c.loop_end..c.n_layer { self.layer(m, il, il, false, pos, &mut nb); }
+            return nb;
+        }
         for pass in 0..c.loop_count {
             // The bank of the previous pass: its blocks after the first core block, and its output.
             let n_bank = nb.saturating_sub(n_pre + 1);
