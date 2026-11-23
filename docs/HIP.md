@@ -188,6 +188,32 @@ FP32 scan, and on CUDA it is 0.73-0.87x, i.e. slower.
 2. Decode on an MoE model: the expert residency policy, not a kernel. That is where the multi-x is (see the reference
    numbers from Strata in the handoff).
 
+## Inkling 2 decode
+
+Inkling 2 Mini UD-Q4_K_XL, 9070 XT, X470 (PCIe 3.0) with dual-channel DDR4 (36 GB/s read), `bench --pp 512 --tg 64`.
+The core layers (6..18, run three times) and the prelude keep all 128 experts in VRAM as slabs. What does not fit runs
+as hybrid layers: the host routes, the GPU runs the cached experts and the CPU the rest. These are the coda, layers
+20-23 of which are Q8_0 at 8.5 MB an expert.
+
+| | 18 slabs (desktop holds 3.3 GB) | 22 slabs (desktop idle) |
+|---|---|---|
+| before | 34.5 tok/s | 48.2 tok/s |
+| after | 39.5 tok/s | 51.8 tok/s |
+
+A token at 18 slabs: 13.5 ms of kernels, then ~9 ms of CPU experts (32 of the coda's 48, 260 MB at 29 GB/s, near the
+DRAM limit). What changed, largest first:
+
+- Copying a missed expert up for one use cost 2.5 ms and the CPU 0.25 ms. The share controller balanced the two sides'
+  times, but a layer has about six misses, so it settled on one copy in most layers and a sync in every one. `plan`
+  now picks the split from the measured cost of one expert on each side (`stage_count`): here, no copies.
+- The VRAM cache froze with what prefill touched first. `Dev::admit` gives a slot to an expert used more often than
+  the coldest resident one. The coda routes are skewed (100 experts out of 768 take 60-67% of the uses), and layers
+  18-19 went from about 9 to 15 of their 16 uses on the GPU. Q8_0 layers cannot take NVFP4 slots, and no VRAM is left.
+- The core passes run as one graph in the hybrid step (`core_graph`): 0.8 ms.
+
+Left: `ink_mix` runs 120 times a token at 12 µs in one workgroup (about 1 ms, but a faster reduction order breaks the
+bit parity with Vulkan), and the coda's CPU time, which only VRAM can take away.
+
 ## Credits
 
 The compatibility shim follows the structure and several implementations of Strata's
