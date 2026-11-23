@@ -17,13 +17,13 @@ const QTYPES: [GgmlType; 29] = {
     use GgmlType::*;
     [F32, BF16, F8E4M3, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_1, Q5_1, Q4_0, Q5_0, NVFP4]
 };
-const KERNELS: [&str; 59] = [
+const KERNELS: [&str; 60] = [
     "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "situ_q", "softcap", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "dflash2_conv", "hadamard",
     "ink_mix", "ink_ctrl_gate", "ink_ctrl_out", "ink_ctrl_gate_b", "ink_ctrl_out_b", "ink_conv", "ink_conv_batch", "ink_clip", "ink_attn", "ink_attn_128", "ink_attn_merge",
-    "ink_attn_prefill_32", "ink_attn_prefill_64", "ink_attn_prefill_128", "ink_attn_prefill_128_old", "ink_attn_prefill_128_kp", "ink_ffn_sum", "ink_route",
+    "ink_attn_prefill_32", "ink_attn_prefill_64", "ink_attn_prefill_128", "ink_attn_prefill_128_old", "ink_attn_prefill_128_kp", "ink_attn_prefill_128_kp16", "ink_ffn_sum", "ink_route",
 ];
 
 pub use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
@@ -1164,13 +1164,17 @@ impl Backend for Gpu {
         &self, q: u64, r: u64, sink: u64, gate: u64, kc: u64, vc: u64, kc_new: u64, vc_new: u64, bias: u64, out: u64,
         pos: usize, nt: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize, ring: usize, win: usize,
     ) -> anyhow::Result<()> {
-        let kn = match hd {
-            32 => "ink_attn_prefill_32",
-            64 => "ink_attn_prefill_64",
-            128 => if std::env::var_os("STRATA_DS_ATTN_OLD").is_some() { "ink_attn_prefill_128_old" } else { "ink_attn_prefill_128_kp" },
+        // The f16 head_dim 128 path scores a 16-query tile a block (kp16), the kp kernel four (a measurement
+        // window, STRATA_DS_ATTN_KP4=1) and the first one a query a warp (STRATA_DS_ATTN_OLD=1).
+        let (kn, qb) = match hd {
+            32 => ("ink_attn_prefill_32", 4),
+            64 => ("ink_attn_prefill_64", 4),
+            128 if std::env::var_os("STRATA_DS_ATTN_OLD").is_some() => ("ink_attn_prefill_128_old", 4),
+            128 if std::env::var_os("STRATA_DS_ATTN_KP4").is_some() || self.kv_mode != 0 => ("ink_attn_prefill_128_kp", 4),
+            128 => ("ink_attn_prefill_128_kp16", 16),
             _ => anyhow::bail!("ink_attn_prefill: unsupported hd={hd}"),
         };
-        launch!(self, kn, cfg((nt.div_ceil(4) as u32, nh as u32), 128, 0),
+        launch!(self, kn, cfg((nt.div_ceil(qb) as u32, nh as u32), 128, 0),
             q, r, sink, gate, kc, vc, kc_new, vc_new, bias, out,
             pos as i32, nt as i32, nh as i32, nkv as i32, nr as i32, ext as i32, ring.max(1) as i32, win as i32);
         Ok(())
@@ -1523,8 +1527,8 @@ mod tests {
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 375);
-        assert_eq!(sm70.len(), 329);
+        assert_eq!(sm80.len(), 376);
+        assert_eq!(sm70.len(), 330);
         assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmis")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());
