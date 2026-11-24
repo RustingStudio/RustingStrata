@@ -1329,6 +1329,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 return rusting_strata::kolibri::chat::generate(&g, &prompt, n);
             }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::raon::ARCH) {
+                anyhow::ensure!(image.is_empty(), "--image is not supported for raon1");
+                let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
+                return rusting_strata::raon::chat::generate(&g, &prompt, n);
+            }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) .is_some_and(rusting_strata::inkling2::is_arch) {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 let max_ctx = 0;
@@ -1435,7 +1440,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             engine.own_warn(&g);
             engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
             if let Some(arch) = g.get("general.architecture").ok().and_then(|v| v.as_str()) {
-                if arch == "deepseek41" || arch == "glm5-next" || arch == "gemma4" || arch == rusting_strata::hy4::ARCH || arch == rusting_strata::kolibri::ARCH || rusting_strata::inkling2::is_arch(arch) {
+                if arch == "deepseek41" || arch == "glm5-next" || arch == "gemma4" || arch == rusting_strata::hy4::ARCH || arch == rusting_strata::kolibri::ARCH || arch == rusting_strata::raon::ARCH || rusting_strata::inkling2::is_arch(arch) {
                     engine.ds_env();
                     // A --ctx below the test grows to fit it, as on the main engine.
                     if rusting_strata::CTX.load(std::sync::atomic::Ordering::Relaxed) != 0 { rusting_strata::CTX.store(engine.ctx, std::sync::atomic::Ordering::Relaxed); }
@@ -1447,6 +1452,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         bench_hy4(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else if arch == rusting_strata::kolibri::ARCH {
                         bench_kolibri(&g, &model, &pp, tg, reps, json_out, &mut engine)
+                    } else if arch == rusting_strata::raon::ARCH {
+                        bench_raon(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else if rusting_strata::inkling2::is_arch(arch) {
                         bench_inkling2(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else {
@@ -1571,6 +1578,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 println!("check: kolibri1 ok: {} layers, {} experts ({} used), {} tensors, every tensor of the forward is present", m.cfg.n_layer, m.cfg.n_expert, m.cfg.n_used, g.tensors.len());
                 return Ok(());
             }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::raon::ARCH) {
+                let m = rusting_strata::raon::forward::RaonModel::new(&g)?;
+                println!("check: raon1 ok: {} layers, {} experts ({} used), {} tensors, every tensor of the forward is present", m.cfg.n_layer, m.cfg.n_expert, m.cfg.n_used, g.tensors.len());
+                return Ok(());
+            }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
                 let c = rusting_strata::deepseek::DsConfig::from_gguf(&g)?;
                 c.validate(&g)?;
@@ -1665,6 +1677,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::kolibri::ARCH) {
                 anyhow::ensure!(image.is_empty(), "--image is not supported for kolibri1");
                 return rusting_strata::kolibri::chat::chat(&g, system, n, think);
+            }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::raon::ARCH) {
+                anyhow::ensure!(image.is_empty(), "--image is not supported for raon1");
+                return rusting_strata::raon::chat::chat(&g, system, n, think);
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) .is_some_and(rusting_strata::inkling2::is_arch) {
                 let max_ctx = 0;
@@ -2165,6 +2181,7 @@ fn $name(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out:
 }
 bench_tokenwise!(bench_hy4, rusting_strata::hy4::forward::Hy4Model);
 bench_tokenwise!(bench_kolibri, rusting_strata::kolibri::forward::KolibriModel);
+bench_tokenwise!(bench_raon, rusting_strata::raon::forward::RaonModel);
 
 /// `strata bench` for Gemma 4, with the `gpu_defaults` of its generate and chat paths.
 fn bench_gemma4(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {
@@ -3593,6 +3610,7 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
             "deepseek41" => rusting_strata::deepseek::chat::serve(&g, &tok, &name)?,
             rusting_strata::hy4::ARCH => rusting_strata::hy4::chat::serve(&g, &tok, &name)?,
             rusting_strata::kolibri::ARCH => rusting_strata::kolibri::chat::serve(&g, &tok, &name)?,
+            rusting_strata::raon::ARCH => rusting_strata::raon::chat::serve(&g, &tok, &name)?,
             _ => rusting_strata::inkling2::chat::serve(&g, &tok, &name, rusting_strata::inkling2::chat::Inkling2Opts {
                 max_ctx: 0, sampler: engine.sampler(), thinking_budget: engine.thinking_budget, think_default: engine.think_default,
                 mmproj, draft_model: engine.draft_model.clone(), ngram_cfg: engine.ngram_config()? })?,
