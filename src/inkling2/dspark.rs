@@ -161,15 +161,15 @@ impl DsparkDrafter {
             None
         };
         let mask_embd = f32s(g_ref, "mask_embd.weight")?;
+        ensure!(mask_embd.len() >= n_embd && mask_embd.len() % n_embd == 0, "dspark: mask_embd.weight len {} is not rows of {n_embd}", mask_embd.len());
         let output_norm = f32s(g_ref, "output_norm.weight")?;
         let joint_proj = host_mat(g_ref, "joint_proj.weight")?;
         let joint_proj_b = f32s(g_ref, "joint_proj.bias")?;
         let markov_head = if g_ref.tensors.contains_key("markov_w2.weight") {
-            MarkovHead::Logits {
-                w2: host_mat(g_ref, "markov_w2.weight")?,
-                bias: f32s(g_ref, "markov_w2.bias")?,
-                gpu: std::sync::OnceLock::new(),
-            }
+            let (w2, bias) = (host_mat(g_ref, "markov_w2.weight")?, f32s(g_ref, "markov_w2.bias")?);
+            ensure!(w2.cols == rank, "dspark: markov_w2.weight has {} columns, markov_w1 gives rank {rank}", w2.cols);
+            ensure!(bias.len() == w2.rows, "dspark: markov_w2.bias len {} != {} rows of markov_w2.weight", bias.len(), w2.rows);
+            MarkovHead::Logits { w2, bias, gpu: std::sync::OnceLock::new() }
         } else {
             MarkovHead::HiddenOut {
                 weight: host_mat(g_ref, "dspark_hidden_out.weight")?,
