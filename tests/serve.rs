@@ -748,3 +748,23 @@ fn held_stream_writes_a_comment_after_15_seconds() {
     assert_eq!(out, b": keep-alive\n\n");
     assert!(held(&mut out, &mut last) && out.len() == 14, "the comment restarts the 15 s");
 }
+
+/// A stream whose prompt is still running gets an SSE comment at each interval and nothing after the prompt ends;
+/// a request that is not a stream gets nothing.
+#[test]
+fn a_running_prompt_keeps_the_stream_alive() {
+    use rusting_strata::serve::alive_every;
+    use std::io::Read;
+    use std::time::Duration;
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut peer = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+    let (c, _) = l.accept().unwrap();
+    let work = || { std::thread::sleep(Duration::from_millis(330)); 7 };
+    assert_eq!(alive_every(&c, None, work), 7);
+    assert_eq!(alive_every(&c, Some(Duration::from_millis(100)), work), 7);
+    std::thread::sleep(Duration::from_millis(250));
+    drop(c);
+    let mut got = String::new();
+    peer.read_to_string(&mut got).unwrap();
+    assert_eq!(got, ": keep-alive\n\n".repeat(3));
+}

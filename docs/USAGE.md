@@ -177,6 +177,10 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   `model` that no listed file has is answered by the loaded model. If the load fails, the request gets `503` with
   the reason and the next chat request loads the model that was there before. With API keys only the admin key sees
   the other models and switches; a customer key sees and gets the loaded model.
+- A streamed reply sends its response head when the model takes the request, before the prompt runs. While the prompt
+  runs, and while the text of a tool call is held back, the stream sends the SSE comment `: keep-alive` every 15 s, so
+  a client that stops after some minutes without a byte keeps reading. If the prompt fails after the head, the stream
+  ends early.
 - It runs one request at a time; `--parallel N` (GPU) decodes up to N together (4 requests: 164 tok/s in total on the
   RTX 3060, 41 each; see [HOSTING.md](HOSTING.md)). From 8 requests decoding at once (`STRATA_BATCH_MIN` sets the
   count), a dense model without MTP, LoRA or recurrent layers on CUDA runs them in one batched forward, and the

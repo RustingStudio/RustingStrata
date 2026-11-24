@@ -3247,17 +3247,18 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let res = (|| -> anyhow::Result<(Vec<u32>, bool)> {
                 let logits;
                 if serve::gone(&w) { anyhow::bail!("client closed the connection"); }
-                let (chat_ids, chat_logits, chat_cached) = match &vision_prompt {
+                // The head goes out before the prompt runs, and comments follow it while the prompt runs (`serve::alive`).
+                if req.stream { write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?; }
+                let (chat_ids, chat_logits, chat_cached) = serve::alive(&w, req.stream, || anyhow::Ok(match &vision_prompt {
                     Some(p) => (p.ids.clone(), r.chat_image(p, &image_input.as_ref().unwrap().embeddings)?, 0),
                     None => r.chat(tok, &prompt, &tpl.render(&req.messages[..n_hist], &req.tools, req.think.unwrap_or(e.think_default), preserve, false), &system)?,
-                };
+                }))?;
                 (_, logits, cached) = (chat_ids, chat_logits, chat_cached);
                 if let Runner::Slot(c) = &*r && let Some(t) = c.started { t0 = t; start(&mut busy); }
                 prefilled = true;
                 t1 = Instant::now();
                 if serve::gone(&w) { anyhow::bail!("client closed the connection"); }
                 if req.stream {
-                    write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
                     if anth {
                         sse(&mut w, json!({"type": "message_start", "message": {"id": format!("msg_{i}"), "type": "message", "role": "assistant", "model": name,
                             "content": [], "stop_reason": null, "stop_sequence": null,

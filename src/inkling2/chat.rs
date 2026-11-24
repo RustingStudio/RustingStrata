@@ -525,7 +525,8 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str, opts: Inkling2O
         ensure!(!ids.is_empty(), "cannot encode prompt");
         ensure!(ids.len() < m.max_ctx, "prompt is {} tokens, the limit is {}", ids.len(), m.max_ctx);
         let t = std::time::Instant::now();
-        let (keep, logits) = if !has_images && m.toks.len() < ids.len() && ids.starts_with(&m.toks) {
+        if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
+        let (keep, logits) = crate::serve::alive(c, q.stream, || if !has_images && m.toks.len() < ids.len() && ids.starts_with(&m.toks) {
             let k = m.toks.len();
             (k, m.prefill_embds(&seq[k..]))
         } else if !has_images && let Some((ck, ck_logits)) = &turn_ckpt && ck.toks.len() <= ids.len() && ids.starts_with(&ck.toks) {
@@ -535,7 +536,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str, opts: Inkling2O
         } else {
             m.reset();
             (0, m.prefill_embds(&seq))
-        };
+        });
         turn_ckpt = (!has_images).then(|| (m.checkpoint(), logits.clone()));
         let prefill_s = t.elapsed().as_secs_f64();
 
@@ -554,7 +555,6 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str, opts: Inkling2O
 
         let budget = q.thinking_budget.unwrap_or(opts.thinking_budget);
         let n = q.max_tokens.unwrap_or(usize::MAX).min(m.max_ctx - m.toks.len());
-        if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
         let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
         let tools = q.tool_calls && !q.tools.is_empty();
         let (mut content, mut reasoning, mut bodies) = (String::new(), String::new(), Vec::<String>::new());
