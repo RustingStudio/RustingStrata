@@ -237,6 +237,22 @@ a token's expert uses in VRAM; the CPU worker takes 1.8 ms a token. Greedy text 
 Vulkan: the placement decides which experts round on the CPU. `--fixed-experts` keeps the slabs and is.
 `STRATA_INK_SLABS=1` keeps the slabs and pools only the layers they leave out.
 
+### Prompt chunks of 2048 rows
+
+A prompt chunk copies each layer run's missing experts into the staging slots, and a chunk of 256 rows already
+touches most of a layer's 128 experts, so the copies repeated every 256 tokens. Prompt chunks now have 2048 rows
+(`STRATA_DS_PF_TOKENS`); the scratch costs about 0.55 GB of VRAM per 1024 rows, and the chunk halves when it does
+not fit. 9.5 GB weight budget, desktop at 2.2 GB, `bench --pp 512,4096 --tg 32`:
+
+| rows | pp 512 | pp 4096 | decode | peak VRAM, card |
+|---|---|---|---|---|
+| 256 | 265 tok/s | 278 tok/s | 49.5 tok/s | 13.47 GB |
+| 2048 | 387 | 767 | 48.9 | 14.61 GB |
+| 4096 | 393 | 891 | 48.8 | 15.48 GB |
+
+At 2048 rows a core layer run still misses 40-45 of the ~125 experts it uses (6-7% of the uses); most of those
+serve 9 or more rows.
+
 Left: `ink_mix` runs 120 times a token at 12 µs in one workgroup (about 1 ms, but a faster reduction order breaks the
 bit parity with Vulkan), and a first run without a profile.
 
