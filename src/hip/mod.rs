@@ -920,8 +920,8 @@ mod tests {
         let Ok(gpu) = Gpu::new(0) else { eprintln!("skipping: no HIP device"); return };
         let g: &dyn Backend = &gpu;
         let (rows, n) = (64usize, 1000usize);
-        let mut st = 5u32;
-        let x: Vec<f32> = (0..rows * n).map(|_| { st = st.wrapping_mul(1664525).wrapping_add(1013904223); (st >> 8) as f32 }).collect();
+        // Each row is a permutation of 0..n, so its maximum is unique and the reference needs no tie rule.
+        let x: Vec<f32> = (0..rows * n).map(|k| { let (r, i) = (k / n, k % n); ((i * 7919 + r * 31) % n) as f32 }).collect();
         let want: Vec<i32> = (0..rows).map(|r| {
             let row = &x[r * n..(r + 1) * n];
             let mut best = 0;
