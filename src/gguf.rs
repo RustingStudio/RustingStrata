@@ -108,7 +108,7 @@ impl Gguf {
         // The reads are queued by `weights::preload`, one call per file. Said here because nothing else shows it: the
         // pages are not mapped into the process, so its resident size does not grow.
         #[cfg(target_os = "linux")]
-        if crate::weights::fits_ram() {
+        if crate::weights::fits_ram() && !crate::weights::net_fs(path) {
             crate::say!("page cache: reading {} MB of {} in the background (it shows as buff/cache, not as used memory)",
                 g.files.iter().map(|(m, _)| m.0.len()).sum::<usize>() >> 20, path.file_name().and_then(|s| s.to_str()).unwrap_or("the model"));
         }
@@ -129,7 +129,7 @@ impl Gguf {
         if std::env::var_os("STRATA_HUGEPAGE").is_some() {
             let _ = mmap.advise(memmap2::Advice::HugePage);
         }
-        crate::weights::preload(&mmap, read);
+        crate::weights::preload(&mmap, read && !crate::weights::net_fs(path));
         let mmap = Map(mmap);
         let mut c = Cur { b: &mmap.0, p: 0 };
         if c.take(4)? != b"GGUF" { bail!("{}: not a GGUF file", path.display()); }

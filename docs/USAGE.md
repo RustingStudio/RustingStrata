@@ -259,6 +259,8 @@ file system that caches data, or from a tmpfs copy.
 When the model files fit in RAM with 4 GiB to spare, they are read into the page cache in the background from the
 start and nothing is dropped, so experts that run on the CPU do not wait for the drive on their first use.
 `STRATA_PRELOAD=1` forces that, `STRATA_PRELOAD=0` turns it off.
+A file on a network file system (SMB, NFS, a FUSE mount) is not read ahead, because that asks the server for the whole
+file at once: its pages are read when they are used (`STRATA_PRELOAD=1` reads it ahead all the same).
 
 Otherwise bytes copied to VRAM are dropped from the page cache (`MADV_DONTNEED`), so on a model close to the machine's
 RAM the experts that missed VRAM keep their pages; `STRATA_COLD_KEEP=1` only marks them reclaimable instead. `serve` learns
