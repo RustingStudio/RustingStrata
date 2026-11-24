@@ -2728,6 +2728,7 @@ fn write_spec_calibration(s: &CalibSettings, result: &calibrate::SearchResult, a
 /// The universal calibration workflow. Every supported architecture goes through here; the measurement is delegated
 /// to `bench`, so there is no arch-specific timing code to keep in sync.
 fn calibrate_v2(s: &CalibSettings) -> anyhow::Result<()> {
+    backend::check_devices(s.backend.as_deref(), &s.device)?;  // before the GGUF is read: a bad --device fails here
     check_workload_ctx(s)?;
     let g = Gguf::open(&s.model)?;
     let arch = g.get("general.architecture").ok().and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
@@ -2805,6 +2806,7 @@ fn spec_baseline(s: &CalibSettings) -> Knobs {
 /// The `spec` subcommand: one task-specific sweep of speculative settings, written under `spec` in the calibration
 /// file. It uses the same budgeted search, with each task as its own workload so acceptance can differ by corpus.
 fn calibrate_spec(s: &CalibSettings) -> anyhow::Result<()> {
+    backend::check_devices(s.backend.as_deref(), &s.device)?;
     check_workload_ctx(s)?;
     let g = Gguf::open(&s.model)?;
     let arch = g.get("general.architecture").ok().and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
