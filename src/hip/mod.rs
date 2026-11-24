@@ -348,7 +348,8 @@ impl Gpu {
                 x: u64, x_stride: usize, _n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32, w_scale: f32) -> anyhow::Result<()> {
         if cols % 64 != 0 { bail!("{} matrix with {cols} columns: GEMM needs a multiple of 64", ty.name()); }
         if n_tiles == 0 { return Ok(()) }
-        let (same, act) = (act & SAME_X != 0, act & !SAME_X);
+        // Only the activation reaches the kernel: SAME_X and BATCHED (the same kernels here) are flags for the host.
+        let (same, act) = (act & SAME_X != 0, act & 3);
         let _ = same;
         let grid = (rows.div_ceil(64) as u32, n_tiles as u32);
         let sm = tiles == 0 && (grid.0 * grid.1 < 112 || nd <= 32);
@@ -977,6 +978,13 @@ mod tests {
             g.gemm_dense(&t, n, gx.addr(), cols, gy.addr(), rows, 0).unwrap();
             g.sync().unwrap();
             let got: Vec<f32> = g.get(&gy, 0, n * rows).unwrap();
+            // A batch step's flag picks no other kernel here, so it gives the same bits (it reached the kernel as an add,
+            // which y filled with ones shows).
+            g.put(&vec![1f32; n * rows], &gy, 0).unwrap();
+            g.gemm_dense(&t, n, gx.addr(), cols, gy.addr(), rows, crate::backend::BATCHED).unwrap();
+            g.sync().unwrap();
+            let batched: Vec<f32> = g.get(&gy, 0, n * rows).unwrap();
+            assert!(got.iter().zip(&batched).all(|(a, b)| a.to_bits() == b.to_bits()), "rows {rows}: BATCHED changed the result");
             let mut worst = 0f32;
             let mut at = 0;
             for i in 0..n * rows {
