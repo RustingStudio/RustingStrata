@@ -253,6 +253,12 @@ not fit. 9.5 GB weight budget, desktop at 2.2 GB, `bench --pp 512,4096 --tg 32`:
 At 2048 rows a core layer run still misses 40-45 of the ~125 experts it uses (6-7% of the uses); most of those
 serve 9 or more rows.
 
+The missed experts are copied on a second stream (`Backend::htod_side`) into two halves of the staging slots: the
+residents run while the first two rounds copy in, then each round runs while the next one fills the other half.
+pp 4096 went from 775 to 834 tok/s (same routing profile, greedy text unchanged); with the copies left out it would
+be 1105. What is left is the host's copy into the pinned ring (one thread, about 10 GB/s; more threads did not help)
+and the routing read at each layer, before which no copy can start.
+
 Left: `ink_mix` runs 120 times a token at 12 µs in one workgroup (about 1 ms, but a faster reduction order breaks the
 bit parity with Vulkan), and a first run without a profile.
 
