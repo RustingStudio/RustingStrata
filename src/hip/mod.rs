@@ -206,7 +206,8 @@ impl Gpu {
             }
             fns.insert(name, f);
         }
-        let am_buf = alloc_raw(&hip, 64 * AMAX_PARTS)?;
+        // argmax_part writes an int2 (8 bytes) per partial: AMAX_PARTS per row, up to 64 rows.
+        let am_buf = alloc_raw(&hip, 64 * AMAX_PARTS * 8)?;
         let q8_buf = alloc_raw(&hip, 1)?;
         // Pinned ring for large host-to-device copies.
         let mut host: *mut c_void = std::ptr::null_mut();
@@ -661,7 +662,7 @@ impl Backend for Gpu {
 
     fn argmax_rows(&self, x: u64, n: usize, rows: usize, out: u64) -> anyhow::Result<()> {
         let part = self.ptr(&self.am);
-        anyhow::ensure!(rows * AMAX_PARTS <= self.am.len(), "argmax_rows: {rows} rows");
+        anyhow::ensure!(rows * AMAX_PARTS * 8 <= self.am.len(), "argmax_rows: {rows} rows");  // len is in bytes
         launch!(self, "argmax_part", cfg((AMAX_PARTS as u32, rows as u32), 256, 0), x, n as i32, part);
         launch!(self, "argmax_rows", cfg((rows as u32, 1), AMAX_PARTS as u32, 0), part, n as i32, out);
         Ok(())
@@ -910,6 +911,37 @@ mod tests {
         g.sync().unwrap();
         let got: Vec<f32> = g.get(&bx, 0, n).unwrap();
         assert!(got.iter().zip(&want).all(|(a, b)| a == b), "first mismatch at {:?}", got.iter().zip(&want).position(|(a, b)| a != b));
+    }
+
+    /// `argmax_rows` on 64 rows, the most a batch step has. The partials are 8 bytes each, AMAX_PARTS per row; the
+    /// buffer used to be sized as if they were one byte, so rows past 8 wrote past its end.
+    #[test]
+    fn argmax_rows_takes_64_rows() {
+        let Ok(gpu) = Gpu::new(0) else { eprintln!("skipping: no HIP device"); return };
+        let g: &dyn Backend = &gpu;
+        let (rows, n) = (64usize, 1000usize);
+        let mut st = 5u32;
+        let x: Vec<f32> = (0..rows * n).map(|_| { st = st.wrapping_mul(1664525).wrapping_add(1013904223); (st >> 8) as f32 }).collect();
+        let want: Vec<i32> = (0..rows).map(|r| {
+            let row = &x[r * n..(r + 1) * n];
+            let mut best = 0;
+            for i in 1..n { if row[i] > row[best] { best = i; } }
+            best as i32
+        }).collect();
+        let bx = g.alloc(4 * rows * n).unwrap();
+        let bo = g.alloc(4 * rows).unwrap();
+        g.put(&x, &bx, 0).unwrap();
+        g.argmax_rows(bx.addr(), n, rows, bo.addr()).unwrap();
+        g.sync().unwrap();
+        let got: Vec<i32> = g.get(&bo, 0, rows).unwrap();
+        assert_eq!(got, want);
+    }
+
+    /// `--backend hip` reaches this backend through `backend::open`, the path the CLI takes.
+    #[test]
+    fn opens_through_backend_open() {
+        let Ok(b) = crate::backend::open(Some("hip"), 0) else { eprintln!("skipping: no HIP device"); return };
+        assert_eq!(b.name(), "hip");
     }
 
     /// `norm_gate` with the quantize-to-int8 epilogue: the first kernel of the qwen35 attention layer, and the one
