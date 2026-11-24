@@ -10,7 +10,7 @@ fn xs(n: usize) -> Vec<f32> {
 
 /// x as the integer GEMV path sees it: int8 per 32 elements with scale max|x| / 127 (float weight types read x as is).
 fn as_seen(ty: GgmlType, x: &[f32]) -> Vec<f32> {
-    if matches!(ty, GgmlType::F32 | GgmlType::BF16) { return x.to_vec(); }
+    if ty.float_x() { return x.to_vec(); }
     x.chunks(32).flat_map(|b| {
         let mx = b.iter().fold(0f32, |m, v| m.max(v.abs()));
         let id = if mx > 0.0 { 127.0 / mx } else { 0.0 };
@@ -199,6 +199,13 @@ fn gemvn_matches_gemv() {
             gpu.moe_gemv(t.ty, t.rows, t.cols, dt.ptr, 0, zid.addr(), 1, dx.addr(), t.cols, 1, dy.addr(), Some((0, 4 * t.rows as i64)), xq.addr()).unwrap();
             let got = down::<f32>(gpu, &dy);
             assert!(got[..t.rows] == want[..t.rows] && got[t.rows..] == want[..t.rows], "{} {name} paired moe_gemv", ty.name());
+            if gpu.supports_gemv_rows() && !matches!(t.ty, rusting_strata::quant::GgmlType::F32 | rusting_strata::quant::GgmlType::BF16) && t.rows >= 6 {
+                let subset: Vec<i32> = (0..t.rows as i32).step_by(3).collect();
+                let (dsub, dys) = (up(gpu, &subset), gpu.zeros::<f32>(subset.len()).unwrap());
+                gpu.gemv_rows(&dt, dx.addr(), dsub.addr(), subset.len(), dys.addr()).unwrap();
+                let sub_want: Vec<f32> = subset.iter().map(|&r| want[r as usize]).collect();
+                assert_eq!(down::<f32>(gpu, &dys), sub_want, "{} {name} gemv_rows", ty.name());
+            }
         }
         assert!(seen.len() >= 5 || !common::is_default_model(&p), "types covered: {seen:?}");
     }
@@ -951,6 +958,32 @@ fn moe_combine_seq_matches_cpu() {
     }
 }
 
+/// `hadamard` (Gyro files) against the matrix product: out = H (s x) / sqrt(block) per block, H[j][k] = +1 or -1 by
+/// the parity of the bits of j & k. Two rows; out of place from x, then in place from silu(x) * u.
+#[test]
+fn hadamard_matches_matrix_product() {
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        let (n, block, rows) = (640, 128, 2);
+        let (x, u) = (xs(rows * n).iter().map(|v| v * 4.0).collect::<Vec<f32>>(), xs(rows * n + 1)[1..].to_vec());
+        let s: Vec<f32> = (0..n).map(|i| if i * 7 % 5 < 2 { -1.0 } else { 1.0 }).collect();
+        let want = |v: &[f32]| -> Vec<f32> { (0..rows * n).map(|i| {
+            let (b, j) = (i - i % block, i % block);
+            (0..block).map(|k| if (j & k).count_ones() % 2 == 1 { -1.0 } else { 1.0 } * s[(b + k) % n] * v[b + k]).sum::<f32>() / (block as f32).sqrt()
+        }).collect() };
+        let (dx, du, ds, dout) = (up(gpu, &x), up(gpu, &u), up(gpu, &s), gpu.zeros::<f32>(rows * n).unwrap());
+        gpu.hadamard(dx.addr(), 0, ds.addr(), dout.addr(), n, block, rows).unwrap();
+        let e = rel_l2(&down::<f32>(gpu, &dout), &want(&x));
+        eprintln!("hadamard {bk}: rel err {e:.2e}");
+        assert!(e < 1e-6, "{bk}: {e}");
+        gpu.hadamard(dx.addr(), du.addr(), ds.addr(), dx.addr(), n, block, rows).unwrap();
+        let act: Vec<f32> = x.iter().zip(&u).map(|(g, u)| g / (1.0 + (-g).exp()) * u).collect();
+        let e = rel_l2(&down::<f32>(gpu, &dx), &want(&act));
+        eprintln!("hadamard in place with swiglu {bk}: rel err {e:.2e}");
+        assert!(e < 1e-6, "{bk}: {e}");
+    }
+}
+
 #[test]
 fn elementwise_ops_match_cpu() {
     // Measurement only (M2-T7): relative error against the CPU reference and differing bits from the
@@ -973,6 +1006,25 @@ fn elementwise_ops_match_cpu() {
         let got = down::<f32>(gpu, &dg);
         assert!(rel_l2(&got, &want) < 1e-6);
         report("swiglu", &got, &want);
+        // situ: 3 rows of 2 * 200 floats, the gates of each row replaced; a zero linear beta leaves the up as it is.
+        // Row scales: none (1), or one per row.
+        for (lb, sc) in [(25.0f32, None), (0.0, None), (25.0, Some([0.5f32, 2.0, 1.5]))] {
+            let (nf, y) = (200, xs(1200).iter().map(|v| v * 12.0).collect::<Vec<f32>>());
+            let dy = up(gpu, &y);
+            let ds = sc.map(|s| up(gpu, &s));
+            gpu.situ(dy.addr(), nf, 3, ds.as_ref().map_or(0, |b| b.addr()), 4.0, lb).unwrap();
+            let mut want = y.clone();
+            for (j, r) in want.chunks_exact_mut(2 * nf).enumerate() {
+                let s = sc.map_or(1.0, |s| s[j]);
+                for i in 0..nf {
+                    let (g, u) = (r[i] * s, r[nf + i] * s);
+                    let up = if lb > 0.0 { lb * (u / lb).tanh() } else { u };
+                    r[i] = 4.0 * (g / 4.0).tanh() / (1.0 + (-g).exp()) * up;
+                }
+            }
+            let got = down::<f32>(gpu, &dy);
+            assert!(rel_l2(&got, &want) < 1e-6, "situ, linear beta {lb}");
+        }
         gpu.add(dg.addr(), du.addr(), n).unwrap();
         let want: Vec<f32> = want.iter().zip(&u).map(|(a, b)| a + b).collect();
         let got = down::<f32>(gpu, &dg);
@@ -1081,6 +1133,15 @@ fn norm_rope_and_gate_ops_match_cpu() {
         let got = down::<f32>(gpu, &dx);
         close(&got, &want, "rope_neox");
         report("rope_neox", "hd 128, 64 rotated, pos 30000", &got, &want);
+        // rope_mrope: one token, 2 heads, sections [11, 11, 10, 0] of the 32 pairs at positions [t, y, x, z].
+        let (mpos, sec) = ([40, 7, 13, 5], [11, 11, 10, 0]);
+        let dx = up(gpu, &x[..2 * hd]);
+        let step = up(gpu, &mpos.map(|p| [p, 0]).concat());
+        gpu.rope_mrope(dx.addr(), hd, 2, 2, n_rot, step.addr(), 1e7, sec).unwrap();
+        let mut want = x[..2 * hd].to_vec();
+        for v in want.chunks_mut(hd) { ops::rope_mrope(v, n_rot, mpos, sec, 1e7) }
+        let got = down::<f32>(gpu, &dx);
+        close(&got, &want, "rope_mrope");
         // rms_norm_rope == rms_norm then rope_neox, from rows 160 floats apart.
         let dx = up(gpu, &x[..6 * 160]);
         let (d1, d2) = (gpu.zeros::<f32>(6 * hd).unwrap(), gpu.zeros::<f32>(6 * hd).unwrap());
@@ -1338,9 +1399,8 @@ fn moe_mailbox_round_trip() {
         assert_eq!(unsafe { (at(SKIP).read_volatile(), at(REQ).read_volatile()) }, want);
         gpu.put(&table, &dtable, 0).unwrap();
         // #34 R2: `mb = 0` (a fully resident cache) still routes, and writes no mailbox word, even with missed
-        // experts in the table: the combine must not wait for a CPU part that does not exist. CUDA only (the Vulkan
-        // kernels read the mailbox unconditionally).
-        if bk == "cuda" {
+        // experts in the table: the combine must not wait for a CPU part that does not exist.
+        {
             let before = unsafe { (at(SKIP).read_volatile(), at(REQ).read_volatile()) };
             gpu.put(&[0i32, 6], &step, 0).unwrap();
             gpu.moe_route(dlog.addr(), 4, k, 0.0, dtable.addr(), dids.addr(), dwts.addr(), slots.addr(), wh.addr(), dh.addr(), 0, n, lay.h, step.addr(), t, 0, false).unwrap();
@@ -1425,6 +1485,9 @@ fn attn_decode_bandwidth() {
 /// | Q2_0 | 18 | `d` f16 @0 |
 /// | TQ1_0 | 54 | `d` f16 @52 |
 /// | TQ2_0 | 66 | `d` f16 @64 |
+/// | TQ2_T | 34 | `d` f16 @0 |
+/// | TQK6 | 26 | `d` f16 @0 |
+/// | TQK7 | 30 | `d` f16 @0 |
 /// | Q4_0 | 18 | `d` f16 @0 |
 /// | Q5_0 | 22 | `d` f16 @0 |
 /// | Q8_0 | 34 | `d` f16 @0 |
@@ -1454,6 +1517,7 @@ fn random_tensor(ty: GgmlType, rows: usize, cols: usize, seed: u32) -> Vec<u8> {
         GgmlType::F32 => (0..rows * cols).flat_map(|_| ((rnd() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()).collect(),
         GgmlType::F16 => (0..rows * cols).flat_map(|_| half::f16::from_f32((rnd() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()).collect(),
         GgmlType::BF16 => (0..rows * cols).flat_map(|_| half::bf16::from_f32((rnd() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()).collect(),
+        GgmlType::F8E4M3 => (0..rows * cols).map(|_| ((0x28 + (rnd() % 24)) as u8) | (((rnd() & 1) as u8) << 7)).collect(),
         _ => {
             let (bb, n) = (ty.block_bytes(), rows * (cols / ty.block_elems()));
             (0..n).flat_map(|_| {
@@ -1478,6 +1542,8 @@ fn random_tensor(ty: GgmlType, rows: usize, cols: usize, seed: u32) -> Vec<u8> {
                             b[o..o + 2].copy_from_slice(&w.to_le_bytes());
                         }
                     }
+                    // Four UE4M3 scales, exponents 3 to 4 (about 0.004 to 0.015).
+                    GgmlType::NVFP4 => for v in &mut b[..4] { *v = 0x18 + (rnd() % 16) as u8; },
                     _ => b[0..2].copy_from_slice(&scale(&mut rnd)),
                 }
                 b
@@ -1507,21 +1573,21 @@ fn random_tensor_scales_are_finite() {
 
 /// Every supported `GgmlType`, in the order `from_u32` accepts them.
 fn all_types() -> Vec<GgmlType> {
-    (0..64).filter_map(|i| GgmlType::from_u32(i).ok()).collect()
+    (0..150).filter_map(|i| GgmlType::from_u32(i).ok()).collect()
 }
 
 #[test]
 fn gemv_partial_superblocks_and_q2_0() {
     for (bk, gpu) in common::backends_except(&[]) {
         let gpu = &*gpu;
-        for ty in [GgmlType::Q2_0, GgmlType::TQ1_0, GgmlType::TQ2_0, GgmlType::Q8_0, GgmlType::IQ4NL, GgmlType::Q4_0, GgmlType::Q5_0, GgmlType::Q4_1, GgmlType::Q5_1, GgmlType::BF16, GgmlType::F32] {
+        for ty in [GgmlType::Q2_0, GgmlType::TQ1_0, GgmlType::TQ2_0, GgmlType::TQ2T, GgmlType::TQK6, GgmlType::TQK7, GgmlType::Q8_0, GgmlType::IQ4NL, GgmlType::NVFP4, GgmlType::Q4_0, GgmlType::Q5_0, GgmlType::Q4_1, GgmlType::Q5_1, GgmlType::BF16, GgmlType::F8E4M3, GgmlType::F32] {
             for cols in [640, 320, 2560] {
                 if cols % ty.block_elems() != 0 { continue; }
                 let (rows, nt, ne) = (40, 3, 4);  // ne experts of `rows` rows for moe_gemv
                 let data = random_tensor(ty, ne * rows, cols, cols as u32 + ty as u32);
-                let all = Tensor { ty, cols, rows: ne * rows, data: &data };
+                let all = Tensor { ty, cols, rows: ne * rows, data: &data, scale: 1.0 };
                 let t = Tensor { rows, data: &data[..ty.row_bytes(cols as u64) * rows], ..all };
-                // Raw bytes, as experts are uploaded (`Backend::upload` turns Q4_0 / Q5_0 into Q8_0).
+                // Raw bytes, as experts are uploaded.
                 let raw = |t: &Tensor| { let b = gpu.alloc(t.data.len()).unwrap(); gpu.htod(t.data, &b, 0).unwrap(); GpuTensor::new(t.ty, t.rows, t.cols, b) };
                 let (dt, dall) = (raw(&t), raw(&all));
                 let what = format!("{bk} {} cols {cols}", ty.name());
@@ -1594,9 +1660,9 @@ fn gemv_partial_superblocks_and_q2_0() {
     }
 }
 
-/// Per-type Vulkan pass/fail matrix over all 25 `GgmlType` variants: dequant, GEMV/GEMV-N/GEMV-Q, MoE GEMV, dense
+/// Per-type Vulkan pass/fail matrix over all `GgmlType` variants: dequant, GEMV/GEMV-N/GEMV-Q, MoE GEMV, dense
 /// and tiled GEMM, plus each type's largest shared-memory request. Synthetic raw blocks bypass `Backend::upload`, so
-/// native kernels run even for the types the loader converts (F16, Q4_0, Q5_0). Vulkan only: run it with
+/// native kernels run even for F16, which the loader converts. Vulkan only: run it with
 /// `STRATA_TEST_BACKENDS=vulkan`. Prints one `MATRIX ty=...` line per type for `docs/V100-results.md`.
 #[test]
 fn vulkan_type_matrix() {
@@ -1604,7 +1670,7 @@ fn vulkan_type_matrix() {
     let gpu: &dyn Backend = &g;
     let not_impl = |e: &anyhow::Error| format!("{e:#}").contains("not implemented");
     let types = all_types();
-    assert_eq!(types.len(), 25, "GgmlType variants");
+    assert_eq!(types.len(), 30, "GgmlType variants");
     let (rows, ne, cols, nt) = (40, 4, 256, 3);
     let mut failures = 0;
     for ty in types {
@@ -1623,13 +1689,13 @@ fn vulkan_type_matrix() {
         }
         let (mut dequant, mut gemv, mut gemvn, mut gemvq, mut moe_gemv, mut gemm_dense, mut gemm) =
             ("pass", "pass", "pass", "pass", "pass", "pass", "pass");
-        let mut note = if matches!(ty, GgmlType::Q4_0 | GgmlType::Q5_0) { "native bytes; loader uploads Q8_0".to_string() } else { String::new() };
+        let mut note = String::new();
         // The f16 GEMM path converts its operands with packFloat2x16; on this Volta driver OpFConvert truncates.
-        if matches!(ty, GgmlType::F32 | GgmlType::BF16 | GgmlType::IQ2XS | GgmlType::IQ2S) {
+        if ty.float_x() || matches!(ty, GgmlType::IQ2XS | GgmlType::IQ2S) {
             note = format!("{note}{}f16 GEMM inputs truncate (Volta OpFConvert); reference matches", if note.is_empty() { "" } else { "; " });
         }
         let data = random_tensor(ty, ne * rows, cols, cols as u32 + ty as u32);
-        let all = Tensor { ty, cols, rows: ne * rows, data: &data };
+        let all = Tensor { ty, cols, rows: ne * rows, data: &data, scale: 1.0 };
         let t = Tensor { rows, data: &data[..ty.row_bytes(cols as u64) * rows], ..all };
         // Raw bytes, as experts are uploaded.
         let raw = |t: &Tensor| {
@@ -1845,7 +1911,7 @@ fn f16_weight_uploads_as_f32() {
     let (rows, cols) = (96, 512);
     let w: Vec<f32> = xs(rows * cols).iter().map(|v| v * 3.0).collect();
     let data: Vec<u8> = w.iter().flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes()).collect();
-    let t = Tensor { ty: GgmlType::F16, rows, cols, data: &data };
+    let t = Tensor { ty: GgmlType::F16, rows, cols, data: &data, scale: 1.0 };
     let wf: Vec<f32> = w.iter().map(|v| half::f16::from_f32(*v).to_f32()).collect();
     let nt = 40;
     let x = xs(nt * cols);
@@ -2020,5 +2086,592 @@ fn router_topk_sigmoid_matches_cpu() {
                 assert!((gv - wv).abs() <= 1e-5, "weight {gv} vs {wv} row {row}");
             }
         }
+    }
+}
+
+/// The Inkling 2 decode kernels against the host formulas of `inkling2::forward` (`mix`, `control`, `convolve`,
+/// `clip`, `attention`), written out here on small shapes.
+#[test]
+fn ink_kernels_match_reference() {
+    let h16 = |v: &[f32]| -> Vec<u16> { v.iter().map(|&x| half::f16::from_f32(x).to_bits()).collect() };
+    let r16 = |v: &[f32]| -> Vec<f32> { v.iter().map(|&x| f16r(x)).collect() };
+    let rms = |x: &[f32], eps: f32| -> Vec<f32> {
+        let s = 1.0 / (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt();
+        x.iter().map(|v| v * s).collect()
+    };
+    let dot = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(a, b)| a * b).sum() };
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        // Depth mix: 3 blocks and the stream, 2 queries.
+        let (n, nb, nq) = (520, 3, 2);
+        let (blocks, cur, q) = (xs(nb * n), xs(n + 7)[7..].to_vec(), xs(nq * n + 3)[3..].to_vec());
+        let states: Vec<Vec<f32>> = blocks.chunks(n).chain([&cur[..]]).map(|s| rms(s, 1e-6)).collect();
+        let mut want = vec![0f32; nq * n];
+        for (q, o) in q.chunks(n).zip(want.chunks_mut(n)) {
+            let sc: Vec<f32> = states.iter().map(|s| dot(s, q) / (n as f32).sqrt()).collect();
+            let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
+            let z: f32 = sc.iter().map(|s| (s - mx).exp()).sum();
+            for (s, l) in states.iter().zip(&sc) { for (o, s) in o.iter_mut().zip(s) { *o += (l - mx).exp() / z * s; } }
+        }
+        let (db, dc, dq, out) = (up(gpu, &blocks), up(gpu, &cur), up(gpu, &q), gpu.zeros::<f32>(nq * n).unwrap());
+        gpu.ink_mix(db.addr(), nb, dc.addr(), dq.addr(), nq, out.addr(), n).unwrap();
+        let e = rel_l2(&down::<f32>(gpu, &out), &want);
+        assert!(e < 1e-5, "{bk} ink_mix {e}");
+
+        // Loop controllers: 3 controllers of rank 5 on one shared input and on three.
+        let (rank, count) = (5, 3);
+        let (down_w, gain, forget) = (xs(count * rank * 2 * n), xs(count * rank * n + 1)[1..].to_vec(), xs(count * rank * n + 2)[2..].to_vec());
+        let (ins, msg) = (xs(count * n + 5)[5..].to_vec(), xs(count * n + 9)[9..].to_vec());
+        let (dd, dg, df) = (up(gpu, &h16(&down_w)), up(gpu, &h16(&gain)), up(gpu, &h16(&forget)));
+        let (di, dm, gate, out) = (up(gpu, &ins), up(gpu, &msg), gpu.zeros::<f32>(count * rank).unwrap(), gpu.zeros::<f32>(count * n).unwrap());
+        let (down_w, gain, forget) = (r16(&down_w), r16(&gain), r16(&forget));
+        for nins in [1, 3] {
+            let mut want = vec![];
+            for j in 0..count {
+                let (c, m) = (&ins[j.min(nins - 1) * n..][..n], &msg[j * n..][..n]);
+                let cat = [rms(c, 1e-6), rms(m, 1e-6)].concat();
+                let g: Vec<f32> = (0..rank).map(|r| dot(&down_w[(j * rank + r) * 2 * n..][..2 * n], &cat)).collect();
+                for i in 0..n {
+                    let (a, f) = (0..rank).fold((0f32, 0f32), |s, r| (s.0 + g[r] * gain[(j * rank + r) * n + i], s.1 + g[r] * forget[(j * rank + r) * n + i]));
+                    want.push(c[i] - f.tanh() * c[i] + a.tanh() * m[i]);
+                }
+            }
+            gpu.ink_ctrl(dd.addr(), dg.addr(), df.addr(), di.addr(), nins, dm.addr(), gate.addr(), out.addr(), n, rank, count).unwrap();
+            let e = rel_l2(&down::<f32>(gpu, &out), &want);
+            assert!(e < 1e-4, "{bk} ink_ctrl {nins} {e}");
+        }
+
+        // Convolution over three tokens, with and without the taps of a head; the history advances.
+        let (n, nc, per) = (300, 4, 100);
+        let (w, taps) = (xs(n * nc), xs(n / per * nc + 11)[11..].to_vec());
+        let (dw, dt, hist, dx) = (up(gpu, &w), up(gpu, &taps), gpu.zeros::<f32>((nc - 1) * n).unwrap(), gpu.zeros::<f32>(n).unwrap());
+        for with in [false, true] {
+            gpu.memset(&hist).unwrap();
+            let mut past = vec![vec![0f32; n]; nc - 1];
+            for t in 0..3 {
+                let x = xs(n + t * 13 + 1)[t * 13 + 1..].to_vec();
+                past.push(x.clone());
+                let want: Vec<f32> = (0..n).map(|c| {
+                    let mut o: f32 = (0..nc).map(|k| past[t + k][c] * w[c * nc + k]).sum();
+                    if with { o += (0..nc).map(|lag| past[t + nc - 1 - lag][c] * taps[c / per * nc + lag]).sum::<f32>(); }
+                    (x[c] + o) / ((if with { 2 * nc } else { nc } + 1) as f32).sqrt()
+                }).collect();
+                gpu.put(&x, &dx, 0).unwrap();
+                gpu.ink_conv(dx.addr(), dw.addr(), if with { dt.addr() } else { 0 }, hist.addr(), dx.addr(), n, nc, per).unwrap();
+                let e = rel_l2(&down::<f32>(gpu, &dx), &want);
+                assert!(e < 1e-5, "{bk} ink_conv taps {with} token {t} {e}");
+            }
+        }
+
+        // Clip: scaled rows capped at an L2 norm, and rows scaled to an RMS of 1, also stored as f16.
+        for (w, rows, thr, mul, scaled) in [(16, 5, 0.9f32, 1.3f32, true), (128, 3, 3.0, 1.0, false), (64, 4, 0.0, 1.0, false)] {
+            let (x, sc) = (xs(w * rows + 4)[4..].to_vec(), xs(w * rows + 30)[30..].to_vec());
+            let mut want: Vec<f32> = if scaled { x.iter().zip(&sc).map(|(x, s)| x * s).collect() } else { x.clone() };
+            for row in want.chunks_mut(w) {
+                let ss = dot(row, row);
+                let f = if thr > 0.0 { (thr / (ss.sqrt() + 1e-6)).min(1.0) } else { 1.0 / (ss / w as f32 + 1e-5).sqrt() } * mul;
+                for v in row { *v *= f; }
+            }
+            let (dx, ds, dst) = (up(gpu, &x), up(gpu, &sc), gpu.zeros::<u16>(w * rows).unwrap());
+            gpu.ink_clip(dx.addr(), if scaled { ds.addr() } else { 0 }, w, rows, thr, 1e-5, mul, dst.addr()).unwrap();
+            let got = down::<f32>(gpu, &dx);
+            let e = rel_l2(&got, &want);
+            assert!(e < 1e-5, "{bk} ink_clip {w} {thr} {e}");
+            let halves: Vec<f32> = down::<u16>(gpu, &dst).iter().map(|&b| half::f16::from_bits(b).to_f32()).collect();
+            assert!(rel_l2(&halves, &want) < 1e-3, "{bk} ink_clip f16 {w}");
+        }
+
+        // Attention over a ring of 300 rows whose newest is row 37: 6 heads on 2 key heads, 4 bias channels over
+        // the nearest 100 rows.
+        let (rows, at, nh, nkv, hd, nr, ext) = (300, 37, 6, 2, 64, 4, 100);
+        let (q, r, sink, g) = (xs(nh * hd), xs(nh * nr + 1)[1..].to_vec(), xs(nh + 2)[2..].to_vec(), xs(nh * hd + 3)[3..].to_vec());
+        let (k, v, bias) = (xs(rows * nkv * hd + 5)[5..].to_vec(), xs(rows * nkv * hd + 6)[6..].to_vec(), xs(ext * nr + 7)[7..].to_vec());
+        let (dk, dv) = (up(gpu, &h16(&k)), up(gpu, &h16(&v)));
+        let (k, v) = (r16(&k), r16(&v));
+        let mut want = vec![0f32; nh * hd];
+        for h in 0..nh {
+            let kh = h / (nh / nkv);
+            let lg: Vec<f32> = (0..rows).map(|i| {
+                let dist = (at + rows - i) % rows;
+                let b = if dist < ext { dot(&r[h * nr..][..nr], &bias[dist * nr..][..nr]) } else { 0.0 };
+                dot(&q[h * hd..][..hd], &k[(i * nkv + kh) * hd..][..hd]) / (hd as f32).sqrt() + b - sink[h]
+            }).collect();
+            let mx = lg.iter().cloned().fold(0f32, f32::max);
+            let z: f32 = (-mx).exp() + lg.iter().map(|s| (s - mx).exp()).sum::<f32>();
+            for (i, s) in lg.iter().enumerate() {
+                for c in 0..hd { want[h * hd + c] += (s - mx).exp() / z * v[(i * nkv + kh) * hd + c]; }
+            }
+            for c in 0..hd { want[h * hd + c] /= 1.0 + (-g[h * hd + c]).exp(); }
+        }
+        let (dq, dr, ds, dg, db) = (up(gpu, &q), up(gpu, &r), up(gpu, &sink), up(gpu, &g), up(gpu, &bias));
+        let (sc, out) = (gpu.zeros::<f32>(nh * rows.div_ceil(64) * (hd + 2)).unwrap(), gpu.zeros::<f32>(nh * hd).unwrap());
+        gpu.ink_attn(dq.addr(), dr.addr(), ds.addr(), dg.addr(), dk.addr(), dv.addr(), db.addr(), sc.addr(), out.addr(), rows, at, nh, nkv, hd, nr, ext).unwrap();
+        let e = rel_l2(&down::<f32>(gpu, &out), &want);
+        assert!(e < 1e-5, "{bk} ink_attn {e}");
+
+        // The weighted sum of the expert outputs on top of the CPU's part.
+        let (ne, n) = (5, 300);
+        let (d, wts, cpu) = (xs(ne * n), xs(ne + 3)[3..].to_vec(), xs(n + 8)[8..].to_vec());
+        let want: Vec<f32> = (0..n).map(|c| cpu[c] + (0..ne).map(|e| wts[e] * d[e * n + c]).sum::<f32>()).collect();
+        let (dd, dw, dc, acc) = (up(gpu, &d), up(gpu, &wts), up(gpu, &cpu), gpu.zeros::<f32>(n).unwrap());
+        gpu.ink_ffn_sum(acc.addr(), dd.addr(), dw.addr(), ne, n, dc.addr()).unwrap();
+        let e = rel_l2(&down::<f32>(gpu, &acc), &want);
+        assert!(e < 1e-6, "{bk} ink_ffn_sum {e}");
+    }
+}
+
+#[test]
+fn ink_pos_kernels_match_fixed_pos() {
+    let xs = |n: usize| (0..n).map(|i| ((i as f32 * 0.37).sin() + (i as f32 * 0.13).cos()) * 0.4).collect::<Vec<_>>();
+    let h16 = |v: &[f32]| v.iter().map(|&x| half::f16::from_f32(x).to_bits()).collect::<Vec<_>>();
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        let (ring, nh, nkv, hd, nr, ext) = (100usize, 6usize, 2usize, 64usize, 4usize, 32usize);
+        let q = xs(nh * hd);
+        let k_init = xs(nkv * hd);
+        let (r, sink, g) = (xs(nh * nr + 1)[1..].to_vec(), xs(nh + 2)[2..].to_vec(), xs(nh * hd + 3)[3..].to_vec());
+        let (k, v, bias) = (xs(ring * nkv * hd + 5)[5..].to_vec(), xs(ring * nkv * hd + 6)[6..].to_vec(), xs(ext * nr + 7)[7..].to_vec());
+        let k_scale = xs(nkv * hd + 9)[9..].to_vec();
+
+        let (dq, dk_in_ref, dk_in_pos, dks) = (up(gpu, &q), up(gpu, &k_init), up(gpu, &k_init), up(gpu, &k_scale));
+        let (dr, ds, dg, db) = (up(gpu, &r), up(gpu, &sink), up(gpu, &g), up(gpu, &bias));
+        let (dk_ref, dv_ref) = (up(gpu, &h16(&k)), up(gpu, &h16(&v)));
+        let (dk_pos, dv_pos) = (up(gpu, &h16(&k)), up(gpu, &h16(&v)));
+        let dpos = gpu.zeros::<i32>(1).unwrap();
+        let sc = gpu.zeros::<f32>(nh * 2 * (hd + 2)).unwrap();
+        let (out_ref, out_pos) = (gpu.zeros::<f32>(nh * hd).unwrap(), gpu.zeros::<f32>(nh * hd).unwrap());
+
+        for pos in [0usize, 65usize, 137usize] {
+            let rows = (pos + 1).min(ring);
+            let at = pos % ring;
+            let max_rows = ((pos / 64 + 1) * 64).min(ring);
+
+            gpu.put(&k_init, &dk_in_ref, 0).unwrap();
+            gpu.put(&k_init, &dk_in_pos, 0).unwrap();
+            gpu.put(&[pos as i32], &dpos, 0).unwrap();
+
+            gpu.ink_clip_n(dk_in_ref.addr(), dks.addr(), hd, nkv, 1, 0.0, 1e-5, 1.0, dk_ref.addr(), at, ring, pos, 0.25, 4.0).unwrap();
+            gpu.ink_clip_pos(dk_in_pos.addr(), dks.addr(), hd, nkv, 1, 0.0, 1e-5, 1.0, dk_pos.addr(), ring, dpos.addr(), 0.25, 4.0).unwrap();
+            assert!(rel_l2(&down::<f32>(gpu, &dk_in_pos), &down::<f32>(gpu, &dk_in_ref)) < 1e-6, "{bk} ink_clip_pos k pos={pos}");
+            assert_eq!(down::<u16>(gpu, &dk_pos), down::<u16>(gpu, &dk_ref), "{bk} ink_clip_pos dst pos={pos}");
+
+            gpu.ink_attn(dq.addr(), dr.addr(), ds.addr(), dg.addr(), dk_ref.addr(), dv_ref.addr(), db.addr(), sc.addr(), out_ref.addr(), rows, at, nh, nkv, hd, nr, ext).unwrap();
+            gpu.ink_attn_pos(dq.addr(), dr.addr(), ds.addr(), dg.addr(), dk_pos.addr(), dv_pos.addr(), db.addr(), sc.addr(), out_pos.addr(), max_rows, ring, dpos.addr(), nh, nkv, hd, nr, ext).unwrap();
+            let e = rel_l2(&down::<f32>(gpu, &out_pos), &down::<f32>(gpu, &out_ref));
+            assert!(e < 1e-6, "{bk} ink_attn_pos pos={pos} err={e}");
+        }
+    }
+}
+
+/// Non-unit per-tensor `scale` (NVFP4 `<stem>.scale` / ModelOpt `weight_scale_2`) multiplies dequant, gemv, gemvn,
+/// gemvq2, gemv_rows, and prefill gemm_dense across act = 0, 1 (SwiGLU), and 2 (accumulate).
+#[test]
+fn tensor_scale_applies_to_all_gpu_ops() {
+    let (rows, cols, nt, m) = (64usize, 256usize, 3usize, 130usize);
+    for (bk, gpu) in common::backends() {
+        let g = &*gpu;
+        for (ty, scale_a, scale_b) in [(GgmlType::NVFP4, 0.375f32, -1.25f32), (GgmlType::F8E4M3, -0.625f32, 1.75f32)] {
+            let da = random_tensor(ty, rows, cols, 100 + ty as u32);
+            let db = random_tensor(ty, rows, cols, 200 + ty as u32);
+            let ta = Tensor { ty, rows, cols, data: &da, scale: scale_a };
+            let tb = Tensor { ty, rows, cols, data: &db, scale: scale_b };
+            let ga = g.upload(&ta).unwrap();
+            let gb = g.upload(&tb).unwrap();
+            assert_eq!(ga.scale, scale_a, "{bk} {} upload scale", ty.name());
+
+            // 1. dequant
+            let dq = g.zeros::<f32>(rows * cols).unwrap();
+            g.dequant(&ga, rows, dq.addr()).unwrap();
+            let got = down::<f32>(g, &dq);
+            let mut want = vec![0f32; rows * cols];
+            for (r, out) in want.chunks_exact_mut(cols).enumerate() { ta.row(r, out); }
+            let diff = got.iter().zip(&want).fold(0f32, |mx, (a, b)| mx.max((a - b).abs()));
+            assert!(diff <= 1e-5, "{bk} {} dequant scaled max diff {diff}", ty.name());
+
+            // 2. gemv & gemvn
+            let x = xs(nt * cols + 7)[7..].to_vec();
+            let dx = up(g, &x);
+            let dy = g.zeros::<f32>(rows).unwrap();
+            g.gemv(&ga, dx.addr(), dy.addr()).unwrap();
+            let mut wy0 = vec![0f32; rows];
+            ta.matvec(&as_seen(ty, &x[..cols]), &mut wy0);
+            assert!(rel_l2(&down::<f32>(g, &dy), &wy0) <= 1e-4, "{bk} {} gemv scaled", ty.name());
+
+            let dyn_ = g.zeros::<f32>(nt * rows).unwrap();
+            g.gemvn(&ga, dx.addr(), cols, dyn_.addr(), rows, nt).unwrap();
+            let got_n = down::<f32>(g, &dyn_);
+            for t_idx in 0..nt {
+                let mut wt = vec![0f32; rows];
+                ta.matvec(&as_seen(ty, &x[t_idx * cols..(t_idx + 1) * cols]), &mut wt);
+                assert!(rel_l2(&got_n[t_idx * rows..(t_idx + 1) * rows], &wt) <= 1e-4, "{bk} {} gemvn scaled t={t_idx}", ty.name());
+            }
+
+            // 3. gemvq2 (paired matrices with distinct scales)
+            let dya = g.zeros::<f32>(nt * rows).unwrap();
+            let dyb = g.zeros::<f32>(nt * rows).unwrap();
+            g.gemvq2(&ga, &gb, dx.addr(), cols, 0, dya.addr(), dyb.addr(), nt).unwrap();
+            let (gota, gotb) = (down::<f32>(g, &dya), down::<f32>(g, &dyb));
+            for t_idx in 0..nt {
+                let (mut wa, mut wb) = (vec![0f32; rows], vec![0f32; rows]);
+                ta.matvec(&as_seen(ty, &x[t_idx * cols..(t_idx + 1) * cols]), &mut wa);
+                tb.matvec(&as_seen(ty, &x[t_idx * cols..(t_idx + 1) * cols]), &mut wb);
+                assert!(rel_l2(&gota[t_idx * rows..(t_idx + 1) * rows], &wa) <= 1e-4, "{bk} {} gemvq2 a scaled", ty.name());
+                assert!(rel_l2(&gotb[t_idx * rows..(t_idx + 1) * rows], &wb) <= 1e-4, "{bk} {} gemvq2 b scaled", ty.name());
+            }
+
+            // 4. gemv_rows (non-float quantized path)
+            if g.supports_gemv_rows() && !ty.float_x() {
+                let ids = [3i32, 0, 17, 63];
+                let (di, dr) = (up(g, &ids), g.zeros::<f32>(ids.len()).unwrap());
+                g.gemv_rows(&ga, dx.addr(), di.addr(), ids.len(), dr.addr()).unwrap();
+                let want_r: Vec<f32> = ids.iter().map(|&r| wy0[r as usize]).collect();
+                assert!(rel_l2(&down::<f32>(g, &dr), &want_r) <= 1e-4, "{bk} {} gemv_rows scaled", ty.name());
+            }
+
+            // 5. gemm_dense for act = 0, act = 1 (SwiGLU: silu(y) * (W x * scale)), act = 2 (y += W x * scale)
+            let xm = xs(m * cols + 11)[11..].to_vec();
+            let dxm = up(g, &xm);
+            let mut base_y = vec![0f32; m * rows];
+            let mut wr = vec![0f32; cols];
+            for r in 0..rows {
+                ta.row(r, &mut wr);
+                for (i, xv) in xm.chunks(cols).enumerate() {
+                    base_y[i * rows + r] = if g.mmq(ty) && cols % 128 == 0 {
+                        wr.iter().zip(as_seen(ty, xv)).map(|(a, b)| a * b).sum()
+                    } else {
+                        wr.iter().zip(xv).map(|(a, b)| f16_in(bk, *a) * f16_in(bk, *b)).sum()
+                    };
+                }
+            }
+            for act in [0i32, 1, 2] {
+                let init: Vec<f32> = xs(m * rows + 3)[3..].to_vec();
+                let dym = up(g, &init);
+                g.gemm_dense(&ga, m, dxm.addr(), cols, dym.addr(), rows, act).unwrap();
+                let got_m = down::<f32>(g, &dym);
+                let want_m: Vec<f32> = base_y.iter().zip(&init).map(|(&v, &y0)| match act {
+                    0 => v,
+                    1 => (y0 / (1.0 + (-y0).exp())) * v,
+                    _ => y0 + v,
+                }).collect();
+                assert!(rel_l2(&got_m, &want_m) <= 5e-4, "{bk} {} gemm_dense act={act} scaled", ty.name());
+            }
+        }
+    }
+}
+
+#[test]
+fn situ_q_and_softcap_match_reference() {
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        // Include n = 1152 (n % 256 != 0) as well as 256-aligned widths, both lb == 0 and lb > 0, and both null & per-row scale.
+        for (n, rows, beta, lb, scaled) in [
+            (1152usize, 8usize, 6.0f32, 0.0f32, false),
+            (1024, 5, 4.0, 12.0, false),
+            (1152, 4, 4.0, 12.0, true),
+        ] {
+            let y = xs(rows * 2 * n);
+            let qbytes = rows * n + rows * (n / 32) * 4;
+            let (dy1, dy2) = (up(gpu, &y), up(gpu, &y));
+            let sc_buf = scaled.then(|| up(gpu, &(0..rows).map(|r| 0.35 + 0.4 * r as f32).collect::<Vec<_>>()));
+            let sc_addr = sc_buf.as_ref().map_or(0, |b| b.addr());
+            let (dq1, dq2) = (gpu.zeros::<u8>(qbytes).unwrap(), gpu.zeros::<u8>(qbytes).unwrap());
+            gpu.situ(dy1.addr(), n, rows, sc_addr, beta, lb).unwrap();
+            gpu.quant_xq(dy1.addr(), 2 * n, n, rows, dq1.addr()).unwrap();
+            gpu.situ_q(dy2.addr(), n, rows, sc_addr, beta, lb, dq2.addr()).unwrap();
+            assert_eq!(down::<u8>(gpu, &dq1), down::<u8>(gpu, &dq2), "{bk} situ_q mismatch n={n} rows={rows} lb={lb} scaled={scaled}");
+        }
+        let logits: Vec<f32> = xs(4097).into_iter().map(|v| v * 500.0).collect();
+        let cap = 30.0f32;
+        let want: Vec<f32> = logits.iter().map(|&v| cap * (v / cap).tanh()).collect();
+        let dl = up(gpu, &logits);
+        gpu.softcap(dl.addr(), logits.len(), cap).unwrap();
+        let e = rel_l2(&down::<f32>(gpu, &dl), &want);
+        assert!(e < 1e-6, "{bk} softcap rel_l2 {e}");
+
+        // Inkling 2 router (positive + negative biases, exact ties, multi-row) & ink_ffn_sum with cpu = 0.
+        let (ne_r, k_r, rows_r, exp_scale) = (128usize, 8usize, 3usize, 2.5f32);
+        let mut rlogits = xs(rows_r * ne_r);
+        let mut bias: Vec<f32> = xs(ne_r + 17)[17..].iter().map(|&v| v * 3.0).collect();
+        // Force an exact score tie between expert 5 and expert 42 on row 1 (lowest index 5 must win).
+        rlogits[ne_r + 5] = 0.25;
+        rlogits[ne_r + 42] = 0.25;
+        bias[5] = -0.35;
+        bias[42] = -0.35;
+        let (dl_r, db_r) = (up(gpu, &rlogits), up(gpu, &bias));
+        let gu_sc: Vec<f32> = (0..ne_r).map(|i| 0.5 + (i % 7) as f32 * 0.25).collect();
+        let dn_sc: Vec<f32> = (0..ne_r).map(|i| 0.75 + (i % 5) as f32 * 0.3).collect();
+        let (d_gu_sc, d_dn_sc) = (up(gpu, &gu_sc), up(gpu, &dn_sc));
+        let (d_ids, d_wts, d_gsc) = (
+            gpu.zeros::<i32>(rows_r * k_r).unwrap(),
+            gpu.zeros::<f32>(rows_r * k_r).unwrap(),
+            gpu.zeros::<f32>(rows_r * k_r).unwrap(),
+        );
+        for with_scales in [false, true] {
+            gpu.ink_route(
+                dl_r.addr(), db_r.addr(), d_ids.addr(), d_wts.addr(),
+                if with_scales { d_gu_sc.addr() } else { 0 },
+                if with_scales { d_dn_sc.addr() } else { 0 },
+                if with_scales { d_gsc.addr() } else { 0 },
+                ne_r, k_r, exp_scale, rows_r,
+            ).unwrap();
+            let got_ids = down::<i32>(gpu, &d_ids);
+            let got_wts = down::<f32>(gpu, &d_wts);
+            let got_gsc = down::<f32>(gpu, &d_gsc);
+            for r in 0..rows_r {
+                let probs: Vec<f32> = rlogits[r * ne_r..][..ne_r].iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect();
+                let mut sel: Vec<usize> = (0..ne_r).collect();
+                sel.sort_by(|&a, &b| (probs[b] + bias[b]).partial_cmp(&(probs[a] + bias[a])).unwrap().then(a.cmp(&b)));
+                sel.truncate(k_r);
+                let sum = sel.iter().map(|&e| probs[e]).sum::<f32>() + 1e-20;
+                let want_ids: Vec<i32> = sel.iter().map(|&e| e as i32).collect();
+                let want_wts: Vec<f32> = sel.iter().map(|&e| probs[e] / sum * exp_scale * if with_scales { dn_sc[e] } else { 1.0 }).collect();
+                assert_eq!(&got_ids[r * k_r..][..k_r], &want_ids[..], "{bk} ink_route ids row {r} scaled={with_scales}");
+                assert!(rel_l2(&got_wts[r * k_r..][..k_r], &want_wts) < 1e-5, "{bk} ink_route wts row {r} scaled={with_scales}");
+                if with_scales {
+                    let want_gsc: Vec<f32> = sel.iter().map(|&e| gu_sc[e]).collect();
+                    assert_eq!(&got_gsc[r * k_r..][..k_r], &want_gsc[..], "{bk} ink_route gsc row {r}");
+                }
+            }
+        }
+
+        // ink_ffn_sum with cpu = 0 (100%-GPU MoE path).
+        let (ne_s, n_s) = (8usize, 256usize);
+        let (d_s, w_s) = (xs(ne_s * n_s), xs(ne_s + 5)[5..].to_vec());
+        let want_s: Vec<f32> = (0..n_s).map(|c| (0..ne_s).map(|e| w_s[e] * d_s[e * n_s + c]).sum::<f32>()).collect();
+        let (dd_s, dw_s, acc_s) = (up(gpu, &d_s), up(gpu, &w_s), gpu.zeros::<f32>(n_s).unwrap());
+        gpu.ink_ffn_sum(acc_s.addr(), dd_s.addr(), dw_s.addr(), ne_s, n_s, 0).unwrap();
+        assert!(rel_l2(&down::<f32>(gpu, &acc_s), &want_s) < 1e-6, "{bk} ink_ffn_sum null cpu");
+    }
+}
+
+/// Every batched prefill Inkling 2 kernel (`ink_mix_n`, `ink_ctrl_n`, `ink_conv_batch` for nt = 1..10,
+/// `ink_clip_n` with log-scale + ring KV write, `ink_ffn_sum_n`, `ink_attn_prefill` full + SWA) matches
+/// token-by-token decode kernels.
+#[test]
+fn ink_prefill_and_batch_match_decode() {
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+
+        // 1. ink_mix_n ([nb][nt][n]) vs per-token ink_mix ([nb][n])
+        let (nb, nq, n, nt) = (3usize, 4usize, 128usize, 5usize);
+        let blocks = xs(nb * nt * n);
+        let cur = xs(nt * n + 11)[11..].to_vec();
+        let q = xs(nq * n + 3)[3..].to_vec();
+        let mut want_mix = vec![0.0f32; nq * nt * n];
+        for tok in 0..nt {
+            let mut b1 = Vec::with_capacity(nb * n);
+            for s in 0..nb { b1.extend_from_slice(&blocks[(s * nt + tok) * n..(s * nt + tok + 1) * n]); }
+            let (db1, dc1, dq, do1) = (up(gpu, &b1), up(gpu, &cur[tok * n..(tok + 1) * n]), up(gpu, &q), gpu.zeros::<f32>(nq * n).unwrap());
+            gpu.ink_mix(db1.addr(), nb, dc1.addr(), dq.addr(), nq, do1.addr(), n).unwrap();
+            let o1 = down::<f32>(gpu, &do1);
+            for qid in 0..nq {
+                want_mix[(qid * nt + tok) * n..(qid * nt + tok + 1) * n].copy_from_slice(&o1[qid * n..(qid + 1) * n]);
+            }
+        }
+        let (db, dc, dq, dout) = (up(gpu, &blocks), up(gpu, &cur), up(gpu, &q), gpu.zeros::<f32>(nq * nt * n).unwrap());
+        gpu.ink_mix_n(db.addr(), nb, dc.addr(), dq.addr(), nq, dout.addr(), n, nt).unwrap();
+        assert!(rel_l2(&down::<f32>(gpu, &dout), &want_mix) < 1e-6, "{bk} ink_mix_n");
+
+        // 2. ink_ctrl_n for both nins=1 and nins=count
+        let (rank, count) = (4usize, 3usize);
+        let down_w: Vec<u16> = xs(count * rank * 2 * n + 7)[7..].iter().map(|&v| half::f16::from_f32(v * 0.25).to_bits()).collect();
+        let gain_w: Vec<u16> = xs(count * rank * n + 13)[13..].iter().map(|&v| half::f16::from_f32(v * 0.25).to_bits()).collect();
+        let forget_w: Vec<u16> = xs(count * rank * n + 19)[19..].iter().map(|&v| half::f16::from_f32(v * 0.25).to_bits()).collect();
+        let msg = xs(count * nt * n + 23)[23..].to_vec();
+        for nins in [1usize, count] {
+            let cur_c = xs(nins * nt * n + 31)[31..].to_vec();
+            let mut want_ctrl = vec![0.0f32; count * nt * n];
+            let (dd, dg, df) = (up(gpu, &down_w), up(gpu, &gain_w), up(gpu, &forget_w));
+            let dgate1 = gpu.zeros::<f32>(count * rank).unwrap();
+            for tok in 0..nt {
+                let mut c1 = Vec::with_capacity(nins * n);
+                for j in 0..nins { c1.extend_from_slice(&cur_c[(j * nt + tok) * n..(j * nt + tok + 1) * n]); }
+                let mut m1 = Vec::with_capacity(count * n);
+                for j in 0..count { m1.extend_from_slice(&msg[(j * nt + tok) * n..(j * nt + tok + 1) * n]); }
+                let (dc1, dm1, do1) = (up(gpu, &c1), up(gpu, &m1), gpu.zeros::<f32>(count * n).unwrap());
+                gpu.ink_ctrl(dd.addr(), dg.addr(), df.addr(), dc1.addr(), nins, dm1.addr(), dgate1.addr(), do1.addr(), n, rank, count).unwrap();
+                let o1 = down::<f32>(gpu, &do1);
+                for j in 0..count {
+                    want_ctrl[(j * nt + tok) * n..(j * nt + tok + 1) * n].copy_from_slice(&o1[j * n..(j + 1) * n]);
+                }
+            }
+            let (dcc, dmm, dgg, doo) = (up(gpu, &cur_c), up(gpu, &msg), gpu.zeros::<f32>(nt * count * rank).unwrap(), gpu.zeros::<f32>(count * nt * n).unwrap());
+            gpu.ink_ctrl_n(dd.addr(), dg.addr(), df.addr(), dcc.addr(), nins, dmm.addr(), dgg.addr(), doo.addr(), n, rank, count, nt).unwrap();
+            assert!(rel_l2(&down::<f32>(gpu, &doo), &want_ctrl) < 1e-6, "{bk} ink_ctrl_n nins={nins}");
+        }
+
+        // 3. ink_conv_batch across nt = 1..=10 (checks short nt < nc - 1 and long nt >= nc - 1 + hist advance)
+        let (cn, nc, per) = (256usize, 4usize, 32usize);
+        let nheads = cn / per;
+        let cw = xs(cn * nc + 5)[5..].to_vec();
+        let init_hist = xs((nc - 1) * cn + 9)[9..].to_vec();
+        let (dcw, dhist_ref, dhist_bat) = (up(gpu, &cw), up(gpu, &init_hist), up(gpu, &init_hist));
+        for bat_nt in [1usize, 2, 3, 5, 10] {
+            let x_b = xs(bat_nt * cn + bat_nt * 7)[bat_nt * 7..].to_vec();
+            let taps_b = xs(bat_nt * nheads * nc + bat_nt * 13)[bat_nt * 13..].to_vec();
+            let mut want_conv = Vec::with_capacity(bat_nt * cn);
+            for tok in 0..bat_nt {
+                let dcur = up(gpu, &x_b[tok * cn..(tok + 1) * cn]);
+                let dtap = up(gpu, &taps_b[tok * nheads * nc..(tok + 1) * nheads * nc]);
+                let dout = gpu.zeros::<f32>(cn).unwrap();
+                gpu.ink_conv(dcur.addr(), dcw.addr(), dtap.addr(), dhist_ref.addr(), dout.addr(), cn, nc, per).unwrap();
+                want_conv.extend_from_slice(&down::<f32>(gpu, &dout));
+            }
+            let (dx_b, dtaps_b, dout_b) = (up(gpu, &x_b), up(gpu, &taps_b), gpu.zeros::<f32>(bat_nt * cn).unwrap());
+            gpu.ink_conv_batch(dx_b.addr(), dcw.addr(), dtaps_b.addr(), dhist_bat.addr(), dout_b.addr(), cn, nc, per, bat_nt).unwrap();
+            assert!(rel_l2(&down::<f32>(gpu, &dout_b), &want_conv) < 1e-6, "{bk} ink_conv_batch nt={bat_nt}");
+            assert!(rel_l2(&down::<f32>(gpu, &dhist_bat), &down::<f32>(gpu, &dhist_ref)) < 1e-6, "{bk} ink_conv_batch hist nt={bat_nt}");
+        }
+
+        // 4. ink_clip_n with log_alpha + ring KV write + ink_attn_prefill (full & SWA) vs CPU & decode ink_attn
+        let (nh, nkv, hd, nr, ext, kv_nt, pos0, win) = (4usize, 2usize, 64usize, 16usize, 8usize, 6usize, 3usize, 4usize);
+        let q_clip_in = xs(kv_nt * nh * hd + 17)[17..].to_vec();
+        let k_clip_in = xs(kv_nt * nkv * hd + 29)[29..].to_vec();
+        let q_scale = xs(nh * hd + 41)[41..].to_vec();
+        let (log_alpha, log_floor) = (0.35f32, 2.0f32);
+        let (thr, eps, mul) = (0.0f32, 1e-6f32, 0.7f32);
+
+        // Full ring >= pos0 + kv_nt
+        let full_ring = 16usize;
+        let dq_bat = up(gpu, &q_clip_in);
+        let dk_bat = up(gpu, &k_clip_in);
+        let dqs = up(gpu, &q_scale);
+        let dk_kv_bat = gpu.zeros::<u16>(full_ring * nkv * hd).unwrap();
+        let dq_ref = up(gpu, &q_clip_in);
+        let dk_ref = up(gpu, &k_clip_in);
+        let dk_kv_ref = gpu.zeros::<u16>(full_ring * nkv * hd).unwrap();
+        gpu.ink_clip_n(dq_bat.addr(), dqs.addr(), hd, nh, kv_nt, thr, eps, mul, 0, 0, 1, pos0, log_alpha, log_floor).unwrap();
+        gpu.ink_clip_n(dk_bat.addr(), 0, hd, nkv, kv_nt, 8.0, 0.0, 1.0, dk_kv_bat.addr(), pos0, full_ring, 0, 0.0, 1.0).unwrap();
+        for tok in 0..kv_nt {
+            let tm = 1.0 + log_alpha * (((pos0 + tok + 1) as f32) / log_floor).max(1.0).ln();
+            gpu.ink_clip(dq_ref.addr() + (tok * nh * hd * 4) as u64, dqs.addr(), hd, nh, thr, eps, mul * tm, 0).unwrap();
+            gpu.ink_clip(dk_ref.addr() + (tok * nkv * hd * 4) as u64, 0, hd, nkv, 8.0, 0.0, 1.0, dk_kv_ref.addr() + ((pos0 + tok) * nkv * hd * 2) as u64).unwrap();
+        }
+        assert!(rel_l2(&down::<f32>(gpu, &dq_bat), &down::<f32>(gpu, &dq_ref)) < 1e-6, "{bk} ink_clip_n q log");
+        assert!(rel_l2(&down::<f32>(gpu, &dk_bat), &down::<f32>(gpu, &dk_ref)) < 1e-6, "{bk} ink_clip_n k");
+        assert_eq!(down::<u16>(gpu, &dk_kv_bat), down::<u16>(gpu, &dk_kv_ref), "{bk} ink_clip_n kv");
+
+        // Compare ink_attn_prefill against token-by-token ink_attn (seed prefill positions 0..pos0 too).
+        let seed_q = xs(pos0 * nh * hd + 53)[53..].to_vec();
+        let seed_r = xs(pos0 * nh * nr + 59)[59..].to_vec();
+        let seed_k = xs(pos0 * nkv * hd + 61)[61..].to_vec();
+        let seed_v = xs(pos0 * nkv * hd + 67)[67..].to_vec();
+        let r_in = xs(kv_nt * nh * nr + 71)[71..].to_vec();
+        let sink_in = xs(kv_nt * nh + 73)[73..].to_vec();
+        let gate_in = xs(kv_nt * nh * hd + 79)[79..].to_vec();
+        let bias_in = xs(ext * nr + 83)[83..].to_vec();
+        let v_clip_in = xs(kv_nt * nkv * hd + 89)[89..].to_vec();
+
+        // Full attention test: seed [0..pos0] then prefill [pos0..pos0+kv_nt]
+        let kc_full = gpu.zeros::<u16>(full_ring * nkv * hd).unwrap();
+        let vc_full = gpu.zeros::<u16>(full_ring * nkv * hd).unwrap();
+        let dk_seed = up(gpu, &seed_k);
+        let dv_seed = up(gpu, &seed_v);
+        gpu.ink_clip_n(dk_seed.addr(), 0, hd, nkv, pos0, 8.0, 0.0, 1.0, kc_full.addr(), 0, full_ring, 0, 0.0, 1.0).unwrap();
+        gpu.ink_clip_n(dv_seed.addr(), 0, hd, nkv, pos0, 0.0, 1e-6, 1.0, vc_full.addr(), 0, full_ring, 0, 0.0, 1.0).unwrap();
+        gpu.ink_clip_n(up(gpu, &k_clip_in).addr(), 0, hd, nkv, kv_nt, 8.0, 0.0, 1.0, kc_full.addr(), pos0, full_ring, 0, 0.0, 1.0).unwrap();
+        gpu.ink_clip_n(up(gpu, &v_clip_in).addr(), 0, hd, nkv, kv_nt, 0.0, 1e-6, 1.0, vc_full.addr(), pos0, full_ring, 0, 0.0, 1.0).unwrap();
+
+        let (dr, dsink, dgate, dbias) = (up(gpu, &r_in), up(gpu, &sink_in), up(gpu, &gate_in), up(gpu, &bias_in));
+        let dout_pre = gpu.zeros::<f32>(kv_nt * nh * hd).unwrap();
+        gpu.ink_attn_prefill(
+            dq_bat.addr(), dr.addr(), dsink.addr(), dgate.addr(), kc_full.addr(), vc_full.addr(), 0, 0, dbias.addr(), dout_pre.addr(),
+            pos0, kv_nt, nh, nkv, hd, nr, ext, full_ring, 0,
+        ).unwrap();
+        let dsc = gpu.zeros::<f32>(nh * full_ring.div_ceil(64) * (hd + 2)).unwrap();
+        let mut want_pre = Vec::with_capacity(kv_nt * nh * hd);
+        for tok in 0..kv_nt {
+            let at = pos0 + tok;
+            let dout1 = gpu.zeros::<f32>(nh * hd).unwrap();
+            gpu.ink_attn(
+                dq_bat.addr() + (tok * nh * hd * 4) as u64,
+                dr.addr() + (tok * nh * nr * 4) as u64,
+                dsink.addr() + (tok * nh * 4) as u64,
+                dgate.addr() + (tok * nh * hd * 4) as u64,
+                kc_full.addr(), vc_full.addr(), dbias.addr(), dsc.addr(), dout1.addr(),
+                at + 1, at, nh, nkv, hd, nr, ext,
+            ).unwrap();
+            want_pre.extend_from_slice(&down::<f32>(gpu, &dout1));
+        }
+        assert!(rel_l2(&down::<f32>(gpu, &dout_pre), &want_pre) < 1e-6, "{bk} ink_attn_prefill full");
+
+        // SWA wrap test: ring = win, seed [0..pos0] in kc_swab/vc_swab, prefill [pos0..pos0+kv_nt] in kc_new/vc_new, then ring copy!
+        let _ = (seed_q, seed_r);
+        let kc_swa = gpu.zeros::<u16>(win * nkv * hd).unwrap();
+        let vc_swa = gpu.zeros::<u16>(win * nkv * hd).unwrap();
+        let kc_swab = gpu.zeros::<u16>(win * nkv * hd).unwrap();
+        let vc_swab = gpu.zeros::<u16>(win * nkv * hd).unwrap();
+        gpu.ink_clip_n(up(gpu, &seed_k).addr(), 0, hd, nkv, pos0, 8.0, 0.0, 1.0, kc_swab.addr(), 0, win, 0, 0.0, 1.0).unwrap();
+        gpu.ink_clip_n(up(gpu, &seed_v).addr(), 0, hd, nkv, pos0, 0.0, 1e-6, 1.0, vc_swab.addr(), 0, win, 0, 0.0, 1.0).unwrap();
+        let kc_new = gpu.zeros::<u16>(kv_nt * nkv * hd).unwrap();
+        let vc_new = gpu.zeros::<u16>(kv_nt * nkv * hd).unwrap();
+        gpu.ink_clip_n(up(gpu, &k_clip_in).addr(), 0, hd, nkv, kv_nt, 8.0, 0.0, 1.0, kc_new.addr(), 0, kv_nt, 0, 0.0, 1.0).unwrap();
+        gpu.ink_clip_n(up(gpu, &v_clip_in).addr(), 0, hd, nkv, kv_nt, 0.0, 1e-6, 1.0, vc_new.addr(), 0, kv_nt, 0, 0.0, 1.0).unwrap();
+        let dout_swa = gpu.zeros::<f32>(kv_nt * nh * hd).unwrap();
+        gpu.ink_attn_prefill(
+            dq_bat.addr(), dr.addr(), dsink.addr(), dgate.addr(), kc_swab.addr(), vc_swab.addr(), kc_new.addr(), vc_new.addr(), dbias.addr(), dout_swa.addr(),
+            pos0, kv_nt, nh, nkv, hd, nr, ext, win, win,
+        ).unwrap();
+        // Copy last keep = min(kv_nt, win) rows from kc_new/vc_new into kc_swab/vc_swab at (pos0 + kv_nt - keep) % win.
+        let keep = kv_nt.min(win);
+        let src0 = kv_nt - keep;
+        let dst0 = (pos0 + src0) % win;
+        let first = keep.min(win - dst0);
+        let rb = 2 * gpu.kv_words(nkv * hd);
+        gpu.dtod(&kc_new, src0 * rb, &kc_swab, dst0 * rb, first * rb).unwrap();
+        gpu.dtod(&vc_new, src0 * rb, &vc_swab, dst0 * rb, first * rb).unwrap();
+        if first < keep {
+            gpu.dtod(&kc_new, (src0 + first) * rb, &kc_swab, 0, (keep - first) * rb).unwrap();
+            gpu.dtod(&vc_new, (src0 + first) * rb, &vc_swab, 0, (keep - first) * rb).unwrap();
+        }
+        let mut want_swa = Vec::with_capacity(kv_nt * nh * hd);
+        let all_k = [seed_k, k_clip_in].concat();
+        let all_v = [seed_v, v_clip_in].concat();
+        for abs_p in 0..pos0 + kv_nt {
+            let dk1 = up(gpu, &all_k[abs_p * nkv * hd..(abs_p + 1) * nkv * hd]);
+            let dv1 = up(gpu, &all_v[abs_p * nkv * hd..(abs_p + 1) * nkv * hd]);
+            let at = abs_p % win;
+            gpu.ink_clip(dk1.addr(), 0, hd, nkv, 8.0, 0.0, 1.0, kc_swa.addr() + (at * nkv * hd * 2) as u64).unwrap();
+            gpu.ink_clip(dv1.addr(), 0, hd, nkv, 0.0, 1e-6, 1.0, vc_swa.addr() + (at * nkv * hd * 2) as u64).unwrap();
+            if abs_p >= pos0 {
+                let tok = abs_p - pos0;
+                let rows = (abs_p + 1).min(win);
+                let dout1 = gpu.zeros::<f32>(nh * hd).unwrap();
+                gpu.ink_attn(
+                    dq_bat.addr() + (tok * nh * hd * 4) as u64,
+                    dr.addr() + (tok * nh * nr * 4) as u64,
+                    dsink.addr() + (tok * nh * 4) as u64,
+                    dgate.addr() + (tok * nh * hd * 4) as u64,
+                    kc_swa.addr(), vc_swa.addr(), dbias.addr(), dsc.addr(), dout1.addr(),
+                    rows, at, nh, nkv, hd, nr, ext,
+                ).unwrap();
+                want_swa.extend_from_slice(&down::<f32>(gpu, &dout1));
+            }
+        }
+        assert!(rel_l2(&down::<f32>(gpu, &dout_swa), &want_swa) < 1e-6, "{bk} ink_attn_prefill swa");
+        assert_eq!(down::<u16>(gpu, &kc_swab), down::<u16>(gpu, &kc_swa), "{bk} swa ring copy k");
+        assert_eq!(down::<u16>(gpu, &vc_swab), down::<u16>(gpu, &vc_swa), "{bk} swa ring copy v");
+
+        // 5. ink_ffn_sum_n (with non-zero cpu and null cpu)
+        let (fne, fn_dim, fnt) = (8usize, 256usize, 4usize);
+        let fd = xs(fnt * fne * fn_dim + 97)[97..].to_vec();
+        let fw = xs(fnt * fne + 101)[101..].to_vec();
+        let fcpu = xs(fnt * fn_dim + 103)[103..].to_vec();
+        let mut want_sum = vec![0.0f32; fnt * fn_dim];
+        let mut want_sum_null = vec![0.0f32; fnt * fn_dim];
+        for tok in 0..fnt {
+            for c in 0..fn_dim {
+                let s: f32 = (0..fne).map(|e| fw[tok * fne + e] * fd[(tok * fne + e) * fn_dim + c]).sum();
+                want_sum[tok * fn_dim + c] = fcpu[tok * fn_dim + c] + s;
+                want_sum_null[tok * fn_dim + c] = s;
+            }
+        }
+        let (dfd, dfw, dfc) = (up(gpu, &fd), up(gpu, &fw), up(gpu, &fcpu));
+        let dacc1 = gpu.zeros::<f32>(fnt * fn_dim).unwrap();
+        let dacc0 = gpu.zeros::<f32>(fnt * fn_dim).unwrap();
+        gpu.ink_ffn_sum_n(dacc1.addr(), dfd.addr(), dfw.addr(), fne, fn_dim, fnt, dfc.addr()).unwrap();
+        gpu.ink_ffn_sum_n(dacc0.addr(), dfd.addr(), dfw.addr(), fne, fn_dim, fnt, 0).unwrap();
+        assert!(rel_l2(&down::<f32>(gpu, &dacc1), &want_sum) < 1e-6, "{bk} ink_ffn_sum_n cpu");
+        assert!(rel_l2(&down::<f32>(gpu, &dacc0), &want_sum_null) < 1e-6, "{bk} ink_ffn_sum_n null");
     }
 }

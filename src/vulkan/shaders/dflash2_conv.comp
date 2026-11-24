@@ -1,0 +1,23 @@
+#version 460
+layout(local_size_x = 256) in;
+#include "common.glsl"
+// Grouped dynamic causal convolution for DFlash2 (prepare/finish).
+// x: [T, H], dyn: [T, 2, K, G], base: [2, K, H], outp: [T, H].
+// part = 0 (prepare) or 1 (finish); G = H / gs.
+layout(push_constant) uniform P { F32 x; F32 dyn; F32 base; F32 outp; uint H; uint gs; uint K; uint T; uint part; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint t = gl_GlobalInvocationID.y;
+    if (i >= p.H || t >= p.T) return;
+    uint g = i / p.gs;
+    uint G = p.H / p.gs;
+    float acc = 0.0;
+    for (uint off = 0; off < p.K; off++) {
+        if (t >= off) {
+            float k_val = p.base.v[(p.part * p.K + off) * p.H + i]
+                        + p.dyn.v[((t * 2u + p.part) * p.K + off) * G + g];
+            acc = fma(k_val, p.x.v[(t - off) * p.H + i], acc);
+        }
+    }
+    p.outp.v[t * p.H + i] = acc;
+}

@@ -4,19 +4,34 @@
 #include "tables.glsl"
 layout(constant_id = 1) const uint T = 0;
 layout(constant_id = 2) const uint SBB = 1024;
-// With SHARED_TABLES defined, the IQ4 values and IQ3_S / IQ2_S grids come from shared memory, which the shader fills
-// with load_tables (all its invocations) first: the table buffer costs a load per lookup (CUDA QS<T>).
+// With SHARED_TABLES defined, the IQ3_S / IQ3_XXS / IQ2_S grids come from shared memory, which the shader fills
+// with load_tables (all its invocations) first; the IQ4_NL LUT lives directly in register constants.
+// Bytes of kvalues_iq4nl 0-7 and 8-15. A select and a shift: a constant array indexed per value ran IQ4_NL at a
+// third of the speed of Q4_0.
+int iq4_lut(uint nib) {
+    uint64_t t = nib < 8u ? 0xF6EADDCFBFAD9881ul : 0x7159453526190D01ul;
+    return int(uint(t >> (8u * (nib & 7u))) << 24) >> 24;
+}
+// kvalues_fp4 (E2M1 values times 2) in the same form, for NVFP4.
+int fp4_lut(uint nib) {
+    uint64_t t = nib < 8u ? 0x0C08060403020100ul : 0xF4F8FAFCFDFEFF00ul;
+    return int(uint(t >> (8u * (nib & 7u))) << 24) >> 24;
+}
+// An unsigned E4M3 scale halved (ue4m3 in kernels.cu); 0x7F is 0.
+float ue4m3(uint x) {
+    uint e = (x >> 3) & 15u, m = x & 7u;
+    return x == 0x7Fu ? 0.0 : e != 0u ? uintBitsToFloat((e + 119u) << 23 | m << 20) : float(m) * (1.0 / 1024.0);
+}
 #ifdef SHARED_TABLES
 // Sized by T (1 entry for the other types), so only the table in use takes shared memory.
-shared int s_kv[T == 20 || T == 23 ? 16 : 1];
 shared uint s_g3[T == 21 ? 512 : (T == 18 ? 256 : 1)];
 shared uint64_t s_g2[T == 22 ? 1024 : 1];
-#define KV_IQ4NL s_kv
+// IQ4_NL / IQ4_XS / NVFP4: the values of two codes (the low nibble of the index, then the high) as the two low bytes.
+shared uint s_iq4[T == 20 || T == 23 || T == 40 ? 256 : 1];
 #define IQ3S_GRID s_g3
 #define IQ3XXS_GRID s_g3
 #define IQ2S_GRID s_g2
 #else
-#define KV_IQ4NL kvalues_iq4nl
 #define IQ3S_GRID iq3s_grid
 #define IQ3XXS_GRID iq3xxs_grid
 #define IQ2S_GRID iq2s_grid
@@ -29,6 +44,13 @@ uint ld16(U8 w, uint o) { return uint(U16(uint64_t(w)).v[o >> 1]); }  // 2-align
 uint ld32(U8 w, uint o) { return ld16(w, o) | ld16(w, o + 2) << 16; }
 float h2f(uint h) { return float(uint16BitsToFloat16(uint16_t(h))); }
 float ldh(U8 w, uint o) { return h2f(ld16(w, o)); }
+float f8_e4m3_to_f32(uint x) {
+    uint ax = x & 0x7Fu;
+    if (ax == 0u || ax == 0x7Fu) return 0.0;
+    uint exp = ax >> 3u, man = ax & 7u;
+    float mag = (exp == 0u) ? float(man) * (1.0 / 512.0) : uintBitsToFloat(((exp + 120u) << 23u) | (man << 20u));
+    return (x & 0x80u) != 0u ? -mag : mag;
+}
 // Bytes of a row of `cols` values (a multiple of the type's block).
 uint rowb(uint cols) { return cols * SBB / 256; }
 int sb(uint x) { return int(x << 24) >> 24; }  // the low byte, signed
@@ -58,9 +80,9 @@ int sgn(uint g, uint sg, uint j) { int v = int((g >> (8 * (j & 3))) & 255); retu
 
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer U32x2 { uvec2 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer U32x4 { uvec4 v[]; };
-// Q4_K, Q5_K and IQ4_XS blocks (144, 176, 136 bytes) and every field ld8 reads in them are 8-aligned; Q2_K's (84) 4-aligned.
+// Q4_K, Q5_K and IQ4_XS blocks (144, 176, 136 bytes) and every field ld8 reads in them are 8-aligned; Q2_K's (84) and NVFP4's (36) 4-aligned.
 const bool A8 = T == 12 || T == 13 || T == 23;
-const bool A4 = T == 10 || T == 3 || T == 7;  // and Q4_1, Q5_1 (20, 24)
+const bool A4 = T == 10 || T == 3 || T == 7 || T == 40 || T == 43;  // and Q4_1, Q5_1, NVFP4, F8_E4M3 (20, 24, 36, 4n)
 // 8 bytes at 2-aligned w + o: one load for the A8 types, two word loads for A4, else the three words around them
 // shifted (ld8a2 in kernels.cu) without a branch: in Q8_0 the lanes of a subgroup differ in alignment.
 uvec2 ld8(U8 w, uint o) {
@@ -73,10 +95,11 @@ uvec2 ld8(U8 w, uint o) {
 #ifdef SHARED_TABLES
 void load_tables() {
     uint li = gl_LocalInvocationIndex, n = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
-    if (T == 20 || T == 23) { if (li < 16) s_kv[li] = kvalues_iq4nl[li]; barrier(); }
     if (T == 18) { for (uint i = li; i < 256; i += n) s_g3[i] = iq3xxs_grid[i]; barrier(); }
     if (T == 21) { for (uint i = li; i < 512; i += n) s_g3[i] = iq3s_grid[i]; barrier(); }
     if (T == 22) { for (uint i = li; i < 1024; i += n) s_g2[i] = iq2s_grid[i]; barrier(); }
+    if (T == 20 || T == 23) { for (uint i = li; i < 256; i += n) s_iq4[i] = uint(iq4_lut(i & 15) & 255) | uint(iq4_lut(i >> 4) & 255) << 8; barrier(); }
+    if (T == 40) { for (uint i = li; i < 256; i += n) s_iq4[i] = uint(fp4_lut(i & 15) & 255) | uint(fp4_lut(i >> 4) & 255) << 8; barrier(); }
 }
 #endif
 // Bytewise a - c (each byte of a below 128; CUDA __vsub4).
@@ -198,6 +221,21 @@ void iq_grid(U8 w, uint b, uint ib, uint l, out uint g0, out uint g1, out uint s
 // 32-bit add since no grid byte is 0 (no carries).
 uint apply_signs(uint g, uint s) { uint n = (s * 0x00204081u) & 0x01010101u; return (g ^ (n * 0xFFu)) + n; }
 
+// IQ4_XS (23) or IQ4_NL (20, 8 blocks of 18): scale and byte offset of the codes of values [8 sub, 8 sub + 8).
+void iq4_at(U8 w, uint b, uint sub, out uint o, out float d) {
+    uint ib = sub >> 2, r = (sub & 3) * 8;
+    if (T == 23) {
+        uvec2 hd = ld8(w, b);  // d, scales_h, scales_l
+        uint ls = ((hd.y >> (4 * ib)) & 15) | ((hd.x >> (16 + 2 * ib)) & 3) << 4;
+        d = h2f(hd.x & 0xFFFF) * float(int(ls) - 32);
+        o = b + 8 + 16 * ib + (r & 15);
+    } else {
+        uint p = b + 18 * ib;
+        d = ldh(w, p);
+        o = p + 2 + (r & 15);
+    }
+}
+
 // Values [8 sub, 8 sub + 8) of the quantized super-block at byte b as value i = d * q[i] - m with q[i] an int8
 // (QI<T> in kernels.cu).
 void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
@@ -238,20 +276,17 @@ void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
         uint e = sub * 8, j = e >> 7, l = (e >> 5) & 3, m = e & 31;
         d = ldh(w, b + 64);
         [[unroll]] for (uint i = 0; i < 8; i++) q[i] = int((u8_(w, b + 32 * j + m + i) >> (2 * l)) & 3) - 1;
+    } else if (T == 40) {  // NVFP4, 4 blocks of 36: 4 UE4M3 scales, then 32 code bytes; byte 8 s + j holds values 16 s + j, 16 s + 8 + j
+        uint p = b + 36 * (sub >> 3), s = (sub & 7) >> 1, sh = 4 * (sub & 1);
+        d = ue4m3(u8_(w, p + s));
+        U32 u = U32(uint64_t(w) + p + 4 + 8 * s);
+        uvec2 v = uvec2(u.v[0], u.v[1]);
+        [[unroll]] for (uint i = 0; i < 8; i++) q[i] = fp4_lut(((i < 4 ? v.x : v.y) >> (8 * (i & 3) + sh)) & 15);
     } else {  // IQ4_XS (23), IQ4_NL (20, 8 blocks of 18)
         uint r = l * 8, o;
-        if (T == 23) {
-            uvec2 hd = ld8(w, b);  // d, scales_h, scales_l
-            uint ls = ((hd.y >> (4 * ib)) & 15) | ((hd.x >> (16 + 2 * ib)) & 3) << 4;
-            d = h2f(hd.x & 0xFFFF) * float(int(ls) - 32);
-            o = b + 8 + 16 * ib + (r & 15);
-        } else {
-            uint p = b + 18 * ib;
-            d = ldh(w, p);
-            o = p + 2 + (r & 15);
-        }
+        iq4_at(w, b, sub, o, d);
         uvec2 v = ld8(w, o);
-        [[unroll]] for (uint i = 0; i < 8; i++) q[i] = KV_IQ4NL[((i < 4 ? v.x : v.y) >> (8 * (i & 3) + (r < 16 ? 0 : 4))) & 15];
+        [[unroll]] for (uint i = 0; i < 8; i++) q[i] = iq4_lut(((i < 4 ? v.x : v.y) >> (8 * (i & 3) + (r < 16 ? 0 : 4))) & 15);
     }
 }
 
@@ -272,6 +307,28 @@ void qw(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out float
         lo = vsub4(q, 0x01010101u); hi = vsub4(c, 0x01010101u);
         return;
     }
+#ifdef SHARED_TABLES
+    if (T == 20 || T == 23) {  // two codes a table lookup
+        uint o;
+        m = 0.0;
+        iq4_at(w, b, sub, o, d);
+        uvec2 v = ld8(w, o);
+        uint sh = (sub & 3) < 2 ? 0 : 4, a = (v.x >> sh) & 0x0F0F0F0Fu, c = (v.y >> sh) & 0x0F0F0F0Fu;
+        lo = s_iq4[(a & 15u) | ((a >> 4) & 0xF0u)] | s_iq4[((a >> 16) & 15u) | ((a >> 20) & 0xF0u)] << 16;
+        hi = s_iq4[(c & 15u) | ((c >> 4) & 0xF0u)] | s_iq4[((c >> 16) & 15u) | ((c >> 20) & 0xF0u)] << 16;
+        return;
+    }
+    if (T == 40) {  // NVFP4: two codes a table lookup
+        uint p = b + 36u * (sub >> 3u), s = (sub >> 1u) & 3u, sh = (sub & 1u) * 4u;
+        m = 0.0;
+        d = ue4m3(u8_(w, p + s));
+        uvec2 v = ld8(w, p + 4u + 8u * s);
+        uint a = (v.x >> sh) & 0x0F0F0F0Fu, c = (v.y >> sh) & 0x0F0F0F0Fu;
+        lo = s_iq4[(a & 15u) | ((a >> 4u) & 0xF0u)] | s_iq4[((a >> 16u) & 15u) | ((a >> 20u) & 0xF0u)] << 16u;
+        hi = s_iq4[(c & 15u) | ((c >> 4u) & 0xF0u)] | s_iq4[((c >> 16u) & 15u) | ((c >> 20u) & 0xF0u)] << 16u;
+        return;
+    }
+#endif
     int q[8];
     qi8(w, b, sub, q, d, m);
     lo = pack4(q[0], q[1], q[2], q[3]); hi = pack4(q[4], q[5], q[6], q[7]);
@@ -281,8 +338,46 @@ void qw(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out float
 uint shfl32(uint v, uint src) { return subgroupShuffle(v, W64 ? ((gl_SubgroupInvocationID & ~31u) | src) : src); }
 
 // Warp-cooperative super-block dequantization for GEMV (all 32 lanes of the logical warp pass the same w and b, with sub = LANE).
-void qw_sb(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out float m) {
-    if (T == 11) {  // Q3_K (110 bytes = 28 uint32 words from 4-aligned base): 1 coalesced U32 load per lane + register shuffles
+// `full` is true for whole 256-element super-blocks; partial tail super-blocks keep the scalar per-lane path.
+void qw_sb(U8 w, uint b, uint sub, bool full, out uint lo, out uint hi, out float d, out float m) {
+    if (full && T == 19) {  // IQ1_S (50 bytes = 13 uint32 words from 4-aligned base)
+        m = 0.0;
+        uint64_t addr = uint64_t(w) + b, base4 = addr & ~3ul;
+        uint align_sh = uint(addr & 2ul) * 8u;
+        uint raw = sub < 13u ? U32(base4).v[sub] : 0u;
+        uint next_raw = shfl32(raw, min(sub + 1u, 12u));
+        float d0 = h2f((shfl32(raw, 0u) >> align_sh) & 0xFFFFu);
+        uint w32 = align_sh == 0u ? ((raw >> 16u) | (next_raw << 16u)) : next_raw;
+        uint ib = sub >> 2u, l = sub & 3u;
+        uint q8 = (shfl32(w32, sub >> 2u) >> (8u * l)) & 255u;
+        uint qh = (shfl32(w32, 8u + (ib >> 1u)) >> (16u * (ib & 1u))) & 0xFFFFu;
+        d = d0 * float(2u * ((qh >> 12u) & 7u) + 1u) * 0.125;
+        uint idx = q8 | (((qh >> (3u * l)) & 7u) << 8u);
+        uint64_t g = iq1s_grid[idx];
+        int delt = (qh & 0x8000u) != 0u ? -1 : 1;
+        lo = pack4(8 * sb(uint(g)) + delt, 8 * sb(uint(g >> 8u)) + delt, 8 * sb(uint(g >> 16u)) + delt, 8 * sb(uint(g >> 24u)) + delt);
+        hi = pack4(8 * sb(uint(g >> 32u)) + delt, 8 * sb(uint(g >> 40u)) + delt, 8 * sb(uint(g >> 48u)) + delt, 8 * sb(uint(g >> 56u)) + delt);
+        return;
+    }
+    if (full && T == 16) {  // IQ2_XXS (66 bytes = 17 uint32 words from 4-aligned base)
+        m = 0.0;
+        uint64_t addr = uint64_t(w) + b, base4 = addr & ~3ul;
+        uint align_sh = uint(addr & 2ul) * 8u;
+        uint raw = sub < 17u ? U32(base4).v[sub] : 0u;
+        uint next_raw = shfl32(raw, min(sub + 1u, 16u));
+        float d0 = h2f((shfl32(raw, 0u) >> align_sh) & 0xFFFFu);
+        uint w32 = align_sh == 0u ? ((raw >> 16u) | (next_raw << 16u)) : next_raw;
+        uint ib = sub >> 2u, l = sub & 3u;
+        uint qs_b = (shfl32(w32, 2u * ib) >> (8u * l)) & 255u;
+        uint aux = shfl32(w32, 2u * ib + 1u);
+        uint64_t g = iq2xxs_grid[qs_b];
+        uint sg = ksign((aux >> (7u * l)) & 127u);
+        d = d0 * (0.5 + float(aux >> 28u)) * 0.25;
+        lo = apply_signs(uint(g), sg & 15u);
+        hi = apply_signs(uint(g >> 32u), sg >> 4u);
+        return;
+    }
+    if (full && T == 11) {  // Q3_K (110 bytes = 28 uint32 words from 4-aligned base): 1 coalesced U32 load per lane + register shuffles
         m = 0.0;
         uint64_t addr = uint64_t(w) + b, base4 = addr & ~3ul;
         uint align_sh = uint(addr & 2ul) * 8u;
@@ -301,7 +396,7 @@ void qw_sb(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out fl
         hi = vsub4(((v.y >> (2u * j)) & 0x03030303u) | ((h.y >> hb) & 0x01010101u) << 2, 0x04040404u);
         return;
     }
-    if (T == 14) {  // Q6_K (210 bytes = 53 uint32 words from 4-aligned base): 2 coalesced U32 loads per lane + register shuffles
+    if (full && T == 14) {  // Q6_K (210 bytes = 53 uint32 words from 4-aligned base): 2 coalesced U32 loads per lane + register shuffles
         m = 0.0;
         uint64_t addr = uint64_t(w) + b, base4 = addr & ~3ul;
         uint align_sh = uint(addr & 2ul) * 8u;
@@ -322,7 +417,7 @@ void qw_sb(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out fl
         hi = vsub4(((l.y >> ns) & 0x0F0F0F0Fu) | ((h.y >> hs) & 0x03030303u) << 4, 0x20202020u);
         return;
     }
-    if (T == 18) {  // IQ3_XXS (98 bytes = 25 uint32 words from 4-aligned base): 1 coalesced U32 load per lane + LDS grid
+    if (full && T == 18) {  // IQ3_XXS (98 bytes = 25 uint32 words from 4-aligned base): 1 coalesced U32 load per lane + LDS grid
         m = 0.0;
         uint64_t addr = uint64_t(w) + b, base4 = addr & ~3ul;
         uint align_sh = uint(addr & 2ul) * 8u;
@@ -342,13 +437,37 @@ void qw_sb(U8 w, uint b, uint sub, out uint lo, out uint hi, out float d, out fl
     qw(w, b, sub, lo, hi, d, m);
 }
 
+// Codebook points of trellis step t of the 4 K code bytes at o (quant::tq_points; K 8 for TQ2_T, 6 TQK6, 7 TQK7).
+void tq_points(U8 w, uint o, uint K, uint t, out uint pa, out uint pb) {
+    uint s;
+    if (K == 8) s = u8_(w, o + ((t + 31) & 31)) << 8 | u8_(w, o + t);
+    else {
+        uint off = (31 - t) * K, n = 4 * K, i = off >> 3;
+        s = (u8_(w, o + i) | u8_(w, o + (i + 1) % n) << 8 | u8_(w, o + (i + 2) % n) << 16) >> (off & 7);
+    }
+    uint x = (s & 0x7FFFu) * 0x9E3779B1u;
+    pa = x >> 21; pb = (x >> 10) & 2047u;
+}
+
 // Values [8 sub, 8 sub + 8) of the super-block at byte b (deq8<T> in kernels.cu; d * q - m is the same float).
 void deq8(U8 w, uint b, uint sub, out float o[8]) {
-    if (T == 0) {  // F32
+    if (T >= 144 && T <= 146) {  // TQ2_T, TQK6, TQK7: two blocks of f16 d and 32 steps of 4 values; floats only
+        uint K = T == 144 ? 8 : (T == 145 ? 6 : 7), bb = b + (sub >> 4) * (2 + 4 * K), t = (sub & 15) * 2;
+        float d = ldh(w, bb);
+        [[unroll]] for (uint i = 0; i < 2; i++) {
+            uint pa, pb;
+            tq_points(w, bb + 2, K, t + i, pa, pb);
+            o[4 * i] = tq_lut[2 * pa] * d; o[4 * i + 1] = tq_lut[2 * pa + 1] * d;
+            o[4 * i + 2] = tq_lut[2 * pb] * d; o[4 * i + 3] = tq_lut[2 * pb + 1] * d;
+        }
+    } else if (T == 0) {  // F32
         [[unroll]] for (uint i = 0; i < 8; i++) o[i] = F32(uint64_t(w)).v[b / 4 + 8 * sub + i];
     } else if (T == 30) {  // BF16
         uvec4 q = U32x4(uint64_t(w) + b + 16 * sub).v[0];  // rows of BF16 start 16-aligned (cols % 8 == 0)
         [[unroll]] for (uint i = 0; i < 4; i++) { o[2 * i] = uintBitsToFloat(q[i] << 16); o[2 * i + 1] = uintBitsToFloat(q[i] & 0xFFFF0000u); }
+    } else if (T == 43) {  // F8_E4M3
+        uvec2 v = ld8(w, b + sub * 8u);
+        [[unroll]] for (uint i = 0; i < 8; i++) o[i] = f8_e4m3_to_f32(((i < 4 ? v.x : v.y) >> (8u * (i & 3u))) & 0xFFu);
     } else {
         int q[8]; float d, m;
         qi8(w, b, sub, q, d, m);

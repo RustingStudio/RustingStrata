@@ -1,13 +1,28 @@
 #version 460
 layout(local_size_x = 256) in;
 #include "common.glsl"
-// Workgroup y = token t: out[t][i] = sum over streams c of xn[t][c n + i] * sigmoid(g[t][c n + i]) / hc.
+// Workgroup y = token t:
+// - qwen4exp (hc < 256): out[t][i] = sum_{c < hc} xn[t][c n + i] * sigmoid(g[t][c n + i]) / hc.
+// - sensenova_loop mHC (hc & 0x100 != 0): streams = hc & 0xFF, out_dim = (hc >> 16) & 0xFF,
+//   g[0..out_dim] = bias, g[32 + t*out_dim..] = logits[t]; out[t][i] = sum_{c < streams} sigmoid(bias[c] + logits[t][c]) * xn[t][c n + i].
 layout(push_constant) uniform P { F32 xn; F32 g; F32 out_; uint n; uint hc; } p;
 void main() {
-    uint i = gl_GlobalInvocationID.x;
+    uint i = gl_GlobalInvocationID.x, t = gl_WorkGroupID.y;
     if (i >= p.n) return;
-    uint b = gl_WorkGroupID.y * p.hc * p.n + i;
+    if ((p.hc & 0x100u) != 0u) {
+        uint streams = p.hc & 0xFFu;
+        uint out_dim = (p.hc >> 16) & 0xFFu;
+        uint b = t * streams * p.n + i;
+        uint loff = 32u + t * out_dim;
+        float s = 0.0;
+        for (uint c = 0; c < streams; c++) {
+            s += sigmoid(p.g.v[c] + p.g.v[loff + c]) * p.xn.v[b + c * p.n];
+        }
+        p.out_.v[t * p.n + i] = s;
+        return;
+    }
+    uint b = t * p.hc * p.n + i;
     float s = 0.0;
     for (uint c = 0; c < p.hc; c++) s += fdiv(p.xn.v[b + c * p.n] * sigmoid(p.g.v[b + c * p.n]), float(p.hc));
-    p.out_.v[gl_WorkGroupID.y * p.n + i] = s;
+    p.out_.v[t * p.n + i] = s;
 }

@@ -15,30 +15,34 @@ const _: () = assert!(ATT_SPLITS <= 256); // attn_merge keeps one weight per spl
 /// Positions per GEMM tile. Prefill cuts its tile lists at this size.
 pub const GEMM_BM: usize = 128;
 
-/// `len` bytes of device memory at device address `addr`, freed when the owner drops.
+/// `len` bytes of device memory at device address `addr`, freed when the last clone drops.
+#[derive(Clone)]
 pub struct Buf {
     addr: u64,
     len: usize,
-    _owner: Box<dyn Any + Send + Sync>,
+    _owner: std::sync::Arc<dyn Any + Send + Sync>,
 }
 
 impl Buf {
-    pub fn new(addr: u64, len: usize, owner: impl Any + Send + Sync) -> Buf { Buf { addr, len, _owner: Box::new(owner) } }
+    pub fn new(addr: u64, len: usize, owner: impl Any + Send + Sync) -> Buf { Buf { addr, len, _owner: std::sync::Arc::new(owner) } }
     pub fn addr(&self) -> u64 { self.addr }
     pub fn len(&self) -> usize { self.len }
 }
 
+#[derive(Clone)]
 pub struct GpuTensor {
     pub ty: GgmlType,
     pub rows: usize,
     pub cols: usize,
     pub ptr: u64,
+    pub scale: f32,
     _buf: Buf,
 }
 
 impl GpuTensor {
     /// `rows` x `cols` of `ty` stored in `buf` from its start.
-    pub fn new(ty: GgmlType, rows: usize, cols: usize, buf: Buf) -> GpuTensor { GpuTensor { ty, rows, cols, ptr: buf.addr, _buf: buf } }
+    pub fn new(ty: GgmlType, rows: usize, cols: usize, buf: Buf) -> GpuTensor { GpuTensor { ty, rows, cols, ptr: buf.addr, scale: 1.0, _buf: buf } }
+    pub fn with_scale(mut self, scale: f32) -> GpuTensor { self.scale = scale; self }
     pub fn bytes(&self) -> usize { self.ty.row_bytes(self.cols as u64) * self.rows }
 }
 
@@ -73,19 +77,35 @@ pub fn open(kind: Option<&str>, device: usize) -> anyhow::Result<Box<dyn Backend
     }
 }
 
+/// Which usable Vulkan device each GPU index opens, so that an index is the same card on both backends. `cuda` is the
+/// identifier of every CUDA device in CUDA's order (`None`: the driver gives none), `vk` the one of every usable
+/// Vulkan device in the order Vulkan alone would count them. Index i is the position in `vk` of CUDA device i's
+/// identifier, `None` when no usable Vulkan device has it. A CUDA device without identifier takes the next Vulkan
+/// device that no CUDA device names, and the rest of those follow the CUDA devices: with no CUDA device, or none
+/// that Vulkan knows, the order is `vk`'s own.
+pub fn device_order<T: PartialEq>(cuda: &[Option<T>], vk: &[T]) -> Vec<Option<usize>> {
+    let mut rest = (0..vk.len()).filter(|&i| !cuda.iter().flatten().any(|c| *c == vk[i]));
+    let mut order: Vec<_> = cuda.iter().map(|c| match c { Some(c) => vk.iter().position(|v| v == c), None => rest.next() }).collect();
+    order.extend(rest.map(Some));
+    order
+}
+
 /// `gemm` `act` flag: x is unchanged since the previous gemm call, which read the same x, so its int8 copy is reused.
 pub const SAME_X: i32 = 4;
 
 /// The weight type `Backend::upload` stores a tensor of type `ty` as: F16 as F32 (no F16 kernels; F32 holds every F16
-/// value exactly) and Q4_0/Q5_0 as Q8_0 (which holds their values exactly). Expert tensors are copied raw by
-/// `GpuModel::load_part`, not through `upload`, so they keep their type.
-pub fn upload_type(ty: GgmlType) -> GgmlType { match ty { GgmlType::F16 => GgmlType::F32, GgmlType::Q4_0 | GgmlType::Q5_0 => GgmlType::Q8_0, ty => ty } }
+/// value exactly). Expert tensors are copied raw by `GpuModel::load_part`, not through `upload`.
+pub fn upload_type(ty: GgmlType) -> GgmlType { if ty == GgmlType::F16 { GgmlType::F32 } else { ty } }
 
 pub trait Backend: Send {
     /// "cuda", "vulkan" or "hip".
     fn name(&self) -> &'static str;
     /// The GPU's name as the driver reports it.
     fn device(&self) -> String;
+    /// Create a lightweight handle sharing the same underlying GPU device/context for an auxiliary draft model.
+    fn share(&self) -> anyhow::Result<Box<dyn Backend>> {
+        anyhow::bail!("backend {} does not support device sharing", self.name())
+    }
     /// Zeroed buffer of `bytes` (at least 1).
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf>;
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()>;
@@ -100,6 +120,9 @@ pub trait Backend: Send {
     /// Run the ops `f` queues as the graph recorded under `key`, recording it on first use. `f` runs only when
     /// recording, so its ops must read per-call values from device memory.
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()>;
+    /// Free the graph recorded under `key`, if there is one. For a caller whose keys change as it runs (a graph holds
+    /// device memory, and CUDA stops recording at a fixed number of them).
+    fn graph_drop(&self, _key: u64) -> anyhow::Result<()> { Ok(()) }
     /// Queue the ops of `f`, none of which reads what another writes, with no ordering among them (Vulkan: no
     /// barriers between them); ops after the batch see all their results.
     fn batch(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> { f() }
@@ -136,26 +159,27 @@ pub trait Backend: Send {
     fn preflight(&self, _types: &[GgmlType], _verbose: bool) -> anyhow::Result<()> { Ok(()) }
 
     fn upload(&self, t: &Tensor) -> anyhow::Result<GpuTensor> {
-        match upload_type(t.ty) {
+        let gt = match upload_type(t.ty) {
             GgmlType::F32 if t.ty == GgmlType::F16 => {
                 let mut f = vec![0f32; t.rows * t.cols];
                 crate::quant::dequant_row(GgmlType::F16, t.data, &mut f);
                 let b = self.alloc(4 * f.len())?;
                 self.htod(&f.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), &b, 0)?;
-                Ok(GpuTensor::new(GgmlType::F32, t.rows, t.cols, b))
-            }
-            GgmlType::Q8_0 if matches!(t.ty, GgmlType::Q4_0 | GgmlType::Q5_0) => {
-                let q = crate::quant::to_q8_0(t.ty, t.data);
-                let b = self.alloc(q.len())?;
-                self.htod(&q, &b, 0)?;
-                Ok(GpuTensor::new(GgmlType::Q8_0, t.rows, t.cols, b))
+                GpuTensor::new(GgmlType::F32, t.rows, t.cols, b)
             }
             ty => {
                 let b = self.alloc(t.data.len())?;
                 self.htod(t.data, &b, 0)?;
-                Ok(GpuTensor::new(ty, t.rows, t.cols, b))
+                GpuTensor::new(ty, t.rows, t.cols, b)
             }
-        }
+        };
+        Ok(gt.with_scale(t.scale))
+    }
+
+    fn upload_raw(&self, t: &Tensor) -> anyhow::Result<GpuTensor> {
+        let b = self.alloc(t.data.len())?;
+        self.htod(t.data, &b, 0)?;
+        Ok(GpuTensor::new(t.ty, t.rows, t.cols, b).with_scale(t.scale))
     }
 
     /// u16 words of a KV cache for `n` values: f16, or q8 with one f16 scale per 32 values.
@@ -182,6 +206,19 @@ pub trait Backend: Send {
     fn gemvq2(&self, a: &GpuTensor, b: &GpuTensor, x: u64, x_stride: usize, xq: u64, ya: u64, yb: u64, nt: usize) -> anyhow::Result<()> {
         self.gemvq(a, x, x_stride, xq, ya, a.rows, nt)?;
         self.gemvq(b, x, x_stride, xq, yb, b.rows, nt)
+    }
+    /// Whether this backend supports indexed-row GEMV (`gemv_rows`).
+    fn supports_gemv_rows(&self) -> bool { false }
+    /// `y[i] = W[ids[i]] x` for `i < n_rows` (indexed subset of rows of `w`).
+    fn gemv_rows(&self, _w: &GpuTensor, _x: u64, _ids: u64, _n_rows: usize, _y: u64) -> anyhow::Result<()> {
+        anyhow::bail!("gemv_rows unsupported on this backend")
+    }
+    /// `y[t * n_rows + i] = W[ids[i]] x[t]` for `t < nt`, `i < n_rows`.
+    fn gemv_rows_n(&self, w: &GpuTensor, x: u64, x_stride: usize, _xq: u64, ids: u64, n_rows: usize, y: u64, nt: usize) -> anyhow::Result<()> {
+        for t in 0..nt {
+            self.gemv_rows(w, x + (t * x_stride * 4) as u64, ids, n_rows, y + (t * n_rows * 4) as u64)?;
+        }
+        Ok(())
     }
     /// For j < k with ids[j] >= 0: y[j] = W_j x[j / xg], where W_j is the `rows` x `cols` matrix at w + ids[j] * stride
     /// bytes. `pair` = (w2, y2) also computes the same product for the matrices at byte offset w2 into the output at
@@ -210,7 +247,22 @@ pub trait Backend: Send {
     /// Row r: vector r % per (n floats) of token r / per, tokens `stride` floats apart.
     fn l2_norm(&self, x: u64, n: usize, per: usize, stride: usize, rows: usize, eps: f32) -> anyhow::Result<()>;
     /// `heads` rows of `stride` floats, `per` per token; token t is at position step[0] + t.
-    fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()>;
+    fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
+        self.rope_pairs(x, stride, heads, per, n_rot, step, base, 0, n_rot / 2)
+    }
+    /// `rope_neox` of pairs `lo..hi` only (M-RoPE: one call per section, each with its own position buffer).
+    fn rope_pairs(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32, lo: usize, hi: usize) -> anyhow::Result<()>;
+    /// M-RoPE (`ops::rope_mrope`): section s of the pairs turns by position `pos[2 * s]` (`pos`: four [position, _]
+    /// i32 pairs); pairs past the sections use the last position.
+    fn rope_mrope(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, pos: u64, base: f32, sections: [usize; 4]) -> anyhow::Result<()> {
+        let (half, mut lo) = (n_rot / 2, 0);
+        for (s, n) in sections.into_iter().enumerate() {
+            let hi = if s == 3 { half } else { (lo + n).min(half) };
+            if hi > lo { self.rope_pairs(x, stride, heads, per, n_rot, pos + 8 * s as u64, base, lo, hi)?; }
+            lo = hi;
+        }
+        Ok(())
+    }
     /// `rms_norm` of `rows` heads of n (output rows of n), then `rope_neox` on them.
     fn rms_norm_rope(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
         self.rms_norm(x, x_stride, w, out, n, n, rows, eps)?;
@@ -228,6 +280,102 @@ pub trait Backend: Send {
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()>;
     /// g = silu(g) * u.
     fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()>;
+    /// Beta*tanh(gate/beta) * sigmoid(gate) * lb*tanh(up/lb) as in `situ`, directly quantized as `quant_xq` into `xq`.
+    fn situ_q(&self, _y: u64, _n: usize, _rows: usize, _scale: u64, _beta: f32, _lb: f32, _xq: u64) -> anyhow::Result<()> { anyhow::bail!("{}: situ_q not implemented", self.name()) }
+    /// `x[i] = cap * tanh(x[i] / cap)` for `i < n`.
+    fn softcap(&self, _x: u64, _n: usize, _cap: f32) -> anyhow::Result<()> { anyhow::bail!("{}: softcap not implemented", self.name()) }
+    /// Inkling's activation on `rows` rows of 2n floats at `y`, n gates then n ups: each gate becomes
+    /// beta*tanh(gate/beta) * sigmoid(gate) * lb*tanh(up/lb) (`lb` not above 0: times the up as it is).
+    fn situ(&self, _y: u64, _n: usize, _rows: usize, _scale: u64, _beta: f32, _lb: f32) -> anyhow::Result<()> { anyhow::bail!("{}: SITU not implemented", self.name()) }
+    // Inkling 2's decode token and batched prefill on the device (`inkling2::device`); the host math is in `inkling2::forward`.
+    /// Depth mix: `out[j]` (n floats each, j < nq) = the softmax-weighted sum of the RMS-normed states, scored by
+    /// query row j of `q`. The states are the `nb` rows of `blocks` (the newest last) and `cur`.
+    fn ink_mix(&self, blocks: u64, nb: usize, cur: u64, q: u64, nq: usize, out: u64, n: usize) -> anyhow::Result<()> {
+        self.ink_mix_n(blocks, nb, cur, q, nq, out, n, 1)
+    }
+    /// Batched depth mix across `nt` tokens: `blocks` `[nb][nt][n]`, `cur` `[nt][n]`, `q` `[nq][n]`, `out` `[nq][nt][n]`.
+    fn ink_mix_n(&self, _blocks: u64, _nb: usize, _cur: u64, _q: u64, _nq: usize, _out: u64, _n: usize, _nt: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
+    }
+    /// `count` loop controllers: `out[j] = cur_j - tanh(forget)*cur_j + tanh(gain)*msg[j]`, `cur_j` row
+    /// `min(j, nins - 1)` of `cur`. `down` (`[rank][2n]`), `gain` and `forget` (`[rank][n]`) are f16, a controller
+    /// after another. `gate`: `count * rank` floats of scratch.
+    fn ink_ctrl(&self, down: u64, gain: u64, forget: u64, cur: u64, nins: usize, msg: u64, gate: u64, out: u64, n: usize, rank: usize, count: usize) -> anyhow::Result<()> {
+        self.ink_ctrl_n(down, gain, forget, cur, nins, msg, gate, out, n, rank, count, 1)
+    }
+    /// Batched loop controllers across `nt` tokens: `cur` `[min(nins, count)][nt][n]`, `msg`/`out` `[count][nt][n]`,
+    /// `gate` `[nt][count][rank]`.
+    fn ink_ctrl_n(&self, _down: u64, _gain: u64, _forget: u64, _cur: u64, _nins: usize, _msg: u64, _gate: u64, _out: u64, _n: usize, _rank: usize, _count: usize, _nt: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
+    }
+    /// Short causal convolution with a residual, `out` may be `cur`: weights `w` `[channel][lag]`, the last
+    /// `n_conv - 1` inputs in `hist` (advanced by `cur`), and input-dependent `taps` `[channel / per][lag]` or 0.
+    fn ink_conv(&self, _cur: u64, _w: u64, _taps: u64, _hist: u64, _out: u64, _n: usize, _n_conv: usize, _per: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
+    /// Batched short causal convolution with a residual over `nt` tokens: `cur` and `out` (`[nt][n]`) must not alias;
+    /// `taps` (`[nt][n / per][n_conv]`) may be 0. Advances `hist` by the last `n_conv - 1` inputs across `hist + cur`.
+    fn ink_conv_batch(&self, _cur: u64, _w: u64, _taps: u64, _hist: u64, _out: u64, _n: usize, _n_conv: usize, _per: usize, _nt: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 batched conv not implemented", self.name())
+    }
+    /// `rows` rows of `w` (at most 128) floats at `x`, in place: times `scale` (per value, or 0), then each row
+    /// scaled to an L2 norm of at most `thr`, or with `thr` 0 to an RMS of 1 (`eps`); then times `mul`. `dst` not 0:
+    /// the result also goes there in the active KV layout.
+    fn ink_clip(&self, x: u64, scale: u64, w: usize, rows: usize, thr: f32, eps: f32, mul: f32, dst: u64) -> anyhow::Result<()> {
+        self.ink_clip_n(x, scale, w, rows, 1, thr, eps, mul, dst, 0, 1, 0, 0.0, 1.0)
+    }
+    /// Batched `ink_clip` over `nt` tokens of `rows` rows each (`x`: `[nt][rows][w]`, `scale`: `[rows][w]` or 0).
+    /// When `dst != 0`, stores token `tok` at KV row `(dst_at0 + tok) % dst_ring`. When `log_alpha != 0.0`,
+    /// scales `mul` by `1 + log_alpha * ln(max((pos0 + tok + 1) / log_floor, 1))`.
+    fn ink_clip_n(
+        &self, _x: u64, _scale: u64, _w: usize, _rows: usize, _nt: usize,
+        _thr: f32, _eps: f32, _mul: f32,
+        _dst: u64, _dst_at0: usize, _dst_ring: usize,
+        _pos0: usize, _log_alpha: f32, _log_floor: f32,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
+    }
+    /// Graph-capturable `ink_clip_n`: reads `pos0` from device `i32` pointer `pos_ptr` (`dst_at0 = pos0 % dst_ring`).
+    fn ink_clip_pos(
+        &self, _x: u64, _scale: u64, _w: usize, _rows: usize, _nt: usize,
+        _thr: f32, _eps: f32, _mul: f32,
+        _dst: u64, _dst_ring: usize,
+        _pos_ptr: u64, _log_alpha: f32, _log_floor: f32,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
+    }
+    /// Attention of one token over `rows` key and value rows (`nkv * hd` wide in active KV format; the token's own row is `at`, the
+    /// row before it `at - 1` modulo `rows`). Logit: q.k / sqrt(hd) + r.bias[distance] (distance < `ext`) - sink, a
+    /// softmax with one more logit of 0, times sigmoid(gate). `hd` divides 128. `sc`: `nh * rows.div_ceil(64) * (hd + 2)`
+    /// floats of scratch.
+    fn ink_attn(&self, _q: u64, _r: u64, _sink: u64, _gate: u64, _k: u64, _v: u64, _bias: u64, _sc: u64, _out: u64, _rows: usize, _at: usize, _nh: usize, _nkv: usize, _hd: usize, _nr: usize, _ext: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
+    /// Graph-capturable `ink_attn`: reads `pos` from device `i32` pointer `pos_ptr`, sets `rows = min(pos + 1, ring)` and `at = pos % ring`,
+    /// dispatching `max_rows.div_ceil(64)` chunks.
+    fn ink_attn_pos(&self, _q: u64, _r: u64, _sink: u64, _gate: u64, _k: u64, _v: u64, _bias: u64, _sc: u64, _out: u64, _max_rows: usize, _ring: usize, _pos_ptr: u64, _nh: usize, _nkv: usize, _hd: usize, _nr: usize, _ext: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
+    /// Batched causal Inkling 2 attention over `nt` query tokens starting at position `pos` (`hd` 32/64/128).
+    /// When `kc_new != 0`, keys/values for `kp >= pos` read row `kp - pos` of `kc_new`/`vc_new` so SWA history `< pos` in `kc`/`vc` is preserved.
+    /// `q`/`gate`/`out`: `[nt][nh][hd]`, `r`: `[nt][nh][nr]`, `sink`: `[nt][nh]`, `bias`: `[ext][nr]`.
+    fn ink_attn_prefill(
+        &self, _q: u64, _r: u64, _sink: u64, _gate: u64, _kc: u64, _vc: u64, _kc_new: u64, _vc_new: u64, _bias: u64, _out: u64,
+        _pos: usize, _nt: usize, _nh: usize, _nkv: usize, _hd: usize, _nr: usize, _ext: usize, _ring: usize, _win: usize,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 prefill attention not implemented", self.name())
+    }
+    /// `acc[c] = (cpu ? cpu[c] : 0) + sum over e < ne of wts[e] * d[e * n + c]`.
+    fn ink_ffn_sum(&self, acc: u64, d: u64, wts: u64, ne: usize, n: usize, cpu: u64) -> anyhow::Result<()> {
+        self.ink_ffn_sum_n(acc, d, wts, ne, n, 1, cpu)
+    }
+    /// Batched `ink_ffn_sum` over `nt` tokens (`acc`/`cpu`: `[nt][n]`, `d`: `[nt][ne][n]`, `wts`: `[nt][ne]`).
+    fn ink_ffn_sum_n(&self, _acc: u64, _d: u64, _wts: u64, _ne: usize, _n: usize, _nt: usize, _cpu: u64) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
+    }
+    /// Inkling 2 sigmoid top-k router for `rows` tokens: picks top `k` from `logits` (`[rows, n_expert]`) using
+    /// `sigmoid(logit) + bias`, writes indices `[rows, k]` to `ids`, normalized unbiased probs * `exp_scale` (* `dn_sc[id]`
+    /// if non-null) to `wts`, and optional `gu_sc[id]` (or `1.0`) to `gsc_out`.
+    fn ink_route(&self, _logits: u64, _bias: u64, _ids: u64, _wts: u64, _gu_sc: u64, _dn_sc: u64, _gsc_out: u64, _n_expert: usize, _k: usize, _exp_scale: f32, _rows: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 router not implemented", self.name()) }
+    /// Gyro files (`config::Hadamard`): each of `rows` rows of n floats at `x` (times silu(x) * u first when `u` is
+    /// not 0) becomes H (s x) per `block` values, written to `out`, which may be `x`. `s`: the row's n signs as floats.
+    fn hadamard(&self, _x: u64, _u: u64, _s: u64, _out: u64, _n: usize, _block: usize, _rows: usize) -> anyhow::Result<()> {
+        anyhow::bail!("this file rotates its expert inputs (prism.hadamard), which the {} backend does not do", self.name())
+    }
     /// The SwiGLU of `rows` rows of n for a GEMV with quantized weights: either g = silu(g) * u (returns 0), or
     /// silu(g) * u quantized into `xq` as `quant_xq` does (returns xq, for the GEMV's xq; g is then left as is).
     fn swiglu_q(&self, g: u64, u: u64, n: usize, rows: usize, _xq: u64) -> anyhow::Result<u64> {
@@ -242,8 +390,15 @@ pub trait Backend: Send {
     /// `interleave`: value head h reads key head h / (nv / nk), else h % nk.
     /// `dt_bias` not 0: beta and g are raw, and the kernel applies `ssm_gates` (with `dt_bias` and `a`) as it reads them.
     fn deltanet(&self, y: u64, s: u64, beta: u64, g: u64, dt_bias: u64, a: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize) -> anyhow::Result<()>;
+    /// Stride (in tokens) between saved DeltaNet checkpoints in `snap` (`1` saves every token, `4` saves every 4th token).
+    fn delta_snap_stride(&self) -> usize { 1 }
+    fn deltanet_strided(&self, y: u64, s: u64, beta: u64, g: u64, dt_bias: u64, a: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize, _snap_stride: usize) -> anyhow::Result<()> {
+        self.deltanet(y, s, beta, g, dt_bias, a, o, nk, nv, interleave, dk, dv, scale, t, ych, snap, nsnap)
+    }
     /// Causal conv + SiLU over `t` tokens of `ch` channels, then roll the conv state forward (snapshots as in `deltanet`).
     fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize, snap: u64, nsnap: usize) -> anyhow::Result<()>;
+    /// Grouped dynamic causal convolution for DFlash2 (`part = 0` prepare, `part = 1` finish).
+    fn dflash2_conv(&self, x: u64, dyn_w: u64, base: u64, out: u64, h: usize, gs: usize, k: usize, t: usize, part: usize) -> anyhow::Result<()>;
     /// `qg` 0: no output gate.
     fn attn_prefill(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
         self.attn_prefill_m(q, kc, vc, qg, out, step, t, nh, nkv, hd, scale, 0, 0, 0, 0)
@@ -370,5 +525,27 @@ impl<'a> dyn Backend + 'a {
         let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), n * size_of::<T>()) };
         self.dtoh(src, at * size_of::<T>(), b)?;
         Ok(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::device_order;
+
+    /// Identifiers are letters here. Two cards of one model have one name and two identifiers, so names play no part.
+    #[test]
+    fn a_gpu_index_is_the_same_card_on_cuda_and_vulkan() {
+        // CUDA counts the faster card first, Vulkan in bus order (the 5060 Ti and 3060 of the report).
+        assert_eq!(device_order(&[Some('T'), Some('S')], &['S', 'T']), [Some(1), Some(0)]);
+        // Two cards of the same model, and an integrated GPU that CUDA does not know: it follows the CUDA devices.
+        assert_eq!(device_order(&[Some('B'), Some('A')], &['A', 'I', 'B']), [Some(2), Some(0), Some(1)]);
+        // CUDA device 0 is not usable on Vulkan (filtered out): index 0 fails, index 1 is still CUDA's card 1.
+        assert_eq!(device_order(&[Some('A'), Some('B')], &['B']), [None, Some(0)]);
+        // A CUDA device without identifier takes the first Vulkan device that no CUDA device names.
+        assert_eq!(device_order(&[None, Some('B')], &['B', 'A']), [Some(1), Some(0)]);
+        // No CUDA (AMD, Intel, llvmpipe), or no identifier at all: Vulkan's own order, as before.
+        assert_eq!(device_order(&[], &['A', 'B']), [Some(0), Some(1)]);
+        assert_eq!(device_order(&[None, None], &['A', 'B']), [Some(0), Some(1)]);
+        assert_eq!(device_order::<char>(&[Some('A')], &[]), [None]);
     }
 }

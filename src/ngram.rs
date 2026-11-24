@@ -27,6 +27,7 @@ const DRAFT_MIN_PERCENT_STRICT: [i32; LLAMA_NGRAM_MAX] = [75, 66, 66, 66];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpecType {
     None,
+    Suffix,
     NgramSimple,
     NgramMapK,
     NgramMapK4v,
@@ -40,13 +41,14 @@ impl SpecType {
         for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             let ty = match part {
                 "none" => return Ok(vec![]),
+                "suffix" => SpecType::Suffix,
                 "ngram-simple" => SpecType::NgramSimple,
                 "ngram-map-k" => SpecType::NgramMapK,
                 "ngram-map-k4v" => SpecType::NgramMapK4v,
                 "ngram-mod" => SpecType::NgramMod,
                 "ngram-cache" => SpecType::NgramCache,
                 other => anyhow::bail!(
-                    "unknown --spec-type {other:?} (expected: none, ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod, ngram-cache)"
+                    "unknown --spec-type {other:?} (expected: none, suffix, ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod, ngram-cache)"
                 ),
             };
             if !out.contains(&ty) {
@@ -59,6 +61,7 @@ impl SpecType {
     pub fn as_str(self) -> &'static str {
         match self {
             SpecType::None => "none",
+            SpecType::Suffix => "suffix",
             SpecType::NgramSimple => "ngram-simple",
             SpecType::NgramMapK => "ngram-map-k",
             SpecType::NgramMapK4v => "ngram-map-k4v",
@@ -166,6 +169,39 @@ pub fn ngram_simple_draft_eos(
     }
     let take = copy_max.min(draft_max);
     tokens[match_pos + n..match_pos + n + take].to_vec()
+}
+
+/// Multi-order rolling suffix matcher (n = 16 -> 4, plus unanimous-repeat n = 3) returning `(draft, matched_n)`.
+pub fn suffix_draft_with_order(tokens: &[u32], sampled: u32, max_draft: usize, eos: &[u32]) -> (Vec<u32>, usize) {
+    let cur_len = tokens.len();
+    if max_draft == 0 || cur_len < 6 { return (Vec::new(), 0); }
+    for n in [16usize, 12, 8, 6, 4] {
+        if cur_len <= n + 1 { continue; }
+        let d = ngram_simple_draft_eos(tokens, sampled, n, 48, max_draft, eos);
+        if d.len() >= n.min(4).min(max_draft) {
+            return (d, n);
+        }
+    }
+    if cur_len > 10 && max_draft >= 4 {
+        let p = &tokens[cur_len - 2..cur_len];
+        let mut hits = [0usize; 2];
+        let mut nh = 0usize;
+        for j in (1..=cur_len - 7).rev() {
+            if tokens[j] == p[0] && tokens[j + 1] == p[1] && tokens[j + 2] == sampled {
+                hits[nh] = j + 3;
+                nh += 1;
+                if nh == 2 { break; }
+            }
+        }
+        if nh == 2 && hits[0] + 4 <= cur_len && hits[1] + 4 <= cur_len {
+            let avail = (cur_len - hits[0]).min(cur_len - hits[1]).min(max_draft);
+            let same = (0..avail).take_while(|&i| tokens[hits[0] + i] == tokens[hits[1] + i]).count();
+            if same >= 4 {
+                return (tokens[hits[0]..hits[0] + same].to_vec(), 3);
+            }
+        }
+    }
+    (Vec::new(), 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -894,6 +930,7 @@ pub struct NgramDrafter {
     nc_static: NgramCacheMap,
     last_used: Option<SpecType>,
     last_draft_len: usize,
+    last_matched_n: usize,
     short_cooldown: usize,
 }
 
@@ -911,7 +948,7 @@ impl NgramDrafter {
         let pruned = ngram_cache_filter_vocab(&mut nc_static, cfg.n_vocab)
             + ngram_cache_filter_vocab(&mut nc_dynamic, cfg.n_vocab);
         if pruned > 0 {
-            eprintln!(
+            crate::say!(
                 "note: pruned {pruned} out-of-vocabulary entries (n_vocab={}) from ngram lookup cache",
                 cfg.n_vocab
             );
@@ -942,6 +979,7 @@ impl NgramDrafter {
             nc_static,
             last_used: None,
             last_draft_len: 0,
+            last_matched_n: 0,
             short_cooldown: 0,
         })
     }
@@ -966,6 +1004,7 @@ impl NgramDrafter {
         self.cache_size = 0;
         self.last_used = None;
         self.last_draft_len = 0;
+        self.last_matched_n = 0;
         self.short_cooldown = 0;
         if let Some(m) = &mut self.map_k {
             m.begin(&[]);
@@ -986,6 +1025,7 @@ impl NgramDrafter {
         self.history.extend_from_slice(prompt);
         self.last_used = None;
         self.last_draft_len = 0;
+        self.last_matched_n = 0;
         self.short_cooldown = 0;
         if let Some(m) = &mut self.map_k {
             m.begin(&self.history);
@@ -998,33 +1038,47 @@ impl NgramDrafter {
         }
     }
 
+    /// Like `draft`, also returning the matched prefix order (`0` for non-suffix drafters).
+    pub fn draft_with_order(&mut self, sampled: u32, max_draft: usize) -> (Vec<u32>, usize) {
+        let d = self.draft(sampled, max_draft);
+        let n = if d.is_empty() { 0 } else { self.last_matched_n };
+        (d, n)
+    }
+
     /// Propose up to `max_draft` tokens following `sampled` (which is not yet in `self.history`).
     pub fn draft(&mut self, sampled: u32, max_draft: usize) -> Vec<u32> {
         let cap = max_draft.min(self.cfg.draft_max);
         self.last_used = None;
         self.last_draft_len = 0;
+        self.last_matched_n = 0;
         if cap == 0 {
             return Vec::new();
         }
         let mut out = Vec::new();
         for &ty in &self.cfg.types {
-            let res = match ty {
-                SpecType::None => Vec::new(),
+            let (res, mn) = match ty {
+                SpecType::None => (Vec::new(), 0),
+                SpecType::Suffix => {
+                    if self.short_cooldown == 0 { suffix_draft_with_order(&self.history, sampled, cap, &self.eos) } else { (Vec::new(), 0) }
+                }
                 SpecType::NgramSimple => {
                     let mut r = ngram_simple_draft_eos(&self.history, sampled, self.cfg.size_n, self.cfg.size_m, cap, &self.eos);
+                    let mut mn = if r.is_empty() { 0 } else { self.cfg.size_n };
                     if r.is_empty() && self.short_cooldown == 0 {
                         if self.cfg.size_n > 6 {
                             r = ngram_simple_draft_eos(&self.history, sampled, 6, self.cfg.size_m, cap, &self.eos);
+                            if !r.is_empty() { mn = 6; }
                         }
                         if r.is_empty() && self.cfg.size_n > 4 {
                             r = ngram_simple_draft_eos(&self.history, sampled, 4, self.cfg.size_m, cap.min(8), &self.eos);
+                            if !r.is_empty() { mn = 4; }
                         }
                     }
-                    r
+                    (r, mn)
                 }
-                SpecType::NgramMapK => self.map_k.as_mut().map_or_else(Vec::new, |m| m.draft(&self.history, sampled, cap)),
-                SpecType::NgramMapK4v => self.map_k4v.as_mut().map_or_else(Vec::new, |m| m.draft(&self.history, sampled, cap)),
-                SpecType::NgramMod => self.mod_state.as_mut().map_or_else(Vec::new, |m| m.draft(&self.history, sampled, cap)),
+                SpecType::NgramMapK => (self.map_k.as_mut().map_or_else(Vec::new, |m| m.draft(&self.history, sampled, cap)), 0),
+                SpecType::NgramMapK4v => (self.map_k4v.as_mut().map_or_else(Vec::new, |m| m.draft(&self.history, sampled, cap)), 0),
+                SpecType::NgramMod => (self.mod_state.as_mut().map_or_else(Vec::new, |m| m.draft(&self.history, sampled, cap)), 0),
                 SpecType::NgramCache => {
                     let mut inp = self.history.clone();
                     inp.push(sampled);
@@ -1039,14 +1093,14 @@ impl NgramDrafter {
                         Vec::new()
                     };
                     if !exact.is_empty() {
-                        exact
+                        (exact, 6)
                     } else if self.short_cooldown == 0 || !self.nc_static.is_empty() || !self.nc_dynamic.is_empty() {
                         let cache_cap = if self.nc_static.is_empty() && self.nc_dynamic.is_empty() {
                             cap.min(6)
                         } else {
                             cap
                         };
-                        ngram_cache_draft(
+                        (ngram_cache_draft(
                             &self.history,
                             sampled,
                             cache_cap,
@@ -1055,14 +1109,15 @@ impl NgramDrafter {
                             &self.nc_context,
                             &self.nc_dynamic,
                             &self.nc_static,
-                        )
+                        ), 0)
                     } else {
-                        Vec::new()
+                        (Vec::new(), 0)
                     }
                 }
             };
             if !res.is_empty() {
                 self.last_used = Some(ty);
+                self.last_matched_n = mn;
                 out = res;
                 break;
             }

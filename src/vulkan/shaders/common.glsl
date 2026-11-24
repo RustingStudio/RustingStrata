@@ -85,9 +85,10 @@ uint warp_scan(uint v) {
     return v;
 }
 
-// Sums and maxima over a subgroup of 32 in the butterfly order of the CUDA warp_sum / warp_max.
+// Sums, maxima and minima over a subgroup of 32 in the butterfly order of CUDA warp_sum / warp_max.
 float warp_sum(float v) { for (uint o = 16; o > 0; o >>= 1) v += subgroupShuffleXor(v, o); return v; }
 float warp_max(float v) { for (uint o = 16; o > 0; o >>= 1) v = max(v, subgroupShuffleXor(v, o)); return v; }
+float warp_min(float v) { for (uint o = 16; o > 0; o >>= 1) v = min(v, subgroupShuffleXor(v, o)); return v; }
 
 // Sum over the workgroup; every invocation gets the result. Call in uniform control flow.
 shared float block_sum_s[32];
@@ -117,34 +118,106 @@ uint pack4(int a, int b, int c, int d) { return uint(a & 255) | uint(b & 255) <<
 // llama.cpp q8_K numerics (--llama-numerics) for kernels that quantize x.
 layout(constant_id = 0) const bool LLAMA_Q8 = false;
 
-// KV cache rows (one per position and KV head) hold hd f16 values, or with KV_Q8 (`--kv q8`, set on every pipeline) hd
-// int8 values followed by hd / 32 f16 scales, as KV_Q8 in kernels.cu. Offsets below count values.
-layout(constant_id = 15) const bool KV_Q8 = false;
-// Store x at value offset e; with KV_Q8 the 32 lanes of the subgroup hold one 32-value block.
+// KV cache rows (one per position and KV head) hold hd f16 values (KV_MODE 0), hd int8 values followed by hd / 32 f16 scales
+// (KV_MODE 1, `--kv q8`), hd/2 packed uint4 nibbles + hd/32 f16 scales (KV_MODE 2, `--kv q4`), or affine 2-bit codes
+// (hd/4 B) + hd/32 f16 scales + hd/32 f16 mins (KV_MODE 3, `--kv q2`). Offsets below count values.
+layout(constant_id = 15) const uint KV_MODE = 0u;
+// Store x at value offset e; with quantized KV the 32 lanes of the subgroup hold one 32-value block.
 void kv_put(U16 c, uint e, uint hd, float x) {
-    if (!KV_Q8) { c.v[e] = uint16_t(f2h(x)); return; }
+    if (KV_MODE == 0u) { c.v[e] = uint16_t(f2h(x)); return; }
+    if (KV_MODE == 3u) {
+        uint16_t mnh = uint16_t(f2h(warp_min(x)));
+        float mn = float(uint16BitsToHalf(mnh)), mx = warp_max(x);
+        float d_raw = rcp_d(max(0.0, mx - mn), 3.0);
+        uint16_t dh = uint16_t(f2h(d_raw));
+        float d = float(uint16BitsToHalf(dh)), y = d == 0.0 ? 0.0 : rcp_d(x - mn, d), qf = trunc(y);
+        if (abs(y - qf) >= 0.5) qf += sign(y);
+        uint uq = uint(clamp(int(qf), 0, 3));
+        uint packed = uq
+            | (subgroupShuffleXor(uq, 1u) << 2)
+            | (subgroupShuffleXor(uq, 2u) << 4)
+            | (subgroupShuffleXor(uq, 3u) << 6);
+        uint w = e % hd, r = e / hd * (3u * hd / 8u);
+        if ((w & 3u) == 0u) U8(uint64_t(c)).v[r + w / 4u] = uint8_t(packed);
+        if ((w & 31u) == 0u) {
+            c.v[(r + hd / 4u) / 2u + w / 32u] = dh;
+            c.v[(r + hd / 4u + hd / 16u) / 2u + w / 32u] = mnh;
+        }
+        return;
+    }
+    if (KV_MODE == 2u) {
+        float d = rcp_d(warp_max(abs(x)), 7.0), y = d == 0.0 ? 0.0 : rcp_d(x, d), qf = trunc(y);
+        if (abs(y - qf) >= 0.5) qf += sign(y);  // roundf: halves away from zero
+        uint nib = uint(clamp(int(qf), -7, 7) + 8);
+        uint pair = nib | (subgroupShuffleXor(nib, 1u) << 4);
+        uint w = e % hd, r = e / hd * (hd / 2 + hd / 16);
+        if ((w & 1u) == 0u) U8(uint64_t(c)).v[r + w / 2] = uint8_t(pair);
+        if ((w & 31u) == 0u) c.v[(r + hd / 2) / 2 + w / 32] = uint16_t(f2h(d));
+        return;
+    }
     float d = rcp_d(warp_max(abs(x)), 127.0), y = d == 0.0 ? 0.0 : rcp_d(x, d), q = trunc(y);
     if (abs(y - q) >= 0.5) q += sign(y);  // roundf: halves away from zero
     uint w = e % hd, r = e / hd * (hd + hd / 16);
     U8(uint64_t(c)).v[r + w] = uint8_t(int(q) & 255);
     if (w % 32 == 0) c.v[(r + hd) / 2 + w / 32] = uint16_t(f2h(d));
 }
-// The cache value at offset off. q8: q * d rounded once to f16 (the product is exact in f32), as ldkv in kernels.cu.
+// The cache value at offset off. q8/q4/q2: dequantized and rounded once to f16, as ldkv in kernels.cu.
 float ldkv(U16 c, uint off, uint hd) {
-    if (!KV_Q8) return float(uint16BitsToHalf(c.v[off]));
+    if (KV_MODE == 0u) return float(uint16BitsToHalf(c.v[off]));
+    if (KV_MODE == 3u) {
+        uint w = off % hd, r = off / hd * (3u * hd / 8u), b = uint(U8(uint64_t(c)).v[r + w / 4u]);
+        float d = unpackHalf2x16(uint(c.v[(r + hd / 4u) / 2u + w / 32u])).x;
+        float mn = unpackHalf2x16(uint(c.v[(r + hd / 4u + hd / 16u) / 2u + w / 32u])).x;
+        uint q = (b >> (2u * (w & 3u))) & 3u;
+        return rh(fma(float(q), d, mn));
+    }
+    if (KV_MODE == 2u) {
+        uint w = off % hd, r = off / hd * (hd / 2 + hd / 16), b = uint(U8(uint64_t(c)).v[r + w / 2]);
+        float d = unpackHalf2x16(uint(c.v[(r + hd / 2) / 2 + w / 32])).x;
+        int q = int((w & 1u) == 0u ? (b & 15u) : (b >> 4)) - 8;
+        return rh(float(q) * d);
+    }
     uint w = off % hd, r = off / hd * (hd + hd / 16);
     float d = unpackHalf2x16(uint(c.v[(r + hd) / 2 + w / 32])).x;
     return rh(float(int(uint(U8(uint64_t(c)).v[r + w]) << 24) >> 24) * d);
 }
-// q8 values off and off + 1 (off even) as one f16 pair word, from one 2-byte load and one scale.
+// q8/q4/q2 values off and off + 1 (off even) as one f16 pair word, from one load and one scale(+min).
 uint ldkv2(U16 c, uint off, uint hd) {
+    if (KV_MODE == 3u) {
+        uint w = off % hd, r = off / hd * (3u * hd / 8u), b = uint(U8(uint64_t(c)).v[r + w / 4u]);
+        uint s = (b >> (2u * (w & 2u))) & 15u;
+        float d = unpackHalf2x16(uint(c.v[(r + hd / 4u) / 2u + w / 32u])).x;
+        float mn = unpackHalf2x16(uint(c.v[(r + hd / 4u + hd / 16u) / 2u + w / 32u])).x;
+        return packHalf2x16(vec2(rh(fma(float(s & 3u), d, mn)), rh(fma(float(s >> 2), d, mn))));
+    }
+    if (KV_MODE == 2u) {
+        uint w = off % hd, r = off / hd * (hd / 2 + hd / 16), b = uint(U8(uint64_t(c)).v[r + w / 2]);
+        float d = unpackHalf2x16(uint(c.v[(r + hd / 2) / 2 + w / 32])).x;
+        return packHalf2x16(vec2(rh(float(int(b & 15u) - 8) * d), rh(float(int(b >> 4) - 8) * d)));
+    }
     uint w = off % hd, r = off / hd * (hd + hd / 16), b = uint(c.v[(r + w) / 2]);
     float d = unpackHalf2x16(uint(c.v[(r + hd) / 2 + w / 32])).x;
     return packHalf2x16(vec2(rh(float(int(b << 24) >> 24) * d), rh(float(int(b << 16) >> 24) * d)));
 }
-// q8 values off .. off + 3 (off % 4 == 0) as two f16 pair words, from one 4-byte load and one scale. Rows start
-// 4-byte aligned only when hd % 64 == 0 (hd * 17 / 16 bytes each); otherwise two ldkv2.
+// q8/q4/q2 values off .. off + 3 (off % 4 == 0) as two f16 pair words using packed FP16 arithmetic.
 uvec2 ldkv4(U16 c, uint off, uint hd) {
+    if (KV_MODE == 3u) {
+        uint w = off % hd, r = off / hd * (3u * hd / 8u), b = uint(U8(uint64_t(c)).v[r + w / 4u]);
+        precise f16vec2 d2 = f16vec2(uint16BitsToHalf(c.v[(r + hd / 4u) / 2u + w / 32u]));
+        precise f16vec2 mn2 = f16vec2(uint16BitsToHalf(c.v[(r + hd / 4u + hd / 16u) / 2u + w / 32u]));
+        precise f16vec2 m = f16vec2(1024.0hf);
+        precise f16vec2 a = fma(unpackFloat2x16(((b & 3u) | ((b & 12u) << 14)) | 0x64006400u) - m, d2, mn2);
+        precise f16vec2 z = fma(unpackFloat2x16((((b >> 4) & 3u) | ((b & 0xc0u) << 10)) | 0x64006400u) - m, d2, mn2);
+        return uvec2(packFloat2x16(a), packFloat2x16(z));
+    }
+    if (KV_MODE == 2u) {
+        uint w = off % hd, r = off / hd * (hd / 2 + hd / 16), b = uint(c.v[(r + w / 2) / 2]);
+        float16_t d = uint16BitsToHalf(c.v[(r + hd / 2) / 2 + w / 32]);
+        precise f16vec2 m = f16vec2(1032.0hf);
+        precise f16vec2 a = (unpackFloat2x16(((b & 0x000Fu) | ((b & 0x00F0u) << 12)) | 0x64006400u) - m) * d;
+        precise f16vec2 z = (unpackFloat2x16((((b >> 8) & 0x000Fu) | ((b & 0xF000u) << 4)) | 0x64006400u) - m) * d;
+        return uvec2(packFloat2x16(a), packFloat2x16(z));
+    }
     if (hd % 64 != 0) return uvec2(ldkv2(c, off, hd), ldkv2(c, off + 2, hd));
     uint w = off % hd, r = off / hd * (hd + hd / 16), b = U32(uint64_t(c)).v[(r + w) / 4];
     // q + 128 as the low mantissa bits of 1024 gives the f16 1152 + q, so q comes out exact without int -> float

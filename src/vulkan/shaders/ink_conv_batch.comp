@@ -1,0 +1,36 @@
+#version 460
+layout(local_size_x = 256) in;
+#include "common.glsl"
+layout(push_constant) uniform P { F32 cur; F32 w; F32 taps; F32 hist; F32 o; uint n; uint nc; uint per; uint nt; uint mode; } p;
+
+// Batched causal short convolution for Inkling 2 prefill (o != cur):
+// mode 0 (grid [ceil(n/256), nt, 1]): writes o[tok, c] reading hist and cur[0..=tok] read-only.
+// mode 1 (grid [ceil(n/256), 1, 1]): advances hist[0..nc-1, c] from the last nc - 1 inputs across hist + cur.
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= p.n) return;
+    if (p.mode != 0u) {
+        float old[8];
+        for (uint k = 0; k + 1 < p.nc; k++) old[k] = p.hist.v[k * p.n + c];
+        for (uint k = 0; k + 1 < p.nc; k++) {
+            int src = int(p.nt) - int(p.nc - 1u) + int(k);
+            p.hist.v[k * p.n + c] = src >= 0 ? p.cur.v[uint(src) * p.n + c] : old[uint(int(p.nc - 1u) + src)];
+        }
+        return;
+    }
+    uint tok = gl_WorkGroupID.y;
+    bool taps = uint64_t(p.taps) != 0;
+    float x[8], o = 0.0;
+    for (uint k = 0; k < p.nc; k++) {
+        int s = int(tok) - int(p.nc - 1u) + int(k);
+        float xv = s < 0 ? p.hist.v[uint(int(p.nc - 1u) + s) * p.n + c] : p.cur.v[uint(s) * p.n + c];
+        x[k] = xv;
+        o += xv * p.w.v[c * p.nc + k];
+    }
+    if (taps) {
+        uint nheads = p.n / p.per;
+        uint tp_base = (tok * nheads + c / p.per) * p.nc;
+        for (uint lag = 0; lag < p.nc; lag++) o += x[p.nc - 1u - lag] * p.taps.v[tp_base + lag];
+    }
+    p.o.v[tok * p.n + c] = fdiv(x[p.nc - 1u] + o, sqrt_(float((taps ? 2u * p.nc : p.nc) + 1u)));
+}

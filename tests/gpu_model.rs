@@ -101,16 +101,19 @@ fn prefill_matches_reference() {
 /// less while the first one's context lives), so the hidden states and the near-ties moved between backends and runs.
 #[test]
 fn mtp_draft_matches_reference() {
-    use rusting_strata::model::Mtp;
     let _gpu = common::gpu_lock();
     let Some(p) = common::model_path() else { return };
     let g = Gguf::open(&p).unwrap();
     let m = Model::load(&g).unwrap();
     if m.cfg.n_nextn == 0 { eprintln!("SKIP: no nextn layer"); return }
-    let tok = Tokenizer::from_gguf(&g).unwrap();
+    draft_matches_reference(&m, &Tokenizer::from_gguf(&g).unwrap());
+}
+
+fn draft_matches_reference(m: &Model, tok: &Tokenizer) {
+    use rusting_strata::model::Mtp;
     for (bk, gpu) in common::backends() {
         eprintln!("backend {bk}");
-        let mut gm = GpuModel::load(&m, gpu, 256, 0, usize::MAX / 2, 1).unwrap();
+        let mut gm = GpuModel::load(m, gpu, 256, 0, usize::MAX / 2, 1).unwrap();
         let mut ids = tok.encode("The capital of France is").unwrap();
         let (mut st, mut mtp) = (State::new(&m.cfg), Mtp::default());
         let mut bad = 0;
@@ -180,16 +183,48 @@ fn mtp_spec_matches_greedy() {
     let g = Gguf::open(&p).unwrap();
     let m = Model::load(&g).unwrap();
     if m.cfg.n_nextn == 0 { eprintln!("SKIP: no nextn layer"); return }
+    spec_matches_greedy(&m, &Tokenizer::from_gguf(&g).unwrap());
+}
+
+/// Flash-Next (hyper-connections, PLE, QSA with top_k lowered so that it selects) with its companion draft head: the
+/// GPU draft matches the CPU one, and drafted decode gives the plain greedy tokens (rollback of the PLE context and
+/// the QSA key ring after rejected drafts).
+#[test]
+fn qwen4exp_mtp_matches() {
+    let _gpu = common::gpu_lock();
+    let d = std::path::Path::new("/mnt/ollama/qwen4exp");
+    let (p, a) = (d.join("Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf"), d.join("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"));
+    if !p.exists() || !a.exists() { return }
+    let (g, ag) = (Gguf::open(&p).unwrap(), Gguf::open(&a).unwrap());
+    let mut m = Model::load_with_aux(&g, Some(&ag), &[]).unwrap();
+    m.cfg.idx_top_k = 8;
     let tok = Tokenizer::from_gguf(&g).unwrap();
-    for (bk, gpu) in common::backends() {
-        eprintln!("backend {bk}");
-        let mut gm = GpuModel::load(&m, gpu, 512, 0, 512 << 20, 3).unwrap();
-        assert_eq!(gm.k, 3);
+    draft_matches_reference(&m, &tok);
+    spec_matches_greedy(&m, &tok);
+}
+
+fn spec_matches_greedy(m: &Model, tok: &Tokenizer) {
+    // One device, then the layers split in two parts (on the same GPU): the draft head is on the last part.
+    for (split, (bk, gpu)) in [false, true].into_iter().flat_map(|sp| common::backends().into_iter().map(move |b| (sp, b))) {
+        eprintln!("backend {bk}, split {split}");
+        let mut gm = if split {
+            let second = common::backends().into_iter().find(|b| b.0 == bk).unwrap().1;
+            // Both parts are on one GPU here: the first must not fill it with experts.
+            // SAFETY: the GPU lock serializes every test that loads a model, the only readers of this variable.
+            unsafe { std::env::set_var("STRATA_EXPERT_MB", "1024") };
+            let gm = GpuModel::load_split(m, vec![gpu, second], 512, 16, 512 << 20, 3, 1);
+            unsafe { std::env::remove_var("STRATA_EXPERT_MB") };
+            gm.unwrap()
+        } else {
+            GpuModel::load(m, gpu, 512, 16, 512 << 20, 3).unwrap()
+        };
+        assert_eq!((gm.k, gm.parts().count()), (3, 1 + split as usize));
         gm.adapt_every = 0;
         let ids = tok.encode("Write a short story about a dragon.").unwrap();
         let n = 64;
-        let mut run = |k: usize| -> (Vec<u32>, (usize, usize)) {
-            (gm.k, gm.drafts) = (k.max(1), (0, 0));
+        let short = gm.short;
+        let mut run = |k: usize, short: usize| -> (Vec<u32>, (usize, usize)) {
+            (gm.k, gm.drafts, gm.short) = (k.max(1), (0, 0), short);
             gm.reset().unwrap();
             let mut t = ops::argmax(&gm.prefill(&ids).unwrap()) as u32;
             let (mut out, mut row) = (vec![], 0);
@@ -206,12 +241,15 @@ fn mtp_spec_matches_greedy() {
             out.truncate(n);
             (out, gm.drafts)
         };
-        let plain = run(0).0;
-        for k in [1, 2, 3] {
-            let (spec, (made, ok)) = run(k);
-            eprintln!("k {k}: drafts accepted {ok}/{made}");
-            assert_eq!(spec, plain, "k {k}");
-            if k == 1 { assert!(2 * ok >= made, "acceptance {ok}/{made}"); }
+        // The prompt through `step`, then through the chunked prefill (short = 1).
+        for short in [short, 1] {
+            let plain = run(0, short).0;
+            for k in [1, 2, 3] {
+                let (spec, (made, ok)) = run(k, short);
+                eprintln!("short {short} k {k}: drafts accepted {ok}/{made}");
+                assert_eq!(spec, plain, "short {short} k {k}");
+                if k == 1 && short > 1 { assert!(2 * ok >= made, "acceptance {ok}/{made}"); }
+            }
         }
     }
 }
@@ -700,7 +738,8 @@ fn gpu_image_prefill_matches_cpu() {
         for _ in 0..64 {
             text.push_str(&tok.decode(&[next]).unwrap());
             if text.to_ascii_lowercase().contains("red") { break; }
-            next = ops::argmax(&gm.step(next).unwrap()) as u32;
+            // The image prompt dropped the draft head: drafted decode must fall back to plain steps.
+            next = gm.spec_step(next, 0, &mut ops::Sampler::greedy()).unwrap().1;
         }
         eprintln!("backend {bk}: generated {text:?}");
         assert!(text.to_ascii_lowercase().contains("red"), "backend {bk}: {text:?}");

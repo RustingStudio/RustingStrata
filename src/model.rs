@@ -1,7 +1,7 @@
 //! Scalar CPU reference forward for the architectures in `config::arch`, one token at a time.
 //! Mirrors llama.cpp `src/models/qwen35moe.cpp`; this is the correctness oracle, not the fast path.
 
-use crate::config::{Eagle3Config, LayerKind, ModelConfig};
+use crate::config::{DFlashConfig, Eagle3Config, LayerKind, ModelConfig};
 use crate::gguf::Gguf;
 use crate::ops;
 use crate::weights::{Tensor, Weights};
@@ -30,6 +30,7 @@ pub struct Model<'a> {
     pub cfg: ModelConfig,
     pub w: Weights<'a>,
     pub loras: Vec<Lora>,
+    pub draft_model: Option<Box<Model<'a>>>,
     ple: Option<Ple>,
 }
 
@@ -38,17 +39,17 @@ impl Model<'_> {
     /// evictable page cache and is not counted, so models larger than RAM still load.
     pub fn ram_estimate(&self) -> usize {
         let lora: usize = self.loras.iter().flat_map(|l| l.entries.values()).map(|e| (e.a.len() * e.in_dim + e.b.len() * e.out_dim) * 4).sum();
-        self.w.built.values().map(|t| t.data.len()).sum::<usize>() + lora
+        let dm = self.draft_model.as_ref().map_or(0, |d| d.ram_estimate());
+        self.w.built.values().map(|t| t.data.len()).sum::<usize>() + lora + dm
     }
 }
 
 /// qwen4exp per-layer embedding (PLE): n-gram hash constants from the GGUF.
-struct Ple { mult: Vec<u64>, off: Vec<u64>, vocab: Vec<u64>, eos: i64 }
+struct Ple { mult: Vec<u64>, off: Vec<u64>, vocab: Vec<u64>, eos: i64, heads_per_ngram: usize }
 
-// PLE geometry, checked against the GGUF at load: n-grams up to 3 tokens, 8 hash heads per n-gram order,
+// PLE geometry, checked against the GGUF at load: n-grams up to 3 tokens, `heads_per_ngram` hash heads per n-gram order,
 // a 4-tap causal conv dilated by the n-gram size, so it reads rows t-9, t-6, t-3, t.
 const PLE_NGRAM: usize = 3;
-const PLE_HEADS: usize = 8;
 const PLE_KERNEL: usize = 4;
 const PLE_HIST: usize = (PLE_KERNEL - 1) * PLE_NGRAM;
 /// QSA: cells per pooled indexer key.
@@ -109,8 +110,36 @@ impl<'a> Model<'a> {
     }
     pub fn load_with_aux(g: &'a Gguf, aux: Option<&'a Gguf>, loras: &[(String, f32)]) -> anyhow::Result<Model<'a>> {
         let mut cfg = ModelConfig::from_gguf(g)?;
-        let w = Weights::new_with_aux(g, aux)?;
-        if cfg.n_nextn == 0 {
+        // A DFlash draft given on the command line replaces the target's own MTP head; without this the draft was
+        // ignored without a word for a target GGUF that carries one.
+        if cfg.n_nextn > 0 && aux.is_some_and(|ag| ag.tensors.contains_key("dflash.fc.weight")) {
+            crate::say!("note: DFlash draft model given: the target's own MTP head is not used");
+            cfg.n_nextn = 0;
+        }
+        let is_standalone_draft = aux.is_some_and(|ag| {
+            !ag.tensors.contains_key("fc.weight")
+                && !ag.tensors.contains_key("dflash.fc.weight")
+                && !ag.tensors.contains_key(&format!("blk.{}.nextn.eh_proj.weight", cfg.n_layer))
+                && ag.tensors.contains_key("token_embd.weight")
+                && ModelConfig::from_gguf(ag).is_ok()
+        });
+        let w = Weights::new_with_aux(g, if is_standalone_draft { None } else { aux })?;
+        let mut draft_model = None;
+        if is_standalone_draft {
+            let ag = aux.unwrap();
+            let dm = Model::load(ag)?;
+            anyhow::ensure!(
+                dm.cfg.n_vocab == cfg.n_vocab,
+                "standalone draft model vocab ({}) != target vocab ({})",
+                dm.cfg.n_vocab,
+                cfg.n_vocab
+            );
+            crate::say!(
+                "note: loaded standalone external draft model (arch={}, layers={}, embd={}, vocab={})",
+                dm.cfg.arch, dm.cfg.n_layer, dm.cfg.n_embd, dm.cfg.n_vocab
+            );
+            draft_model = Some(Box::new(dm));
+        } else if cfg.n_nextn == 0 {
             if let Some(ag) = aux.filter(|_| w.layer(cfg.n_layer, "eagle3.fc.weight").is_ok()) {
                 let il = cfg.n_layer;
                 let wq = w.layer(il, "attn_q.weight")?;
@@ -157,16 +186,72 @@ impl<'a> Model<'a> {
                     extract_layers, n_ff, n_head, n_head_kv, head_dim, n_rot, rope_base, eps,
                     draft_vocab, norm_before_residual, rope_neox, d2t,
                 });
-                eprintln!(
+                crate::say!(
                     "note: loaded standalone EAGLE3 draft head (extract_layers={extract_layers:?}, heads={n_head}x{head_dim}, kv={n_head_kv}, ff={n_ff}, draft_vocab={draft_vocab})"
+                );
+            } else if aux.is_some_and(|ag| ag.tensors.contains_key("dflash.fc.weight")) {
+                let ag = aux.unwrap();
+                let u = |k: &str| ag.meta.get(k).and_then(|v| v.as_u64()).map(|v| v as usize);
+                let f = |k: &str| ag.meta.get(k).and_then(|v| v.as_f32());
+                let n_layer = u("dflash.block_count").context("dflash.block_count")?;
+                let block_size = u("dflash.block_size").unwrap_or(16).max(2);
+                let mask_token_id = u("dflash.mask_token_id").context("dflash.mask_token_id")? as u32;
+                let n_embd = u("dflash.embedding_length").unwrap_or(cfg.n_embd);
+                let n_ff = u("dflash.feed_forward_length").context("dflash.feed_forward_length")?;
+                let n_head = u("dflash.attention.head_count").unwrap_or(cfg.n_head);
+                let n_head_kv = u("dflash.attention.head_count_kv").unwrap_or(cfg.n_head_kv);
+                let head_dim = u("dflash.attention.key_length").unwrap_or(n_embd / n_head.max(1));
+                let n_rot = u("dflash.rope.dimension_count").unwrap_or(head_dim);
+                let rope_base = f("dflash.rope.freq_base").unwrap_or(cfg.rope_base);
+                let eps = f("dflash.attention.layer_norm_rms_epsilon").unwrap_or(cfg.eps);
+                let sliding_window = u("dflash.attention.sliding_window").unwrap_or(0);
+                let input_embedding_scale = f("dflash.input_embedding_scale").unwrap_or(1.0);
+                let output_multiplier = f("dflash.output_multiplier").unwrap_or(1.0);
+                let conv_kernel_size = u("dflash.conv_kernel_size").unwrap_or(0);
+                let conv_group_size = u("dflash.conv_group_size").unwrap_or(0);
+                let selector_rank = u("dflash.selector_rank").unwrap_or(0);
+                let selector_top_k = u("dflash.selector_top_k").unwrap_or(0);
+                let target_layer_ids = ag.meta.get("dflash.target_layers").and_then(|v| v.as_arr())
+                    .context("dflash.target_layers")?
+                    .iter().map(|v| v.as_u64().map(|x| x as usize).context("bad dflash target layer")).collect::<anyhow::Result<Vec<_>>>()?;
+                anyhow::ensure!(target_layer_ids.iter().all(|&id| id < cfg.n_layer), "dflash target_layer_ids out of range for {} layers: {target_layer_ids:?}", cfg.n_layer);
+                let layer_swa = ag.meta.get("dflash.attention.sliding_window_pattern").and_then(|v| v.as_arr())
+                    .filter(|a| a.len() >= n_layer)
+                    .map(|a| a[..n_layer].iter().map(|v| v.as_u64().unwrap_or(0) != 0).collect())
+                    .unwrap_or_else(|| vec![false; n_layer]);
+                cfg.dflash = Some(DFlashConfig {
+                    target_layer_ids: target_layer_ids.clone(),
+                    block_size,
+                    mask_token_id,
+                    n_layer,
+                    n_embd,
+                    n_ff,
+                    n_head,
+                    n_head_kv,
+                    head_dim,
+                    n_rot,
+                    rope_base,
+                    eps,
+                    sliding_window,
+                    layer_swa,
+                    input_embedding_scale,
+                    output_multiplier,
+                    conv_kernel_size,
+                    conv_group_size,
+                    selector_rank,
+                    selector_top_k,
+                });
+                crate::say!(
+                    "note: loaded standalone DFlash{} draft model (layers={n_layer}, block={block_size}, mask={mask_token_id}, target_layers={target_layer_ids:?}, heads={n_head}x{head_dim}, kv={n_head_kv}, ff={n_ff})",
+                    if selector_rank > 0 { "2" } else { "" }
                 );
             } else if aux.is_some_and(|ag| ag.tensors.contains_key(&format!("blk.{}.nextn.eh_proj.weight", cfg.n_layer))) {
                 cfg.n_nextn = 1;
-                eprintln!("note: loaded standalone MTP draft head from companion GGUF (layer {})", cfg.n_layer);
+                crate::say!("note: loaded standalone MTP draft head from companion GGUF (layer {})", cfg.n_layer);
             }
         }
         if !w.validate(cfg.n_layer)? && cfg.n_nextn > 0 {
-            eprintln!("note: the MTP (nextn) layer has a quant type this engine does not support; loading without MTP");
+            crate::say!("note: the MTP (nextn) layer has a quant type this engine does not support; loading without MTP");
             cfg.n_nextn = 0;
         }
         let emb_t = w.get("token_embd.weight")?;
@@ -182,10 +267,11 @@ impl<'a> Model<'a> {
                 g.get(&p(k))?.as_arr().with_context(|| p(k))?.iter().map(|v| v.as_u64().with_context(|| p(k))).collect()
             };
             let int = |k: &str| -> anyhow::Result<u64> { g.get(&p(k))?.as_u64().with_context(|| p(k)) };
-            anyhow::ensure!(int("ngram_size")? == PLE_NGRAM as u64 && int("heads_per_ngram")? == PLE_HEADS as u64
+            let heads_per_ngram = int("heads_per_ngram")? as usize;
+            anyhow::ensure!(int("ngram_size")? == PLE_NGRAM as u64 && heads_per_ngram > 0
                 && int("conv_kernel")? == PLE_KERNEL as u64, "unsupported PLE geometry");
-            let ple = Ple { mult: arr("layer_multipliers")?, off: arr("head_offsets")?, vocab: arr("head_vocab_sizes")?, eos: int("eos_token_id")? as i64 };
-            let heads = (PLE_NGRAM - 1) * PLE_HEADS;
+            let ple = Ple { mult: arr("layer_multipliers")?, off: arr("head_offsets")?, vocab: arr("head_vocab_sizes")?, eos: int("eos_token_id")? as i64, heads_per_ngram };
+            let heads = (PLE_NGRAM - 1) * heads_per_ngram;
             anyhow::ensure!(ple.mult.len() == PLE_NGRAM && ple.off.len() == heads && ple.vocab.len() == heads
                 && ple.vocab.iter().all(|&v| v > 0) && heads * cfg.n_embd_ple == cfg.n_embd, "bad PLE metadata");
             w.get("per_layer_token_embd.weight")?;
@@ -194,7 +280,7 @@ impl<'a> Model<'a> {
             w.get("output_norm.weight")?;
             None
         };
-        let mut m = Model { cfg, w, loras: Vec::new(), ple };
+        let mut m = Model { cfg, w, loras: Vec::new(), draft_model, ple };
         m.apply_lora(loras)?;
         Ok(m)
     }
@@ -202,6 +288,14 @@ impl<'a> Model<'a> {
     pub fn apply_lora(&mut self, specs: &[(String, f32)]) -> anyhow::Result<()> {
         // Load everything before touching the current overlays, so a bad adapter leaves the model unchanged.
         let loras: Vec<Lora> = specs.iter().map(|(path, scale)| load_lora(path, *scale)).collect::<anyhow::Result<_>>()?;
+        // Routed-expert adapters are not baked (`bake_lora` checks the others): they index activations and the
+        // residual row by their own dimensions at inference, so these must be the base tensor's.
+        let ne = self.cfg.n_expert.max(1);
+        for (name, e) in loras.iter().flat_map(|l| &l.entries).filter(|(n, _)| n.ends_with("ffn_down_exps.weight")) {
+            let Ok(base) = self.w.get(name) else { continue };
+            anyhow::ensure!(e.in_dim == base.cols && e.out_dim * ne == base.rows && (e.n_expert == 1 || e.n_expert == ne),
+                "lora: target {name} is {}x{} with {ne} experts, adapter is {}x{} with {}", base.rows / ne, base.cols, e.out_dim, e.in_dim, e.n_expert);
+        }
         self.w.clear_baked();
         self.loras = loras;
         self.w.bake_lora(&self.loras);
@@ -261,6 +355,7 @@ impl<'a> Model<'a> {
 
     pub fn step_embed_h(&self, st: &mut State, mut x: Vec<f32>, rope_pos: [i32; 4], token: u32) -> (Vec<f32>, Vec<f32>) {
         if self.cfg.hc_n > 0 { return self.step_embed_hc(st, x, rope_pos, token); }
+        if self.cfg.mhc_streams > 0 { return self.step_embed_mhc(st, x, rope_pos); }
         let kv_pos = st.pos;
         for il in 0..self.cfg.n_layer { self.block(il, &mut x, &mut st.layers[il], kv_pos, rope_pos); }
         st.pos += 1;
@@ -268,10 +363,113 @@ impl<'a> Model<'a> {
         (self.head(&x, &self.w.get("output_norm.weight").unwrap().to_f32()), x)
     }
 
+    /// SenseNova-Loop (`sensenova_loop`): shared-weight looped layers with manifold-constrained hyper-connections (mHC)
+    /// and 20-step log-space Sinkhorn-Knopp doubly-stochastic stream mixing.
+    fn step_embed_mhc(&self, st: &mut State, mut x: Vec<f32>, rope_pos: [i32; 4]) -> (Vec<f32>, Vec<f32>) {
+        let c = &self.cfg;
+        let kv_pos = st.pos;
+        let s = c.mhc_streams;
+        let mut r = Vec::new();
+        for il in 0..c.n_layer {
+            let mk = c.mhc_layer_kinds.get(il).copied().unwrap_or(0);
+            if mk == 0 {
+                self.block(il, &mut x, &mut st.layers[il], kv_pos, rope_pos);
+                continue;
+            }
+            if mk & 1 != 0 {
+                r = x.repeat(s);
+            }
+            let (mut branch, post, mix) = self.mhc_route(il, "mhc_attn", &r, s);
+            let mut h = vec![0f32; c.n_embd];
+            ops::rms_norm(&branch, &self.f(il, "attn_norm.weight"), c.eps, &mut h);
+            let attn_out = match &mut st.layers[il] {
+                LayerState::Recurrent { conv, s: dstate } => self.deltanet(il, &h, conv, dstate),
+                LayerState::Attn { k, v, ik } => self.attention(il, &h, k, v, ik, kv_pos, rope_pos),
+            };
+            Self::mhc_merge(&mut r, &attn_out, &post, &mix, s);
+            let (branch_f, post_f, mix_f) = self.mhc_route(il, "mhc_ffn", &r, s);
+            branch = branch_f;
+            ops::rms_norm(&branch, &self.f(il, "post_attention_norm.weight"), c.eps, &mut h);
+            let ffn_out = if c.is_moe_layer(il) { self.moe(il, &h) } else { self.dense_ffn(il, &h) };
+            Self::mhc_merge(&mut r, &ffn_out, &post_f, &mix_f, s);
+            if mk & 2 != 0 {
+                let inv_s = 1.0 / s as f32;
+                for i in 0..c.n_embd {
+                    let mut sum = 0.0f32;
+                    for sc in 0..s { sum += r[sc * c.n_embd + i]; }
+                    x[i] = sum * inv_s;
+                }
+            }
+        }
+        st.pos += 1;
+        st.rope_pos = [rope_pos[0] + 1; 4];
+        (self.head(&x, &self.w.get("output_norm.weight").unwrap().to_f32()), x)
+    }
+
+    fn mhc_route(&self, il: usize, prefix: &str, r: &[f32], streams: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let n = self.cfg.n_embd;
+        let sq_mean = r.iter().map(|&v| v * v).sum::<f32>() / (r.len().max(1) as f32);
+        let scale = 1.0 / (sq_mean + 1e-6).sqrt();
+        let norm: Vec<f32> = r.iter().map(|&v| v * scale).collect();
+        let w = self.t(il, &format!("{prefix}.weight"));
+        let b = self.f(il, &format!("{prefix}.bias"));
+        let mut logits = mv(&w, &norm);
+        for (l, &bi) in logits.iter_mut().zip(&b) { *l += bi; }
+        let pre: Vec<f32> = logits[..streams].iter().map(|&v| ops::sigmoid(v)).collect();
+        let post: Vec<f32> = logits[streams..2 * streams].iter().map(|&v| 2.0 * ops::sigmoid(v)).collect();
+        let mix = if logits.len() <= 2 * streams {
+            let mut id = vec![0.0f32; streams * streams];
+            for i in 0..streams { id[i * streams + i] = 1.0; }
+            id
+        } else {
+            let mut m = logits[2 * streams..2 * streams + streams * streams].to_vec();
+            for _ in 0..20 {
+                for r0 in 0..streams {
+                    let row = &mut m[r0 * streams..(r0 + 1) * streams];
+                    let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let lse = mx + row.iter().map(|&v| (v - mx).exp()).sum::<f32>().ln();
+                    for v in row.iter_mut() { *v -= lse; }
+                }
+                for c0 in 0..streams {
+                    let mut mx = f32::NEG_INFINITY;
+                    for r0 in 0..streams { mx = mx.max(m[r0 * streams + c0]); }
+                    let mut se = 0.0f32;
+                    for r0 in 0..streams { se += (m[r0 * streams + c0] - mx).exp(); }
+                    let lse = mx + se.ln();
+                    for r0 in 0..streams { m[r0 * streams + c0] -= lse; }
+                }
+            }
+            m.into_iter().map(f32::exp).collect()
+        };
+        let mut branch = vec![0.0f32; n];
+        for (sc, &p) in pre.iter().enumerate() {
+            for (bi, &rv) in branch.iter_mut().zip(&r[sc * n..(sc + 1) * n]) {
+                *bi += p * rv;
+            }
+        }
+        (branch, post, mix)
+    }
+
+    fn mhc_merge(r: &mut [f32], branch: &[f32], post: &[f32], mix: &[f32], streams: usize) {
+        let n = branch.len();
+        let old = r.to_vec();
+        for r0 in 0..streams {
+            let p = post[r0];
+            let dst = &mut r[r0 * n..(r0 + 1) * n];
+            for i in 0..n {
+                let mut acc = p * branch[i];
+                for c0 in 0..streams {
+                    acc += mix[r0 * streams + c0] * old[c0 * n + i];
+                }
+                dst[i] = acc;
+            }
+        }
+    }
+
     /// qwen4exp: the residual is a stack of hc_n streams (hyper-connections). Every half-layer reads the stack
     /// down to one vector, runs its block and writes the output back into every stream with a per-stream weight.
     /// Layers holding `ple_key` first add the per-layer n-gram embedding (PLE) to the stack. Returns the logits
-    /// and the head's mixed vector. Mirrors original Strata's `Engine::enqueue` (llama.cpp qwen4exp.cpp).
+    /// and the stack before the head's read (the MTP draft input). Mirrors original Strata's `Engine::enqueue` (llama.cpp qwen4exp.cpp).
     fn step_embed_hc(&self, st: &mut State, x: Vec<f32>, rope_pos: [i32; 4], token: u32) -> (Vec<f32>, Vec<f32>) {
         let c = &self.cfg;
         let mut r = x.repeat(c.hc_n);
@@ -290,7 +488,7 @@ impl<'a> Model<'a> {
         st.pos += 1;
         st.rope_pos = [rope_pos[0] + 1; 4];
         let (h, _) = self.hc_read(&r, "output_hc_");
-        (mv(&self.w.get("output.weight").unwrap(), &h), h)
+        (mv(&self.w.get("output.weight").unwrap(), &h), r)
     }
 
     /// Hyper-connection read (`build_hc_mix`) of the stack `r` with the tensors `{p}norm/down/up/inject.weight`:
@@ -342,7 +540,7 @@ impl<'a> Model<'a> {
         for n in 2..=PLE_NGRAM {
             let mut m = (ctx[0] as u64).wrapping_mul(p.mult[0]);
             for j in 1..n { m ^= (ctx[j] as u64).wrapping_mul(p.mult[j]); }
-            for h in (n - 2) * PLE_HEADS..(n - 1) * PLE_HEADS { rows.push(m % p.vocab[h] + p.off[h]); }
+            for h in (n - 2) * p.heads_per_ngram..(n - 1) * p.heads_per_ngram { rows.push(m % p.vocab[h] + p.off[h]); }
         }
         rows
     }
@@ -413,6 +611,7 @@ impl<'a> Model<'a> {
     pub fn mtp_step(&self, ms: &mut Mtp, hid: &[f32], token: u32) -> (Vec<f32>, Vec<f32>) {
         let (c, il) = (&self.cfg, self.cfg.n_layer);
         let n = c.n_embd;
+        if c.hc_n > 0 { return self.mtp_step_hc(ms, hid, token); }
         let mut eh = vec![0f32; 2 * n];
         ops::rms_norm(&self.embed(token), &self.f(il, "nextn.enorm.weight"), c.eps, &mut eh[..n]);
         ops::rms_norm(hid, &self.f(il, "nextn.hnorm.weight"), c.eps, &mut eh[n..]);
@@ -421,6 +620,28 @@ impl<'a> Model<'a> {
         self.block(il, &mut x, &mut ms.kv, ms.pos, rope_pos);
         ms.pos += 1;
         (self.head(&x, &self.f(il, "nextn.shared_head_norm.weight")), x)
+    }
+
+    /// qwen4exp draft step (llama.cpp `graph_mtp`): `hid` is the hc_n x n_embd stack. Every stream is projected
+    /// on its own from [enorm(embed), hnorm(stream)], then the nextn block runs as a hyper-connection layer with
+    /// plain attention (no PLE, no QSA). Returns the logits and the new stack, which is `hid` of the next draft.
+    fn mtp_step_hc(&self, ms: &mut Mtp, hid: &[f32], token: u32) -> (Vec<f32>, Vec<f32>) {
+        let (c, il) = (&self.cfg, self.cfg.n_layer);
+        let n = c.n_embd;
+        let mut e = vec![0f32; n];
+        ops::rms_norm(&self.embed(token), &self.f(il, "nextn.enorm.weight"), c.eps, &mut e);
+        let mut hn = vec![0f32; hid.len()];
+        self.gnorm(hid, &self.f(il, "nextn.hnorm.weight"), &mut hn);
+        let proj = self.t(il, "nextn.eh_proj.weight");
+        let mut r: Vec<f32> = hn.chunks_exact(n).flat_map(|h| mv(&proj, &[&e, h].concat())).collect();
+        let (h, inj) = self.hc_read(&r, &format!("blk.{il}.hc_attn_"));
+        let LayerState::Attn { k, v, ik } = &mut ms.kv else { unreachable!("the nextn block is an attention layer") };
+        Self::hc_write(&mut r, &self.attention(il, &h, k, v, ik, ms.pos, [ms.pos as i32; 4]), &inj);
+        let (h, inj) = self.hc_read(&r, &format!("blk.{il}.hc_ffn_"));
+        Self::hc_write(&mut r, &self.moe(il, &h), &inj);
+        ms.pos += 1;
+        let (h, _) = self.hc_read(&r, &format!("blk.{il}.nextn.hc_head_"));
+        (mv(&self.w.get("output.weight").unwrap(), &h), r)
     }
 
     fn deltanet(&self, il: usize, h: &[f32], conv: &mut [f32], s: &mut [f32]) -> Vec<f32> {
@@ -495,7 +716,7 @@ impl<'a> Model<'a> {
     fn qsa(&self, il: usize, h: &[f32], ik: &mut Vec<f32>, pos: usize, rope_pos: [i32; 4]) -> Option<Vec<usize>> {
         let c = &self.cfg;
         let (nh, d) = (c.idx_n_head, c.idx_head_dim);
-        if c.idx_top_k == 0 || self.w.layer(il, "indexer.k_proj.weight").is_err() { return None; }
+        if c.idx_top_k == 0 || il >= c.n_layer || self.w.layer(il, "indexer.k_proj.weight").is_err() { return None; }
         ik.extend_from_slice(&mv(&self.t(il, "indexer.k_proj.weight"), h));
         let (nb, top) = ((pos + 1) / QSA_POOL, c.idx_top_k / QSA_POOL);
         if nb <= top { return None; }
@@ -580,9 +801,14 @@ impl<'a> Model<'a> {
     }
 
     fn ffn(&self, il: usize, gate: &Tensor, up: &Tensor, down: &Tensor, down_name: &str, expert: Option<usize>, h: &[f32]) -> Vec<f32> {
+        // A routed expert of a Gyro file reads rotated inputs (`config::Hadamard`); the LoRA delta reads the plain ones.
+        // The shared expert (also called with an expert index) reads plain inputs.
+        let rot = self.cfg.hadamard.as_ref().filter(|_| down_name == "ffn_down_exps.weight");
+        let hr = rot.map(|r| r.rotated(h));
+        let h = hr.as_deref().unwrap_or(h);
         let mut a = mv(gate, h);
         for (x, u) in a.iter_mut().zip(mv(up, h)) { *x = ops::silu(*x) * u; }
-        let mut y = mv(down, &a);
+        let mut y = match rot { Some(r) => mv(down, &r.rotated(&a)), None => mv(down, &a) };
         if down_name == "ffn_down_exps.weight" {
             self.lora_delta(&format!("blk.{il}.{down_name}"), &a, &mut y, expert);
         }
@@ -652,8 +878,8 @@ pub fn load_lora(path: &str, scale: f32) -> anyhow::Result<Lora> {
     for base in bases {
         let a_info = g.tensors.get(&format!("{base}.lora_a")).context("missing lora_a")?;
         let b_info = g.tensors.get(&format!("{base}.lora_b")).context("missing lora_b")?;
-        let a_t = Tensor { ty: GgmlType::from_u32(a_info.ty)?, cols: a_info.dims[0] as usize, rows: a_info.dims[1..].iter().product::<u64>() as usize, data: g.bytes(a_info) };
-        let b_t = Tensor { ty: GgmlType::from_u32(b_info.ty)?, cols: b_info.dims[0] as usize, rows: b_info.dims[1..].iter().product::<u64>() as usize, data: g.bytes(b_info) };
+        let a_t = Tensor { ty: GgmlType::from_u32(a_info.ty)?, cols: a_info.dims[0] as usize, rows: a_info.dims[1..].iter().product::<u64>() as usize, data: g.bytes(a_info), scale: 1.0 };
+        let b_t = Tensor { ty: GgmlType::from_u32(b_info.ty)?, cols: b_info.dims[0] as usize, rows: b_info.dims[1..].iter().product::<u64>() as usize, data: g.bytes(b_info), scale: 1.0 };
         let a_flat = a_t.to_f32();
         let b_flat = b_t.to_f32();
         let a_dims = &a_info.dims;
@@ -729,6 +955,19 @@ mod tests {
         assert_eq!((e.rank, e.in_dim, e.out_dim, e.n_expert), (2, 4, 3, 1));
         assert_eq!(e.a[0], (0..8).map(|i| i as f32).collect::<Vec<_>>());
         assert_eq!(e.b[0], (0..6).map(|i| 10.0 + i as f32).collect::<Vec<_>>());
+    }
+
+    /// A routed-expert adapter whose dimensions are not the base tensor's is refused (needs `STRATA_MODEL`, a MoE model).
+    #[test]
+    fn routed_expert_lora_dimensions_are_checked() {
+        let Some(m) = std::env::var_os("STRATA_MODEL").filter(|m| Path::new(m).exists()) else { return };
+        let g = Gguf::open(Path::new(&m)).unwrap();
+        if !g.tensors.contains_key("blk.0.ffn_down_exps.weight") { return; }
+        let p = tiny_adapter("dims");
+        let r = Model::load_with_lora(&g, &[(p.to_str().unwrap().to_string(), 1.0)]);
+        std::fs::remove_file(&p).ok();
+        let e = format!("{:#}", r.err().expect("a 3x4 adapter on the expert down matrix must be refused"));
+        assert!(e.contains("blk.0.ffn_down_exps.weight") && e.contains("adapter is 3x4"), "{e}");
     }
 
     #[test]
@@ -940,5 +1179,371 @@ mod tests {
         assert_eq!(m.cfg.n_nextn, 1);
         assert_eq!((ec.n_head, ec.head_dim, ec.n_head_kv, ec.n_ff, ec.draft_vocab), (2, 4, 1, 6, 3));
         assert_eq!(ec.d2t, vec![0, 1, 7]);
+    }
+
+    #[test]
+    fn dflash_safetensors_auto_converts_and_loads() {
+        let dir = std::env::temp_dir().join(format!("strata_dflash_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut kvs = Vec::new();
+        let w_s = |b: &mut Vec<u8>, s: &str| { b.extend((s.len() as u64).to_le_bytes()); b.extend(s.as_bytes()); };
+        let w_kv = |b: &mut Vec<u8>, k: &str, t: u32, p: &[u8]| { w_s(b, k); b.extend(t.to_le_bytes()); b.extend(p); };
+        let s = |b: &mut Vec<u8>, k: &str, v: &str| { let mut p = Vec::new(); w_s(&mut p, v); w_kv(b, k, 8, &p); };
+        s(&mut kvs, "general.architecture", "qwen3");
+        w_kv(&mut kvs, "qwen3.block_count", 4, &1u32.to_le_bytes());
+        w_kv(&mut kvs, "qwen3.embedding_length", 4, &32u32.to_le_bytes());
+        w_kv(&mut kvs, "qwen3.attention.head_count", 4, &2u32.to_le_bytes());
+        w_kv(&mut kvs, "qwen3.attention.head_count_kv", 4, &1u32.to_le_bytes());
+        w_kv(&mut kvs, "qwen3.attention.key_length", 4, &16u32.to_le_bytes());
+        w_kv(&mut kvs, "qwen3.attention.layer_norm_rms_epsilon", 6, &1e-6f32.to_le_bytes());
+        let mut hdr = Vec::new();
+        let mut body = Vec::new();
+        for (name, dims, nb) in [
+            ("token_embd.weight", vec![32u64, 4], 32 * 4 * 4),
+            ("output_norm.weight", vec![32u64], 32 * 4),
+            ("output.weight", vec![32u64, 4], 32 * 4 * 4),
+        ] {
+            w_s(&mut hdr, name);
+            hdr.extend((dims.len() as u32).to_le_bytes());
+            for d in dims { hdr.extend(d.to_le_bytes()); }
+            hdr.extend(0u32.to_le_bytes());
+            hdr.extend((body.len() as u64).to_le_bytes());
+            body.resize(body.len() + nb, 0);
+            while body.len() % 32 != 0 { body.push(0); }
+        }
+        let mut tgt = Vec::new();
+        tgt.extend(b"GGUF");
+        tgt.extend(3u32.to_le_bytes());
+        tgt.extend(3u64.to_le_bytes());
+        tgt.extend(7u64.to_le_bytes());
+        tgt.extend(kvs);
+        tgt.extend(hdr);
+        while tgt.len() % 32 != 0 { tgt.push(0); }
+        tgt.extend(body);
+        let pt = dir.join("target.gguf");
+        std::fs::write(&pt, &tgt).unwrap();
+
+        let cfg_path = dir.join("config.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{
+                "architectures": ["DFlashDraftModel"],
+                "dflash_config": { "block_size": 16, "mask_token_id": 2, "target_layer_ids": [0] },
+                "hidden_size": 32,
+                "intermediate_size": 32,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "sliding_window": 4096,
+                "rms_norm_eps": 1e-6,
+                "rope_parameters": { "rope_theta": 10000000.0 }
+            }"#,
+        ).unwrap();
+
+        let mut st_specs: Vec<(String, &str, Vec<u64>, Vec<u8>)> = vec![
+            ("fc.weight".into(), "BF16", vec![32, 32], vec![0u8; 32 * 32 * 2]),
+            ("hidden_norm.weight".into(), "BF16", vec![32], vec![0u8; 32 * 2]),
+            ("norm.weight".into(), "BF16", vec![32], vec![0u8; 32 * 2]),
+        ];
+        for il in 0..2 {
+            st_specs.push((format!("layers.{il}.input_layernorm.weight"), "BF16", vec![32], vec![0u8; 32 * 2]));
+            st_specs.push((format!("layers.{il}.post_attention_layernorm.weight"), "BF16", vec![32], vec![0u8; 32 * 2]));
+            st_specs.push((format!("layers.{il}.self_attn.q_norm.weight"), "BF16", vec![16], vec![0u8; 16 * 2]));
+            st_specs.push((format!("layers.{il}.self_attn.k_norm.weight"), "BF16", vec![16], vec![0u8; 16 * 2]));
+            st_specs.push((format!("layers.{il}.self_attn.q_proj.weight"), "BF16", vec![32, 32], vec![0u8; 32 * 32 * 2]));
+            st_specs.push((format!("layers.{il}.self_attn.k_proj.weight"), "BF16", vec![16, 32], vec![0u8; 16 * 32 * 2]));
+            st_specs.push((format!("layers.{il}.self_attn.v_proj.weight"), "BF16", vec![16, 32], vec![0u8; 16 * 32 * 2]));
+            st_specs.push((format!("layers.{il}.self_attn.o_proj.weight"), "BF16", vec![32, 32], vec![0u8; 32 * 32 * 2]));
+            st_specs.push((format!("layers.{il}.mlp.gate_proj.weight"), "BF16", vec![32, 32], vec![0u8; 32 * 32 * 2]));
+            st_specs.push((format!("layers.{il}.mlp.up_proj.weight"), "BF16", vec![32, 32], vec![0u8; 32 * 32 * 2]));
+            st_specs.push((format!("layers.{il}.mlp.down_proj.weight"), "BF16", vec![32, 32], vec![0u8; 32 * 32 * 2]));
+        }
+        let mut st_hdr = serde_json::Map::new();
+        let mut st_body = Vec::new();
+        for (name, dt, shape, data) in st_specs {
+            let start = st_body.len();
+            st_body.extend_from_slice(&data);
+            st_hdr.insert(name, serde_json::json!({"dtype": dt, "shape": shape, "data_offsets": [start, st_body.len()]}));
+        }
+        let hdr_bytes = serde_json::to_vec(&st_hdr).unwrap();
+        let mut st_file = Vec::with_capacity(8 + hdr_bytes.len() + st_body.len());
+        st_file.extend_from_slice(&(hdr_bytes.len() as u64).to_le_bytes());
+        st_file.extend_from_slice(&hdr_bytes);
+        st_file.extend_from_slice(&st_body);
+        let st_path = dir.join("model.safetensors");
+        std::fs::write(&st_path, &st_file).unwrap();
+
+        let aux_gguf = dir.join("model-dflash-q8_0.gguf");
+        crate::gguf::convert_safetensors_dflash_to_gguf(&st_path, &cfg_path, &aux_gguf, 1).unwrap();
+        let gt = Gguf::open(&pt).unwrap();
+        let ga = Gguf::open(&aux_gguf).unwrap();
+        let m = Model::load_with_aux(&gt, Some(&ga), &[]).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let df = m.cfg.dflash.as_ref().expect("dflash config loaded");
+        assert_eq!(m.cfg.n_nextn, 0);
+        assert_eq!((df.n_layer, df.block_size, df.mask_token_id, df.n_embd, df.n_ff, df.n_head, df.n_head_kv, df.head_dim, df.sliding_window), (2, 16, 2, 32, 32, 2, 1, 16, 4096));
+        assert_eq!(df.target_layer_ids, vec![0]);
+        assert_eq!(df.layer_swa, vec![true, false]);
+        // Metadata that disagrees with the tensors is refused before any GPU buffer is sized from it.
+        crate::gpu_model::dflash_check(&m, df).unwrap();
+        for bad in [
+            crate::config::DFlashConfig { n_ff: 16, ..df.clone() },
+            crate::config::DFlashConfig { head_dim: 8, n_rot: 8, ..df.clone() },
+            crate::config::DFlashConfig { n_embd: 16, ..df.clone() },
+            crate::config::DFlashConfig { conv_kernel_size: 3, ..df.clone() },
+            crate::config::DFlashConfig { mask_token_id: u32::MAX, ..df.clone() },
+        ] {
+            assert!(crate::gpu_model::dflash_check(&m, &bad).is_err());
+        }
+    }
+
+    #[test]
+    fn sensenova_loop_mhc_cpu_matches_gpu() {
+        let dir = std::env::temp_dir().join(format!("strata_snloop_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut kvs = Vec::new();
+        let w_s = |b: &mut Vec<u8>, s: &str| { b.extend((s.len() as u64).to_le_bytes()); b.extend(s.as_bytes()); };
+        let w_kv = |b: &mut Vec<u8>, k: &str, t: u32, p: &[u8]| { w_s(b, k); b.extend(t.to_le_bytes()); b.extend(p); };
+        let s = |b: &mut Vec<u8>, k: &str, v: &str| { let mut p = Vec::new(); w_s(&mut p, v); w_kv(b, k, 8, &p); };
+        s(&mut kvs, "general.architecture", "sensenova_loop");
+        w_kv(&mut kvs, "sensenova_loop.block_count", 4, &4u32.to_le_bytes());
+        w_kv(&mut kvs, "sensenova_loop.embedding_length", 4, &64u32.to_le_bytes());
+        w_kv(&mut kvs, "sensenova_loop.feed_forward_length", 4, &64u32.to_le_bytes());
+        w_kv(&mut kvs, "sensenova_loop.attention.head_count", 4, &1u32.to_le_bytes());
+        w_kv(&mut kvs, "sensenova_loop.attention.head_count_kv", 4, &1u32.to_le_bytes());
+        w_kv(&mut kvs, "sensenova_loop.attention.key_length", 4, &64u32.to_le_bytes());
+        w_kv(&mut kvs, "sensenova_loop.attention.layer_norm_rms_epsilon", 6, &1e-6f32.to_le_bytes());
+        w_kv(&mut kvs, "sensenova_loop.mhc.streams", 4, &2u32.to_le_bytes());
+        // recurrent_layers = [false, false, false, false]
+        w_s(&mut kvs, "sensenova_loop.attention.recurrent_layers");
+        kvs.extend(9u32.to_le_bytes());
+        kvs.extend(7u32.to_le_bytes());
+        kvs.extend(4u64.to_le_bytes());
+        kvs.extend([0u8, 0, 0, 0]);
+        // mhc.layer_kinds = [1 (enter), 2 (leave), 1 (enter visit 2), 2 (leave visit 2)]
+        w_s(&mut kvs, "sensenova_loop.mhc.layer_kinds");
+        kvs.extend(9u32.to_le_bytes());
+        kvs.extend(4u32.to_le_bytes());
+        kvs.extend(4u64.to_le_bytes());
+        for v in [1u32, 2, 1, 2] { kvs.extend(v.to_le_bytes()); }
+
+        let mut hdr = Vec::new();
+        let mut body = Vec::new();
+        let mut seed = 1usize;
+        let mut add_t = |name: &str, dims: &[u64], scale: f32| {
+            w_s(&mut hdr, name);
+            hdr.extend((dims.len() as u32).to_le_bytes());
+            for &d in dims { hdr.extend(d.to_le_bytes()); }
+            hdr.extend(0u32.to_le_bytes()); // F32
+            hdr.extend((body.len() as u64).to_le_bytes());
+            let n: usize = dims.iter().product::<u64>() as usize;
+            for i in 0..n {
+                let v = if scale == 0.0 {
+                    1.0f32
+                } else {
+                    (((seed * 31 + i * 17 + 7) % 97) as f32 - 48.0) * scale
+                };
+                body.extend_from_slice(&v.to_le_bytes());
+            }
+            seed += 1;
+            while body.len() % 32 != 0 { body.push(0); }
+        };
+        add_t("token_embd.weight", &[64, 8], 0.02);
+        add_t("output_norm.weight", &[64], 0.0);
+        add_t("output.weight", &[64, 8], 0.02);
+        // Only physical layers 0 and 1 are stored in the GGUF; virtual layers 2 and 3 loop over 0 and 1!
+        for il in 0..2 {
+            add_t(&format!("blk.{il}.attn_norm.weight"), &[64], 0.0);
+            add_t(&format!("blk.{il}.post_attention_norm.weight"), &[64], 0.0);
+            add_t(&format!("blk.{il}.attn_q_norm.weight"), &[64], 0.0);
+            add_t(&format!("blk.{il}.attn_k_norm.weight"), &[64], 0.0);
+            add_t(&format!("blk.{il}.attn_q.weight"), &[64, 128], 0.01); // q_gate = true -> 2 * n_head * head_dim = 128
+            add_t(&format!("blk.{il}.attn_k.weight"), &[64, 64], 0.01);
+            add_t(&format!("blk.{il}.attn_v.weight"), &[64, 64], 0.01);
+            add_t(&format!("blk.{il}.attn_output.weight"), &[64, 64], 0.01);
+            add_t(&format!("blk.{il}.ffn_gate.weight"), &[64, 64], 0.01);
+            add_t(&format!("blk.{il}.ffn_up.weight"), &[64, 64], 0.01);
+            add_t(&format!("blk.{il}.ffn_down.weight"), &[64, 64], 0.01);
+            add_t(&format!("blk.{il}.mhc_attn.weight"), &[128, 8], 0.01);
+            add_t(&format!("blk.{il}.mhc_attn.bias"), &[8], 0.01);
+            add_t(&format!("blk.{il}.mhc_ffn.weight"), &[128, 8], 0.01);
+            add_t(&format!("blk.{il}.mhc_ffn.bias"), &[8], 0.01);
+        }
+        let n_tensors = 3 + 2 * 15;
+        let mut gg = Vec::new();
+        gg.extend(b"GGUF");
+        gg.extend(3u32.to_le_bytes());
+        gg.extend((n_tensors as u64).to_le_bytes());
+        gg.extend(11u64.to_le_bytes());
+        gg.extend(kvs);
+        gg.extend(hdr);
+        while gg.len() % 32 != 0 { gg.push(0); }
+        gg.extend(body);
+        let p = dir.join("snloop.gguf");
+        std::fs::write(&p, &gg).unwrap();
+
+        let g = Gguf::open(&p).unwrap();
+        let m = Model::load(&g).unwrap();
+        assert_eq!(m.cfg.phys_layer, vec![0, 1, 0, 1]);
+        assert_eq!(m.cfg.mhc_streams, 2);
+
+        let mut st = State::new(&m.cfg);
+        let mut cpu_logits = Vec::new();
+        for &tok in &[1u32, 3, 2, 4] {
+            cpu_logits = m.step(&mut st, tok);
+        }
+
+        if let Ok(bk) = crate::backend::open(None, 0) {
+            let mut gm = crate::gpu_model::GpuModel::load(&m, bk, 64, 0, 0, 0).unwrap();
+            let mut gpu_logits = Vec::new();
+            for &tok in &[1u32, 3, 2, 4] {
+                gpu_logits = gm.step(tok).unwrap();
+            }
+            let max_err = cpu_logits.iter().zip(&gpu_logits).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            crate::say!("sensenova_loop decode vs cpu max_err = {max_err}");
+            assert!(max_err < 1e-2, "sensenova_loop CPU vs GPU decode max_err = {max_err} (cpu={cpu_logits:?}, gpu={gpu_logits:?})");
+
+            if let Ok(bk2) = crate::backend::open(None, 0) {
+                let mut gm_pf = crate::gpu_model::GpuModel::load(&m, bk2, 64, 64, 0, 0).unwrap();
+                gm_pf.short = 2;
+                let pf_logits = gm_pf.prefill(&[1u32, 3, 2, 4]).unwrap();
+                let max_err_pf = cpu_logits.iter().zip(&pf_logits).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                let max_err_gpu = gpu_logits.iter().zip(&pf_logits).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                crate::say!("sensenova_loop prefill vs cpu max_err = {max_err_pf}, prefill vs gpu_decode max_err = {max_err_gpu}");
+                assert!(max_err_pf < 1e-2, "sensenova_loop CPU vs GPU chunked prefill max_err = {max_err_pf} (cpu={cpu_logits:?}, pf={pf_logits:?})");
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn standalone_external_draft_model_spec_step_matches_greedy() {
+        let dir = std::env::temp_dir().join(format!("strata_extdraft_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let make_qwen3 = |path: &std::path::Path, seed_off: usize| {
+            let mut kvs = Vec::new();
+            let w_s = |b: &mut Vec<u8>, s: &str| { b.extend((s.len() as u64).to_le_bytes()); b.extend(s.as_bytes()); };
+            let w_kv = |b: &mut Vec<u8>, k: &str, t: u32, p: &[u8]| { w_s(b, k); b.extend(t.to_le_bytes()); b.extend(p); };
+            let s = |b: &mut Vec<u8>, k: &str, v: &str| { let mut p = Vec::new(); w_s(&mut p, v); w_kv(b, k, 8, &p); };
+            s(&mut kvs, "general.architecture", "qwen3");
+            w_kv(&mut kvs, "qwen3.block_count", 4, &1u32.to_le_bytes());
+            w_kv(&mut kvs, "qwen3.embedding_length", 4, &64u32.to_le_bytes());
+            w_kv(&mut kvs, "qwen3.feed_forward_length", 4, &64u32.to_le_bytes());
+            w_kv(&mut kvs, "qwen3.attention.head_count", 4, &1u32.to_le_bytes());
+            w_kv(&mut kvs, "qwen3.attention.head_count_kv", 4, &1u32.to_le_bytes());
+            w_kv(&mut kvs, "qwen3.attention.key_length", 4, &64u32.to_le_bytes());
+            w_kv(&mut kvs, "qwen3.attention.layer_norm_rms_epsilon", 6, &1e-6f32.to_le_bytes());
+
+            let mut hdr = Vec::new();
+            let mut body = Vec::new();
+            let mut seed = 1 + seed_off;
+            let mut add_t = |name: &str, dims: &[u64], scale: f32| {
+                w_s(&mut hdr, name);
+                hdr.extend((dims.len() as u32).to_le_bytes());
+                for &d in dims { hdr.extend(d.to_le_bytes()); }
+                hdr.extend(0u32.to_le_bytes());
+                hdr.extend((body.len() as u64).to_le_bytes());
+                let n: usize = dims.iter().product::<u64>() as usize;
+                for i in 0..n {
+                    let v = if scale == 0.0 { 1.0f32 } else { (((seed * 29 + i * 13 + 3) % 89) as f32 - 44.0) * scale };
+                    body.extend_from_slice(&v.to_le_bytes());
+                }
+                seed += 1;
+                while body.len() % 32 != 0 { body.push(0); }
+            };
+            add_t("token_embd.weight", &[64, 8], 0.02);
+            add_t("output_norm.weight", &[64], 0.0);
+            add_t("output.weight", &[64, 8], 0.02);
+            add_t("blk.0.attn_norm.weight", &[64], 0.0);
+            add_t("blk.0.ffn_norm.weight", &[64], 0.0);
+            add_t("blk.0.attn_q_norm.weight", &[64], 0.0);
+            add_t("blk.0.attn_k_norm.weight", &[64], 0.0);
+            add_t("blk.0.attn_q.weight", &[64, 64], 0.01);
+            add_t("blk.0.attn_k.weight", &[64, 64], 0.01);
+            add_t("blk.0.attn_v.weight", &[64, 64], 0.01);
+            add_t("blk.0.attn_output.weight", &[64, 64], 0.01);
+            add_t("blk.0.ffn_gate.weight", &[64, 64], 0.01);
+            add_t("blk.0.ffn_up.weight", &[64, 64], 0.01);
+            add_t("blk.0.ffn_down.weight", &[64, 64], 0.01);
+            let mut gg = Vec::new();
+            gg.extend(b"GGUF");
+            gg.extend(3u32.to_le_bytes());
+            gg.extend(14u64.to_le_bytes());
+            gg.extend(8u64.to_le_bytes());
+            gg.extend(kvs);
+            gg.extend(hdr);
+            while gg.len() % 32 != 0 { gg.push(0); }
+            gg.extend(body);
+            std::fs::write(path, &gg).unwrap();
+        };
+        let pt = dir.join("target.gguf");
+        let pd = dir.join("draft.gguf");
+        make_qwen3(&pt, 0);
+        make_qwen3(&pd, 0);
+
+        let gt = Gguf::open(&pt).unwrap();
+        let gd = Gguf::open(&pd).unwrap();
+        let m = Model::load_with_aux(&gt, Some(&gd), &[]).unwrap();
+        assert!(m.draft_model.is_some());
+
+        if let Ok(bk1) = crate::backend::open(None, 0)
+            && let Ok(bk2) = crate::backend::open(None, 0)
+        {
+            let mut gm_base = crate::gpu_model::GpuModel::load(&m, bk1, 64, 0, 0, 0).unwrap();
+            let mut gm_spec = crate::gpu_model::GpuModel::load(&m, bk2, 64, 0, 0, 3).unwrap();
+            assert!(gm_spec.has_ext_draft());
+
+            let l_base = gm_base.prefill(&[1, 2]).unwrap();
+            let l_spec = gm_spec.prefill(&[1, 2]).unwrap();
+            let mut next_b = crate::ops::argmax(&l_base) as u32;
+            let mut next_s = crate::ops::argmax(&l_spec) as u32;
+            assert_eq!(next_b, next_s);
+
+            let mut base_toks = Vec::new();
+            for _ in 0..8 {
+                base_toks.push(next_b);
+                next_b = gm_base.step_greedy(next_b).unwrap();
+            }
+            let mut spec_toks = Vec::new();
+            let mut smp = crate::ops::Sampler::greedy();
+            let mut row = 0;
+            while spec_toks.len() < 8 {
+                let (toks, nx, rw) = gm_spec.spec_step(next_s, row, &mut smp).unwrap();
+                spec_toks.extend_from_slice(&toks);
+                next_s = nx;
+                row = rw;
+            }
+            spec_toks.truncate(8);
+            assert_eq!(base_toks, spec_toks);
+
+            // Now test when external draft model has different weights (forces rejections and state rollbacks).
+            make_qwen3(&pd, 42);
+            let gd2 = Gguf::open(&pd).unwrap();
+            let m2 = Model::load_with_aux(&gt, Some(&gd2), &[]).unwrap();
+            if let Ok(bk3) = crate::backend::open(None, 0) {
+                let mut gm_diff = crate::gpu_model::GpuModel::load(&m2, bk3, 64, 0, 0, 3).unwrap();
+                let l_diff = gm_diff.prefill(&[1, 2]).unwrap();
+                let mut next_d = crate::ops::argmax(&l_diff) as u32;
+                let mut diff_toks = Vec::new();
+                let mut row_d = 0;
+                while diff_toks.len() < 8 {
+                    let (toks, nx, rw) = gm_diff.spec_step(next_d, row_d, &mut smp).unwrap();
+                    diff_toks.extend_from_slice(&toks);
+                    next_d = nx;
+                    row_d = rw;
+                }
+                diff_toks.truncate(8);
+                assert_eq!(base_toks, diff_toks);
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

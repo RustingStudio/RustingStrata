@@ -44,6 +44,12 @@ fn graph_records_once_and_replays() {
         for _ in 0..3 { g.graph(5, &mut || { calls += 1; g.add(x.addr(), y.addr(), 4) }).unwrap(); }
         assert_eq!(calls, 1, "f runs only when recording");
         assert_eq!(g.get::<f32>(&x, 0, 4).unwrap(), [3.0, 6.0, 9.0, 12.0]);
+        // A dropped graph is recorded again, and a drop of an unknown key does nothing.
+        g.graph_drop(5).unwrap();
+        g.graph_drop(6).unwrap();
+        for _ in 0..2 { g.graph(5, &mut || { calls += 1; g.add(x.addr(), y.addr(), 4) }).unwrap(); }
+        assert_eq!(calls, 2, "f runs again after the drop");
+        assert_eq!(g.get::<f32>(&x, 0, 4).unwrap(), [5.0, 10.0, 15.0, 20.0]);
     }
 }
 
@@ -69,10 +75,12 @@ fn host_mailbox_is_shared_with_kernels() {
 fn shared_memory_matches_the_committed_spirv() {
     let q2k = [0, 10, 84, 0, 0];  // T = Q2_K (10), SBB = 84: KS = 16
     let iq3s = [0, 21, 110, 0, 0];  // T = IQ3_S (21), SBB = 110: KS = 32
-    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi_dp", &q2k, false).unwrap(), 49152, "gemmi_dp with Q2_K");
-    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi_dp", &iq3s, false).unwrap(), 40960, "gemmi_dp with IQ3_S");
+    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi_dp", &q2k, 0).unwrap(), 49152, "gemmi_dp with Q2_K");
+    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi_dp", &iq3s, 0).unwrap(), 40960, "gemmi_dp with IQ3_S");
     // The COOP variant reads the IQ tables from the buffer too: a shared copy asked for 49168 bytes (Xid 13 on a V100).
-    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi", &q2k, false).unwrap(), 49152, "gemmi with Q2_K");
+    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi", &q2k, 0).unwrap(), 49152, "gemmi with Q2_K");
+    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi_16", &q2k, 0).unwrap(), 40960, "gemmi_16 with Q2_K");
+    assert_eq!(rusting_strata::vulkan::spv_smem::shared_bytes("gemmi_s_16", &q2k, 0).unwrap(), 20992, "gemmi_s_16 with Q2_K");
 }
 
 /// The refusal `Vk::pipeline` raises before it creates anything: kernel, specialization, bytes needed and limit.
@@ -82,12 +90,12 @@ fn shared_memory_matches_the_committed_spirv() {
 fn shared_memory_refusal_names_kernel_spec_bytes_and_limit() {
     use rusting_strata::vulkan::spv_smem::check_shared_memory;
     let spec = [0u32, 10, 84, 0, 0];
-    let e = format!("{:#}", check_shared_memory("gemmi_dp", &spec, false, 40960).unwrap_err());
+    let e = format!("{:#}", check_shared_memory("gemmi_dp", &spec, 0, 40960).unwrap_err());
     for want in ["gemmi_dp", "[0, 10, 84, 0, 0]", "49152", "40960", "maxComputeSharedMemorySize"] {
         assert!(e.contains(want), "{e:?} does not contain {want:?}");
     }
     // Exactly at the limit is accepted: the V100 reports 49152 and `gemmi_dp` with Q2_K needs 49152.
-    assert_eq!(check_shared_memory("gemmi_dp", &spec, false, 49152).unwrap(), 49152);
+    assert_eq!(check_shared_memory("gemmi_dp", &spec, 0, 49152).unwrap(), 49152);
 }
 
 /// The preflight over the reference model's weight types only (no weights uploaded): every pair must fit. Skips
@@ -134,7 +142,7 @@ fn batched_quantized_gemm_uses_prepared_x() {
     use rusting_strata::weights::Tensor;
 
     let data = include_bytes!("fixtures/Q4_K.raw").repeat(8);
-    let weight = Tensor { ty: GgmlType::Q4K, cols: 256, rows: 64, data: &data };
+    let weight = Tensor { ty: GgmlType::Q4K, cols: 256, rows: 64, data: &data, scale: 1.0 };
     assert_eq!(data.len(), weight.ty.row_bytes(256) * 64);
     let n = 128;
     let input: Vec<f32> = (0..n * 256).map(|i| (i % 127) as f32 / 63.0 - 1.0).collect();
@@ -153,5 +161,17 @@ fn batched_quantized_gemm_uses_prepared_x() {
         assert!(got.iter().any(|v| v.abs() > 1e-5), "{backend}: empty GEMM result");
         assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             "{backend}: batched result differs from non-batched GEMM");
+
+        // New rows at the same address: a GEMM without SAME_X quantizes them again.
+        let input2: Vec<f32> = input.iter().map(|v| 0.5 - v * v).collect();
+        let gemm = |x: u64| {
+            let y = gpu.zeros::<f32>(n * 64).unwrap();
+            gpu.gemm_dense(&weight, n, x, 256, y.addr(), 64, 0).unwrap();
+            common::down::<f32>(&*gpu, &y).iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        };
+        let want = gemm(common::up(&*gpu, &input2).addr());
+        gemm(x.addr());
+        gpu.put(&input2, &x, 0).unwrap();
+        assert!(gemm(x.addr()) == want, "{backend}: GEMM used the quantization of the rows x held before");
     }
 }

@@ -235,7 +235,7 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
     let mut m = forward::GlmModel::new(g)?;
     let eos = tok.eos_ids();
     let ids = tok.encode(prompt)?;
-    if std::env::var_os("STRATA_GLM_TRACE").is_some() { eprintln!("prompt ids {ids:?}"); }
+    if std::env::var_os("STRATA_GLM_TRACE").is_some() { crate::say!("prompt ids {ids:?}"); }
     let mut logits = m.prefill(&ids);
     let (mut out, mut shown) = (vec![], 0);
     // STRATA_GLM_FORCE=<file of comma-separated token ids>: teacher-force those tokens (compare top-5 per step with a reference run).
@@ -248,7 +248,7 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
             let mut idx: Vec<usize> = (0..logits.len()).collect();
             idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
             let t: Vec<String> = idx[..5].iter().map(|&k| format!("{k}:{:.4}", logits[k] as f64 - lz)).collect();
-            eprintln!("TOP5 {i} {}", t.join(" "));
+            crate::say!("TOP5 {i} {}", t.join(" "));
         }
         if let Some(&f) = forced.get(i) { next = f; }
         if eos.contains(&next) { break; }
@@ -376,7 +376,7 @@ pub fn gpu_defaults() {
     if std::env::var_os("STRATA_GLM_PREFETCH").is_none() { unsafe { std::env::set_var("STRATA_GLM_PREFETCH", "2") } }
 }
 
-/// Context limit per request: the model's trained context, or `STRATA_GLM_CTX`.
+/// Context limit per request: `--ctx`, else `STRATA_GLM_CTX`, else the model's trained context.
 fn ctx_limit(m: &forward::GlmModel) -> usize { forward::max_ctx(&m.cfg) }
 
 /// `rustingstrata chat` for GLM: greedy, thinking on, KV kept across turns while the history extends it.
@@ -388,7 +388,7 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize) -> anyhow::Result<()> {
     let stop = stop_ids(g, &tok);
     let mut msgs: Vec<(String, String)> = system.into_iter().map(|s| ("system".to_string(), s)).collect();
     loop {
-        print!("> ");
+        print!("{}", crate::term::prompt());
         std::io::stdout().flush()?;
         let mut line = String::new();
         if std::io::stdin().lock().read_line(&mut line)? == 0 { break; }
@@ -396,7 +396,7 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize) -> anyhow::Result<()> {
         msgs.push(("user".into(), line.trim_end().into()));
         let view: Vec<(&str, &str)> = msgs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
         let ids = tok.encode(&chat_prompt(&view))?;
-        if ids.len() >= ctx_limit(&m) { eprintln!("context full ({} tokens)", ids.len()); break; }
+        if ids.len() >= ctx_limit(&m) { crate::say!("context full ({} tokens)", ids.len()); break; }
         let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
         let logits = m.prefill(&ids[keep..]);
         let room = n.min(ctx_limit(&m) - ids.len());
@@ -407,96 +407,63 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `rustingstrata serve` for GLM: one request at a time, OpenAI `/v1/chat/completions` (JSON or SSE), `/v1/models`, `/health`.
+/// The chat of `rustingstrata serve` for GLM (see `serve::Own`): one request at a time, JSON or SSE.
 /// ponytail: greedy only, no stop strings; prompt + reply limited to the model's context (STRATA_GLM_CTX overrides); KV reused when the prompt extends it.
-pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow::Result<()> {
+pub fn serve<'a>(g: &'a Gguf, tok: &'a crate::tokenizer::Tokenizer, name: &'a str) -> anyhow::Result<crate::serve::Own<'a>> {
+    use anyhow::Context;
     use serde_json::json;
     use std::io::Write;
     gpu_defaults();
-    let tok = crate::tokenizer::Tokenizer::from_gguf(g)?;
     let mut m = forward::GlmModel::new(g)?;
-    let stop = stop_ids(g, &tok);
+    let stop = stop_ids(g, tok);
     let ctx = ctx_limit(&m);
-    let l = std::net::TcpListener::bind(addr)?;
-    eprintln!("glm serve on http://{addr}/ model {name}");
-    for c in l.incoming() {
-        let Ok(mut c) = c else { continue };
-        let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-        let _ = c.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-        let Ok(r) = crate::serve::read_request(&mut std::io::BufReader::new(&c)) else { continue };
-        let send = |c: &mut std::net::TcpStream, status: &str, ty: &str, b: &str| {
-            let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+    Ok(Box::new(move |c: &mut std::net::TcpStream, q: &crate::serve::ChatRequest| {
+        let ids = tok.encode(&chat_prompt_tools(&q.messages, &q.tools)).ok().filter(|i| !i.is_empty()).context("cannot encode prompt")?;
+        anyhow::ensure!(ids.len() < ctx, "prompt is {} tokens, the limit is {}", ids.len(), ctx - 1);
+        let t = std::time::Instant::now();
+        let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
+        let logits = m.prefill(&ids[keep..]);
+        let prefill_s = t.elapsed().as_secs_f64();
+        let n = q.max_tokens.unwrap_or(256).min(ctx - ids.len());
+        if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
+        let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
+        let stream = q.stream;
+        let tools = q.tool_calls && !q.tools.is_empty();
+        let mut hold = crate::chat::Hold::new(tools, vec![]);
+        let (out, done) = decode_greedy(&mut m, &tok, &stop, logits, n, &mut |t| {
+            let t = hold.push(t);
+            !stream || t.is_empty() || write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok()
+        });
+        let calls = if tools { parse_calls(&hold.text, &q.tools) } else { None };
+        let done = if calls.is_some() { "tool_calls" } else { done };
+        let calls_json = |(content, calls): &(String, Vec<(String, String)>), stream: bool| {
+            let c: Vec<_> = calls.iter().enumerate().map(|(k, (f, a))| {
+                let mut c = json!({"id": format!("call_{k}"), "type": "function", "function": {"name": f, "arguments": a}});
+                if stream { c["index"] = k.into(); }
+                c
+            }).collect();
+            if stream { json!({"tool_calls": c}) } else { json!({"role": "assistant", "content": if content.is_empty() { None } else { Some(content) }, "tool_calls": c}) }
         };
-        let path = r.path.split('?').next().unwrap_or("");
-        if path != "/health" && api_key.is_none() && !crate::serve::host_ok(&r.host, addr, &[]) {
-            send(&mut c, "403 Forbidden", "application/json", r#"{"error":{"message":"bad Host header"}}"#);
-            continue;
-        }
-        if path != "/health" && api_key.is_some_and(|k| !crate::serve::key_ok(&r.auth, k)) {
-            send(&mut c, "401 Unauthorized", "application/json", r#"{"error":{"message":"missing or wrong API key","type":"invalid_api_key"}}"#);
-            continue;
-        }
-        match (r.method.as_str(), path) {
-            ("GET", "/health") => send(&mut c, "200 OK", "application/json", r#"{"status":"ok"}"#),
-            ("GET", "/v1/models") => send(&mut c, "200 OK", "application/json", &json!({"object": "list", "data": [{"id": name, "object": "model", "owned_by": "strata"}]}).to_string()),
-            ("POST", "/v1/chat/completions") => {
-                let q = match crate::serve::chat_request(&r.body) {
-                    Ok(q) => q,
-                    Err(e) => { send(&mut c, "400 Bad Request", "application/json", &json!({"error": {"message": format!("{e:#}"), "type": "invalid_request_error"}}).to_string()); continue }
-                };
-                let ids = match tok.encode(&chat_prompt_tools(&q.messages, &q.tools)) {
-                    Ok(i) if !i.is_empty() => i,
-                    _ => { send(&mut c, "400 Bad Request", "application/json", r#"{"error":{"message":"cannot encode prompt"}}"#); continue }
-                };
-                if ids.len() >= ctx {
-                    send(&mut c, "400 Bad Request", "application/json", &json!({"error": {"message": format!("prompt is {} tokens, the limit is {}", ids.len(), ctx - 1), "type": "invalid_request_error"}}).to_string());
-                    continue;
-                }
-                let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
-                let logits = m.prefill(&ids[keep..]);
-                let n = q.max_tokens.unwrap_or(256).min(ctx - ids.len());
-                if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
-                let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
-                let stream = q.stream;
-                let tools = q.tool_calls && !q.tools.is_empty();
-                let mut hold = crate::chat::Hold::new(tools, vec![]);
-                let (out, done) = decode_greedy(&mut m, &tok, &stop, logits, n, &mut |t| {
-                    let t = hold.push(t);
-                    !stream || t.is_empty() || write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok()
-                });
-                let calls = if tools { parse_calls(&hold.text, &q.tools) } else { None };
-                let done = if calls.is_some() { "tool_calls" } else { done };
-                let calls_json = |(content, calls): &(String, Vec<(String, String)>), stream: bool| {
-                    let c: Vec<_> = calls.iter().enumerate().map(|(k, (f, a))| {
-                        let mut c = json!({"id": format!("call_{k}"), "type": "function", "function": {"name": f, "arguments": a}});
-                        if stream { c["index"] = k.into(); }
-                        c
-                    }).collect();
-                    if stream { json!({"tool_calls": c}) } else { json!({"role": "assistant", "content": if content.is_empty() { None } else { Some(content) }, "tool_calls": c}) }
-                };
-                if stream {
-                    match &calls {
-                        Some(x) => { let _ = write!(c, "data: {}\n\n", chunk(calls_json(x, true), None)); }
-                        None if !hold.rest().is_empty() => { let _ = write!(c, "data: {}\n\n", chunk(json!({"content": hold.rest()}), None)); }
-                        None => {}
-                    }
-                    // llama-swap and OpenAI clients read the final chunk's usage.
-                    let mut last = chunk(json!({}), Some(done));
-                    last["usage"] = json!({"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len(),
-                        "prompt_tokens_details": {"cached_tokens": keep}});
-                    let _ = write!(c, "data: {last}\n\ndata: [DONE]\n\n");
-                } else {
-                    let message = match &calls { Some(x) => calls_json(x, false), None => json!({"role": "assistant", "content": hold.text}) };
-                    let b = json!({"object": "chat.completion", "model": name, "choices": [{"index": 0, "message": message, "finish_reason": done}],
-                        "usage": {"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len(),
-                            "prompt_tokens_details": {"cached_tokens": keep}}});
-                    send(&mut c, "200 OK", "application/json", &b.to_string());
-                }
+        if stream {
+            match &calls {
+                Some(x) => { let _ = write!(c, "data: {}\n\n", chunk(calls_json(x, true), None)); }
+                None if !hold.rest().is_empty() => { let _ = write!(c, "data: {}\n\n", chunk(json!({"content": hold.rest()}), None)); }
+                None => {}
             }
-            _ => send(&mut c, "404 Not Found", "application/json", r#"{"error":{"message":"not found"}}"#),
+            // llama-swap and OpenAI clients read the final chunk's usage.
+            let mut last = chunk(json!({}), Some(done));
+            last["usage"] = json!({"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len(),
+                "prompt_tokens_details": {"cached_tokens": keep}});
+            let _ = write!(c, "data: {last}\n\ndata: [DONE]\n\n");
+        } else {
+            let message = match &calls { Some(x) => calls_json(x, false), None => json!({"role": "assistant", "content": hold.text}) };
+            let b = json!({"object": "chat.completion", "model": name, "choices": [{"index": 0, "message": message, "finish_reason": done}],
+                "usage": {"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len(),
+                    "prompt_tokens_details": {"cached_tokens": keep}}});
+            crate::serve::send(c, "200 OK", "application/json", &b.to_string());
         }
-    }
-    Ok(())
+        Ok(crate::serve::Done { prompt: ids.len(), cached: keep, completion: out.len(), prefill_s, finish: done })
+    }))
 }
 
 #[cfg(test)]

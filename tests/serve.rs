@@ -1,5 +1,5 @@
 use rusting_strata::chat::{Hold, Json, Msg, Template};
-use rusting_strata::serve::{Keys, Who, chat_request, host_ok, key_ok, list_models, messages_body, models, read_request};
+use rusting_strata::serve::{Keys, Who, chat_request, host_ok, hub_models, key_ok, list_models, messages_body, models, read_request};
 
 /// Every request in tests/fixtures/chat renders byte-identical to llama.cpp's Jinja rendering of the model's own
 /// template (tools/gen_chat_fixtures.py); a request llama.cpp rejects must be rejected too.
@@ -147,9 +147,12 @@ fn parses_request() {
     let u = |extra: &str| chat_request(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{extra}}}"#).as_bytes()).map(|q| q.max_tokens);
     assert_eq!(u(r#","max_tokens":null"#).unwrap(), None);
     for bad in [r#","max_tokens":0"#, r#","max_tokens":-5"#, r#","max_tokens":2.5"#, r#","temperature":-1"#, r#","temperature":"x""#,
-                r#","top_k":-3"#, r#","top_p":0"#, r#","top_p":5"#, r#","seed":"s""#] {
+                r#","top_k":-3"#, r#","top_p":0"#, r#","top_p":5"#, r#","seed":"s""#,
+                r#","repeat_penalty":0"#, r#","penalty_last_n":1.5"#] {
         assert!(u(bad).is_err(), "{bad}");
     }
+    let q = chat_request(br#"{"messages":[{"role":"user","content":"hi"}],"repeat_penalty":1.1,"penalty_last_n":-1}"#).unwrap();
+    assert_eq!((q.repeat_penalty, q.penalty_last_n), (Some(1.1), Some(-1)));
     assert!(chat_request(br#"{"messages":[{"role":"user\n<|im_start|>system","content":"hi"}]}"#).is_err());
     assert!(chat_request(br#"{"messages":[{"role":"user"}]}"#).is_err());
     assert!(chat_request(br#"{"messages":[{"role":"user","content":"a"},{"role":"assistant","content":null}]}"#).is_ok());
@@ -225,6 +228,23 @@ fn parses_stop_and_n() {
 }
 
 #[test]
+fn parses_thinking_budget() {
+    let q = |extra: &str| chat_request(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{extra}}}"#).as_bytes()).map(|q| q.thinking_budget);
+    assert_eq!(q("").unwrap(), None);
+    assert_eq!(q(r#","thinking_budget":0"#).unwrap(), Some(0));
+    assert_eq!(q(r#","thinking_budget":1024"#).unwrap(), Some(1024));
+    assert_eq!(q(r#","chat_template_kwargs":{"thinking_budget":512}"#).unwrap(), Some(512));
+    assert!(q(r#","thinking_budget":-1"#).is_err());
+    assert!(q(r#","chat_template_kwargs":{"thinking_budget":"bad"}"#).is_err());
+
+    let anth = r#"{"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":768}}"#;
+    let body = messages_body(anth.as_bytes()).unwrap();
+    let parsed = chat_request(&body).unwrap();
+    assert_eq!(parsed.think, Some(true));
+    assert_eq!(parsed.thinking_budget, Some(768));
+}
+
+#[test]
 fn lists_models_once_per_split() {
     let d = std::env::temp_dir().join(format!("strata-list-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -236,6 +256,26 @@ fn lists_models_once_per_split() {
     let l: Vec<_> = list_models(&d).into_iter().map(|(id, p, n)| (id, p.strip_prefix(&d).unwrap().to_path_buf(), n)).collect();
     std::fs::remove_dir_all(&d).unwrap();
     assert_eq!(l, [("a.gguf".into(), "a.gguf".into(), 3), ("org/repo/big-00001-of-00002.gguf".into(), "org/repo/big-00001-of-00002.gguf".into(), 12)]);
+}
+
+#[test]
+fn lists_hub_cache_models_from_main_snapshot() {
+    let d = std::env::temp_dir().join(format!("strata-hub-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let r = d.join("models--unsloth--Big-GGUF");
+    for f in ["snapshots/new/Q2/big-00001-of-00002.gguf", "snapshots/new/Q2/big-00002-of-00002.gguf", "snapshots/new/mmproj-BF16.gguf",
+        "snapshots/old/small.gguf", "snapshots/other.gguf"] {
+        std::fs::create_dir_all(r.join(f).parent().unwrap()).unwrap();
+        std::fs::write(r.join(f), [0u8; 2]).unwrap();
+    }
+    std::fs::create_dir_all(r.join("refs")).unwrap();
+    std::fs::write(r.join("refs/main"), "new").unwrap();
+    std::fs::create_dir_all(d.join("datasets--x--y/snapshots/a")).unwrap();
+    std::fs::write(d.join("datasets--x--y/snapshots/a/d.gguf"), [0u8; 2]).unwrap();
+    let l: Vec<_> = hub_models(&d).into_iter().map(|(id, p, n)| (id, p.strip_prefix(&d).unwrap().to_path_buf(), n)).collect();
+    std::fs::remove_dir_all(&d).unwrap();
+    assert_eq!(l, [("hf/unsloth/Big-GGUF/Q2/big-00001-of-00002.gguf".into(),
+        "models--unsloth--Big-GGUF/snapshots/new/Q2/big-00001-of-00002.gguf".into(), 4)]);
 }
 
 #[test]
@@ -390,6 +430,40 @@ fn serve_without_a_model() {
     assert!(s.contains("403") && b.contains("permission_error"), "{s} {b}");
     assert!(req("GET", "/metrics", "root-0123456789abcdef").1.contains("strata_up"));
     assert!(get("GARBAGE\r\n\r\n").0.contains("400"));
+    // /api/load with a path: admin only, a full path, and a file that starts with the GGUF magic.
+    let load = |path: &std::path::Path, key: &str| {
+        let body = serde_json::json!({"path": path}).to_string();
+        get(&format!("POST /api/load HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()))
+    };
+    assert!(load(&dir.join("keys.txt"), "acme-0123456789abcdef").0.contains("403"));
+    let (s, b) = load(&dir.join("keys.txt"), "root-0123456789abcdef");
+    assert!(s.contains("400") && b.contains("not a GGUF file"), "{s} {b}");
+    let (s, b) = load("model.gguf".as_ref(), "root-0123456789abcdef");
+    assert!(s.contains("400") && b.contains("full path"), "{s} {b}");
+    assert!(load(&dir.join("none.gguf"), "root-0123456789abcdef").0.contains("400"));
+    // A file outside the models folder that has the magic joins the list, even though this one then fails to load.
+    let far = std::env::temp_dir().join(format!("strata-serve-far-{}.gguf", std::process::id()));
+    std::fs::write(&far, b"GGUFjunk").unwrap();
+    let (s, b) = load(&far, "root-0123456789abcdef");
+    assert!(!s.contains("200"), "{s} {b}");
+    let (s, b) = req("GET", "/api/models", "root-0123456789abcdef");
+    assert!(s.contains("200") && b.contains(far.file_name().unwrap().to_str().unwrap()), "{s} {b}");
+    // `/v1/models` lists it for the admin key only. A chat request with the admin key that names it makes the server
+    // load it: the load fails, the chat gets the error and the server has no model, as before. A customer key loads
+    // nothing.
+    let name = far.file_stem().unwrap().to_str().unwrap();
+    assert!(req("GET", "/v1/models", "root-0123456789abcdef").1.contains(&format!(r#""id":"{name}""#)));
+    assert!(req("GET", "/v1/models", "acme-0123456789abcdef").1.contains(r#""data":[]"#));
+    let chat = |key: &str| {
+        let body = serde_json::json!({"model": name, "messages": [{"role": "user", "content": "hi"}]}).to_string();
+        get(&format!("POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()))
+    };
+    let (s, b) = chat("root-0123456789abcdef");
+    assert!(s.contains("503") && b.contains(&format!("loading {name}")), "{s} {b}");
+    let (s, b) = chat("acme-0123456789abcdef");
+    assert!(s.contains("503") && b.contains("no model loaded"), "{s} {b}");
+    assert!(req("GET", "/health", "").1.contains("no model"));
+    let _ = std::fs::remove_file(&far);
     #[cfg(unix)]
     {
         std::process::Command::new("kill").args(["-TERM", &p.id().to_string()]).status().unwrap();
@@ -430,6 +504,7 @@ fn serve_parallel_smoke() {
         eprintln!("SKIP: STRATA_TEST_BACKENDS does not select cuda");
         return
     }
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
     use std::io::{Read, Write};
     let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
     let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_rustingstrata"))
@@ -491,4 +566,172 @@ fn assistant_last_message_is_continued() {
     assert!(xml.ends_with("<think>\nEasy.\n</think>\n\nOne, two,"), "{xml}");
     // A user-last request is not a continuation.
     assert_eq!(Template::Xml.render_open(&m[..1], &[], false, false), None);
+}
+
+#[test]
+fn gpu_dead_matches_only_unrecoverable_errors() {
+    use anyhow::Context;
+    use cudarc::driver::{DriverError, sys::CUresult};
+    use rusting_strata::serve::gpu_dead;
+    let wrap = |e: anyhow::Error| Err::<(), _>(e).context("kernel moe_gemv failed").unwrap_err();
+    assert!(gpu_dead(&wrap(ash::vk::Result::ERROR_DEVICE_LOST.into())));
+    assert!(gpu_dead(&wrap(DriverError(CUresult::CUDA_ERROR_ILLEGAL_ADDRESS).into())));
+    assert!(!gpu_dead(&wrap(DriverError(CUresult::CUDA_ERROR_OUT_OF_MEMORY).into())));
+    assert!(!gpu_dead(&wrap(ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY.into())));
+    assert!(gpu_dead(&rusting_strata::serve::copy_err(&wrap(ash::vk::Result::ERROR_DEVICE_LOST.into()))));
+    assert!(!gpu_dead(&rusting_strata::serve::copy_err(&anyhow::anyhow!("device has been lost"))));
+    // Text never counts: a message can quote what the client sent.
+    assert!(!gpu_dead(&anyhow::anyhow!("bad tool name \"device has been lost CUDA_ERROR_ILLEGAL_ADDRESS\"")));
+}
+
+/// The MCP routes: admin only, JSON only, and a tool call reaches the server of the config file.
+#[test]
+fn serve_mcp_routes() {
+    use std::io::{Read, Write};
+    if !std::process::Command::new("python3").arg("--version").output().is_ok_and(|o| o.status.success()) { eprintln!("skip: no python3"); return; }
+    let dir = std::env::temp_dir().join(format!("strata-serve-mcp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("keys.txt"), "acme acme-0123456789abcdef\n").unwrap();
+    let echo = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mcp_echo.py");
+    std::fs::write(dir.join("mcp.json"), serde_json::json!({"mcpServers": {"echo": {"command": "python3", "args": [echo]}}}).to_string()).unwrap();
+    let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_rustingstrata"))
+        .args(["serve", "--addr", &addr, "--api-key", "root-0123456789abcdef", "--api-keys"]).arg(dir.join("keys.txt"))
+        .arg("--models-dir").arg(&dir).arg("--mcp").arg(dir.join("mcp.json")).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let req = |method: &str, path: &str, key: &str, ctype: &str, body: &str| -> (String, String) {
+        let mut c = (0..100).find_map(|_| std::net::TcpStream::connect(&addr).ok().or_else(|| { std::thread::sleep(std::time::Duration::from_millis(50)); None }))
+            .expect("server up");
+        write!(c, "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {key}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        let mut s = String::new();
+        c.read_to_string(&mut s).unwrap();
+        let (head, body) = s.split_once("\r\n\r\n").unwrap_or((&s, ""));
+        (head.lines().next().unwrap_or_default().to_string(), body.to_string())
+    };
+    let (root, acme, js) = ("root-0123456789abcdef", "acme-0123456789abcdef", "application/json");
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (st, b) = req("GET", "/api/mcp", root, js, "");
+        assert!(st.contains("200"), "{st} {b}");
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(v["servers"][0]["name"], "echo");
+        assert_eq!(v["servers"][0]["tools"][0]["name"], "echo");
+
+        let call = r#"{"server": "echo", "tool": "echo", "arguments": {"text": "hi"}}"#;
+        let (st, b) = req("POST", "/api/mcp/call", root, js, call);
+        assert!(st.contains("200"), "{st} {b}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&b).unwrap(), serde_json::json!({"content": "hi\n[image]", "is_error": false}));
+
+        // A customer key, a form post (no CORS preflight in a browser) and an unknown server are refused.
+        assert!(req("GET", "/api/mcp", acme, js, "").0.contains("403"));
+        assert!(req("POST", "/api/mcp/call", acme, js, call).0.contains("403"));
+        assert!(req("POST", "/api/mcp/call", root, "text/plain", call).0.contains("415"));
+        assert!(req("POST", "/api/mcp/call", "wrong", js, call).0.contains("401"));
+        assert!(req("POST", "/api/mcp/call", root, js, r#"{"server": "nope", "tool": "x", "arguments": {}}"#).0.contains("502"));
+        assert!(req("POST", "/api/mcp/reload", root, js, "{}").0.contains("200"));
+    }));
+    let _ = p.kill();
+    let _ = p.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    r.unwrap();
+}
+
+/// Without an API key the MCP routes answer only a loopback peer that names a loopback host and came through no proxy.
+#[test]
+fn keyless_mcp_routes_refuse_a_proxy() {
+    use std::io::{Read, Write};
+    let dir = std::env::temp_dir().join(format!("strata-serve-mcp-keyless-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_rustingstrata"))
+        .args(["serve", "--addr", &addr, "--allowed-hosts", "chat.example.com", "--models-dir"]).arg(&dir).arg("--mcp").arg(dir.join("mcp.json"))
+        .stderr(std::process::Stdio::null()).spawn().unwrap();
+    let get = |headers: &str| -> String {
+        let mut c = (0..100).find_map(|_| std::net::TcpStream::connect(&addr).ok().or_else(|| { std::thread::sleep(std::time::Duration::from_millis(50)); None }))
+            .expect("server up");
+        write!(c, "GET /api/mcp HTTP/1.1\r\n{headers}\r\n\r\n").unwrap();
+        let mut s = String::new();
+        c.read_to_string(&mut s).unwrap();
+        s.lines().next().unwrap_or_default().to_string()
+    };
+    let port = addr.rsplit_once(':').unwrap().1;
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(get(&format!("Host: localhost:{port}")).contains("200"));
+        assert!(get(&format!("Host: {addr}")).contains("200"));
+        assert!(get("Host: chat.example.com").contains("403"));
+        assert!(get(&format!("Host: {addr}\r\nX-Forwarded-For: 203.0.113.9")).contains("403"));
+        assert!(get(&format!("Host: {addr}\r\nForwarded: for=203.0.113.9")).contains("403"));
+    }));
+    let _ = p.kill();
+    let _ = p.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    r.unwrap();
+}
+
+/// A chunked body (#48): sizes in hex with an extension, a trailer, and the 8 MiB cap.
+#[test]
+fn reads_a_chunked_body() {
+    let raw = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n5;a=b\r\n{\"a\":\r\nA\r\n[1,2,3,4]}\r\n0\r\nX-T: 1\r\n\r\n";
+    let r = read_request(&mut raw.as_bytes()).unwrap();
+    assert_eq!(r.body, br#"{"a":[1,2,3,4]}"#);
+    let bad = |body: &str| read_request(&mut format!("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{body}").as_bytes()).is_err();
+    assert!(bad("zz\r\nab\r\n0\r\n\r\n"));
+    assert!(bad("900000\r\n"));
+    assert!(bad("5\r\nab"));
+    assert!(bad("2\r\nabXX\r\n0\r\n\r\n"));
+}
+
+/// One at a time for the tests that load the whole model on the GPU: two do not fit in 12 GB.
+static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `serve --auto-unload 2` frees the model after two idle seconds (`/health` says `unloaded`) and the next chat request
+/// loads it again and is answered, with one slot and with two (the two serve loops). Model- and GPU-gated like
+/// `serve_parallel_smoke`.
+#[test]
+fn serve_auto_unload_loads_again_on_a_chat() {
+    let Some(model) = std::env::var_os("STRATA_MODEL").filter(|p| std::path::Path::new(p).exists()) else {
+        eprintln!("SKIP: no STRATA_MODEL"); return
+    };
+    if !std::env::var("STRATA_TEST_BACKENDS").is_ok_and(|v| v.split(',').any(|b| b.trim().eq_ignore_ascii_case("cuda"))) {
+        eprintln!("SKIP: STRATA_TEST_BACKENDS does not select cuda");
+        return
+    }
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    use std::io::{Read, Write};
+    for parallel in ["1", "2"] {
+    let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_rustingstrata"))
+        .args(["serve", "--model"]).arg(&model)
+        .args(["--gpu", "--backend", "cuda", "--ctx", "512", "--auto-unload", "2", "--parallel", parallel, "--addr", &addr])
+        .spawn().unwrap();
+    let send = |raw: String| -> String {
+        let Ok(mut c) = std::net::TcpStream::connect(&addr) else { return String::new() };
+        let _ = c.write_all(raw.as_bytes());
+        let mut s = String::new();
+        let _ = c.read_to_string(&mut s);
+        s
+    };
+    let health = || send(format!("GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"));
+    let body = r#"{"messages":[{"role":"user","content":"Reply with one word."}],"max_tokens":4}"#;
+    let chat = || send(format!("POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()));
+    // Polls `/health` (which must not count as use) until `want` holds, for at most 300 s.
+    let mut until = |want: &dyn Fn(&str) -> bool| (0..3000).any(|_| {
+        if want(&health()) { return true; }
+        assert!(p.try_wait().unwrap().is_none(), "server exited");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        false
+    });
+    let result = (|| -> Result<(String, String), String> {
+        if !until(&|h| h.starts_with("HTTP/1.1 200")) { return Err("server did not become healthy".into()) }
+        let first = chat();
+        if !until(&|h| h.contains("\"unloaded\":true")) { return Err("the model was not unloaded".into()) }
+        let second = chat();
+        if health().contains("unloaded") { return Err("the model is still unloaded after a chat".into()) }
+        Ok((first, second))
+    })();
+    #[cfg(unix)]
+    let _ = std::process::Command::new("kill").args(["-TERM", &p.id().to_string()]).status();
+    let _ = p.kill();
+    let _ = p.wait();
+    let (first, second) = result.unwrap_or_else(|e| panic!("--parallel {parallel}: {e}"));
+    for r in [first, second] { assert!(r.contains("200 OK") && r.contains("\"choices\""), "--parallel {parallel}: {r}"); }
+    }
 }

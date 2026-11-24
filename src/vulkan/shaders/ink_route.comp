@@ -1,0 +1,66 @@
+#version 460
+layout(local_size_x = 32) in;
+#include "common.glsl"
+
+// Inkling 2 router: sigmoid(logits[row, i]), top-k sorted by (prob + bias[i]) descending (ties: lowest expert index),
+// then weights normalized over the selected experts' unbiased probs * exp_scale (* dn_sc[id] if non-null),
+// and optional gsc_out[row, lane] = gu_sc[id] (or 1.0 if gu_sc is null).
+layout(push_constant) uniform P { F32 logits; F32 bias; I32 ids; F32 wts; F32 gu_sc; F32 dn_sc; F32 gsc_out; uint n; uint k; float exp_scale; } p;
+
+uint f2key(float x) {
+    uint u = floatBitsToUint(x == 0.0 ? 0.0 : x);
+    return (u & 0x80000000u) != 0u ? ~u : (u ^ 0x80000000u);
+}
+
+const uint R = 16;
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = LANE;
+    uint base = W64 ? (gl_SubgroupInvocationID & ~31u) : 0u;
+    float p_arr[R], s_arr[R];
+    for (uint r = 0; r < R; r++) {
+        uint i = lane + 32u * r;
+        if (i < p.n) {
+            float pr = sigmoid(p.logits.v[row * p.n + i]);
+            float b = uint64_t(p.bias) != 0 ? p.bias.v[i] : 0.0;
+            p_arr[r] = pr;
+            s_arr[r] = pr + b;
+        } else {
+            p_arr[r] = 0.0;
+            s_arr[r] = -1.0 / 0.0;
+        }
+    }
+    uint taken = 0u;
+    float sum = 0.0, mine = 0.0;
+    int id = 0;
+    for (uint j = 0; j < p.k; j++) {
+        uint bk = 0u, bi = 0xffffffffu;
+        for (uint r = 0; r < R; r++) {
+            uint i = lane + 32u * r;
+            if (i < p.n && ((taken >> r) & 1u) == 0u) {
+                uint key = f2key(s_arr[r]);
+                if (key > bk) { bk = key; bi = i; }
+            }
+        }
+        uint mk = warp_max_uint(bk);
+        bi = warp_min_uint(bk == mk ? bi : 0xffffffffu);
+        uint wlane = bi & 31u, wr = bi >> 5;
+        float wp = 0.0;
+        if (lane == wlane) {
+            taken |= 1u << wr;
+            for (uint r = 0; r < R; r++) if (r == wr) wp = p_arr[r];
+        }
+        wp = subgroupShuffle(wp, base + wlane);
+        if (lane == j) { id = int(bi); mine = wp; }
+        sum += wp;
+    }
+    float scale = fdiv(p.exp_scale, sum + 1e-20);
+    if (lane < p.k) {
+        p.ids.v[row * p.k + lane] = id;
+        float dn = uint64_t(p.dn_sc) != 0ul ? p.dn_sc.v[id] : 1.0;
+        p.wts.v[row * p.k + lane] = mine * scale * dn;
+        if (uint64_t(p.gsc_out) != 0ul) {
+            p.gsc_out.v[row * p.k + lane] = uint64_t(p.gu_sc) != 0ul ? p.gu_sc.v[id] : 1.0;
+        }
+    }
+}

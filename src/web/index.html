@@ -106,7 +106,7 @@ input, select, textarea { background: var(--bg); border: 1px solid var(--line); 
 #top .drop { flex: 0 1 auto; max-width: min(420px, 50vw); }
 #top .droplist { min-width: min(520px, 94vw); }
 #status { flex: 1; min-width: 0; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: right; }
-#status.bad { color: var(--bad); }
+#status.bad { color: var(--bad); white-space: normal; }
 #chat { flex: 1; overflow-y: auto; padding: 18px 20px 8px; }
 #msgs { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
 .u { white-space: pre-wrap; overflow-wrap: anywhere; padding-left: 2ch; text-indent: -2ch; }
@@ -161,6 +161,14 @@ details.think div { white-space: pre-wrap; }
 .tools label:has(input:checked) { color: var(--accent); border-color: var(--accent); }
 .tools input { width: auto; margin: 0; accent-color: var(--accent); }
 .tools .hint { flex: 1; color: var(--muted); text-align: right; }
+.tcall { margin: 6px 0; border: 1px solid var(--line); border-radius: 2px; font-size: 12px; }
+.tcall summary { padding: 4px 8px; cursor: pointer; color: var(--muted); }
+.tcall.bad summary { color: var(--bad); }
+.tcall pre { margin: 0; padding: 8px; max-height: 240px; overflow: auto; white-space: pre-wrap; }
+#mcplist .srv { margin: 6px 0; }
+#mcplist .srv label { display: flex; gap: 6px; align-items: baseline; }
+#mcplist .srv .t { margin-left: 22px; color: var(--muted); }
+#mcplist input { width: auto; }
 #send { min-width: 64px; margin-left: auto; }
 #preview { display: flex; gap: 8px; flex-wrap: wrap; padding: 6px 0 2px; }
 #preview[hidden] { display: none; }
@@ -280,6 +288,7 @@ progress { width: 100%; height: 6px; accent-color: var(--accent); margin-top: 10
         <button id="attach" type="button" title="Attach an image" data-ic="image">image</button>
         <input id="file" type="file" accept="image/*" hidden>
         <label title="The model reasons before it answers. Slower, often better on hard questions."><input id="think" type="checkbox">think</label>
+        <label id="toolsl" hidden title="The model may call the tools of your MCP servers. Choose them in settings."><input id="tools" type="checkbox"><span id="toolsn">tools</span></label>
         <span class="hint">Enter sends, Shift+Enter adds a line</span>
         <button id="send" class="primary" type="submit" data-ic="send">send</button>
       </div>
@@ -328,6 +337,7 @@ progress { width: 100%; height: 6px; accent-color: var(--accent); margin-top: 10
   <header role="tablist">
     <button role="tab" data-tab="models" aria-selected="true" type="button">models</button>
     <button role="tab" data-tab="chat" aria-selected="false" type="button">replies</button>
+    <button role="tab" data-tab="tools" aria-selected="false" type="button">tools</button>
     <button role="tab" data-tab="conn" aria-selected="false" type="button">connection and data</button>
     <button class="ghost" id="close" type="button" aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
   </header>
@@ -346,13 +356,19 @@ progress { width: 100%; height: 6px; accent-color: var(--accent); margin-top: 10
     <label>Models on this computer</label>
     <div id="local"></div>
     <p class="note" id="dir"></p>
+    <label for="path">Load a .gguf file from another folder: its full path on the server</label>
+    <div class="row">
+      <input id="path" list="paths" placeholder="/path/to/model.gguf" autocomplete="off" spellcheck="false">
+      <datalist id="paths"></datalist>
+      <button id="open" type="button">load</button>
+    </div>
     <label>Load options</label>
     <div class="row" style="gap:20px">
       <div><label for="ectx">context <output id="ectx-o"></output></label><input id="ectx" type="range" min="1024" max="262144" step="1024" value="4096"></div>
       <div><label for="emtp">MTP drafts <output id="emtp-o"></output></label><input id="emtp" type="range" min="0" max="8" step="1" value="0"></div>
     </div>
     <div class="row">
-      <div><label for="ekv">KV cache format</label><select id="ekv"><option value="f16">f16 (default)</option><option value="q8">q8 (half the memory)</option></select></div>
+      <div><label for="ekv">KV cache format</label><select id="ekv"><option value="f16">f16 (default)</option><option value="q8">q8 (half the memory)</option><option value="q4">q4 (quarter the memory)</option><option value="q2">q2 (5.3x smaller, 512k-1M ctx)</option></select></div>
       <div><label for="ecache">chat cache in RAM, MB</label><input id="ecache" type="number" min="0" step="256"></div>
     </div>
     <div class="row">
@@ -389,6 +405,19 @@ progress { width: 100%; height: 6px; accent-color: var(--accent); margin-top: 10
     <label for="stop">stop strings, one per line (at most 16)</label>
     <textarea id="stop" rows="2"></textarea>
     <p class="note">top_p and top_k at the left end, and an empty seed, are not sent: the server's own flags apply.</p>
+  </div>
+  <div class="tab" id="tab-tools" hidden>
+    <label>MCP servers</label>
+    <div id="mcplist"></div>
+    <p class="note" id="mcpnote"></p>
+    <div class="row"><button id="mcpreload" type="button" data-ic="regen">read the file again and restart servers</button></div>
+    <label>Options</label>
+    <div class="row" style="gap:20px">
+      <label style="display:flex;align-items:center;gap:6px"><input id="mcpauto" type="checkbox" style="width:auto;flex:none">run tools without asking</label>
+      <div><label for="mcprounds">tool rounds per reply</label><input id="mcprounds" type="number" min="1" max="50" step="1" value="8"></div>
+      <div><label for="mcpmax">longest tool result, characters</label><input id="mcpmax" type="number" min="1000" step="1000" value="16000"></div>
+    </div>
+    <p class="note">A tool can read and change things outside this page. Without "run tools without asking", every call waits for your answer.</p>
   </div>
   <div class="tab" id="tab-conn" hidden>
     <label for="tint">color theme</label>
@@ -478,13 +507,55 @@ const headers = () => {
   if ($('key').value) h.Authorization = 'Bearer ' + $('key').value;
   return h;
 };
-async function api(path, body) {
-  const r = await fetch(path, body ? { method: 'POST', headers: headers(), body: JSON.stringify(body) } : { headers: headers() });
+async function api(path, body, signal) {
+  const r = await fetch(path, body ? { method: 'POST', headers: headers(), body: JSON.stringify(body), signal } : { headers: headers() });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error?.message || r.statusText);
   return j;
 }
 const status = (t, bad) => { $('status').textContent = t; $('status').className = bad ? 'bad' : ''; };
+
+// MCP tools. The server runs them (GET /api/mcp, POST /api/mcp/call); which are on is kept in this browser.
+let mcp = { servers: [] };
+const mcpOff = new Set(JSON.parse(store.get('mcp.off', '[]')));          // "server" or "server/tool"
+const toolName = (s, t) => (s + '__' + t).replace(/[^A-Za-z0-9_-]/g, '_');
+// The enabled tools as the chat API takes them, and the way back from a model-facing name to its server.
+function toolset(servers = mcp.servers, off = mcpOff) {
+  const defs = [], by = {};
+  for (const s of servers) for (const t of s.tools || []) {
+    if (off.has(s.name) || off.has(s.name + '/' + t.name)) continue;
+    const name = toolName(s.name, t.name);
+    if (by[name]) continue;                                            // two names that sanitize alike: the first wins
+    by[name] = { server: s.name, tool: t.name };
+    defs.push({ type: 'function', function: { name, description: t.description || '', parameters: t.inputSchema || { type: 'object', properties: {} } } });
+  }
+  return { defs, by };
+}
+function mcpShow() {
+  const n = toolset().defs.length, any = mcp.servers.some(s => (s.tools || []).length);
+  $('toolsl').hidden = !any;
+  $('toolsn').textContent = n ? `tools ${n}` : 'tools';
+  $('mcpnote').textContent = mcp.error ? mcp.error : mcp.servers.length ? `Servers come from ${mcp.path}.`
+    : `No servers. Put a file at ${mcp.path || 'the --mcp path'} like {"mcpServers": {"files": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/some/folder"]}}} and press the button below.`;
+  $('mcplist').replaceChildren(...mcp.servers.map(s => {
+    const d = el('div', 'srv'), row = (key, text, title) => {
+      const l = el('label'), c = el('input'); c.type = 'checkbox'; c.checked = !mcpOff.has(key);
+      c.onchange = () => { c.checked ? mcpOff.delete(key) : mcpOff.add(key); store.set('mcp.off', JSON.stringify([...mcpOff])); mcpShow(); };
+      const t = el('span'); t.textContent = text; if (title) l.title = title;
+      l.append(c, t); return l;
+    };
+    d.append(row(s.name, s.error ? `${s.name}: ${s.error}` : `${s.name} (${(s.tools || []).length} tools)`));
+    if (!mcpOff.has(s.name)) for (const t of s.tools || []) { const r = row(s.name + '/' + t.name, t.name, t.description); r.className = 't'; d.append(r); }
+    return d;
+  }));
+}
+async function mcpLoad(reload) {
+  try { mcp = await api(reload ? '/api/mcp/reload' : '/api/mcp', reload ? {} : undefined); } catch (e) { mcp = { servers: [], error: e.message }; }
+  mcpShow();
+}
+$('mcpreload').onclick = () => { $('mcpnote').textContent = 'starting servers…'; mcpLoad(true); };
+for (const id of ['mcpauto', 'tools']) { $(id).checked = store.get(id, '') === '1'; $(id).onchange = () => store.set(id, $(id).checked ? '1' : ''); }
+for (const id of ['mcprounds', 'mcpmax']) { $(id).value = store.get(id, $(id).value); $(id).oninput = () => store.set(id, $(id).value); }
 
 // Panels and dialog.
 $('sbar').onclick = () => document.body.classList.toggle('showpanel');
@@ -541,11 +612,12 @@ $('csys').onclick = () => { openSettings('chat'); $('csystem').focus(); };
 // Export and import.
 const download = (name, text, type) => { const a = el('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); };
 const pack = list => JSON.stringify({ version: 1, chats: list }, null, 1);
-const chatMd = c => `# ${c.title}\n\n` + c.msgs.filter(m => !m.error).map(m => `**${m.role === 'user' ? 'you' : 'model'}:**\n\n${m.content}`).join('\n\n---\n\n') + '\n';
+const chatMd = c => `# ${c.title}\n\n` + c.msgs.filter(m => (m.role === 'tool' || !m.error) && (m.content || m.role !== 'assistant')).map(m => m.role === 'tool' ? `**${m.error ? 'tool failed' : 'tool'} ${m.name}:**\n\n~~~\n${m.content}\n~~~` : `**${m.role === 'user' ? 'you' : 'model'}:**\n\n${m.content}`).join('\n\n---\n\n') + '\n';
 // Takes chats from an export file; an existing chat is replaced only by a newer one. Throws on any other file.
 function merge(text) {
   const j = JSON.parse(text), inc = Array.isArray(j) ? j : j?.chats;
-  const okMsg = m => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string';
+  const okCall = c => c && typeof c.id === 'string' && typeof c.name === 'string' && typeof c.args === 'string';
+  const okMsg = m => m && ['user', 'assistant', 'tool'].includes(m.role) && typeof m.content === 'string' && (m.calls == null || Array.isArray(m.calls) && m.calls.every(okCall));
   if (!Array.isArray(inc) || !inc.every(c => c && typeof c.id === 'string' && typeof c.title === 'string' && typeof c.at === 'number' && Array.isArray(c.msgs) && c.msgs.every(okMsg)))
     throw new Error('not a RustingStrata chat export');
   let n = 0;
@@ -756,7 +828,11 @@ function edit(i, node) {
 }
 function delMsg(i) {
   if (busy) return;
-  cur.msgs.splice(i, cur.msgs[i].role === 'user' && cur.msgs[i + 1]?.role === 'assistant' ? 2 : 1);
+  // A user message goes with its reply; a reply goes whole (tool calls and their results cannot stay without each other).
+  let n = 1;
+  if (cur.msgs[i].role !== 'user') while (i > 0 && cur.msgs[i - 1].role !== 'user') { i--; n++; }
+  while (cur.msgs[i + n] && cur.msgs[i + n].role !== 'user') n++;
+  cur.msgs.splice(i, n);
   save(); show();
 }
 const suggestions = ['Explain in simple words how a graphics card runs a language model', 'Write a Python script that renames photos by the date they were taken', 'Plan three days in Lisbon on a small budget'];
@@ -783,6 +859,15 @@ function show() {
       w.append(d, metaLine(m, i, false));
       box.append(w); return;
     }
+    if (m.role === 'tool') {
+      const d = el('details', 'tcall' + (m.error ? ' bad' : '')), s = el('summary'), p = el('pre');
+      const call = cur.msgs.slice(0, i).reverse().flatMap(x => x.calls || []).find(c => c.id === m.id);
+      s.textContent = `${m.error ? 'tool failed' : 'tool'}: ${m.name}`;
+      p.textContent = (call ? call.args + '\n\n' : '') + m.content;
+      d.append(s, p); box.append(d); return;
+    }
+    // A reply that only called tools has no text of its own: its tool blocks follow.
+    if (m.calls?.length && !m.content && !m.think) return;
     const a = el('div', 'a' + (m.error ? ' error' : '')), b = el('div', 'body');
     if (m.error) b.textContent = m.content; else body(b, m, false);
     a.append(b, metaLine(m, i, i === cur.msgs.length - 1));
@@ -794,15 +879,26 @@ $('new').onclick = () => { if (busy) busy.abort(); cur = null; pendingImages = [
 
 // Asks for a reply to the chat. `cont` continues the last reply instead: the server takes an assistant message at the
 // end of the request as the start of its answer and returns only the new text.
-async function reply(cont) {
+// The chat as the API takes it. `open` is the reply being continued (its thinking goes along).
+function wire(msgs, open) {
+  // `error` means two different things. On an assistant message the turn never happened, so there is nothing to send.
+  // On a tool message it means the tool failed, and that failure is the answer the model is waiting for: dropping it
+  // leaves the call unanswered, and a model with an unanswered call repeats the same call instead of noticing.
+  return msgs.filter(x => !x.error || x.role === 'tool').map(x => {
+    const imgs = x.images || [];
+    if (imgs.length) return { role: x.role, content: [{ type: 'text', text: x.content }, ...imgs.map(url => ({ type: 'image_url', image_url: { url } }))] };
+    // Say it is an error in the text too: a failed result otherwise looks like a payload that happens to be prose.
+    if (x.role === 'tool') return { role: 'tool', tool_call_id: x.id, content: x.error && !/^(Error: |The tool failed: )/.test(x.content) ? `Error: ${x.content}` : x.content };
+    if (x.calls?.length) return { role: 'assistant', content: x.content, tool_calls: x.calls.map(c => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.args || '{}' } })) };
+    return x === open && x.think ? { role: x.role, content: x.content, reasoning_content: x.think } : { role: x.role, content: x.content };
+  });
+}
+// `round` counts the tool rounds of this reply: after the model's tool calls ran, `reply` asks again with the results.
+async function reply(cont, round = 0) {
   const chat = cur, sys = chat.system?.trim() || $('system').value.trim();
   const m = cont ? chat.msgs.at(-1) : { role: 'assistant', content: '', think: '' };
   if (cont) m.content = m.content.trimEnd();
-  const history = chat.msgs.filter(x => !x.error).map(x => {
-    const imgs = x.images || [];
-    if (imgs.length) return { role: x.role, content: [{ type: 'text', text: x.content }, ...imgs.map(url => ({ type: 'image_url', image_url: { url } }))] };
-    return x === m && m.think ? { role: x.role, content: x.content, reasoning_content: m.think } : { role: x.role, content: x.content };
-  });
+  const history = wire(chat.msgs, m), ts = !cont && $('tools').checked ? toolset() : { defs: [], by: {} };
   if (!cont) chat.msgs.push(m);
   show();
   const b = $('msgs').lastElementChild.querySelector('.body');
@@ -816,7 +912,7 @@ async function reply(cont) {
     const r = await fetch('/v1/chat/completions', { method: 'POST', headers: headers(), signal: busy.signal, body: JSON.stringify({
       messages: sys ? [{ role: 'system', content: sys }, ...history] : history,
       stream: true, stream_options: { include_usage: true }, ...sampler(),
-      chat_template_kwargs: { enable_thinking: $('think').checked },
+      chat_template_kwargs: { enable_thinking: $('think').checked }, ...(ts.defs.length ? { tools: ts.defs } : {}),
     }) });
     if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error?.message || r.statusText); }
     const rd = r.body.getReader(), dec = new TextDecoder();
@@ -832,6 +928,12 @@ async function reply(cont) {
         const j = JSON.parse(line.slice(6)), c = j.choices?.[0], d = c?.delta || {};
         if (j.usage) usage = j.usage;
         if (c?.finish_reason) finish = c.finish_reason;
+        for (const t of d.tool_calls || []) {
+          const c = (m.calls ||= [])[t.index ?? m.calls.length] ||= { id: '', name: '', args: '' };
+          if (t.id) c.id = t.id;
+          if (t.function?.name) c.name += t.function.name;
+          if (t.function?.arguments) c.args += t.function.arguments;
+        }
         if (!d.reasoning_content && !d.content) continue;
         if (d.reasoning_content) { if (!tr) tr = performance.now(); m.think += d.reasoning_content; n++; }
         if (d.content) {
@@ -861,10 +963,52 @@ async function reply(cont) {
       m.meta = [`${k} tok`, ...(k > 1 ? [`${((k - 1) / gen).toFixed(1)} tok/s`] : []), `ttft ${secs((first - t0) / 1000)}`];
     }
   }
+  // Tool round: run each call, add its result as a tool message and ask again. A call that was not run (stopped,
+  // refused by the round limit, a reply cut inside the call) must not stay in the history without its result, so
+  // the calls are dropped then.
+  let again = false;
+  if (m.calls?.length) {
+    const max = +$('mcprounds').value || 8, cap = +$('mcpmax').value || 16000, results = [];
+    if (err || finish !== 'tool_calls') {}
+    else if (round >= max) status(`Stopped after ${max} tool rounds. Raise the limit in settings, tools.`, true);
+    else {
+      busy = new AbortController();
+      $('send').innerHTML = ic('stop') + 'stop';
+      for (const c of m.calls) {
+        const at = ts.by[c.name];
+        let content, bad = true;
+        if (busy.signal.aborted) break;
+        if (!at) content = `There is no tool ${c.name}.`;
+        // ponytail: the browser's own confirm box; replace with an inline allow/deny row if it annoys.
+        else if (!$('mcpauto').checked && !confirm(`Run ${at.server} / ${at.tool}?\n\n${c.args}`)) content = 'The user did not allow this tool call.';
+        else {
+          status(`running ${at.server} / ${at.tool}…`);
+          try {
+            let args = {}; try { args = JSON.parse(c.args || '{}'); } catch {}
+            // "stop" ends the wait here; the server still waits for the tool's answer (up to STRATA_MCP_TIMEOUT).
+            const r = await api('/api/mcp/call', { server: at.server, tool: at.tool, arguments: args }, busy.signal);
+            content = r.content.length > cap ? r.content.slice(0, cap) + `\n[cut: ${r.content.length - cap} more characters]` : r.content;
+            bad = r.is_error;
+          } catch (e) { content = 'The tool failed: ' + e.message; }
+        }
+        results.push({ role: 'tool', id: c.id, name: c.name, content, error: bad });
+      }
+      again = results.length === m.calls.length && !busy.signal.aborted;
+      busy = null;
+      $('send').innerHTML = ic('send') + 'send';
+      status('');
+      if (again) chat.msgs.push(...results);
+    }
+    if (!again) {
+      delete m.calls;
+      if (!m.content && !m.think && !m.error) chat.msgs.splice(chat.msgs.indexOf(m), 1);   // nothing but the dropped calls
+    }
+  }
   chat.at = Date.now();
   save();
   if (chat === cur) show(); else list();
   stats();
+  if (again) return reply(false, round + 1);
 }
 function send(text) {
   if (busy) return;
@@ -879,7 +1023,7 @@ function send(text) {
 }
 function regenerate() {
   if (busy || !cur) return;
-  while (cur.msgs.length && cur.msgs.at(-1).role === 'assistant') cur.msgs.pop();
+  while (cur.msgs.length && cur.msgs.at(-1).role !== 'user') cur.msgs.pop();
   if (cur.msgs.length) reply();
 }
 $('form').onsubmit = e => {
@@ -968,7 +1112,7 @@ async function models() {
   listed = true; showOpts(j.options); tint();
   const loaded = j.models.find(m => m.loaded), top = best(known);
   $('model').replaceChildren(...(loaded ? [] : [opt('', j.models.length ? 'choose a model' : 'no models yet')]),
-    ...j.models.map(m => opt(m.id, `${m.id.split('/').pop().replace(/\.gguf$/i, '')}  ${gb(m.bytes)}`)));
+    ...j.models.map(m => opt(m.id, `${m.id.split(/[\\/]/).pop().replace(/\.gguf$/i, '')}  ${gb(m.bytes)}`)));
   $('model').value = loaded ? loaded.id : '';
   $('local').replaceChildren(...j.models.map(m => {
     const d = el('div', '', modelRow(m, m === top));
@@ -983,21 +1127,29 @@ async function models() {
   if (!j.models.length && !$('dlg').open) openSettings('models');
   if (!cur || !cur.msgs.length) show();
 }
-async function load(id, calibrate) {
+async function load(id, calibrate, path) {
   $('model').value = id;
   $('model').disabled = $('send').disabled = true; $('model').sync();
   status(calibrate ? 'Calibrating ' + id + '… a few minutes' : 'Loading ' + id + '… large models take a minute');
   stats();
   try {
     // Calibration replaces chunk and MTP, so the page's values for them are not sent with it.
-    await api('/api/load', calibrate ? { model: id, calibrate: true } : { model: id, options: engineOpts() }); status('');
+    await api('/api/load', calibrate ? { model: id, calibrate: true } : { model: id, path, options: engineOpts() }); status('');
+    if (path) { store.set('paths', JSON.stringify([path, ...paths().filter(p => p !== path)].slice(0, 8))); $('path').value = ''; showPaths(); }
     for (const i in EO) if (!calibrate || i === 'emtp' || i === 'echunk') delete $(i).dataset.dirty;
   } catch (e) { status(e.message, true); }
   $('model').disabled = $('send').disabled = false; $('model').sync();
   models(); stats();
 }
 $('model').onchange = () => $('model').value && load($('model').value);
-$('key').addEventListener('change', () => { models(); stats(); });
+// Files loaded by path: the server lists them only until it stops, so this browser keeps the last few to offer again.
+const paths = () => { try { return JSON.parse(store.get('paths', '[]')); } catch { return []; } };
+const showPaths = () => $('paths').replaceChildren(...paths().map(p => opt(p, p)));
+showPaths();
+// Windows "Copy as path" puts quotes around the path.
+$('open').onclick = () => { const p = $('path').value.trim().replace(/^"(.*)"$/, '$1'); if (p) { $('dlg').close(); load(p, false, p); } };
+$('path').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); $('open').click(); } };
+$('key').addEventListener('change', () => { models(); stats(); mcpLoad(); });
 
 // Hugging Face downloads.
 const dlnote = (t, bad) => { $('dlnote').textContent = t; $('dlnote').className = 'note' + (bad ? ' bad' : ''); };
@@ -1069,9 +1221,9 @@ async function stats() {
   if (firstStats) { models(); $('files').sync(); }   // the fit notes need this computer's memory
   const st = $('state');
   if (!s) { [st.textContent, st.className] = ['Offline', 'state']; return; }
-  [st.textContent, st.className] = s.loading ? ['Loading', 'state busy'] : s.busy ? [`Writing${s.busy > 1 ? ' ' + s.busy + ' replies' : ''}, ${s.live_tokens} tokens`, 'state busy'] : s.model ? ['Ready', 'state ready'] : ['No model', 'state'];
+  [st.textContent, st.className] = s.loading ? ['Loading', 'state busy'] : s.busy ? [`Writing${s.busy > 1 ? ' ' + s.busy + ' replies' : ''}, ${s.live_tokens} tokens`, 'state busy'] : s.unloaded ? ['Unloaded, loads on the next message', 'state'] : s.model ? ['Ready', 'state ready'] : ['No model', 'state'];
   $('mname').textContent = s.model || 'No model loaded';
-  $('minfo').innerHTML = s.model && !s.loading ? dl([
+  $('minfo').innerHTML = s.model && !s.loading && !s.unloaded ? dl([
     ['Runs on', { cpu: 'Processor', cuda: 'CUDA', vulkan: 'Vulkan' }[s.backend]],
     ['Device', s.device || s.system.cpu],
     ['Context', num(s.ctx) + ' tokens'],
@@ -1137,6 +1289,30 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) stat
 function selftest() {
   const swap = (list, f) => { const keep = chats; chats = list; try { return f(); } finally { chats = keep; } };
   const tests = [
+    ['tool names', () => toolName('my files', 'read.file') === 'my_files__read_file'],
+    ['toolset skips what is off', () => {
+      const sv = [{ name: 'a', tools: [{ name: 'x', description: 'd', inputSchema: { type: 'object' } }, { name: 'y' }] }, { name: 'b', tools: [{ name: 'x' }] }];
+      const t = toolset(sv, new Set(['a/y', 'b']));
+      return t.defs.length === 1 && t.defs[0].function.name === 'a__x' && t.by.a__x.server === 'a' && t.by.a__x.tool === 'x' && t.defs[0].function.parameters.type === 'object';
+    }],
+    ['history carries calls and results', () => {
+      const w = wire([{ role: 'user', content: 'q' }, { role: 'assistant', content: '', think: '', calls: [{ id: 'call_0_0', name: 'a__x', args: '{"k":1}' }] },
+        { role: 'tool', id: 'call_0_0', name: 'a__x', content: 'r' }, { role: 'assistant', content: 'done' }]);
+      return w[1].tool_calls[0].function.arguments === '{"k":1}' && w[1].tool_calls[0].id === 'call_0_0' && w[2].role === 'tool' && w[2].tool_call_id === 'call_0_0' && w[2].content === 'r' && !w[3].tool_calls;
+    }],
+    // `error` on a tool message is the tool's answer, so it goes; on an assistant message the turn never happened.
+    ['tool errors go to the model, transport errors do not', () => {
+      const w = wire([{ role: 'user', content: 'q' }, { role: 'assistant', content: '', calls: [{ id: 'c1', name: 'a__x', args: '{}' }, { id: 'c2', name: 'a__y', args: '{}' }] },
+        { role: 'tool', id: 'c1', name: 'a__x', content: 'boom', error: true },
+        { role: 'tool', id: 'c2', name: 'a__y', content: 'The tool failed: Bad Gateway', error: true }, { role: 'assistant', content: 'gone', error: true }]);
+      return w.length === 4 && w[1].tool_calls.length === 2 && w[2].role === 'tool' && w[2].tool_call_id === 'c1' && w[3].tool_call_id === 'c2' && w[2].content === 'Error: boom' && w[3].content === 'The tool failed: Bad Gateway';
+    }],
+    ['tool messages export and import', () => {
+      const c = { id: 't1', title: 't', at: 1, msgs: [{ role: 'user', content: 'q' }, { role: 'assistant', content: '', calls: [{ id: 'c1', name: 'a__x', args: '{}' }] }, { role: 'tool', id: 'c1', name: 'a__x', content: 'r' }, { role: 'assistant', content: 'done' }] };
+      const bad = { ...c, msgs: [{ role: 'assistant', content: '', calls: 'x' }] }, md = chatMd(c);
+      return swap([], () => merge(pack([c])) === 1 && chats[0].msgs[2].role === 'tool' && chats[0].msgs[1].calls[0].id === 'c1') && md.includes('**tool a__x:**\n\n~~~\nr\n~~~') && !md.includes('**model:**\n\n\n')
+        && swap([], () => { try { merge(pack([bad])); return false; } catch { return true; } });
+    }],
     ['table', () => { const h = md('| a | b |\n|---|---|\n| 1 | 2 |'); return h.includes('<th>a</th>') && h.includes('<td>2</td>'); }],
     ['quote', () => md('> hi').includes('<blockquote><p>hi</p></blockquote>')],
     ['nested list', () => md('- a\n  - b\n- c') === '<ul><li>a<ul><li>b</li></ul></li><li>c</li></ul>'],
@@ -1164,6 +1340,7 @@ show();
 models();
 poll(true);
 stats();
+mcpLoad();
 </script>
 </body>
 </html>

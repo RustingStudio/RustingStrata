@@ -122,29 +122,159 @@ pub struct Sampler {
     pub top_p: f32,
     /// xorshift64 state; must not be 0.
     pub rng: u64,
+    /// OpenAI `presence_penalty`: subtracted once from the logit of every token this sampler already returned.
+    pub presence: f32,
+    /// OpenAI `frequency_penalty`: subtracted from a returned token's logit once per time it was returned.
+    pub frequency: f32,
+    /// llama.cpp `repeat_penalty`: the logit of a token among the last `last_n` returned ones is divided by it when
+    /// positive, multiplied when not. 1 is off.
+    pub repeat: f32,
+    /// llama.cpp `penalty_last_n`, for `repeat` only: 0 turns it off, a negative value takes the whole reply.
+    pub last_n: i32,
+    /// How often each token was returned, for the penalties (only the reply, not the prompt).
+    pub seen: std::collections::HashMap<usize, u32>,
+    /// DRY ("don't repeat yourself") multiplier; 0 is off. A token that would extend a sequence of `n >=
+    /// dry_allowed` tokens that already appeared in the reply loses `dry_mult * dry_base^(n - dry_allowed)` of logit.
+    pub dry_mult: f32,
+    pub dry_base: f32,
+    pub dry_allowed: usize,
+    /// Tokens a DRY match does not cross (their text has a newline, colon, quote or asterisk); empty for none.
+    pub dry_breakers: std::sync::Arc<Vec<bool>>,
+    /// The ids of `<tool_call>` and `</tool_call>`: no penalty applies between them (and those tokens are not
+    /// counted), so tool arguments may copy paths and names the reply already wrote.
+    pub tool_tags: Option<(usize, usize)>,
+    /// The returned tokens in order (outside tool calls), for DRY.
+    pub hist: Vec<usize>,
+    pub in_tool: bool,
 }
 
+/// DRY looks back this many reply tokens, and matches at most this long.
+const DRY_WINDOW: usize = 4096;
+const DRY_MAX_MATCH: usize = 64;
+
 impl Sampler {
-    pub fn greedy() -> Self { Sampler { temp: 0.0, top_k: 0, top_p: 1.0, rng: 1 } }
+    pub fn greedy() -> Self {
+        Sampler { temp: 0.0, top_k: 0, top_p: 1.0, rng: 1, presence: 0.0, frequency: 0.0, repeat: 1.0, last_n: 64,
+            seen: Default::default(),
+            dry_mult: 0.0, dry_base: 1.75, dry_allowed: 2, dry_breakers: Default::default(), tool_tags: None,
+            hist: Vec::new(), in_tool: false }
+    }
+
+    /// The logits with the repeat, presence, frequency and DRY penalties applied, or None when there is nothing to change.
+    /// Without them a quantized model that samples greedily (or nearly) falls into loops it never leaves.
+    fn penalized(&self, logits: &[f32]) -> Option<Vec<f32>> {
+        if self.in_tool { return None; }
+        let rep = !self.seen.is_empty() && (self.presence != 0.0 || self.frequency != 0.0);
+        let dry = self.dry_penalties();
+        let n = if self.repeat == 1.0 { 0 } else { usize::try_from(self.last_n).unwrap_or(usize::MAX) };
+        let mut last = self.hist[self.hist.len().saturating_sub(n)..].to_vec();
+        if !rep && dry.is_empty() && last.is_empty() { return None; }
+        let mut l = logits.to_vec();
+        (last.sort_unstable(), last.dedup());
+        for t in last {
+            if let Some(x) = l.get_mut(t) { *x = if *x > 0.0 { *x / self.repeat } else { *x * self.repeat }; }
+        }
+        if rep {
+            for (&t, &n) in &self.seen {
+                if let Some(x) = l.get_mut(t) { *x -= self.presence + self.frequency * n as f32; }
+            }
+        }
+        for (t, p) in dry {
+            if let Some(x) = l.get_mut(t) { *x -= p; }
+        }
+        Some(l)
+    }
+
+    /// DRY penalties for the next token: for every earlier place where the reply's last tokens already appeared,
+    /// the token that followed them there, with the longest such match (as llama.cpp's DRY sampler).
+    pub fn dry_penalties(&self) -> Vec<(usize, f32)> {
+        let h = &self.hist[self.hist.len().saturating_sub(DRY_WINDOW)..];
+        let n = h.len();
+        if self.dry_mult <= 0.0 || n < 2 { return vec![]; }
+        let brk = |t: usize| self.dry_breakers.get(t).copied().unwrap_or(false);
+        let last = h[n - 1];
+        if brk(last) { return vec![]; }
+        let mut best: std::collections::HashMap<usize, usize> = Default::default();
+        for i in 0..n - 1 {
+            if h[i] != last { continue; }
+            let mut len = 1;
+            while len < DRY_MAX_MATCH && len <= i && !brk(h[i - len]) && h[i - len] == h[n - 1 - len] { len += 1; }
+            let e = best.entry(h[i + 1]).or_insert(0);
+            *e = (*e).max(len);
+        }
+        best.into_iter().filter(|&(_, len)| len >= self.dry_allowed.max(1))
+            .map(|(t, len)| (t, self.dry_mult * self.dry_base.powi((len - self.dry_allowed.max(1)) as i32))).collect()
+    }
+
+    /// Records a token the reply now has (done by `pick` and `accept` for the tokens they return).
+    pub fn note(&mut self, t: usize) {
+        if let Some((open, close)) = self.tool_tags {
+            if t == open { self.in_tool = true; return; }
+            if t == close { self.in_tool = false; return; }
+        }
+        if self.in_tool { return; }
+        *self.seen.entry(t).or_insert(0) += 1;
+        self.hist.push(t);
+    }
 
     pub fn pick(&mut self, logits: &[f32]) -> anyhow::Result<usize> {
-        if self.temp <= 0.0 {
+        let pen = self.penalized(logits);
+        let logits = pen.as_deref().unwrap_or(logits);
+        let i = if self.temp <= 0.0 {
             let i = argmax(logits);
             anyhow::ensure!(logits[i].is_finite(), NON_FINITE);
-            return Ok(i);
-        }
-        let c = self.cands(logits);
-        self.draw(&c)
+            i
+        } else {
+            let c = self.cands(logits);
+            self.draw(&c)?
+        };
+        self.note(i);
+        Ok(i)
     }
 
     /// Speculative sampling with a fixed draft `d`: keeps `d` (None) with its probability under this sampler, else
     /// returns a token drawn from the others, renormalized. The result has the distribution of `pick`. `temp` > 0.
     pub fn accept(&mut self, logits: &[f32], d: usize) -> anyhow::Result<Option<usize>> {
-        let c = self.cands(logits);
+        let pen = self.penalized(logits);
+        let c = self.cands(pen.as_deref().unwrap_or(logits));
         anyhow::ensure!(!c.is_empty(), NON_FINITE);
         let q = c.iter().find(|x| x.0 == d).map_or(0.0, |x| x.1);
-        if self.rand() * c.iter().map(|x| x.1).sum::<f32>() < q { return Ok(None); }
-        Ok(Some(self.draw(&c.into_iter().filter(|x| x.0 != d).collect::<Vec<_>>())?))
+        if self.rand() * c.iter().map(|x| x.1).sum::<f32>() < q { self.note(d); return Ok(None); }
+        let x = self.draw(&c.into_iter().filter(|x| x.0 != d).collect::<Vec<_>>())?;
+        self.note(x);
+        Ok(Some(x))
+    }
+
+    /// Normalized candidate probabilities `(token_id, prob)` under this sampler (`temp > 0`), sorted descending.
+    pub fn draft_dist(&mut self, logits: &[f32]) -> anyhow::Result<(u32, Vec<(usize, f32)>)> {
+        let c = self.cands(logits);
+        let total: f32 = c.iter().map(|x| x.1).sum();
+        anyhow::ensure!(!c.is_empty() && total > 0.0, NON_FINITE);
+        let probs: Vec<(usize, f32)> = c.into_iter().map(|(id, w)| (id, w / total)).collect();
+        let tok = self.draw(&probs)? as u32;
+        Ok((tok, probs))
+    }
+
+    /// Leviathan lossless speculative rejection sampling using draft distribution `q` and target `logits` (`temp > 0`).
+    /// Keeps `d` (`None`) with probability `min(1, p(d)/q(d))`, otherwise samples from normalized `max(0, p - q)`.
+    pub fn accept_dist(&mut self, logits: &[f32], d: usize, q: &[(usize, f32)]) -> anyhow::Result<Option<usize>> {
+        let pen = self.penalized(logits);
+        let c = self.cands(pen.as_deref().unwrap_or(logits));
+        let total: f32 = c.iter().map(|x| x.1).sum();
+        anyhow::ensure!(!c.is_empty() && total > 0.0, NON_FINITE);
+        let qd = q.iter().find(|x| x.0 == d).map_or(0.0, |x| x.1);
+        if qd <= 0.0 { let x = self.draw(&c)?; self.note(x); return Ok(Some(x)); }
+        let pd = c.iter().find(|x| x.0 == d).map_or(0.0, |x| x.1) / total;
+        if self.rand() * qd < pd { self.note(d); return Ok(None); }
+        let res: Vec<(usize, f32)> = c.iter().filter_map(|&(id, w)| {
+            let p = w / total;
+            let qv = q.iter().find(|x| x.0 == id).map_or(0.0, |x| x.1);
+            let r = p - qv;
+            (r > 0.0).then_some((id, r))
+        }).collect();
+        let x = if res.is_empty() { self.draw(&c)? } else { self.draw(&res)? };
+        self.note(x);
+        Ok(Some(x))
     }
 
     /// The tokens `pick` draws from, with their weights (exp of the scaled logit, not normalized), most likely first.

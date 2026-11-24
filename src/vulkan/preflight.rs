@@ -12,9 +12,9 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 impl Vk {
-    /// The `Workgroup` bytes of kernel `name` with `spec` and this device's `--kv q8` setting.
+    /// The `Workgroup` bytes of kernel `name` with `spec` and this device's KV cache mode.
     pub fn shared_bytes(&self, name: &str, spec: &[u32]) -> Result<u32> {
-        spv_smem::shared_bytes(name, spec, self.0.kv_q8)
+        spv_smem::shared_bytes(name, spec, self.0.kv_mode)
     }
 
     /// Check the (kernel, specialization) pairs the weight types `types` reach (see `gpu_model::gpu_weight_types`)
@@ -30,22 +30,24 @@ impl Vk {
         let (mut n, mut worst) = (0usize, (0u32, "", Vec::new()));
         for (name, spec) in self.shared_memory_pairs(types) {
             if !checked.insert((name, spec.clone())) { continue; }
-            let bytes = spv_smem::check_shared_memory(name, &spec, self.0.kv_q8, self.0.smem_limit)?;
+            let bytes = spv_smem::check_shared_memory(name, &spec, self.0.kv_mode, self.0.smem_limit)?;
             n += 1;
-            if verbose { eprintln!("vulkan: preflight {name} {spec:?}: {bytes} bytes"); }
+            if verbose { crate::say!("vulkan: preflight {name} {spec:?}: {bytes} bytes"); }
             if bytes > worst.0 { worst = (bytes, name, spec); }
         }
-        eprintln!("vulkan: shared-memory preflight: {n} (kernel, specialization) pairs checked, largest {} bytes \
+        crate::say!("vulkan: shared-memory preflight: {n} (kernel, specialization) pairs checked, largest {} bytes \
             ({}) of {} allowed, {:.1} ms", worst.0, worst.1, self.0.smem_limit, t0.elapsed().as_secs_f64() * 1e3);
         if !verbose {
             let mut st = self.0.st();
             for &ty in types {
                 let ws = self.wspec(ty);
-                if !matches!(ty, GgmlType::F32 | GgmlType::BF16) {
+                if !ty.float_x() {
                     for nt in [1u32, 3, 5, 9, 17] {
                         let _ = self.0.pipeline(&mut st, "gemv_q", &[&ws[..], &[nt]].concat());
                     }
-                    let _ = self.0.pipeline(&mut st, "moe_gemv_q", &ws);
+                    for nm in [1u32, 4, 8, 17] {
+                        let _ = self.0.pipeline(&mut st, "moe_gemv_q", &[&ws[..], &[nm]].concat());
+                    }
                     let _ = self.0.pipeline(&mut st, "moe_down_combine", &ws);
                 } else {
                     for nt in [1u32, 3, 5, 9, 17] {
@@ -58,6 +60,7 @@ impl Vk {
             for name in ["moe_combine", "deltanet", "conv_silu", "conv_seq", "conv_state", "l2_norm", "norm_gate", "moe_route", "argmax_rows", "attn_merge"] {
                 let _ = self.0.pipeline(&mut st, name, &[]);
             }
+            let _ = self.0.pipeline(&mut st, "deltanet", &[0, 4]);
             for name in ["rms_norm", "swiglu_q", "quant_xq"] {
                 let _ = self.0.pipeline(&mut st, name, &[self.0.llama]);
             }
@@ -72,7 +75,7 @@ impl Vk {
         let mut max = 0;
         for (name, spec) in self.shared_memory_pairs(types) {
             if !checked.insert((name, spec.clone())) { continue; }
-            max = max.max(spv_smem::check_shared_memory(name, &spec, self.0.kv_q8, self.0.smem_limit)?);
+            max = max.max(spv_smem::check_shared_memory(name, &spec, self.0.kv_mode, self.0.smem_limit)?);
         }
         Ok(max)
     }
@@ -83,7 +86,7 @@ impl Vk {
         let mut pairs: Vec<(&'static str, Vec<u32>)> = Vec::new();
         for &ty in types {
             let ws = self.wspec(ty).to_vec();
-            let float = matches!(ty, GgmlType::F32 | GgmlType::BF16);
+            let float = ty.float_x();
             let mut push = |name: &'static str, spec: Vec<u32>| pairs.push((name, spec));
             // gemm_raw: `f = !mmq(ty) || cols % 128 != 0`; the float kernel takes every type, the int8 one the rest.
             if float || !crate::cuda::Gpu::mmq(ty) {
@@ -91,10 +94,11 @@ impl Vk {
                 else { push("gemm_f_dp", ws.clone()); }
             }
             if !float {
-                if self.0.coop_i8 { push("gemmi", ws.clone()); push("gemmi_s", ws.clone()); }
+                if self.0.coop_i8 == 32 { push("gemmi", ws.clone()); push("gemmi_s", ws.clone()); }
+                else if self.0.coop_i8 == 16 { push("gemmi_16", ws.clone()); push("gemmi_s_16", ws.clone()); }
                 else { push("gemmi_dp", ws.clone()); }
                 for nt in 1..=4 { push("gemv_q", [&ws[..], &[nt]].concat()); }
-                push("moe_gemv_q", ws.clone());
+                for nm in [1u32, 4, 8, 17] { push("moe_gemv_q", [&ws[..], &[nm]].concat()); }
                 push("dequant", ws.clone());
             } else {
                 for nt in 1..=4 { for wpb in [1u32, 8] { push("gemv_f", [&ws[..], &[nt, 32 * wpb]].concat()); } }

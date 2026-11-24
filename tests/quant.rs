@@ -1,5 +1,5 @@
 mod common;
-use rusting_strata::quant::{GgmlType, dequant_row};
+use rusting_strata::quant::{GgmlType, dequant_row, f8_e4m3_to_f32, ue4m3};
 
 fn check(name: &str, ty: GgmlType) {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
@@ -25,9 +25,20 @@ fn check(name: &str, ty: GgmlType) {
 #[test] fn tq1_0() { check("TQ1_0", GgmlType::TQ1_0) }
 #[test] fn tq2_0() { check("TQ2_0", GgmlType::TQ2_0) }
 #[test] fn rejects_unknown() { assert!(GgmlType::from_u32(24).is_err()); } // I8 is not supported
+#[test]
+fn names_the_gyro_l_types() {
+    // The pair trellis of Gyro-L is not ported: the error must name the type, not read as "unknown" (issue #30).
+    let e = GgmlType::from_u32(148).unwrap_err().to_string();
+    assert!(e.contains("TQP6") && e.contains("Gyro-L"), "{e}");
+    assert!(GgmlType::from_u32(150).unwrap_err().to_string().contains("unknown"));
+}
+// Random blocks decoded by the reference C++ decoder (tools/gen_tq_fixtures.cpp).
+#[test] fn tq2_t() { check("TQ2_T", GgmlType::TQ2T) }
+#[test] fn tqk6() { check("TQK6", GgmlType::TQK6) }
+#[test] fn tqk7() { check("TQK7", GgmlType::TQK7) }
 
 /// One Q4_0 block (value = (q - 8) d) and one Q5_0 block (32 high bits after d; value = (q - 16) d): element j is
-/// the low nibble of byte j, j + 16 the high nibble. Converted to Q8_0 they give the same values.
+/// the low nibble of byte j, j + 16 the high nibble.
 #[test]
 fn q4_0_and_q5_0_blocks() {
     let d = half::f16::from_f32(0.25).to_le_bytes();
@@ -41,10 +52,9 @@ fn q4_0_and_q5_0_blocks() {
     ] {
         let ty = GgmlType::from_u32(id).unwrap();
         assert_eq!(ty.row_bytes(32), b.len());
-        let (mut y, mut y8) = ([0f32; 32], [0f32; 32]);
+        let mut y = [0f32; 32];
         dequant_row(ty, &b, &mut y);
-        dequant_row(GgmlType::Q8_0, &rusting_strata::quant::to_q8_0(ty, &b), &mut y8);
-        for j in 0..32 { assert_eq!((y[j], y8[j]), (0.25 * want[j], 0.25 * want[j]), "{} element {j}", ty.name()); }
+        for j in 0..32 { assert_eq!(y[j], 0.25 * want[j], "{} element {j}", ty.name()); }
     }
 }
 
@@ -152,4 +162,83 @@ fn f16_and_q2_0_blocks() {
     let mut y = [0f32; 64];
     dequant_row(GgmlType::Q2_0, &blk, &mut y);
     for (j, v) in y.iter().enumerate() { assert_eq!(*v, [-0.5, 0.0, 0.5, 1.0][j % 4], "j={j}"); }
+}
+
+#[test]
+fn nvfp4_and_f8_e4m3_blocks() {
+    assert_eq!(GgmlType::from_u32(40).unwrap(), GgmlType::NVFP4);
+    assert_eq!(GgmlType::from_u32(43).unwrap(), GgmlType::F8E4M3);
+    assert_eq!(GgmlType::NVFP4.row_bytes(64), 36);
+    assert_eq!(GgmlType::F8E4M3.row_bytes(8), 8);
+    assert!(!GgmlType::NVFP4.float_x() && GgmlType::F8E4M3.float_x());
+    assert!(GgmlType::NVFP4.gpu("vulkan") && GgmlType::NVFP4.gpu("cuda"));
+    assert!(GgmlType::F8E4M3.gpu("vulkan") && GgmlType::F8E4M3.gpu("cuda"));
+
+    assert_eq!(ue4m3(0), 0.0);
+    assert_eq!(ue4m3(0x7F), 0.0);
+    assert_eq!(ue4m3(0x01), 1.0 / 1024.0);
+    assert_eq!(ue4m3(0x38), 0.5);
+    assert_eq!(ue4m3(0x40), 1.0);
+
+    assert_eq!(f8_e4m3_to_f32(0), 0.0);
+    assert_eq!(f8_e4m3_to_f32(0x7F), 0.0);
+    assert_eq!(f8_e4m3_to_f32(0xFF), 0.0);
+    assert_eq!(f8_e4m3_to_f32(0x01), 1.0 / 512.0);
+    assert_eq!(f8_e4m3_to_f32(0x38), 1.0);
+    assert_eq!(f8_e4m3_to_f32(0xBC), -1.5);
+
+    let mut y8 = [0f32; 4];
+    dequant_row(GgmlType::F8E4M3, &[0x00, 0x38, 0xBC, 0x7F], &mut y8);
+    assert_eq!(y8, [0.0, 1.0, -1.5, 0.0]);
+
+    // NVFP4 block: 4 sub-blocks of 16 elems. Sub-block 0 scale=0x40 (d=1.0), sub-block 1 scale=0x38 (d=0.5),
+    // sub-block 2 scale=0x7F (d=0.0), sub-block 3 scale=0x40 (d=1.0).
+    let mut blk = vec![0u8; 36];
+    blk[0..4].copy_from_slice(&[0x40, 0x38, 0x7F, 0x40]);
+    for j in 0..8 {
+        blk[4 + j] = 0x92;        // lo=2 (+2), hi=9 (-1) -> *1.0 = [2, -1]
+        blk[12 + j] = 0x73;       // lo=3 (+3), hi=7 (+12) -> *0.5 = [1.5, 6.0]
+        blk[20 + j] = 0xFE;       // scaled by 0 -> [0.0, 0.0]
+        blk[28 + j] = 0xFA;       // lo=10 (-2), hi=15 (-12) -> *1.0 = [-2.0, -12.0]
+    }
+    let mut y4 = [0f32; 64];
+    dequant_row(GgmlType::NVFP4, &blk, &mut y4);
+    for j in 0..8 {
+        assert_eq!(y4[j], 2.0);
+        assert_eq!(y4[8 + j], -1.0);
+        assert_eq!(y4[16 + j], 1.5);
+        assert_eq!(y4[24 + j], 6.0);
+        assert_eq!(y4[32 + j], 0.0);
+        assert_eq!(y4[40 + j], 0.0);
+        assert_eq!(y4[48 + j], -2.0);
+        assert_eq!(y4[56 + j], -12.0);
+    }
+
+    // A matrix's scalar `.scale` multiplies every row, and an expert cut out of it keeps it.
+    let raw_exps = [&blk[..], &blk[..]].concat();
+    let mat3d = rusting_strata::deepseek::mat::Mat { data: &raw_exps, ty: GgmlType::NVFP4, rows: 2, cols: 64, cpu: true, gpu: None, scale: -2.0 };
+    let mut r1 = [0f32; 64];
+    mat3d.expert_host(1, 2).row_into(0, &mut r1);
+    assert_eq!(r1[0], -4.0);
+}
+
+/// `matvec_many_cpu` gives the bits of one `Mat::matvec` per matrix. The row counts are not multiples of the 32-row
+/// work chunk, so a chunk covers the end of one matrix and the start of the next.
+#[test]
+fn matvec_many_cpu_matches_matvec() {
+    use rusting_strata::deepseek::mat::{Mat, matvec_many_cpu};
+    let cols = 64;
+    let mut seed = 7u32;
+    let mut rnd = || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); (seed >> 16) as u8 };
+    // Q8_0 rows: per 32 values an f16 scale (0.5) and 32 int8.
+    let raw: Vec<Vec<u8>> = [5usize, 40, 33].iter().map(|&rows| {
+        (0..rows * cols / 32).flat_map(|_| [0x00, 0x38].into_iter().chain((0..32).map(|_| rnd())).collect::<Vec<u8>>()).collect()
+    }).collect();
+    let ms: Vec<Mat> = raw.iter().zip([1.0f32, -2.0, 0.25])
+        .map(|(d, scale)| Mat { data: d, ty: GgmlType::Q8_0, rows: d.len() / (cols / 32 * 34), cols, cpu: true, gpu: None, scale }).collect();
+    let xs: Vec<Vec<f32>> = (0..3).map(|i| (0..cols).map(|j| ((i * 31 + j * 7) % 23) as f32 / 11.0 - 1.0).collect()).collect();
+    let got = matvec_many_cpu(&ms, &xs.iter().map(|x| &x[..]).collect::<Vec<_>>()).expect("the integer dot takes Q8_0");
+    let want: Vec<f32> = ms.iter().zip(&xs).flat_map(|(m, x)| { let mut y = vec![0f32; m.rows]; m.matvec(x, &mut y); y }).collect();
+    assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), want.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+    assert!(want.iter().any(|&v| v != 0.0));
 }

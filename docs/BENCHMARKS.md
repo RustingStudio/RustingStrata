@@ -15,12 +15,36 @@ Reference machine unless stated: RTX 3060 12 GB, Ryzen 5 7600X, 32 GB RAM.
 
 | Model (file) | Decode, RustingStrata | Decode, llama.cpp | Other engine | Entry |
 |---|---|---|---|---|
+| Qwen3.6-35B-A3B UD-Q5_K_M, 4241-token prompt | 80.5 tok/s (75.1-82.0) | 64.4 (58.8-66.0) | - | [below](#qwen36-35b-a3b-ud-q5_k_m) |
 | Qwen3.6-35B-A3B UD-Q2_K_XL | 118.2 tok/s (113.4 after 4K) | 68.4 (66.5) | - | [below](#qwen36-35b-a3b-ud-q2_k_xl) |
 | Qwen3.6-35B-A3B UD-Q3_K_M, 6474-token prompt | 83.0 tok/s (108.0 with MTP) | 67.5 (101.1 with MTP) | PolyStrata 79.2 (113.3 with MTP) | [below](#qwen36-35b-a3b-ud-q3_k_m-vs-polystrata) |
 | Qwen3.8-Flash-Next GSQ-RCO IQ2_XS, 1262-token prompt | 33.0 tok/s (29.3-35.8) | 25.6 (23.2-26.9) | - | [below](#qwen38-flash-next-gsq-rco-iq2_xs) |
 | GLM-5.3-Flash UD-Q2_K_XL (119 GB) | 1.35-1.57 tok/s | 0.57-0.62 | - | [below](#glm-53-flash-ud-q2_k_xl-119-gb) |
 | DeepSeek-V4.1-Flash IQ2_XXS (249 GB) | 2-3.6 tok/s | 0.3-1.5 | - | [below](#deepseek-v41-flash-iq2_xxs-249-gb) |
+| Inkling 2 Mini IQ4_NL (17.6 GB), 512-token prompt | 31.2 tok/s (28.7-33.7) | 8.7-10.5 | - | [below](#inkling-2-mini-iq4_nl-176-gb) |
 | Recursive Flint 39.8B UD-Q5_K_XL, 4102-token prompt | 64.6 tok/s (63.8-65.6) | 48.6 (47.5-49.3) | - | [below](#recursive-flint-398b-ud-q5_k_xl) |
+
+## Qwen3.6-35B-A3B UD-Q5_K_M
+
+`Qwen3.6-35B-A3B-UD-Q5_K_M.gguf` (25.2 GiB, does not fit in VRAM: a third of the experts are on the GPU). llama.cpp
+is build 12191, tuned for the same file (`-cmoe --moe-cache-mib 7500 -ngl 99 -fa on -t 6 -ub 2048 -b 2048`, the best
+decode of a 9-config sweep over `-ncmoe`, `--moe-cache-mib` and `--moe-cache-cpu-share`).
+
+| | CUDA | llama.cpp |
+|---|---|---|
+| Decode after 4K prompt | **80.5 tok/s** (75.1-82.0) | 64.4 (58.8-66.0) |
+| Prefill, 4K prompt | **1530 tok/s** (1451-1596) | 1118-1122 with `-ncmoe 27`, its best prefill flags (2 runs, one load); 793 (367-1063) with the decode flags above |
+
+Measured at commit 5a27ed1 (1.2.5) with `rustingstrata serve --gpu --ctx 8192 --mtp 0` and `llama-server`: the same
+4241-token prompt file and the same script for both, greedy, thinking off, 128 tokens, no drafts in either engine.
+Two loads per engine in alternating order; in each load a warm-up and the first 4K request are thrown away. Decode is
+the mean of runs 4-8 of each load (10 runs, range in brackets). Both engines climb for the first runs after a load;
+over all 16 runs it is 78.8 (63.6-82.0) against 60.3 (31.3-66.0). Prefill is 4 new prompts per load (8 runs).
+
+Not equal: the replies were 128 tokens (RustingStrata) and 125 (llama.cpp, ended by itself). About 20 GiB of RAM was
+free for the 25.2 GiB file, so neither engine had the whole file in the page cache. Perplexity against llama.cpp was
+not run on this file; for UD-Q3_K_M it is
+[below](#quality-vs-llamacpp-qwen36-35b-a3b-ud-q3_k_m).
 
 ## Qwen3.6-35B-A3B UD-Q2_K_XL
 
@@ -36,6 +60,15 @@ Reference machine unless stated: RTX 3060 12 GB, Ryzen 5 7600X, 32 GB RAM.
 | Greedy top-1 agreement with llama.cpp (20 prompts x 32 tokens) | 98-99% | 98-99% | 98.3% (its batch vs token-by-token modes) |
 
 Method: `rustingstrata bench --gpu --mtp 0 --pp 512,4096,32768 --tg 128 --reps 3 --ctx 32896`, mean of 3 rounds. llama.cpp from `llama-server` timings, 4047-token prompt plus 128 tokens, 3 runs. MTP gains depend on the text.
+
+Agreement counts a token when it matches llama.cpp run token by token or with the context as one batch;
+llama.cpp's own two modes agree on only 98.3%. The remaining misses are near-ties where
+float rounding order picks a different token. The expert placement adapts between runs and the CPU and
+GPU expert kernels round differently, so greedy output can change at such near-ties from one run to the next. MTP
+on and off give identical greedy tokens.
+
+With less VRAM, simulated on the 3060 with `--vram-margin` (not measured on real 8 GB or 6 GB cards): ~8 GB
+keeps 116 / 110 tok/s decode (short / after 4K) and 2128 tok/s 4K prefill, ~6 GB 105 / 97 and 2056.
 
 ## Qwen3.6-35B-A3B UD-Q3_K_M vs PolyStrata
 
@@ -206,6 +239,41 @@ rustingstrata perplexity --model M --file F --ctx-len 512 --gpu --mtp 0 --kld-ba
 llama-perplexity -m M -f F -c 512 --kl-divergence --kl-divergence-base base.bin
 ```
 llama.cpp batch vs token-by-token modes differ by about 1.7% in top-token agreement on their own.
+
+## Inkling 2 Mini IQ4_NL (17.6 GB)
+
+`Inkling-2-Mini-IQ4_NL.gguf` (architecture `inkling2_loop`, 26.07 B parameters), measured 2026-11-21 on the reference
+machine (30 GB RAM), warm page cache, in one session. RustingStrata: `bench --pp 64,512,2048 --tg 64 --reps 2` with
+`--backend cuda`, `--backend vulkan` and `STRATA_DS_GPU=0`; mean of the two runs, the two runs in brackets.
+llama.cpp c622f62 built with CUDA: `llama-bench -t 6 -r 2 -p 64,512,2048 -n 64` with `-ngl 18` (`-ngl 99` runs out
+of VRAM; 12, 16 and 20 layers measured within 3% of 18 at 64 and 512 tokens), and with `-ngl 0` at 64, 512 and 2048 tokens.
+
+| | Prefill 64 tokens | Prefill 512 | Prefill 2048 | Decode (tok/s) |
+|---|---|---|---|---|
+| RustingStrata, CUDA | 120.7 (59.2, 182.2) | 259.2 (254.6, 263.9) | 220.2 (218.7, 221.8) | 34.5 / 31.2 / 31.2 after 64 / 512 / 2048 tokens |
+| RustingStrata, Vulkan (same card) | 82.7 (34.5, 130.9) | 226.9 (226.6, 227.1) | 182.6 (179.0, 186.2) | 27.3 / 27.5 / 24.5 |
+| RustingStrata, CPU only | 47.5 (47.1, 47.9) | 49.8 (49.7, 49.8) | 48.2 (48.2, 48.2) | 11.8 / 11.6 / 10.9 |
+| llama.cpp, CUDA build, `-ngl 18` | 124.7 ± 3.6 | 383.9 ± 7.2 | 322.6 ± 1.0 | 8.7 ± 1.3 |
+| llama.cpp, CUDA build, `-ngl 0` | 122.3 ± 5.0 | 377.5 ± 7.8 | 311.9 ± 4.4 | 10.5 ± 1.2 |
+
+Quality vs llama.cpp, same GGUF, teacher-forced: llama.cpp c622f62's greedy tokens (CPU build, `/completion` at
+temperature 0) are fed through RustingStrata's forward and the top token is compared at every step
+(`tests/inkling2_forward.rs`). Short prompt: 24 of 24. Prompt of several hundred tokens: at least 47 of 48 (one near
+tie). The same on the CPU, CUDA and Vulkan paths.
+
+Caveats: llama.cpp reads the prompt faster (RustingStrata is at 0.6-0.7 of its speed from 512 tokens on): its CUDA
+build runs the batch on the GPU even with no layer offloaded, and RustingStrata computes the attention scores of a
+chunk on the CPU. `llama-bench` decodes 64 tokens from an empty context, `bench` decodes them after the prompt, so
+the decode columns are not the same test. The first run of the 64-token prompt is the first work of the process and
+is the slow one of the two. A CPU-only llama.cpp build was not benchmarked with `llama-bench`; its server reported
+40.4 tok/s for the prompt and 11.0 tok/s for the reply earlier the same day (one run, not side by side). Vulkan was
+run on the RTX 3060 only. Decoding is greedy in both engines.
+
+The decode column was measured again later the same day, same command, after a decoded token moved onto the GPU
+(it was 29.9 / 27.1 / 25.6 on CUDA, 21.5 / 20.9 / 19.8 on Vulkan and 12.0 / 11.6 / 11.3 on the CPU). A desktop app
+used part of the GPU during that run. Alternating runs of the old and new build at a 512-token prompt, same load:
+CUDA 25.4 to 33.5 tok/s, Vulkan 16.6 to 25.4 tok/s, prefill unchanged (within 1-4%). Most of the Vulkan gain is the
+IQ4_NL expert matvec (105 to 270 GB/s on 8 experts of 2304x2304).
 
 ## Not yet measured
 

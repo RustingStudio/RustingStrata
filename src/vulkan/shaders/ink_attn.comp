@@ -1,0 +1,59 @@
+#version 460
+layout(local_size_x = 128) in;
+#include "common.glsl"
+layout(push_constant) uniform P { F32 q; F32 r; F32 sink; U16 k; U16 v; F32 bias; F32 sc; I32 pos_ptr;
+                                  uint rows; uint at; uint ring; uint nh; uint nkv; uint hd; uint nr; uint ext; } p;
+
+// Inkling 2's attention of one token, first of two dispatches: workgroup (head, chunk) of 4 warps takes the 64 rows
+// from chunk * 64, a warp one row at a time. Supports KV_MODE 0/1/2/3 via ldkv(). CUDA: ink_attn.
+shared float qs[128];
+shared float ps[64];
+shared float acc[128];
+void main() {
+    uint h = gl_WorkGroupID.x, kh = h / (p.nh / p.nkv), kw = p.nkv * p.hd, t = gl_LocalInvocationID.x;
+    uint rows = p.rows, at = p.at;
+    if (uint64_t(p.pos_ptr) != 0ul) {
+        uint pos = uint(p.pos_ptr.v[0]);
+        rows = min(pos + 1u, p.ring);
+        at = pos % p.ring;
+    }
+    uint i0 = gl_WorkGroupID.y * 64, n = i0 < rows ? min(64u, rows - i0) : 0u;
+    if (t < p.hd) qs[t] = p.q.v[h * p.hd + t];
+    barrier();
+    float scale = fdiv(1.0, sqrt_(float(p.hd)));
+    for (uint j = WARP; j < 64; j += 4) {
+        uint i = i0 + j, dist = at >= i ? at - i : at + rows - i;
+        float d = 0.0;
+        if (j < n) {
+            uint ko = i * kw + kh * p.hd;
+            for (uint c = LANE; c < p.hd; c += 32) d += qs[c] * ldkv(p.k, ko + c, p.hd);
+            d *= scale;
+            if (dist < p.ext) for (uint c = LANE; c < p.nr; c += 32) d += p.r.v[h * p.nr + c] * p.bias.v[dist * p.nr + c];
+        }
+        d = warp_sum(d);
+        if (LANE == 0 && j < n) ps[j] = d - p.sink.v[h];
+    }
+    barrier();
+    float mx = -3.0e38;
+    for (uint j = 0; j < n; j++) mx = max(mx, ps[j]);
+    barrier();
+    if (t < n) ps[t] = expf_(ps[t] - mx);
+    barrier();
+    uint c = t % p.hd, parts = 128 / p.hd;
+    float a = 0.0;
+    for (uint j = t / p.hd; j < n; j += parts) a += ps[j] * ldkv(p.v, (i0 + j) * kw + kh * p.hd + c, p.hd);
+    acc[t] = a;
+    barrier();
+    uint o = (h * gl_NumWorkGroups.y + gl_WorkGroupID.y) * (p.hd + 2);
+    if (t < p.hd) {
+        float s = 0.0;
+        for (uint j = 0; j < parts; j++) s += acc[j * p.hd + t];
+        p.sc.v[o + 2 + t] = s;
+    }
+    if (t == 0) {
+        float z = 0.0;
+        for (uint j = 0; j < n; j++) z += ps[j];
+        p.sc.v[o] = mx;
+        p.sc.v[o + 1] = z;
+    }
+}

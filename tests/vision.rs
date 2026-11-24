@@ -1,5 +1,6 @@
 //! Vision projector tests against the local Qwen3.5-2B mmproj. Skipped when the file is absent.
 
+mod common;
 use rusting_strata::gguf::Gguf;
 use rusting_strata::model::{Model, State};
 use rusting_strata::ops;
@@ -105,6 +106,42 @@ fn qwen35_2b_red_image_predicts_red() {
     assert!(text.contains("red"), "generated {text:?}");
 }
 
+
+/// GPU image prefill (embedding rows with M-RoPE positions) against the CPU forward, then one text token past the
+/// image (RoPE offset).
+#[test]
+fn qwen35_2b_gpu_image_prefill_matches_cpu() {
+    let Some(p) = projector() else { return };
+    let Some(model_path) = text_model() else { return };
+    let _l = common::gpu_lock();
+    let g = Gguf::open(&model_path).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    // 8x6 tokens: x and y positions differ.
+    let img = image::RgbImage::from_fn(256, 192, |x, y| image::Rgb([x as u8, y as u8, 90]));
+    let pre = p.preprocess(&img).unwrap();
+    let (nx, ny) = p.count_tokens(pre.width, pre.height).unwrap();
+    let feats = p.encode(&pre).unwrap();
+    let ids = tok.encode("<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>Describe.<|im_end|>\n<|im_start|>assistant\n").unwrap();
+    let id = |t| tok.token_id(t).unwrap();
+    let pr = expand_images(&ids, id("<|vision_start|>"), id("<|vision_end|>"), id("<|image_pad|>"), &[(nx, ny)]).unwrap();
+    let embs = [feats];
+    let mut st = State::new(&m.cfg);
+    let want = rusting_strata::vision::feed_prompt(&m, &mut st, &pr, &embs).unwrap();
+    let next = ops::argmax(&want) as u32;
+    let want2 = m.step(&mut st, next);
+    for (name, gpu) in common::backends() {
+        let mut gm = rusting_strata::gpu_model::GpuModel::load(&m, gpu, 256, 0, 512 << 20, 0).unwrap();
+        for (w, got) in [(&want, gm.prefill_image(&pr, &embs).unwrap()), (&want2, gm.step(next).unwrap())] {
+            let d = w.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let range = w.iter().fold(f32::MIN, |a, &b| a.max(b)) - w.iter().fold(f32::MAX, |a, &b| a.min(b));
+            eprintln!("{name}: max logit diff {d} (range {range})");
+            assert_eq!(ops::argmax(w), ops::argmax(&got), "{name}");
+            // The bound of `gpu_forward_matches_cpu_reference` (int8 activations on the GPU).
+            assert!(d <= 0.05 * range, "{name}: max logit diff {d} vs range {range}");
+        }
+    }
+}
 
 #[test]
 fn gemma4v_preprocess_min_tokens() {
@@ -335,5 +372,70 @@ fn gemma4v_red_image_predicts_red() {
         logits = m.step(next);
     }
     eprintln!("generated = {text:?}");
+    assert!(text.to_ascii_lowercase().contains("red"), "generated {text:?}");
+}
+
+const INKLING2_MMPROJ: &str = "/mnt/storage/home-vault/models-local/inkling2-mini/mmproj-F16.gguf";
+const INKLING2_MODEL: &str = "/mnt/storage/home-vault/models-local/inkling2-mini/Inkling-2-Mini-IQ4_NL.gguf";
+
+fn inkling2_projector() -> Option<VisionProjector> {
+    let p = std::env::var("STRATA_INKLING2_MMPROJ").unwrap_or_else(|_| INKLING2_MMPROJ.into());
+    if !Path::new(&p).exists() { eprintln!("skip: {p} missing"); return None; }
+    Some(VisionProjector::open(Path::new(&p)).expect("open inkling2 mmproj"))
+}
+
+#[test]
+fn inkling2v_encode_and_pad() {
+    let Some(p) = inkling2_projector() else { return };
+    let c = p.cfg();
+    assert_eq!(c.projector_type, "inkling2v");
+    assert_eq!((c.n_embd, c.projection_dim, c.patch_size, c.n_merge, c.n_layer), (1024, 2304, 20, 2, 23));
+    // 64x64 is not a multiple of 40, so inkling2v pads right/bottom to 80x80 (2x2 merged tokens).
+    let img = image::RgbImage::from_pixel(64, 64, image::Rgb([255, 0, 0]));
+    let pre = p.preprocess(&img).unwrap();
+    assert_eq!((pre.width, pre.height), (80, 80));
+    assert_eq!(p.count_tokens(64, 64).unwrap(), (2, 2));
+    let feats = p.encode(&pre).unwrap();
+    assert_eq!(feats.len(), 4);
+    assert!(feats.iter().all(|r| r.len() == 2304 && r.iter().all(|v| v.is_finite())));
+    // Different colors produce distinct vision embeddings.
+    let img_blue = image::RgbImage::from_pixel(80, 80, image::Rgb([0, 0, 255]));
+    let feats_blue = p.encode(&p.preprocess(&img_blue).unwrap()).unwrap();
+    assert_ne!(feats[0][..8], feats_blue[0][..8]);
+}
+
+#[test]
+fn inkling2v_red_image_predicts_red() {
+    let Some(p) = inkling2_projector() else { return };
+    let path = std::env::var("STRATA_INKLING2_MODEL").unwrap_or_else(|_| INKLING2_MODEL.into());
+    if !Path::new(&path).exists() { eprintln!("skip: {path} missing"); return; }
+    let _l = common::gpu_lock();
+    rusting_strata::inkling2::chat::gpu_defaults();
+    let g = Gguf::open(Path::new(&path)).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let mut m = rusting_strata::inkling2::forward::Inkling2Model::new_with_ctx(&g, 2048).unwrap();
+    let img = image::RgbImage::from_pixel(160, 160, image::Rgb([220, 0, 0]));
+    let pre = p.preprocess(&img).unwrap();
+    let (nx, ny) = p.count_tokens(pre.width, pre.height).unwrap();
+    let feats = p.encode(&pre).unwrap();
+    assert_eq!(feats.len(), nx * ny);
+    let mut msg = rusting_strata::chat::Msg::new("user", "What is the main color of this image? Answer with one word.");
+    msg.images = vec!["red.png".into()];
+    let rendered = rusting_strata::inkling2::chat::render_with_effort(&[msg], &[], "0");
+    let grids = [(nx, ny)];
+    let embs = [feats];
+    let seq = rusting_strata::inkling2::chat::prompt_seq(&tok, &rendered, Some((&grids, &embs))).unwrap();
+    let logits = m.prefill_embds(&seq);
+    assert_eq!(logits.len(), m.cfg.n_vocab);
+    let mut text = String::new();
+    let mut next = ops::argmax(&logits) as u32;
+    let eos = tok.eos_ids();
+    for _ in 0..24 {
+        if eos.contains(&next) { break; }
+        text.push_str(&tok.decode(&[next]).unwrap());
+        if text.to_ascii_lowercase().contains("red") { break; }
+        next = m.step_argmax(next);
+    }
+    eprintln!("inkling2v generated = {text:?}");
     assert!(text.to_ascii_lowercase().contains("red"), "generated {text:?}");
 }

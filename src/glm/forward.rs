@@ -100,10 +100,10 @@ pub struct GlmModel<'a> {
     route_counts: std::cell::RefCell<Vec<u32>>,
 }
 
-/// Context limit: the trained context unless `STRATA_GLM_CTX` says otherwise. Beyond `idx_top_k` the k-pool indexer
+/// Context limit: `--ctx`, else `STRATA_GLM_CTX`, else the trained context. Beyond `idx_top_k` the k-pool indexer
 /// selects rows; that path is checked against llama.cpp up to ~3.6k tokens. The KV cache grows with the sequence, so RAM is the real bound.
 pub fn max_ctx(cfg: &GlmConfig) -> usize {
-    std::env::var("STRATA_GLM_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(cfg.n_ctx_train)
+    crate::ctx_limit(std::env::var("STRATA_GLM_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(cfg.n_ctx_train))
 }
 
 fn silu(x: f32) -> f32 {

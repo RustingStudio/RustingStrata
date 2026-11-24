@@ -13,7 +13,7 @@ const STAGE: usize = 16;
 
 /// Float offsets into the scratch slab (each region holds `chunk` rows). Mixer and FFN regions alias, and so do the
 /// hyper-connection read and PLE temporaries (`xn` .. `pv`), which run outside both.
-struct Lay { h: usize, a: usize, b: usize, c: usize, d: usize, e: usize, rl: usize, wts: usize, ge: usize, ye: usize, shg: usize, shy: usize, sg: usize,
+struct Lay { h: usize, a: usize, b: usize, c: usize, d: usize, e: usize, rl: usize, wts: usize, ge: usize, ye: usize, shg: usize, shy: usize, sg: usize, hr: usize,
              xn: usize, lo: usize, hg: usize, pk: usize, pq: usize, pg: usize, pn: usize, pv: usize, inj: usize, mix: usize, mo: usize, emb: usize }
 
 pub(super) struct Scratch {
@@ -22,6 +22,8 @@ pub(super) struct Scratch {
     slab: Buf,
     /// `[chunk, 3 * n_embd]` hidden states captured before EAGLE3 `extract_layers`.
     feat: Option<Buf>,
+    /// `[chunk, n_ids * n_embd]` post-layer hidden states captured for DFlash `target_layer_ids`.
+    dflash_feat: Option<Buf>,
     /// ids | xrow | inv, `chunk * k` each.
     ints: Buf,
     tiles: Buf,
@@ -32,10 +34,15 @@ impl Scratch {
     pub fn new(m: &Model, gpu: &dyn Backend, chunk: usize) -> anyhow::Result<Scratch> {
         let c = &m.cfg;
         let mut stage_bytes = 0;
-        for il in 0..c.n_layer {
-            if !c.is_moe_layer(il) { continue; }
+        let max_il = if c.n_nextn > 0 && c.eagle3.is_none() { c.n_layer + 1 } else { c.n_layer };
+        for il in 0..max_il {
+            if il < c.n_layer && !c.is_moe_layer(il) { continue; }
             let mut b = 0;
-            for name in MATS { b = (b + m.w.layer(il, name)?.expert(0, c.n_expert).data.len()).next_multiple_of(16); }  // as ExpertCache lays out a slot
+            for name in MATS {
+                if let Ok(t) = m.w.layer(il, name) {
+                    b = (b + t.expert(0, c.n_expert).data.len()).next_multiple_of(16); // as ExpertCache lays out a slot
+                }
+            }
             stage_bytes = stage_bytes.max(b);
         }
         let (ne, k) = (c.n_embd, c.n_expert_used.max(1));
@@ -51,6 +58,7 @@ impl Scratch {
         let mut take = |n: usize| { let o = at; at += n * chunk; o };
         let (rl, wts, ge) = (take(c.n_expert), take(k), take((k * c.n_ff_exp).max(c.n_ff)));
         let (ye, shg, shy, sg) = (take(k * ne), take(c.n_ff_shexp), take(ne), take(1));
+        let hr = take(if c.hadamard.is_some() { ne } else { 0 });  // Gyro files: the rotated h
         let mut total = at.max(mix_end);
         let (mut xn, mut lo, mut hg, mut pk, mut pq, mut pg, mut pn, mut pv, mut inj, mut mix, mut mo, mut emb) = Default::default();
         if c.hc_n > 0 {
@@ -61,30 +69,50 @@ impl Scratch {
             let mut take = |n: usize| { let o = at; at += n * chunk; o };
             (inj, mix, mo, emb) = (take(c.hc_n), take(ne), take(ne), take(ne));
             total = at;
+        } else if c.mhc_streams > 0 {
+            let md = c.mhc_streams * ne;
+            at = base;
+            let mut take = |n: usize| { let o = at; at += n * chunk; o };
+            xn = take(md);
+            at = at.max(total);
+            let mut take = |n: usize| { let o = at; at += n * chunk; o };
+            (hg, mix, mo) = (take(md), take(ne), take(ne));
+            total = at;
         }
         let n_tiles = 3 * (chunk * k / GEMM_BM + 2 * c.n_expert);
         Ok(Scratch {
-            chunk, lay: Lay { h, a, b, c: c2, d, e, rl, wts, ge, ye, shg, shy, sg, xn, lo, hg, pk, pq, pg, pn, pv, inj, mix, mo, emb },
+            chunk, lay: Lay { h, a, b, c: c2, d, e, rl, wts, ge, ye, shg, shy, sg, hr, xn, lo, hg, pk, pq, pg, pn, pv, inj, mix, mo, emb },
             slab: gpu.zeros::<f32>(total)?,
             feat: if c.eagle3.is_some() { Some(gpu.zeros::<f32>(3 * ne * chunk)?) } else { None },
+            dflash_feat: c.dflash.as_ref().map(|dc| gpu.zeros::<f32>(dc.target_layer_ids.len() * ne * chunk)).transpose()?,
             ints: gpu.zeros::<i32>(3 * chunk * k)?, tiles: gpu.zeros::<u64>(2 * n_tiles)?,
             staging: gpu.zeros::<u8>(if c.is_moe() { 3 * STAGE * stage_bytes } else { 0 })?,
         })
     }
 
     /// Bytes of VRAM this scratch takes.
-    pub fn bytes(&self) -> usize { self.slab.len() + self.feat.as_ref().map_or(0, Buf::len) + self.ints.len() + self.tiles.len() + self.staging.len() }
+    pub fn bytes(&self) -> usize {
+        self.slab.len()
+            + self.feat.as_ref().map_or(0, Buf::len)
+            + self.dflash_feat.as_ref().map_or(0, Buf::len)
+            + self.ints.len()
+            + self.tiles.len()
+            + self.staging.len()
+    }
 }
 
 impl GpuModel<'_> {
     /// Run `tokens` from the current position; returns the logits after the last one. Short prompts (and models
     /// loaded without a prefill chunk) go through the decode step.
     pub fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
-        if self.prompt_cache_path.is_some() && self.pos == 0 && tokens.len() > 1 {
+        let fresh = self.pos == 0;
+        if fresh { self.reset_shortlist(); }
+        self.note_short_tokens(tokens);
+        if self.prompt_cache_path.is_some() && fresh && tokens.len() > 1 {
             let t0 = std::time::Instant::now();
             let (logits, reused) = self.prefill_cached(tokens, 0, tokens.len() - 1)?;
             if reused > 0 {
-                eprintln!(
+                crate::say!(
                     "warm start: reused {reused}/{} prompt tokens from cache (TTFT {:.1} ms)",
                     tokens.len(),
                     t0.elapsed().as_secs_f64() * 1e3
@@ -93,6 +121,11 @@ impl GpuModel<'_> {
             return Ok(logits);
         }
         let r = self.prefill_with(tokens, &mut |_| Ok(()))?;
+        if fresh {
+            self.ext_draft_sync_prompt(tokens)?;
+        } else if self.tail().ext_draft.is_some() {
+            self.tail_mut().ext_draft_pend.extend_from_slice(tokens);
+        }
         if let Some(ng) = self.ngram.as_mut() { ng.begin(tokens); }
         Ok(r)
     }
@@ -136,7 +169,7 @@ impl GpuModel<'_> {
         let mut p = Some(&mut *self);
         while let Some(q) = p {
             if let Some(cache) = q.cache.as_mut() {
-                if adapt && !cache.fully_resident() { cache.adapt(q.m, &*q.gpu, usize::MAX)?; }
+                if adapt && !cache.fully_resident() { cache.settle(q.m, &*q.gpu)?; }
             }
             p = q.next.as_deref_mut();
         }
@@ -158,6 +191,8 @@ impl GpuModel<'_> {
     pub fn prefill_cached_with(&mut self, tokens: &[u32], sys: usize, keep: usize, between: &mut dyn FnMut(&mut Self) -> anyhow::Result<()>)
         -> anyhow::Result<(Vec<f32>, usize)> {
         anyhow::ensure!(sys <= keep && keep < tokens.len(), "prefill_cached: sys {sys}, keep {keep} of {} tokens", tokens.len());
+        self.reset_shortlist();
+        self.note_short_tokens(tokens);
         let reused = self.cache_begin(tokens, keep)?;
         if sys > reused {
             self.prefill_with(&tokens[reused..sys], between)?;
@@ -169,10 +204,11 @@ impl GpuModel<'_> {
             self.save_state()?;
             (self.saved_ids, self.saved_owner) = (tokens[..keep].to_vec(), self.owner);
             if let Err(e) = self.sync_saved_to_prompt_cache() {
-                eprintln!("warning: could not save prompt cache: {e:#}");
+                crate::say!("warning: could not save prompt cache: {e:#}");
             }
         }
         let logits = self.prefill_with(&tokens[keep..], between)?;
+        self.ext_draft_sync_prompt(tokens)?;
         if let Some(ng) = self.ngram.as_mut() { ng.begin(tokens); }
         Ok((logits, reused))
     }
@@ -253,9 +289,18 @@ impl GpuModel<'_> {
 
     fn step_all(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
         let mut logits = Vec::new();
-        // Hyper-connection models: TMAX tokens per forward (prompts too short for the chunked GEMM prefill).
-        if self.m.cfg.hc_n > 0 {
-            for ch in tokens.chunks(self.tmax()) { logits = self.verify(ch)?.pop().unwrap(); }
+        // Hyper-connection / mHC models: TMAX tokens per forward (prompts too short for the chunked GEMM prefill).
+        if self.m.cfg.hc_n > 0 || self.m.cfg.mhc_streams > 0 {
+            // The draft head's entry for a token pairs it with the stack of the token before: row 0 of `x` at the
+            // start (as below), then the rows of the chunk.
+            let mut last = 0;
+            for ch in tokens.chunks(self.tmax()) {
+                let fill = self.mtp_synced();
+                if fill && self.pos > 0 { let r = self.row_ptr(last); self.mtp_run(&ch[..1], r, false)?; }
+                logits = self.verify(ch)?.pop().unwrap();
+                if fill && ch.len() > 1 { let r = self.row_ptr(0); self.mtp_run(&ch[1..], r, false)?; }
+                last = ch.len() - 1;
+            }
             return Ok(logits);
         }
         for &t in tokens {
@@ -268,6 +313,7 @@ impl GpuModel<'_> {
 
     /// `input`: the hidden rows and PLE input from the part before (None: embed `toks`).
     fn prefill_chunk(&mut self, toks: &[u32], input: Option<(&[f32], &[f32])>) -> anyhow::Result<()> {
+        self.dflash_commit_ctx()?;
         // Missed experts are read from the mapped weights in the order the staging copies take them.
         let pre = self.cache.is_some().then(Prefetch::start);
         let owned: (Vec<f32>, Vec<f32>);
@@ -296,8 +342,6 @@ impl GpuModel<'_> {
         let (x, h) = (at(0), at(l.h));
         let ha = HcAt { xn: at(l.xn), lo: at(l.lo), hg: at(l.hg), inj: at(l.inj), h, hq: 0, emb: at(l.emb), pk: at(l.pk), pq: at(l.pq), pg: at(l.pg),
                         pn: at(l.pn), pv: at(l.pv), gemm: true };
-        // Hyper-connections: the mixer and FFN outputs go to "mix" and "mo", then into the streams.
-        let (mx, mact) = if c.hc_n > 0 { (at(l.mix), 0) } else { (x, 2) };
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
         let (dv, channels) = (c.ssm_dv(), c.ssm_d_inner + 2 * nk * dk);
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
@@ -305,7 +349,9 @@ impl GpuModel<'_> {
         // The draft head runs as one more layer on the chunk while it is in step with the main model.
         let fill = self.mtp_synced();
         let is_eagle = self.mtp.as_ref().is_some_and(|mh| mh.eagle.is_some());
-        let mtp = self.mtp.as_ref().filter(|mh| fill && mh.eagle.is_none());
+        // ponytail: the chunked prefill does not fill a hyper-connection draft head (it starts without the prompt:
+        // lower acceptance at first, same output). Fill it as one more hc layer here if that costs speed.
+        let mtp = self.mtp.as_ref().filter(|mh| fill && mh.eagle.is_none() && c.hc_n == 0);
         // STRATA_NAN_TRACE[=N]: from position N (default 0), one line per layer with the largest magnitude of each intermediate buffer, and the first
         // row of one holding a non-finite value. Each probe waits for the GPU: diagnostic runs only.
         let trace = std::env::var("STRATA_NAN_TRACE").is_ok_and(|v| self.pos >= v.parse::<usize>().unwrap_or(0));
@@ -346,11 +392,30 @@ impl GpuModel<'_> {
                 step += 8;
                 rope += 8;
             }
+            // Hyper-connections / mHC: mixer and FFN outputs go to "mix" and "mo", then into the streams.
+            let (mx, mact) = if c.hc_n > 0 || ly.mhc.is_some() { (at(l.mix), 0) } else { (x, 2) };
             if let Some(pl) = &ly.ple { self.ple(pl, x, step, t, &ha)?; }
-            match (&ly.attn_norm, &ly.hc) {
-                (Some(an), _) => g.rms_norm(x, ne, an.ptr, h, ne, ne, t, eps)?,
-                (None, Some(hr)) => self.hc_read(&hr[0], x, t, &ha)?,
-                _ => unreachable!(),
+            if let Some((mk, mhc_a, _)) = &ly.mhc {
+                let s = c.mhc_streams;
+                let md = s * ne;
+                let ones = self.mhc_ones.as_ref().unwrap().addr();
+                if mk & 1 != 0 {
+                    g.hc_write(at(l.hg), x, 0, ne, 0x100 | 0x400 | s, t, false)?;
+                }
+                g.rms_norm(at(l.hg), md, ones, at(l.xn), md, md, t, 1e-6)?;
+                if mhc_a.weight.cols % 64 == 0 {
+                    g.gemm_dense(&mhc_a.weight, t, at(l.xn), md, mhc_a.buf.addr() + 128, mhc_a.out_dim, 0)?;
+                } else {
+                    self.mv(&mhc_a.weight, at(l.xn), md, mhc_a.buf.addr() + 128, mhc_a.out_dim, t)?;
+                }
+                g.hc_mix(at(l.hg), mhc_a.buf.addr(), h, ne, 0x100 | s | (mhc_a.out_dim << 16), t)?;
+                g.rms_norm(h, ne, ly.attn_norm.as_ref().unwrap().ptr, h, ne, ne, t, eps)?;
+            } else {
+                match (&ly.attn_norm, &ly.hc) {
+                    (Some(an), _) => g.rms_norm(x, ne, an.ptr, h, ne, ne, t, eps)?,
+                    (None, Some(hr)) => self.hc_read(&hr[0], x, t, &ha)?,
+                    _ => unreachable!(),
+                }
             }
             match &ly.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, .. } => {
@@ -426,20 +491,45 @@ impl GpuModel<'_> {
                 }
             }
             probe(&mut tr, "| mixer", &pf.slab, x, d, t)?;
-            match (&ly.post_norm, &ly.hc) {
-                (Some(pn), _) => g.rms_norm(x, ne, pn.ptr, h, ne, ne, t, eps)?,
-                (None, Some(hr)) => {
-                    g.hc_write(x, mx, at(l.inj), ne, c.hc_n, t, false)?;
-                    self.hc_read(&hr[1], x, t, &ha)?;
+            if let Some((_, mhc_a, mhc_f)) = &ly.mhc {
+                let s = c.mhc_streams;
+                let md = s * ne;
+                let ones = self.mhc_ones.as_ref().unwrap().addr();
+                g.hc_write(at(l.hg), mx, mhc_a.buf.addr(), ne, 0x100 | s | (mhc_a.out_dim << 16), t, false)?;
+                g.rms_norm(at(l.hg), md, ones, at(l.xn), md, md, t, 1e-6)?;
+                if mhc_f.weight.cols % 64 == 0 {
+                    g.gemm_dense(&mhc_f.weight, t, at(l.xn), md, mhc_f.buf.addr() + 128, mhc_f.out_dim, 0)?;
+                } else {
+                    self.mv(&mhc_f.weight, at(l.xn), md, mhc_f.buf.addr() + 128, mhc_f.out_dim, t)?;
                 }
-                _ => unreachable!(),
+                g.hc_mix(at(l.hg), mhc_f.buf.addr(), h, ne, 0x100 | s | (mhc_f.out_dim << 16), t)?;
+                g.rms_norm(h, ne, ly.post_norm.as_ref().unwrap().ptr, h, ne, ne, t, eps)?;
+            } else {
+                match (&ly.post_norm, &ly.hc) {
+                    (Some(pn), _) => g.rms_norm(x, ne, pn.ptr, h, ne, ne, t, eps)?,
+                    (None, Some(hr)) => {
+                        g.hc_write(x, mx, at(l.inj), ne, c.hc_n, t, false)?;
+                        self.hc_read(&hr[1], x, t, &ha)?;
+                    }
+                    _ => unreachable!(),
+                }
             }
             match &ly.ffn {
                 Ffn::Dense { gate, up, down } => {
                     g.gemm_dense(gate, t, h, ne, at(l.ge), c.n_ff, 0)?;
                     g.gemm_dense(up, t, h, ne, at(l.ge), c.n_ff, 1 | SAME_X)?;
                     probe(&mut tr, "gate_up", &pf.slab, at(l.ge), c.n_ff, t)?;
-                    g.gemm_dense(down, t, at(l.ge), c.n_ff, x, ne, 2)?;
+                    if let Some((mk, _, mhc_f)) = &ly.mhc {
+                        g.gemm_dense(down, t, at(l.ge), c.n_ff, at(l.mo), ne, 0)?;
+                        let leave_bit = if mk & 2 != 0 { 0x200 } else { 0 };
+                        let code_f = 0x100 | leave_bit | c.mhc_streams | (mhc_f.out_dim << 16);
+                        g.hc_write(at(l.hg), at(l.mo), mhc_f.buf.addr(), ne, code_f, t, false)?;
+                        if mk & 2 != 0 {
+                            g.dtod(&pf.slab, 4 * l.mo, &pf.slab, 0, 4 * t * ne)?;
+                        }
+                    } else {
+                        g.gemm_dense(down, t, at(l.ge), c.n_ff, x, ne, 2)?;
+                    }
                 }
                 Ffn::Moe { router, shared } => {
                     let k = c.n_expert_used;
@@ -469,7 +559,7 @@ impl GpuModel<'_> {
                             lower --chunk (for example --chunk 1024) or --ctx, and try STRATA_NAN_TRACE=1 for a non-finite hidden state", self.pos);
                     }
                     let cache = self.cache.as_mut().unwrap();
-                    cache.record(il, &ids);
+                    cache.record_prompt(il, &ids);
                     // Sort (token, j) pairs by expert: slot s holds token xrow[s]; inv maps t * k + j to its slot.
                     let mut off = vec![0usize; c.n_expert + 1];
                     for &e in &ids { off[e as usize + 1] += 1; }
@@ -553,6 +643,12 @@ impl GpuModel<'_> {
                     let tp = |s: usize| pf.tiles.addr() + 16 * s as u64;
                     let xrow_d = pf.ints.addr() + 4 * (n * k) as u64;
                     let [mg, mu, md] = lx.mats;
+                    // Gyro files: the routed experts read the rotated h and the rotated SwiGLU output (`config::Hadamard`).
+                    let rot = self.hada.as_ref().zip(c.hadamard.as_ref());
+                    let (hx, same) = match rot {
+                        Some((s, r)) => { g.hadamard(h, 0, s[0].addr(), at(l.hr), ne, r.block, t)?; (at(l.hr), 0) }
+                        None => (h, SAME_X),
+                    };
                     let copy = |j: usize| -> anyhow::Result<()> {
                         let grp = &staged[j];
                         for (name, mat) in MATS.iter().zip(&lx.mats) {
@@ -571,10 +667,12 @@ impl GpuModel<'_> {
                     for ((_, cp), (gu, downs)) in steps.iter().zip(&spans) {
                         g.beside(&mut || {
                             if gu[0].1 > 0 {
-                                g.gemm(mg.ty, mg.rows, mg.cols, tp(gu[0].0), gu[0].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, SAME_X)?;
-                                g.gemm(mu.ty, mu.rows, mu.cols, tp(gu[1].0), gu[1].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X)?;
+                                g.gemm(mg.ty, mg.rows, mg.cols, tp(gu[0].0), gu[0].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, same)?;
+                                g.gemm(mu.ty, mu.rows, mu.cols, tp(gu[1].0), gu[1].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X)?;
                             }
                             for &((s0, n0), lo, hi) in downs {
+                                let ge = at(l.ge) + (4 * lo * c.n_ff_exp) as u64;
+                                if let Some((s, r)) = rot { g.hadamard(ge, 0, s[1].addr(), ge, c.n_ff_exp, r.block, hi - lo)?; }
                                 g.gemm(md.ty, md.rows, md.cols, tp(s0), n0, at(l.ge) + (4 * lo * c.n_ff_exp) as u64, c.n_ff_exp, hi - lo, 0, at(l.ye) + (4 * lo * ne) as u64, ne, 0)?;
                             }
                             if let Some(j) = *cp { copy(j)?; }
@@ -599,7 +697,17 @@ impl GpuModel<'_> {
                 }
             }
             probe(&mut tr, "| ffn", &pf.slab, x, d, t)?;
-            if trace { eprintln!("nan-trace pos {} layer {il}:{tr}", self.pos); tr.clear(); }
+            if trace { crate::say!("nan-trace pos {} layer {il}:{tr}", self.pos); tr.clear(); }
+            if il < c.n_layer {
+                if let (Some(dff), Some(df)) = (&pf.dflash_feat, self.dflash.as_ref()) {
+                    if let Some(idx) = df.cfg.target_layer_ids.iter().position(|&tl| tl == il) {
+                        let n_ids = df.cfg.target_layer_ids.len();
+                        for r in 0..t {
+                            g.dtod(&pf.slab, 4 * r * ne, dff, 4 * (r * n_ids + idx) * ne, 4 * ne)?;
+                        }
+                    }
+                }
+            }
             g.kick()?;
         }
         if fill && is_eagle {
@@ -621,11 +729,40 @@ impl GpuModel<'_> {
             let eg = self.mtp.as_ref().unwrap().eagle.as_ref().unwrap();
             self.gpu.dtod(&pf.slab, 4 * (lh + (t - 1) * ne), &eg.cur_g, 0, 4 * ne)?;
         } else {
-            match self.mtp.as_mut() {
-                Some(mh) if fill => mh.pos += t,
-                // Row 0 of `x` gets the last hidden state (with the draft head, the copy above did it).
-                _ => g.dtod(&pf.slab, 4 * (t - 1) * d, &self.x, 0, 4 * d)?,
+            if let Some(mh) = self.mtp.as_mut().filter(|_| fill) { mh.pos += t; }
+            // Row 0 of `x` gets the last hidden state (the draft head's layer above did it when it ran: not with
+            // hyper-connections).
+            if !(fill && c.hc_n == 0) { g.dtod(&pf.slab, 4 * (t - 1) * d, &self.x, 0, 4 * d)?; }
+        }
+        if let (Some(pf), Some(df)) = (&self.pf, &self.dflash)
+            && let Some(dff) = &pf.dflash_feat
+        {
+            let g = &self.gpu;
+            let (l, n, base) = (&pf.lay, pf.chunk, pf.slab.addr());
+            let at = |o: usize| base + 4 * o as u64;
+            let h = at(l.h);
+            let dc = &df.cfg;
+            let n_ids = dc.target_layer_ids.len();
+            let (df_ne, df_nkv, df_hd, df_eps) = (dc.n_embd, dc.n_head_kv, dc.head_dim, dc.eps);
+            let df_kv = df_nkv * df_hd;
+            g.gemm_dense(&df.fc, t, dff.addr(), n_ids * ne, at(l.a), df_ne, 0)?;
+            g.rms_norm(at(l.a), df_ne, df.hidden_norm.ptr, h, df_ne, df_ne, t, df_eps)?;
+            g.put(&[df.pos as i32, 0], &df.ctx_step, 0)?;
+            let (kraw, kk, vv) = (at(l.c), at(l.c + n * df_kv), at(l.c + 2 * n * df_kv));
+            for (li, dl) in df.layers.iter().enumerate() {
+                let first_act = if li == 0 { 0 } else { SAME_X };
+                g.gemm_dense(&dl.k, t, h, df_ne, kraw, df_kv, first_act)?;
+                g.gemm_dense(&dl.v, t, h, df_ne, vv, df_kv, SAME_X)?;
+                g.rms_norm_rope_kv(
+                    kraw, df_hd, dl.kn.ptr, kk,
+                    df_hd, t * df_nkv, df_eps, df_nkv, dc.n_rot, df.ctx_step.addr(), dc.rope_base,
+                    vv, dl.kc[self.cur].addr(), dl.vc[self.cur].addr(),
+                )?;
             }
+        }
+        if let Some(df) = self.dflash.as_mut() {
+            df.pos += t;
+            df.pend_ctx = 0;
         }
         self.pos += toks.len();
         let Some(nx) = self.next.as_deref_mut() else { return Ok(()) };

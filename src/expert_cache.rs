@@ -35,6 +35,12 @@ pub struct ExpertCache {
     /// profile of the last reply alone made the next run's placement fit that reply only, and where the placement
     /// changes the greedy text (CPU and GPU experts round differently), runs alternated between two placements.
     long: Vec<f32>,
+    /// Routing of the prompt being prefilled, until `settle` folds it into `counts`. Not part of `long`: a prompt has
+    /// thousands of tokens for a reply's hundreds, and a profile made of prompts placed the prompt's experts while
+    /// decode, the only phase that pays for a miss, routed elsewhere (issue #44).
+    prompt: Vec<f32>,
+    /// Sum of one layer's `counts` in steady state (k experts per token, an adapt every 8 tokens).
+    steady: f32,
     /// None under `STRATA_FIXED_EXPERTS`: placement ignores and keeps the saved profile and never adapts.
     profile: Option<PathBuf>,
     /// Whether `record` ran since the load: a fully resident run records nothing and must not rewrite the profile.
@@ -62,7 +68,7 @@ impl ExpertCache {
         let n_layers = range.end;
         let c = &m.cfg;
         let n = c.n_expert;
-        const MAX_POOL_FULL_BYTES: usize = 8192 << 20;
+        const MAX_POOL_FULL_BYTES: usize = 2048 << 20;
         let mut layers: Vec<Option<(usize, [Mat; 3])>> = Vec::new();
         let mut pool_specs: Vec<(usize, usize)> = Vec::new(); // (slot_bytes, experts in pool)
         for il in 0..n_layers {
@@ -91,12 +97,15 @@ impl ExpertCache {
             .filter(|b| b.len() >= 4 * c.n_layer * n)
             .map(|b| b.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect::<Vec<_>>())
             .unwrap_or_default();
+        if let Some(p) = profile.as_ref().filter(|_| frac < 1.0) {
+            crate::say!("expert profile: {}{}", p.display(), if counts.is_empty() { " (none yet: written when the run ends)" } else { "" });
+        }
         let mut long = counts;
         long.resize(n_layers * n, 0.0);
         // `counts` start from the profile at the size routing gives them in steady state (k experts per token, an
         // adapt every 8 tokens), so the first tokens of a run do not move the placement more than later ones.
         let steady = (c.n_expert_used * 8) as f32 / (1.0 - KEEP);
-        let counts = long.chunks(n.max(1)).flat_map(|l| { let s = l.iter().sum::<f32>(); l.iter().map(move |x| if s > 0.0 { x * steady / s } else { 0.0 }) }).collect();
+        let counts: Vec<f32> = long.chunks(n.max(1)).flat_map(|l| { let s = l.iter().sum::<f32>(); l.iter().map(move |x| if s > 0.0 { x * steady / s } else { 0.0 }) }).collect();
 
         // The budget comes from the driver's free-memory estimate, which can be more than it will allocate (AMD's
         // Windows driver): on a failed allocation, free the pools and try a tenth less.
@@ -108,7 +117,7 @@ impl ExpertCache {
             match r {
                 Ok(p) => break p,
                 Err(e) if frac > 0.01 => {
-                    eprintln!("expert slots: {e:#}; trying {:.0} MB", 0.9 * frac * total as f64 / 1048576.0);
+                    crate::say!("expert slots: {e:#}; trying {:.0} MB", 0.9 * frac * total as f64 / 1048576.0);
                     frac *= 0.9;
                 }
                 Err(e) => return Err(e),
@@ -124,7 +133,8 @@ impl ExpertCache {
                 }),
             });
         }
-        let mut cache = ExpertCache { pools, layers: out, n_expert: n, counts, long, profile, recorded: false, swaps: 0 };
+        let prompt = vec![0.0; counts.len()];
+        let mut cache = ExpertCache { pools, layers: out, n_expert: n, counts, long, prompt, steady, profile, recorded: false, swaps: 0 };
         // Initial fill: hottest first by profile; ties (and no profile) keep layer order.
         let mut order: Vec<usize> = (0..n_layers * n).filter(|&i| cache.layers[i / n].is_some()).collect();
         order.sort_by(|&a, &b| cache.counts[b].total_cmp(&cache.counts[a]).then(a.cmp(&b)));
@@ -211,6 +221,29 @@ impl ExpertCache {
         }
     }
 
+    /// Routing of a prefill chunk, for `settle`.
+    pub fn record_prompt(&mut self, il: usize, ids: &[i32]) {
+        for &e in ids { self.prompt[il * self.n_expert + e as usize] += 1.0; }
+    }
+
+    /// After a prefill: the prompt's routing joins `counts`, scaled back to steady-state size, and the placement
+    /// follows. A long prompt still decides the placement the reply starts with, but its thousands of tokens no
+    /// longer outweigh the reply's: the reply's own routing moves the placement as fast as in any other run.
+    pub fn settle(&mut self, m: &Model, gpu: &dyn Backend) -> anyhow::Result<()> {
+        let n = self.n_expert;
+        if self.profile.is_some() {
+            for il in 0..self.layers.len() {
+                let r = il * n..(il + 1) * n;
+                for i in r.clone() { self.counts[i] += self.prompt[i]; }
+                let sum = self.counts[r.clone()].iter().sum::<f32>();
+                if sum > self.steady { for i in r { self.counts[i] *= self.steady / sum; } }
+            }
+            self.swap(m, gpu, usize::MAX)?;
+        }
+        self.prompt.fill(0.0);
+        Ok(())
+    }
+
     /// Forget the short-term routing counts: the prompt's thousands of tokens no longer outweigh the reply's first
     /// tokens, so `adapt` follows the text being decoded instead of the prompt that produced it.
     pub fn reset_counts(&mut self) { self.counts.fill(0.0); }
@@ -220,6 +253,10 @@ impl ExpertCache {
         if self.profile.is_none() { return Ok(()); }
         for c in &mut self.counts { *c *= KEEP; }
         for c in &mut self.long { *c *= LONG_KEEP; }
+        self.swap(m, gpu, max_swaps)
+    }
+
+    fn swap(&mut self, m: &Model, gpu: &dyn Backend, max_swaps: usize) -> anyhow::Result<()> {
         let n = self.n_expert;
         for p in 0..self.pools.len() {
             let mut hot: Vec<usize> = (0..self.counts.len())
@@ -298,7 +335,7 @@ mod tests {
             table_dev: Buf::new(0, 4 * n, ()),
         })).collect();
         let mut c = ExpertCache { pools: vec![pool], layers: ls, n_expert: n, counts: vec![0.0; layers * n],
-            long: vec![0.0; layers * n], profile, recorded: false, swaps: 0 };
+            long: vec![0.0; layers * n], prompt: vec![0.0; layers * n], steady: 1.0, profile, recorded: false, swaps: 0 };
         for il in 0..layers {
             for e in 0..resident {
                 c.pools[0].owner.push((il, e));

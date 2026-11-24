@@ -12,18 +12,21 @@ pub struct Request {
     pub host: String,
     pub auth: String,
     pub json: bool,
+    /// A reverse proxy's header is present (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`): the peer address is the
+    /// proxy's, not the client's.
+    pub proxied: bool,
     pub body: Vec<u8>,
 }
 
-/// Reads one request (Content-Length bodies only, no chunked uploads). Headers are capped at 64 KiB and the body at
-/// 8 MiB.
+/// Reads one request, with a `Content-Length` or a chunked body (`Transfer-Encoding: chunked`, which wins when both
+/// are present). Headers are capped at 64 KiB and the body at 8 MiB.
 pub fn read_request(r: &mut impl BufRead) -> anyhow::Result<Request> {
     let mut h = r.take(64 << 10);
     let mut line = String::new();
     h.read_line(&mut line)?;
     let mut it = line.split_whitespace();
     let (method, path) = (it.next().context("empty request")?.to_string(), it.next().context("no path")?.to_string());
-    let (mut len, mut host, mut auth, mut json) = (0, String::new(), String::new(), false);
+    let (mut len, mut host, mut auth, mut json, mut proxied, mut chunked) = (0, String::new(), String::new(), false, false, false);
     loop {
         line.clear();
         if h.read_line(&mut line)? == 0 { bail!("headers cut off or too long"); }
@@ -33,18 +36,46 @@ pub fn read_request(r: &mut impl BufRead) -> anyhow::Result<Request> {
         let (k, v) = (k.to_ascii_lowercase(), v.trim());
         match k.as_str() {
             "content-length" => len = v.parse().context("bad Content-Length")?,
+            "transfer-encoding" => chunked = v.to_ascii_lowercase().contains("chunked"),
             "host" => host = v.to_string(),
             "authorization" => auth = v.to_string(),
             // The Anthropic API's key header (Claude Code with ANTHROPIC_API_KEY).
             "x-api-key" if auth.is_empty() => auth = format!("Bearer {v}"),
             "content-type" => json = v.starts_with("application/json"),
+            "forwarded" | "x-real-ip" => proxied = true,
+            _ if k.starts_with("x-forwarded-") => proxied = true,
             _ => {}
         }
     }
-    if len > 8 << 20 { bail!("body too large"); }
-    let mut body = vec![0; len];
-    r.read_exact(&mut body)?;
-    Ok(Request { method, path, host, auth, json, body })
+    const MAX: usize = 8 << 20;
+    let mut body = Vec::new();
+    if chunked {
+        // Each chunk: a hex size (extensions after ';' are ignored), CRLF, the bytes, CRLF. Size 0 ends the body;
+        // trailer lines after it are read and dropped.
+        loop {
+            line.clear();
+            if r.by_ref().take(1 << 10).read_line(&mut line)? == 0 { bail!("chunked body cut off"); }
+            let n = usize::from_str_radix(line.split(';').next().unwrap_or_default().trim(), 16).context("bad chunk size")?;
+            if n == 0 { break; }
+            if n > MAX - body.len() { bail!("body too large"); }
+            let at = body.len();
+            body.resize(at + n, 0);
+            r.read_exact(&mut body[at..])?;
+            line.clear();
+            r.by_ref().take(1 << 10).read_line(&mut line)?;
+            if !line.trim_end().is_empty() { bail!("bad chunk end"); }
+        }
+        let mut t = r.by_ref().take(64 << 10);
+        loop {
+            line.clear();
+            if t.read_line(&mut line)? == 0 || line.trim_end().is_empty() { break; }
+        }
+    } else {
+        if len > MAX { bail!("body too large"); }
+        body.resize(len, 0);
+        r.read_exact(&mut body)?;
+    }
+    Ok(Request { method, path, host, auth, json, proxied, body })
 }
 
 /// Host header check against DNS rebinding: a loopback name, the host the server was bound to, or a name the user
@@ -67,6 +98,22 @@ pub fn gone(c: &std::net::TcpStream) -> bool {
 }
 
 /// `Authorization` header check for `--api-key`, without an early exit on the first differing byte.
+/// The chat page of `serve`.
+pub const PAGE: &str = include_str!("web/index.html");
+
+/// What a chat of a model outside the main engine did, for the server's log and statistics.
+pub struct Done { pub prompt: usize, pub cached: usize, pub completion: usize, pub prefill_s: f64, pub finish: &'static str }
+
+/// Writes one response with a body.
+pub fn send(c: &mut impl std::io::Write, status: &str, ty: &str, b: &str) {
+    let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+}
+
+/// The chat of a model outside the main engine (Gemma 4, GLM, DeepSeek, Hy4, Inkling 2), which owns the model: it
+/// writes the whole reply to a POST /v1/chat/completions and returns what it did. An error is returned before
+/// anything is written.
+pub type Own<'a> = Box<dyn FnMut(&mut std::net::TcpStream, &ChatRequest) -> anyhow::Result<Done> + 'a>;
+
 pub fn key_ok(auth: &str, key: &str) -> bool {
     if key.is_empty() { return false; }
     let a = auth.strip_prefix("Bearer ").unwrap_or("").as_bytes();
@@ -160,6 +207,69 @@ pub fn list_models(dir: &Path) -> Vec<(String, PathBuf, u64)> {
     out
 }
 
+/// GGUF models that the Hugging Face hub cache (`hf download`, `huggingface_hub`, llama.cpp `-hf`) and llama.cpp's
+/// own cache already hold, so the page offers them without a second download. Hub repos appear as
+/// `hf/<org>/<repo>/<file>` from the snapshot that `refs/main` names (else the newest one); llama.cpp's cache as
+/// `llama.cpp/<file>`.
+pub fn cached_models() -> Vec<(String, PathBuf, u64)> {
+    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let home = env("HOME").or_else(|| env("USERPROFILE")).unwrap_or_default();
+    let cache = env("XDG_CACHE_HOME").unwrap_or_else(|| home.join(".cache"));
+    let hub = env("HF_HUB_CACHE").or_else(|| env("HF_HOME").map(|h| h.join("hub"))).unwrap_or_else(|| cache.join("huggingface/hub"));
+    let mut out = hub_models(&hub);
+    let llama = env("LLAMA_CACHE").unwrap_or_else(|| cache.join("llama.cpp"));
+    out.extend(list_models(&llama).into_iter().map(|(id, p, n)| (format!("llama.cpp/{id}"), p, n)));
+    out
+}
+
+/// The models of a Hugging Face hub cache folder (`cached_models`).
+pub fn hub_models(hub: &Path) -> Vec<(String, PathBuf, u64)> {
+    let mut out = Vec::new();
+    for repo in std::fs::read_dir(hub).into_iter().flatten().flatten().map(|e| e.path()) {
+        let Some(name) = repo.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_prefix("models--")) else { continue };
+        let snaps = repo.join("snapshots");
+        let snap = std::fs::read_to_string(repo.join("refs/main")).ok().map(|h| snaps.join(h.trim())).filter(|p| p.is_dir())
+            .or_else(|| std::fs::read_dir(&snaps).ok()?.flatten().map(|e| e.path())
+                .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()));
+        let Some(snap) = snap else { continue };
+        out.extend(list_models(&snap).into_iter().map(|(id, p, n)| (format!("hf/{}/{id}", name.replacen("--", "/", 1)), p, n)));
+    }
+    out
+}
+
+/// Whether an error is a GPU failure no later request can recover from: a lost Vulkan device, or a CUDA error that
+/// leaves the context unusable (the CUDA documentation: "the process must be terminated and relaunched"). It looks
+/// only at the backend's typed error in the chain, never at message text: an error message can quote request data.
+pub fn gpu_dead(err: &anyhow::Error) -> bool {
+    use cudarc::driver::sys::CUresult as C;
+    err.chain().any(|e| e.is::<GpuLost>() || e.downcast_ref::<ash::vk::Result>() == Some(&ash::vk::Result::ERROR_DEVICE_LOST)
+        || e.downcast_ref::<cudarc::driver::DriverError>().is_some_and(|d| matches!(d.0, C::CUDA_ERROR_ILLEGAL_ADDRESS
+            | C::CUDA_ERROR_LAUNCH_FAILED | C::CUDA_ERROR_ECC_UNCORRECTABLE | C::CUDA_ERROR_HARDWARE_STACK_ERROR
+            | C::CUDA_ERROR_ILLEGAL_INSTRUCTION | C::CUDA_ERROR_MISALIGNED_ADDRESS | C::CUDA_ERROR_INVALID_ADDRESS_SPACE
+            | C::CUDA_ERROR_INVALID_PC | C::CUDA_ERROR_CONTEXT_IS_DESTROYED)))
+}
+
+/// Marks a copy of an error that was `gpu_dead` (`copy_err`).
+#[derive(Debug)]
+pub struct GpuLost;
+impl std::fmt::Display for GpuLost { fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("GPU device lost") } }
+impl std::error::Error for GpuLost {}
+
+/// A copy of `err` for each of several waiting requests (`anyhow::Error` is not `Clone`): its text, and still `gpu_dead`.
+pub fn copy_err(err: &anyhow::Error) -> anyhow::Error {
+    let text = format!("{err:#}");
+    if gpu_dead(err) { anyhow::Error::new(GpuLost).context(text) } else { anyhow::anyhow!(text) }
+}
+
+/// After `gpu_dead` the server exits with status 1, so a service manager restarts it (`Restart=on-failure`) instead of
+/// every later request failing on a server that looks healthy.
+pub fn exit_if_gpu_dead(err: &anyhow::Error) {
+    if gpu_dead(err) {
+        crate::say!("the GPU device is lost and this process cannot use it again: exiting with status 1 (restart the server)");
+        std::process::exit(1);
+    }
+}
+
 /// A projector filename (`mmproj*`, `*-mmproj.gguf`), matching `vision::is_mmproj` without reading the header.
 fn is_mmproj_name(name: &str) -> bool { name.starts_with("mmproj") || name.contains("-mmproj") || name.contains("mmproj-") }
 
@@ -204,12 +314,26 @@ pub struct ChatRequest {
     pub tool_calls: bool,
     pub max_tokens: Option<usize>,
     pub stream: bool,
+    pub include_usage: bool,
     pub think: Option<bool>,
+    /// Optional reasoning effort (`"none"|"minimal"|"low"|"medium"|"high"|"xhigh"|"max"` or float in `[0.0, 0.99]`).
+    pub reasoning_effort: Option<String>,
+    /// Maximum tokens allowed inside `<think>` before forcing `</think>\n\n` (0 = unlimited).
+    pub thinking_budget: Option<usize>,
     /// `chat_template_kwargs.preserve_thinking`; the server's `--preserve-thinking` when absent.
     pub preserve_thinking: Option<bool>,
     pub temperature: Option<f32>,
     pub top_k: Option<usize>,
     pub top_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    /// llama.cpp server names: the repeat penalty and how many of the reply's last tokens it looks at.
+    pub repeat_penalty: Option<f32>,
+    pub penalty_last_n: Option<i32>,
+    /// DRY sampler (llama.cpp server names): multiplier, base, allowed length.
+    pub dry_multiplier: Option<f32>,
+    pub dry_base: Option<f32>,
+    pub dry_allowed_length: Option<usize>,
     pub seed: Option<u64>,
     /// The reply ends before the first of these strings (`stop`).
     pub stop: Vec<String>,
@@ -253,10 +377,42 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
     // Hold checks every prefix of every stop string at each token, so both are bounded.
     if stop.len() > 16 || stop.iter().any(|s| s.len() > 256) { bail!("stop takes at most 16 strings of at most 256 bytes"); }
     let think = v["chat_template_kwargs"]["enable_thinking"].as_bool();
-    Ok(ChatRequest { messages, tools, tool_calls, max_tokens, stream: v["stream"].as_bool().unwrap_or(false), think,
+    let include_usage = v["stream_options"]["include_usage"].as_bool().unwrap_or(false);
+    let raw_effort = if !v["reasoning_effort"].is_null() {
+        &v["reasoning_effort"]
+    } else {
+        &v["chat_template_kwargs"]["reasoning_effort"]
+    };
+    let reasoning_effort = match raw_effort {
+        Value::Null => None,
+        Value::String(s) => Some(s.trim().to_string()),
+        Value::Number(n) => {
+            let f = n.as_f64().context("reasoning_effort must be a finite number")?;
+            Some(if f == 0.0 { "0".into() } else { format!("{f}") })
+        }
+        _ => bail!("reasoning_effort must be a string or a number"),
+    };
+    let thinking_budget = match int("thinking_budget", 0)? {
+        Some(n) => Some(n as usize),
+        None => match &v["chat_template_kwargs"]["thinking_budget"] {
+            Value::Null => None,
+            x => Some(x.as_u64().context("chat_template_kwargs.thinking_budget must be an integer >= 0")? as usize),
+        },
+    };
+    Ok(ChatRequest { messages, tools, tool_calls, max_tokens, stream: v["stream"].as_bool().unwrap_or(false), include_usage, think, reasoning_effort, thinking_budget,
         preserve_thinking: v["chat_template_kwargs"]["preserve_thinking"].as_bool(),
         temperature: num("temperature", |f| f >= 0.0, "a number >= 0")?, top_k: int("top_k", 0)?.map(|n| n as usize),
-        top_p: num("top_p", |f| f > 0.0 && f <= 1.0, "a number in (0, 1]")?, seed: int("seed", 0)?, stop })
+        top_p: num("top_p", |f| f > 0.0 && f <= 1.0, "a number in (0, 1]")?,
+        presence_penalty: num("presence_penalty", |f| (-2.0..=2.0).contains(&f), "a number in [-2, 2]")?,
+        frequency_penalty: num("frequency_penalty", |f| (-2.0..=2.0).contains(&f), "a number in [-2, 2]")?,
+        repeat_penalty: num("repeat_penalty", |f| f > 0.0 && f <= 5.0, "a number in (0, 5]")?,
+        penalty_last_n: match &v["penalty_last_n"] {
+            Value::Null => None,
+            x => Some(x.as_i64().and_then(|n| i32::try_from(n).ok()).context("penalty_last_n must be an integer")?),
+        },
+        dry_multiplier: num("dry_multiplier", |f| (0.0..=5.0).contains(&f), "a number in [0, 5]")?,
+        dry_base: num("dry_base", |f| f > 1.0 && f <= 4.0, "a number in (1, 4]")?,
+        dry_allowed_length: int("dry_allowed_length", 1)?.map(|n| n as usize), seed: int("seed", 0)?, stop })
 }
 
 /// What the chat page's side panel shows about the server, kept by the request loop and answered by the reader
@@ -265,7 +421,12 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
 pub struct Stats {
     /// The loaded model's name, or the one loading.
     pub model: Option<String>,
+    /// The file name of `model` without `.gguf`, which `--alias` hides.
+    #[serde(skip)]
+    pub file: String,
     pub loading: bool,
+    /// `--auto-unload` freed `model`; a chat request loads it again.
+    pub unloaded: bool,
     /// "cuda", "vulkan" or "cpu", and the GPU's name.
     pub backend: String,
     pub device: String,
@@ -482,6 +643,11 @@ pub fn messages_body(body: &[u8]) -> anyhow::Result<Vec<u8>> {
     for (from, to) in [("max_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k"), ("stop_sequences", "stop"), ("stream", "stream")] {
         if !matches!(j.get(from), Json::Null) { out.push((to, j.get(from).clone())); }
     }
-    if j.get("thinking").get("type").as_str() == Some("enabled") { out.push(("chat_template_kwargs", obj(vec![("enable_thinking", Json::Bool(true))]))); }
+    if j.get("thinking").get("type").as_str() == Some("enabled") {
+        out.push(("chat_template_kwargs", obj(vec![("enable_thinking", Json::Bool(true))])));
+        if !matches!(j.get("thinking").get("budget_tokens"), Json::Null) {
+            out.push(("thinking_budget", j.get("thinking").get("budget_tokens").clone()));
+        }
+    }
     Ok(obj(out).dump().into_bytes())
 }

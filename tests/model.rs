@@ -74,6 +74,32 @@ fn qwen4exp_greedy_paris() {
     assert_eq!(tok.decode(&[ops::argmax(&logits) as u32]).unwrap().trim(), "Paris");
 }
 
+/// Flash-Next MTP drafter (companion GGUF, `blk.48`): the draft for position p + 2 against the main model's greedy
+/// token over the generated tokens.
+#[test]
+#[ignore]
+fn qwen4exp_mtp_draft_acceptance() {
+    use rusting_strata::model::Mtp;
+    let (p, d) = (std::path::Path::new(QWEN4EXP), std::path::Path::new("/mnt/ollama/qwen4exp/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"));
+    if !p.exists() || !d.exists() { return }
+    let (g, ag) = (Gguf::open(p).unwrap(), Gguf::open(d).unwrap());
+    let m = Model::load_with_aux(&g, Some(&ag), &[]).unwrap();
+    assert_eq!(m.cfg.n_nextn, 1);
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let mut ids = tok.encode("Write a short story about a dragon.").unwrap();
+    let n_prompt = ids.len();
+    let (mut st, mut mtp, mut drafts) = (State::new(&m.cfg), Mtp::default(), vec![]);
+    for i in 0..n_prompt + 16 {
+        let (logits, x) = m.step_h(&mut st, ids[i]);
+        if i + 1 == ids.len() { ids.push(ops::argmax(&logits) as u32); }
+        drafts.push(ops::argmax(&m.mtp_step(&mut mtp, &x, ids[i + 1]).0) as u32);
+    }
+    let hits: Vec<bool> = (n_prompt - 2..drafts.len() - 1).map(|p| drafts[p] == ids[p + 2]).collect();
+    let n_ok = hits.iter().filter(|&&b| b).count();
+    eprintln!("MTP acceptance {n_ok}/{} on {:?}", hits.len(), tok.decode(&ids[n_prompt..]).unwrap());
+    assert!(n_ok * 10 >= hits.len() * 5, "MTP acceptance {n_ok}/{}", hits.len());
+}
+
 /// QSA sparse attention with top_k lowered to 8 cells (2 pooled blocks) so a short prompt runs sparse: the
 /// log-probabilities of the next token, teacher-forced, against llama.cpp (`--override-kv
 /// qwen4exp.attention.indexer.top_k=int:8`, CUDA, -cmoe). The block scores are close, so a rounding difference can

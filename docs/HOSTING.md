@@ -128,19 +128,22 @@ sudo -u strata env STRATA_API_KEY=<admin key> rustingstrata serve --model $M --g
 
 Clients then use the OpenAI address `https://api.example.com/v1` with their key, or the Anthropic address
 `https://api.example.com` (`POST /v1/messages`). The request fields RustingStrata honors (sampling, `stop`, tools,
-thinking) are listed under [Use](../README.md#use) in the README; the usage of a streamed reply comes in its last
+thinking) are listed under [Server API](USAGE.md#server-api); the usage of a streamed reply comes in its last
 chunk.
 
 ## Keys
 
 - **Admin key** (`--api-key`, or `STRATA_API_KEY` to keep it out of the process list). It can use every route: the
-  chat APIs, the chat page's stats, loading another model (`/api/load`) and downloading models (`/api/download`).
-  Keep it for yourself.
+  chat APIs, the chat page's stats, loading another model (`/api/load`, from the models folder
+  or by the path of any GGUF file the server can read; or a chat request whose `model` is another name of
+  `GET /v1/models`) and downloading models (`/api/download`). Keep it for
+  yourself.
 - **Customer keys** (`--api-keys FILE`). One `name key` pair a line, `#` starts a comment (so a key cannot contain
   `#`). Keys must be at least 16 characters, names and keys must not repeat, and the admin key must not be among
   them. A customer key reaches only `POST /v1/chat/completions`,
-  `POST /v1/messages`, `POST /v1/messages/count_tokens` and `GET /v1/models`; other routes answer `403`. The name
-  goes into the usage log.
+  `POST /v1/messages`, `POST /v1/messages/count_tokens` and `GET /v1/models`; other routes answer `403`. It sees
+  only the loaded model in `/v1/models`, and the `model` of its requests never loads another one. The name goes into
+  the usage log.
 - **Changing the key file.** The server reads the file again when it changes, and the next request uses the new
   keys; replies being generated go on. A file that cannot be read or does not parse keeps the old keys (the server
   log says why). A file with no keys removes all customer keys when there is an admin key; without one it is refused,
@@ -273,6 +276,9 @@ TimeoutStopSec=300
 WantedBy=multi-user.target
 ```
 
+When the GPU device is lost (a driver reset, a GPU hang), no later request can succeed, so `serve` exits with
+status 1 and `Restart=on-failure` starts it again.
+
 With the user, keys and calibration of the quick start:
 
 ```sh
@@ -284,12 +290,41 @@ Run `calibrate` as the service user, because the calibration file and the CUDA k
 `~/.cache/rusting_strata`. The first start after an update compiles the CUDA kernels (about 15 s); `/health` answers
 `503` until the model has loaded.
 
+In a container that folder is lost when the container exits, and the next one starts uncalibrated with only the
+`not calibrated on this machine` line to say so. Set `XDG_CACHE_HOME` to a mounted path (the folder is then
+`$XDG_CACHE_HOME/rusting_strata`) for both `calibrate` and `serve`, for example `-v /srv/strata-cache:/cache -e
+XDG_CACHE_HOME=/cache`.
+
 **Stopping and restarting.** On `SIGTERM` (`systemctl stop` or `restart`) the server answers new requests, `/health`
 included, with `503` and `Retry-After: 5`, lets the requests it already accepted finish (the queued ones too), saves
 the routing profile it learned, so that the next start places the experts as well, and then exits.
 `TimeoutStopSec` must cover a full queue, or keep `--max-waiting` low. A load balancer
 sends the new requests to the other servers meanwhile, so restarting one server at a time cuts no reply. `systemd`
 sends `SIGKILL` after `TimeoutStopSec`; Ctrl+C still stops at once. On Windows there is no such drain.
+
+## Docker
+
+The repository has a `Dockerfile` for the server. The image holds the binary, NVRTC for the CUDA kernels and the
+Vulkan loader; the GPU driver comes from the host (for NVIDIA cards through the NVIDIA Container Toolkit).
+
+```sh
+docker build -t rustingstrata .
+docker run -d --name strata --gpus all -p 127.0.0.1:8080:8080 \
+  -v /srv/models:/models -v /srv/strata-cache:/cache rustingstrata
+```
+
+- The default command is `serve --gpu --addr 0.0.0.0:8080 --models-dir /models`: no model is loaded at the start
+  (`/health` answers `503` until one is), and the chat page at http://127.0.0.1:8080 lists the files in `/models`
+  and loads the one you pick. Arguments after the image name replace the command, for example
+  `rustingstrata serve --gpu --addr 0.0.0.0:8080 --model /models/model.gguf` to load a model at the start.
+- `/models` is the folder of GGUF files. `/cache` keeps the calibration, the compiled CUDA kernels and the expert
+  placement; without that mount every new container compiles the kernels again and runs uncalibrated.
+- Calibrate once per model and machine, with the same mounts:
+  `docker run --rm --gpus all -v /srv/models:/models -v /srv/strata-cache:/cache rustingstrata calibrate --model /models/model.gguf`.
+- The example publishes the port on the loopback address only. To reach the chat page through a LAN name, add
+  `-e STRATA_ALLOWED_HOSTS=that-name`; set a key with `-e STRATA_API_KEY=...` before the port faces a network.
+- For a Vulkan card (AMD, Intel) pass the render device in place of `--gpus all`: `--device /dev/dri`, and add
+  `--backend vulkan` to the command. This path has not been run on an AMD or Intel card yet.
 
 ## Health checks
 
@@ -298,6 +333,9 @@ sends `SIGKILL` after `TimeoutStopSec`; Ctrl+C still stops at once. On Windows t
 - `200 {"status": "ok", "waiting": N, "slots": S}` once a model is loaded. `waiting` counts the requests being read,
   generated or queued besides this one; `slots` is how many are generated at once (`--parallel`). A load balancer
   can send the next request to the server with the lowest `waiting / slots`.
+- `200 {"status": "ok", "unloaded": true, "waiting": N}` when `--auto-unload` has freed the model: the next chat
+  request loads it again, so the server stays in rotation. During that load `/health` answers `503 loading`, as for
+  any load.
 - `503 {"status": "loading"}` or `503 {"status": "no model"}` otherwise.
 - `503` with an `error` body (no `status`) when `--max-waiting` connections are open, or while the server stops. A
   load balancer then treats a full server as down, which sends the next requests elsewhere.
