@@ -24,6 +24,8 @@ pub const MEMCPY_D2H: c_int = 2;
 pub const MEMCPY_D2D: c_int = 3;
 pub const HOST_MALLOC_PORTABLE: u32 = 1;
 pub const HOST_MALLOC_MAPPED: u32 = 2;
+pub const HOST_REGISTER_PORTABLE: u32 = 1;
+pub const HOST_REGISTER_READ_ONLY: u32 = 8;
 pub const EVENT_DISABLE_TIMING: u32 = 2;
 pub const STREAM_NON_BLOCKING: u32 = 1;
 pub const CAPTURE_MODE_THREAD_LOCAL: c_int = 1;
@@ -91,6 +93,8 @@ pub struct Hip {
     pub host_malloc: unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> c_int,
     pub host_free: unsafe extern "C" fn(*mut c_void) -> c_int,
     pub host_device_ptr: unsafe extern "C" fn(*mut *mut c_void, *mut c_void, u32) -> c_int,
+    pub host_register: unsafe extern "C" fn(*mut c_void, usize, u32) -> c_int,
+    pub host_unregister: unsafe extern "C" fn(*mut c_void) -> c_int,
     pub module_load: unsafe extern "C" fn(*mut Module, *const c_void) -> c_int,
     pub function: unsafe extern "C" fn(*mut Func, Module, *const c_char) -> c_int,
     pub launch: unsafe extern "C" fn(Func, u32, u32, u32, u32, u32, u32, u32, Stream, *mut *mut c_void, *mut *mut c_void) -> c_int,
@@ -152,6 +156,8 @@ impl Hip {
             host_malloc: g!("hipHostMalloc"),
             host_free: g!("hipHostFree"),
             host_device_ptr: g!("hipHostGetDevicePointer"),
+            host_register: g!("hipHostRegister"),
+            host_unregister: g!("hipHostUnregister"),
             module_load: g!("hipModuleLoadData"),
             function: g!("hipModuleGetFunction"),
             launch: g!("hipModuleLaunchKernel"),

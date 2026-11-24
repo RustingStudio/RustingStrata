@@ -147,6 +147,9 @@ pub trait Backend: Send {
     /// `main_waits`/`side_waits` hold the other queue there. A backend with one queue copies in order with its
     /// kernels, so these defaults are already correct.
     fn htod_side(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> { self.htod(src, dst, off) }
+    /// Page-lock `data` (host memory that outlives this backend, such as the mapped model file), so `htod` from it
+    /// is a DMA without a copy through a staging buffer. False when the backend does not do that.
+    fn pin_host(&self, _data: &[u8]) -> anyhow::Result<bool> { Ok(false) }
     fn side_mark(&self) -> anyhow::Result<usize> { Ok(0) }
     fn main_waits(&self, _side_mark: usize) -> anyhow::Result<()> { Ok(()) }
     fn main_mark(&self) -> anyhow::Result<usize> { Ok(0) }

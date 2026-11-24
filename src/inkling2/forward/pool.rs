@@ -95,6 +95,25 @@ impl Pool {
                 gu: (gu.ty, gu.rows, gu.cols), dn: (dn.ty, dn.rows, dn.cols), dn_off, host: he,
             });
         }
+        // STRATA_INK_PIN=1: page-lock the pooled layers' experts in the mapped file, so a prompt chunk's staging copies
+        // are DMAs from there (`Backend::pin_host`) instead of a host copy through the pinned ring.
+        if std::env::var_os("STRATA_INK_PIN").is_some() {
+            let t0 = std::time::Instant::now();
+            let (mut gb, mut ok) = (0.0, true);
+            for &ip in need {
+                let ml = &m.layers[ip];
+                for data in [ml.gate_up.data, ml.down.data] {
+                    match d.parts[0].be.pin_host(data) {
+                        Ok(true) => gb += data.len() as f64 / 1e9,
+                        Ok(false) => ok = false,
+                        Err(e) => { eprintln!("inkling2: pinning the experts failed ({e:#}); staging copies go through the ring"); ok = false; }
+                    }
+                    if !ok { break; }
+                }
+                if !ok { break; }
+            }
+            eprintln!("inkling2: pinned {gb:.2} GB of experts in {:.1} s", t0.elapsed().as_secs_f64());
+        }
         // Slots in proportion to each layout's experts, from what the budget and the card have left.
         let total: usize = kinds.iter().map(|k| k.1 * ne * k.2.len()).sum();
         let free = d.parts[0].be.mem_info().map_or(0, |m| m.0).saturating_sub(f_res + (64 << 20));

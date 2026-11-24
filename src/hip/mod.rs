@@ -40,6 +40,8 @@ pub struct Gpu {
     side: ffi::Stream,
     marks: Vec<Event>,
     next_mark: std::sync::atomic::AtomicUsize,
+    /// Host ranges `pin_host` registered (start, end, the address registered): `htod` copies from them directly.
+    pinned: std::sync::RwLock<Vec<(usize, usize, usize)>>,
     fns: HashMap<String, ffi::Func>,
     /// "gfx1201": the target hiprtc compiled for.
     arch: String,
@@ -217,7 +219,7 @@ impl Gpu {
         let mut dev: *mut c_void = std::ptr::null_mut();
         hip.check(unsafe { (hip.host_device_ptr)(&mut dev, host, 0) }, "hipHostGetDevicePointer(ring)")?;
         let staging = Staging { _pin: Buf::new(dev as u64, RING, PinnedHost { hip: hip.clone(), p: host }), host: host.cast(), head: 0, busy: VecDeque::new() };
-        Ok(Gpu { hip, device, stream, side, marks, next_mark: Default::default(), fns, arch, kv_q8, max_smem, am: am_buf,
+        Ok(Gpu { hip, device, stream, side, marks, next_mark: Default::default(), pinned: Default::default(), fns, arch, kv_q8, max_smem, am: am_buf,
                  graphs: Mutex::new(HashMap::new()), fr: Mutex::new((HashMap::new(), Vec::new())), staging: Mutex::new(staging) })
     }
 
@@ -258,7 +260,8 @@ impl Gpu {
     /// host (expert streaming during prefill).
     fn htod_on(&self, stream: ffi::Stream, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
         anyhow::ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
-        if src.len() < RING_MIN {
+        let (s0, s1) = (src.as_ptr() as usize, src.as_ptr() as usize + src.len());
+        if src.len() < RING_MIN || self.pinned.read().unwrap().iter().any(|&(a, b, _)| a <= s0 && s1 <= b) {
             let r = unsafe { (self.hip.memcpy_async)((dst.addr() + off as u64) as *mut c_void, src.as_ptr().cast(), src.len(),
                                                      ffi::MEMCPY_H2D, stream) };
             return self.hip.check(r, "hipMemcpyAsync(htod)");
@@ -459,6 +462,14 @@ struct Staging {
     busy: VecDeque<(usize, usize, Event)>,
 }
 
+impl Drop for Gpu {
+    /// Unlock what `pin_host` locked, before the mapping it belongs to goes.
+    fn drop(&mut self) {
+        let _ = self.wait();
+        for &(_, _, p) in self.pinned.read().unwrap().iter() { unsafe { (self.hip.host_unregister)(p as *mut c_void) }; }
+    }
+}
+
 /// A `hipEvent_t` that destroys itself.
 struct Event { hip: Arc<ffi::Hip>, ev: ffi::Event }
 
@@ -542,6 +553,24 @@ impl Backend for Gpu {
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> { self.htod_on(self.stream, src, dst, off) }
 
     fn htod_side(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> { self.htod_on(self.side, src, dst, off) }
+
+    /// `hipHostRegister` of the pages under `data`, read-only when the runtime takes that flag (the model file is
+    /// mapped read-only).
+    fn pin_host(&self, data: &[u8]) -> anyhow::Result<bool> {
+        const PAGE: usize = 4096;
+        let (a, b) = (data.as_ptr() as usize, data.as_ptr() as usize + data.len());
+        if self.pinned.read().unwrap().iter().any(|&(s, e, _)| s <= a && b <= e) { return Ok(true); }
+        let (pa, pb) = (a & !(PAGE - 1), b.div_ceil(PAGE) * PAGE);
+        let mut last = 0;
+        for flags in [ffi::HOST_REGISTER_READ_ONLY | ffi::HOST_REGISTER_PORTABLE, ffi::HOST_REGISTER_PORTABLE] {
+            last = unsafe { (self.hip.host_register)(pa as *mut c_void, pb - pa, flags) };
+            if last == ffi::HIP_SUCCESS {
+                self.pinned.write().unwrap().push((pa, pb, pa));
+                return Ok(true);
+            }
+        }
+        self.hip.check(last, "hipHostRegister").map(|_| false)
+    }
     fn side_mark(&self) -> anyhow::Result<usize> { self.mark(self.side) }
     fn main_waits(&self, m: usize) -> anyhow::Result<()> { self.wait_mark(self.stream, m) }
     fn main_mark(&self) -> anyhow::Result<usize> { self.mark(self.stream) }
