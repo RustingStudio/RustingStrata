@@ -1967,7 +1967,9 @@ bench_tokenwise!(bench_hy4, rusting_strata::hy4::forward::Hy4Model);
 
 /// `strata bench` for Inkling 2 (uses GPU argmax decode, plus `--draft-model` DSpark / `--spec-type` context lookup).
 fn bench_inkling2(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {
-    rusting_strata::deepseek::chat::gpu_defaults();
+    // The same defaults `chat`, `generate` and `serve` set: without them the plain weights spread over both cards,
+    // `Device::new` refuses the second one and the whole benchmark runs the host path (about a fifth of the speed).
+    rusting_strata::inkling2::chat::gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
     let max_ctx = engine.ctx.max(pp.iter().copied().max().unwrap_or(0) + tg + 64);
     let opts = rusting_strata::inkling2::chat::Inkling2Opts {
