@@ -42,6 +42,8 @@ struct MlaWeights<'a> {
     kv_a_norm: Vec<f32>,
     k_b: Mat<'a>,
     v_b: Mat<'a>,
+    k_groups: Vec<Mat<'a>>,
+    v_groups: Vec<Mat<'a>>,
     gate: Mat<'a>,
     wo: Mat<'a>,
 }
@@ -349,14 +351,20 @@ impl<'a> RaonModel<'a> {
                     wo: m("attn_output")?,
                 })
             } else {
+                let k_b = Mat::load_groups(g, &format!("blk.{il}.attn_k_b.weight"), cfg.n_head)?;
+                let v_b = Mat::load_groups(g, &format!("blk.{il}.attn_v_b.weight"), cfg.n_head)?;
+                let k_groups = (0..cfg.n_head).map(|h| k_b.group(h, cfg.n_head)).collect();
+                let v_groups = (0..cfg.n_head).map(|h| v_b.group(h, cfg.n_head)).collect();
                 Attn::Mla(MlaWeights {
                     q_a: m("attn_q_a")?,
                     q_a_norm: v("attn_q_a_norm")?,
                     q_b: m("attn_q_b")?,
                     kv_a: m("attn_kv_a_mqa")?,
                     kv_a_norm: v("attn_kv_a_norm")?,
-                    k_b: Mat::load_groups(g, &format!("blk.{il}.attn_k_b.weight"), cfg.n_head)?,
-                    v_b: Mat::load_groups(g, &format!("blk.{il}.attn_v_b.weight"), cfg.n_head)?,
+                    k_b,
+                    v_b,
+                    k_groups,
+                    v_groups,
                     gate: m("attn_gate")?,
                     wo: m("attn_output")?,
                 })
@@ -421,7 +429,12 @@ impl<'a> RaonModel<'a> {
     }
 
     pub fn set_effort(&mut self, effort: Option<&str>, think: bool) {
-        self.effort_alpha = self.cfg.effort_alpha_for(effort, think);
+        let next = self.cfg.effort_alpha_for(effort, think);
+        if (next - self.effort_alpha).abs() > 1e-6 && !self.toks.is_empty() {
+            // Prefix KV/RDA states were built under a different steering alpha; invalidate cache.
+            self.reset();
+        }
+        self.effort_alpha = next;
     }
 
     fn hc_pre(&self, flat: &[f32], hc_w: &Hcw) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -441,16 +454,28 @@ impl<'a> RaonModel<'a> {
 
     fn hc_post(&self, flat: &mut [f32], branch: &[f32], post: &[f32], h_res: &[f32]) {
         let (hc, n) = (self.cfg.hc, self.cfg.n_embd);
-        let old = flat.to_vec();
-        for dst in 0..hc {
-            let out = &mut flat[dst * n..(dst + 1) * n];
-            let p = post[dst];
+        if hc <= 8 {
+            let mut col = [0.0f32; 8];
             for j in 0..n {
-                let mut s = p * branch[j];
-                for src in 0..hc {
-                    s += h_res[dst * hc + src] * old[src * n + j];
+                for src in 0..hc { col[src] = flat[src * n + j]; }
+                let bj = branch[j];
+                for dst in 0..hc {
+                    let mut s = post[dst] * bj;
+                    let row = &h_res[dst * hc..(dst + 1) * hc];
+                    for src in 0..hc { s += row[src] * col[src]; }
+                    flat[dst * n + j] = s;
                 }
-                out[j] = s;
+            }
+        } else {
+            let old = flat.to_vec();
+            for dst in 0..hc {
+                let out = &mut flat[dst * n..(dst + 1) * n];
+                let p = post[dst];
+                for j in 0..n {
+                    let mut s = p * branch[j];
+                    for src in 0..hc { s += h_res[dst * hc + src] * old[src * n + j]; }
+                    out[j] = s;
+                }
             }
         }
     }
@@ -536,8 +561,7 @@ impl<'a> RaonModel<'a> {
         krow[kr..].copy_from_slice(&kv[kr..]);
         self.mla_keys[il].extend_from_slice(&krow);
 
-        let k_groups: Vec<Mat> = (0..nh).map(|h| a.k_b.group(h, nh)).collect();
-        let qn = matvec_many(&k_groups, &q, kl);
+        let qn = matvec_many(&a.k_groups, &q, kl);
         let scale = 1.0 / (kl as f32).sqrt();
         let all_k = &self.mla_keys[il];
         let n_pos = all_k.len() / kw;
@@ -564,8 +588,7 @@ impl<'a> RaonModel<'a> {
             }
         });
 
-        let v_groups: Vec<Mat> = (0..nh).map(|h| a.v_b.group(h, nh)).collect();
-        let mut out = matvec_many(&v_groups, &att, kr);
+        let mut out = matvec_many(&a.v_groups, &att, kr);
         let mut g = vec![0.0f32; nh * vl];
         a.gate.matvec(cur, &mut g);
         for (o, gv) in out.iter_mut().zip(&g) { *o *= sigmoid(*gv); }

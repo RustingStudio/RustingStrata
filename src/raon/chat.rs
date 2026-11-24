@@ -124,14 +124,15 @@ pub fn parse_calls(text: &str) -> Option<(String, Vec<(String, String)>)> {
     let start = from + text[from..].find(CALL_TAG)?;
     let mut calls = Vec::new();
     for block in text[start..].split(CALL_TAG).skip(1) {
-        let inner = block.split("</tool_call>").next()?;
-        let (_, after_fn) = inner.split_once("<function=")?;
-        let (name, rest) = after_fn.split_once('>')?;
-        let body = rest.split("</function>").next()?;
+        let Some(inner) = block.split("</tool_call>").next() else { continue; };
+        let Some((_, after_fn)) = inner.split_once("<function=") else { continue; };
+        let Some((name, rest)) = after_fn.split_once('>') else { continue; };
+        let Some(body) = rest.split("</function>").next() else { continue; };
         let mut args = serde_json::Map::new();
         for part in body.split("<parameter=").skip(1) {
-            let (k, vrest) = part.split_once('>')?;
-            let val = vrest.split("</parameter>").next()?.trim();
+            let Some((k, vrest)) = part.split_once('>') else { continue; };
+            let Some(val) = vrest.split("</parameter>").next() else { continue; };
+            let val = val.trim();
             args.insert(k.trim().to_string(), serde_json::from_str(val).unwrap_or_else(|_| val.into()));
         }
         calls.push((name.trim().to_string(), serde_json::Value::Object(args).to_string()));
@@ -200,7 +201,9 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
         let logits = m.prefill(&ids[keep..]);
         let (out, _) = decode(&mut m, &tok, logits, n.min(max_ctx - ids.len()), show);
         println!();
-        history.push(Msg::new("assistant", &tok.decode(&out).unwrap_or_default()));
+        let reply = tok.decode(&out).unwrap_or_default();
+        let stored = if think { format!("{THINK_OPEN}{reply}") } else { reply };
+        history.push(Msg::new("assistant", &stored));
     }
     Ok(())
 }
@@ -267,4 +270,11 @@ fn template_and_calls() {
     assert_eq!(render(&user, &[], true, None), "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n");
     let reply = "<think>\nplan\n</think>\n\nok\n\n<tool_call>\n<function=get>\n<parameter=city>\nSeoul\n</parameter>\n<parameter=n>\n3\n</parameter>\n</function>\n</tool_call>";
     assert_eq!(parse_calls(reply), Some(("ok".into(), vec![("get".into(), r#"{"city":"Seoul","n":3}"#.into())])));
+    // One malformed tool_call block must not discard valid sibling blocks.
+    let mixed = "<tool_call>malformed</tool_call>\n<tool_call>\n<function=ping>\n</function>\n</tool_call>";
+    assert_eq!(parse_calls(mixed), Some(("".into(), vec![("ping".into(), "{}".into())])));
+    // Multi-turn history with think=true preserves reasoning block properly.
+    let hist = [Msg::new("user", "hi"), Msg::new("assistant", "<think>\nplan\n</think>\n\nhello"), Msg::new("user", "next")];
+    let rendered = render(&hist, &[], true, Some(false));
+    assert!(rendered.contains("<|im_start|>assistant\n<think></think>\n\nhello<|im_end|>\n"));
 }
