@@ -88,16 +88,19 @@ __device__ __forceinline__ int any_sync(unsigned, int predicate) { return (int)(
 // ---- matrix cores (gfx11/gfx12 WMMA) ----
 // D[16x16] += A[16x16] * B^T[16x16]: both operands are 16 rows of 16 halves, which is exactly how the prefill GEMM
 // stages X (positions) and W (output rows) in shared memory, so no transpose is needed. Each lane supplies the
-// k-values of its own row of both operands and holds 8 results: rows 8*(lane>>4) + i, column lane & 15.
-// gfx12 splits the k dimension across the two half-waves (each lane gives 8 halves, lanes 16-31 the upper half);
-// gfx11 takes all 16 from one lane.
+// k-values of its own row of both operands and holds 8 results of column lane & 15, in rows STRATA_WMMA_ROW(lane, i).
+// gfx12 splits the k dimension across the two half-waves (each lane gives 8 halves, lanes 16-31 the upper half) and
+// gives lanes 16-31 rows 8..15; gfx11 takes all 16 halves from every lane (lanes 16-31 repeat lanes 0-15) and
+// interleaves the rows, even ones in lanes 0-15 and odd ones in lanes 16-31 (as llama.cpp's mma.cuh has it for RDNA3).
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || \
     defined(__gfx1151__) || defined(__gfx1152__)
 #define STRATA_WMMA 1
 #define STRATA_WMMA_K 16
+#define STRATA_WMMA_ROW(lane, i) (2 * (i) + ((lane) >> 4))
 #elif defined(__gfx1200__) || defined(__gfx1201__)
 #define STRATA_WMMA 1
 #define STRATA_WMMA_K 8
+#define STRATA_WMMA_ROW(lane, i) (8 * ((lane) >> 4) + (i))
 #else
 #define STRATA_WMMA 0
 #define STRATA_WMMA_K 0

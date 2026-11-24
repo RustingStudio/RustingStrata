@@ -1265,9 +1265,9 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
         if (kb + 1 < nk) stw();
     }
 #if GEMM_WMMA
-    // D layout of the AMD WMMA: lane 16*(lane>>4) keeps column lane & 15 and rows 8*(lane>>4) .. +7 of each tile.
+    // D layout of the AMD WMMA: the lane keeps column lane & 15 and rows STRATA_WMMA_ROW(lane, 0..7) of each tile.
     {
-        const int l16 = lane & 15, wl = lane >> 4;
+        const int l16 = lane & 15;
         constexpr int MT = SM ? 1 : 2, NTW = SM ? 1 : 2;
 #pragma unroll
         for (int mt = 0; mt < MT; mt++)
@@ -1277,7 +1277,7 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
                 if (n >= rows) continue;
 #pragma unroll
                 for (int i = 0; i < 8; i++) {
-                    int r = wm + mt * 16 + 8 * wl + i;
+                    int r = wm + mt * 16 + STRATA_WMMA_ROW(lane, i);
                     if (r >= tl.cnt) continue;
                     float* yr = y + (size_t)(tl.m0 + r) * y_stride;
                     float v = accw[mt * NTW + nt][i];
@@ -3323,7 +3323,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
                 for (int kk = 0; kk < HD; kk += 16)
                     acc = strata_hip::strata_wmma(strata_hip::strata_ld_wmma(qrow + kk), strata_hip::strata_ld_wmma(krow + kk), acc);
 #pragma unroll
-                for (int i = 0; i < 8; i++) sw[(8 * (lane >> 4) + i) * PW + kg * 16 + l16] = acc[i];
+                for (int i = 0; i < 8; i++) sw[STRATA_WMMA_ROW(lane, i) * PW + kg * 16 + l16] = acc[i];
             }
             __syncwarp();
 #pragma unroll
@@ -3464,7 +3464,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
 #if GEMM_WMMA
         // P * V on the matrix cores, the way the scores are: A = P (this warp's 16 query rows x the tile's keys, in
         // halves), B = V^T (16 head dimensions x the same keys, one half a tile row apart). The lane's 8 results land
-        // in AMD's layout again (query rows 8*(lane>>4) + i, dim column lane & 15), so each 16 x 16 result tile is
+        // in AMD's layout again (query rows STRATA_WMMA_ROW(lane, i), dim column lane & 15), so each 16 x 16 result tile is
         // staged in f32 and read back as the two m16n8k16 dim tiles the rescale above, the epilogue below and the
         // score stage all use (`st` is free again by now: it held the scores of this tile).
         if (!skip) {
@@ -3489,7 +3489,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
                     acc = strata_hip::strata_wmma(strata_hip::strata_ld_wmma(pa), strata_hip::strata_ld_wmma_t(pb, PQ), acc);
                 }
 #pragma unroll
-                for (int i = 0; i < 8; i++) sw[(8 * (lane >> 4) + i) * 16 + l16] = acc[i];
+                for (int i = 0; i < 8; i++) sw[STRATA_WMMA_ROW(lane, i) * 16 + l16] = acc[i];
                 __syncwarp();
 #pragma unroll
                 for (int r = 0; r < 2; r++)

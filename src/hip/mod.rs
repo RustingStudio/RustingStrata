@@ -1073,4 +1073,15 @@ mod tests {
         let arch = hip.arch(0).unwrap();
         rtc.compile(&source(false), "kernels.cu", &arch, &[]).expect("hiprtc compiles kernels.cu for the device");
     }
+
+    /// The gfx11 (RDNA3) WMMA branch compiles, whatever card is present: its intrinsics, operand width and
+    /// `STRATA_WMMA_ROW` layout differ from gfx12's. Numerics on gfx11 need an RDNA3 card to check.
+    #[test]
+    fn hiprtc_compiles_the_kernels_for_gfx11() {
+        let Ok(rtc) = ffi::Rtc::get() else {
+            eprintln!("skipping: no hiprtc");
+            return;
+        };
+        rtc.compile(&source(false), "kernels.cu", "gfx1100", &[]).expect("hiprtc compiles kernels.cu for gfx1100");
+    }
 }
