@@ -693,26 +693,27 @@ impl Device {
     pub(super) fn lm_head_batch_gpu(&mut self, m: &Inkling2Model, h_rows: &[f32], nt: usize) -> Result<()> {
         let c = &m.cfg;
         let vrows = m.output.rows;
-        let d = dev::get().unwrap().lock().unwrap();
+        let d = dev::get().context("no GPU device")?.lock().map_err(|_| anyhow::anyhow!("GPU device lock poisoned"))?;
         let be = &*d.parts[0].be;
         self.ensure_pf(be, c, vrows, nt)?;
         let pf = self.pf.as_ref().unwrap();
         let o = pf.buf.addr();
         be.put(h_rows, &pf.buf, ((pf.p.hn - o) / 4) as usize)?;
-        be.gemvq(d.tensor(m.output.gpu.unwrap()), pf.p.hn, c.n_embd, 0, pf.logits_buf.addr(), vrows, nt)?;
+        be.gemvq(d.tensor(m.output.gpu.context("output.weight not on GPU")?), pf.p.hn, c.n_embd, 0, pf.logits_buf.addr(), vrows, nt)?;
         Ok(())
     }
 
     /// Add low-rank `w2 @ latent + bias` onto `pf.logits_buf[step]` on GPU and return the argmax token ID.
     pub(super) fn markov_w2_argmax_gpu(
-        &self, m: &Inkling2Model, w2: &crate::backend::GpuTensor, bias_addr: u64, latent: &[f32], step: usize,
+        &self, m: &Inkling2Model, w2: &crate::backend::GpuTensor, bias_addr: u64, bias_len: usize, latent: &[f32], step: usize,
     ) -> Result<u32> {
         let c = &m.cfg;
         let vrows = m.output.rows;
-        let nv = c.n_vocab.min(w2.rows);
+        let nv = c.n_vocab.min(w2.rows).min(bias_len);
+        ensure!(nv > 0, "markov_w2: empty vocabulary intersection");
         let pf = self.pf.as_ref().context("lm_head_batch_gpu not called")?;
         let (s, o) = (self.s, self.scr.addr());
-        let d = dev::get().unwrap().lock().unwrap();
+        let d = dev::get().context("no GPU device")?.lock().map_err(|_| anyhow::anyhow!("GPU device lock poisoned"))?;
         let be = &*d.parts[0].be;
         be.put(latent, &self.scr, ((s.hn - o) / 4) as usize)?;
         be.gemvq(w2, s.hn, w2.cols, 0, s.logits, w2.rows, 1)?;

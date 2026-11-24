@@ -601,12 +601,26 @@ impl<'a> Inkling2Model<'a> {
 
     /// Add `w2 @ latent + bias` onto `pf.logits_buf[step]` on GPU and return the argmax token ID.
     pub(super) fn markov_w2_argmax_gpu(
-        &self, w2: &crate::backend::GpuTensor, bias_addr: u64, latent: &[f32], step: usize,
+        &self, w2: &crate::backend::GpuTensor, bias_addr: u64, bias_len: usize, latent: &[f32], step: usize,
     ) -> Option<u32> {
-        self.device.as_ref()?.markov_w2_argmax_gpu(self, w2, bias_addr, latent, step).ok()
+        self.device.as_ref()?.markov_w2_argmax_gpu(self, w2, bias_addr, bias_len, latent, step).ok()
     }
 
     pub(super) fn output_rows(&self) -> usize { self.output.rows }
+
+    /// Project `nt` hidden states (`[nt, n_embd]`) through the target LM head on CPU only.
+    pub(super) fn lm_head_batch_cpu(&self, h_rows: &[f32], nt: usize) -> Vec<f32> {
+        let rows: Vec<&[f32]> = h_rows.chunks_exact(self.cfg.n_embd).take(nt).collect();
+        let raw = matvec_rows(&self.output, &rows);
+        if self.output.rows == self.cfg.n_vocab {
+            return raw;
+        }
+        let mut out = Vec::with_capacity(nt * self.cfg.n_vocab);
+        for row in raw.chunks_exact(self.output.rows) {
+            out.extend_from_slice(&row[..self.cfg.n_vocab]);
+        }
+        out
+    }
 
     /// Project `nt` hidden states (`[nt, n_embd]`) through the target LM head (`output.weight`) and return
     /// `[nt, cfg.n_vocab]` logits before softcap.
@@ -618,16 +632,7 @@ impl<'a> Inkling2Model<'a> {
                 return v;
             }
         }
-        let rows: Vec<&[f32]> = h_rows.chunks_exact(self.cfg.n_embd).take(nt).collect();
-        let raw = matvec_rows(&self.output, &rows);
-        if self.output.rows == self.cfg.n_vocab {
-            return raw;
-        }
-        let mut out = Vec::with_capacity(nt * self.cfg.n_vocab);
-        for row in raw.chunks_exact(self.output.rows) {
-            out.extend_from_slice(&row[..self.cfg.n_vocab]);
-        }
-        out
+        self.lm_head_batch_cpu(h_rows, nt)
     }
 
     /// Project a single hidden state `h` (`[n_embd]`) through the target LM head (`output.weight`) and return the
