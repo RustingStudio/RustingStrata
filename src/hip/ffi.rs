@@ -31,9 +31,6 @@ pub const ATTR_MAX_DYNAMIC_SHARED: c_int = 8;
 pub const ATTR_SHARED_PER_BLOCK_OPTIN: c_int = 75;
 pub const ATTR_SHARED_PER_BLOCK: c_int = 74;
 pub const ATTR_WARP_SIZE: c_int = 87;
-pub const ATTR_INTEGRATED: c_int = 16;
-pub const ATTR_MULTIPROCESSOR_COUNT: c_int = 63;
-pub const ATTR_MAX_THREADS_PER_BLOCK: c_int = 56;
 
 /// Room for `hipDeviceProp_t`, which `hipGetDeviceProperties` writes whole. ROCm 7's `hipDeviceProp_tR0600` is 1472
 /// bytes; the size is not exported and changes between versions, so the buffer leaves ample room for a larger one.
@@ -52,8 +49,6 @@ fn find_gfx(bytes: &[u8]) -> Option<String> {
     }
     None
 }
-
-type Fn = unsafe extern "C" fn();
 
 /// Library names to try, in order. `STRATA_HIP` (a path or a name) replaces the whole list.
 fn candidates(vars: Option<PathBuf>, default_suffix: &[&str]) -> Vec<PathBuf> {
@@ -76,14 +71,11 @@ pub struct Hip {
     pub mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> c_int,
     pub malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> c_int,
     pub free: unsafe extern "C" fn(*mut c_void) -> c_int,
-    pub memset: unsafe extern "C" fn(*mut c_void, c_int, usize) -> c_int,
     pub memset_async: unsafe extern "C" fn(*mut c_void, c_int, usize, Stream) -> c_int,
     pub memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> c_int,
     pub memcpy_async: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int, Stream) -> c_int,
     pub stream_create: unsafe extern "C" fn(*mut Stream, u32) -> c_int,
-    pub stream_destroy: unsafe extern "C" fn(Stream) -> c_int,
     pub stream_sync: unsafe extern "C" fn(Stream) -> c_int,
-    pub stream_wait_event: unsafe extern "C" fn(Stream, Event, u32) -> c_int,
     pub stream_begin_capture: unsafe extern "C" fn(Stream, c_int) -> c_int,
     pub stream_end_capture: unsafe extern "C" fn(Stream, *mut Graph) -> c_int,
     pub stream_is_capturing: unsafe extern "C" fn(Stream, *mut c_int) -> c_int,
@@ -94,18 +86,15 @@ pub struct Hip {
     pub event_create: unsafe extern "C" fn(*mut Event, u32) -> c_int,
     pub event_record: unsafe extern "C" fn(Event, Stream) -> c_int,
     pub event_sync: unsafe extern "C" fn(Event) -> c_int,
-    pub event_query: unsafe extern "C" fn(Event) -> c_int,
     pub event_destroy: unsafe extern "C" fn(Event) -> c_int,
     pub host_malloc: unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> c_int,
     pub host_free: unsafe extern "C" fn(*mut c_void) -> c_int,
     pub host_device_ptr: unsafe extern "C" fn(*mut *mut c_void, *mut c_void, u32) -> c_int,
     pub module_load: unsafe extern "C" fn(*mut Module, *const c_void) -> c_int,
-    pub module_unload: unsafe extern "C" fn(Module) -> c_int,
     pub function: unsafe extern "C" fn(*mut Func, Module, *const c_char) -> c_int,
     pub launch: unsafe extern "C" fn(Func, u32, u32, u32, u32, u32, u32, u32, Stream, *mut *mut c_void, *mut *mut c_void) -> c_int,
     pub func_set_attribute: unsafe extern "C" fn(*const c_void, c_int, c_int) -> c_int,
     pub error_string: unsafe extern "C" fn(c_int) -> *const c_char,
-    pub last_error: unsafe extern "C" fn() -> c_int,
     _lib: Library,
 }
 
@@ -142,14 +131,11 @@ impl Hip {
             mem_get_info: g!("hipMemGetInfo"),
             malloc: g!("hipMalloc"),
             free: g!("hipFree"),
-            memset: g!("hipMemset"),
             memset_async: g!("hipMemsetAsync"),
             memcpy: g!("hipMemcpy"),
             memcpy_async: g!("hipMemcpyAsync"),
             stream_create: g!("hipStreamCreateWithFlags"),
-            stream_destroy: g!("hipStreamDestroy"),
             stream_sync: g!("hipStreamSynchronize"),
-            stream_wait_event: g!("hipStreamWaitEvent"),
             stream_begin_capture: g!("hipStreamBeginCapture"),
             stream_end_capture: g!("hipStreamEndCapture"),
             stream_is_capturing: g!("hipStreamIsCapturing"),
@@ -160,18 +146,15 @@ impl Hip {
             event_create: g!("hipEventCreateWithFlags"),
             event_record: g!("hipEventRecord"),
             event_sync: g!("hipEventSynchronize"),
-            event_query: g!("hipEventQuery"),
             event_destroy: g!("hipEventDestroy"),
             host_malloc: g!("hipHostMalloc"),
             host_free: g!("hipHostFree"),
             host_device_ptr: g!("hipHostGetDevicePointer"),
             module_load: g!("hipModuleLoadData"),
-            module_unload: g!("hipModuleUnload"),
             function: g!("hipModuleGetFunction"),
             launch: g!("hipModuleLaunchKernel"),
             func_set_attribute: g!("hipFuncSetAttribute"),
             error_string: g!("hipGetErrorString"),
-            last_error: g!("hipGetLastError"),
             _lib: lib,
         })
     }
