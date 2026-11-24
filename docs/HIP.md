@@ -211,8 +211,34 @@ DRAM limit). What changed, largest first:
   18-19 went from about 9 to 15 of their 16 uses on the GPU. Q8_0 layers cannot take NVFP4 slots, and no VRAM is left.
 - The core passes run as one graph in the hybrid step (`core_graph`): 0.8 ms.
 
+### The expert pool
+
+Since then, every layer keeps only its most used experts in VRAM (`inkling2/forward/pool.rs`), and a decode token
+never comes back to the host:
+
+- `ink_route` routes on the device, and `ink_slots` looks each expert up in the layer's slot table. An expert that
+  is not in VRAM goes to the CPU worker (`worker.rs`) through the mailbox of `cpu_worker`, with the routing and
+  the activation. `ink_ffn_sum_mb` waits for the worker's sum only in a layer run that missed. The token is one
+  graph.
+- After each token the routing counts (decayed per token) decide the placement. Up to 4 missed experts go into free
+  slots and 2 into the slots of less used ones. The long counts are saved as
+  `~/.cache/rusting_strata/inkling2-profile-*.f32` when the model goes, and they place the next load.
+- A prompt chunk runs from the same slots. The chunk's other experts are copied into 32 staging slots a pool, in
+  rounds, before the GEMMs run.
+
+| 12 GB weight budget, desktop holds 3 GB | pp 512 | pp 4096 | decode |
+|---|---|---|---|
+| slabs and hybrid layers (above) | 443 tok/s | 438 tok/s | 39.8 / 38.9 tok/s |
+| pool, no profile yet | 329 | 378 | 49.7 / 55.7 |
+| pool, profile of one earlier run | 436 | 426 | 60.5 / 58.9 |
+
+Decode after the prompt of each column. At this budget the pool holds 68% of each layout's experts and keeps 98% of
+a token's expert uses in VRAM; the CPU worker takes 1.8 ms a token. Greedy text is no longer bit-identical to
+Vulkan: the placement decides which experts round on the CPU. `--fixed-experts` keeps the slabs and is.
+`STRATA_INK_SLABS=1` keeps the slabs and pools only the layers they leave out.
+
 Left: `ink_mix` runs 120 times a token at 12 µs in one workgroup (about 1 ms, but a faster reduction order breaks the
-bit parity with Vulkan), and the coda's CPU time, which only VRAM can take away.
+bit parity with Vulkan), and a first run without a profile.
 
 ## Credits
 
