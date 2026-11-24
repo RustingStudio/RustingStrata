@@ -1337,7 +1337,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     reps,
                 };
                 let unix_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                let record = bench_record(&meta, &results, r.expert_summary().as_ref(), unix_time);
+                let mut record = bench_record(&meta, &results, r.expert_summary().as_ref(), unix_time);
+                // The arch-specific benchners print this; putting it in the JSON too gives tools one reliable source.
+                let drafts = if let Runner::Gpu(g) = &r { g.drafts } else { (0, 0) };
+                record["drafts"] = json!({"made": drafts.0, "accepted": drafts.1});
                 let mut line = serde_json::to_string(&record)?;
                 line.push('\n');
                 std::fs::write(&path, line).with_context(|| format!("writing the JSON record to {}", path.display()))?;
