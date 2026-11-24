@@ -3,7 +3,7 @@
 
 use crate::quant::{GgmlType, tables::*};
 use anyhow::{Context, bail};
-use crate::backend::{Backend, Buf, SAME_X};
+use crate::backend::{BATCHED, Backend, Buf, SAME_X};
 use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice, LaunchConfig, PushKernelArg, result, sys};
 use cudarc::nvrtc::Ptx;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -42,6 +42,9 @@ pub struct Gpu {
     /// q8 rows of the last integer GEMM's X (see quant_q8 in kernels.cu), grown on demand, and which x they hold
     /// (x, x_stride, n_x, cols) for a `SAME_X` call; None after a call without it that did not quantize.
     q8: std::sync::Mutex<(CudaSlice<u8>, Option<[u64; 4]>)>,
+    /// `gemmd_*` scratch for a GEMM that two blocks share the columns of: a slot per stream (see `GEMMD_SLOT`),
+    /// allocated by the first such GEMM.
+    gd: std::sync::OnceLock<CudaSlice<u8>>,
     /// The kernels were compiled for KV cache mode (0 = f16, 1 = q8, 2 = q4).
     pub kv_mode: u32,
     /// The GPU has int8 tensor-core mma (sm_80+). Turing runs the prefill GEMM on the f16 path instead.
@@ -71,6 +74,12 @@ const RING: usize = 64 << 20;
 const RING_MIN: usize = 256 << 10;
 /// `nb` inside `beside`: launches stay on the main stream, copies go to the side stream.
 const BESIDE: usize = usize::MAX - 1;
+/// `gemmd_*` splits the columns of a matrix of at most this many rows between two blocks. Measured on an RTX 3060
+/// with Qwen3-4B: the 9728-row FFN matrices gain at 8 and 16 positions and are level at 64; the output head (151936
+/// rows) fills the card without the split.
+const GEMMD_SPLIT_ROWS: usize = 16384;
+/// A scratch slot of `gemmd_*`: a count per 128 rows, then the partial sums of both blocks for 64 positions.
+const GEMMD_SLOT: usize = GEMMD_SPLIT_ROWS / 128 * 4 + 2 * 64 * GEMMD_SPLIT_ROWS * 4;
 
 /// A recorded graph. Its handles are plain CUDA driver handles, which any thread may launch once the context is
 /// bound (cudarc leaves `CudaGraph` without `Send` only because it holds raw pointers).
@@ -355,15 +364,15 @@ fn smem_log(family: &str, optin: usize, stat: usize, set: Option<usize>, carveou
     format!("cuda shared memory: opt-in {optin} B per block, {family}: {stat} B static, dynamic max {dynamic}, carveout {carveout}")
 }
 
-/// The kernel names to load from the cubin: the full list on sm_80+, without the int8 prefill GEMM (`gemmi_*` and
-/// `gemmis_*`, 23 non-float types x 2 fewer names) on a device where that code is not compiled in. Pure so a CPU test can pin
-/// both lists (326 / 280 names).
+/// The kernel names to load from the cubin: the full list on sm_80+, without the int8 GEMM (`gemmi_*`, `gemmis_*` and
+/// `gemmd_*`, 23 non-float types x 3 fewer names) on a device where that code is not compiled in. Pure so a CPU test can pin
+/// both lists (393 / 324 names).
 fn kernel_names(sm80: bool) -> Vec<String> {
     let int8 = move |&&t: &&GgmlType| sm80 && !t.float_x();
     KERNELS.iter().map(|s| s.to_string())
         .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm", "gemms"].map(|p| kname(p, t))))
         .chain(QTYPES.iter().flat_map(|&t| ["gemv", "gemvn", "moe_gemv"].map(|p| kname(p, t) + "_p")))
-        .chain(QTYPES.iter().filter(int8).flat_map(|&t| [kname("gemmi", t), kname("gemmis", t)]))
+        .chain(QTYPES.iter().filter(int8).flat_map(|&t| [kname("gemmi", t), kname("gemmis", t), kname("gemmd", t)]))
         .chain([64, 128, 256, 512].iter().flat_map(|h| [format!("attn_decode_{h}"), format!("attn_decode_gqa_{h}")]))
         .chain(["attn_decode_gqa4_128".to_string()])
         .collect()
@@ -523,7 +532,7 @@ impl Gpu {
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = ctx.new_event(None)?;
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, kv_mode, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default() })
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, gd: Default::default(), kv_mode, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -590,7 +599,7 @@ impl Gpu {
         // So does one of at most 32 positions (batched decode): the same blocks, a quarter of the positions in each.
         let sm = tiles == 0 && (grid.0 * grid.1 < 112 || nd <= 32);
         let grid = if sm { (grid.0, nd.div_ceil(32) as u32) } else { grid };
-        let (same, act) = (act & SAME_X != 0, act & !SAME_X);
+        let (same, batched, act) = (act & SAME_X != 0, act & BATCHED != 0, act & 3);
         let mut q8 = self.q8.lock().unwrap();
         let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
         let reuse = same && q8.1 == key;
@@ -613,6 +622,20 @@ impl Gpu {
         // Only SAME_X promises that x still holds what was quantized: the same address can hold new rows.
         if !same { q8.1 = None; }
         let xq = self.q8_x(&mut q8, ty, cols, n_x, x, x_stride)?.expect("int8 GEMM without a quantized x");
+        // A step of a batch of requests: at most 64 rows of x, no tile list.
+        if batched && tiles == 0 && xrow == 0 && nd <= 64 {
+            let pb = nd.next_power_of_two().max(8);
+            let xw = if pb >= 32 { 128 } else { 4096 / pb };  // GEMMD_XW
+            let ks = if rows <= GEMMD_SPLIT_ROWS && cols >= 2 * xw { 2 } else { 1 };
+            // The launches of a stream run in order, so each stream has a slot (`st`: the odd launches of a batch go to `side`).
+            let n = self.nb.load(Relaxed);
+            if self.gd.get().is_none() { let _ = self.gd.set(self.stream.alloc_zeros(2 * GEMMD_SLOT)?); }
+            let slot = self.ptr(self.gd.get().unwrap()) + if n < BESIDE && n % 2 == 1 { GEMMD_SLOT as u64 } else { 0 };
+            launch!(self, &kname("gemmd", ty),
+                cfg(((ks * rows.div_ceil(128)) as u32, 1), 256, (2 * pb * (xw + 32 + xw / 8 + xw / 4) + pb / 2 * (xw / 32) * 32) as u32),
+                wd, xq, nd as i32, pb as i32, ks as i32, slot + (GEMMD_SPLIT_ROWS / 128 * 4) as u64, slot, y, y_stride as i32, rows as i32, cols as i32, act, w_scale);
+            return Ok(());
+        }
         launch!(self, &kname(if sm { "gemmis" } else { "gemmi" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
             tiles, wd, nd as i32, xq, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act, w_scale);
         if tiles != 0 {
@@ -774,6 +797,7 @@ impl Backend for Gpu {
             fns: self.fns.clone(),
             i8_gemm: self.i8_gemm,
             q8,
+            gd: Default::default(),
             kv_mode: self.kv_mode,
             int8_mma: self.int8_mma,
             turing: self.turing,
@@ -1498,13 +1522,13 @@ mod tests {
     }
 
     /// M1-T5, CPU-only: the loaded name list drops `gemmi_*`/`gemmis_*` only on a device where kernels.cu compiles
-    /// them out. 370 names today (sm_80); 23 non-float types x 2 fewer names = 324 on sm_70.
+    /// them out. 393 names today (sm_80); 23 non-float types x 3 fewer names = 324 on sm_70.
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 370);
+        assert_eq!(sm80.len(), 393);
         assert_eq!(sm70.len(), 324);
-        assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmis")),
+        assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmd")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());
         assert!(sm80.contains(&"gemmi_q4_k".to_string()));

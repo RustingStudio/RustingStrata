@@ -1557,6 +1557,214 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
         gemmi_q<T, SBB, 128, true>(tiles, wd, nd, x, xrow, y, y_stride, rows, n64, act, sc);                    \
     }
 ITYPES(DEF_GEMMI)
+
+// ---- small-batch int8 GEMM (batched decode: at most 64 positions) ----
+// grid = ks * ceil(rows / 128), block = 256, dynamic shared memory (Gpu::gemm_raw has the size); pb = 8, 16, 32 or 64
+// is nd rounded up.
+// A warp owns 16 W rows as the mma A operand. Lane (g, t) decodes the 8 weights 32 q + 8 t .. of rows g and g + 8
+// from global memory itself, so W is not staged in shared memory and the K loop has no barrier per step
+// (gemmi_q: two barriers per 64 columns and every warp of the block decodes for the mmas of half of them).
+// Both operands permute the k index of the mma the same way (column 8 t + j is k 4 t + j, column 8 t + 4 + j is
+// k 16 + 4 t + j), so a lane's 8 weights are one QI get and its 8 x values one load. A type with a scale per 16 runs
+// two mmas per 32 columns, each with the lanes of the other half zeroed.
+// X (q8 rows) is the B operand, from a shared-memory window of GEMMD_XW(pb) columns that cp.async double-buffers: one
+// barrier per window.
+// ks = 2: two blocks (seg 0, 1) share 128 rows, each over half of the columns (Gpu::gemm_raw has the rule and the
+// measurement). Both blocks store their partial sums in scr ([seg][position][row]); the one that ends second (flag:
+// the count of blocks done for these rows, over all launches) adds the other's and writes y. a + b is b + a, so the
+// result does not depend on which block that is.
+#define GEMMD_XW(pb) ((pb) >= 32 ? 128 : 4096 / (pb))
+template <int T, int SBB>
+__device__ __forceinline__ void gemmd_q(const u8* w, const u8* __restrict__ x, int nd, int pb, int ks, float* scr, int* flag,
+                                        float* y, int y_stride, int rows, int cols, int act, float sc) {
+    // One window: pb rows of xw + 32 int8 (the pitch puts two lanes on a bank, the least an 8-byte load allows),
+    // then xw / 32 scales and xw / 16 sums per row. Two windows, then pk.
+    extern __shared__ __align__(16) signed char gemmd_s[];
+    int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    int seg = blockIdx.x % ks, rb = blockIdx.x / ks, bs = blockDim.x, ts = tid;
+    int xw = GEMMD_XW(pb), lx = 31 - __clz(xw), pitch = xw + 32, od = pb * pitch, os = od + pb * (xw >> 3), xb_ = os + pb * (xw >> 2);
+    int nq = cols / 32, qw = xw >> 5, nwin = (cols + xw - 1) >> lx, nws = (nwin + ks - 1) / ks, w0 = seg * nws;
+    signed char* gx = gemmd_s;
+    float* pk = (float*)(gx + 2 * xb_);  // per (position pair, 32 columns): d0, d1, s0, s1, then the four half sums
+    int np = nd, npt = (np + 7) >> 3, r0 = (rb * (bs >> 5) + warp) * 16;
+    const u8* xr = x;
+    int nc0 = pb * (xw >> 4), nc1 = nc0 + pb * (xw >> 7), nc2 = nc1 + pb * (xw >> 6);
+    auto ldx = [&](int wi) {  // window wi of this block's columns
+        signed char* d = gx + (wi & 1) * xb_;
+        int k0 = (w0 + wi) * xw;
+        for (int c = ts; c < nc2; c += bs) {  // 16-byte chunks: int8, then scales, then sums
+            int pos, o; const u8* src; signed char* dst; bool ok;
+            if (c < nc0) {
+                pos = c >> (lx - 4); o = (c & ((xw >> 4) - 1)) * 16;
+                src = xr + (size_t)pos * Q8_ROW(cols) + k0 + o; dst = d + pos * pitch + o; ok = k0 + o < cols;
+            } else if (c < nc1) {
+                pos = (c - nc0) >> (lx - 7); o = ((c - nc0) & ((xw >> 7) - 1)) * 16;
+                src = xr + (size_t)pos * Q8_ROW(cols) + cols + (k0 >> 3) + o; dst = d + od + pos * (xw >> 3) + o; ok = k0 + o * 8 < cols;
+            } else {
+                pos = (c - nc1) >> (lx - 6); o = ((c - nc1) & ((xw >> 6) - 1)) * 16;
+                src = xr + (size_t)pos * Q8_ROW(cols) + cols + cols / 8 + (k0 >> 2) + o; dst = d + os + pos * (xw >> 2) + o; ok = k0 + o * 4 < cols;
+            }
+            cp_async16(dst, src, ok && pos < np);
+        }
+        cp_async_commit();
+    };
+    const bool live = r0 < rows;
+    const u8* pa = w + (size_t)min(r0 + g, rows - 1) * ROWB(cols, SBB);
+    const u8* pb_ = w + (size_t)min(r0 + g + 8, rows - 1) * ROWB(cols, SBB);
+    constexpr int KS = scale32<T>() ? 32 : 16;
+    float acc[8][4] = {};
+    const signed char* xb;
+    // The scales and sums of window wi, from the staged q8 rows into pk: one load per mma instead of four.
+    auto pack = [&](int wi) {
+        const float* xd = (const float*)(gx + (wi & 1) * xb_ + od); const float* xs = (const float*)(gx + (wi & 1) * xb_ + os);
+        for (int c = ts; c < (pb >> 1) * qw; c += bs) {
+            int p = 2 * (c % (pb >> 1)), kw = c / (pb >> 1);  // [kw][pair]: the four t of a warp load from 16 banks
+            float* o = pk + c * 8;
+            *(float2*)o = make_float2(xd[p * qw + kw], xd[(p + 1) * qw + kw]);
+            if (QI<T>::MIN) {
+                float2 s0 = *(const float2*)(xs + p * 2 * qw + 2 * kw), s1 = *(const float2*)(xs + (p + 1) * 2 * qw + 2 * kw);
+                *(float2*)(o + 2) = make_float2(s0.x + s0.y, s1.x + s1.y);
+                *(float4*)(o + 4) = make_float4(s0.x, s0.y, s1.x, s1.y);
+            }
+        }
+        __syncthreads();
+    };
+    // The mmas of one 32-column block (kw in the window): A fragment a0..a3, W scale and min of rows g and g + 8.
+    auto blk = [&](int kw, u32 a0, u32 a1, u32 a2, u32 a3, float wda, float wma, float wdb, float wmb) {
+        // Scale per 16: lanes t < 2 hold the first 16 columns of the 32, lane t ^ 2 the scale of the other 16.
+        float oda = 0.f, oma = 0.f, odb = 0.f, omb = 0.f;
+        if (KS == 16) {
+            oda = __shfl_xor_sync(0xffffffffu, wda, 2); odb = __shfl_xor_sync(0xffffffffu, wdb, 2);
+            if (QI<T>::MIN) { oma = __shfl_xor_sync(0xffffffffu, wma, 2); omb = __shfl_xor_sync(0xffffffffu, wmb, 2); }
+        }
+        #pragma unroll
+        for (int pt = 0; pt < 8; pt++) {  // 8 positions an mma
+            if (pt >= npt) break;
+            const uint2 bx = *(const uint2*)(xb + (pt * 8 + g) * pitch + kw * 32 + 8 * t);
+            const float* o = pk + (kw * (pb >> 1) + pt * 4 + t) * 8;
+            float dx[2], s32[2] = {0.f, 0.f};
+            float2 sx[2] = {make_float2(0.f, 0.f), make_float2(0.f, 0.f)};
+            if (QI<T>::MIN && KS == 32) { const float4 v = *(const float4*)o; dx[0] = v.x; dx[1] = v.y; s32[0] = v.z; s32[1] = v.w; }
+            else {
+                const float2 v = *(const float2*)o; dx[0] = v.x; dx[1] = v.y;
+                if (QI<T>::MIN) { const float4 u = *(const float4*)(o + 4); sx[0] = make_float2(u.x, u.y); sx[1] = make_float2(u.z, u.w); }
+            }
+            #pragma unroll
+            for (int h = 0; h < 32 / KS; h++) {
+                const bool mine = KS == 32 || (t >> 1) == h;
+                int c[4];
+                mma_s8_16832_b(c, mine ? a0 : 0, mine ? a1 : 0, mine ? a2 : 0, mine ? a3 : 0, bx.x, bx.y);
+                const float dw[2] = {mine ? wda : oda, mine ? wdb : odb}, mw[2] = {mine ? wma : oma, mine ? wmb : omb};
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    // Two fmas into the sum (a product, a subtraction and an add cost one instruction more).
+                    acc[pt][i] = fmaf(__int_as_float(c[i]) - 12582912.0f, dx[i & 1] * dw[i >> 1], acc[pt][i]);  // i2f_small
+                    if (QI<T>::MIN) acc[pt][i] = fmaf(-(KS == 32 ? s32[i & 1] : h ? sx[i & 1].y : sx[i & 1].x), mw[i >> 1], acc[pt][i]);
+                }
+            }
+        }
+    };
+    // Generic: block q + 1 is decoded during block q's mmas.
+    int la = 0, ha = 0, lb = 0, hb = 0; float da = 0.f, ma = 0.f, db = 0.f, mb = 0.f;
+    auto dec = [&](int q) {
+        ma = mb = 0.f;
+        int sub = (q & 7) * 4 + t; size_t o = (size_t)(q >> 3) * SBB;
+        QI<T>::get(pa + o, sub, la, ha, da, ma);
+        QI<T>::get(pb_ + o, sub, lb, hb, db, mb);
+    };
+    // Q4_K: 64 columns of a row are 32 bytes of nibbles (low: the first 32 columns), so the lane's two blocks are one
+    // 8-byte load a row; the pair after is loaded before this pair's mmas.
+    const bool k4 = T == 12 && ((size_t)w & 15) == 0 && cols % 256 == 0;
+    uint4 sa_ = make_uint4(0, 0, 0, 0), sb_ = sa_; uint2 ua = make_uint2(0, 0), ub = ua;
+    float sda = 0.f, sma = 0.f, sdb = 0.f, smb = 0.f;
+    auto ldp = [&](int p, bool hdr) {  // hdr: the pair is the first of its super-block that this block reads
+        size_t o = (size_t)(p >> 2) * 144; int j = 16 + 32 * (p & 3) + 8 * t;
+        if (hdr) { sa_ = *(const uint4*)(pa + o); sb_ = *(const uint4*)(pb_ + o); }
+        ua = *(const uint2*)(pa + o + j); ub = *(const uint2*)(pb_ + o + j);
+    };
+    ldx(0);
+    cp_async_wait<0>();
+    __syncthreads();
+    pack(0);
+    if (live && w0 * qw < nq) { if (k4) ldp(w0 * qw / 2, true); else dec(w0 * qw); }
+    for (int wi = 0; wi < nws; wi++) {
+        if (wi + 1 < nws) ldx(wi + 1);  // into the buffer of window wi - 1: every thread passed the barrier below
+        xb = gx + (wi & 1) * xb_;
+        int qa = (w0 + wi) * qw, q1 = min(nq, qa + qw);
+        if (live && k4) {
+            for (int p = qa / 2; p < q1 / 2; p++) {
+                const uint4 ca = sa_, cb = sb_; const uint2 va = ua, vb = ub;
+                if (p + 1 < nq / 2) ldp(p + 1, !((p + 1) & 3));
+                // The four lanes of a row would decode the same scale: at an even pair (a window starts at one: it
+                // is 128 columns or more) lane t decodes the scale of block t of the next four, and a shuffle
+                // hands each block's scale to the row's lanes.
+                if (!(p & 1)) {
+                    k4_dm_w(ca.x, ca.y, ca.z, ca.w, 2 * (p & 2) + t, sda, sma);
+                    k4_dm_w(cb.x, cb.y, cb.z, cb.w, 2 * (p & 2) + t, sdb, smb);
+                }
+                #pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    const int from = (lane & ~3) | (2 * (p & 1) + h);
+                    const float wda = __shfl_sync(0xffffffffu, sda, from), wma = __shfl_sync(0xffffffffu, sma, from);
+                    const float wdb = __shfl_sync(0xffffffffu, sdb, from), wmb = __shfl_sync(0xffffffffu, smb, from);
+                    blk(2 * p + h - qa, (va.x >> (4 * h)) & 0x0F0F0F0Fu, (vb.x >> (4 * h)) & 0x0F0F0F0Fu,
+                        (va.y >> (4 * h)) & 0x0F0F0F0Fu, (vb.y >> (4 * h)) & 0x0F0F0F0Fu, wda, wma, wdb, wmb);
+                }
+            }
+        } else if (live) {
+            for (int q = qa; q < q1; q++) {
+                const u32 a0 = la, a1 = lb, a2 = ha, a3 = hb;
+                const float wda = da, wma = ma, wdb = db, wmb = mb;
+                if (q + 1 < nq) dec(q + 1);
+                blk(q - qa, a0, a1, a2, a3, wda, wma, wdb, wmb);
+            }
+        }
+        cp_async_wait<0>(); __syncthreads();
+        if (wi + 1 < nws) pack(wi + 1);
+    }
+    if (ks > 1) {
+        float* mine = scr + (size_t)seg * nd * rows;
+        const volatile float* other = scr + (size_t)(seg ^ 1) * nd * rows;  // another block's stores: not cached
+        if (live) {
+            #pragma unroll
+            for (int j = 0; j < 32; j++) {
+                int r = r0 + g + 8 * ((j >> 1) & 1), p = (j >> 2) * 8 + 2 * t + (j & 1);
+                if (r < rows && p < np) mine[(size_t)p * rows + r] = acc[j >> 2][j & 3];
+            }
+        }
+        __threadfence();  // every thread's sums are in memory before the count says so
+        __syncthreads();
+        int* second = (int*)gemmd_s;
+        if (tid == 0) *second = atomicAdd(flag + rb, 1) & 1;
+        __syncthreads();
+        if (!*second) return;
+        if (live) {
+            #pragma unroll
+            for (int j = 0; j < 32; j++) {
+                int r = r0 + g + 8 * ((j >> 1) & 1), p = (j >> 2) * 8 + 2 * t + (j & 1);
+                if (r < rows && p < np) acc[j >> 2][j & 3] += other[(size_t)p * rows + r];
+            }
+        }
+    }
+    if (live) {
+        #pragma unroll
+        for (int pt = 0; pt < 8; pt++)
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int r = r0 + g + 8 * (i >> 1), p = pt * 8 + 2 * t + (i & 1);
+                if (r >= rows || p >= np) continue;
+                float* yp = y + (size_t)p * y_stride + r;
+                float v = acc[pt][i] * sc;
+                *yp = act == 0 ? v : act == 1 ? silu(*yp) * v : *yp + v;
+            }
+    }
+}
+#define DEF_GEMMD(T, NAME, SBB)                                                                                    \
+    extern "C" __global__ void __launch_bounds__(256, 2) gemmd_##NAME(const u8* w, const u8* x, int nd, int pb,        \
+            int ks, float* scr, int* flag, float* y, int y_stride, int rows, int cols, int act, float sc) {       \
+        gemmd_q<T, SBB>(w, x, nd, pb, ks, scr, flag, y, y_stride, rows, cols, act, sc);                           \
+    }
+ITYPES(DEF_GEMMD)
 #endif
 
 // ---- elementwise / norm ----

@@ -91,6 +91,10 @@ pub fn device_order<T: PartialEq>(cuda: &[Option<T>], vk: &[T]) -> Vec<Option<us
 
 /// `gemm` `act` flag: x is unchanged since the previous gemm call, which read the same x, so its int8 copy is reused.
 pub const SAME_X: i32 = 4;
+/// `gemm_dense` `act` flag: the call is a step of a batch of requests (`step_batch`), so the backend may take a kernel
+/// that sums the products in another order than the prefill GEMM. Paths of a single request leave it clear: their bits
+/// do not change.
+pub const BATCHED: i32 = 8;
 
 /// The weight type `Backend::upload` stores a tensor of type `ty` as: F16 as F32 (no F16 kernels; F32 holds every F16
 /// value exactly). Expert tensors are copied raw by `GpuModel::load_part`, not through `upload`.

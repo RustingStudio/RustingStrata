@@ -988,7 +988,7 @@ impl Vk {
         ensure!(cols % 64 == 0, "{} matrix with {cols} columns: GEMM needs a multiple of 64", ty.name());
         if n_tiles == 0 { return Ok(()); }
         let (spec, grid, nk) = (self.wspec(ty), [rows.div_ceil(64), n_tiles, 1], (cols / 64) as u32);
-        let (same, act) = (act & SAME_X != 0, act & !SAME_X);
+        let (same, act) = (act & SAME_X != 0, act & 3);  // BATCHED: the same kernels
         let mut q8 = self.q8_mutex(n_x, cols).lock().unwrap();
         let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);  // as on CUDA
         let reuse = same && q8.1 == key;

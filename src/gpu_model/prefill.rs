@@ -3,7 +3,7 @@
 //! copied into a small staging area, a group of them at a time, each group's copy beside the previous group's GEMMs.
 
 use super::{Ffn, GpuModel, HcAt, Mixer};
-use crate::backend::{Backend, Buf, GEMM_BM, SAME_X};
+use crate::backend::{BATCHED, Backend, Buf, GEMM_BM, SAME_X};
 use crate::expert_cache::MATS;
 use crate::model::Model;
 use crate::weights::Prefetch;
@@ -812,18 +812,18 @@ impl GpuModel<'_> {
                 let (Mixer::Attn { q, k, v, qn, kn, o, sink, .. }, Ffn::Dense { gate, up, down }) = (&ly.mixer, &ly.ffn) else { unreachable!() };
                 let kvt = bt.kvt.addr() + (8 * i * 2 * bt.rows) as u64;
                 g.rms_norm(x, ne, ly.attn_norm.as_ref().unwrap().ptr, h, ne, ne, t, eps)?;
-                g.gemm_dense(q, t, h, ne, at(l.a), nh * qs, 0)?;
-                g.gemm_dense(k, t, h, ne, kraw, kv, SAME_X)?;
-                g.gemm_dense(v, t, h, ne, vv, kv, SAME_X)?;
+                g.gemm_dense(q, t, h, ne, at(l.a), nh * qs, BATCHED)?;
+                g.gemm_dense(k, t, h, ne, kraw, kv, SAME_X | BATCHED)?;
+                g.gemm_dense(v, t, h, ne, vv, kv, SAME_X | BATCHED)?;
                 let win = c.swa.get(self.first + i).copied().unwrap_or(false).then_some(c.n_swa).unwrap_or(0);
                 g.rms_norm_rope_qk_rows(at(l.a), qs, qn.ptr, at(l.b), nh, kraw, kn.ptr, kk, nkv, hd, eps, c.n_rot, step, c.rope_base, vv, kvt, t)?;
                 g.attn_rows(at(l.b), if c.q_gate { at(l.a) } else { 0 }, at(l.d), bt.attp.addr(), step, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), t,
                             sink.as_ref().map_or(0, |s| s.ptr), win, kvt, splits)?;
-                g.gemm_dense(o, t, at(l.d), nh * hd, x, ne, 2)?;
+                g.gemm_dense(o, t, at(l.d), nh * hd, x, ne, 2 | BATCHED)?;
                 g.rms_norm(x, ne, ly.post_norm.as_ref().unwrap().ptr, h, ne, ne, t, eps)?;
-                g.gemm_dense(gate, t, h, ne, at(l.ge), c.n_ff, 0)?;
-                g.gemm_dense(up, t, h, ne, at(l.ge), c.n_ff, 1 | SAME_X)?;
-                g.gemm_dense(down, t, at(l.ge), c.n_ff, x, ne, 2)?;
+                g.gemm_dense(gate, t, h, ne, at(l.ge), c.n_ff, BATCHED)?;
+                g.gemm_dense(up, t, h, ne, at(l.ge), c.n_ff, 1 | SAME_X | BATCHED)?;
+                g.gemm_dense(down, t, at(l.ge), c.n_ff, x, ne, 2 | BATCHED)?;
                 g.kick()?;
             }
             // Region a, not h: the next forward's first GEMM reads h, and the backend may keep the quantized rows of
@@ -831,7 +831,7 @@ impl GpuModel<'_> {
             let (on, nr) = (self.output_norm.as_ref().unwrap().ptr, heads.len());
             if all { g.rms_norm(x, ne, on, at(l.a), ne, ne, t, eps)?; }
             else { for (j, &r) in heads.iter().enumerate() { g.rms_norm(at(r * ne), ne, on, at(l.a + j * ne), ne, ne, 1, eps)?; } }
-            g.gemm_dense(self.output.as_ref().unwrap(), nr, at(l.a), ne, bt.logits.addr(), nvoc, 0)?;
+            g.gemm_dense(self.output.as_ref().unwrap(), nr, at(l.a), ne, bt.logits.addr(), nvoc, BATCHED)?;
             g.argmax_rows(bt.logits.addr(), nvoc, nr, bt.amax.addr())?;
             let am = g.get::<i32>(&bt.amax, 0, nr)?;
             heads.iter().zip(am).enumerate()
