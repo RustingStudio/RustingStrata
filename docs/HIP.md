@@ -259,6 +259,11 @@ pp 4096 went from 775 to 834 tok/s (same routing profile, greedy text unchanged)
 be 1105. What is left is the host's copy into the pinned ring (one thread, about 10 GB/s; more threads did not help)
 and the routing read at each layer, before which no copy can start.
 
+`STRATA_INK_PIN=1` page-locks the pooled experts in the mapped file (`hipHostRegister`, read-only; 15.8 GB in
+1.8 s), so the staging copies and the pool's swaps between tokens are DMAs from the file's pages: pp 4096 855 tok/s,
+decode 51-53. It keeps that much RAM locked while the model is loaded, so it is not the default. 64 or 96 staging
+slots instead of 32 were slower (838, 823): each one is a pool slot less.
+
 Left: `ink_mix` runs 120 times a token at 12 µs in one workgroup (about 1 ms, but a faster reduction order breaks the
 bit parity with Vulkan), and a first run without a profile.
 
