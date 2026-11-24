@@ -231,19 +231,24 @@ pub struct Rtc {
     _lib: Library,
 }
 
-static RTC: OnceLock<Option<Rtc>> = OnceLock::new();
+static RTC: OnceLock<Result<Rtc, String>> = OnceLock::new();
 
 impl Rtc {
-    pub fn get() -> Option<&'static Rtc> { RTC.get_or_init(Self::open).as_ref() }
+    /// The library, or which paths were tried and why each failed.
+    pub fn get() -> Result<&'static Rtc, &'static str> { RTC.get_or_init(Self::open).as_ref().map_err(|e| e.as_str()) }
 
-    fn open() -> Option<Rtc> {
+    fn open() -> Result<Rtc, String> {
         let want = candidates(std::env::var_os("STRATA_HIPRTC").map(Into::into),
                               &["libhiprtc.so", "libhiprtc.so.7", "libhiprtc.so.6"]);
+        let mut tried = Vec::new();
         for path in &want {
-            let Ok(lib) = (unsafe { Library::new(path) }) else { continue };
+            let lib = match unsafe { Library::new(path) } {
+                Ok(l) => l,
+                Err(e) => { tried.push(format!("{}: not loadable ({e})", path.display())); continue }
+            };
             unsafe {
-                macro_rules! g { ($n:literal) => { match Self::sym(&lib, $n) { Some(f) => f, None => continue } } }
-                return Some(Rtc {
+                macro_rules! g { ($n:literal) => { match Self::sym(&lib, $n) { Some(f) => f, None => { tried.push(format!("{}: no {}", path.display(), $n)); continue } } } }
+                return Ok(Rtc {
                     version: g!("hiprtcVersion"),
                     create: g!("hiprtcCreateProgram"),
                     compile: g!("hiprtcCompileProgram"),
@@ -258,7 +263,7 @@ impl Rtc {
                 });
             }
         }
-        None
+        Err(format!("no hiprtc: {}", tried.join(", ")))
     }
 
     unsafe fn sym<T: Copy>(lib: &Library, name: &str) -> Option<T> {

@@ -174,7 +174,7 @@ impl Gpu {
         // The HIP kernels hold an f16 or q8 cache (KV_MODE 0 or 1): refuse q4 and q2 rather than run f16 unasked.
         anyhow::ensure!(crate::cuda::kv_mode() <= 1, "--kv q4 and q2 are not available on the HIP backend (f16 or q8)");
         let kv_q8 = crate::cuda::kv_q8();
-        let rtc = ffi::Rtc::get().context("HIP init").context("hiprtc is required to compile the kernels")?;
+        let rtc = ffi::Rtc::get().map_err(|e| anyhow::anyhow!("{e}")).context("HIP init").context("hiprtc is required to compile the kernels")?;
         let (maj, min) = rtc.version();
         let tag = format!("{maj}.{min}");
         eprintln!("hip: {} ({arch}, wave{warp}, {} B shared memory a block)",
@@ -1062,7 +1062,7 @@ mod tests {
     /// The generated source compiles for this device through hiprtc (the CUDA source with `STRATA_HIP` taken).
     #[test]
     fn hiprtc_compiles_the_kernels() {
-        let Some(rtc) = ffi::Rtc::get() else {
+        let Ok(rtc) = ffi::Rtc::get() else {
             eprintln!("skipping: no hiprtc");
             return;
         };
