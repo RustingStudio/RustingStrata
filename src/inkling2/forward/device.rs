@@ -1644,7 +1644,14 @@ impl Device {
         match gpu {
             Some(tg) => {
                 m.balance(&m.cpu_share, adapt, tg, tc);
-                let host: Vec<f32> = match rem { Some(r) => cpu.iter().zip(&r).map(|(a, b)| a + b).collect(), None => cpu };
+                // `cpu` and `r` are per-dimension sums (`run_experts` returns the weighted mix), not per-expert
+                // weights: both have length `n`, and the elementwise add is the host total.
+                debug_assert_eq!(cpu.len(), n);
+                let host: Vec<f32> = match rem {
+                    Some(r) => { debug_assert_eq!(r.len(), n); cpu.iter().zip(&r).map(|(a, b)| a + b).collect() }
+                    None => cpu,
+                };
+                debug_assert_eq!(host.len(), n);
                 let wc: Vec<f32> = (0..c.n_used).map(|i| list.get(i).map_or(0.0, |e| e.2)).chain(host).collect();
                 be.put(&wc, &self.scr, ((s.wc - o) / 4) as usize).expect("inkling2 device step");
                 be.ink_ffn_sum(s.acc, s.d, s.wc, list.len(), n, s.wc + f(c.n_used)).expect("inkling2 device step");

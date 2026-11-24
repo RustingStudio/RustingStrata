@@ -45,6 +45,17 @@ def rows(f, n, nv, nch):
             yield c, i, scale, offset, q
 
 
+def same_bytes(a, b, chunk=1 << 20):
+    """Compare two files in chunks, without holding either one in memory."""
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        while True:
+            x, y = fa.read(chunk), fb.read(chunk)
+            if x != y:
+                return False
+            if not x:
+                return True
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("base")
@@ -62,9 +73,7 @@ def main():
     first = na // 2
     per = na - 1 - first
 
-    same = fa.read() == fb.read()
-    fa.seek(0), fb.seek(0)
-    header(fa), header(fb)
+    same = same_bytes(a.base, a.new)
 
     klds, top1, cells, moved, worst, nll_a, nll_b = [], 0, 0, 0, 0.0, 0.0, 0.0
     for (c, i, sa, oa, qa), (_, _, sb, ob, qb) in zip(rows(fa, na, nva, ncha), rows(fb, nb, nvb, nchb)):

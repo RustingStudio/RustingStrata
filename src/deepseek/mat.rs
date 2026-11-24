@@ -73,11 +73,43 @@ pub(crate) mod dev {
         let f: Vec<f64> = v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
         match f[..] { [small, large] => if free < 8 << 30 { small } else { large }, [v] => v, _ => 0.8 }
     }
+    /// Free VRAM GPU 0 keeps after the plain weights for the decode state, the KV growth and the prefill scratch.
+    /// Those buffers are allocated outside the weight budget, so the reserve is checked against live free VRAM.
+    const STATE_RESERVE: usize = 768 << 20;
+    /// Whether `len` more plain-weight bytes fit GPU 0's budget and still leave `STATE_RESERVE` free there.
+    fn plain_first_fits(bytes: usize, len: usize, budget: usize, free: usize) -> bool {
+        bytes.saturating_add(len) <= budget && free >= len.saturating_add(STATE_RESERVE)
+    }
+    fn plain_first_enabled_from(v: Option<&str>) -> bool { v.is_some_and(|v| v != "0") }
+    fn plain_first_enabled() -> bool { plain_first_enabled_from(std::env::var("STRATA_DS_PLAIN_FIRST").ok().as_deref()) }
     #[test]
     fn gpu_fraction_takes_one_value_or_a_pair() {
         let gb = |n: usize| n << 30;
         assert_eq!([gpu_fraction("", gb(4)), gpu_fraction("0.9", gb(4)), gpu_fraction("x", gb(4))], [0.8, 0.9, 0.8]);
         assert_eq!([gpu_fraction("0.6,0.9", gb(4)), gpu_fraction("0.6, 0.9", gb(11))], [0.6, 0.9]);
+    }
+    #[test]
+    fn plain_first_reserves_the_state() {
+        let budget = 1 << 30;
+        assert!(plain_first_fits(0, 100, budget, 100 + STATE_RESERVE));
+        assert!(!plain_first_fits(0, 100, budget, 100 + STATE_RESERVE - 1)); // free VRAM too low
+        assert!(!plain_first_fits(budget, 100, budget, 1 << 40));            // budget full
+    }
+    #[test]
+    fn plain_first_env_zero_is_off() {
+        assert!(!plain_first_enabled_from(None));
+        assert!(!plain_first_enabled_from(Some("0")));
+        assert!(plain_first_enabled_from(Some("1")));
+    }
+    #[test]
+    fn expert_group_is_consumed_on_a_cache_hit() {
+        let mut d = Dev::default();
+        let data = vec![0u8; 8];
+        let k = data.as_ptr() as usize;
+        d.ex.insert(k, 0);
+        d.exs.push((0, k, 1, 1.0));
+        assert_eq!(d.expert_grouped((0x1000, 64), &data, GgmlType::F32, 0, 0, 1.0, false), Some(0));
+        assert!(d.group.is_none());
     }
     fn open() -> Option<Dev> {
         // Unset or 0: every matvec runs on the CPU.
@@ -165,9 +197,13 @@ pub(crate) mod dev {
         pub fn pick(&mut self, len: usize) -> usize {
             self.reclaim();
             // Local patch (Inkling 2 on several GPUs): the decode state lives on GPU 0 and reads the plain weights
-            // there, so they stay on GPU 0 while the weight budget has room (the old `room` was ~0.3 GB at 0.9).
-            if self.parts.len() > 1 && self.cur == 0 && std::env::var_os("STRATA_DS_PLAIN_FIRST").is_some()
-                && self.parts[0].bytes + len <= self.parts[0].budget { return 0; }
+            // there, so they stay on GPU 0 while the budget has room and the live free VRAM keeps the state reserve.
+            // The state, KV and prefill scratch are allocated outside the budget; `room` alone would move the plain
+            // weights to GPU 1 (it is ~0.4 GB at 0.9), which is what this branch avoids.
+            if self.parts.len() > 1 && self.cur == 0 && plain_first_enabled() {
+                let free = self.parts[0].be.mem_info().map_or(usize::MAX, |m| m.0);
+                if plain_first_fits(self.parts[0].bytes, len, self.parts[0].budget, free) { return 0; }
+            }
             while self.cur + 1 < self.parts.len() && self.parts[self.cur].bytes + len > self.parts[self.cur].room { self.cur += 1; }
             self.cur
         }
@@ -239,6 +275,7 @@ pub(crate) mod dev {
             self.expert(data, ty, rows, cols, scale, evict)
         }
         pub fn expert(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize, scale: f32, evict: bool) -> Option<u32> {
+            let group = self.group.take();
             self.reclaim();
             let k = data.as_ptr() as usize;
             self.now += 1;
@@ -255,7 +292,7 @@ pub(crate) mod dev {
             // Local patch: all experts of one stacked tensor (a layer's gate_up or down) go to the same GPU, so a
             // layer's matvecs hit `batch_mats`' single-GPU path instead of two sequential batches with two readbacks.
             // The GPU with the most free budget used to win per expert, which spread every layer over both cards.
-            let pref = self.group.take().and_then(|(base, len)| self.affinity(base, len));
+            let pref = group.and_then(|(base, len)| self.affinity(base, len));
             let room = |p: &Part| (p.bytes + data.len() <= p.budget).then(|| p.budget - p.bytes);
             let pick = pref.filter(|&d| room(&self.parts[d]).is_some())
                 .or_else(|| (0..self.parts.len()).filter_map(|d| room(&self.parts[d]).map(|r| (r, d))).max().map(|(_, d)| d));

@@ -29,6 +29,33 @@ const KERNELS: [&str; 60] = [
 pub use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
 use crate::backend::ATT_SPLITS_1;
 
+/// Kernel-choice flags read from the environment once, when the `Gpu` is made: they sit on the token path, so a
+/// lookup per launch is not worth it.
+#[derive(Clone, Copy)]
+struct InkFlags {
+    /// `STRATA_CTRL_TILE=0` forces the per-token `ink_ctrl_*` pair (unset or any other value: tiled).
+    ctrl_tile: bool,
+    /// `STRATA_DS_ATTN_OLD=1` keeps the scalar/one-query-a-warp attention kernels for a measurement window.
+    attn_old: bool,
+    /// `STRATA_DS_ATTN_KP4=1` selects the four-query 128-key tile prefill kernel.
+    attn_kp4: bool,
+}
+
+impl InkFlags {
+    fn from_parts(ctrl: Option<&str>, attn_old: Option<&str>, attn_kp4: Option<&str>) -> Self {
+        // The same truthiness for all three: unset is the default, `0` turns the option off.
+        let on = |v: Option<&str>, default: bool| v.map_or(default, |v| v != "0");
+        Self { ctrl_tile: on(ctrl, true), attn_old: on(attn_old, false), attn_kp4: on(attn_kp4, false) }
+    }
+    fn from_env() -> Self {
+        Self::from_parts(
+            std::env::var("STRATA_CTRL_TILE").ok().as_deref(),
+            std::env::var("STRATA_DS_ATTN_OLD").ok().as_deref(),
+            std::env::var("STRATA_DS_ATTN_KP4").ok().as_deref(),
+        )
+    }
+}
+
 pub struct Gpu {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
@@ -44,6 +71,8 @@ pub struct Gpu {
     q8: std::sync::Mutex<(CudaSlice<u8>, Option<[u64; 4]>)>,
     /// The kernels were compiled for KV cache mode (0 = f16, 1 = q8, 2 = q4).
     pub kv_mode: u32,
+    /// The environment's kernel-choice flags, read once at creation.
+    flags: InkFlags,
     /// The GPU has int8 tensor-core mma (sm_80+). Turing runs the prefill GEMM on the f16 path instead.
     pub int8_mma: bool,
     /// sm_75: m16n8k8 mma, 64 KB of shared memory a block (no int8 mma, unlike sm_80+; unlike sm_70 it has no m8n8k4).
@@ -523,7 +552,7 @@ impl Gpu {
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = ctx.new_event(None)?;
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, kv_mode, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default() })
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, kv_mode, flags: InkFlags::from_env(), int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -760,9 +789,11 @@ impl Gpu {
 
 impl Gpu {
     /// The decode attention entry point and its key positions per block: the f16 head_dim 128 kernel scores a
-    /// 128-key tile a block, the scalar one 64 keys (`STRATA_DS_ATTN_OLD=1` keeps it for a measurement window).
-    pub(crate) fn ink_attn_kernel(&self, hd: usize) -> (&'static str, usize) {
-        if hd == 128 && self.kv_mode == 0 && std::env::var_os("STRATA_DS_ATTN_OLD").is_none() { ("ink_attn_128", 128) } else { ("ink_attn", 64) }
+    /// 128-key tile a block, the scalar one 64 keys (`STRATA_DS_ATTN_OLD=1` keeps it for a measurement window;
+    /// the flag is cached in `flags` at `Gpu` creation). The 128-key kernel keeps the relative-bias row in 32
+    /// shared floats, so a wider `nr` uses the scalar kernel.
+    pub(crate) fn ink_attn_kernel(&self, hd: usize, nr: usize) -> (&'static str, usize) {
+        if hd == 128 && nr <= 32 && self.kv_mode == 0 && !self.flags.attn_old { ("ink_attn_128", 128) } else { ("ink_attn", 64) }
     }
 }
 
@@ -783,6 +814,7 @@ impl Backend for Gpu {
             i8_gemm: self.i8_gemm,
             q8,
             kv_mode: self.kv_mode,
+            flags: self.flags,
             int8_mma: self.int8_mma,
             turing: self.turing,
             max_smem: self.max_smem,
@@ -1092,8 +1124,9 @@ impl Backend for Gpu {
     fn ink_ctrl_n(&self, down: u64, gain: u64, forget: u64, cur: u64, nins: usize, msg: u64, gate: u64, out: u64, n: usize, rank: usize, count: usize, nt: usize) -> anyhow::Result<()> {
         // A prompt chunk uses the tiled pair (a weight row is read once per 64 tokens); a decoded token the
         // per-token pair, which has no tile to reuse. Both pairs read and write the same gate layout.
-        // STRATA_CTRL_TILE=0 forces the per-token pair, to compare the two on the same text.
-        let tiled = nt >= 64 && rank <= 64 && n % 64 == 0 && std::env::var("STRATA_CTRL_TILE").map_or(true, |v| v != "0");
+        // STRATA_CTRL_TILE=0 forces the per-token pair, to compare the two on the same text (the flag is cached
+        // in `flags` at `Gpu` creation).
+        let tiled = nt >= 64 && rank <= 64 && n % 64 == 0 && self.flags.ctrl_tile;
         if tiled {
             let g1 = cfg((count as u32, nt.div_ceil(64) as u32), 256, 0);
             let g2 = LaunchConfig { grid_dim: (count as u32, n.div_ceil(64) as u32, nt.div_ceil(64) as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
@@ -1125,7 +1158,7 @@ impl Backend for Gpu {
         pos0: usize, log_alpha: f32, log_floor: f32,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(w <= 128, "ink_clip_n: w={w} > 128");
-        anyhow::ensure!(kv_mode() == 0 || dst == 0 || w % 32 == 0, "ink_clip_n: quantized KV requires w % 32 == 0 (got {w})");
+        anyhow::ensure!(self.kv_mode == 0 || dst == 0 || w % 32 == 0, "ink_clip_n: quantized KV requires w % 32 == 0 (got {w})");
         let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
         let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
         launch!(self, "ink_clip", cfg((rows as u32, nt as u32), 128, 0),
@@ -1139,7 +1172,7 @@ impl Backend for Gpu {
         pos_ptr: u64, log_alpha: f32, log_floor: f32,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(w <= 128, "ink_clip_pos: w={w} > 128");
-        anyhow::ensure!(kv_mode() == 0 || dst == 0 || w % 32 == 0, "ink_clip_pos: quantized KV requires w % 32 == 0 (got {w})");
+        anyhow::ensure!(self.kv_mode == 0 || dst == 0 || w % 32 == 0, "ink_clip_pos: quantized KV requires w % 32 == 0 (got {w})");
         let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
         let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
         launch!(self, "ink_clip", cfg((rows as u32, nt as u32), 128, 0),
@@ -1147,14 +1180,14 @@ impl Backend for Gpu {
         Ok(())
     }
     fn ink_attn(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, rows: usize, at: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
-        let (kn, ck) = self.ink_attn_kernel(hd);
+        let (kn, ck) = self.ink_attn_kernel(hd, nr);
         let chunks = rows.div_ceil(ck) as u32;
         launch!(self, kn, cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, rows as i32, at as i32, 1i32, nkv as i32, hd as i32, nr as i32, ext as i32, 0u64);
         launch!(self, "ink_attn_merge", cfg((nh as u32, 1), 128, 0), sc, gate, out, chunks as i32, hd as i32);
         Ok(())
     }
     fn ink_attn_pos(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, max_rows: usize, ring: usize, pos_ptr: u64, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
-        let (kn, ck) = self.ink_attn_kernel(hd);
+        let (kn, ck) = self.ink_attn_kernel(hd, nr);
         let chunks = max_rows.div_ceil(ck) as u32;
         launch!(self, kn, cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, 0i32, 0i32, ring.max(1) as i32, nkv as i32, hd as i32, nr as i32, ext as i32, pos_ptr);
         launch!(self, "ink_attn_merge", cfg((nh as u32, 1), 128, 0), sc, gate, out, chunks as i32, hd as i32);
@@ -1165,12 +1198,13 @@ impl Backend for Gpu {
         pos: usize, nt: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize, ring: usize, win: usize,
     ) -> anyhow::Result<()> {
         // The f16 head_dim 128 path scores a 16-query tile a block (kp16), the kp kernel four (a measurement
-        // window, STRATA_DS_ATTN_KP4=1) and the first one a query a warp (STRATA_DS_ATTN_OLD=1).
+        // window, STRATA_DS_ATTN_KP4=1) and the first one a query a warp (STRATA_DS_ATTN_OLD=1); both flags are
+        // cached in `flags` at `Gpu` creation.
         let (kn, qb) = match hd {
             32 => ("ink_attn_prefill_32", 4),
             64 => ("ink_attn_prefill_64", 4),
-            128 if std::env::var_os("STRATA_DS_ATTN_OLD").is_some() => ("ink_attn_prefill_128_old", 4),
-            128 if std::env::var_os("STRATA_DS_ATTN_KP4").is_some() || self.kv_mode != 0 => ("ink_attn_prefill_128_kp", 4),
+            128 if self.flags.attn_old => ("ink_attn_prefill_128_old", 4),
+            128 if self.flags.attn_kp4 || self.kv_mode != 0 => ("ink_attn_prefill_128_kp", 4),
             128 => ("ink_attn_prefill_128_kp16", 16),
             _ => anyhow::bail!("ink_attn_prefill: unsupported hd={hd}"),
         };
@@ -1704,5 +1738,20 @@ mod tests {
             "cuda shared memory: opt-in 98304 B per block, attn_prefill_*: 0 B static, dynamic max 72704 B, carveout 82%");
         assert_eq!(super::smem_log("attn_decode_*", 98304, 2112, None, None),
             "cuda shared memory: opt-in 98304 B per block, attn_decode_*: 2112 B static, dynamic max default (48 KiB), carveout default");
+    }
+
+    /// `STRATA_CTRL_TILE` is read as text: unset or any value but "0" keeps the tiled `ink_ctrl_*` pair. The
+    /// attention flags are plain presence checks and must pass through unchanged.
+    #[test]
+    fn ink_flags_parse_ctrl_tile() {
+        assert!(super::InkFlags::from_parts(None, None, None).ctrl_tile);
+        assert!(!super::InkFlags::from_parts(Some("0"), None, None).ctrl_tile);
+        assert!(super::InkFlags::from_parts(Some("1"), None, None).ctrl_tile);
+        let old = super::InkFlags::from_parts(None, Some("1"), None);
+        assert!(old.attn_old && !old.attn_kp4);
+        let kp4 = super::InkFlags::from_parts(Some("0"), None, Some("1"));
+        assert!(kp4.attn_kp4 && !kp4.attn_old && !kp4.ctrl_tile);
+        let off = super::InkFlags::from_parts(Some("0"), Some("0"), Some("0"));
+        assert!(!off.ctrl_tile && !off.attn_old && !off.attn_kp4);
     }
 }
