@@ -978,8 +978,9 @@ mod tests {
             g.gemm_dense(&t, n, gx.addr(), cols, gy.addr(), rows, 0).unwrap();
             g.sync().unwrap();
             let got: Vec<f32> = g.get(&gy, 0, n * rows).unwrap();
-            // A batch step's flag picks no other kernel here, so it gives the same bits (it reached the kernel as an add,
-            // which y filled with ones shows).
+            // A batch step's flag picks no other kernel here, so it gives the same bits. The host masks the flag off
+            // (`act & 3`), so this call stores over y. If the flag ever reached the kernel as `act` 8, the kernel would add
+            // to the ones and the bit comparison below would fail.
             g.put(&vec![1f32; n * rows], &gy, 0).unwrap();
             g.gemm_dense(&t, n, gx.addr(), cols, gy.addr(), rows, crate::backend::BATCHED).unwrap();
             g.sync().unwrap();
