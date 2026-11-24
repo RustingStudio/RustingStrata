@@ -1242,6 +1242,166 @@ mod avx512 {
         }
     }
 
+    /// Four-activation Q8_0 dot: decodes each 64-weight pair once and scores all 4 Q8_K vectors via `vpdpbusd`.
+    pub fn dot4_q8_0(row: &[u8], xq: [&[Q8K]; 4]) -> [f32; 4] {
+        unsafe {
+            let zero = _mm512_setzero_si512();
+            let mut acc = [_mm512_setzero_ps(); 4];
+            for (j, b2) in row.chunks_exact(68).enumerate() {
+                let (bi, o) = (j / 4, (j % 4) * 64);
+                let w0 = _mm256_loadu_si256(b2[2..34].as_ptr() as *const __m256i);
+                let w1 = _mm256_loadu_si256(b2[36..68].as_ptr() as *const __m256i);
+                let w = _mm512_inserti64x4(_mm512_castsi256_si512(w0), w1, 1);
+                let neg = _mm512_movepi8_mask(w);
+                let aw = _mm512_abs_epi8(w);
+                let d0 = d16(b2);
+                let d1 = d16(&b2[34..]);
+                for k in 0..4 {
+                    let y = &xq[k][bi];
+                    let q = q8_512(y, o);
+                    let p32 = _mm512_dpbusd_epi32(zero, aw, _mm512_mask_sub_epi8(q, neg, zero, q));
+                    let dv = _mm512_mask_blend_ps(0xFF00, _mm512_set1_ps(d0 * y.d), _mm512_set1_ps(d1 * y.d));
+                    acc[k] = _mm512_fmadd_ps(dv, _mm512_cvtepi32_ps(p32), acc[k]);
+                }
+            }
+            let mut out = std::array::from_fn(|k| _mm512_reduce_add_ps(acc[k]));
+            let n = row.len() / 34;
+            if n % 2 == 1 {
+                let i = n - 1;
+                let b = &row[34 * i..34 * i + 34];
+                let (bi, o) = (i / 8, (i % 8) * 32);
+                let d = d16(b);
+                for k in 0..4 {
+                    let y = &xq[k][bi];
+                    let s: i32 = b[2..34].iter().zip(&y.qs[o..o + 32]).map(|(&w, &q)| w as i8 as i32 * q as i32).sum();
+                    out[k] += d * y.d * s as f32;
+                }
+            }
+            out
+        }
+    }
+
+    /// Four-activation IQ4_NL dot: decodes each 64-weight pair once via 512-bit `vpshufb`.
+    pub fn dot4_iq4nl(row: &[u8], xq: [&[Q8K]; 4]) -> [f32; 4] {
+        unsafe {
+            let values = _mm512_broadcast_i32x4(_mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i));
+            let (m4, zero) = (_mm_set1_epi8(0xF), _mm512_setzero_si512());
+            let mut acc = [_mm512_setzero_ps(); 4];
+            for (j, b2) in row.chunks_exact(36).enumerate() {
+                let (b0, b1) = (&b2[..18], &b2[18..]);
+                let (bi, o) = (j / 4, (j % 4) * 64);
+                let bits0 = _mm_loadu_si128(b0[2..].as_ptr() as *const __m128i);
+                let bits1 = _mm_loadu_si128(b1[2..].as_ptr() as *const __m128i);
+                let idx0 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(bits0, 4), m4), _mm_and_si128(bits0, m4));
+                let idx1 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(bits1, 4), m4), _mm_and_si128(bits1, m4));
+                let w = _mm512_shuffle_epi8(values, _mm512_inserti64x4(_mm512_castsi256_si512(idx0), idx1, 1));
+                let neg = _mm512_movepi8_mask(w);
+                let aw = _mm512_abs_epi8(w);
+                let (d0, d1) = (d16(b0), d16(b1));
+                for k in 0..4 {
+                    let y = &xq[k][bi];
+                    let q = q8_512(y, o);
+                    let p32 = _mm512_dpbusd_epi32(zero, aw, _mm512_mask_sub_epi8(q, neg, zero, q));
+                    let dv = _mm512_mask_blend_ps(0xFF00, _mm512_set1_ps(d0 * y.d), _mm512_set1_ps(d1 * y.d));
+                    acc[k] = _mm512_fmadd_ps(dv, _mm512_cvtepi32_ps(p32), acc[k]);
+                }
+            }
+            let mut out = std::array::from_fn(|k| _mm512_reduce_add_ps(acc[k]));
+            let n = row.len() / 18;
+            if n % 2 == 1 {
+                let i = n - 1;
+                let b = &row[18 * i..18 * i + 18];
+                let (bi, o) = (i / 8, (i % 8) * 32);
+                let d = d16(b);
+                for k in 0..4 {
+                    let y = &xq[k][bi];
+                    let mut s = 0i32;
+                    for l in 0..16 {
+                        s += KVALUES_IQ4NL[(b[2 + l] & 0xF) as usize] as i32 * y.qs[o + l] as i32;
+                        s += KVALUES_IQ4NL[(b[2 + l] >> 4) as usize] as i32 * y.qs[o + 16 + l] as i32;
+                    }
+                    out[k] += d * y.d * s as f32;
+                }
+            }
+            out
+        }
+    }
+
+    /// Four-activation IQ4_XS dot: decodes each 256-weight super-block once via 512-bit `vpshufb`.
+    pub fn dot4_iq4xs(row: &[u8], xq: [&[Q8K]; 4]) -> [f32; 4] {
+        unsafe {
+            let values = _mm512_broadcast_i32x4(_mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i));
+            let (m4, zero) = (_mm_set1_epi8(0xF), _mm512_setzero_si512());
+            let mut sumf = [0.0f32; 4];
+            for (bi, b) in row.chunks_exact(136).enumerate() {
+                let sh = u16::from_le_bytes([b[2], b[3]]);
+                let d = d16(b);
+                let mut sumi = [zero; 4];
+                for p in 0..4 {
+                    let (ib0, ib1) = (2 * p, 2 * p + 1);
+                    let bits0 = _mm_loadu_si128(b.as_ptr().add(8 + 16 * ib0) as *const __m128i);
+                    let bits1 = _mm_loadu_si128(b.as_ptr().add(8 + 16 * ib1) as *const __m128i);
+                    let idx0 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(bits0, 4), m4), _mm_and_si128(bits0, m4));
+                    let idx1 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(bits1, 4), m4), _mm_and_si128(bits1, m4));
+                    let w = _mm512_shuffle_epi8(values, _mm512_inserti64x4(_mm512_castsi256_si512(idx0), idx1, 1));
+                    let neg = _mm512_movepi8_mask(w);
+                    let aw = _mm512_abs_epi8(w);
+                    let sc = |ib: usize| (((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) as i32 | ((((sh >> (2 * ib)) & 3) as i32) << 4)) - 32;
+                    let sv = _mm512_mask_set1_epi32(_mm512_set1_epi32(sc(ib0)), 0xFF00, sc(ib1));
+                    for k in 0..4 {
+                        let q = q8_512(&xq[k][bi], 64 * p);
+                        let d32 = _mm512_dpbusd_epi32(zero, aw, _mm512_mask_sub_epi8(q, neg, zero, q));
+                        sumi[k] = _mm512_add_epi32(sumi[k], _mm512_mullo_epi32(d32, sv));
+                    }
+                }
+                for k in 0..4 {
+                    sumf[k] += d * xq[k][bi].d * _mm512_reduce_add_epi32(sumi[k]) as f32;
+                }
+            }
+            sumf
+        }
+    }
+
+    /// Four-activation Q6_K dot: decodes each 256-weight super-block once via 512-bit `vpdpbusd`.
+    pub fn dot4_q6k(row: &[u8], xq: [&[Q8K]; 4]) -> [f32; 4] {
+        unsafe {
+            let (m4, m2, zero) = (_mm512_set1_epi8(0xF), _mm512_set1_epi8(3), _mm512_setzero_si512());
+            let mut sumf = [0.0f32; 4];
+            for (bi, b) in row.chunks_exact(210).enumerate() {
+                let sc = |g: usize| b[192 + g] as i8 as i32;
+                let db = d16(&b[208..]);
+                let mut sumi = [zero; 4];
+                for n in 0..2 {
+                    let ql = _mm512_loadu_si512(b[64 * n..].as_ptr() as *const __m512i);
+                    let qh256 = _mm256_loadu_si256(b[128 + 32 * n..].as_ptr() as *const __m256i);
+                    let qh = _mm512_inserti64x4(_mm512_castsi256_si512(qh256), qh256, 1);
+                    let lo_h = _mm512_and_si512(ql, m4);
+                    let hi_h = _mm512_and_si512(_mm512_srli_epi16(ql, 4), m4);
+                    let h0 = _mm512_slli_epi16(_mm512_and_si512(_mm512_mask_blend_epi32(0xFF00, qh, _mm512_srli_epi16(qh, 2)), m2), 4);
+                    let h1 = _mm512_slli_epi16(_mm512_and_si512(_mm512_mask_blend_epi32(0xFF00, _mm512_srli_epi16(qh, 4), _mm512_srli_epi16(qh, 6)), m2), 4);
+                    let w0 = _mm512_or_si512(lo_h, h0);
+                    let w1 = _mm512_or_si512(hi_h, h1);
+                    let g = 8 * n;
+                    let s0 = _mm512_set_epi32(sc(g + 3), sc(g + 3), sc(g + 3), sc(g + 3), sc(g + 2), sc(g + 2), sc(g + 2), sc(g + 2),
+                                              sc(g + 1), sc(g + 1), sc(g + 1), sc(g + 1), sc(g), sc(g), sc(g), sc(g));
+                    let s1 = _mm512_set_epi32(sc(g + 7), sc(g + 7), sc(g + 7), sc(g + 7), sc(g + 6), sc(g + 6), sc(g + 6), sc(g + 6),
+                                              sc(g + 5), sc(g + 5), sc(g + 5), sc(g + 5), sc(g + 4), sc(g + 4), sc(g + 4), sc(g + 4));
+                    for k in 0..4 {
+                        let y = &xq[k][bi];
+                        sumi[k] = _mm512_add_epi32(sumi[k], _mm512_mullo_epi32(_mm512_dpbusd_epi32(zero, w0, q8_512(y, 128 * n)), s0));
+                        sumi[k] = _mm512_add_epi32(sumi[k], _mm512_mullo_epi32(_mm512_dpbusd_epi32(zero, w1, q8_512(y, 128 * n + 64)), s1));
+                    }
+                }
+                for k in 0..4 {
+                    let y = &xq[k][bi];
+                    let m: i32 = (0..16).map(|g| sc(g) * y.bs[g] as i32).sum();
+                    sumf[k] += y.d * db * (_mm512_reduce_add_epi32(sumi[k]) as f32 - 32.0 * m as f32);
+                }
+            }
+            sumf
+        }
+    }
+
     /// TQ1_0: all 256 trits per block evaluated in 4 512-bit `vpdpbusd` instructions.
     pub fn dot_tq1_0(row: &[u8], xq: &[Q8K]) -> f32 {
         unsafe {
@@ -1465,6 +1625,16 @@ pub fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
 /// Four dots of one row at once, with the bits of `int_dot`'s kernel: the row is read and decoded once, and the
 /// four sums do not wait for each other. None where no such kernel exists; the caller then uses `int_dot`.
 pub fn int_dot4(ty: GgmlType) -> Option<fn(&[u8], [&[Q8K]; 4]) -> [f32; 4]> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vnni", target_feature = "avx512vbmi"))]
+    if std::env::var_os("STRATA_SCALAR").is_none() && std::env::var_os("STRATA_AVX512").is_some() {
+        return match ty {
+            GgmlType::Q8_0 => Some(avx512::dot4_q8_0),
+            GgmlType::IQ4NL => Some(avx512::dot4_iq4nl),
+            GgmlType::IQ4XS => Some(avx512::dot4_iq4xs),
+            GgmlType::Q6K => Some(avx512::dot4_q6k),
+            _ => None,
+        };
+    }
     #[cfg(target_feature = "avx2")]
     if std::env::var_os("STRATA_SCALAR").is_none() && std::env::var_os("STRATA_AVX512").is_none() {
         return match ty { GgmlType::Q8_0 => Some(avx2::dot4_q8_0), GgmlType::IQ4NL => Some(avx2::dot4_iq4nl), _ => None };

@@ -239,6 +239,23 @@ fn synthetic_raon_chunked_prefill_matches_step_and_effort_steers() {
     let steer_diff = logits_none.iter().zip(&logits_low).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
     assert!(steer_diff > 1e-3, "effort steering had no effect: diff={steer_diff}");
 
+    // 4. Speculative verify_greedy with partial mismatch must match token-by-token step bit-for-bit.
+    m.reset();
+    m.set_effort(Some("none"), false);
+    let l_base = m.prefill(&prompt[..4]);
+    let mut m_step = RaonModel::new(&g).unwrap();
+    m_step.set_effort(Some("none"), false);
+    let _ = m_step.prefill(&prompt[..4]);
+    let anchor = l_base.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+    let l1 = m_step.step(anchor);
+    let t1 = l1.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+    let l2 = m_step.step(t1);
+    let wrong = (t1 + 1) % 48;
+    let (acc, l_spec) = m.verify_greedy(anchor, &[t1, wrong, 0], &[]);
+    assert_eq!(acc, vec![t1], "should accept matching first draft token and stop at mismatch");
+    let spec_diff = l2.iter().zip(&l_spec).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(spec_diff < 1e-4, "verify_greedy rollback logits differ from step: {spec_diff}");
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

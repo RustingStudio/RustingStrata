@@ -142,17 +142,38 @@ pub fn parse_calls(text: &str) -> Option<(String, Vec<(String, String)>)> {
 
 fn decode(m: &mut RaonModel, tok: &Tokenizer, mut logits: Vec<f32>, n: usize, mut piece: impl FnMut(&str) -> bool) -> (Vec<u32>, bool) {
     let eos = tok.eos_ids();
+    let spec_on = std::env::var("STRATA_RAON_SPEC").ok().as_deref() != Some("0");
     let (mut out, mut shown) = (Vec::new(), 0);
-    for i in 0..n {
+    let mut emit = |out: &[u32], shown: &mut usize| -> bool {
+        let s = tok.decode(out).unwrap_or_default();
+        if !s.ends_with('\u{FFFD}') && s.len() > *shown && s.is_char_boundary(*shown) {
+            if !piece(&s[*shown..]) { return false; }
+            *shown = s.len();
+        }
+        true
+    };
+    while out.len() < n {
         let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
         if eos.contains(&next) { return (out, true); }
         out.push(next);
-        let s = tok.decode(&out).unwrap_or_default();
-        if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
-            if !piece(&s[shown..]) { break; }
-            shown = s.len();
+        if !emit(&out, &mut shown) { break; }
+        if out.len() >= n { break; }
+        let rem = n - out.len();
+        if spec_on && rem >= 2 {
+            let max_d = rem.min(3);
+            let (draft, order) = crate::ngram::suffix_draft_with_order(&m.toks, next, max_d, &eos);
+            if draft.len() >= 2 && order >= 3 {
+                let (accepted, next_logits) = m.verify_greedy(next, &draft, &eos);
+                logits = next_logits;
+                for t in accepted {
+                    out.push(t);
+                    if !emit(&out, &mut shown) { return (out, false); }
+                    if out.len() >= n { return (out, false); }
+                }
+                continue;
+            }
         }
-        if i + 1 < n { logits = m.step(next); }
+        logits = m.step(next);
     }
     (out, false)
 }

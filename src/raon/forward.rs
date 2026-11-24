@@ -74,6 +74,7 @@ struct Layer<'a> {
 }
 
 /// Recurrent state for one RDA layer: rolling 3-token Q/K/V conv windows + `[n_head][head_dim][head_dim]` V-first state.
+#[derive(Clone)]
 struct RdaState {
     q_hist: Vec<f32>,
     k_hist: Vec<f32>,
@@ -534,47 +535,93 @@ impl<'a> RaonModel<'a> {
         for (d, &b) in decay.iter_mut().zip(&r.dt_b) { *d += b; }
 
         let st = self.rda_states[il].as_mut().unwrap();
-        let mut q = conv1d_step_silu(&q_proj, &mut st.q_hist, &r.q_conv, d_inner);
-        let mut k = conv1d_step_silu(&k_proj, &mut st.k_hist, &r.k_conv, d_inner);
-        let mut v = conv1d_step_silu(&v_proj, &mut st.v_hist, &r.v_conv, d_inner);
-
         let q_scale = 1.0 / (hd as f32).sqrt();
-        let mut log_alpha = vec![0.0f32; d_inner];
-        let mut beta = vec![0.0f32; nh];
-        for h in 0..nh {
-            let qs = &mut q[h * hd..(h + 1) * hd];
-            let qn = dot(qs, qs).sqrt().max(1e-6);
-            let qf = q_scale / qn;
-            for x in qs.iter_mut() { *x *= qf; }
-
-            let ks = &mut k[h * hd..(h + 1) * hd];
-            let kn = dot(ks, ks).sqrt().max(1e-6);
-            let kf = 1.0 / kn;
-            for x in ks.iter_mut() { *x *= kf; }
-
-            // ssm_a holds -exp(A_log); negate to recover exp(A_log)
-            let exp_a = -r.ssm_a[h];
-            for j in 0..hd {
-                let scaled = exp_a * decay[h * hd + j];
-                log_alpha[h * hd + j] = match self.cfg.gate_lower_bound {
-                    Some(lb) => lb * sigmoid(scaled),
-                    None => -softplus(scaled),
-                };
-            }
-            let br = beta_raw[h];
-            let dr = rda_delta[h];
-            let ratio = (softplus(-br) - softplus(-(br + dr))).exp();
-            for x in &mut v[h * hd..(h + 1) * hd] { *x *= ratio; }
-            beta[h] = sigmoid(br);
-        }
-
-        let out = rda_recurrent_step(&q, &k, &v, &log_alpha, &beta, &mut st.state, nh, hd);
+        let glb = self.cfg.gate_lower_bound;
+        let eps = self.cfg.eps;
         let mut gated = vec![0.0f32; d_inner];
-        for h in 0..nh {
-            let s = h * hd..(h + 1) * hd;
-            rms_norm_w(&out[s.clone()], &r.o_norm, self.cfg.eps, &mut gated[s.clone()]);
-            for j in s { gated[j] *= sigmoid(gate[j]); }
-        }
+        // Fused per-head parallel pass: depthwise conv1d+SiLU, L2-norm, decay/ratio, V-first delta-rule recurrence,
+        // RMSNorm + output sigmoid gate — keeps each head's vectors hot in L1 with zero intermediate Vec allocations.
+        let (qh0, qh12) = st.q_hist.split_at_mut(d_inner);
+        let (qh1, qh2) = qh12.split_at_mut(d_inner);
+        let (kh0, kh12) = st.k_hist.split_at_mut(d_inner);
+        let (kh1, kh2) = kh12.split_at_mut(d_inner);
+        let (vh0, vh12) = st.v_hist.split_at_mut(d_inner);
+        let (vh1, vh2) = vh12.split_at_mut(d_inner);
+        gated.par_chunks_mut(hd)
+            .zip(st.state.par_chunks_mut(hd * hd))
+            .zip(qh0.par_chunks_mut(hd).zip(qh1.par_chunks_mut(hd)).zip(qh2.par_chunks_mut(hd)))
+            .zip(kh0.par_chunks_mut(hd).zip(kh1.par_chunks_mut(hd)).zip(kh2.par_chunks_mut(hd)))
+            .zip(vh0.par_chunks_mut(hd).zip(vh1.par_chunks_mut(hd)).zip(vh2.par_chunks_mut(hd)))
+            .enumerate()
+            .for_each(|(h, ((((gh, sh), ((q0, q1), q2)), ((k0, k1), k2)), ((v0, v1), v2)))| {
+                let off = h * hd;
+                let mut q = [0.0f32; 128];
+                let mut k = [0.0f32; 128];
+                let mut v = [0.0f32; 128];
+                let mut dec = [0.0f32; 128];
+                let mut qn2 = 0.0f32;
+                let mut kn2 = 0.0f32;
+                let exp_a = -r.ssm_a[h];
+                let br = beta_raw[h];
+                let dr = rda_delta[h];
+                let ratio = (softplus(-br) - softplus(-(br + dr))).exp();
+                let bh = sigmoid(br);
+                for j in 0..hd {
+                    let c = off + j;
+                    let wq = &r.q_conv[c * 4..c * 4 + 4];
+                    let qx = q_proj[c];
+                    let qv = silu(q0[j] * wq[0] + q1[j] * wq[1] + q2[j] * wq[2] + qx * wq[3]);
+                    q0[j] = q1[j]; q1[j] = q2[j]; q2[j] = qx;
+                    q[j] = qv; qn2 += qv * qv;
+
+                    let wk = &r.k_conv[c * 4..c * 4 + 4];
+                    let kx = k_proj[c];
+                    let kv = silu(k0[j] * wk[0] + k1[j] * wk[1] + k2[j] * wk[2] + kx * wk[3]);
+                    k0[j] = k1[j]; k1[j] = k2[j]; k2[j] = kx;
+                    k[j] = kv; kn2 += kv * kv;
+
+                    let wv = &r.v_conv[c * 4..c * 4 + 4];
+                    let vx = v_proj[c];
+                    let vv = silu(v0[j] * wv[0] + v1[j] * wv[1] + v2[j] * wv[2] + vx * wv[3]);
+                    v0[j] = v1[j]; v1[j] = v2[j]; v2[j] = vx;
+                    v[j] = vv * ratio;
+
+                    let scaled = exp_a * decay[c];
+                    let la = match glb {
+                        Some(lb) => lb * sigmoid(scaled),
+                        None => -softplus(scaled),
+                    };
+                    dec[j] = la.exp();
+                }
+                let qf = q_scale / qn2.sqrt().max(1e-6);
+                let kf = 1.0 / kn2.sqrt().max(1e-6);
+                for j in 0..hd { q[j] *= qf; k[j] *= kf; }
+
+                let mut out_h = [0.0f32; 128];
+                let mut ss = 0.0f32;
+                for vi in 0..hd {
+                    let row = &mut sh[vi * hd..(vi + 1) * hd];
+                    let mut pred = 0.0f32;
+                    for ki in 0..hd {
+                        let s = row[ki] * dec[ki];
+                        row[ki] = s;
+                        pred += s * k[ki];
+                    }
+                    let err = bh * (v[vi] - pred);
+                    let mut o = 0.0f32;
+                    for ki in 0..hd {
+                        let s = row[ki] + err * k[ki];
+                        row[ki] = s;
+                        o += s * q[ki];
+                    }
+                    out_h[vi] = o;
+                    ss += o * o;
+                }
+                let inv = 1.0 / (ss / hd as f32 + eps).sqrt();
+                for j in 0..hd {
+                    gh[j] = out_h[j] * inv * r.o_norm[j] * sigmoid(gate[off + j]);
+                }
+            });
         let mut y = vec![0.0f32; self.cfg.n_embd];
         r.wo.matvec(&gated, &mut y);
         y
@@ -755,10 +802,19 @@ impl<'a> RaonModel<'a> {
     }
 
     fn prefill_chunk(&mut self, toks: &[u32]) {
+        self.prefill_chunk_opt(toks, false);
+    }
+
+    fn prefill_chunk_opt(&mut self, toks: &[u32], capture_snaps: bool) -> Option<(Vec<Vec<f32>>, Vec<Vec<Option<RdaState>>>)> {
         let (nt, n, hc) = (toks.len(), self.cfg.n_embd, self.cfg.hc);
-        if nt == 0 { return; }
+        if nt == 0 { return None; }
         let p0 = self.toks.len();
         self.toks.extend_from_slice(toks);
+        let mut rda_snaps = if capture_snaps {
+            vec![vec![None; self.cfg.n_layer]; nt]
+        } else {
+            Vec::new()
+        };
 
         let mut flats: Vec<Vec<f32>> = toks.iter().map(|&t| {
             let mut emb = vec![0.0f32; n];
@@ -857,6 +913,9 @@ impl<'a> RaonModel<'a> {
                             beta[h] = sigmoid(br);
                         }
                         let out = rda_recurrent_step(&q, &k, &v, &log_alpha, &beta, &mut st.state, nh, hd);
+                        if capture_snaps {
+                            rda_snaps[t][il] = Some(st.clone());
+                        }
                         let gt = &g_all[t * d_inner..(t + 1) * d_inner];
                         let dst = &mut gated_all[t * d_inner..(t + 1) * d_inner];
                         for h in 0..nh {
@@ -1062,6 +1121,56 @@ impl<'a> RaonModel<'a> {
                 self.hc_post(&mut flats[t], &ffn_out_all[t * n..(t + 1) * n], &posts[t], &h_ress[t]);
             }
         }
+        if !capture_snaps {
+            return None;
+        }
+        let inv_hc = 1.0 / hc as f32;
+        let mut normed_all = vec![0.0f32; nt * n];
+        let mut cur = vec![0.0f32; n];
+        for t in 0..nt {
+            cur.fill(0.0);
+            for s in 0..hc {
+                for j in 0..n { cur[j] += flats[t][s * n + j] * inv_hc; }
+            }
+            rms_norm_w(&cur, &self.out_norm, self.cfg.eps, &mut normed_all[t * n..(t + 1) * n]);
+        }
+        let nrefs: Vec<&[f32]> = normed_all.chunks_exact(n).collect();
+        let all_logits = matvec_rows(&self.out_w, &nrefs);
+        let logits_per_tok: Vec<Vec<f32>> = all_logits.chunks_exact(self.out_w.rows).map(|s| s.to_vec()).collect();
+        Some((logits_per_tok, rda_snaps))
+    }
+
+    /// Verify `draft` tokens following `anchor` in one batched pass (`int_dot4` on CPU / batched GEMM on GPU).
+    /// Returns `(accepted_draft_tokens, next_logits)` and rolls back RDA + MLA states on any mismatch,
+    /// guaranteeing bit-identical greedy output to calling `step` one token at a time.
+    pub fn verify_greedy(&mut self, anchor: u32, draft: &[u32], eos: &[u32]) -> (Vec<u32>, Vec<f32>) {
+        if draft.is_empty() {
+            return (Vec::new(), self.step(anchor));
+        }
+        let p0 = self.toks.len();
+        let mut seq = Vec::with_capacity(1 + draft.len());
+        seq.push(anchor);
+        seq.extend_from_slice(draft);
+        let (logits, mut snaps) = self.prefill_chunk_opt(&seq, true).unwrap();
+        let kw = self.cfg.kv_lora_rank + self.cfg.qk_rope_hd;
+        let mut accepted = Vec::with_capacity(draft.len());
+        for (j, &d) in draft.iter().enumerate() {
+            let pred = logits[j].iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+            if pred == d && !eos.contains(&pred) {
+                accepted.push(d);
+            } else {
+                let keep_len = p0 + j + 1;
+                self.toks.truncate(keep_len);
+                for il in 0..self.cfg.n_layer {
+                    if !self.cfg.is_rda[il] {
+                        self.mla_keys[il].truncate(keep_len * kw);
+                    }
+                }
+                self.rda_states = std::mem::take(&mut snaps[j]);
+                return (accepted, logits[j].clone());
+            }
+        }
+        (accepted, logits[draft.len()].clone())
     }
 
     pub fn prefill(&mut self, toks: &[u32]) -> Vec<f32> {
