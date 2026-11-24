@@ -35,10 +35,23 @@ pub const ATTR_INTEGRATED: c_int = 16;
 pub const ATTR_MULTIPROCESSOR_COUNT: c_int = 63;
 pub const ATTR_MAX_THREADS_PER_BLOCK: c_int = 56;
 
-/// `hipDeviceProp_t` from ROCm 7: the field offsets the backend reads. The struct is version-specific, so every
-/// read is validated (the architecture name must look like `gfxNNNN`) and `STRATA_HIP_ARCH` overrides it.
-const PROP_SIZE: usize = 1472;
-const PROP_GCN_ARCH_NAME: usize = 1160;
+/// Room for `hipDeviceProp_t`, which `hipGetDeviceProperties` writes whole. ROCm 7's `hipDeviceProp_tR0600` is 1472
+/// bytes; the size is not exported and changes between versions, so the buffer leaves ample room for a larger one.
+/// The architecture name is found by shape (`find_gfx`), and `STRATA_HIP_ARCH` overrides it.
+const PROP_BUF: usize = 16 << 10;
+
+/// The first `gfxNNNN`-looking string at a 4-byte offset in `bytes` (at least 6 characters, at most 16), read only
+/// within `bytes`.
+fn find_gfx(bytes: &[u8]) -> Option<String> {
+    for i in (0..bytes.len()).step_by(4) {
+        let w = &bytes[i..(i + 16).min(bytes.len())];
+        if !w.starts_with(b"gfx") { continue }
+        let end = w.iter().position(|&b| b == 0 || !b.is_ascii_alphanumeric()).unwrap_or(w.len());
+        if end < 6 { continue }
+        return String::from_utf8(w[..end].to_vec()).ok();
+    }
+    None
+}
 
 type Fn = unsafe extern "C" fn();
 
@@ -189,18 +202,10 @@ impl Hip {
     fn prop_arch(&self, device: c_int) -> Option<String> {
         // Resolved here and not in `bind`: this is the only use, and a missing symbol must not fail the backend.
         let f: unsafe extern "C" fn(*mut c_void, c_int) -> c_int = unsafe { Self::sym(&self._lib, "hipGetDeviceProperties") }?;
-        let mut buf = vec![0u64; PROP_SIZE / 8];
+        let mut buf = vec![0u64; PROP_BUF / 8];
         let r = unsafe { f(buf.as_mut_ptr().cast(), device) };
         if r != HIP_SUCCESS { return None }
-        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), PROP_SIZE) };
-        for i in (0..bytes.len().saturating_sub(8)).step_by(4) {
-            if &bytes[i..i + 3] != b"gfx" { continue }
-            let end = bytes[i..i + 16].iter().position(|&b| b == 0 || !(b as char).is_ascii_alphanumeric()).unwrap_or(16);
-            if end < 6 { continue }
-            let s = String::from_utf8(bytes[i..i + end].to_vec()).ok()?;
-            return Some(s);
-        }
-        None
+        find_gfx(unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), PROP_BUF) })
     }
 
     pub fn device_name(&self, device: c_int) -> String {
@@ -345,4 +350,24 @@ struct ProgGuard {
 
 impl Drop for ProgGuard {
     fn drop(&mut self) { unsafe { (self.destroy)(&mut self.prog) }; }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_gfx;
+
+    /// The name is found at the end of the buffer without reading past it, a short `gfx` is passed over, and a
+    /// buffer without one gives None.
+    #[test]
+    fn find_gfx_reads_only_inside_the_buffer() {
+        let mut b = vec![0u8; 64];
+        b[8..11].copy_from_slice(b"gfx");
+        b[56..63].copy_from_slice(b"gfx1201");
+        assert_eq!(find_gfx(&b).as_deref(), Some("gfx1201"));
+        assert_eq!(find_gfx(&b[..60]), None);
+        let mut tail = vec![0u8; 61];
+        tail[52..61].copy_from_slice(b"gfx1100ab");
+        assert_eq!(find_gfx(&tail).as_deref(), Some("gfx1100ab"));
+        assert_eq!(find_gfx(&[0u8; 32]), None);
+    }
 }
