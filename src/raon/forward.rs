@@ -117,6 +117,10 @@ pub struct RaonModel<'a> {
     /// Active reasoning effort steering alpha (`0.0` disables steering).
     pub effort_alpha: f32,
     pub toks: Vec<u32>,
+    capture_layers: Vec<usize>,
+    pending_feats: Vec<Vec<f32>>,
+    /// Pre-allocated per-token RDA snapshots reused across `verify_greedy` calls (zero malloc/page-fault churn).
+    rda_snap_pool: Vec<Vec<Option<RdaState>>>,
     pub trace: bool,
 }
 
@@ -458,15 +462,36 @@ impl<'a> RaonModel<'a> {
             chart_base,
             effort_alpha,
             toks: Vec::new(),
+            capture_layers: Vec::new(),
+            pending_feats: Vec::new(),
+            rda_snap_pool: Vec::new(),
             trace: std::env::var_os("STRATA_DS_TRACE").is_some(),
             cfg,
         })
+    }
+
+    pub fn set_capture_layers(&mut self, layers: Vec<usize>) {
+        self.capture_layers = layers;
+        self.pending_feats.clear();
+    }
+
+    pub fn take_pending_feats(&mut self) -> Vec<Vec<f32>> {
+        std::mem::take(&mut self.pending_feats)
+    }
+
+    pub fn embed_tok(&self, tok: u32, out: &mut [f32]) {
+        self.tok_embd.row_into(tok as usize, out);
+    }
+
+    pub fn lm_head_rows(&self, xs: &[&[f32]]) -> Vec<f32> {
+        matvec_rows(&self.out_w, xs)
     }
 
     pub fn reset(&mut self) {
         for s in self.rda_states.iter_mut().flatten() { s.clear(); }
         for k in &mut self.mla_keys { k.clear(); }
         self.toks.clear();
+        self.pending_feats.clear();
     }
 
     pub fn set_effort(&mut self, effort: Option<&str>, think: bool) {
@@ -751,6 +776,11 @@ impl<'a> RaonModel<'a> {
 
         let prof = std::env::var_os("STRATA_RAON_PROF").is_some();
         let (mut t_hc, mut t_rda, mut t_mla, mut t_ffn) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let mut feat = if self.capture_layers.is_empty() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(self.capture_layers.len() * flat.len())
+        };
         for il in 0..self.cfg.n_layer {
             let t0 = std::time::Instant::now();
             let (cur, post, h_res) = self.hc_pre(&flat, &self.layers[il].hc_attn);
@@ -775,7 +805,13 @@ impl<'a> RaonModel<'a> {
             t_ffn += t3.elapsed().as_secs_f64() * 1e3;
             let t4 = std::time::Instant::now();
             self.hc_post(&mut flat, &ffn_out, &post, &h_res);
+            if self.capture_layers.contains(&il) {
+                feat.extend_from_slice(&flat);
+            }
             t_hc += (t1.duration_since(t0) + t3.duration_since(t2) + t4.elapsed()).as_secs_f64() * 1e3;
+        }
+        if !self.capture_layers.is_empty() {
+            self.pending_feats.push(feat);
         }
 
         if !want_logits {
@@ -805,15 +841,24 @@ impl<'a> RaonModel<'a> {
         self.prefill_chunk_opt(toks, false);
     }
 
-    fn prefill_chunk_opt(&mut self, toks: &[u32], capture_snaps: bool) -> Option<(Vec<Vec<f32>>, Vec<Vec<Option<RdaState>>>)> {
+    fn prefill_chunk_opt(&mut self, toks: &[u32], capture_snaps: bool) -> Option<Vec<Vec<f32>>> {
         let (nt, n, hc) = (toks.len(), self.cfg.n_embd, self.cfg.hc);
         if nt == 0 { return None; }
         let p0 = self.toks.len();
         self.toks.extend_from_slice(toks);
-        let mut rda_snaps = if capture_snaps {
-            vec![vec![None; self.cfg.n_layer]; nt]
-        } else {
+        if capture_snaps && self.rda_snap_pool.len() < nt {
+            let nl = self.cfg.n_layer;
+            while self.rda_snap_pool.len() < nt {
+                let row = (0..nl)
+                    .map(|il| self.cfg.is_rda[il].then(|| RdaState::new(self.cfg.n_head, self.cfg.rda_hd, self.cfg.d_conv)))
+                    .collect();
+                self.rda_snap_pool.push(row);
+            }
+        }
+        let mut chunk_feats: Vec<Vec<f32>> = if self.capture_layers.is_empty() {
             Vec::new()
+        } else {
+            (0..nt).map(|_| Vec::with_capacity(self.capture_layers.len() * hc * n)).collect()
         };
 
         let mut flats: Vec<Vec<f32>> = toks.iter().map(|&t| {
@@ -913,8 +958,13 @@ impl<'a> RaonModel<'a> {
                             beta[h] = sigmoid(br);
                         }
                         let out = rda_recurrent_step(&q, &k, &v, &log_alpha, &beta, &mut st.state, nh, hd);
-                        if capture_snaps {
-                            rda_snaps[t][il] = Some(st.clone());
+                        if capture_snaps
+                            && let Some(dst_st) = self.rda_snap_pool[t][il].as_mut()
+                        {
+                            dst_st.q_hist.copy_from_slice(&st.q_hist);
+                            dst_st.k_hist.copy_from_slice(&st.k_hist);
+                            dst_st.v_hist.copy_from_slice(&st.v_hist);
+                            dst_st.state.copy_from_slice(&st.state);
                         }
                         let gt = &g_all[t * d_inner..(t + 1) * d_inner];
                         let dst = &mut gated_all[t * d_inner..(t + 1) * d_inner];
@@ -1051,7 +1101,137 @@ impl<'a> RaonModel<'a> {
                                 cpu_grp.push((ge, ue, de, picks));
                             }
                         }
-                        let run_grp = |grp: &[(Mat, Mat, Mat, Vec<(usize, f32)>)]| -> Vec<f32> {
+                        let run_cpu_grp = |grp: &[(Mat, Mat, Mat, Vec<(usize, f32)>)]| -> Vec<f32> {
+                            let mut out = vec![0.0f32; nt * n];
+                            if grp.is_empty() { return out; }
+                            let can_int = std::env::var_os("STRATA_CPU_REF").is_none()
+                                && grp.iter().all(|(ge, ue, de, _)| {
+                                    ge.cols % ge.ty.block_elems() == 0
+                                        && ue.cols % ue.ty.block_elems() == 0
+                                        && de.cols % de.ty.block_elems() == 0
+                                        && crate::cpu_moe::int_dot(ge.ty).is_some()
+                                        && crate::cpu_moe::int_dot(ue.ty).is_some()
+                                        && crate::cpu_moe::int_dot(de.ty).is_some()
+                                });
+                            if can_int && grp.len() >= 4 {
+                                // Quantize each token's activation once, then run all active experts in parallel
+                                // (1 Rayon pass total, zero inter-expert barriers, L1/L2 cache-local per expert).
+                                let xq_all: Vec<_> = (0..nt)
+                                    .into_par_iter()
+                                    .map(|t| crate::cpu_moe::quantize_q8k(&normed_flat[t * n..(t + 1) * n]))
+                                    .collect();
+                                let partials: Vec<(Vec<(usize, f32)>, Vec<f32>)> = grp
+                                    .par_iter()
+                                    .map(|(ge, ue, de, picks)| {
+                                        let np = picks.len();
+                                        let g_dot = crate::cpu_moe::int_dot(ge.ty).unwrap();
+                                        let g_dot4 = crate::cpu_moe::int_dot4(ge.ty);
+                                        let u_dot = crate::cpu_moe::int_dot(ue.ty).unwrap();
+                                        let u_dot4 = crate::cpu_moe::int_dot4(ue.ty);
+                                        let d_dot = crate::cpu_moe::int_dot(de.ty).unwrap();
+                                        let d_dot4 = crate::cpu_moe::int_dot4(de.ty);
+                                        let grb = ge.ty.row_bytes(ge.cols as u64);
+                                        let urb = ue.ty.row_bytes(ue.cols as u64);
+                                        let drb = de.ty.row_bytes(de.cols as u64);
+                                        let mut act = vec![0.0f32; np * exp_nf];
+                                        for r in 0..exp_nf {
+                                            let gw = &ge.data[r * grb..(r + 1) * grb];
+                                            let uw = &ue.data[r * urb..(r + 1) * urb];
+                                            let mut p = 0;
+                                            if let (Some(gd4), Some(ud4)) = (g_dot4, u_dot4) {
+                                                while p + 4 <= np {
+                                                    let qs = [
+                                                        xq_all[picks[p].0].as_slice(),
+                                                        xq_all[picks[p + 1].0].as_slice(),
+                                                        xq_all[picks[p + 2].0].as_slice(),
+                                                        xq_all[picks[p + 3].0].as_slice(),
+                                                    ];
+                                                    let gv = gd4(gw, qs);
+                                                    let uv = ud4(uw, qs);
+                                                    for j in 0..4 {
+                                                        act[(p + j) * exp_nf + r] = situ_glu(gv[j] * ge.scale, uv[j] * ue.scale, gb, vb);
+                                                    }
+                                                    p += 4;
+                                                }
+                                            }
+                                            while p < np {
+                                                let q = xq_all[picks[p].0].as_slice();
+                                                let gv = g_dot(gw, q) * ge.scale;
+                                                let uv = u_dot(uw, q) * ue.scale;
+                                                act[p * exp_nf + r] = situ_glu(gv, uv, gb, vb);
+                                                p += 1;
+                                            }
+                                        }
+                                        let aq: Vec<_> = act
+                                            .chunks_exact(exp_nf)
+                                            .map(crate::cpu_moe::quantize_q8k)
+                                            .collect();
+                                        let mut dy = vec![0.0f32; np * n];
+                                        for r in 0..n {
+                                            let dw = &de.data[r * drb..(r + 1) * drb];
+                                            let mut p = 0;
+                                            if let Some(dd4) = d_dot4 {
+                                                while p + 4 <= np {
+                                                    let dv = dd4(dw, [
+                                                        aq[p].as_slice(),
+                                                        aq[p + 1].as_slice(),
+                                                        aq[p + 2].as_slice(),
+                                                        aq[p + 3].as_slice(),
+                                                    ]);
+                                                    for j in 0..4 { dy[(p + j) * n + r] = dv[j] * de.scale; }
+                                                    p += 4;
+                                                }
+                                            }
+                                            while p < np {
+                                                dy[p * n + r] = d_dot(dw, aq[p].as_slice()) * de.scale;
+                                                p += 1;
+                                            }
+                                        }
+                                        (picks.clone(), dy)
+                                    })
+                                    .collect();
+                                for (picks, dy) in partials {
+                                    for (pi, &(t, w)) in picks.iter().enumerate() {
+                                        let dst = &mut out[t * n..(t + 1) * n];
+                                        let src = &dy[pi * n..(pi + 1) * n];
+                                        for j in 0..n { dst[j] += w * src[j]; }
+                                    }
+                                }
+                                return out;
+                            }
+                            let mut gu_jobs: Vec<(Mat, usize)> = Vec::with_capacity(grp.len() * 2);
+                            let mut gu_x: Vec<f32> = Vec::new();
+                            let mut d_jobs: Vec<(Mat, usize)> = Vec::with_capacity(grp.len());
+                            for (ge, ue, de, picks) in grp {
+                                gu_jobs.push((*ge, picks.len()));
+                                for &(t, _) in picks { gu_x.extend_from_slice(&normed_flat[t * n..(t + 1) * n]); }
+                                gu_jobs.push((*ue, picks.len()));
+                                for &(t, _) in picks { gu_x.extend_from_slice(&normed_flat[t * n..(t + 1) * n]); }
+                                d_jobs.push((*de, picks.len()));
+                            }
+                            let gu_out = matvec_rows_many(&gu_jobs, &gu_x);
+                            let mut act_x = Vec::with_capacity(gu_out.len() / 2);
+                            let mut off = 0;
+                            for (_, _, _, picks) in grp {
+                                let m = picks.len() * exp_nf;
+                                let g_slice = &gu_out[off..off + m];
+                                let u_slice = &gu_out[off + m..off + 2 * m];
+                                for i in 0..m { act_x.push(situ_glu(g_slice[i], u_slice[i], gb, vb)); }
+                                off += 2 * m;
+                            }
+                            let d_out = matvec_rows_many(&d_jobs, &act_x);
+                            let mut doff = 0;
+                            for (_, _, _, picks) in grp {
+                                for &(t, w) in picks {
+                                    let dst = &mut out[t * n..(t + 1) * n];
+                                    let src = &d_out[doff..doff + n];
+                                    for j in 0..n { dst[j] += w * src[j]; }
+                                    doff += n;
+                                }
+                            }
+                            out
+                        };
+                        let run_gpu_grp = |grp: &[(Mat, Mat, Mat, Vec<(usize, f32)>)]| -> Vec<f32> {
                             let mut out = vec![0.0f32; nt * n];
                             if grp.is_empty() { return out; }
                             let mut gu_jobs: Vec<(Mat, usize)> = Vec::with_capacity(grp.len() * 2);
@@ -1087,10 +1267,10 @@ impl<'a> RaonModel<'a> {
                             out
                         };
                         match (gpu_grp.is_empty(), cpu_grp.is_empty()) {
-                            (false, true) => y_all = run_grp(&gpu_grp),
-                            (true, false) => y_all = run_grp(&cpu_grp),
+                            (false, true) => y_all = run_gpu_grp(&gpu_grp),
+                            (true, false) => y_all = run_cpu_grp(&cpu_grp),
                             (false, false) => {
-                                let (mut gy, cy) = rayon::join(|| run_grp(&gpu_grp), || run_grp(&cpu_grp));
+                                let (mut gy, cy) = rayon::join(|| run_gpu_grp(&gpu_grp), || run_cpu_grp(&cpu_grp));
                                 for (a, b) in gy.iter_mut().zip(&cy) { *a += b; }
                                 y_all = gy;
                             }
@@ -1119,7 +1299,13 @@ impl<'a> RaonModel<'a> {
 
             for t in 0..nt {
                 self.hc_post(&mut flats[t], &ffn_out_all[t * n..(t + 1) * n], &posts[t], &h_ress[t]);
+                if self.capture_layers.contains(&il) {
+                    chunk_feats[t].extend_from_slice(&flats[t]);
+                }
             }
+        }
+        if !self.capture_layers.is_empty() {
+            self.pending_feats.extend(chunk_feats);
         }
         if !capture_snaps {
             return None;
@@ -1137,7 +1323,7 @@ impl<'a> RaonModel<'a> {
         let nrefs: Vec<&[f32]> = normed_all.chunks_exact(n).collect();
         let all_logits = matvec_rows(&self.out_w, &nrefs);
         let logits_per_tok: Vec<Vec<f32>> = all_logits.chunks_exact(self.out_w.rows).map(|s| s.to_vec()).collect();
-        Some((logits_per_tok, rda_snaps))
+        Some(logits_per_tok)
     }
 
     /// Verify `draft` tokens following `anchor` in one batched pass (`int_dot4` on CPU / batched GEMM on GPU).
@@ -1148,10 +1334,11 @@ impl<'a> RaonModel<'a> {
             return (Vec::new(), self.step(anchor));
         }
         let p0 = self.toks.len();
+        let pf0 = self.pending_feats.len();
         let mut seq = Vec::with_capacity(1 + draft.len());
         seq.push(anchor);
         seq.extend_from_slice(draft);
-        let (logits, mut snaps) = self.prefill_chunk_opt(&seq, true).unwrap();
+        let logits = self.prefill_chunk_opt(&seq, true).unwrap();
         let kw = self.cfg.kv_lora_rank + self.cfg.qk_rope_hd;
         let mut accepted = Vec::with_capacity(draft.len());
         for (j, &d) in draft.iter().enumerate() {
@@ -1161,12 +1348,19 @@ impl<'a> RaonModel<'a> {
             } else {
                 let keep_len = p0 + j + 1;
                 self.toks.truncate(keep_len);
+                if !self.capture_layers.is_empty() {
+                    self.pending_feats.truncate(pf0 + j + 1);
+                }
                 for il in 0..self.cfg.n_layer {
                     if !self.cfg.is_rda[il] {
                         self.mla_keys[il].truncate(keep_len * kw);
+                    } else if let (Some(dst), Some(src)) = (self.rda_states[il].as_mut(), self.rda_snap_pool[j][il].as_ref()) {
+                        dst.q_hist.copy_from_slice(&src.q_hist);
+                        dst.k_hist.copy_from_slice(&src.k_hist);
+                        dst.v_hist.copy_from_slice(&src.v_hist);
+                        dst.state.copy_from_slice(&src.state);
                     }
                 }
-                self.rda_states = std::mem::take(&mut snaps[j]);
                 return (accepted, logits[j].clone());
             }
         }

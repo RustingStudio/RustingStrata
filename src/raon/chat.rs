@@ -1,7 +1,8 @@
 //! `rustingstrata generate|chat|serve` for KRAFTON Raon-1 mini (`raon1`).
-use super::forward::RaonModel;
+use super::{dflash::RaonDFlash, forward::RaonModel};
 use crate::{chat::{Json, Msg}, gguf::Gguf, tokenizer::Tokenizer};
 use std::io::{BufRead, Write};
+use std::path::Path;
 
 const IM_START: &str = "<|im_start|>";
 const IM_END: &str = "<|im_end|>";
@@ -140,7 +141,14 @@ pub fn parse_calls(text: &str) -> Option<(String, Vec<(String, String)>)> {
     (!calls.is_empty()).then(|| (text[from..start].trim().to_string(), calls))
 }
 
-fn decode(m: &mut RaonModel, tok: &Tokenizer, mut logits: Vec<f32>, n: usize, mut piece: impl FnMut(&str) -> bool) -> (Vec<u32>, bool) {
+fn decode(
+    m: &mut RaonModel,
+    mut df: Option<&mut RaonDFlash>,
+    tok: &Tokenizer,
+    mut logits: Vec<f32>,
+    n: usize,
+    mut piece: impl FnMut(&str) -> bool,
+) -> (Vec<u32>, bool) {
     let eos = tok.eos_ids();
     let spec_on = std::env::var("STRATA_RAON_SPEC").ok().as_deref() != Some("0");
     let (mut out, mut shown) = (Vec::new(), 0);
@@ -159,7 +167,40 @@ fn decode(m: &mut RaonModel, tok: &Tokenizer, mut logits: Vec<f32>, n: usize, mu
         if !emit(&out, &mut shown) { break; }
         if out.len() >= n { break; }
         let rem = n - out.len();
-        if spec_on && rem >= 2 {
+        if let Some(dflash) = df.as_deref_mut() && rem >= 2 {
+            let t0 = std::time::Instant::now();
+            let feats = m.take_pending_feats();
+            dflash.commit_ctx(&feats);
+            let t1 = std::time::Instant::now();
+            let blk = std::env::var("STRATA_DFLASH_BLOCK")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(4)
+                .clamp(2, dflash.block_size);
+            let k_eff = rem.min(blk - 1);
+            let draft = dflash.draft_block(next, m, k_eff);
+            let t2 = std::time::Instant::now();
+            if !draft.is_empty() {
+                let (accepted, next_logits) = m.verify_greedy(next, &draft, &eos);
+                if std::env::var_os("STRATA_RAON_PROF").is_some() {
+                    eprintln!(
+                        "dflash: acc={}/{} commit={:.1}ms draft={:.1}ms verify={:.1}ms",
+                        accepted.len(),
+                        draft.len(),
+                        t1.duration_since(t0).as_secs_f64() * 1e3,
+                        t2.duration_since(t1).as_secs_f64() * 1e3,
+                        t2.elapsed().as_secs_f64() * 1e3,
+                    );
+                }
+                logits = next_logits;
+                for t in accepted {
+                    out.push(t);
+                    if !emit(&out, &mut shown) { return (out, false); }
+                    if out.len() >= n { return (out, false); }
+                }
+                continue;
+            }
+        } else if spec_on && rem >= 2 {
             let max_d = rem.min(3);
             let (draft, order) = crate::ngram::suffix_draft_with_order(&m.toks, next, max_d, &eos);
             if draft.len() >= 2 && order >= 3 {
@@ -183,23 +224,33 @@ fn show(s: &str) -> bool {
     std::io::stdout().flush().is_ok()
 }
 
-pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
+pub fn generate(g: &Gguf, prompt: &str, n: usize, draft_model: Option<&Path>) -> anyhow::Result<()> {
     gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
     let mut m = RaonModel::new(g)?;
+    let df_gguf = draft_model.map(Gguf::open).transpose()?;
+    let mut df = df_gguf.as_ref().map(RaonDFlash::load).transpose()?;
+    if let Some(d) = &df {
+        m.set_capture_layers(d.target_layers.clone());
+    }
     let max_ctx = m.cfg.n_ctx;
     let ids = tok.encode(prompt)?;
     anyhow::ensure!(!ids.is_empty() && ids.len() < max_ctx, "prompt is {} tokens, the limit is {max_ctx}", ids.len());
     let logits = m.prefill(&ids);
-    decode(&mut m, &tok, logits, n.min(max_ctx - ids.len()), show);
+    decode(&mut m, df.as_mut(), &tok, logits, n.min(max_ctx - ids.len()), show);
     println!();
     Ok(())
 }
 
-pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::Result<()> {
+pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool, draft_model: Option<&Path>) -> anyhow::Result<()> {
     gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
     let mut m = RaonModel::new(g)?;
+    let df_gguf = draft_model.map(Gguf::open).transpose()?;
+    let mut df = df_gguf.as_ref().map(RaonDFlash::load).transpose()?;
+    if let Some(d) = &df {
+        m.set_capture_layers(d.target_layers.clone());
+    }
     m.set_effort(None, think);
     let max_ctx = m.cfg.n_ctx;
     let stdin = std::io::stdin();
@@ -218,9 +269,15 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
             println!("context is full ({max_ctx} tokens); restart the chat");
             break;
         }
-        let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
+        let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) {
+            m.toks.len()
+        } else {
+            m.reset();
+            if let Some(d) = df.as_mut() { d.reset(); }
+            0
+        };
         let logits = m.prefill(&ids[keep..]);
-        let (out, _) = decode(&mut m, &tok, logits, n.min(max_ctx - ids.len()), show);
+        let (out, _) = decode(&mut m, df.as_mut(), &tok, logits, n.min(max_ctx - ids.len()), show);
         println!();
         let reply = tok.decode(&out).unwrap_or_default();
         let stored = if think { format!("{THINK_OPEN}{reply}") } else { reply };
@@ -253,7 +310,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str) -> anyhow::Resu
         let tools = q.tool_calls && !q.tools.is_empty();
         let mut hold = crate::chat::Hold::new(tools, vec![]).tagged(CALL_TAG);
         let mut alive = std::time::Instant::now();
-        let (out, stopped) = decode(&mut m, &tok, logits, n, |p| {
+        let (out, stopped) = decode(&mut m, None, &tok, logits, n, |p| {
             let t = hold.push(p);
             !q.stream || if t.is_empty() { crate::serve::held(c, &mut alive) } else { write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok() }
         });

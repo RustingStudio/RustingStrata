@@ -2,6 +2,7 @@
 //! SiTU-GLU dense/MoE FFN, and per-layer reasoning effort steering.
 //! Mirrors `krafton-ai/llama.cpp` `src/models/raon1.cpp` and `KRAFTON/Raon-1-mini` `modeling_raon1_mini.py`.
 pub mod chat;
+pub mod dflash;
 pub mod forward;
 
 use crate::gguf::{Gguf, Value};

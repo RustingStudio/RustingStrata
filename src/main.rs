@@ -1332,7 +1332,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::raon::ARCH) {
                 anyhow::ensure!(image.is_empty(), "--image is not supported for raon1");
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
-                return rusting_strata::raon::chat::generate(&g, &prompt, n);
+                return rusting_strata::raon::chat::generate(&g, &prompt, n, engine.draft_model.as_deref());
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) .is_some_and(rusting_strata::inkling2::is_arch) {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
@@ -1680,7 +1680,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::raon::ARCH) {
                 anyhow::ensure!(image.is_empty(), "--image is not supported for raon1");
-                return rusting_strata::raon::chat::chat(&g, system, n, think);
+                return rusting_strata::raon::chat::chat(&g, system, n, think, engine.draft_model.as_deref());
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) .is_some_and(rusting_strata::inkling2::is_arch) {
                 let max_ctx = 0;
