@@ -193,6 +193,8 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   `penalty_last_n` tokens of the reply (default 64; 0 turns it off, -1 takes the whole reply). The window is for
   the repeat penalty only: the presence and frequency penalties count the whole reply.
 - `max_tokens` (or `max_completion_tokens`) and `stop` (up to 16 strings) work as in the OpenAI API; `n` must be 1.
+  Without `max_tokens` (and without `--max-tokens` on the server) a reply runs until the model stops or the context
+  is full.
 - A request whose last message has role `assistant` (and no tool calls) continues that message: the reply holds only
   the new text. The chat page's continue button uses this.
 - Thinking is on by default (`--think false` turns it off). A request overrides it with `chat_template_kwargs.enable_thinking`

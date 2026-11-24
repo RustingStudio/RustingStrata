@@ -553,7 +553,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str, opts: Inkling2O
         if let Some(s) = q.seed { smp.rng = s.max(1); }
 
         let budget = q.thinking_budget.unwrap_or(opts.thinking_budget);
-        let n = q.max_tokens.unwrap_or(256).min(m.max_ctx - m.toks.len());
+        let n = q.max_tokens.unwrap_or(usize::MAX).min(m.max_ctx - m.toks.len());
         if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
         let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
         let tools = q.tool_calls && !q.tools.is_empty();

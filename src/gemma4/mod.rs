@@ -290,7 +290,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a crate::tokenizer::Tokenizer, name: &'a st
         // A failed feed leaves part of the prompt in the cache, so the next request starts over.
         let logits = match feed(&mut m, &seq[keep..]) { Ok(l) => l, Err(e) => { m.reset(); return Err(e) } };
         let prefill_s = t.elapsed().as_secs_f64();
-        let n = q.max_tokens.unwrap_or(256).min(ctx - ids.len());
+        let n = q.max_tokens.unwrap_or(usize::MAX).min(ctx - ids.len());
         if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
         let stream = q.stream;
         let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
