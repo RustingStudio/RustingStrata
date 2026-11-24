@@ -16,8 +16,9 @@
 // kernels.cu selects its code paths by the CUDA architecture level: ldmatrix from sm_75, cp.async/m16n8k16/int8-mma
 // from sm_80, m8n8k4 (mma884) from sm_70. AMD has none of those instructions, so the build takes the portable
 // pre-Volta level: per-lane shared loads instead of ldmatrix, plain typed copies instead of cp.async, and the
-// CUDA-core (f16 FMA) multiplicands instead of mma.sync. Prefill therefore runs without matrix cores until the
-// gfx12 WMMA path lands; decode is unaffected (it has no tensor-core path).
+// CUDA-core (f16 FMA) multiplicands instead of mma.sync. On gfx11 and gfx12 the prefill GEMM and attention use the
+// WMMA matrix cores instead (GEMM_WMMA, below); other targets and STRATA_HIP_WMMA=0 keep the f16 FMA path. Decode is
+// unaffected (it has no tensor-core path).
 #ifndef __CUDA_ARCH__
 #define __CUDA_ARCH__ 700
 #endif

@@ -95,7 +95,7 @@ the KV cache than a 16 GB card has left over for experts, so the run above strea
   Both results land in AMD's layout — 8 a lane, rows `8*(lane>>4) + i`, column `lane & 15` — rather than the m16n8k16
   layout the softmax, the causal mask and the epilogue are written for, so each 16x16 result tile is staged in f32
   and read back as `s[ng][2h + e] == S[warp*16 + g + 8h][ng*8 + 2t + e]` (scores) or `o[d][2r + e]` (P·V). One warp
-  staging tile serves both stages (`FA_BQ` x (`FA_BKL` + 8) floats, 4-6 KiB added to the block's dynamic shared
+  staging tile serves both stages (`FA_BQ` x (`FA_BKL` + 8) floats, 6-10 KiB added to the block's dynamic shared
   memory), and it is why head_dim 256 prefill takes 16 keys a step (`FA_BK_FOR`, as on Turing's 64 KB blocks): 32
   keys would need 78 KiB of a block's 64. `STRATA_HIP_WMMA=0` runs the same numerics on the CUDA cores; the
   CPU-reference test covers both.

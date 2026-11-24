@@ -1204,7 +1204,7 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
 #if GEMM_WMMA
             // AMD matrix cores: the tile in xs (positions, rows = m) and ws (rows = n) is fed straight in as A and B
             // of D[16x16] += A * B^T. A warp owns MT x NT 16x16 tiles: (32 positions, 32 rows) for the big kernel and
-            // (16 positions, 64 rows) for the small-tile one. Each lane holds 8 results of every tile.
+            // one (16 positions, 16 rows) for the small-tile one, whose 8 warps cover 32 positions x 64 rows. Each lane holds 8 results of every tile.
             const int l16 = lane & 15, w0 = STRATA_WMMA_K0(lane);
             constexpr int MT = SM ? 1 : 2, NTW = SM ? 1 : 2;
             strata_hip::strata_hk wa[MT], wb[NTW];
@@ -3111,20 +3111,19 @@ extern "C" __global__ void moe_route(const float* p, int n, int k, float extra_s
 // One block per expert (grid.y) and line range (grid.x). STRATA_MOE_PREFETCH=1 only; a hint, never a correctness
 // dependency. Volta: prefetch.global.L2 exists since sm_20.
 extern "C" __global__ void moe_prefetch(const int* ids, int k, const int* table, const char* base, int stride, int bytes) {
+#if STRATA_HIP
+    // AMD has no L2 prefetch instruction to give: on HIP this hint does nothing.
+    (void)ids; (void)k; (void)table; (void)base; (void)stride; (void)bytes;
+#else
     int j = blockIdx.y;
     if (j >= k) return;
     int s = table[ids[j]];
     if (s < 0) return;
     const char* p = base + (size_t)((unsigned int)s * (unsigned int)stride);
     int lines = bytes >> 7;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < lines; i += gridDim.x * blockDim.x) {
-#if STRATA_HIP
-        (void)p;  // no L2 prefetch instruction to give: moe_prefetch is a CUDA-only hint
-        break;
-#else
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < lines; i += gridDim.x * blockDim.x)
         asm volatile("prefetch.global.L2 [%0];" ::"l"(p + ((size_t)i << 7)));
 #endif
-    }
 }
 
 // x += sum_j w[j] ye[j] + sigmoid(sg) sh + cpu. If a slot missed, wait for the CPU worker's done flag first.
@@ -3218,7 +3217,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
     // HIP: the P staging tile in halves (the PV A fragments, as on Volta) and, after it, the f32 tile the matrix-core
     // scores are staged through before they are read in the m16n8k16 layout the softmax below is written for. Both
     // sit after `vs` so the qs/ks/vs offsets do not move; `hip::Gpu::attn_prefill_m` adds the f32 tile to the block's
-    // dynamic shared memory (FA_BQ * (FA_BKL + 8) floats, 4-8 KiB).
+    // dynamic shared memory (FA_BQ * (FA_BKL + 8) floats: 10 KiB at 32 keys, 6 KiB at 16).
     u16* ps = vs + FA_BKL * PQ;
     float* st = (float*)(ps + FA_BQ * (FA_BKL + 8));
 #endif
