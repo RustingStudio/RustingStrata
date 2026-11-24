@@ -35,6 +35,11 @@ pub struct Gpu {
     hip: Arc<ffi::Hip>,
     device: usize,
     stream: ffi::Stream,
+    /// The copy queue of `htod_side`, and the events its marks are recorded in (reused round robin: a wait already
+    /// queued keeps the record it saw).
+    side: ffi::Stream,
+    marks: Vec<Event>,
+    next_mark: std::sync::atomic::AtomicUsize,
     fns: HashMap<String, ffi::Func>,
     /// "gfx1201": the target hiprtc compiled for.
     arch: String,
@@ -178,6 +183,9 @@ impl Gpu {
         let obj = compile_cached(rtc, &src, &arch, &tag)?;
         let mut stream: ffi::Stream = std::ptr::null_mut();
         hip.check(unsafe { (hip.stream_create)(&mut stream, ffi::STREAM_NON_BLOCKING) }, "hipStreamCreate")?;
+        let mut side: ffi::Stream = std::ptr::null_mut();
+        hip.check(unsafe { (hip.stream_create)(&mut side, ffi::STREAM_NON_BLOCKING) }, "hipStreamCreate(side)")?;
+        let marks = (0..MARKS).map(|_| Event::new(&hip)).collect::<anyhow::Result<Vec<_>>>()?;
         let mut module: ffi::Module = std::ptr::null_mut();
         hip.check(unsafe { (hip.module_load)(&mut module, obj.as_ptr().cast()) }, "hipModuleLoadData")?;
         let mut fns = HashMap::new();
@@ -209,7 +217,7 @@ impl Gpu {
         let mut dev: *mut c_void = std::ptr::null_mut();
         hip.check(unsafe { (hip.host_device_ptr)(&mut dev, host, 0) }, "hipHostGetDevicePointer(ring)")?;
         let staging = Staging { _pin: Buf::new(dev as u64, RING, PinnedHost { hip: hip.clone(), p: host }), host: host.cast(), head: 0, busy: VecDeque::new() };
-        Ok(Gpu { hip, device, stream, fns, arch, kv_q8, max_smem, am: am_buf,
+        Ok(Gpu { hip, device, stream, side, marks, next_mark: Default::default(), fns, arch, kv_q8, max_smem, am: am_buf,
                  graphs: Mutex::new(HashMap::new()), fr: Mutex::new((HashMap::new(), Vec::new())), staging: Mutex::new(staging) })
     }
 
@@ -234,7 +242,50 @@ impl Gpu {
     }
 
     fn wait(&self) -> anyhow::Result<()> {
+        self.hip.check(unsafe { (self.hip.stream_sync)(self.side) }, "hipStreamSynchronize(side)")?;
         self.hip.check(unsafe { (self.hip.stream_sync)(self.stream) }, "hipStreamSynchronize")
+    }
+
+    /// Record the point `stream` has reached in the next mark event.
+    fn mark(&self, stream: ffi::Stream) -> anyhow::Result<usize> {
+        let i = self.next_mark.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % MARKS;
+        self.marks[i].record(stream)?;
+        Ok(i)
+    }
+
+    /// `htod` on `stream`: queue the copy and return once `src` may be reused. From pageable memory the runtime
+    /// stages the buffer inside the call, and large copies go through the pinned ring so the DMA does not stop the
+    /// host (expert streaming during prefill).
+    fn htod_on(&self, stream: ffi::Stream, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
+        if src.len() < RING_MIN {
+            let r = unsafe { (self.hip.memcpy_async)((dst.addr() + off as u64) as *mut c_void, src.as_ptr().cast(), src.len(),
+                                                     ffi::MEMCPY_H2D, stream) };
+            return self.hip.check(r, "hipMemcpyAsync(htod)");
+        }
+        let mut g = self.staging.lock().unwrap();
+        for (i, c) in src.chunks(RING).enumerate() {
+            if g.head + c.len() > RING { g.head = 0; }
+            let (a, b) = (g.head, g.head + c.len());
+            // Regions still being read by an earlier copy have to complete before the host overwrites them.
+            while g.busy.iter().any(|&(s, e, _)| s < b && a < e) {
+                let (_, _, ev) = g.busy.pop_front().unwrap();
+                self.hip.check(unsafe { (self.hip.event_sync)(ev.ev) }, "hipEventSynchronize")?;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), g.host.add(a), c.len()) };
+            let r = unsafe { (self.hip.memcpy_async)((dst.addr() + (off + i * RING) as u64) as *mut c_void,
+                                                     g.host.add(a) as *const c_void, c.len(), ffi::MEMCPY_H2D, stream) };
+            self.hip.check(r, "hipMemcpyAsync(htod ring)")?;
+            let ev = Event::new(&self.hip)?;
+            ev.record(stream)?;
+            g.busy.push_back((a, b, ev));
+            g.head = b;
+        }
+        Ok(())
+    }
+
+    fn wait_mark(&self, stream: ffi::Stream, i: usize) -> anyhow::Result<()> {
+        self.hip.check(unsafe { (self.hip.stream_wait_event)(stream, self.marks[i % MARKS].ev, 0) }, "hipStreamWaitEvent")
     }
 
     fn ptr(&self, b: &Buf) -> u64 { b.addr() }
@@ -430,6 +481,8 @@ impl Drop for Event {
 const GRAPHS_MAX: usize = 32;
 
 const RING: usize = 64 << 20;
+/// Mark events of the copy queue (`Gpu::mark`).
+const MARKS: usize = 64;
 const RING_MIN: usize = 256 << 10;
 
 fn alloc_raw(hip: &Arc<ffi::Hip>, bytes: usize) -> anyhow::Result<Buf> {
@@ -485,36 +538,14 @@ impl Backend for Gpu {
         Ok(b)
     }
 
-    /// Queue a host-to-device copy on the stream and return once `src` may be reused: from pageable memory the
-    /// runtime stages the buffer inside the call, and large copies go through the pinned ring so the DMA does not
-    /// stop the host (expert streaming during prefill).
-    fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
-        anyhow::ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
-        if src.len() < RING_MIN {
-            let r = unsafe { (self.hip.memcpy_async)((dst.addr() + off as u64) as *mut c_void, src.as_ptr().cast(), src.len(),
-                                                     ffi::MEMCPY_H2D, self.stream) };
-            return self.hip.check(r, "hipMemcpyAsync(htod)");
-        }
-        let mut g = self.staging.lock().unwrap();
-        for (i, c) in src.chunks(RING).enumerate() {
-            if g.head + c.len() > RING { g.head = 0; }
-            let (a, b) = (g.head, g.head + c.len());
-            // Regions still being read by an earlier copy have to complete before the host overwrites them.
-            while g.busy.iter().any(|&(s, e, _)| s < b && a < e) {
-                let (_, _, ev) = g.busy.pop_front().unwrap();
-                self.hip.check(unsafe { (self.hip.event_sync)(ev.ev) }, "hipEventSynchronize")?;
-            }
-            unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), g.host.add(a), c.len()) };
-            let r = unsafe { (self.hip.memcpy_async)((dst.addr() + (off + i * RING) as u64) as *mut c_void,
-                                                     g.host.add(a) as *const c_void, c.len(), ffi::MEMCPY_H2D, self.stream) };
-            self.hip.check(r, "hipMemcpyAsync(htod ring)")?;
-            let ev = Event::new(&self.hip)?;
-            ev.record(self.stream)?;
-            g.busy.push_back((a, b, ev));
-            g.head = b;
-        }
-        Ok(())
-    }
+    /// `htod_on` the kernels' stream.
+    fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> { self.htod_on(self.stream, src, dst, off) }
+
+    fn htod_side(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> { self.htod_on(self.side, src, dst, off) }
+    fn side_mark(&self) -> anyhow::Result<usize> { self.mark(self.side) }
+    fn main_waits(&self, m: usize) -> anyhow::Result<()> { self.wait_mark(self.stream, m) }
+    fn main_mark(&self) -> anyhow::Result<usize> { self.mark(self.stream) }
+    fn side_waits(&self, m: usize) -> anyhow::Result<()> { self.wait_mark(self.side, m) }
 
     fn dtoh(&self, src: &Buf, off: usize, dst: &mut [u8]) -> anyhow::Result<()> {
         anyhow::ensure!(off + dst.len() <= src.len(), "dtoh: {} bytes at {off} from {}", dst.len(), src.len());

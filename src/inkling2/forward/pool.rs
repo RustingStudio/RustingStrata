@@ -167,12 +167,18 @@ impl Pool {
 
     /// Copy expert `e` of layer `ip` into slot `slot` (a staging slot too) of its pool: its address.
     pub fn upload(&self, be: &dyn crate::backend::Backend, ip: usize, e: usize, slot: usize) -> Result<u64> {
+        self.upload_on(be, ip, e, slot, false)
+    }
+
+    /// `upload`, on the backend's copy queue when `side` (`Backend::htod_side`).
+    pub fn upload_on(&self, be: &dyn crate::backend::Backend, ip: usize, e: usize, slot: usize, side: bool) -> Result<u64> {
         let pl = self.layers[ip].as_ref().unwrap();
         let sl = &self.slots[pl.pool];
         let at = sl.buf.as_ref().unwrap().addr() + (slot * sl.bytes) as u64;
         let (gu, dn) = (pl.host.gate_up.expert_host(e, self.ne), pl.host.down.expert_host(e, self.ne));
-        be.htod(gu.data, &Buf::new(at, gu.data.len(), ()), 0)?;
-        be.htod(dn.data, &Buf::new(at + pl.dn_off as u64, dn.data.len(), ()), 0)?;
+        let (gb, db) = (Buf::new(at, gu.data.len(), ()), Buf::new(at + pl.dn_off as u64, dn.data.len(), ()));
+        if side { be.htod_side(gu.data, &gb, 0)?; be.htod_side(dn.data, &db, 0)?; }
+        else { be.htod(gu.data, &gb, 0)?; be.htod(dn.data, &db, 0)?; }
         Ok(at)
     }
 

@@ -1655,18 +1655,20 @@ impl Device {
             slot[e] = pool.slot(ip, e);
             if slot[e] >= 0 { resident.push(e) } else { missing.push(e) }
         }
-        // The queue is idle after the read above; a later round waits for the one before, which reads the slots.
-        let stage = |round: &[usize], slot: &mut [i32]| -> Result<()> {
-            be.sync()?;
+        // Staging copies go on the copy queue (`Backend::htod_side`) into `st0 + first..`, and return its mark. The
+        // copy queue first waits for the kernels queued so far, which may still read those slots (an earlier round or
+        // layer run).
+        let stage = |round: &[usize], first: usize, slot: &mut [i32]| -> Result<usize> {
+            be.side_waits(be.main_mark()?)?;
             for (j, &e) in round.iter().enumerate() {
-                pool.upload(be, ip, e, st0 + j)?;
-                slot[e] = (st0 + j) as i32;
+                pool.upload_on(be, ip, e, st0 + first + j, true)?;
+                slot[e] = (st0 + first + j) as i32;
             }
-            Ok(())
+            be.side_mark()
         };
         if !use_gemm {
             if missing.len() > STAGE { return Ok(false); }
-            if !missing.is_empty() { stage(&missing, &mut slot)?; }
+            if !missing.is_empty() { let m = stage(&missing, 0, &mut slot)?; be.main_waits(m)?; }
             let sids: Vec<i32> = ids.iter().map(|&e| slot[e as usize]).collect();
             be.put(&sids, &pf.buf, ((p.ids - buf_o) / 4) as usize)?;
             let xh_tok_floats = (n + n.div_ceil(32) * 4).div_ceil(16) * 4;
@@ -1688,11 +1690,14 @@ impl Device {
             return Ok(true);
         }
         use crate::backend::GEMM_BM;
-        // Groups: the residents with the first round of misses, then one group per further round.
+        // Groups: the residents, then one per round of misses. The rounds alternate between the two halves of the
+        // staging slots: while the kernels run on one half, the copy queue fills the other, and the residents run
+        // while the first two rounds copy in.
+        const HALF: usize = STAGE / 2;
         let mut groups: Vec<Vec<usize>> = vec![resident];
-        for (i, r) in missing.chunks(STAGE).enumerate() {
-            if i == 0 { groups[0].extend_from_slice(r) } else { groups.push(r.to_vec()) }
-        }
+        groups.extend(missing.chunks(HALF).map(|r| r.to_vec()));
+        let rounds = groups.len() - 1;
+        let mut ready = vec![0usize; rounds];
         let np = nt * k;
         let (mut xrow, mut inv, mut gsc_rows) = (Vec::with_capacity(np), vec![0i32; np], Vec::with_capacity(np));
         let mut rows = vec![(0usize, 0usize); c.n_expert];
@@ -1714,8 +1719,10 @@ impl Device {
         let gsc_a = if !gsc_rows.is_empty() { be.put(&gsc_rows, &pf.buf, ((p.gsc - buf_o) / 4) as usize)?; p.gsc } else { 0 };
         let ma = pf.meta.addr();
         for (gi, g) in groups.iter().enumerate() {
-            let miss: Vec<usize> = g.iter().copied().filter(|&e| slot[e] < 0 || slot[e] as usize >= st0).collect();
-            if gi > 0 || !miss.is_empty() { stage(&miss, &mut slot)?; }
+            // The first two rounds are staged once the residents' kernels are queued: the host's part of a copy (into
+            // the pinned ring) then runs while the card works.
+            if gi == 1 { for i in 0..rounds.min(2) { ready[i] = stage(&groups[1 + i], (i % 2) * HALF, &mut slot)?; } }
+            if gi > 0 { be.main_waits(ready[gi - 1])?; }
             let (mut tg, mut td) = (vec![], vec![]);
             for &e in g {
                 let (m0, cnt) = rows[e];
@@ -1733,6 +1740,8 @@ impl Device {
             be.gemm(gt, gr, gc, ma, tg.len() / 2, p.hn, n, nt, ma + xr_off as u64, p.y, 2 * nf, 0)?;
             be.situ(p.y + f(r0 * 2 * nf), nf, r1 - r0, if gsc_a != 0 { gsc_a + f(r0) } else { 0 }, c.situ_beta, c.situ_linear_beta)?;
             be.gemm(dt, dr, dc, ma + dn_off as u64, td.len() / 2, p.y, 2 * nf, np, 0, p.d, n, 0)?;
+            // Round r + 2 takes this round's half once the kernels above are done with it (`stage` waits for them).
+            if gi > 0 && gi + 1 < rounds { ready[gi + 1] = stage(&groups[gi + 2], ((gi - 1) % 2) * HALF, &mut slot)?; }
         }
         be.memset(&pf.acc_buf)?;
         be.moe_combine_seq(pf.acc_buf.addr(), p.d, p.wts, ma + inv_off as u64, k, 0, 0, n, nt)?;

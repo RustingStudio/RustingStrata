@@ -142,6 +142,15 @@ pub trait Backend: Send {
     fn mem_info(&self) -> anyhow::Result<(usize, usize)>;
     /// Wait for all queued device work.
     fn sync(&self) -> anyhow::Result<()>;
+    /// A second queue for host-to-device copies, so they run beside the kernels (a prompt chunk's expert staging).
+    /// `htod_side` queues a copy there; `side_mark`/`main_mark` record the point each queue has reached, and
+    /// `main_waits`/`side_waits` hold the other queue there. A backend with one queue copies in order with its
+    /// kernels, so these defaults are already correct.
+    fn htod_side(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> { self.htod(src, dst, off) }
+    fn side_mark(&self) -> anyhow::Result<usize> { Ok(0) }
+    fn main_waits(&self, _side_mark: usize) -> anyhow::Result<()> { Ok(()) }
+    fn main_mark(&self) -> anyhow::Result<usize> { Ok(0) }
+    fn side_waits(&self, _main_mark: usize) -> anyhow::Result<()> { Ok(()) }
     /// Run the ops `f` queues as the graph recorded under `key`, recording it on first use. `f` runs only when
     /// recording, so its ops must read per-call values from device memory.
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()>;
