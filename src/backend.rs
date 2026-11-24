@@ -59,6 +59,15 @@ unsafe impl Plain for u64 {}
 /// Device memory, recorded graphs and kernel ops. Host copies are synchronous; device work runs in queue order.
 /// Pointer arguments are device addresses; strides are in floats unless named otherwise.
 /// The backend `kind` ("cuda", "vulkan" or "hip") on GPU `device`; with no kind, CUDA if it loads, else Vulkan.
+/// Refuses a `--device` list with several indices on the HIP backend: `hip::Gpu` opens one device per process
+/// (hipSetDevice runs once, in `Gpu::new`), so a split over two cards would run both layers on the first one.
+pub fn check_devices(kind: Option<&str>, devices: &[usize]) -> anyhow::Result<()> {
+    if kind == Some("hip") && devices.len() > 1 {
+        anyhow::bail!("the hip backend runs one device: --device {} needs cuda or vulkan", devices.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(","));
+    }
+    Ok(())
+}
+
 pub fn open(kind: Option<&str>, device: usize) -> anyhow::Result<Box<dyn Backend>> {
     match kind {
         Some("cuda") => Ok(Box::new(crate::cuda::Gpu::new(device)?)),
@@ -534,7 +543,15 @@ impl<'a> dyn Backend + 'a {
 
 #[cfg(test)]
 mod tests {
-    use super::device_order;
+    use super::{check_devices, device_order};
+
+    #[test]
+    fn hip_refuses_a_device_split_and_nothing_else() {
+        assert!(check_devices(Some("hip"), &[0, 1]).is_err());
+        assert!(check_devices(Some("hip"), &[0]).is_ok());
+        assert!(check_devices(Some("cuda"), &[0, 1]).is_ok());
+        assert!(check_devices(None, &[0, 1]).is_ok());
+    }
 
     /// Identifiers are letters here. Two cards of one model have one name and two identifiers, so names play no part.
     #[test]

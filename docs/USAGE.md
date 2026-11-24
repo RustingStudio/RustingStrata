@@ -71,6 +71,7 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 
 ## Flags
 
+- `--backend NAME` GPU backend: `cuda`, `vulkan` or `hip` (AMD cards through ROCm, one device per run, see [HIP.md](HIP.md)). Without it CUDA is used when it loads, else Vulkan.
 - `--ctx` KV cache size in tokens (default 4096). For Inkling 2, Hy4, GLM, DeepSeek and Gemma 4 it is the prompt plus reply limit instead, and the default is the context the model was trained on; their caches grow with the text.
 - `--mtp [N]` speculative decoding with the model's draft head. Greedy tokens stay the same; sampling keeps its
   distribution. Needs a GGUF with an MTP head (for example the Qwen3.6-35B-A3B MTP files).
@@ -225,7 +226,7 @@ OpenCode and other agents use the OpenAI address.
 
 `--device 0,1` splits the layers over the cards in proportion to their free VRAM, so more experts stay resident. The
 cards run one after the other, so one request gets more memory, not twice the speed of one card. MTP drafting is off on
-a split model.
+a split model. The HIP backend runs one device, so `--device 0,1` is refused with `--backend hip`.
 
 An index is the same card on both backends. NVIDIA cards are counted as CUDA counts them (by default the fastest card
 first, which is not the order of `nvidia-smi`), on Vulkan too; the other Vulkan devices follow, dedicated cards before
