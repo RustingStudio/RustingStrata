@@ -1,7 +1,7 @@
 //! Kernel tests, run on every backend that opens (`common::backends`).
 mod common;
 use common::{down, up};
-use rusting_strata::backend::{Backend, ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor, SAME_X};
+use rusting_strata::backend::{Backend, ATT_GQA_MIN, ATT_SPLITS, BATCHED, GEMM_BM, GpuTensor, SAME_X};
 use rusting_strata::{cuda::Gpu, gguf::Gguf, quant::GgmlType, weights::{Tensor, Weights}};
 
 fn xs(n: usize) -> Vec<f32> {
@@ -442,6 +442,57 @@ fn gemm_matches_reference_for_every_type() {
                         ty.name(), rel_l2(&got, &f0));
                 }
             }
+        }
+    }
+}
+
+/// The small-batch GEMM (a `BATCHED` `gemm_dense` of at most 64 rows of x, the decode of a batch) against per-row dot products of the
+/// first 300 rows, and against the tile-list GEMM, for every type, with partial warps and position groups.
+#[test]
+fn small_batch_gemm_matches_tile_gemm() {
+    let Some(p) = common::model_path() else { return };
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        let g = Gguf::open(&p).unwrap();
+        let w = Weights::new(&g).unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        for (name, info) in &g.tensors {
+            let Ok(ty) = GgmlType::from_u32(info.ty) else { continue };
+            if info.dims.len() < 2 || info.dims[0] % 256 != 0 || !seen.insert(ty.name()) { continue; }
+            let t = w.get(name).unwrap();
+            // 300 rows: two blocks of 128 and a part of a third, whose last warp has 12 rows.
+            let t = Tensor { rows: t.rows.min(300), data: &t.data[..t.data.len() / t.rows * t.rows.min(300)], ..t };
+            let dt = gpu.upload(&t).unwrap();
+            let int8 = gpu.mmq(t.ty) && t.cols % 128 == 0;
+            for n in [1usize, 7, 16, 40, 64] {
+                let x = xs(n * t.cols);
+                let xrow: Vec<i32> = (0..n as i32).collect();
+                let (dx, dr, dtl) = (up(gpu, &x), up(gpu, &xrow), up(gpu, &[dt.ptr, (n as u64) << 32]));
+                let (dy, dz) = (gpu.zeros::<f32>(n * t.rows).unwrap(), gpu.zeros::<f32>(n * t.rows).unwrap());
+                gpu.gemm_dense(&dt, n, dx.addr(), t.cols, dy.addr(), t.rows, BATCHED).unwrap();
+                gpu.gemm(t.ty, t.rows, t.cols, dtl.addr(), 1, dx.addr(), t.cols, n, dr.addr(), dz.addr(), t.rows, 0).unwrap();
+                let (got, tile) = (down::<f32>(gpu, &dy), down::<f32>(gpu, &dz));
+                if int8 {
+                    let mut wr = vec![0f32; t.cols];
+                    let mut want = vec![0f32; n * t.rows];
+                    for r in 0..t.rows {
+                        t.row(r, &mut wr);
+                        for i in 0..n { want[i * t.rows + r] = wr.iter().zip(as_seen(t.ty, &x[i * t.cols..][..t.cols])).map(|(a, b)| a * b).sum(); }
+                    }
+                    let e = rel_l2(&got, &want);
+                    assert!(e <= 1e-4, "{bk} {} ({name}), {n} rows of x: rel err {e}", ty.name());
+                }
+                // The same products as the tile GEMM, summed as two halves of the columns.
+                let e = rel_l2(&got, &tile);
+                assert!(e <= 1e-5, "{bk} {} ({name}), {n} rows of x: rel err {e} against the tile GEMM", ty.name());
+                // Either block of a pair of the column split may end last: the bits do not depend on which.
+                for _ in 0..4 {
+                    gpu.gemm_dense(&dt, n, dx.addr(), t.cols, dy.addr(), t.rows, BATCHED).unwrap();
+                    let again = down::<f32>(gpu, &dy);
+                    assert!(again.iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()), "{bk} {} ({name}), {n} rows of x: two runs differ", ty.name());
+                }
+            }
+            eprintln!("{bk} {:8} {name}: ok", ty.name());
         }
     }
 }
