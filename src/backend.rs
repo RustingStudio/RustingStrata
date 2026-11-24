@@ -68,6 +68,12 @@ pub fn check_devices(kind: Option<&str>, devices: &[usize]) -> anyhow::Result<()
     Ok(())
 }
 
+/// Opens every device of a `--device` list, after the check above. Callers open a list through this, not one device at a time.
+pub fn open_all(kind: Option<&str>, devices: &[usize]) -> anyhow::Result<Vec<Box<dyn Backend>>> {
+    check_devices(kind, devices)?;
+    devices.iter().map(|&d| open(kind, d)).collect()
+}
+
 pub fn open(kind: Option<&str>, device: usize) -> anyhow::Result<Box<dyn Backend>> {
     match kind {
         Some("cuda") => Ok(Box::new(crate::cuda::Gpu::new(device)?)),

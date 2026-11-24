@@ -394,10 +394,7 @@ impl Engine {
         }
         if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
         set_kv_env(&self.kv);  // read by Gpu::new and Vk::new
-        let open = || {
-            backend::check_devices(self.backend.as_deref(), &self.device)?;
-            self.device.iter().map(|&d| backend::open(self.backend.as_deref(), d)).collect::<anyhow::Result<Vec<_>>>()
-        };
+        let open = || backend::open_all(self.backend.as_deref(), &self.device);
         let bk = match self.gpu.then(open).transpose() {
             Err(e) if self.cpu_fallback => { say!("no GPU backend ({e:#}), running on the CPU"); None }
             r => r?,
@@ -2093,7 +2090,6 @@ fn best(f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<f64> {
 /// With `aux` (`--mtp-model`/`--draft-model`) the drafts are measured with that file, and runs given the same file use
 /// the measured draft count.
 fn calibrate(model: &Path, aux: Option<&Path>, ctx: usize, margin: &[usize], kind: Option<&str>, device: &[usize], mut split: Option<Vec<f64>>) -> anyhow::Result<()> {
-    backend::check_devices(kind, device)?;
     let g = Gguf::open(model)?;
     let aux_g = open_mtp_gguf(aux)?;
     let m = Model::load_with_aux(&g, aux_g.as_ref(), &[])?;
@@ -2104,7 +2100,7 @@ fn calibrate(model: &Path, aux: Option<&Path>, ctx: usize, margin: &[usize], kin
     anyhow::ensure!(n_pf >= 512, "--ctx too small to calibrate");
     let pf = prose(&tok, n_pf)?;
     let load = |chunk: usize, split: Option<&[f64]>| -> anyhow::Result<GpuModel> {
-        let bk = device.iter().map(|&d| backend::open(kind, d)).collect::<anyhow::Result<Vec<_>>>()?;
+        let bk = backend::open_all(kind, device)?;
         let mut gm = GpuModel::load_split_margins(&m, bk, ctx, chunk, margin, split, kload, 1).context(LOAD_HINT)?;
         gm.adapt_every = 0; // fixed placement: steadier timings
         Ok(gm)
