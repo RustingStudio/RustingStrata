@@ -401,13 +401,13 @@ impl Device {
         let need = need_pos + 1;
         ensure!(need <= m.max_ctx, "context is limited to {} tokens", m.max_ctx);
         let mut d = dev::get().unwrap().lock().unwrap();
-        let row_words = d.parts[0].be.kv_row_words(kw);
+        let (kwk, kwv) = (d.parts[0].be.kv_words(kw), d.parts[0].be.kv_words_v(kw));
         let full_cap = self.slots.iter().enumerate().find(|&(il, _)| !c.swa[layer_of(c, il)]).map(|(_, s)| s.cap);
         if let Some(cap) = full_cap && need > cap {
             let new_cap = grown(need, m.max_ctx);
             let n = (0..c.n_slot()).filter(|&il| !c.swa[layer_of(c, il)]).count();
             // The margin is the one of `new`: the prompt scratch and the graphs of the reply come after this.
-            let bytes = 2 * n * new_cap * row_words + sc_bytes(c, new_cap) + (512 << 20);
+            let bytes = 2 * n * new_cap * (kwk + kwv) + sc_bytes(c, new_cap) + (512 << 20);
             room(&mut d, bytes);
             // The expert cache was not enough: whole layers of experts go, the last loaded first. Their experts
             // then run through the expert cache or on the CPU, which costs less than a model without its device state.
@@ -438,8 +438,9 @@ impl Device {
         for (il, s) in self.slots.iter_mut().enumerate() {
             if c.swa[layer_of(c, il)] || need <= s.cap { continue; }
             let new_cap = grown(need, m.max_ctx);
-            for b in [&mut s.k, &mut s.v] {
-                let new = be.alloc(2 * new_cap * row_words)?;
+            // K and V are separate buffers with their own word width; sizing both with their sum doubles f16.
+            for (b, words) in [(&mut s.k, kwk), (&mut s.v, kwv)] {
+                let new = be.alloc(2 * new_cap * words)?;
                 be.dtod(b, 0, &new, 0, b.len())?;
                 be.sync()?;  // the copy reads the buffer that `*b = new` frees
                 *b = new;

@@ -143,19 +143,6 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   `q4`, `q2`, `turbo4`, `turbo3` or `turbo2`; for example `--k f16 --v q4` or `--k turbo4 --v turbo3`.
   A mixed layout allocates each half with its own word width. The Vulkan backend only supports symmetric
   legacy formats. Text can differ from f16 because attention reads rounded keys and values.
-
-  RTX 3050 Laptop, Inkling 2 Mini Q3_K_XL, `bench --pp 128 --tg 32 --reps 3 --gpu --mtp 0 --temp 0 --chunk 128`
-  (tokens/s, median of three runs; greedy decoding):
-
-  | KV | prefill | decode | KV | prefill | decode |
-  |---|---:|---:|---|---:|---:|
-  | f16 | 27.4 | 6.1 | turbo4 | 35.0 | 7.9 |
-  | q8 | 30.2 | 7.7 | turbo4-3 | 37.4 | 8.4 |
-  | q4 | 32.8 | 7.1 | turbo3 | 42.9 | 8.6 |
-  | q2 | 32.6 | 7.9 | turbo2 | 35.6 | 8.2 |
-  | K=f16 V=q4 | 37.1 | 7.5 | K=q8 V=q4 | 31.6 | 6.3 |
-  | K=turbo4 V=f16 | 37.3 | 8.0 | K=f16 V=turbo4 | 41.6 | 8.4 |
-  | K=turbo4 V=q4 | 38.6 | 8.1 | K=q4 V=turbo4 | 40.9 | 8.2 |
 - `calibrate --mtp-model PATH` or `--draft-model PATH` measures with that draft file loaded, so the chunk and the
   expert placement see the VRAM it takes, and picks the draft count. Runs with the same `--mtp-model` or
   `--draft-model` file use that count unless `--mtp` is given; runs with another draft file or none do not.

@@ -3267,10 +3267,21 @@ __device__ void ink_attn_prefill_t(const float* q, const float* r, const float* 
     int start = (win > 0 && q_pos + 1 > win) ? (q_pos + 1 - win) : 0;
     float scale = 1.f / sqrtf((float)HD);
     float qv[PER], acc[PER];
-    // Four consecutive dims per lane, repeated once per 128-wide WHT group (one group at HD=128, two at 256).
-    auto dim = [&](int j) { return PER >= 4 ? (j >> 2) * 128 + 4 * lane + (j & 3) : 4 * lane + j; };
+    // The legacy cache uses main's strided lane + 32*j layout for every head size. Only a TurboQuant half uses the
+    // contiguous four-dims-per-lane layout its WHT sign diagonals are defined on (one group per 128 dims).
+    // K and V are indexed independently so a mixed cache keeps the f16 half bit-identical to main.
+#if K_MODE >= 4
+    auto kidx = [&](int j) { return (j >> 2) * 128 + 4 * lane + (j & 3); };
+#else
+    auto kidx = [&](int j) { return lane + 32 * j; };
+#endif
+#if V_MODE >= 4
+    auto vidx = [&](int j) { return (j >> 2) * 128 + 4 * lane + (j & 3); };
+#else
+    auto vidx = [&](int j) { return lane + 32 * j; };
+#endif
     for (int j = 0; j < PER; j++) {
-        qv[j] = q[((size_t)t * nh + h) * HD + dim(j)] * scale;
+        qv[j] = q[((size_t)t * nh + h) * HD + kidx(j)] * scale;
         acc[j] = 0.f;
     }
 #if K_MODE >= 4
@@ -3294,7 +3305,7 @@ __device__ void ink_attn_prefill_t(const float* q, const float* r, const float* 
         if (++old_row == ring) old_row = 0;
         size_t kbase = row * kw + (size_t)kh * HD;
         float s = 0.f;
-        for (int j = 0; j < PER; j++) s += qv[j] * ldkv1<K_MODE, TQ_KBITS>(kbuf, kbase + dim(j), HD);
+        for (int j = 0; j < PER; j++) s += qv[j] * ldkv1<K_MODE, TQ_KBITS>(kbuf, kbase + kidx(j), HD);
         s = warp_sum(s);
         int dist = q_pos - kp;
         float b = 0.f;
@@ -3309,7 +3320,7 @@ __device__ void ink_attn_prefill_t(const float* q, const float* r, const float* 
         float logit = s + b - sink_val;
         float mn = fmaxf(m, logit), c = expf(m - mn), e = expf(logit - mn);
         l = l * c + e;
-        for (int j = 0; j < PER; j++) acc[j] = e * ldkv1<V_MODE, TQ_VBITS>(vbuf, kbase + dim(j), HD) + acc[j] * c;
+        for (int j = 0; j < PER; j++) acc[j] = e * ldkv1<V_MODE, TQ_VBITS>(vbuf, kbase + vidx(j), HD) + acc[j] * c;
         m = mn;
     }
     float inv = 1.f / l;
@@ -3324,7 +3335,7 @@ __device__ void ink_attn_prefill_t(const float* q, const float* r, const float* 
     if (PER == 2) { float2 v = {ov[0], ov[1]}; tq_wht2(v, lane, true); ov[0]=v.x; ov[1]=v.y; }
 #endif
     for (int j = 0; j < PER; j++) {
-        int col = dim(j);
+        int col = vidx(j);
         size_t idx = ((size_t)t * nh + h) * HD + col;
         outp[idx] = ov[j] * sigmoid(gate[idx]);
     }
@@ -3730,9 +3741,11 @@ extern "C" __global__ void attn_merge(const float* part, const float* qg, float*
         for (int s = 0; s < ns; s++) o += pp[s * (hd + 2) + d] * ws[s];
         o = o / L;
 #if V_MODE >= 4
-        ro[d] = o;
+        ro[d] = o;  // keep the ungated value: inverse WHT must run before the Q gate
 #else
-        out[h * hd + d] = o * (qg ? sigmoid(qg[h * 2 * hd + hd + d]) : 1.0f);
+        // Match main exactly: apply the Q gate before both the output write and the int8 copy.
+        o = o * (qg ? sigmoid(qg[h * 2 * hd + hd + d]) : 1.0f);
+        out[h * hd + d] = o;
         if (xq) {  // hd is a multiple of 32: a warp holds one scale's 32 values
             float mx = warp_max(fabsf(o)), id = mx > 0.0f ? 127.0f / mx : 0.0f;
             size_t n = (size_t)gridDim.x * hd, i = blockIdx.z * n + h * hd + d;
@@ -3963,11 +3976,12 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
                                                const float* sink, int win) {
     constexpr int PQ = HD + 8;
     constexpr int FA_BKL = FA_BK_FOR(HD);
+#if V_MODE >= 4
+    // warp x query half x 8 query rows x 128 dims: a unique cell for every (query row, dim, WHT group half).
+    __shared__ float tro[2][8][128];  // reused by the four warps in turn
+#endif
     extern __shared__ __align__(16) u16 fa_sm[];
     u16 *qs = fa_sm, *ks = qs + FA_BQ * PQ, *vs = ks + FA_BKL * PQ;
-#if V_MODE >= 4
-    __shared__ float tro[2][HD];  // ungated output of the two query rows, before inverse WHT
-#endif
 #if __CUDA_ARCH__ < 800 && GEMM_TC
     // Volta only: warp-private P tile for the PV A fragments (see the staging in the PV step below). Appended after
     // `vs` so the qs/ks/vs offsets above do not move; FA_BQ * (FA_BKL + 8) halves = 5120 B.
@@ -3996,6 +4010,9 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
     int last = pos0 + min(q0 + FA_BQ, T) - 1;  // last key any query of the tile sees
     int qp[2] = {pos0 + q0 + warp * 16 + g, pos0 + q0 + warp * 16 + g + 8};
     float o[HD / 8][4] = {}, m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+#if V_MODE >= 4
+    float invr[2] = {1.f, 1.f};
+#endif
 #if __CUDA_ARCH__ < 800 && GEMM_TC
     // Same storage as o / extra softmax state for the m8n8k4 layout (PTX ISA 8.5 §9.7.13.4.1). o2[j][grp][i] ==
     // &o[0][0][j * HD / 4 + grp * 8 + i]: the lane owns 4 rows (query half j, p2), so m and l need four entries each;
@@ -4373,41 +4390,53 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
         float sc = m[r] == -INFINITY ? 0.0f : expf(m[r] - M);
         float den = l[r] * sc + (sk == -INFINITY ? 0.0f : expf(sk - M));
         float inv = den > 0.0f ? sc / den : 0.0f;
+#if V_MODE >= 4
+        invr[r] = inv;  // store after each 128-value group is rotated below
+#else
 #pragma unroll
         for (int d = 0; d < HD / 8; d++)
             for (int e = 0; e < 2; e++) {
                 int col = d * 8 + 2 * t4 + e;
-#if V_MODE >= 4
-                tro[r][col] = o[d][2 * r + e] * inv;
-#else
                 orow[col] = o[d][2 * r + e] * inv * (gate ? sigmoid(gate[col]) : 1.0f);
-#endif
             }
+#endif
     }
 #if V_MODE >= 4
-    __syncthreads();
-    for (int gg = 0; gg < HD / 128; gg++) {
-        int base = gg * 128 + 4 * tid;
-        for (int r = 0; r < 2; r++) {
-            if (tid < 32) {
-                float4 v = make_float4(tro[r][base], tro[r][base+1], tro[r][base+2], tro[r][base+3]);
-                tq_wht4(v, tid, true);
-                tro[r][base]=v.x; tro[r][base+1]=v.y; tro[r][base+2]=v.z; tro[r][base+3]=v.w;
-            }
-            __syncthreads();
-        }
-    }
-    for (int r = 0; r < 2; r++) {
-        int t = q0 + warp * 16 + g + 8 * r;
-        if (t >= T) continue;
-        float* orow = out + (size_t)t * nh * HD + h * HD;
-        const float* gate = qg ? qg + (size_t)t * nh * 2 * HD + h * 2 * HD + HD : nullptr;
-        for (int d = 0; d < HD / 8; d++)
-            for (int e = 0; e < 2; e++) {
-                int col = d * 8 + 2 * t4 + e;
-                orow[col] = tro[r][col] * (gate ? sigmoid(gate[col]) : 1.0f);
-            }
-    }
+    // One warp stages and rotates one query row at a time. tro is indexed by (r, query-row gi, dim),
+    // never by the dim owner: a thread with g == gi owns all 128 dims of row gi through its four lanes.
+    for (int wi = 0; wi < 4; wi++)
+        for (int gi = 0; gi < 8; gi++)
+            for (int gg = 0; gg < HD / 128; gg++)
+                for (int r = 0; r < 2; r++) {
+                    if (warp == wi && g == gi)
+                        for (int d = 16 * gg; d < 16 * gg + 16; d++)
+                            for (int e = 0; e < 2; e++) {
+                                int col = d * 8 + 2 * t4 + e;
+                                tro[r][gi][col & 127] = o[d][2 * r + e] * invr[r];
+                            }
+                    __syncthreads();
+                    if (warp == wi && lane < 32) {
+                        float4 v = make_float4(tro[r][gi][4*lane], tro[r][gi][4*lane+1],
+                                               tro[r][gi][4*lane+2], tro[r][gi][4*lane+3]);
+                        tq_wht4(v, lane, true);
+                        tro[r][gi][4*lane]=v.x; tro[r][gi][4*lane+1]=v.y;
+                        tro[r][gi][4*lane+2]=v.z; tro[r][gi][4*lane+3]=v.w;
+                    }
+                    __syncthreads();
+                    if (warp == wi && g == gi) {
+                        int t = q0 + warp * 16 + g + 8 * r;
+                        if (t < T) {
+                            float* orow = out + (size_t)t * nh * HD + h * HD;
+                            const float* gate = qg ? qg + (size_t)t * nh * 2 * HD + h * 2 * HD + HD : nullptr;
+                            for (int d = 16 * gg; d < 16 * gg + 16; d++)
+                                for (int e = 0; e < 2; e++) {
+                                    int col = d * 8 + 2 * t4 + e;
+                                    orow[col] = tro[r][gi][col & 127] * (gate ? sigmoid(gate[col]) : 1.0f);
+                                }
+                        }
+                    }
+                    __syncthreads();
+                }
 #endif
 #endif
 }
@@ -4418,6 +4447,10 @@ __device__ void attn_prefill_llama(const float* q, const u16* kc, const u16* vc,
                                    const int* step, int T, int nh, int nkv, float scale, const unsigned* qm, int mw,
                                    const float* sink, int win) {
     constexpr int R = (HD + 127) / 128;
+#if V_MODE >= 4
+    // warp x query half x 8 query rows x 128 dims: a unique cell for every (query row, dim, WHT group half).
+    __shared__ float tro[2][8][128];  // reused by the four warps in turn
+#endif
     extern __shared__ __align__(16) u16 fa_sm[];
     float *sq = (float*)fa_sm, *sc = sq + HD;
     int h = blockIdx.y, kvh = h / (nh / nkv), tid = threadIdx.x, w = tid >> 5, lane = tid & 31;

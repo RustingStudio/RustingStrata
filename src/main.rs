@@ -405,7 +405,11 @@ impl Engine {
         if let Some(b) = &self.backend { unsafe { std::env::set_var("STRATA_DS_BACKEND", b) } }
         if self.device != [0] { unsafe { std::env::set_var("STRATA_DS_DEVICES", self.device.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")) } }
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // Hy4: every expert on the GPU
-        if self.kv != "f16" && std::env::var_os("STRATA_KV_K").is_none() { set_kv_env_for(&self.kv, self.k.as_deref(), self.v.as_deref())?; }
+        // `--k`/`--v` must take effect even when `--kv` is left at its f16 default; otherwise an Inkling 2
+        // mixed layout silently degrades to plain f16.
+        if (self.kv != "f16" || self.k.is_some() || self.v.is_some()) && std::env::var_os("STRATA_KV_K").is_none() {
+            set_kv_env_for(&self.kv, self.k.as_deref(), self.v.as_deref())?;
+        }
         Ok(())
     }
 
