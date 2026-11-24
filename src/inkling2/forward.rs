@@ -1381,6 +1381,7 @@ impl<'a> Inkling2Model<'a> {
                 match d.prepare(self, target_end) {
                     Ok(()) => {
                         let chunk = env_chunk.unwrap_or(device::pf_tokens()).clamp(1, device::pf_tokens());
+                        let chunk = d.prefill_rows(self, chunk.min(seq.len()).max(1));
                         let mut logits = vec![];
                         let mut done = 0usize;
                         let mut failed = None;

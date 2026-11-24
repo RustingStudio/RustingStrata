@@ -44,12 +44,14 @@ struct DSlot { k: Buf, v: Buf, hist: Buf, cap: usize }
 /// prompt chunk on, a prefill scratch. The activations come over the host once per layer run (about 10 KB per token).
 struct Remote { part: usize, scr: Buf, s: Scratch, pf: Option<PrefillScratch> }
 
-/// Tokens of one prompt chunk on the device: `STRATA_DS_PF_TOKENS` (default 256 on one card, 512 on two or more;
-/// at most 2048).
+/// Tokens of one prompt chunk on the device: `STRATA_DS_PF_TOKENS` (default 2048 on one card, 512 on two or more;
+/// at most 2048). On one card each chunk copies the pool's missing experts into the
+/// staging slots again, so a longer chunk spreads that copy over more tokens; the scratch costs about 0.55 GB of VRAM
+/// per 1024 rows, and `prefill_rows` halves the chunk when VRAM has no room for it.
 pub(super) fn pf_tokens() -> usize {
     let multi = std::env::var("STRATA_DS_DEVICES")
         .map_or(false, |v| v.split(',').filter(|d| !d.trim().is_empty()).count() > 1);
-    let default = if multi { 512 } else { 256 };
+    let default = if multi { 512 } else { 2048 };
     std::env::var("STRATA_DS_PF_TOKENS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(default).clamp(1, 2048)
 }
 
@@ -925,7 +927,10 @@ impl Device {
         }
         let target = need_nt.max(pf_tokens());
         let mut tries = vec![target];
-        if need_nt < target { tries.push(need_nt.max(128)); tries.push(need_nt.max(64)); tries.push(need_nt); }
+        // A smaller scratch when VRAM is short: halve down to 256 rows, then the old small sizes.
+        let mut cap = target / 2;
+        while cap >= 256 && cap >= need_nt { tries.push(cap); cap /= 2; }
+        if need_nt < 256 { tries.push(need_nt.max(128)); tries.push(need_nt.max(64)); tries.push(need_nt); }
         let mut last_err = None;
         for cap in tries {
             match PrefillScratch::alloc(be, c, self.rank, vocab_rows, cap, false) {
@@ -1010,6 +1015,15 @@ impl Device {
 
     /// Run a chunk of token IDs or raw vision embeddings (`Some(emb)` skips `tok_norm`, matching `inkling2.cpp::build_inputs`).
     /// When `capture_dspark` is true, also returns the 4 target layer hidden states `[5, 23, 41, 48]` (`[4][nt][n_embd]`).
+    /// Rows the next prompt chunks may have: `want`, or half of it down to 256 when VRAM has no room for that scratch.
+    pub(super) fn prefill_rows(&mut self, m: &Inkling2Model, want: usize) -> usize {
+        let d = dev::get().unwrap().lock().unwrap();
+        let be = &*d.parts[0].be;
+        let mut cap = want;
+        while cap > 256 && self.ensure_pf(be, &m.cfg, m.output.rows, cap).is_err() { cap /= 2; }
+        cap
+    }
+
     pub(super) fn prefill_chunk_seq(
         &mut self,
         m: &Inkling2Model,
