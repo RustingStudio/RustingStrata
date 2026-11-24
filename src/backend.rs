@@ -58,12 +58,28 @@ unsafe impl Plain for u64 {}
 
 /// Device memory, recorded graphs and kernel ops. Host copies are synchronous; device work runs in queue order.
 /// Pointer arguments are device addresses; strides are in floats unless named otherwise.
-/// The backend `kind` ("cuda" or "vulkan") on GPU `device`; with no kind, CUDA if it loads, else Vulkan.
+/// The backend `kind` ("cuda", "vulkan" or "hip") on GPU `device`; with no kind, CUDA if it loads, else Vulkan.
+/// Refuses a `--device` list with several indices on the HIP backend: `hip::Gpu` opens one device per process
+/// (hipSetDevice runs once, in `Gpu::new`), so a split over two cards would run both layers on the first one.
+pub fn check_devices(kind: Option<&str>, devices: &[usize]) -> anyhow::Result<()> {
+    if kind == Some("hip") && devices.len() > 1 {
+        anyhow::bail!("the hip backend runs one device: --device {} needs cuda or vulkan", devices.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(","));
+    }
+    Ok(())
+}
+
+/// Opens every device of a `--device` list, after the check above. Callers open a list through this, not one device at a time.
+pub fn open_all(kind: Option<&str>, devices: &[usize]) -> anyhow::Result<Vec<Box<dyn Backend>>> {
+    check_devices(kind, devices)?;
+    devices.iter().map(|&d| open(kind, d)).collect()
+}
+
 pub fn open(kind: Option<&str>, device: usize) -> anyhow::Result<Box<dyn Backend>> {
     match kind {
         Some("cuda") => Ok(Box::new(crate::cuda::Gpu::new(device)?)),
         Some("vulkan") => Ok(Box::new(crate::vulkan::Vk::new(device)?)),
-        Some(k) => anyhow::bail!("unknown backend {k:?} (cuda or vulkan)"),
+        Some("hip") => Ok(Box::new(crate::hip::Gpu::new(device)?)),
+        Some(k) => anyhow::bail!("unknown backend {k:?} (cuda, vulkan or hip)"),
         None => match crate::cuda::Gpu::new(device) {
             Ok(g) => Ok(Box::new(g)),
             Err(c) if format!("{c}") == "CUDA init" => {
@@ -101,7 +117,7 @@ pub const BATCHED: i32 = 8;
 pub fn upload_type(ty: GgmlType) -> GgmlType { if ty == GgmlType::F16 { GgmlType::F32 } else { ty } }
 
 pub trait Backend: Send {
-    /// "cuda" or "vulkan".
+    /// "cuda", "vulkan" or "hip".
     fn name(&self) -> &'static str;
     /// The GPU's name as the driver reports it.
     fn device(&self) -> String;
@@ -533,7 +549,15 @@ impl<'a> dyn Backend + 'a {
 
 #[cfg(test)]
 mod tests {
-    use super::device_order;
+    use super::{check_devices, device_order};
+
+    #[test]
+    fn hip_refuses_a_device_split_and_nothing_else() {
+        assert!(check_devices(Some("hip"), &[0, 1]).is_err());
+        assert!(check_devices(Some("hip"), &[0]).is_ok());
+        assert!(check_devices(Some("cuda"), &[0, 1]).is_ok());
+        assert!(check_devices(None, &[0, 1]).is_ok());
+    }
 
     /// Identifiers are letters here. Two cards of one model have one name and two identifiers, so names play no part.
     #[test]

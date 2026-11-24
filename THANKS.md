@@ -41,6 +41,11 @@ If you helped and your name is missing here, that is our mistake. Open an issue 
 - [luckydevil13](https://github.com/luckydevil13): AMD benchmarks and a lot of talk about which models to support.
 - [ike287](https://github.com/ike287): feedback and feature requests.
 
+## Code
+
+- [Niko1221](https://github.com/Niko1221/Strata): the HIP backend's device-side compatibility layer (`src/hip/compat.h`)
+  follows the structure and several implementations of Strata's `include/strata/hip_compat/intrinsics.hpp` (MIT).
+
 ## Ideas
 
 - [FredWalter](https://github.com/FredWalter): asked for multi-GPU and Qwen3.8-Flash-Next (issue #1), and later
