@@ -2090,6 +2090,7 @@ fn best(f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<f64> {
 /// With `aux` (`--mtp-model`/`--draft-model`) the drafts are measured with that file, and runs given the same file use
 /// the measured draft count.
 fn calibrate(model: &Path, aux: Option<&Path>, ctx: usize, margin: &[usize], kind: Option<&str>, device: &[usize], mut split: Option<Vec<f64>>) -> anyhow::Result<()> {
+    backend::check_devices(kind, device)?;  // before the GGUF is read: a bad --device fails here, not after the load
     let g = Gguf::open(model)?;
     let aux_g = open_mtp_gguf(aux)?;
     let m = Model::load_with_aux(&g, aux_g.as_ref(), &[])?;
