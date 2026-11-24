@@ -885,6 +885,16 @@ impl Backend for Gpu {
         Ok(())
     }
 
+    fn ink_pool(&self) -> bool { true }
+    fn ink_slots(&self, ids: u64, wts: u64, table: u64, slots: u64, wh: u64, h: u64, mb: u64, nh: usize, h_off: usize, step: u64, k: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(k <= 32, "ink_slots: k={k}");
+        launch!(self, "ink_slots", cfg((1, 1), 256, 0), ids, wts, table, slots, wh, h, mb, nh as i32, h_off as i32, step, k as i32);
+        Ok(())
+    }
+    fn ink_ffn_sum_mb(&self, acc: u64, d: u64, wh: u64, k: usize, n: usize, mb: u64, y_off: usize, step: u64, slots: u64) -> anyhow::Result<()> {
+        launch!(self, "ink_ffn_sum_mb", cfg((n.div_ceil(256) as u32, 1), 256, 0), acc, d, wh, k as i32, n as i32, mb, y_off as i32, step, slots);
+        Ok(())
+    }
     fn ink_route(&self, logits: u64, bias: u64, ids: u64, wts: u64, gu_sc: u64, dn_sc: u64, gsc_out: u64, n_expert: usize, k: usize, exp_scale: f32, rows: usize) -> anyhow::Result<()> {
         anyhow::ensure!(n_expert <= 512 && k <= 32, "ink_route: n_expert={n_expert} k={k}");
         launch!(self, "ink_route", cfg((rows as u32, 1), 32, 0), logits, bias, ids, wts, gu_sc, dn_sc, gsc_out, n_expert as i32, k as i32, exp_scale);

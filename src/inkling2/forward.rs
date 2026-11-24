@@ -15,6 +15,8 @@ use half::{f16, slice::HalfFloatSliceExt};
 use rayon::prelude::*;
 
 mod device;
+mod pool;
+mod worker;
 
 /// Epsilon of the norms without a weight (depth mix, loop controllers).
 const MIX_EPS: f32 = 1e-6;

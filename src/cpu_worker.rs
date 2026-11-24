@@ -197,7 +197,7 @@ impl CpuWorker {
 
 /// Copies `out.len()` (a multiple of 4) words from 16-byte aligned `p`. On write-combining memory (the Vulkan BAR
 /// mailbox) streaming loads fetch a whole 64-byte line per read instead of one uncached read per load.
-unsafe fn read_wc(p: *const u32, out: &mut [u32]) {
+pub(crate) unsafe fn read_wc(p: *const u32, out: &mut [u32]) {
     #[cfg(target_feature = "sse4.1")]
     for (i, c) in out.chunks_exact_mut(4).enumerate() {
         use std::arch::x86_64::*;

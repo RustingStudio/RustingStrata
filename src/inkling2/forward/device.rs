@@ -57,7 +57,7 @@ pub(super) fn pf_tokens() -> usize {
 #[derive(Clone, Copy)]
 struct Scratch {
     cur: u64, x: u64, blocks: u64, bank: u64, outb: u64, prelude: u64, msg: u64, ins: u64, ins2: u64, gate: u64, nrm: u64, nrm_xq: u64,
-    q: u64, r: u64, sink: u64, og: u64, k: u64, v: u64, kp: u64, vp: u64, att: u64, proj: u64, h: u64, h2: u64, hn: u64,
+    q: u64, r: u64, sink: u64, og: u64, k: u64, v: u64, kp: u64, vp: u64, att: u64, proj: u64, h: u64, h2: u64, hn: u64, wh: u64, step: u64,
     y: u64, d: u64, ids: u64, xh: u64, xq: u64, wc: u64, rlogits: u64, amax: u64, pos: u64, acc: u64, logits: u64, end: u64,
 }
 
@@ -70,7 +70,7 @@ impl Scratch {
             cur: f(n), x: f(n), blocks: f(4 * n), bank: f(4 * n), outb: f(n), prelude: f(n), msg: f(4 * n), ins: f(3 * n), ins2: f(3 * n),
             gate: f(4 * rank), nrm: f(3 * n), nrm_xq: f(3 * xq_row_floats), q: f(q), r: f(c.n_head * c.n_rel), sink: f(c.n_head), og: f(q), k: f(c.n_head_kv * c.head_dim),
             v: f(c.n_head_kv * c.head_dim), kp: f(c.n_head_kv * c.n_conv), vp: f(c.n_head_kv * c.n_conv), att: f(q), proj: f(n), h: f(n),
-            h2: f(n), hn: f(n), y: f(c.n_used * 2 * c.n_ff_exp), d: f(c.n_used * n), ids: f(3 * c.n_used), xh: f(n), xq: f(c.n_used * c.n_ff_exp), wc: f(c.n_used + n), rlogits: f(c.n_expert), amax: f(16), pos: f(1), acc: f(n),
+            h2: f(n), hn: f(n), wh: f(c.n_used), step: f(2), y: f(c.n_used * 2 * c.n_ff_exp), d: f(c.n_used * n), ids: f(3 * c.n_used), xh: f(n), xq: f(c.n_used * c.n_ff_exp), wc: f(c.n_used + n), rlogits: f(c.n_expert), amax: f(16), pos: f(1), acc: f(n),
             logits: f(vocab), end: a - base,
         }
     }
@@ -183,6 +183,7 @@ pub(super) struct Device {
     pf: Option<PrefillScratch>,
     s: Scratch,
     rank: usize,
+    /// Every layer's experts run on the device: in a slab, or in `pool` with the CPU worker for the rest.
     all_full: bool,
     /// GPU 1's share of the FFN layers (None when every layer's experts are on GPU 0).
     rem: Option<Remote>,
@@ -190,6 +191,8 @@ pub(super) struct Device {
     seg_graph: bool,
     /// Blocks in the depth mix after the loop (what `layer_attn` counted when the loop graph was recorded).
     loop_nb: usize,
+    /// VRAM slots and the CPU worker for the layers without a slab (decode only; None under `--fixed-experts`).
+    pool: Option<super::pool::Pool>,
     /// Keys of the recorded `step_fast` graphs, by `argmax`, and of `core_graph` (0: none).
     graph_keys: [u64; 3],
     /// Positions whose rows both sides hold, and whether the device has run tokens after them.
@@ -255,6 +258,17 @@ fn shapes_fit(m: &Inkling2Model, rank: usize) -> bool {
 }
 
 /// The layer whose weights slot `il` runs.
+/// (slot, layer) of each layer run of a token, in the order it runs them.
+fn run_order(c: &Inkling2Config) -> Vec<(usize, usize)> {
+    let core = c.loop_end - c.loop_start;
+    let mut runs: Vec<(usize, usize)> = (0..c.loop_start).map(|il| (il, il)).collect();
+    for pass in 0..c.loop_count {
+        runs.extend((c.loop_start..c.loop_end).map(|ip| (if pass == 0 { ip } else { c.n_layer + (pass - 1) * core + ip - c.loop_start }, ip)));
+    }
+    runs.extend((c.loop_end..c.n_layer).map(|il| (il, il)));
+    runs
+}
+
 fn layer_of(c: &Inkling2Config, il: usize) -> usize {
     if il < c.n_layer { il } else { c.loop_start + (il - c.n_layer) % (c.loop_end - c.loop_start) }
 }
@@ -338,7 +352,13 @@ impl Device {
             let cpu_share = std::env::var("STRATA_DS_CPU_SHARE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
             let (mut n_full, mut slab_bytes, mut per_part) = (0usize, 0usize, [0usize; 2]);
             let mut rem: Option<Remote> = None;
-            if cpu_share <= 0.0 && c.n_expert <= 512 && c.n_used <= 32 {
+            // With the expert pool (`pool`), every layer keeps its most used experts in VRAM instead: no slabs.
+            // STRATA_INK_SLABS=1 keeps the slabs and pools only the layers they leave out. One GPU only: a split
+            // keeps upstream's slabs on both cards.
+            let one_gpu = dev::get().unwrap().lock().unwrap().parts.len() == 1;
+            let pooled = one_gpu && cpu_share <= 0.0 && std::env::var_os("STRATA_FIXED_EXPERTS").is_none()
+                && std::env::var_os("STRATA_INK_SLABS").is_none() && dev::get().unwrap().lock().unwrap().parts[0].be.ink_pool();
+            if cpu_share <= 0.0 && c.n_expert <= 512 && c.n_used <= 32 && !pooled {
                 let (b_res, f_res) = (64 << 20, 384 << 20);
                 let (n_parts, pf_cap, vocab) = (dev::get().unwrap().lock().unwrap().parts.len().min(2), pf_tokens(), m.output.rows);
                 let (res0, res1) = {
@@ -415,13 +435,20 @@ impl Device {
                     c.n_layer, slab_bytes as f64 / 1e9, per_part[0] as f64 / 1e9, per_part[1] as f64 / 1e9,
                     c.n_expert, c.n_used, c.loop_start, c.loop_end, c.loop_count, crate::deepseek::mat::budget_left() as f64 / 1e9);
             }
-            let all_full = rem.is_none() && layers.iter().all(|l| l.full_exps.is_some());
+            // The layers without a slab: a pool of expert slots in what the budget has left, the CPU worker for the
+            // rest. Not under --fixed-experts, whose numerics must not depend on the placement, and not on a split.
+            let need: Vec<usize> = (0..c.n_layer).filter(|&ip| layers[ip].full_exps.is_none()).collect();
+            let pool = (one_gpu && !need.is_empty() && cpu_share <= 0.0 && std::env::var_os("STRATA_FIXED_EXPERTS").is_none()).then(|| {
+                let runs = run_order(c).into_iter().filter(|r| need.contains(&r.1)).collect();
+                super::pool::Pool::new(m, &mut dev::get().unwrap().lock().unwrap(), &need, runs)
+            }).flatten();
+            let all_full = rem.is_none() && (0..c.n_layer).all(|ip| layers[ip].full_exps.is_some() || pool.as_ref().is_some_and(|p| p.layer(ip).is_some()));
             let core = c.loop_end - c.loop_start;
             let seg_graph = rem.is_some() && std::env::var_os("STRATA_DS_NO_SEG_GRAPH").is_none()
                 && layers.iter().all(|l| l.full_exps.is_some())
                 && (c.loop_start..c.loop_end).all(|ip| layers[ip].full_exps.as_ref().is_some_and(|fe| fe.part == 0))
                 && (c.loop_count * core) % 2 == 0;
-            Ok(Device { layers, loops, slots, out_query, out_norm, scr, sc_buf, pf: None, s, rank, all_full, rem, seg_graph, loop_nb: 0, graph_keys: [0; 3], synced: 0, ahead: false })
+            Ok(Device { layers, loops, slots, out_query, out_norm, scr, sc_buf, pf: None, s, rank, all_full, rem, seg_graph, loop_nb: 0, pool, graph_keys: [0; 3], synced: 0, ahead: false })
         })();
         made.inspect_err(|e| crate::say!("inkling2: no room in VRAM for the decode state ({e:#}); the tokens run as prompt chunks do")).ok()
     }
@@ -588,12 +615,14 @@ impl Device {
         let (mut emb, mut cur) = (vec![0f32; n], vec![0f32; n]);
         m.tok_embd.row_into(tok as usize, &mut emb);
         rms_norm_w(&emb, &m.tok_norm, c.eps, &mut cur);
-        let d = dev::get().unwrap().lock().unwrap();
+        let mut d = dev::get().unwrap().lock().unwrap();
         let be = &*d.parts[0].be;
-        (|| -> Result<(Vec<f32>, u32)> {
+        let out = (|| -> Result<(Vec<f32>, u32)> {
             if !self.ahead { self.to_device(m, be, pos)?; }
             be.put(&cur, &self.scr, ((self.s.cur - o) / 4) as usize)?;
             be.put(&[pos as i32], &self.scr, ((self.s.pos - o) / 4) as usize)?;
+            let seq = self.pool.as_mut().map_or(0, |p| p.worker.begin());
+            be.put(&[pos as i32, seq as i32], &self.scr, ((self.s.step - o) / 4) as usize)?;
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::hash::DefaultHasher::new();
@@ -696,13 +725,23 @@ impl Device {
                     be.argmax_rows(self.s.logits, c.n_vocab, 1, self.s.amax)?;
                 }
             }
-            if argmax {
-                let id = be.get::<i32>(&self.scr, ((self.s.amax - o) / 4) as usize, 1)?[0] as u32;
-                Ok((Vec::new(), id))
+            let out = if argmax {
+                (Vec::new(), be.get::<i32>(&self.scr, ((self.s.amax - o) / 4) as usize, 1)?[0] as u32)
             } else {
-                Ok((be.get(&self.scr, ((self.s.logits - o) / 4) as usize, c.n_vocab)?, 0))
+                (be.get(&self.scr, ((self.s.logits - o) / 4) as usize, c.n_vocab)?, 0)
+            };
+            Ok(out)
+        })().expect("inkling2 device fast step");
+        // The read waited for the token: the pool's slots are free to change.
+        if let Some(p) = &mut self.pool {
+            p.adapt(&mut d).expect("inkling2 expert pool");
+            if std::env::var_os("STRATA_DS_PROF").is_some() && pos % 32 == 0 {
+                let [hit, miss, moved] = std::mem::take(&mut p.stats);
+                eprintln!("PROF pool at {pos}: {hit} expert uses in VRAM, {miss} on the CPU, {moved} copied in; CPU worker {:.1} ms a token",
+                    p.worker.busy().as_secs_f64() * 1e3 / p.tokens.max(1) as f64);
             }
-        })().expect("inkling2 device fast step")
+        }
+        out
     }
 
     /// The core passes as one HIP/CUDA graph when every core layer has its experts in VRAM: about 1100 launches a
@@ -1435,6 +1474,19 @@ impl Device {
                 be.add(*x_a, p.acc2, nt * n)?;
                 m.lap(5, t_gpu);
                 true
+            } else if self.pool.as_ref().is_some_and(|q| q.has_room(ip)) {
+                m.lap(0, t_prep);
+                let t_gpu = std::time::Instant::now();
+                let on = self.prefill_ffn_pool(be, m, ip, nt, small, h)?;
+                if on {
+                    if verify_mode {
+                        be.dtod(&pf.acc_buf, 0, &pf.conv_log, log_base + 4 * VERIFY_MAX * (2 * kw + n), 4 * nt * n)?;
+                    }
+                    be.ink_conv_batch(pf.acc_buf.addr(), l.convs[3].addr(), 0, hist(3), p.acc2, n, nc, hd, nt)?;
+                    be.add(*x_a, p.acc2, nt * n)?;
+                    m.lap(5, t_gpu);
+                }
+                on
             } else {
                 be.rms_norm(h, n, l.ffn_norm.addr(), p.hn, n, n, nt, c.eps)?;
                 m.lap(0, t_prep);
@@ -1551,6 +1603,126 @@ impl Device {
             be.moe_combine_seq(pf.acc_buf.addr(), p.d, p.wts, ma + inv_off as u64, k, 0, 0, n, nt)?;
         }
         Ok(())
+    }
+
+    /// The routed experts of a prompt chunk in a pool layer: the pool's slots, and the chunk's other experts copied
+    /// into the staging slots in rounds of `pool::STAGE`, with a wait before each refill. The experts run in the
+    /// order of their rounds, so a round's rows are one block. False: a small batch with more misses than staging
+    /// slots, left to the host path (`p.hn` holds the normed input).
+    fn prefill_ffn_pool(&self, be: &dyn Backend, m: &Inkling2Model, ip: usize, nt: usize, small: bool, h: u64) -> Result<bool> {
+        use super::pool::STAGE;
+        let (c, ml, l) = (&m.cfg, &m.layers[ip], &self.layers[ip]);
+        let pool = self.pool.as_ref().unwrap();
+        let pl = pool.layer(ip).unwrap();
+        let pf = self.pf.as_ref().unwrap();
+        let (p, buf_o) = (pf.p, pf.buf.addr());
+        let (n, nf, k) = (c.n_embd, c.n_ff_exp, c.n_used);
+        let ((gt, gr, gc), (dt, dr, dc)) = (pl.gu, pl.dn);
+        let (base, stride) = pool.base(pl);
+        let (dn_base, st0) = (base + pl.dn_off as u64, pool.stage(pl));
+        let use_gemm = !small && gc % 64 == 0 && dc % 64 == 0;
+        if use_gemm || gt.float_x() {
+            be.rms_norm(h, n, l.ffn_norm.addr(), p.hn, n, n, nt, c.eps)?;
+        } else {
+            be.rms_norm_q(h, n, l.ffn_norm.addr(), p.hn, n, n, nt, c.eps, p.xh, 0)?;
+        }
+        Self::proj_n(be, &pl.gate_inp, small, nt, p.hn, 0, p.rlogits, 0)?;
+        let gu_sc = pl.gu_scale.as_ref().map_or(0, |b| b.addr());
+        let dn_sc = pl.dn_scale.as_ref().map_or(0, |b| b.addr());
+        be.ink_route(p.rlogits, pl.bias.addr(), p.ids, p.wts, gu_sc, dn_sc, if gu_sc != 0 { p.gsc } else { 0 }, c.n_expert, k, c.exp_scale, nt)?;
+        let ids: Vec<i32> = be.get(&pf.buf, ((p.ids - buf_o) / 4) as usize, nt * k)?;
+        let mut by_e: Vec<Vec<(usize, usize)>> = vec![vec![]; c.n_expert];
+        for (t, row) in ids.chunks_exact(k).enumerate() {
+            for (j, &e) in row.iter().enumerate() { by_e[e as usize].push((t, j)); }
+        }
+        let mut slot = vec![-1i32; c.n_expert];
+        let (mut resident, mut missing) = (vec![], vec![]);
+        for e in (0..c.n_expert).filter(|&e| !by_e[e].is_empty()) {
+            slot[e] = pool.slot(ip, e);
+            if slot[e] >= 0 { resident.push(e) } else { missing.push(e) }
+        }
+        // The queue is idle after the read above; a later round waits for the one before, which reads the slots.
+        let stage = |round: &[usize], slot: &mut [i32]| -> Result<()> {
+            be.sync()?;
+            for (j, &e) in round.iter().enumerate() {
+                pool.upload(be, ip, e, st0 + j)?;
+                slot[e] = (st0 + j) as i32;
+            }
+            Ok(())
+        };
+        if !use_gemm {
+            if missing.len() > STAGE { return Ok(false); }
+            if !missing.is_empty() { stage(&missing, &mut slot)?; }
+            let sids: Vec<i32> = ids.iter().map(|&e| slot[e as usize]).collect();
+            be.put(&sids, &pf.buf, ((p.ids - buf_o) / 4) as usize)?;
+            let xh_tok_floats = (n + n.div_ceil(32) * 4).div_ceil(16) * 4;
+            for tok0 in (0..nt).step_by(16) {
+                let (bt, ids_a) = ((nt - tok0).min(16), p.ids + (4 * tok0 * k) as u64);
+                let np = bt * k;
+                let gsc_a = if gu_sc != 0 { p.gsc + f(tok0 * k) } else { 0 };
+                let (hn_a, xh_a, acc_a) = (p.hn + f(tok0 * n), p.xh + f(tok0 * xh_tok_floats), pf.acc_buf.addr() + f(tok0 * n));
+                be.moe_gemv(gt, gr, gc, base, stride, ids_a, np, hn_a, n, k, p.y, None, xh_a)?;
+                if dt.float_x() || nf % 32 != 0 {
+                    be.situ(p.y, nf, np, gsc_a, c.situ_beta, c.situ_linear_beta)?;
+                    be.moe_gemv(dt, dr, dc, dn_base, stride, ids_a, np, p.y, 2 * nf, 1, p.d, None, 0)?;
+                } else {
+                    be.situ_q(p.y, nf, np, gsc_a, c.situ_beta, c.situ_linear_beta, p.xq)?;
+                    be.moe_gemv(dt, dr, dc, dn_base, stride, ids_a, np, p.y, 2 * nf, 1, p.d, None, p.xq)?;
+                }
+                be.ink_ffn_sum_n(acc_a, p.d, p.wts + f(tok0 * k), k, n, bt, 0)?;
+            }
+            return Ok(true);
+        }
+        use crate::backend::GEMM_BM;
+        // Groups: the residents with the first round of misses, then one group per further round.
+        let mut groups: Vec<Vec<usize>> = vec![resident];
+        for (i, r) in missing.chunks(STAGE).enumerate() {
+            if i == 0 { groups[0].extend_from_slice(r) } else { groups.push(r.to_vec()) }
+        }
+        let np = nt * k;
+        let (mut xrow, mut inv, mut gsc_rows) = (Vec::with_capacity(np), vec![0i32; np], Vec::with_capacity(np));
+        let mut rows = vec![(0usize, 0usize); c.n_expert];
+        for &e in groups.iter().flatten() {
+            rows[e] = (xrow.len(), by_e[e].len());
+            for &(t, j) in &by_e[e] {
+                inv[t * k + j] = xrow.len() as i32;
+                xrow.push(t as i32);
+                if !ml.gu_scale.is_empty() { gsc_rows.push(ml.gu_scale[e]); }
+            }
+        }
+        let max_tiles = (0..c.n_expert).map(|e| by_e[e].len().div_ceil(GEMM_BM)).sum::<usize>();
+        let dn_off = 16 * max_tiles;
+        let xr_off = 2 * dn_off;
+        let inv_off = xr_off + 4 * np;
+        ensure!(inv_off + 4 * np <= pf.meta.len(), "prefill meta overflow");
+        be.put(&xrow, &pf.meta, xr_off / 4)?;
+        be.put(&inv, &pf.meta, inv_off / 4)?;
+        let gsc_a = if !gsc_rows.is_empty() { be.put(&gsc_rows, &pf.buf, ((p.gsc - buf_o) / 4) as usize)?; p.gsc } else { 0 };
+        let ma = pf.meta.addr();
+        for (gi, g) in groups.iter().enumerate() {
+            let miss: Vec<usize> = g.iter().copied().filter(|&e| slot[e] < 0 || slot[e] as usize >= st0).collect();
+            if gi > 0 || !miss.is_empty() { stage(&miss, &mut slot)?; }
+            let (mut tg, mut td) = (vec![], vec![]);
+            for &e in g {
+                let (m0, cnt) = rows[e];
+                let at = slot[e] as u64 * stride as u64;
+                for a in (0..cnt).step_by(GEMM_BM) {
+                    let tag = (m0 + a) as u64 | ((GEMM_BM.min(cnt - a) as u64) << 32);
+                    tg.extend([base + at, tag]);
+                    td.extend([dn_base + at, tag]);
+                }
+            }
+            if tg.is_empty() { continue; }
+            be.put(&tg, &pf.meta, 0)?;
+            be.put(&td, &pf.meta, dn_off / 8)?;
+            let (r0, r1) = (rows[g[0]].0, g.iter().map(|&e| rows[e].0 + rows[e].1).max().unwrap());
+            be.gemm(gt, gr, gc, ma, tg.len() / 2, p.hn, n, nt, ma + xr_off as u64, p.y, 2 * nf, 0)?;
+            be.situ(p.y + f(r0 * 2 * nf), nf, r1 - r0, if gsc_a != 0 { gsc_a + f(r0) } else { 0 }, c.situ_beta, c.situ_linear_beta)?;
+            be.gemm(dt, dr, dc, ma + dn_off as u64, td.len() / 2, p.y, 2 * nf, np, 0, p.d, n, 0)?;
+        }
+        be.memset(&pf.acc_buf)?;
+        be.moe_combine_seq(pf.acc_buf.addr(), p.d, p.wts, ma + inv_off as u64, k, 0, 0, n, nt)?;
+        Ok(true)
     }
 
     fn layer_attn(&self, be: &dyn Backend, d: &dev::Dev, m: &Inkling2Model, il: usize, ip: usize, msgs: bool, pos: usize, graph: bool, nb: &mut usize) -> Result<()> {
@@ -1678,7 +1850,7 @@ impl Device {
     }
 
     fn layer_ffn_gpu(&mut self, be: &dyn Backend, m: &Inkling2Model, il: usize, ip: usize) -> Result<bool> {
-        let Some(fe) = &self.layers[ip].full_exps else { return Ok(false) };
+        let Some(fe) = &self.layers[ip].full_exps else { return self.layer_ffn_pool(be, m, il, ip) };
         Self::ffn_core(be, &m.cfg, self.s, fe)?;
         self.ffn_tail(be, m, il, ip)?;
         Ok(true)
@@ -1701,6 +1873,39 @@ impl Device {
         let acc: Vec<f32> = be1.get(&r.scr, ((rs.acc - o1) / 4) as usize, n)?;
         be0.put(&acc, &self.scr, ((s.acc - o0) / 4) as usize)?;
         self.ffn_tail(be0, m, il, ip)?;
+        Ok(true)
+    }
+
+    /// `layer_ffn_gpu` of a layer in the expert pool: the router and the slot lookup on the device, the experts in a
+    /// slot there, the others on the CPU worker (mailbox `il`), whose sum the combine waits for only after a miss.
+    fn layer_ffn_pool(&mut self, be: &dyn Backend, m: &Inkling2Model, il: usize, ip: usize) -> Result<bool> {
+        let Some(pool) = &self.pool else { return Ok(false) };
+        let Some(pl) = pool.layer(ip) else { return Ok(false) };
+        let (c, ds, s) = (&m.cfg, &self.slots[il], self.s);
+        let (n, hd, nc, nf, k) = (c.n_embd, c.head_dim, c.n_conv, c.n_ff_exp, c.n_used);
+        let hist3 = ds.hist.addr() + f(hists(c).0[3]);
+        let (base, stride) = pool.base(pl);
+        let mb = pool.worker.mb(il);
+        let slots = s.ids + f(k);
+        be.gemv(&pl.gate_inp, s.hn, s.rlogits)?;
+        let gu_sc = pl.gu_scale.as_ref().map_or(0, |b| b.addr());
+        let dn_sc = pl.dn_scale.as_ref().map_or(0, |b| b.addr());
+        let gsc_a = if gu_sc != 0 { s.ids + f(2 * k) } else { 0 };
+        be.ink_route(s.rlogits, pl.bias.addr(), s.ids, s.wc, gu_sc, dn_sc, gsc_a, c.n_expert, k, c.exp_scale, 1)?;
+        be.ink_slots(s.ids, s.wc, pl.table_dev.addr(), slots, s.wh, s.hn, mb, n, pool.worker.layout.h, s.step, k)?;
+        let ((gt, gr, gc), (dt, dr, dc)) = (pl.gu, pl.dn);
+        be.moe_gemv(gt, gr, gc, base, stride, slots, k, s.hn, n, k, s.y, None, s.xh)?;
+        if dt.float_x() {
+            be.situ(s.y, nf, k, gsc_a, c.situ_beta, c.situ_linear_beta)?;
+            be.moe_gemv(dt, dr, dc, base + pl.dn_off as u64, stride, slots, k, s.y, 2 * nf, 1, s.d, None, 0)?;
+        } else {
+            be.situ_q(s.y, nf, k, gsc_a, c.situ_beta, c.situ_linear_beta, s.xq)?;
+            be.moe_gemv(dt, dr, dc, base + pl.dn_off as u64, stride, slots, k, s.y, 2 * nf, 1, s.d, None, s.xq)?;
+        }
+        be.ink_ffn_sum_mb(s.acc, s.d, s.wh, k, n, mb, pool.worker.layout.y, s.step, slots)?;
+        be.ink_conv(s.acc, self.layers[ip].convs[3].addr(), 0, hist3, s.acc, n, nc, hd)?;
+        be.add(s.x, s.acc, n)?;
+        (self.s.cur, self.s.x) = (s.x, s.cur);
         Ok(true)
     }
 

@@ -49,6 +49,8 @@ pub(crate) mod dev {
         aff_bytes: Vec<usize>,
         /// Use counts of expert matrices that missed, keyed like `ex` and halved with the slots' counts (see `admit`).
         seen: std::collections::HashMap<usize, f32>,
+        /// Entries that are views of slots someone else owns (`pin`): never evicted or released here.
+        pinned: std::collections::HashSet<usize>,
     }
     static DEV: LazyLock<Mutex<Dev>> = LazyLock::new(Default::default);
     /// Whether `DEV` is open: None before the first `get` and after `free`.
@@ -196,6 +198,16 @@ pub(crate) mod dev {
             }
             Some(arc)
         }
+        /// `alloc_slab_on` GPU 0 without contents: room for slots the caller fills.
+        pub fn alloc_room(&mut self, bytes: usize, budget_reserve: usize, free_reserve: usize) -> Option<std::sync::Arc<SlabBuf>> {
+            self.reclaim();
+            let p = self.parts.first_mut()?;
+            if bytes == 0 || p.bytes + bytes + budget_reserve > p.budget { return None; }
+            if let Ok((free, _)) = p.be.mem_info() && free < bytes + free_reserve { return None; }
+            let b = p.be.alloc(bytes).ok()?;
+            p.bytes += bytes;
+            Some(std::sync::Arc::new(SlabBuf { buf: b, bytes, acct: bytes, freed: self.freed.clone() }))
+        }
         /// The GPU that takes `len` more bytes of plain weights: the current one while they fit, then the next; the last takes all.
         pub fn pick(&mut self, len: usize) -> usize {
             self.reclaim();
@@ -234,7 +246,7 @@ pub(crate) mod dev {
         /// the room back. Returns the bytes freed.
         pub fn release(&mut self, d: usize, bytes: usize) -> usize {
             if self.parts[d].be.sync().is_err() { return 0; }
-            let mut old: Vec<(u64, usize)> = self.exs.iter().filter(|e| gpu_of(e.0) == d).map(|e| (e.2, e.1)).collect();
+            let mut old: Vec<(u64, usize)> = self.exs.iter().filter(|e| gpu_of(e.0) == d && !self.pinned.contains(&e.1)).map(|e| (e.2, e.1)).collect();
             old.sort_unstable();
             let mut freed = 0;
             for (_, k) in old {
@@ -311,7 +323,7 @@ pub(crate) mod dev {
             if !evict || self.parts.iter().all(|p| p.budget == 0) || data.len() > STAGE || std::env::var_os("STRATA_DS_NOEVICT").is_some() { return None; }
             let lfu = std::env::var_os("STRATA_DS_LFU").is_some();
             let victim = self.exs.iter().enumerate()
-                .filter(|(_, e)| e.2 + 96 <= now && { let t = self.tensor(e.0); t.ty == ty && t.rows == rows && t.cols == cols })
+                .filter(|(_, e)| e.2 + 96 <= now && !self.pinned.contains(&e.1) && { let t = self.tensor(e.0); t.ty == ty && t.rows == rows && t.cols == cols })
                 .min_by(|(_, a), (_, b)| if lfu { a.3.total_cmp(&b.3).then(a.2.cmp(&b.2)) } else { a.2.cmp(&b.2) })
                 .map(|(p, _)| p);
             let Some(p) = victim else { return Some(STAGED) };
@@ -345,7 +357,7 @@ pub(crate) mod dev {
             let now = self.now;
             // The coldest slot of each matrix's shape that is free to overwrite.
             let victim = |s: &Self, ty: GgmlType, rows: usize, cols: usize, not: Option<usize>| s.exs.iter().enumerate()
-                .filter(|&(p, e)| e.2 + 96 <= now && Some(p) != not && { let t = s.tensor(e.0); t.ty == ty && t.rows == rows && t.cols == cols })
+                .filter(|&(p, e)| e.2 + 96 <= now && Some(p) != not && !s.pinned.contains(&e.1) && { let t = s.tensor(e.0); t.ty == ty && t.rows == rows && t.cols == cols })
                 .min_by(|a, b| a.1.3.total_cmp(&b.1.3)).map(|(p, e)| (p, e.3));
             let mut plan = vec![];
             for &(data, ty, rows, cols, _) in &cands[i] {
@@ -367,6 +379,29 @@ pub(crate) mod dev {
                 self.exs[p] = (id, k, now, self.seen.remove(&k).unwrap_or(count));
             }
             Some(i)
+        }
+        /// Make the matrix at `data` resident as a view of VRAM at `addr` that the caller owns (an expert pool slot),
+        /// so lookups such as a prompt chunk's find it. Not counted against the budget, never evicted here; `unpin`
+        /// before the slot changes. Nothing changes when the matrix already has an entry.
+        pub fn pin(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize, scale: f32, addr: u64) {
+            let k = data.as_ptr() as usize;
+            if self.ex.contains_key(&k) { return; }
+            let p = &mut self.parts[0];
+            p.ts.push(GpuTensor::new(ty, rows, cols, Buf::new(addr, data.len(), ())).with_scale(scale));
+            let i = p.ts.len() as u32 - 1;
+            self.ex.insert(k, self.exs.len());
+            self.exs.push((i, k, self.now, 0.0));
+            self.pinned.insert(k);
+        }
+        /// Drop the `pin` of the matrix at `data`.
+        pub fn unpin(&mut self, data: &[u8]) {
+            let k = data.as_ptr() as usize;
+            if !self.pinned.remove(&k) { return; }
+            let p = self.ex.remove(&k).unwrap();
+            let (i, ..) = self.exs.swap_remove(p);
+            if p < self.exs.len() { self.ex.insert(self.exs[p].1, p); }
+            let t = &mut self.parts[gpu_of(i)].ts[(i & (1 << SHIFT) - 1) as usize];
+            *t = GpuTensor::new(t.ty, 0, 0, Buf::new(0, 0, ()));
         }
         pub fn gemv(&self, i: u32, x: &[f32], y: &mut [f32], staged: Option<(&[u8], GgmlType, usize, usize, f32)>) {
             let p = &self.parts[if i == STAGED { 0 } else { gpu_of(i) }];

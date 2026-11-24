@@ -433,6 +433,17 @@ pub trait Backend: Send {
     /// Attention of a vision encoder: each of the `n` rows of `q` sees all `n` keys (no mask). `q`, `k`, `v` and `out`
     /// are f32 `[n][nh][hd]`.
     fn vit_attn(&self, _q: u64, _k: u64, _v: u64, _out: u64, _n: usize, _nh: usize, _hd: usize, _scale: f32) -> anyhow::Result<()> { anyhow::bail!("{}: vision attention not implemented", self.name()) }
+    /// Whether `ink_slots` and `ink_ffn_sum_mb` exist here.
+    fn ink_pool(&self) -> bool { false }
+    /// Inkling 2 decode with an expert pool: the lookup of `ink_route`'s experts in `table` (`slots`, `wh`), the
+    /// routing and on a miss `h` (nh floats, at word `h_off`) written to the CPU worker's mailbox `mb`.
+    fn ink_slots(&self, _ids: u64, _wts: u64, _table: u64, _slots: u64, _wh: u64, _h: u64, _mb: u64, _nh: usize, _h_off: usize, _step: u64, _k: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: no Inkling 2 expert pool kernels", self.name())
+    }
+    /// `ink_ffn_sum` of the pool's experts, plus the CPU worker's answer at word `y_off` of `mb` when one missed.
+    fn ink_ffn_sum_mb(&self, _acc: u64, _d: u64, _wh: u64, _k: usize, _n: usize, _mb: u64, _y_off: usize, _step: u64, _slots: u64) -> anyhow::Result<()> {
+        anyhow::bail!("{}: no Inkling 2 expert pool kernels", self.name())
+    }
     fn ink_route(&self, _logits: u64, _bias: u64, _ids: u64, _wts: u64, _gu_sc: u64, _dn_sc: u64, _gsc_out: u64, _n_expert: usize, _k: usize, _exp_scale: f32, _rows: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 router not implemented", self.name()) }
     /// Gyro files (`config::Hadamard`): each of `rows` rows of n floats at `x` (times silu(x) * u first when `u` is
     /// not 0) becomes H (s x) per `block` values, written to `out`, which may be `x`. `s`: the row's n signs as floats.
