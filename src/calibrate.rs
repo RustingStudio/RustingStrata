@@ -73,7 +73,7 @@ pub struct Measurement {
 }
 
 impl Measurement {
-    fn valid(&self) -> bool {
+    pub fn valid(&self) -> bool {
         [self.prefill_tok_s, self.decode_tok_s].iter().all(|v| v.is_finite() && *v > 0.0)
     }
 }
@@ -203,9 +203,10 @@ fn default_knobs(space: &[KnobSpec]) -> Knobs {
 
 /// Run the search. `measure` is called once per sample with the workload matrix; it should apply the knobs, take its
 /// own repetitions and return one measurement per workload. `baseline` has one measurement per workload, taken with
-/// the settings a user gets without a calibration file.
+/// `baseline_knobs` (the settings a user gets without a calibration file). The baseline competes in the search: a
+/// candidate slower than today's defaults must not be written as the winner.
 pub fn search<F>(space: &[KnobSpec], workloads: &[Workload], cfg: &SearchConfig, obj: &Objective,
-                baseline: Vec<Measurement>, mut measure: F) -> Result<SearchResult>
+                baseline_knobs: &Knobs, baseline: Vec<Measurement>, mut measure: F) -> Result<SearchResult>
 where F: FnMut(&Knobs, &[Workload]) -> Result<Vec<Measurement>>
 {
     anyhow::ensure!(!space.is_empty() && !workloads.is_empty(), "calibration needs a knob space and at least one workload");
@@ -214,6 +215,16 @@ where F: FnMut(&Knobs, &[Workload]) -> Result<Vec<Measurement>>
     while baselines.len() < workloads.len() { baselines.push(fallback.clone()); }
     let start = Instant::now();
     let mut trials: Vec<Trial> = Vec::new();
+    // The baseline is a real trial, measured outside the sample budget. Its ratios against itself are 1.0, so the
+    // search can never pick a slower point unless the baseline measurement itself failed.
+    trials.push(Trial {
+        knobs: baseline_knobs.clone(),
+        measurements: baseline.clone(),
+        score: aggregate_score(&baseline, &baselines, obj),
+        error: if baseline.iter().any(|m| m.valid()) { None } else { Some("baseline measurement failed".to_string()) },
+        elapsed_ms: 0,
+        workloads: workloads.len(),
+    });
     let mut used = 0usize;
 
     let mut evaluate = |knobs: &Knobs, subset: &[Workload]| -> Result<Trial> {
@@ -230,6 +241,8 @@ where F: FnMut(&Knobs, &[Workload]) -> Result<Vec<Measurement>>
     // One bench child per distinct (knob point, workload set): repeats cost a full model load and consume budget
     // without adding information. `seen` is shared by every stage, including all starts.
     let mut seen: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
+    // The baseline was measured outside the budget: never spend a sample repeating it.
+    seen.insert((baseline_knobs.label(), workloads.len()));
     let mut eval_unique = |knobs: &Knobs, subset: &[Workload]| -> Result<Option<Trial>> {
         if !seen.insert((knobs.label(), subset.len())) { return Ok(None); }
         evaluate(knobs, subset).map(Some)
@@ -339,6 +352,7 @@ mod tests {
     }
     fn workloads() -> Vec<Workload> { vec![Workload::new(128, 16, "prose"), Workload::new(512, 16, "prose")] }
     fn base() -> Measurement { Measurement { prefill_tok_s: 100.0, decode_tok_s: 20.0, ..Default::default() } }
+    fn baseline_knobs() -> Knobs { let mut k = Knobs::default(); k.set("chunk", 256.0); k.set("mtp", 0.0); k }
 
     #[test]
     fn objective_is_a_geometric_mean_of_two_signals() {
@@ -364,7 +378,7 @@ mod tests {
     fn search_respects_the_sample_budget_and_finds_the_best_region() {
         let mut calls = 0;
         let cfg = SearchConfig { samples: 12, coarse: 4, starts: 2, patience: 1, seed: 5 };
-        let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), vec![base(), base()], |k, _| {
+        let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), &baseline_knobs(), vec![base(), base()], |k, _| {
             calls += 1;
             let boost = if k.i("chunk") == Some(1024) { 2.0 } else { 1.0 } * if k.i("mtp") == Some(1) { 1.5 } else { 1.0 };
             Ok(vec![Measurement { prefill_tok_s: 100.0 * boost, decode_tok_s: 20.0 * boost, ..Default::default() }])
@@ -387,7 +401,7 @@ mod tests {
             KnobSpec::new("mtp", (0..8).map(|i| i as f64), false),
         ];
         let cfg = SearchConfig { samples: 40, coarse: 3, starts: 3, patience: 2, seed: 9 };
-        let r = search(&big, &workloads(), &cfg, &Objective::balanced(), vec![base(), base()], |k, _| {
+        let r = search(&big, &workloads(), &cfg, &Objective::balanced(), &baseline_knobs(), vec![base(), base()], |k, _| {
             let boost = 1.0 + k.i("chunk").unwrap() as f64 / 1000.0 + k.i("mtp").unwrap() as f64 / 100.0;
             Ok(vec![Measurement { prefill_tok_s: 100.0 * boost, decode_tok_s: 20.0 * boost, ..Default::default() }])
         }).unwrap();
@@ -397,7 +411,7 @@ mod tests {
     #[test]
     fn short_prompt_only_gains_cannot_win_the_search() {
         let cfg = SearchConfig { samples: 14, coarse: 6, starts: 3, patience: 1, seed: 3 };
-        let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), vec![base(), base()], |k, subset| {
+        let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), &baseline_knobs(), vec![base(), base()], |k, subset| {
             let mtp = k.i("mtp").unwrap();
             Ok(subset.iter().map(|w| {
                 let boost = if mtp == 1 { if w.pp == 128 { 2.0 } else { 0.25 } } else { 1.0 };
@@ -411,7 +425,7 @@ mod tests {
     #[test]
     fn failed_measurements_are_recorded_and_never_win() {
         let cfg = SearchConfig { samples: 8, coarse: 4, starts: 1, patience: 1, seed: 2 };
-        let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), vec![base(), base()], |k, _| {
+        let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), &baseline_knobs(), vec![base(), base()], |k, _| {
             if k.i("mtp") == Some(1) { anyhow::bail!("out of memory") }
             Ok(vec![base(), base()])
         }).unwrap();
@@ -422,7 +436,7 @@ mod tests {
     #[test]
     fn an_empty_baseline_still_allows_the_search_to_run() {
         let cfg = SearchConfig { samples: 10, coarse: 3, starts: 1, patience: 1, seed: 6 };
-        let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), vec![], |_, _| {
+        let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), &baseline_knobs(), vec![], |_, _| {
             Ok(vec![Measurement { prefill_tok_s: 100.0, decode_tok_s: 20.0, ..Default::default() }])
         }).unwrap();
         assert!(r.best.error.is_none());
@@ -432,7 +446,7 @@ mod tests {
     #[test]
     fn the_same_knob_point_is_never_measured_twice() {
         let cfg = SearchConfig { samples: 60, coarse: 6, starts: 3, patience: 2, seed: 7 };
-        let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), vec![base(), base()], |k, _| {
+        let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), &baseline_knobs(), vec![base(), base()], |k, _| {
             let boost = 1.0 + k.i("chunk").unwrap() as f64 / 10000.0 + k.i("mtp").unwrap() as f64 / 10.0;
             Ok(vec![Measurement { prefill_tok_s: 100.0 * boost, decode_tok_s: 20.0 * boost, ..Default::default() }])
         }).unwrap();
@@ -446,11 +460,24 @@ mod tests {
     fn every_start_converging_is_recorded_as_converged() {
         // A flat landscape: no move ever improves, so all starts stop on patience before the budget is used.
         let cfg = SearchConfig { samples: 60, coarse: 3, starts: 2, patience: 2, seed: 4 };
-        let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), vec![base(), base()], |_, _| {
+        let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), &baseline_knobs(), vec![base(), base()], |_, _| {
             Ok(vec![base(), base()])
         }).unwrap();
         assert!(r.samples_used < cfg.samples, "should stop early: {}", r.samples_used);
         assert_eq!(r.stop_reason, "converged");
+    }
+
+    #[test]
+    fn a_slower_candidate_can_never_beat_the_baseline() {
+        let cfg = SearchConfig { samples: 20, coarse: 6, starts: 3, patience: 2, seed: 11 };
+        let base_knobs = baseline_knobs();
+        let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), &base_knobs,
+                       vec![base(), base()], |_, _| {
+            Ok(vec![Measurement { prefill_tok_s: 50.0, decode_tok_s: 10.0, ..Default::default() }])
+        }).unwrap();
+        assert_eq!(r.best.knobs, base_knobs, "a slower point must not be written");
+        assert!((r.best.score - 1.0).abs() < 1e-9, "the baseline wins at score 1.0");
+        assert!(r.trials.iter().any(|t| t.knobs == base_knobs && t.score == 1.0));
     }
 
     #[test]

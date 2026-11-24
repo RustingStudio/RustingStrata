@@ -113,8 +113,10 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 - `--chunk`, `--threads` prefill chunk size and CPU expert threads. On a GPU `--threads` defaults to the physical
   core count (SMT siblings only add contention; on the 6-core/12-thread reference machine 6 beats 12 by ~20%).
   `rustingstrata calibrate` measures the best chunk, draft count and short-prompt threshold and later runs read them
-  from `~/.cache/rusting_strata/strata-<model>.json` unless flags override. See [CALIBRATION.md](CALIBRATION.md) for
-  the budgeted search and the `calibrate spec` sweep.
+  from `~/.cache/rusting_strata/strata-<model>[-backend][-dev…].json` unless flags override. The suffix uses the
+  backend that actually opened (so a CUDA to Vulkan fallback writes the Vulkan file). The models with their own
+  forward are calibrated too; see [CALIBRATION.md](CALIBRATION.md) for the budgeted search and the `calibrate spec`
+  sweep.
   `XDG_CACHE_HOME` moves that folder to `$XDG_CACHE_HOME/rusting_strata` (on Windows it is
   `%LOCALAPPDATA%\rusting_strata`). In a container, set it to a mounted path: `docker run --rm` otherwise discards
   the file on exit, and the next container runs uncalibrated. The file names the GPU it was measured on, and a file
@@ -240,19 +242,12 @@ first, which is not the order of `nvidia-smi`), on Vulkan too; the other Vulkan 
 integrated ones. The load prints the card of every index (`cuda device 1: ...` or `vulkan device 1: ...`).
 
 The split by free VRAM does not know which card is faster or which sits on a slow PCIe link (x1 riser, x4 slot).
-`rustingstrata calibrate --model M.gguf --device 0,1` measures it: it times prefill and decode with the split by free
-VRAM, then with layers moved from one card to the other in steps of 15% of the layers, and follows the faster
-direction for up to three rounds. A split that is more than 3% faster (prefill tok/s times decode tok/s; each split line prints this product as
-a share of the best one so far) is written to the calibration file as layers per card, and later runs with the same
-cards in the same `--device` order load with it.
-A card with fewer layers keeps more of their experts in VRAM, so fewer are uploaded to it during prefill, and the other
-card then keeps fewer of its own: the timings decide. The order of the cards is not searched: to compare, calibrate
-`--device 1,0` too. Each order has its own file (`strata-<model>-dev0-1.json`, `-dev1-0.json`), and a run uses the
-file of the order it is given.
-
-`--split 30,70` (or `STRATA_SPLIT=30,70`) sets the share of the layers per card by hand, in `--device` order, and
-takes precedence over the calibrated split; `calibrate --split 30,70` measures chunk and drafts with that split and
-stores it. The load prints each card's layers and its measured host-to-VRAM copy rate. AMD cards clock down in the gaps while the other card works; `echo high >
+`--split 30,70` (or `STRATA_SPLIT=30,70`) sets the share of the layers per card by hand, in `--device` order; the load
+prints each card's layers and its measured host-to-VRAM copy rate. `rustingstrata calibrate` does not measure or write
+a split: it times the chunk, drafts and short-prompt threshold with the split the run will use, and `--split` is
+accepted for symmetry but ignored with a note. To compare card orders, calibrate `--device 1,0` too: each order has
+its own file (`strata-<model>-dev0-1.json`, `-dev1-0.json`), and a run uses the file of the order it is given.
+AMD cards clock down in the gaps while the other card works; `echo high >
 /sys/class/drm/cardN/device/power_dpm_force_performance_level` (as root, per card) took a two-card split from 44 to 57
 tok/s in one report.
 

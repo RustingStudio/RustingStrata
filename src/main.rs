@@ -355,6 +355,19 @@ impl Runner<'_> {
     }
 }
 
+/// Chunk variables an `own_calib` call set, with the value each had before it. `serve` loads several models in one
+/// process; without restoring them, a model with no calibration runs with the previous model's chunk.
+static CALIB_ENV: std::sync::Mutex<Vec<(&'static str, Option<std::ffi::OsString>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Undo the chunk variables set by the previous `own_calib` call, before a new model applies its own calibration.
+fn restore_calib_env() {
+    let saved = std::mem::take(&mut *CALIB_ENV.lock().unwrap_or_else(|e| e.into_inner()));
+    for (key, old) in saved {
+        // SAFETY: called before a model is loaded, before any thread of that model reads these variables.
+        unsafe { match old { Some(v) => std::env::set_var(key, v), None => std::env::remove_var(key) } }
+    }
+}
+
 impl Engine {
     /// Hand `--backend`, `--device`, and `--kv` to the DeepSeek, GLM, Gemma 4 and Inkling 2 paths.
     fn ds_env(&self) {
@@ -370,18 +383,25 @@ impl Engine {
     /// searched (they are memory choices), so this never touches the global CTX: doing that once made an explicit
     /// --ctx look implicit to the main engine's runner.
     fn own_calib(&self, model: &Path) {
+        restore_calib_env();
         let Ok(g) = Gguf::open(model) else { return };
         let arch = g.get("general.architecture").ok().and_then(|v| v.as_str()).unwrap_or("");
         if !rusting_strata::config::OWN_ARCHS.contains(&arch) { return; }
-        let path = calibration_path(model, self.backend.as_deref().unwrap_or("cuda"), &self.device);
-        let (Ok(bytes), Some(&d)) = (std::fs::read(&path), self.device.first()) else { return };
+        // Like `runner`, look up the file under the backend that really opened: with no --backend, CUDA may fall
+        // back to Vulkan, and `calibrate` writes the file under that name.
+        let Some(&d) = self.device.first() else { return };
+        let Ok(b) = backend::open(self.backend.as_deref(), d) else { return };
+        let path = calibration_path(model, b.name(), &self.device);
+        let Ok(bytes) = std::fs::read(&path) else { return };
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return };
-        let gpu = backend::open(self.backend.as_deref(), d).ok().map(|b| b.device().to_string()).unwrap_or_default();
+        let gpu = b.device();
         if !calibration_fits(&v, &gpu) { return; }
         if v["bytes"].as_u64().is_some_and(|n| std::fs::metadata(model).is_ok_and(|m| m.len() != n)) { return; }
         // GLM reads its own variable, Gemma 4 its own, the others read STRATA_DS_CHUNK. Explicit values win.
         if let Some(n) = v["chunk"].as_u64() {
+            let mut saved = CALIB_ENV.lock().unwrap_or_else(|e| e.into_inner());
             for (k, value) in chunk_env_updates(n as usize, |k| std::env::var_os(k).is_some()) {
+                saved.push((k, std::env::var_os(k)));
                 unsafe { std::env::set_var(k, value); }
             }
         }
@@ -2522,19 +2542,43 @@ fn model_has_mtp(g: &Gguf, aux: bool) -> bool {
     nextn > 0 || g.meta.keys().any(|k| k.starts_with("dflash.") || k.starts_with("eagle3."))
 }
 
+/// The chunk a user gets without a calibration file. `None`: the engine prefills one token at a time and reads no
+/// chunk at all, so there is no chunk to search and none to write.
+fn arch_default_chunk(arch: &str) -> Option<usize> {
+    if arch == "gemma4" { Some(256) }
+    else if arch == "glm5-next" { Some(512) }
+    else if arch == rusting_strata::hy4::ARCH { Some(1024) }
+    else if rusting_strata::inkling2::is_arch(arch) { Some(256) }  // its GPU prefill clamps to 256
+    else if arch == "deepseek41" { None }
+    else { Some(4096) }
+}
+
 /// The search space. Context and KV format are deliberately absent: they are memory choices the user makes, not
 /// speed knobs to be silently changed by a calibration. An own-arch model only has its chunk (read from the
 /// environment at prefill time); main-engine models also have MTP drafts and the short-prompt threshold.
 fn build_space(arch: &str, s: &CalibSettings, has_mtp: bool) -> Vec<KnobSpec> {
     let own = rusting_strata::config::OWN_ARCHS.contains(&arch);
-    // A chunk larger than the context cannot be used: drop it instead of spending samples on guaranteed failures.
-    let mut chunks: Vec<f64> = s.chunk_values.iter().map(|n| *n as f64).filter(|&c| c <= s.ctx as f64).collect();
-    if s.ctx >= 4096 && !chunks.contains(&4096.0) { chunks.push(4096.0); } // today's default is the baseline
-    if chunks.is_empty() { chunks.push(s.ctx as f64); }
-    let mut space = vec![KnobSpec::new("chunk", chunks, false)];
+    let mut space = Vec::new();
+    if let Some(default_chunk) = arch_default_chunk(arch) {
+        // A chunk larger than the context cannot be used: drop it instead of spending samples on guaranteed failures.
+        let mut chunks: Vec<f64> = s.chunk_values.iter().map(|n| *n as f64).filter(|&c| c <= s.ctx as f64).collect();
+        // Inkling 2 clamps its GPU chunk to 256: larger values measure the same point under another label.
+        if rusting_strata::inkling2::is_arch(arch) { chunks.retain(|&c| c <= 256.0); }
+        // The engine's own default must be in the space; otherwise the baseline would be a point nobody searches.
+        if default_chunk <= s.ctx && !chunks.contains(&(default_chunk as f64)) { chunks.push(default_chunk as f64); }
+        if chunks.is_empty() { chunks.push(s.ctx.min(default_chunk) as f64); }
+        chunks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        space.push(KnobSpec::new("chunk", chunks, false));
+    }
     if !own {
         let mtp: Vec<f64> = if has_mtp { vec![0.0, 1.0, 2.0, 4.0] } else { vec![0.0] };
-        let short: Vec<f64> = vec![16.0, 32.0, 64.0, 128.0];
+        // `short` skips chunked prefill for prompts shorter than the threshold. The old 16/32/64/128 candidates
+        // never crossed a workload depth (128/512/2048), so every candidate measured the same timings. One
+        // threshold just above each --pp depth flips exactly that depth into the short path; 32 is the default.
+        let mut short: Vec<f64> = vec![32.0];
+        short.extend(s.pp.iter().map(|&pp| pp.saturating_add(1) as f64));
+        short.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        short.dedup();
         debug_assert!(short.contains(&32.0));
         space.push(KnobSpec::new("mtp", mtp, false));
         space.push(KnobSpec::new("short", short, false));
@@ -2551,13 +2595,15 @@ fn check_workload_ctx(s: &CalibSettings) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The baseline must be what a user runs today without a calibration file: chunk 4096, short 32, all the physical
-/// cores (left to the engine's own default), and no drafts. Not the first point of the search space.
-fn baseline_knobs(space: &[KnobSpec]) -> Knobs {
+/// The baseline must be what a user runs today without a calibration file: the engine's own chunk (4096 for the
+/// main engine, 256/512/1024 for Gemma 4/GLM/Hy4, 256 for Inkling 2, none for DeepSeek), short 32, the physical
+/// core count (left to the engine's own default), and no drafts. Not the first point of the search space.
+fn baseline_knobs(space: &[KnobSpec], arch: &str) -> Knobs {
     let mut k = Knobs::default();
+    let default_chunk = arch_default_chunk(arch).unwrap_or(4096) as f64;
     for s in space {
         let v = match s.name.as_str() {
-            "chunk" => 4096.0,
+            "chunk" => default_chunk,
             "short" => 32.0,
             "mtp" => 0.0,
             _ => s.values.first().copied().unwrap_or(0.0),
@@ -2567,17 +2613,17 @@ fn baseline_knobs(space: &[KnobSpec]) -> Knobs {
     k
 }
 
-/// Write the small file that later runs read, keeping every key of the v1 format. The full trace is written beside it
-/// when `--out` is given, so a calibration can be audited or reproduced from its seed.
-/// Readers of the calibration file use the --backend flag, or "cuda" when it is absent. Write under that same name:
-/// the backend reported by a bench child (e.g. vulkan) would produce a file no run ever looks for.
-fn calib_backend_name(s: &CalibSettings) -> String {
-    s.backend.clone().unwrap_or_else(|| "cuda".into())
+/// The backend a run will look up: the one the bench child really opened, not the `--backend` request. Without a
+/// request CUDA falls back to Vulkan on some machines; writing under "cuda" would make every run miss the file.
+/// The request is only a fallback when nothing was measured.
+fn calib_backend_name(s: &CalibSettings, measured: &RefCell<String>) -> String {
+    let real = measured.borrow().clone();
+    if real.is_empty() { s.backend.clone().unwrap_or_else(|| "cuda".into()) } else { real }
 }
 
 /// The physical device the search measured on, for the v1 `gpu` compatibility check.
-fn calib_gpu_name(s: &CalibSettings) -> String {
-    s.device.first().and_then(|&d| backend::open(s.backend.as_deref(), d).ok())
+fn calib_gpu_name(s: &CalibSettings, backend_name: &str) -> String {
+    s.device.first().and_then(|&d| backend::open(Some(backend_name), d).ok())
         .map(|b| b.device().to_string()).unwrap_or_default()
 }
 
@@ -2595,6 +2641,30 @@ fn write_report(s: &CalibSettings, result: &calibrate::SearchResult) -> anyhow::
 /// The v2 search does not measure a layer split, so a stale v1 `split` must not survive into the file it rewrites.
 fn drop_split(v: &mut serde_json::Value) {
     if let Some(o) = v.as_object_mut() { o.remove("split"); }
+}
+
+/// An engine with no tunable knobs (DeepSeek reads no chunk) still gets a file: later runs stop warning and a later
+/// `calibrate spec` has somewhere to put its result. Only identity and measured rates are recorded; a stale chunk
+/// left by an older file of this name must not survive.
+fn write_knobless_calibration(s: &CalibSettings, baseline: &[Measurement], workloads: &[Workload], arch: &str,
+                              backend: &str, gpu: &str) -> anyhow::Result<PathBuf> {
+    let path = calibration_path(&s.model, backend, &s.device);
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let mut v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    drop_split(&mut v);
+    let first = baseline.iter().find(|m| m.valid()).cloned().unwrap_or_default();
+    v["schema"] = json!(2);
+    v["arch"] = json!(arch);
+    v["gpu"] = json!(gpu);
+    v["bytes"] = json!(std::fs::metadata(&s.model)?.len());
+    v["measured"] = json!({
+        "prefill_tok_s": round1(first.prefill_tok_s),
+        "decode_tok_s": round1(first.decode_tok_s),
+    });
+    v["workloads"] = serde_json::to_value(workloads)?;
+    if let Some(o) = v.as_object_mut() { for k in ["chunk", "mtp", "short", "best", "search"] { o.remove(k); } }
+    std::fs::write(&path, serde_json::to_string_pretty(&v)?)?;
+    Ok(path)
 }
 
 fn write_calibration(s: &CalibSettings, result: &calibrate::SearchResult, workloads: &[Workload], arch: &str, backend: &str, gpu: &str) -> anyhow::Result<PathBuf> {
@@ -2670,21 +2740,35 @@ fn calibrate_v2(s: &CalibSettings) -> anyhow::Result<()> {
     say!("calibrate {arch}: {} workloads, {}-sample budget, scoring prefill and decode equally", workloads.len(), s.samples);
     for w in &workloads { say!("  {}", w.label()); }
     say!("knobs: {}", space.iter().map(|k| format!("{}=[{}]", k.name, k.values.iter().map(|v| format!("{v:.0}")).collect::<Vec<_>>().join(","))).collect::<Vec<_>>().join("  "));
-    say!("baseline (current defaults): {}", baseline_knobs(&space).label());
+    say!("baseline (current defaults): {}", baseline_knobs(&space, &arch).label());
     if s.dry_run { say!("dry run: no measurements taken"); return Ok(()); }
 
     let backend = RefCell::new(String::new());
     let mut measure = measure_fn(s, &backend);
-    let base_knobs = baseline_knobs(&space);
+    let base_knobs = baseline_knobs(&space, &arch);
     say!("baseline (current defaults): {}", base_knobs.label());
     let (baseline, ok) = baseline_samples(measure(&base_knobs, &workloads));
-    if !ok { say!("warning: baseline failed (e.g. OOM at chunk 4096); searching from a neutral reference"); }
+    if !ok { say!("warning: baseline failed (e.g. OOM at the default chunk); searching from a neutral reference"); }
+    let backend_name = calib_backend_name(s, &backend);
+    let gpu = calib_gpu_name(s, &backend_name);
+    if space.is_empty() {
+        let path = write_knobless_calibration(s, &baseline, &workloads, &arch, &backend_name, &gpu)?;
+        say!("{arch}: this engine reads no chunk, MTP count or short threshold; nothing to tune");
+        say!("written to {}", path.display());
+        return Ok(());
+    }
     let cfg = SearchConfig { samples: s.samples, coarse: (s.samples / 3).min(8), starts: 3, patience: 2, seed: s.seed };
-    let result = calibrate::search(&space, &workloads, &cfg, &Objective::balanced(), baseline, &mut measure)?;
+    let result = calibrate::search(&space, &workloads, &cfg, &Objective::balanced(), &base_knobs, baseline, &mut measure)?;
     anyhow::ensure!(result.best.error.is_none(), "no successful measurement; calibration not written");
+    // The baseline competes at score 1.0, so this only happens when the baseline measurement itself failed. Never
+    // write a setting that cannot be shown to beat the defaults.
+    if result.best.score < 1.0 {
+        say!("best score {:.3} is below today's defaults; keeping the defaults and not writing a calibration", result.best.score);
+        return Ok(());
+    }
     say!("best {}: score {:.3} vs baseline ({:.1} samples, {}, {:.1}s)", result.best.knobs.label(), result.best.score,
         result.samples_used, result.stop_reason, result.elapsed_ms as f64 / 1000.0);
-    let path = write_calibration(s, &result, &workloads, &arch, &calib_backend_name(s), &calib_gpu_name(s))?;
+    let path = write_calibration(s, &result, &workloads, &arch, &backend_name, &gpu)?;
     println!("{}\nwritten to {}", serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&path)?)?)?, path.display());
     Ok(())
 }
@@ -2730,12 +2814,17 @@ fn calibrate_spec(s: &CalibSettings) -> anyhow::Result<()> {
     if s.dry_run { say!("dry run: no measurements taken"); return Ok(()); }
     let backend = RefCell::new(String::new());
     let mut measure = measure_fn(s, &backend);
-    let (baseline, ok) = baseline_samples(measure(&spec_baseline(s), &workloads));
+    let base = spec_baseline(s);
+    let (baseline, ok) = baseline_samples(measure(&base, &workloads));
     if !ok { say!("warning: baseline failed; searching from a neutral reference"); }
-    say!("baseline (current defaults): {}", spec_baseline(s).label());
+    say!("baseline (current defaults): {}", base.label());
     let cfg = SearchConfig { samples: s.samples, coarse: (s.samples / 3).min(8), starts: 3, patience: 2, seed: s.seed };
-    let result = calibrate::search(&space, &workloads, &cfg, &Objective::balanced(), baseline, &mut measure)?;
+    let result = calibrate::search(&space, &workloads, &cfg, &Objective::balanced(), &base, baseline, &mut measure)?;
     anyhow::ensure!(result.best.error.is_none(), "no successful spec measurement; calibration not written");
+    if result.best.score < 1.0 {
+        say!("best spec score {:.3} is below today's defaults; keeping the defaults and not writing a spec section", result.best.score);
+        return Ok(());
+    }
     let idx = |name: &str, len: usize| result.best.knobs.i(name).unwrap_or(0).min(len.saturating_sub(1));
     let mut spec = serde_json::Map::new();
     for (i, w) in workloads.iter().enumerate() {
@@ -2750,7 +2839,8 @@ fn calibrate_spec(s: &CalibSettings) -> anyhow::Result<()> {
             "acceptance_pct": share,
         }));
     }
-    let path = write_spec_calibration(s, &result, &arch, &calib_backend_name(s), &calib_gpu_name(s), &serde_json::Value::Object(spec))?;
+    let backend_name = calib_backend_name(s, &backend);
+    let path = write_spec_calibration(s, &result, &arch, &backend_name, &calib_gpu_name(s, &backend_name), &serde_json::Value::Object(spec))?;
     say!("spec sweep written to {}", path.display());
     Ok(())
 }
@@ -4276,9 +4366,13 @@ mod calibrate_cli_tests {
     #[test]
     fn the_calibration_file_is_named_like_the_reader_looks_for_it() {
         let mut s = CalibSettings::new(PathBuf::from("m.gguf"));
-        assert_eq!(calib_backend_name(&s), "cuda");
-        s.backend = Some("vulkan".into());
-        assert_eq!(calib_backend_name(&s), "vulkan");
+        let measured = RefCell::new(String::new());
+        assert_eq!(calib_backend_name(&s, &measured), "cuda");
+        // CUDA requested but Vulkan really opened: runs look for the Vulkan file, so that is where we write.
+        *measured.borrow_mut() = "vulkan".into();
+        assert_eq!(calib_backend_name(&s, &measured), "vulkan");
+        s.backend = Some("cuda".into());
+        assert_eq!(calib_backend_name(&s, &measured), "vulkan");
     }
 
     #[test]
@@ -4307,6 +4401,18 @@ mod calibrate_cli_tests {
         assert_eq!(kept.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
                    vec!["STRATA_GLM_CHUNK", "STRATA_G4_CHUNK"]);
         assert!(chunk_env_updates(512, |_| true).is_empty());
+    }
+
+    #[test]
+    fn calibration_chunk_environment_is_restored_for_the_next_model() {
+        const KEY: &str = "STRATA_TEST_CALIB_RESTORE";
+        let original = std::env::var_os(KEY);
+        unsafe { std::env::remove_var(KEY) }
+        CALIB_ENV.lock().unwrap().push((KEY, original.clone()));
+        unsafe { std::env::set_var(KEY, "256") }
+        assert_eq!(std::env::var_os(KEY).as_deref(), Some(std::ffi::OsStr::new("256")));
+        restore_calib_env();
+        assert_eq!(std::env::var_os(KEY), original, "the next model must not inherit this chunk");
     }
 
     #[test]
@@ -4416,7 +4522,7 @@ mod calibrate_cli_tests {
         let main = build_space("qwen35moe", &s, true);
         let names: Vec<_> = main.iter().map(|k| k.name.as_str()).collect();
         assert_eq!(names, vec!["chunk", "mtp", "short"]);
-        let base = baseline_knobs(&main);
+        let base = baseline_knobs(&main, "qwen35moe");
         assert_eq!((base.i("chunk"), base.i("mtp"), base.i("short")), (Some(4096), Some(0), Some(32)));
 
         // No MTP head: don't spend samples on drafts that the engine cannot use.
@@ -4439,6 +4545,38 @@ mod calibrate_cli_tests {
         assert!(!chunks.is_empty());
         s.ctx = 4096;
         assert!(build_space("qwen35moe", &s, true)[0].values.contains(&4096.0));
+    }
+
+    #[test]
+    fn the_baseline_chunk_is_each_engines_own_default() {
+        let s = CalibSettings::new(PathBuf::from("m.gguf"));
+        for (arch, want) in [("gemma4", 256), ("glm5-next", 512), ("hy_v4_flash", 1024),
+                             ("inkling2_loop", 256), ("inkling2", 256), ("qwen35moe", 4096)] {
+            let space = build_space(arch, &s, true);
+            let base = baseline_knobs(&space, arch);
+            assert_eq!(base.i("chunk"), Some(want), "{arch}");
+            assert!(space[0].values.contains(&(want as f64)), "{arch} baseline must be searchable");
+        }
+        // DeepSeek prefills one token at a time: there is no chunk to search or write.
+        assert!(build_space("deepseek41", &s, true).is_empty());
+        assert_eq!(arch_default_chunk("deepseek41"), None);
+    }
+
+    #[test]
+    fn inkling_chunks_larger_than_its_gpu_cap_are_not_searched() {
+        let s = CalibSettings::new(PathBuf::from("m.gguf"));
+        let space = build_space("inkling2_loop", &s, false);
+        assert!(space[0].values.iter().all(|&c| c <= 256.0), "{:?}", space[0].values);
+    }
+
+    #[test]
+    fn short_candidates_cross_the_workload_depths() {
+        let s = CalibSettings::new(PathBuf::from("m.gguf"));
+        let space = build_space("qwen35moe", &s, true);
+        let short = &space.last().unwrap().values;
+        assert_eq!(short, &vec![32.0, 129.0, 513.0, 2049.0]);
+        // Every threshold above its depth makes that workload take the short path; none is inert.
+        for &pp in &s.pp { assert!(short.iter().any(|&t| t > pp as f64 && t <= (pp + 1) as f64)); }
     }
 
     #[test]

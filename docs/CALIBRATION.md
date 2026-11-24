@@ -42,11 +42,15 @@ score = sqrt((prefill / baseline_prefill) · (decode / baseline_decode))
 ```
 
 An arithmetic mean would let a huge gain in one signal hide a regression in the other. Ratios are clamped to
-`[1e-3, 1e3]` so a failed measurement cannot produce infinities. Time to first token is *not* a separate signal: for
-greedy decoding the first token's logits come out of the prefill, so TTFT would just reweight prefill.
+`[1e-3, 1e3]` so a failed measurement cannot produce infinities. Several workloads are combined with a geometric mean,
+so every prompt depth counts equally. Time to first token is *not* a separate signal: for greedy decoding the first
+token's logits come out of the prefill, so TTFT would just reweight prefill.
 
-The baseline is what a user gets today **without** a calibration file: chunk 4096, short-prompt threshold 32, all
-physical cores and no drafts. The reported score is relative to that, not to the first point of the search space.
+The baseline is what a user gets today **without** a calibration file: the engine's own chunk — 4096 for the main
+engine, 256 (Gemma 4), 512 (GLM), 1024 (Hy4) and 256 (Inkling 2, which clamps its GPU prefill to that size) for the
+architectures with their own forward, and no chunk at all for DeepSeek, which prefills one token at a time. Where the
+knobs apply, the baseline also uses short-prompt threshold 32, the physical core count and no drafts. The reported
+score is relative to that, not to the first point of the search space.
 
 Context length and KV format are deliberately not searched. They are memory choices the user makes; a noisy speed
 win must not silently double someone's KV cache. `--ctx` and `--kv` only set the conditions of the measurement.
@@ -70,7 +74,10 @@ rustingstrata calibrate --model $M --task prose --task user:prompts.txt --pp 256
 
 The search is deterministic for a given `--seed` and bounded by `--samples`:
 
-1. **Baseline** — current defaults, measured on the full workload matrix (not counted in the budget).
+1. **Baseline** — current defaults, measured on the full workload matrix (not counted in the budget). It is also a
+   trial in the search, so a candidate that scores below it cannot win. If no candidate beats it, no calibration is
+   written and the defaults stay in force. A failed baseline warns and scores against a neutral `1x` reference; such a
+   run writes a file only when a point beats that reference.
 2. **Coarse sweep** — up to `min(samples/3, 8)` points from a low-discrepancy (radical-inverse) sequence over the
    joint knob space. Their scores only pick starting points; they are never compared with full-matrix scores and
    cannot win.
@@ -80,24 +87,32 @@ The search is deterministic for a given `--seed` and bounded by `--samples`:
 4. **Final polish** — one more pass over the cheap knobs from the overall winner.
 
 A candidate that fails (OOM, timeout, missing JSON fields) is recorded with its error and never wins; it still counts
-against the budget. `--timeout SECS` caps each sample. `--warmup N` adds an extra discarded run per sample; it is off
-by default because it loads the model a second time.
+against the budget. Every stage, including the final polish, draws from `--samples`; the baseline alone is outside the
+budget. `--reps N` repetitions happen inside one sample and do not consume extra samples. `--timeout SECS` caps each
+sample. `--warmup N` adds an extra discarded run per sample; it is off by default because it loads the model a second
+time.
 
 ### Knobs
 
 | knob | values | applies to |
 | --- | --- | --- |
-| `chunk` | `--chunk-values`, default `256,512,1024,2048,4096` | all architectures |
+| `chunk` | `--chunk-values`, default `256,512,1024,2048,4096` | main engine and Gemma 4, GLM, Hy4, Inkling 2 (capped at 256); DeepSeek has no chunk knob |
 | `mtp` | `0,1,2,4` | main-engine models with a draft head, otherwise `0` only |
-| `short` | `16,32,64,128` | main engine only |
+| `short` | 32 plus one threshold just above each `--pp` depth (default `32,129,513,2049`) | main engine only |
 
-Inkling 2, Hy4, GLM, DeepSeek and Gemma 4 read their chunk from the environment at prefill time, so `bench_sample`
-sets `STRATA_DS_CHUNK`, `STRATA_GLM_CHUNK` and `STRATA_G4_CHUNK` to the candidate value. Their engines apply a
-calibrated chunk the same way at load time. The main engine reads `chunk`, `mtp` and `short` from the file in the
-usual way.
+Each `short` threshold flips exactly one prompt depth into the short-prompt path: a prompt uses token-at-a-time
+prefill when it is shorter than the threshold. The old fixed `16/32/64/128` list was below every default workload
+depth, so no candidate changed anything and the value written was noise.
 
-Multi-GPU runs (pass `--device 0,1`) use the engine's free-VRAM layer split; the old layer-split sweep is not part of
-this workflow and `--split` is ignored with a note.
+Inkling 2, Hy4, GLM and Gemma 4 read their chunk from the environment at prefill time, so `bench_sample` sets
+`STRATA_DS_CHUNK`, `STRATA_GLM_CHUNK` and `STRATA_G4_CHUNK` to the candidate value. Their engines apply a calibrated
+chunk the same way at load time. In `serve`, those variables are restored before a different model is loaded, so a
+model without a calibration never inherits the previous model's chunk. DeepSeek prefills one token at a time and
+reads no chunk: its calibration records no chunk, MTP count or short threshold. The main engine reads `chunk`, `mtp`
+and `short` from the file in the usual way.
+
+Multi-GPU runs (pass `--device 0,1`) keep the engine's free-VRAM layer split; calibration does not measure or write a
+layer split, and `--split` is ignored with a note.
 
 ## Flags
 
@@ -144,8 +159,9 @@ run are left untouched.
 
 ## The calibration file
 
-The file keeps every v1 key (`chunk`, `mtp`, `short`, `ctx`, `gpu`, `bytes`, `measured`, `aux`, `split`), so older
-binaries still read it. v2 adds:
+The file keeps the v1 keys the engines read (`chunk`, `mtp`, `short`, `ctx`, `gpu`, `bytes`, `measured`, `aux`), so
+older binaries still read it. A stale v1 `split` is deliberately dropped: v2 does not measure a layer split and
+nothing writes that key. v2 adds:
 
 ```json
 {
@@ -168,6 +184,7 @@ binaries still read it. v2 adds:
 `strata-<model>-calib-report.json` with all trials, their knob points, measurements, errors and timings, useful for
 auditing a surprising result or comparing two seeds.
 
-The filename encodes backend and device order (`-vulkan`, `-dev0-1`), so calibrations for different setups do not
-overwrite each other. As before, `XDG_CACHE_HOME` moves the folder, and a file measured on another GPU or another
-file of the same name (different size) is ignored with a warning.
+The filename encodes the backend that **actually opened** and the device order (`-vulkan`, `-dev0-1`), so a CUDA
+to Vulkan fallback writes the file the runs will look for, and calibrations for different setups do not overwrite
+each other. As before, `XDG_CACHE_HOME` moves the folder, and a file measured on another GPU or another file of the
+same name (different size) is ignored with a warning.
