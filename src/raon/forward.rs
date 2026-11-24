@@ -2,7 +2,7 @@
 //! layers, SiTU-GLU dense/MoE FFN + shared expert, and reasoning effort steering.
 //! Matvecs and routed experts reuse `crate::deepseek::mat` (CPU AVX2/AVX-512 + CUDA/Vulkan/HIP GPU).
 use super::RaonConfig;
-use crate::deepseek::mat::{Mat, matvec_many, matvec_many_opt, matvec_rows, vec_f32};
+use crate::deepseek::mat::{Mat, matvec_many, matvec_many_cpu, matvec_many_cpu_shared, matvec_many_opt, matvec_rows, matvec_rows_many, matvec_rows_sets, situ_experts_split, vec_f32};
 use crate::deepseek::ops::rms_norm_w;
 use crate::gguf::Gguf;
 use crate::quant::GgmlType;
@@ -40,8 +40,6 @@ struct MlaWeights<'a> {
     q_b: Mat<'a>,
     kv_a: Mat<'a>,
     kv_a_norm: Vec<f32>,
-    k_b: Mat<'a>,
-    v_b: Mat<'a>,
     k_groups: Vec<Mat<'a>>,
     v_groups: Vec<Mat<'a>>,
     gate: Mat<'a>,
@@ -288,34 +286,78 @@ pub fn route(logits: &[f32], bias: &[f32], top_k: usize, renorm: bool, scale: f3
     out
 }
 
-fn run_experts(list: &[(Mat, Mat, Mat, f32)], x: &[f32], gate_beta: f32, value_beta: f32, n: usize) -> Vec<f32> {
+fn run_experts_gpu(list: &[(Mat, Mat, Mat, f32)], x: &[f32], gate_beta: f32, value_beta: f32, n: usize) -> Vec<f32> {
     let mut mix = vec![0.0f32; n];
     let Some(first) = list.first() else { return mix };
     let (k, nf) = (list.len(), first.0.rows);
-    let batched = list.iter().all(|e| e.0.gpu.is_some()).then(|| {
-        let gu: Vec<Mat> = list.iter().map(|e| e.0).chain(list.iter().map(|e| e.1)).collect();
+    let gs: Vec<Mat> = list.iter().map(|e| e.0).collect();
+    let us: Vec<Mat> = list.iter().map(|e| e.1).collect();
+    let ds: Vec<Mat> = list.iter().map(|e| e.2).collect();
+    let dy = situ_experts_split(&gs, &us, &ds, x, gate_beta, value_beta).or_else(|| {
+        let gu: Vec<Mat> = gs.into_iter().chain(us).collect();
         let y = matvec_many_opt(&gu, x, 0)?;
         let a: Vec<f32> = (0..k * nf).map(|i| situ_glu(y[i], y[k * nf + i], gate_beta, value_beta)).collect();
-        matvec_many_opt(&list.iter().map(|e| e.2).collect::<Vec<_>>(), &a, nf)
-    }).flatten();
-    match batched {
-        Some(dy) => {
+        matvec_many_opt(&ds, &a, nf)
+    });
+    if let Some(dy) = dy {
+        for (i, e) in list.iter().enumerate() {
+            for j in 0..n { mix[j] += e.3 * dy[i * n + j]; }
+        }
+    } else {
+        return run_experts_cpu(list, x, gate_beta, value_beta, n);
+    }
+    mix
+}
+
+fn run_experts_cpu(list: &[(Mat, Mat, Mat, f32)], x: &[f32], gate_beta: f32, value_beta: f32, n: usize) -> Vec<f32> {
+    let mut mix = vec![0.0f32; n];
+    let Some(first) = list.first() else { return mix };
+    let (k, nf) = (list.len(), first.0.rows);
+    let gu: Vec<Mat> = list.iter().map(|e| e.0).chain(list.iter().map(|e| e.1)).collect();
+    let ds: Vec<Mat> = list.iter().map(|e| e.2).collect();
+    if let Some(y) = matvec_many_cpu_shared(&gu, x) {
+        let a: Vec<f32> = (0..k * nf).map(|i| situ_glu(y[i], y[k * nf + i], gate_beta, value_beta)).collect();
+        let xs: Vec<&[f32]> = a.chunks_exact(nf).collect();
+        if let Some(dy) = matvec_many_cpu(&ds, &xs) {
             for (i, e) in list.iter().enumerate() {
                 for j in 0..n { mix[j] += e.3 * dy[i * n + j]; }
             }
-        }
-        None => {
-            let (mut gy, mut uy, mut dy) = (vec![0.0f32; nf], vec![0.0f32; nf], vec![0.0f32; n]);
-            for (g, u, d, w) in list {
-                g.matvec(x, &mut gy);
-                u.matvec(x, &mut uy);
-                for (gv, uv) in gy.iter_mut().zip(&uy) { *gv = situ_glu(*gv, *uv, gate_beta, value_beta); }
-                d.matvec(&gy, &mut dy);
-                for j in 0..n { mix[j] += w * dy[j]; }
-            }
+            return mix;
         }
     }
+    let (mut gy, mut uy, mut dy) = (vec![0.0f32; nf], vec![0.0f32; nf], vec![0.0f32; n]);
+    for (g, u, d, w) in list {
+        g.matvec(x, &mut gy);
+        u.matvec(x, &mut uy);
+        for (gv, uv) in gy.iter_mut().zip(&uy) { *gv = situ_glu(*gv, *uv, gate_beta, value_beta); }
+        d.matvec(&gy, &mut dy);
+        for j in 0..n { mix[j] += w * dy[j]; }
+    }
     mix
+}
+
+fn run_experts(list: &[(Mat, Mat, Mat, f32)], x: &[f32], gate_beta: f32, value_beta: f32, n: usize) -> Vec<f32> {
+    let (mut gpu_list, mut cpu_list) = (Vec::with_capacity(list.len()), Vec::new());
+    for &e in list {
+        if e.0.gpu.is_some() && e.1.gpu.is_some() && e.2.gpu.is_some() {
+            gpu_list.push(e);
+        } else {
+            cpu_list.push(e);
+        }
+    }
+    match (gpu_list.is_empty(), cpu_list.is_empty()) {
+        (true, true) => vec![0.0f32; n],
+        (false, true) => run_experts_gpu(&gpu_list, x, gate_beta, value_beta, n),
+        (true, false) => run_experts_cpu(&cpu_list, x, gate_beta, value_beta, n),
+        (false, false) => {
+            let (mut g, c) = rayon::join(
+                || run_experts_gpu(&gpu_list, x, gate_beta, value_beta, n),
+                || run_experts_cpu(&cpu_list, x, gate_beta, value_beta, n),
+            );
+            for j in 0..n { g[j] += c[j]; }
+            g
+        }
+    }
 }
 
 impl<'a> RaonModel<'a> {
@@ -361,8 +403,6 @@ impl<'a> RaonModel<'a> {
                     q_b: m("attn_q_b")?,
                     kv_a: m("attn_kv_a_mqa")?,
                     kv_a_norm: v("attn_kv_a_norm")?,
-                    k_b,
-                    v_b,
                     k_groups,
                     v_groups,
                     gate: m("attn_gate")?,
@@ -484,14 +524,13 @@ impl<'a> RaonModel<'a> {
         let Attn::Rda(r) = &self.layers[il].attn else { unreachable!() };
         let (nh, hd) = (self.cfg.n_head, self.cfg.rda_hd);
         let d_inner = nh * hd;
-        let q_proj = matvec_rows(&r.wq, &[cur]);
-        let k_proj = matvec_rows(&r.wk, &[cur]);
-        let v_proj = matvec_rows(&r.wv, &[cur]);
-        let gate = matvec_rows(&r.g, &[cur]);
-        let beta_raw = matvec_rows(&r.beta, &[cur]);
-        let rda_delta = matvec_rows(&r.rda, &[cur]);
-        let f_a = matvec_rows(&r.f_a, &[cur]);
-        let mut decay = matvec_rows(&r.f_b, &[&f_a]);
+        let all = matvec_many(&[r.wq, r.wk, r.wv, r.g, r.beta, r.rda, r.f_a], cur, 0);
+        let (o1, o2, o3, o4) = (d_inner, 2 * d_inner, 3 * d_inner, 4 * d_inner);
+        let (o5, o6) = (o4 + r.beta.rows, o4 + r.beta.rows + r.rda.rows);
+        let (q_proj, k_proj, v_proj, gate) = (&all[..o1], &all[o1..o2], &all[o2..o3], &all[o3..o4]);
+        let (beta_raw, rda_delta, f_a) = (&all[o4..o5], &all[o5..o6], &all[o6..]);
+        let mut decay = vec![0.0f32; r.f_b.rows];
+        r.f_b.matvec(f_a, &mut decay);
         for (d, &b) in decay.iter_mut().zip(&r.dt_b) { *d += b; }
 
         let st = self.rda_states[il].as_mut().unwrap();
@@ -543,19 +582,18 @@ impl<'a> RaonModel<'a> {
 
     fn mla_step(&mut self, il: usize, cur: &[f32]) -> Vec<f32> {
         let Attn::Mla(a) = &self.layers[il].attn else { unreachable!() };
-        let (nh, kr, nr, kl, vl) = (self.cfg.n_head, self.cfg.kv_lora_rank, self.cfg.qk_rope_hd, self.cfg.mla_key_len, self.cfg.mla_val_len);
+        let (nh, kr, nr, kl) = (self.cfg.n_head, self.cfg.kv_lora_rank, self.cfg.qk_rope_hd, self.cfg.mla_key_len);
         let nope = kl - nr;
         let kw = kr + nr;
 
-        let mut qr_raw = vec![0.0f32; self.cfg.q_lora_rank];
-        a.q_a.matvec(cur, &mut qr_raw);
-        let mut qr = vec![0.0f32; self.cfg.q_lora_rank];
-        rms_norm_w(&qr_raw, &a.q_a_norm, self.cfg.latent_eps, &mut qr);
+        let proj = matvec_many(&[a.q_a, a.kv_a, a.gate], cur, 0);
+        let q_rank = self.cfg.q_lora_rank;
+        let (qr_raw, kv, g) = (&proj[..q_rank], &proj[q_rank..q_rank + kw], &proj[q_rank + kw..]);
+        let mut qr = vec![0.0f32; q_rank];
+        rms_norm_w(qr_raw, &a.q_a_norm, self.cfg.latent_eps, &mut qr);
         let mut q = vec![0.0f32; nh * kl];
         a.q_b.matvec(&qr, &mut q);
 
-        let mut kv = vec![0.0f32; kw];
-        a.kv_a.matvec(cur, &mut kv);
         let mut krow = vec![0.0f32; kw];
         rms_norm_w(&kv[..kr], &a.kv_a_norm, self.cfg.latent_eps, &mut krow[..kr]);
         krow[kr..].copy_from_slice(&kv[kr..]);
@@ -589,9 +627,7 @@ impl<'a> RaonModel<'a> {
         });
 
         let mut out = matvec_many(&a.v_groups, &att, kr);
-        let mut g = vec![0.0f32; nh * vl];
-        a.gate.matvec(cur, &mut g);
-        for (o, gv) in out.iter_mut().zip(&g) { *o *= sigmoid(*gv); }
+        for (o, &gv) in out.iter_mut().zip(g) { *o *= sigmoid(gv); }
         let mut y = vec![0.0f32; self.cfg.n_embd];
         a.wo.matvec(&out, &mut y);
         y
@@ -601,33 +637,49 @@ impl<'a> RaonModel<'a> {
         let (n, gb, vb) = (self.cfg.n_embd, self.cfg.situ_beta, self.cfg.situ_linear_beta);
         match &self.layers[il].ffn {
             Ffn::Dense { gate, up, down } => {
+                if let Some(y) = situ_experts_split(&[*gate], &[*up], &[*down], cur, gb, vb) {
+                    return y;
+                }
                 let nf = gate.rows;
-                let (mut gy, mut uy, mut y) = (vec![0.0f32; nf], vec![0.0f32; nf], vec![0.0f32; n]);
-                gate.matvec(cur, &mut gy);
-                up.matvec(cur, &mut uy);
-                for (g, u) in gy.iter_mut().zip(&uy) { *g = situ_glu(*g, *u, gb, vb); }
+                let gu = matvec_many(&[*gate, *up], cur, 0);
+                let mut gy = vec![0.0f32; nf];
+                for i in 0..nf { gy[i] = situ_glu(gu[i], gu[nf + i], gb, vb); }
+                let mut y = vec![0.0f32; n];
                 down.matvec(&gy, &mut y);
                 y
             }
             Ffn::Moe { gate_inp, bias, gexps, uexps, dexps, shared, effort_steer } => {
-                let mut logits = vec![0.0f32; gate_inp.rows];
-                gate_inp.matvec(cur, &mut logits);
+                let exp_nf = gexps.rows / self.cfg.n_expert;
+                let fold_shared = shared.is_some_and(|(sg, _, _)| sg.rows == exp_nf);
+                let (logits, shared_gu) = if !fold_shared && let Some((sg, su, _)) = shared {
+                    let all = matvec_many(&[*gate_inp, *sg, *su], cur, 0);
+                    let r = gate_inp.rows;
+                    (all[..r].to_vec(), Some(all[r..].to_vec()))
+                } else {
+                    let mut logits = vec![0.0f32; gate_inp.rows];
+                    gate_inp.matvec(cur, &mut logits);
+                    (logits, None)
+                };
                 let sel = route(&logits, bias, self.cfg.n_used, self.cfg.exp_norm, self.cfg.exp_scale);
-                let list: Vec<(Mat, Mat, Mat, f32)> = sel.into_iter()
+                let evict = std::env::var_os("STRATA_RAON_EVICT").is_some();
+                let mut list: Vec<(Mat, Mat, Mat, f32)> = sel.into_iter()
                     .map(|(e, w)| (
-                        gexps.expert_opt(e, self.cfg.n_expert, true),
-                        uexps.expert_opt(e, self.cfg.n_expert, true),
-                        dexps.expert_opt(e, self.cfg.n_expert, true),
+                        gexps.expert_opt(e, self.cfg.n_expert, evict),
+                        uexps.expert_opt(e, self.cfg.n_expert, evict),
+                        dexps.expert_opt(e, self.cfg.n_expert, evict),
                         w,
                     ))
                     .collect();
+                if fold_shared && let Some((sg, su, sd)) = shared {
+                    list.push((*sg, *su, *sd, 1.0));
+                }
                 let mut y = run_experts(&list, cur, gb, vb, n);
-                if let Some((sg, su, sd)) = shared {
+                if !fold_shared && let Some((sg, _, sd)) = shared {
                     let nf = sg.rows;
-                    let (mut gy, mut uy, mut sy) = (vec![0.0f32; nf], vec![0.0f32; nf], vec![0.0f32; n]);
-                    sg.matvec(cur, &mut gy);
-                    su.matvec(cur, &mut uy);
-                    for (g, u) in gy.iter_mut().zip(&uy) { *g = situ_glu(*g, *u, gb, vb); }
+                    let gu = shared_gu.unwrap();
+                    let mut gy = vec![0.0f32; nf];
+                    for i in 0..nf { gy[i] = situ_glu(gu[i], gu[nf + i], gb, vb); }
+                    let mut sy = vec![0.0f32; n];
                     sd.matvec(&gy, &mut sy);
                     for j in 0..n { y[j] += sy[j]; }
                 }
@@ -650,25 +702,39 @@ impl<'a> RaonModel<'a> {
         let mut flat = emb.repeat(hc);
         let mut normed = vec![0.0f32; n];
 
+        let prof = std::env::var_os("STRATA_RAON_PROF").is_some();
+        let (mut t_hc, mut t_rda, mut t_mla, mut t_ffn) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
         for il in 0..self.cfg.n_layer {
+            let t0 = std::time::Instant::now();
             let (cur, post, h_res) = self.hc_pre(&flat, &self.layers[il].hc_attn);
             rms_norm_w(&cur, &self.layers[il].attn_norm, self.cfg.eps, &mut normed);
+            let t1 = std::time::Instant::now();
             let attn_out = if self.cfg.is_rda[il] {
-                self.rda_step(il, &normed)
+                let y = self.rda_step(il, &normed);
+                t_rda += t1.elapsed().as_secs_f64() * 1e3;
+                y
             } else {
-                self.mla_step(il, &normed)
+                let y = self.mla_step(il, &normed);
+                t_mla += t1.elapsed().as_secs_f64() * 1e3;
+                y
             };
+            let t2 = std::time::Instant::now();
             self.hc_post(&mut flat, &attn_out, &post, &h_res);
 
             let (cur, post, h_res) = self.hc_pre(&flat, &self.layers[il].hc_ffn);
             rms_norm_w(&cur, &self.layers[il].ffn_norm, self.cfg.eps, &mut normed);
+            let t3 = std::time::Instant::now();
             let ffn_out = self.ffn_step(il, &normed);
+            t_ffn += t3.elapsed().as_secs_f64() * 1e3;
+            let t4 = std::time::Instant::now();
             self.hc_post(&mut flat, &ffn_out, &post, &h_res);
+            t_hc += (t1.duration_since(t0) + t3.duration_since(t2) + t4.elapsed()).as_secs_f64() * 1e3;
         }
 
         if !want_logits {
             return Vec::new();
         }
+        let t_out0 = std::time::Instant::now();
         let inv_hc = 1.0 / hc as f32;
         let mut cur = vec![0.0f32; n];
         for s in 0..hc {
@@ -677,6 +743,10 @@ impl<'a> RaonModel<'a> {
         rms_norm_w(&cur, &self.out_norm, self.cfg.eps, &mut normed);
         let mut logits = vec![0.0f32; self.out_w.rows];
         self.out_w.matvec(&normed, &mut logits);
+        if prof {
+            let t_out = t_out0.elapsed().as_secs_f64() * 1e3;
+            eprintln!("raon prof (ms): hc={t_hc:.1} rda={t_rda:.1} mla={t_mla:.1} ffn={t_ffn:.1} out={t_out:.1} total={:.1}", t_hc + t_rda + t_mla + t_ffn + t_out);
+        }
         logits
     }
 
@@ -696,10 +766,9 @@ impl<'a> RaonModel<'a> {
             emb.repeat(hc)
         }).collect();
 
-        let grouped = |m: &Mat<'a>, x: &[f32], nh: usize, w: usize| -> Vec<f32> {
-            let gs: Vec<Mat> = (0..nh).map(|h| m.group(h, nh)).collect();
+        let grouped = |gs: &[Mat<'a>], x: &[f32], nh: usize, w: usize| -> Vec<f32> {
             if nt < nh {
-                return x.chunks_exact(nh * w).flat_map(|xt| matvec_many(&gs, xt, w)).collect();
+                return x.chunks_exact(nh * w).flat_map(|xt| matvec_many(gs, xt, w)).collect();
             }
             let r = gs[0].rows;
             let mut y = vec![0.0f32; nt * nh * r];
@@ -720,7 +789,7 @@ impl<'a> RaonModel<'a> {
             let mix_w = self.layers[il].hc_attn.f.rows;
             let mut posts = Vec::with_capacity(nt);
             let mut h_ress = Vec::with_capacity(nt);
-            let mut normed_rows: Vec<Vec<f32>> = Vec::with_capacity(nt);
+            let mut normed_flat = vec![0.0f32; nt * n];
             for t in 0..nt {
                 let flat = &flats[t];
                 let inv = 1.0 / (flat.iter().map(|&v| v * v).sum::<f32>() / flat.len() as f32 + self.cfg.hc_eps).sqrt();
@@ -734,26 +803,24 @@ impl<'a> RaonModel<'a> {
                     let w = pre[s];
                     for j in 0..n { cur[j] += w * flat[s * n + j]; }
                 }
-                let mut nr = vec![0.0f32; n];
-                rms_norm_w(&cur, &self.layers[il].attn_norm, self.cfg.eps, &mut nr);
+                rms_norm_w(&cur, &self.layers[il].attn_norm, self.cfg.eps, &mut normed_flat[t * n..(t + 1) * n]);
                 posts.push(post);
                 h_ress.push(h_res);
-                normed_rows.push(nr);
             }
 
             // 2. Attention (batched RDA or batched MLA)
-            let nrefs: Vec<&[f32]> = normed_rows.iter().map(Vec::as_slice).collect();
             let attn_out_all = match &self.layers[il].attn {
                 Attn::Rda(r) => {
                     let (nh, hd) = (self.cfg.n_head, self.cfg.rda_hd);
                     let d_inner = nh * hd;
-                    let q_all = matvec_rows(&r.wq, &nrefs);
-                    let k_all = matvec_rows(&r.wk, &nrefs);
-                    let v_all = matvec_rows(&r.wv, &nrefs);
-                    let g_all = matvec_rows(&r.g, &nrefs);
-                    let b_all = matvec_rows(&r.beta, &nrefs);
-                    let d_all = matvec_rows(&r.rda, &nrefs);
-                    let fa_all = matvec_rows(&r.f_a, &nrefs);
+                    let all = matvec_rows_sets(
+                        &[(r.wq, 0), (r.wk, 0), (r.wv, 0), (r.g, 0), (r.beta, 0), (r.rda, 0), (r.f_a, 0)],
+                        &normed_flat, nt,
+                    );
+                    let (l1, l2, l3, l4) = (nt * d_inner, 2 * nt * d_inner, 3 * nt * d_inner, 4 * nt * d_inner);
+                    let (l5, l6) = (l4 + nt * r.beta.rows, l4 + nt * (r.beta.rows + r.rda.rows));
+                    let (q_all, k_all, v_all, g_all) = (&all[..l1], &all[l1..l2], &all[l2..l3], &all[l3..l4]);
+                    let (b_all, d_all, fa_all) = (&all[l4..l5], &all[l5..l6], &all[l6..]);
                     let fa_refs: Vec<&[f32]> = fa_all.chunks_exact(r.f_a.rows).collect();
                     let fb_all = matvec_rows(&r.f_b, &fa_refs);
 
@@ -804,7 +871,9 @@ impl<'a> RaonModel<'a> {
                 Attn::Mla(a) => {
                     let (nh, kr, nr, kl, vl) = (self.cfg.n_head, self.cfg.kv_lora_rank, self.cfg.qk_rope_hd, self.cfg.mla_key_len, self.cfg.mla_val_len);
                     let (nope, kw) = (kl - nr, kr + nr);
-                    let qr_raw = matvec_rows(&a.q_a, &nrefs);
+                    let proj = matvec_rows_sets(&[(a.q_a, 0), (a.kv_a, 0), (a.gate, 0)], &normed_flat, nt);
+                    let (l_q, l_kv) = (nt * self.cfg.q_lora_rank, nt * kw);
+                    let (qr_raw, kv_all, g_all) = (&proj[..l_q], &proj[l_q..l_q + l_kv], &proj[l_q + l_kv..]);
                     let mut qr = vec![0.0f32; qr_raw.len()];
                     for (src, dst) in qr_raw.chunks_exact(self.cfg.q_lora_rank).zip(qr.chunks_exact_mut(self.cfg.q_lora_rank)) {
                         rms_norm_w(src, &a.q_a_norm, self.cfg.latent_eps, dst);
@@ -812,7 +881,6 @@ impl<'a> RaonModel<'a> {
                     let q_refs: Vec<&[f32]> = qr.chunks_exact(self.cfg.q_lora_rank).collect();
                     let q = matvec_rows(&a.q_b, &q_refs);
 
-                    let kv_all = matvec_rows(&a.kv_a, &nrefs);
                     for kv in kv_all.chunks_exact(kw) {
                         let mut krow = vec![0.0f32; kw];
                         rms_norm_w(&kv[..kr], &a.kv_a_norm, self.cfg.latent_eps, &mut krow[..kr]);
@@ -820,7 +888,7 @@ impl<'a> RaonModel<'a> {
                         self.mla_keys[il].extend_from_slice(&krow);
                     }
 
-                    let qn = grouped(&a.k_b, &q, nh, kl);
+                    let qn = grouped(&a.k_groups, &q, nh, kl);
                     let scale = 1.0 / (kl as f32).sqrt();
                     let all_k = &self.mla_keys[il];
                     let mut att = vec![0.0f32; nt * nh * kr];
@@ -847,9 +915,8 @@ impl<'a> RaonModel<'a> {
                         }
                     });
 
-                    let mut out = grouped(&a.v_b, &att, nh, kr);
-                    let g_all = matvec_rows(&a.gate, &nrefs);
-                    for (o, &gv) in out.iter_mut().zip(&g_all) { *o *= sigmoid(gv); }
+                    let mut out = grouped(&a.v_groups, &att, nh, kr);
+                    for (o, &gv) in out.iter_mut().zip(g_all) { *o *= sigmoid(gv); }
                     let orefs: Vec<&[f32]> = out.chunks_exact(nh * vl).collect();
                     matvec_rows(&a.wo, &orefs)
                 }
@@ -865,7 +932,6 @@ impl<'a> RaonModel<'a> {
             let mix_w = self.layers[il].hc_ffn.f.rows;
             posts.clear();
             h_ress.clear();
-            normed_rows.clear();
             for t in 0..nt {
                 let flat = &flats[t];
                 let inv = 1.0 / (flat.iter().map(|&v| v * v).sum::<f32>() / flat.len() as f32 + self.cfg.hc_eps).sqrt();
@@ -879,26 +945,30 @@ impl<'a> RaonModel<'a> {
                     let w = pre[s];
                     for j in 0..n { cur[j] += w * flat[s * n + j]; }
                 }
-                let mut nr = vec![0.0f32; n];
-                rms_norm_w(&cur, &self.layers[il].ffn_norm, self.cfg.eps, &mut nr);
+                rms_norm_w(&cur, &self.layers[il].ffn_norm, self.cfg.eps, &mut normed_flat[t * n..(t + 1) * n]);
                 posts.push(post);
                 h_ress.push(h_res);
-                normed_rows.push(nr);
             }
 
             // 4. Batched FFN (dense or expert-deduplicated MoE + shared + effort steering)
-            let nrefs: Vec<&[f32]> = normed_rows.iter().map(Vec::as_slice).collect();
             let (gb, vb) = (self.cfg.situ_beta, self.cfg.situ_linear_beta);
             let ffn_out_all = match &self.layers[il].ffn {
                 Ffn::Dense { gate, up, down } => {
-                    let mut gy = matvec_rows(gate, &nrefs);
-                    let uy = matvec_rows(up, &nrefs);
-                    for (g, u) in gy.iter_mut().zip(&uy) { *g = situ_glu(*g, *u, gb, vb); }
+                    let gu = matvec_rows_sets(&[(*gate, 0), (*up, 0)], &normed_flat, nt);
+                    let half = nt * gate.rows;
+                    let gy: Vec<f32> = (0..half).map(|i| situ_glu(gu[i], gu[half + i], gb, vb)).collect();
                     let grefs: Vec<&[f32]> = gy.chunks_exact(gate.rows).collect();
                     matvec_rows(down, &grefs)
                 }
                 Ffn::Moe { gate_inp, bias, gexps, uexps, dexps, shared, effort_steer } => {
-                    let logits_all = matvec_rows(gate_inp, &nrefs);
+                    let (logits_all, shared_gu) = if let Some((sg, su, _)) = shared {
+                        let all = matvec_rows_sets(&[(*gate_inp, 0), (*sg, 0), (*su, 0)], &normed_flat, nt);
+                        let r = nt * gate_inp.rows;
+                        (all[..r].to_vec(), Some(all[r..].to_vec()))
+                    } else {
+                        let nrefs: Vec<&[f32]> = normed_flat.chunks_exact(n).collect();
+                        (matvec_rows(gate_inp, &nrefs), None)
+                    };
                     let mut by_e: std::collections::BTreeMap<usize, Vec<(usize, f32)>> = std::collections::BTreeMap::new();
                     for t in 0..nt {
                         let lg = &logits_all[t * gate_inp.rows..(t + 1) * gate_inp.rows];
@@ -907,26 +977,71 @@ impl<'a> RaonModel<'a> {
                         }
                     }
                     let mut y_all = vec![0.0f32; nt * n];
-                    for (e, picks) in by_e {
-                        let ge = gexps.expert_opt(e, self.cfg.n_expert, true);
-                        let ue = uexps.expert_opt(e, self.cfg.n_expert, true);
-                        let de = dexps.expert_opt(e, self.cfg.n_expert, true);
-                        let x_e: Vec<&[f32]> = picks.iter().map(|&(t, _)| normed_rows[t].as_slice()).collect();
-                        let mut gy = matvec_rows(&ge, &x_e);
-                        let uy = matvec_rows(&ue, &x_e);
-                        for (g, u) in gy.iter_mut().zip(&uy) { *g = situ_glu(*g, *u, gb, vb); }
-                        let grefs: Vec<&[f32]> = gy.chunks_exact(ge.rows).collect();
-                        let dy = matvec_rows(&de, &grefs);
-                        for (pi, &(t, w)) in picks.iter().enumerate() {
-                            let dst = &mut y_all[t * n..(t + 1) * n];
-                            let src = &dy[pi * n..(pi + 1) * n];
-                            for j in 0..n { dst[j] += w * src[j]; }
+                    if !by_e.is_empty() {
+                        let evict = std::env::var_os("STRATA_RAON_EVICT").is_some();
+                        let exp_nf = gexps.rows / self.cfg.n_expert;
+                        let mut gpu_grp = Vec::new();
+                        let mut cpu_grp = Vec::new();
+                        for (e, picks) in by_e {
+                            let ge = gexps.expert_opt(e, self.cfg.n_expert, evict);
+                            let ue = uexps.expert_opt(e, self.cfg.n_expert, evict);
+                            let de = dexps.expert_opt(e, self.cfg.n_expert, evict);
+                            if ge.gpu.is_some() && ue.gpu.is_some() && de.gpu.is_some() {
+                                gpu_grp.push((ge, ue, de, picks));
+                            } else {
+                                cpu_grp.push((ge, ue, de, picks));
+                            }
+                        }
+                        let run_grp = |grp: &[(Mat, Mat, Mat, Vec<(usize, f32)>)]| -> Vec<f32> {
+                            let mut out = vec![0.0f32; nt * n];
+                            if grp.is_empty() { return out; }
+                            let mut gu_jobs: Vec<(Mat, usize)> = Vec::with_capacity(grp.len() * 2);
+                            let mut gu_x: Vec<f32> = Vec::new();
+                            let mut d_jobs: Vec<(Mat, usize)> = Vec::with_capacity(grp.len());
+                            for (ge, ue, de, picks) in grp {
+                                gu_jobs.push((*ge, picks.len()));
+                                for &(t, _) in picks { gu_x.extend_from_slice(&normed_flat[t * n..(t + 1) * n]); }
+                                gu_jobs.push((*ue, picks.len()));
+                                for &(t, _) in picks { gu_x.extend_from_slice(&normed_flat[t * n..(t + 1) * n]); }
+                                d_jobs.push((*de, picks.len()));
+                            }
+                            let gu_out = matvec_rows_many(&gu_jobs, &gu_x);
+                            let mut act_x = Vec::with_capacity(gu_out.len() / 2);
+                            let mut off = 0;
+                            for (_, _, _, picks) in grp {
+                                let m = picks.len() * exp_nf;
+                                let g_slice = &gu_out[off..off + m];
+                                let u_slice = &gu_out[off + m..off + 2 * m];
+                                for i in 0..m { act_x.push(situ_glu(g_slice[i], u_slice[i], gb, vb)); }
+                                off += 2 * m;
+                            }
+                            let d_out = matvec_rows_many(&d_jobs, &act_x);
+                            let mut doff = 0;
+                            for (_, _, _, picks) in grp {
+                                for &(t, w) in picks {
+                                    let dst = &mut out[t * n..(t + 1) * n];
+                                    let src = &d_out[doff..doff + n];
+                                    for j in 0..n { dst[j] += w * src[j]; }
+                                    doff += n;
+                                }
+                            }
+                            out
+                        };
+                        match (gpu_grp.is_empty(), cpu_grp.is_empty()) {
+                            (false, true) => y_all = run_grp(&gpu_grp),
+                            (true, false) => y_all = run_grp(&cpu_grp),
+                            (false, false) => {
+                                let (mut gy, cy) = rayon::join(|| run_grp(&gpu_grp), || run_grp(&cpu_grp));
+                                for (a, b) in gy.iter_mut().zip(&cy) { *a += b; }
+                                y_all = gy;
+                            }
+                            (true, true) => {}
                         }
                     }
-                    if let Some((sg, su, sd)) = shared {
-                        let mut gy = matvec_rows(sg, &nrefs);
-                        let uy = matvec_rows(su, &nrefs);
-                        for (g, u) in gy.iter_mut().zip(&uy) { *g = situ_glu(*g, *u, gb, vb); }
+                    if let Some((sg, _, sd)) = shared {
+                        let gu = shared_gu.unwrap();
+                        let half = nt * sg.rows;
+                        let gy: Vec<f32> = (0..half).map(|i| situ_glu(gu[i], gu[half + i], gb, vb)).collect();
                         let grefs: Vec<&[f32]> = gy.chunks_exact(sg.rows).collect();
                         let sy = matvec_rows(sd, &grefs);
                         for (a, b) in y_all.iter_mut().zip(&sy) { *a += b; }
