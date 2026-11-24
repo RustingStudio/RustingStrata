@@ -937,6 +937,30 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// `argmax_rows` on values 0..16, so most rows tie for the maximum: the first index wins, as in the CPU reference.
+    #[test]
+    fn argmax_rows_breaks_ties_at_the_first_index() {
+        let Ok(gpu) = Gpu::new(0) else { eprintln!("skipping: no HIP device"); return };
+        let g: &dyn Backend = &gpu;
+        let (rows, n) = (64usize, 1000usize);
+        let mut st = 77u32;
+        let x: Vec<f32> = (0..rows * n).map(|_| { st = st.wrapping_mul(1664525).wrapping_add(1013904223); ((st >> 16) % 16) as f32 }).collect();
+        let want: Vec<i32> = (0..rows).map(|r| {
+            let row = &x[r * n..(r + 1) * n];
+            let mut best = 0;
+            for i in 1..n { if row[i] > row[best] { best = i; } }
+            best as i32
+        }).collect();
+        assert!(want.iter().enumerate().any(|(r, &b)| x[r * n..(r + 1) * n].iter().filter(|&&v| v == x[r * n + b as usize]).count() > 1), "no row has a tie");
+        let bx = g.alloc(4 * rows * n).unwrap();
+        let bo = g.alloc(4 * rows).unwrap();
+        g.put(&x, &bx, 0).unwrap();
+        g.argmax_rows(bx.addr(), n, rows, bo.addr()).unwrap();
+        g.sync().unwrap();
+        let got: Vec<i32> = g.get(&bo, 0, rows).unwrap();
+        assert_eq!(got, want);
+    }
+
     /// `--backend hip` reaches this backend through `backend::open`, the path the CLI takes.
     #[test]
     fn opens_through_backend_open() {
