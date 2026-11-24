@@ -109,6 +109,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str) -> anyhow::Resu
         let tools = q.tool_calls && !q.tools.is_empty();
         let mut hold = crate::chat::Hold::new(tools, vec![]).tagged(Template::Ds.call_tag());
         let (mut out, mut shown, mut done) = (vec![], 0, "length");
+        let mut alive = std::time::Instant::now();
         for i in 0..n {
             let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
             if eos.contains(&next) { done = "stop"; break; }
@@ -117,7 +118,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str) -> anyhow::Resu
             if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
                 let t = hold.push(&s[shown..]);
                 shown = s.len();
-                if q.stream && !t.is_empty() && write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_err() { break; }
+                if q.stream && !(if t.is_empty() { crate::serve::held(c, &mut alive) } else { write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok() }) { break; }
             }
             if i + 1 < n { logits = m.step(next); }
         }

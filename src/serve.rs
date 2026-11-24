@@ -97,6 +97,15 @@ pub fn gone(c: &std::net::TcpStream) -> bool {
     match r { Ok(n) => n == 0, Err(e) => e.kind() != std::io::ErrorKind::WouldBlock }
 }
 
+/// What a stream writes while its text is held back (the body of a tool call): an SSE comment when `last` is 15 s
+/// old, so a client that gives up after some minutes without a byte (undici: 300 s) keeps reading. False when the
+/// client is gone.
+pub fn held(c: &mut impl std::io::Write, last: &mut std::time::Instant) -> bool {
+    if last.elapsed() < std::time::Duration::from_secs(15) { return true; }
+    *last = std::time::Instant::now();
+    c.write_all(b": keep-alive\n\n").is_ok()
+}
+
 /// `Authorization` header check for `--api-key`, without an early exit on the first differing byte.
 /// The chat page of `serve`.
 pub const PAGE: &str = include_str!("web/index.html");

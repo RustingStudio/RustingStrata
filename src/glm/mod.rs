@@ -430,9 +430,10 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a crate::tokenizer::Tokenizer, name: &'a st
         let stream = q.stream;
         let tools = q.tool_calls && !q.tools.is_empty();
         let mut hold = crate::chat::Hold::new(tools, vec![]);
+        let mut alive = std::time::Instant::now();
         let (out, done) = decode_greedy(&mut m, &tok, &stop, logits, n, &mut |t| {
             let t = hold.push(t);
-            !stream || t.is_empty() || write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok()
+            !stream || if t.is_empty() { crate::serve::held(c, &mut alive) } else { write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok() }
         });
         let calls = if tools { parse_calls(&hold.text, &q.tools) } else { None };
         let done = if calls.is_some() { "tool_calls" } else { done };

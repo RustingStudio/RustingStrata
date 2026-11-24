@@ -735,3 +735,16 @@ fn serve_auto_unload_loads_again_on_a_chat() {
     for r in [first, second] { assert!(r.contains("200 OK") && r.contains("\"choices\""), "--parallel {parallel}: {r}"); }
     }
 }
+
+/// A stream with held text writes an SSE comment once its last write is 15 s old, and nothing before that.
+#[test]
+fn held_stream_writes_a_comment_after_15_seconds() {
+    use rusting_strata::serve::held;
+    use std::time::{Duration, Instant};
+    let (mut out, mut last) = (Vec::new(), Instant::now());
+    assert!(held(&mut out, &mut last) && out.is_empty());
+    last = Instant::now().checked_sub(Duration::from_secs(16)).expect("uptime under 16 s");
+    assert!(held(&mut out, &mut last));
+    assert_eq!(out, b": keep-alive\n\n");
+    assert!(held(&mut out, &mut last) && out.len() == 14, "the comment restarts the 15 s");
+}

@@ -196,9 +196,10 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str) -> anyhow::Resu
         let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
         let tools = q.tool_calls && !q.tools.is_empty();
         let mut hold = crate::chat::Hold::new(tools, vec![]).tagged(CALLS);
+        let mut alive = std::time::Instant::now();
         let (out, stopped) = decode(&mut m, &tok, logits, n, |p| {
             let t = hold.push(p);
-            !q.stream || t.is_empty() || write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok()
+            !q.stream || if t.is_empty() { crate::serve::held(c, &mut alive) } else { write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok() }
         });
         let calls = if tools { parse_calls(&hold.text) } else { None };
         let done = if calls.is_some() { "tool_calls" } else if stopped { "stop" } else { "length" };

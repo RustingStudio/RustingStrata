@@ -558,12 +558,13 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str, opts: Inkling2O
         let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
         let tools = q.tool_calls && !q.tools.is_empty();
         let (mut content, mut reasoning, mut bodies) = (String::new(), String::new(), Vec::<String>::new());
+        let mut alive = std::time::Instant::now();
         let (count, stopped) = decode_with(&mut m, tok, logits, n, &mut smp, budget, &q.stop, |p, start, s| {
             let key = match p {
                 Part::Call if tools => {
                     if start { bodies.push(String::new()); }
                     *bodies.last_mut().unwrap() += s;
-                    return true;
+                    return !q.stream || crate::serve::held(c, &mut alive);
                 }
                 Part::Think => { reasoning += s; "reasoning_content" }
                 _ => { content += s; "content" }
