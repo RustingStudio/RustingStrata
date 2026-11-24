@@ -39,7 +39,7 @@ pub struct Gpu {
     fns: HashMap<String, ffi::Func>,
     /// "gfx1201": the target hiprtc compiled for.
     arch: String,
-    /// `--kv q8` (the kernels were compiled with KV_Q8).
+    /// `--kv q8` (the kernels were compiled with `KV_MODE` 0 or 1; HIP has no q4/q2 cache rows).
     pub kv_q8: bool,
     /// Opt-in shared memory per block on this device (64 KiB on RDNA).
     max_smem: usize,
