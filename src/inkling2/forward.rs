@@ -577,11 +577,62 @@ impl<'a> Inkling2Model<'a> {
     }
 
     /// Look up `tok` in `tok_embd` and RMS-normalize with `tok_norm` (`cfg.eps`), writing `out` (`[n_embd]`).
+    pub fn embed_raw(&self, tok: u32, out: &mut [f32]) {
+        assert!((tok as usize) < self.tok_embd.rows, "token {tok} is outside the vocabulary");
+        self.tok_embd.row_into(tok as usize, out);
+    }
+
     pub fn embed_normed(&self, tok: u32, out: &mut [f32]) {
         assert!((tok as usize) < self.tok_embd.rows, "token {tok} is outside the vocabulary");
         let mut emb = vec![0.0f32; self.cfg.n_embd];
         self.tok_embd.row_into(tok as usize, &mut emb);
         rms_norm_w(&emb, &self.tok_norm, self.cfg.eps, out);
+    }
+
+    /// Project `nt` hidden states (`[nt, n_embd]`) through the target LM head on GPU, keeping the logits on device.
+    pub(super) fn lm_head_batch_gpu(&mut self, h_rows: &[f32], nt: usize) -> bool {
+        if let Some(mut d) = self.device.take() {
+            let ok = d.lm_head_batch_gpu(self, h_rows, nt).is_ok();
+            self.device = Some(d);
+            return ok;
+        }
+        false
+    }
+
+    /// Add `w2 @ latent + bias` onto `pf.logits_buf[step]` on GPU and return the argmax token ID.
+    pub(super) fn markov_w2_argmax_gpu(
+        &self, w2: &crate::backend::GpuTensor, bias_addr: u64, bias_len: usize, latent: &[f32], step: usize,
+    ) -> Option<u32> {
+        self.device.as_ref()?.markov_w2_argmax_gpu(self, w2, bias_addr, bias_len, latent, step).ok()
+    }
+
+    pub(super) fn output_rows(&self) -> usize { self.output.rows }
+
+    /// Project `nt` hidden states (`[nt, n_embd]`) through the target LM head on CPU only.
+    pub(super) fn lm_head_batch_cpu(&self, h_rows: &[f32], nt: usize) -> Vec<f32> {
+        let rows: Vec<&[f32]> = h_rows.chunks_exact(self.cfg.n_embd).take(nt).collect();
+        let raw = matvec_rows(&self.output, &rows);
+        if self.output.rows == self.cfg.n_vocab {
+            return raw;
+        }
+        let mut out = Vec::with_capacity(nt * self.cfg.n_vocab);
+        for row in raw.chunks_exact(self.output.rows) {
+            out.extend_from_slice(&row[..self.cfg.n_vocab]);
+        }
+        out
+    }
+
+    /// Project `nt` hidden states (`[nt, n_embd]`) through the target LM head (`output.weight`) and return
+    /// `[nt, cfg.n_vocab]` logits before softcap.
+    pub fn lm_head_batch(&mut self, h_rows: &[f32], nt: usize) -> Vec<f32> {
+        if let Some(mut d) = self.device.take() {
+            let res = d.lm_head_batch(self, h_rows, nt);
+            self.device = Some(d);
+            if let Ok(v) = res {
+                return v;
+            }
+        }
+        self.lm_head_batch_cpu(h_rows, nt)
     }
 
     /// Project a single hidden state `h` (`[n_embd]`) through the target LM head (`output.weight`) and return the
