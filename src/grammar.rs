@@ -50,7 +50,7 @@ const MAX_ELEMS: usize = 64 << 10;
 /// mask of the vocabulary, and checking every rule start at parse time. A budget that runs out drops the rest of the
 /// stacks, so the grammar stays enforced but may refuse a valid token (only grammars far past what JSON needs).
 const STEPS: usize = 200_000;
-const MASK_STEPS: usize = 50_000_000;
+const MASK_STEPS: usize = 20_000_000;
 const CHECK_STEPS: usize = 200_000;
 /// Stacks kept after a character. ponytail: more are dropped (an odd ambiguous grammar may then refuse a valid text).
 const MAX_STACKS: usize = 1024;
@@ -263,6 +263,7 @@ impl Grammar {
     fn expand(&self, mut st: Vec<(usize, usize, usize)>, depth: usize, steps: &mut usize, out: &mut Vec<Vec<(usize, usize, usize)>>) {
         // ponytail: a depth cut instead of rejecting left recursion when parsing.
         if depth > 200 || *steps <= st.len() { *steps = 0; return; }
+        if out.len() >= MAX_STACKS { return; }
         *steps -= 1 + st.len();
         loop {
             let Some(&(r, a, e)) = st.last() else { out.push(st); return };
@@ -403,7 +404,11 @@ impl Constraint {
         if self.gram.is_none() { return; }
         let mut steps = MASK_STEPS;
         for (t, x) in l.iter_mut().enumerate() {
-            if *x != f32::NEG_INFINITY && !self.allows_in(t as u32, &mut steps) { *x = f32::NEG_INFINITY; }
+            // Each token gets at most its own budget, taken from what the mask has left.
+            let mut mine = steps.min(STEPS);
+            let left = steps - mine;
+            if *x != f32::NEG_INFINITY && !self.allows_in(t as u32, &mut mine) { *x = f32::NEG_INFINITY; }
+            steps = left + mine;
         }
     }
 
