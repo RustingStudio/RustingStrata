@@ -132,3 +132,50 @@ fn turboquant_kv_modes() {
     let n = 4096;
     assert_eq!((gmix.kv_words(n), gmix.kv_words_v(n)), (gt4.kv_words(n), g16.kv_words(n)));
 }
+
+/// Inkling 2 attention at a head width that is not 128: the clip/store path must rotate and normalize K/V
+/// just like the Q rotation in attention, or prefill and decode disagree.
+fn ink_run(g: &Gpu, hd: usize, nh: usize, nkv: usize, nt: usize, pos0: usize, ring: usize) -> (Vec<f32>, Vec<f32>) {
+    let (nr, ext) = (16usize, 8usize);
+    let g: &dyn Backend = g;
+    let q = xs(nt * nh * hd);
+    let r = xs(nt * nh * nr);
+    let sink = xs(nt * nh);
+    let gate = xs(nt * nh * hd);
+    let bias = xs(ext * nr);
+    let k_in = xs(nt * nkv * hd);
+    let v_in = xs(nt * nkv * hd + 7)[7..].iter().map(|x| 0.5 * x).collect::<Vec<_>>();
+    let kc = g.zeros::<u16>(g.kv_words(nkv * hd * ring)).unwrap();
+    let vc = g.zeros::<u16>(g.kv_words_v(nkv * hd * ring)).unwrap();
+    g.ink_clip_n(up(g, &k_in).addr(), 0, hd, nkv, nt, 8.0, 0.0, 1.0, kc.addr(), pos0, ring, 0, 0.0, 1.0).unwrap();
+    g.ink_clip_n(up(g, &v_in).addr(), 0, hd, nkv, nt, 0.0, 1e-6, 1.0, vc.addr(), pos0, ring, 0, 0.0, 1.0).unwrap();
+    let (dq, dr, ds, dg, db) = (up(g, &q), up(g, &r), up(g, &sink), up(g, &gate), up(g, &bias));
+    let dout_pre = g.zeros::<f32>(nt * nh * hd).unwrap();
+    g.ink_attn_prefill(dq.addr(), dr.addr(), ds.addr(), dg.addr(), kc.addr(), vc.addr(), 0, 0, db.addr(),
+                       dout_pre.addr(), pos0, nt, nh, nkv, hd, nr, ext, ring, 0).unwrap();
+    let dsc = g.zeros::<f32>(nh * ring.div_ceil(64) * (hd + 2)).unwrap();
+    let mut want = Vec::with_capacity(nt * nh * hd);
+    for tok in 0..nt {
+        let at = pos0 + tok;
+        let dout1 = g.zeros::<f32>(nh * hd).unwrap();
+        g.ink_attn(dq.addr() + (tok * nh * hd * 4) as u64, dr.addr() + (tok * nh * nr * 4) as u64,
+                   ds.addr() + (tok * nh * 4) as u64, dg.addr() + (tok * nh * hd * 4) as u64,
+                   kc.addr(), vc.addr(), db.addr(), dsc.addr(), dout1.addr(), at + 1, at, nh, nkv, hd, nr, ext).unwrap();
+        want.extend_from_slice(&down::<f32>(g, &dout1));
+    }
+    (down::<f32>(g, &dout_pre), want)
+}
+
+#[test]
+fn turboquant_ink_clip_hd64() {
+    let _gpu = common::gpu_lock();
+    let Some(g16) = open("f16", "f16") else { return };
+    let Some(gt) = open("turbo4", "turbo4") else { return };
+    let (nh, nkv, hd, nt, pos0, ring) = (4usize, 2usize, 64usize, 6usize, 3usize, 16usize);
+    let (pf16, dec16) = ink_run(&g16, hd, nh, nkv, nt, pos0, ring);
+    assert!(rel_l2(&pf16, &dec16) < 1e-6, "f16 hd 64 prefill vs decode");
+    let (pft, dect) = ink_run(&gt, hd, nh, nkv, nt, pos0, ring);
+    eprintln!("turbo hd 64: prefill vs decode {:.2e}, vs f16 {:.2e}", rel_l2(&pft, &dect), rel_l2(&pft, &pf16));
+    assert!(rel_l2(&pft, &dect) < 5e-4, "turbo hd 64 prefill vs decode");
+    assert!(rel_l2(&pft, &pf16) < 0.9, "turbo hd 64 vs f16");
+}

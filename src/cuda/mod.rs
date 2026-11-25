@@ -147,6 +147,10 @@ fn kv_mode_words(m: u32, n: usize) -> usize {
 /// `--kv q8`: KV cache rows in ggml q8_0 form (`kv_mode() == 1`).
 pub fn kv_q8() -> bool { kv_mode() == 1 }
 
+/// Backends without per-side K/V formats only handle a symmetric legacy layout. `kv_mode()` reports 10 for a
+/// mixed layout, which would otherwise pass a `<= 3` guard and reach an `unreachable!` in the size helpers.
+pub fn kv_legacy_symmetric(k: u32, v: u32) -> bool { k == v && k <= 3 }
+
 /// `STRATA_GEMM_FMA`: force the CUDA-core FMA fallback in the f16 prefill kernels instead of the sm_70 tensor-core
 /// path (`GEMM_TC` in kernels.cu). It covers both the f16 prefill GEMM and the prefill attention (`attn_prefill_t`):
 /// the attention's P staging tile is part of every request, so the shared-memory size does not depend on it.
@@ -1238,7 +1242,8 @@ impl Backend for Gpu {
     ) -> anyhow::Result<()> {
         anyhow::ensure!(matches!(hd, 32 | 64 | 128), "ink_attn_prefill: unsupported hd={hd}");
         let g = nh / nkv.max(1);
-        if win == 0 && nkv > 0 && nh % nkv == 0 && g <= 4 {
+        // The shared-memory variant reads a legacy f16 layout and has no WHT; TurboQuant uses the grouped kernel.
+        if kv_mode() == 0 && win == 0 && nkv > 0 && nh % nkv == 0 && g <= 4 {
             // Every key: a block is one K/V head and `tb` tokens, with 32 keys of K and V in shared memory.
             let tb = (32 / g).min(8);
             launch!(self, &format!("ink_attn_prefill_sh_{hd}"), cfg((nt.div_ceil(tb) as u32, nkv as u32), (32 * tb * g) as u32, (2 * 32 * hd * 4) as u32),
@@ -1596,6 +1601,16 @@ mod tests {
             "cuda device 0: NVIDIA GeForce RTX 3060, sm_86");
         assert_eq!(super::device_log(0, "NVIDIA GeForce RTX 3060", "sm_86", (8, 6), true),
             "cuda device 0: NVIDIA GeForce RTX 3060, sm_86");
+    }
+
+    /// CPU-only: a backend that has one format for both halves must reject a mixed layout before its size helpers.
+    #[test]
+    fn legacy_symmetric_kv() {
+        for m in 0..=3 { assert!(super::kv_legacy_symmetric(m, m), "mode {m}"); }
+        assert!(!super::kv_legacy_symmetric(0, 1));
+        assert!(!super::kv_legacy_symmetric(2, 0));
+        assert!(!super::kv_legacy_symmetric(4, 4));
+        assert!(!super::kv_legacy_symmetric(10, 10));
     }
 
     /// M1-T5, CPU-only: the int8 prefill GEMM needs int8 tensor cores, which Volta (7.x) lacks; every sm_80+ part
