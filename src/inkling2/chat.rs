@@ -246,7 +246,7 @@ pub fn decode_with(
     let id = |t: &str| tok.token_id(t);
     let (model, end) = (id(MODEL), id(END));
     let kinds = [(id(TEXT), Part::Text), (id(THINKING), Part::Think), (id(INVOKE), Part::Call)];
-    let pure_greedy = smp.temp <= 0.0 && smp.repeat == 1.0 && smp.presence == 0.0 && smp.frequency == 0.0 && smp.dry_mult <= 0.0;
+    let pure_greedy = smp.temp <= 0.0 && smp.repeat == 1.0 && smp.presence == 0.0 && smp.frequency == 0.0 && smp.dry_mult <= 0.0 && smp.limit.is_none();
     let pick_tok = |smp: &mut Sampler, l: &[f32]| -> u32 {
         if pure_greedy {
             crate::ops::argmax(l) as u32
@@ -330,7 +330,7 @@ pub fn decode_with(
         if i < n {
             if let Some(t) = pending.pop_front() {
                 next = t;
-            } else if m.has_spec() && stops.is_empty() {
+            } else if m.has_spec() && stops.is_empty() && smp.limit.is_none() {
                 let budget_cap = if part == Some(Part::Think) && thinking_budget > 0 {
                     thinking_budget.saturating_sub(think_tokens)
                 } else {
@@ -555,6 +555,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str, opts: Inkling2O
         if let Some(db) = q.dry_base { smp.dry_base = db; }
         if let Some(da) = q.dry_allowed_length { smp.dry_allowed = da; }
         if let Some(s) = q.seed { smp.rng = s.max(1); }
+        smp.limit = crate::grammar::Constraint::new(q, tok)?;
 
         let budget = q.thinking_budget.unwrap_or(opts.thinking_budget);
         let n = q.max_tokens.unwrap_or(usize::MAX).min(m.max_ctx - m.toks.len());

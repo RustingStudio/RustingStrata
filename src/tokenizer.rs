@@ -46,6 +46,7 @@ pub struct Tokenizer {
     /// Gemma 4 vocabulary: U+2581 for a space, `<0xXX>` for a byte.
     spm: bool,
     bytes: std::sync::OnceLock<Vec<Vec<u8>>>,
+    gbytes: std::sync::OnceLock<std::sync::Arc<Vec<Vec<u8>>>>,
 }
 
 /// The BOS id when the GGUF asks for one at the start of a prompt.
@@ -121,7 +122,7 @@ impl Tokenizer {
                 if let Some(id) = inner.token_to_id(t) && !eos.contains(&id) { eos.push(id); }
             }
         }
-        Ok(Tokenizer { inner, eos, bos: add_bos(g), special, spm: false, bytes: Default::default() })
+        Ok(Tokenizer { inner, eos, bos: add_bos(g), special, spm: false, bytes: Default::default(), gbytes: Default::default() })
     }
 
     /// Gemma 4: SPM-style BPE. Spaces become U+2581, merges run over each newline-free run of raw UTF-8, unknown bytes fall back to <0xXX>.
@@ -155,7 +156,7 @@ impl Tokenizer {
         for t in ["<turn|>", "<eos>"] {
             if let Some(id) = inner.token_to_id(t) && !eos.contains(&id) { eos.push(id); }
         }
-        Ok(Tokenizer { inner, eos, bos: add_bos(g), special, spm: true, bytes: Default::default() })
+        Ok(Tokenizer { inner, eos, bos: add_bos(g), special, spm: true, bytes: Default::default(), gbytes: Default::default() })
     }
 
     pub fn token_id(&self, t: &str) -> Option<u32> { self.inner.token_to_id(t) }
@@ -179,6 +180,12 @@ impl Tokenizer {
     pub fn token_bytes(&self, id: u32) -> &[u8] {
         let all = self.bytes.get_or_init(|| (0..self.vocab_size() as u32).map(|i| self.bytes_of(i)).collect());
         all.get(id as usize).map_or(&[], |b| b.as_slice())
+    }
+
+    /// The bytes of each token for a grammar: none for a special token, which a grammar never takes.
+    pub fn grammar_bytes(&self) -> std::sync::Arc<Vec<Vec<u8>>> {
+        self.gbytes.get_or_init(|| std::sync::Arc::new((0..self.vocab_size() as u32)
+            .map(|i| if self.is_special(i) { vec![] } else { self.token_bytes(i).to_vec() }).collect())).clone()
     }
 
     fn bytes_of(&self, id: u32) -> Vec<u8> {

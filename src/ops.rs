@@ -149,6 +149,8 @@ pub struct Sampler {
     /// The returned tokens in order (outside tool calls), for DRY.
     pub hist: Vec<usize>,
     pub in_tool: bool,
+    /// The request's `logit_bias` and grammar, applied after the penalties.
+    pub limit: Option<crate::grammar::Constraint>,
 }
 
 /// DRY looks back this many reply tokens, and matches at most this long.
@@ -160,7 +162,7 @@ impl Sampler {
         Sampler { temp: 0.0, top_k: 0, top_p: 1.0, min_p: 0.0, rng: 1, presence: 0.0, frequency: 0.0, repeat: 1.0, last_n: 64,
             seen: Default::default(),
             dry_mult: 0.0, dry_base: 1.75, dry_allowed: 2, dry_breakers: Default::default(), tool_tags: None,
-            hist: Vec::new(), in_tool: false }
+            hist: Vec::new(), in_tool: false, limit: None }
     }
 
     /// The logits with the repeat, presence, frequency and DRY penalties applied, or None when there is nothing to change.
@@ -188,6 +190,13 @@ impl Sampler {
         Some(l)
     }
 
+    /// `penalized`, then the bias and grammar of `limit`.
+    fn adjusted(&self, logits: &[f32]) -> Option<Vec<f32>> {
+        let mut l = self.penalized(logits);
+        if let Some(c) = &self.limit { c.apply(l.get_or_insert_with(|| logits.to_vec()), self.temp <= 0.0); }
+        l
+    }
+
     /// DRY penalties for the next token: for every earlier place where the reply's last tokens already appeared,
     /// the token that followed them there, with the longest such match (as llama.cpp's DRY sampler).
     pub fn dry_penalties(&self) -> Vec<(usize, f32)> {
@@ -211,6 +220,7 @@ impl Sampler {
 
     /// Records a token the reply now has (done by `pick` and `accept` for the tokens they return).
     pub fn note(&mut self, t: usize) {
+        if let Some(c) = &mut self.limit { c.accept(t as u32); }
         if let Some((open, close)) = self.tool_tags {
             if t == open { self.in_tool = true; return; }
             if t == close { self.in_tool = false; return; }
@@ -221,7 +231,7 @@ impl Sampler {
     }
 
     pub fn pick(&mut self, logits: &[f32]) -> anyhow::Result<usize> {
-        let pen = self.penalized(logits);
+        let pen = self.adjusted(logits);
         let logits = pen.as_deref().unwrap_or(logits);
         let i = if self.temp <= 0.0 {
             let i = argmax(logits);
@@ -238,7 +248,7 @@ impl Sampler {
     /// Speculative sampling with a fixed draft `d`: keeps `d` (None) with its probability under this sampler, else
     /// returns a token drawn from the others, renormalized. The result has the distribution of `pick`. `temp` > 0.
     pub fn accept(&mut self, logits: &[f32], d: usize) -> anyhow::Result<Option<usize>> {
-        let pen = self.penalized(logits);
+        let pen = self.adjusted(logits);
         let c = self.cands(pen.as_deref().unwrap_or(logits));
         anyhow::ensure!(!c.is_empty(), NON_FINITE);
         let q = c.iter().find(|x| x.0 == d).map_or(0.0, |x| x.1);
@@ -261,7 +271,7 @@ impl Sampler {
     /// Leviathan lossless speculative rejection sampling using draft distribution `q` and target `logits` (`temp > 0`).
     /// Keeps `d` (`None`) with probability `min(1, p(d)/q(d))`, otherwise samples from normalized `max(0, p - q)`.
     pub fn accept_dist(&mut self, logits: &[f32], d: usize, q: &[(usize, f32)]) -> anyhow::Result<Option<usize>> {
-        let pen = self.penalized(logits);
+        let pen = self.adjusted(logits);
         let c = self.cands(pen.as_deref().unwrap_or(logits));
         let total: f32 = c.iter().map(|x| x.1).sum();
         anyhow::ensure!(!c.is_empty() && total > 0.0, NON_FINITE);

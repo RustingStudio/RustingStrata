@@ -2960,28 +2960,30 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
     let (mut out, mut start, mut row, mut ahead, mut stopped) = (Vec::new(), 0, 0, None, false);
     let (mut in_think, budget) = think_cap.unwrap_or((false, 0));
     let (mut saw_close, mut tail) = (false, String::new());
+    // With a logit_bias or grammar every token is picked from the logits here: no speculation, no argmax on the GPU.
+    let free = smp.limit.is_none();
     'outer: while out.len() < n {
         let next = match ahead.take() { Some(t) => t, None => smp.pick(&logits)? as u32 };
         if eos.contains(&next) { stopped = true; break; }
         let toks = match r {
-            Runner::Gpu(g) if mtp && g.ngram.is_some() => {
+            Runner::Gpu(g) if free && mtp && g.ngram.is_some() => {
                 let (toks, nx, rw) = g.hybrid_spec_step(next, row, smp)?;
                 (ahead, row) = (Some(nx), rw);
                 toks
             }
-            Runner::Gpu(g) if mtp => {
+            Runner::Gpu(g) if free && mtp => {
                 let (toks, nx, rw) = g.spec_step(next, row, smp)?;
                 (ahead, row) = (Some(nx), rw);
                 toks
             }
-            Runner::Gpu(g) if g.ngram.is_some() => {
+            Runner::Gpu(g) if free && g.ngram.is_some() => {
                 let (toks, nx) = g.ngram_spec_step(next, smp)?;
                 ahead = Some(nx);
                 toks
             }
             // Greedy without MTP: the argmax on the GPU, so only the token id is copied back, not the logits.
-            Runner::Gpu(g) if smp.temp <= 0.0 => { ahead = Some(g.step_greedy(next)?); vec![next] }
-            Runner::Slot(c) if smp.temp <= 0.0 => { ahead = Some(c.step(next, false)?.0); vec![next] }
+            Runner::Gpu(g) if free && smp.temp <= 0.0 => { ahead = Some(g.step_greedy(next)?); vec![next] }
+            Runner::Slot(c) if free && smp.temp <= 0.0 => { ahead = Some(c.step(next, false)?.0); vec![next] }
             _ => { logits = r.step(next)?; vec![next] }
         };
         for t in toks {
@@ -3956,6 +3958,10 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             say!("sampling: temp={} top_k={} top_p={} min_p={} presence={} frequency={} repeat={}/{} dry={}/{}/{}", smp.temp, smp.top_k, smp.top_p, smp.min_p,
                 smp.presence, smp.frequency, smp.repeat, smp.last_n, smp.dry_mult, smp.dry_base, smp.dry_allowed);
             if req.seed.is_some() { smp.rng = seed(req.seed); }
+            smp.limit = match rusting_strata::grammar::Constraint::new(&req, tok) {
+                Ok(c) => c,
+                Err(err) => return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
+            };
             let n = room(e, ids.len(), req.max_tokens.unwrap_or(usize::MAX).min(s.max_tokens));
             if n == 0 { return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("prompt of {} tokens fills the context", ids.len()), "type": "invalid_request_error"}})); }
             let id = format!("chatcmpl-{i}");

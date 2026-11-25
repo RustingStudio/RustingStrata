@@ -409,6 +409,9 @@ pub struct ChatRequest {
     pub seed: Option<u64>,
     /// The reply ends before the first of these strings (`stop`).
     pub stop: Vec<String>,
+    /// `logit_bias`, and a GBNF `grammar` the reply must follow (see `crate::grammar`).
+    pub logit_bias: Vec<(crate::grammar::BiasKey, f32)>,
+    pub grammar: Option<std::sync::Arc<crate::grammar::Grammar>>,
     /// The response head went out while the request waited in the queue (`Queued`): the handler must not write it.
     pub head_sent: bool,
 }
@@ -450,7 +453,14 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
     }.context("stop must be a string or an array of strings")?.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
     // Hold checks every prefix of every stop string at each token, so both are bounded.
     if stop.len() > 16 || stop.iter().any(|s| s.len() > 256) { bail!("stop takes at most 16 strings of at most 256 bytes"); }
-    let think = v["chat_template_kwargs"]["enable_thinking"].as_bool();
+    let grammar = match &v["grammar"] {
+        Value::Null => None,
+        Value::String(s) if s.trim().is_empty() => None,
+        Value::String(s) => Some(std::sync::Arc::new(crate::grammar::Grammar::parse(s)?)),
+        _ => bail!("grammar must be a string"),
+    };
+    // A grammar holds for the whole reply, thinking included, so thinking is off unless the request turns it on.
+    let think = v["chat_template_kwargs"]["enable_thinking"].as_bool().or(grammar.as_ref().map(|_| false));
     let include_usage = v["stream_options"]["include_usage"].as_bool().unwrap_or(false);
     let raw_effort = if !v["reasoning_effort"].is_null() {
         &v["reasoning_effort"]
@@ -487,7 +497,8 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
         },
         dry_multiplier: num("dry_multiplier", |f| (0.0..=5.0).contains(&f), "a number in [0, 5]")?,
         dry_base: num("dry_base", |f| f > 1.0 && f <= 4.0, "a number in (1, 4]")?,
-        dry_allowed_length: int("dry_allowed_length", 1)?.map(|n| n as usize), seed: int("seed", 0)?, stop, head_sent: false })
+        dry_allowed_length: int("dry_allowed_length", 1)?.map(|n| n as usize), seed: int("seed", 0)?, stop,
+        logit_bias: crate::grammar::parse_bias(&v["logit_bias"])?, grammar, head_sent: false })
 }
 
 /// What the chat page's side panel shows about the server, kept by the request loop and answered by the reader
