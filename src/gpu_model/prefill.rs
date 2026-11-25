@@ -3,6 +3,7 @@
 //! copied into a small staging area, a group of them at a time, each group's copy beside the previous group's GEMMs.
 
 use super::{Ffn, GpuModel, HcAt, Mixer};
+use crate::cpu_worker::TMAX;
 use crate::backend::{BATCHED, Backend, Buf, GEMM_BM, SAME_X};
 use crate::expert_cache::MATS;
 use crate::model::Model;
@@ -24,6 +25,8 @@ pub(super) struct Scratch {
     feat: Option<Buf>,
     /// `[chunk, n_ids * n_embd]` post-layer hidden states captured for DFlash `target_layer_ids`.
     dflash_feat: Option<Buf>,
+    /// `[chunk, n_embd]` hc stream mean (hc targets), input to the DFlash capture.
+    dflash_mean: Option<Buf>,
     /// ids | xrow | inv, `chunk * k` each.
     ints: Buf,
     tiles: Buf,
@@ -85,6 +88,7 @@ impl Scratch {
             slab: gpu.zeros::<f32>(total)?,
             feat: if c.eagle3.is_some() { Some(gpu.zeros::<f32>(3 * ne * chunk)?) } else { None },
             dflash_feat: c.dflash.as_ref().map(|dc| gpu.zeros::<f32>(dc.target_layer_ids.len() * ne * chunk)).transpose()?,
+            dflash_mean: if c.dflash.is_some() && c.hc_n > 0 { Some(gpu.zeros::<f32>(ne * chunk)?) } else { None },
             ints: gpu.zeros::<i32>(3 * chunk * k)?, tiles: gpu.zeros::<u64>(2 * n_tiles)?,
             staging: gpu.zeros::<u8>(if c.is_moe() { 3 * STAGE * stage_bytes } else { 0 })?,
         })
@@ -775,8 +779,24 @@ impl GpuModel<'_> {
                 if let (Some(dff), Some(df)) = (&pf.dflash_feat, self.dflash.as_ref()) {
                     if let Some(idx) = df.cfg.target_layer_ids.iter().position(|&tl| tl == il) {
                         let n_ids = df.cfg.target_layer_ids.len();
-                        for r in 0..t {
-                            g.dtod(&pf.slab, 4 * r * ne, dff, 4 * (r * n_ids + idx) * ne, 4 * ne)?;
+                        // hc targets (qwen4exp): collapse the hc streams to their plain mean first
+                        // (mirrors llama.cpp's hc_stream_mean); see the step-side note. hc_mix's gate
+                        // buffer holds TMAX rows, so tile over TMAX-position blocks.
+                        if c.hc_n > 0 {
+                            let dfm = pf.dflash_mean.as_ref().expect("dflash_mean with hc");
+                            let mut done = 0;
+                            while done < t {
+                                let rows = (t - done).min(TMAX);
+                                g.hc_mix(pf.slab.addr() + 4 * (done * c.hc_n * ne) as u64, df.dfg.addr(), dfm.addr() + 4 * (done * ne) as u64, ne, c.hc_n, rows)?;
+                                for r in 0..rows {
+                                    g.dtod(dfm, 4 * (done + r) * ne, dff, 4 * ((done + r) * n_ids + idx) * ne, 4 * ne)?;
+                                }
+                                done += rows;
+                            }
+                        } else {
+                            for r in 0..t {
+                                g.dtod(&pf.slab, 4 * r * ne, dff, 4 * (r * n_ids + idx) * ne, 4 * ne)?;
+                            }
                         }
                     }
                 }
