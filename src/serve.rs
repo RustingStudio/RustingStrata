@@ -97,6 +97,37 @@ pub fn gone(c: &std::net::TcpStream) -> bool {
     match r { Ok(n) => n == 0, Err(e) => e.kind() != std::io::ErrorKind::WouldBlock }
 }
 
+/// The longest time a stream sends nothing.
+const KEEP: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Runs `f`, the prefill of a request. For a stream, whose response head is written before the call, an SSE comment
+/// goes out every 15 s until `f` returns, so a client that waits a limited time for the next byte keeps waiting
+/// through a long prompt (`f` must not write to `c`).
+pub fn alive<T>(c: &std::net::TcpStream, stream: bool, f: impl FnOnce() -> T) -> T { alive_every(c, stream.then_some(KEEP), f) }
+
+/// `alive` with the time between two comments (`None`: no stream, nothing is written).
+pub fn alive_every<T>(c: &std::net::TcpStream, every: Option<std::time::Duration>, f: impl FnOnce() -> T) -> T {
+    use std::io::Write;
+    let Some(every) = every else { return f() };
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|s| {
+        // The end of `f` drops `tx`, which ends the wait at once.
+        s.spawn(move || { let mut c = c; while rx.recv_timeout(every) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) && c.write_all(b": keep-alive\n\n").is_ok() {} });
+        let r = f();
+        drop(tx);
+        r
+    })
+}
+
+/// What a stream writes while its text is held back (the body of a tool call): an SSE comment when `last` is 15 s
+/// old, so a client that gives up after some minutes without a byte (undici: 300 s) keeps reading. False when the
+/// client is gone.
+pub fn held(c: &mut impl std::io::Write, last: &mut std::time::Instant) -> bool {
+    if last.elapsed() < KEEP { return true; }
+    *last = std::time::Instant::now();
+    c.write_all(b": keep-alive\n\n").is_ok()
+}
+
 /// `Authorization` header check for `--api-key`, without an early exit on the first differing byte.
 /// The chat page of `serve`.
 pub const PAGE: &str = include_str!("web/index.html");

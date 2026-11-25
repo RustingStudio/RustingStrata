@@ -15,10 +15,11 @@ The engine picks the code path from `general.architecture` in the file.
 | Qwen3.8-Flash-Next | `qwen4exp` | same |
 | SenseNova-Loop | `sensenova_loop` | same |
 | Recursive Flint | `flint` | same |
-| Gemma 4 | `gemma4` | own forward in `src/gemma4/` |
+| [Gemma 4](#gemma-4-26b-a4b-ud-q4_k_xl-17-gb) | `gemma4` | own forward, matvecs and expert cache on the card, attention on the CPU |
 | [DeepSeek-V4.1-Flash](#deepseek-v41-flash-iq2_xxs-249-gb) | `deepseek41` | own forward, matvecs and expert cache on the CUDA card, greedy only |
 | [GLM-5.3-Flash](#glm-53-flash-ud-q2_k_xl-119-gb) | `glm5-next` | own forward, matvecs and expert cache on the CUDA card, greedy only |
 | [Hy4-flash](#hy4-flash-iq2_siq2_xxs-85-gb) | `hy_v4_flash` | own forward, matvecs and expert cache on CUDA or Vulkan, greedy only |
+| [Kolibri 1.1](#kolibri-11-q4_k_m-434-gb) | `kolibri1` | own forward, matvecs, expert cache and attention on CUDA or Vulkan, greedy only |
 | [Inkling 2 Mini](#inkling-2-mini-iq4_nl-176-gb) | `inkling2_loop`, `inkling2` | own forward, matvecs and expert cache on CUDA or Vulkan |
 
 The models with their own forward open the GPU by themselves (no `--gpu` flag), have nothing to calibrate and load
@@ -50,6 +51,67 @@ The Gyro files of agentionai load too. Their names say TQ1_0 and TQ2_0, but the 
 types and read inputs rotated by a Hadamard transform (`prism.hadamard.*`). `Gyro-S-TQ1_0` (TQK6, TQK7) is tested on
 CPU, CUDA and Vulkan. `Gyro-M-TQ2_0` (TQ2_T) has the same layout and only supported types, but was not run here.
 Gyro-L (TQP5 to TQP7, PTQ1_0) is not supported yet.
+
+## Gemma 4 (26B-A4B UD-Q4_K_XL, 17 GB)
+
+`chat`, `generate` and `serve` detect the `gemma4` architecture and run its own forward: the matrix products and the
+routed experts that fit run on the card, attention and the experts that do not fit run on the CPU. The weights take
+90% of the free VRAM (`STRATA_DS_GPU_FRACTION`; `STRATA_DS_GPU_EXPERTS=<GB>` sets an absolute budget). `--kv`,
+`--chunk`, `--parallel` and `--cache-ram` have no effect on it. The prompt goes through the layers in chunks of 256
+tokens (`STRATA_G4_CHUNK`; 1 is token by token). `STRATA_G4_PROF=1` prints the prefill and decode times.
+
+Reference machine (RTX 3060 12 GB), a 595-token prompt and 64 reply tokens, warm page cache:
+
+| | 1.3.0 | now |
+|---|---|---|
+| Prefill | about 30 tok/s | 109-114 tok/s |
+| Decode | 45-49 ms/token (20-22 tok/s) | 34 ms/token (29 tok/s) |
+
+The 1.3.0 prefill is the wall time less the load and the decode; it had no timer of its own. Decode still pays a
+host round trip for each group of matrix products of each layer, and no llama.cpp run was made on this machine; the
+report in issue #81 has llama.cpp well ahead on an RTX 4070 SUPER.
+
+## Kolibri 1.1 (Q4_K_M, 43.4 GB)
+
+`chat`, `generate`, `serve`, `score` and `bench` detect the `kolibri1` architecture
+([Aleph-Alpha/Kolibri-1.1-GGUF](https://huggingface.co/Aleph-Alpha/Kolibri-1.1-GGUF)) and run its own forward: 50
+layers, 384 experts a layer with 6 routed and one shared, a sliding window of 513 positions on four layers of every
+five, and on every fifth layer an attention over the 2048 keys that an indexer picks (K and V rounded to NVFP4).
+
+```bash
+rustingstrata chat --model Kolibri-1.1-Q4_K_M.gguf
+rustingstrata serve --model Kolibri-1.1-Q4_K_M.gguf --port 8080
+```
+
+The matrix products, both kinds of attention and the routed experts that fit run on the card (CUDA when an NVIDIA
+card and driver are present, Vulkan otherwise; `--backend vulkan` or `--backend cuda` picks one); the other experts
+run on the CPU at the same time. A prompt goes through the layers in chunks of 1024 tokens (`STRATA_DS_CHUNK`), and a
+layer's experts on the card take one round trip for the whole chunk. `STRATA_KOL_CPU_ATTN=1` keeps the attention of a
+chunk on the CPU. The chat template is ChatML with the model's "Reasoning effort" system section (`--think`).
+
+Reference machine (RTX 3060 12 GB, 30 GB RAM), server to server, a streamed chat request with 128 reply tokens,
+prefill / decode in tok/s (the table with ranges is in [BENCHMARKS.md](BENCHMARKS.md#kolibri-11-q4_k_m-434-gb)):
+
+| Prompt | RustingStrata | llama.cpp `-ngl 4` | llama.cpp `-ngl 99 -cmoe` |
+|---|---|---|---|
+| 0.5k tokens | 181 / 33.4 | 145 / 15.5 | 99 / 27.0 |
+| 3.8k | 149 / 23.0 | 41 / 5.9 | 28 / 10.6 |
+| 16k | 139 / 21.0 | 48 / 3.8 | 30 / 8.7 |
+| 32k | 159 / 21.1 | 34 / 3.3 | 33 / 9.3 |
+
+Vulkan on the same card, in a later session of the same day with CUDA beside it (prefill / decode in tok/s): 129 /
+26.8, 106 / 19.5, 103 / 19.1 and 101 / 19.2 at 0.5k, 3.8k, 16k and 32k; CUDA in that session: 209 / 33.7, 182 / 26.4,
+155 / 20.2 and 163 / 21.6.
+
+Quality: llama.cpp's greedy tokens fed through RustingStrata's forward give the same top token at 45, 46, 44 and 46
+of 48 steps after prompts of 2k, 3.8k, 16k and 32k tokens. Two llama.cpp runs of the same file (CPU against GPU
+layers) agree with each other at 40-45 of 48; the misses are near ties.
+
+Caveats: the file is larger than the RAM and VRAM of the reference machine together, so the experts that are not on
+the card are read from the drive through the page cache, and the first request after a start is slower. The Vulkan
+path was run on the RTX 3060 only (no AMD or Intel card); its kernel for the attention over picked keys needs about
+35 KB of workgroup shared memory, and on a card with a smaller limit those layers' attention runs on the CPU.
+Decoding is greedy, there are no stop strings, and the model's thinking arrives inside `content`.
 
 ## DeepSeek-V4.1-Flash (IQ2_XXS, 249 GB)
 

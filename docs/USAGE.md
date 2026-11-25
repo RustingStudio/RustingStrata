@@ -5,9 +5,9 @@ Everything here applies to `rustingstrata chat`, `generate`, `bench` and `serve`
 
 ## Terminal
 
-`rustingstrata interface` is a short set of questions in the terminal: the model (a numbered list of the models
-folder and of the Hugging Face and llama.cpp caches; its last row takes a path to one file, or to a folder whose
-models it then lists), the mode (chat in the terminal,
+`rustingstrata interface` is a short set of questions in the terminal: the model (a numbered list of the last 10
+models picked here, the last one first, then the models folder and the Hugging Face and llama.cpp caches; its last
+row takes a path to one file, or to a folder whose models it then lists), the mode (chat in the terminal,
 chat page in the browser, API server, speed test), GPU or CPU, the context length and, for a server, the address.
 Enter takes the default in brackets. It prints the command the answers make and runs it, so the command can be
 copied for the next time. `--models-dir DIR` lists another folder.
@@ -71,7 +71,8 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 
 ## Flags
 
-- `--ctx` KV cache size in tokens (default 4096). For Inkling 2, Hy4, GLM, DeepSeek and Gemma 4 it is the prompt plus reply limit instead, and the default is the context the model was trained on; their caches grow with the text.
+- `--backend NAME` GPU backend: `cuda`, `vulkan` or `hip` (AMD cards through ROCm, one device per run, see [HIP.md](HIP.md)). Without it CUDA is used when it loads, else Vulkan.
+- `--ctx` KV cache size in tokens (default 4096). For Inkling 2, Hy4, GLM, DeepSeek, Kolibri and Gemma 4 it is the prompt plus reply limit instead, and the default is the context the model was trained on; their caches grow with the text.
 - `--mtp [N]` speculative decoding with the model's draft head. Greedy tokens stay the same; sampling keeps its
   distribution. Needs a GGUF with an MTP head (for example the Qwen3.6-35B-A3B MTP files).
   Qwen3.8-Flash-Next (`qwen4exp`) takes its head from a companion file: `--mtp-model mtp-...-shared-Q8_0.gguf`.
@@ -155,7 +156,7 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 - `--alias prism` (`serve`) is the model name in `/v1/models` and in the replies, whatever file is loaded (default: the
   file name), so clients set up for `prism` keep working when another model is loaded. Calibration and the expert
   profile stay per file.
-- Inkling 2, Hy4, GLM, DeepSeek and Gemma 4 run on their own code path. The server loads them like any other model
+- Inkling 2, Hy4, GLM, DeepSeek, Kolibri and Gemma 4 run on their own code path. The server loads them like any other model
   (`serve --model <file>`, or from the chat page of a running server, in either direction), with these limits: one
   request at a time, greedy (Inkling 2 also samples: `temperature`, `top_k`, `top_p`, `seed`; a seed repeats its
   text only with `STRATA_FIXED_EXPERTS=1`, because the adaptive expert split moves the logits a little),
@@ -176,6 +177,10 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   `model` that no listed file has is answered by the loaded model. If the load fails, the request gets `503` with
   the reason and the next chat request loads the model that was there before. With API keys only the admin key sees
   the other models and switches; a customer key sees and gets the loaded model.
+- A streamed reply sends its response head when the model takes the request, before the prompt runs. While the prompt
+  runs, and while the text of a tool call is held back, the stream sends the SSE comment `: keep-alive` every 15 s, so
+  a client that stops after some minutes without a byte keeps reading. If the prompt fails after the head, the stream
+  ends early.
 - It runs one request at a time; `--parallel N` (GPU) decodes up to N together (4 requests: 164 tok/s in total on the
   RTX 3060, 41 each; see [HOSTING.md](HOSTING.md)). From 8 requests decoding at once (`STRATA_BATCH_MIN` sets the
   count), a dense model without MTP, LoRA or recurrent layers on CUDA runs them in one batched forward, and the
@@ -193,6 +198,8 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   `penalty_last_n` tokens of the reply (default 64; 0 turns it off, -1 takes the whole reply). The window is for
   the repeat penalty only: the presence and frequency penalties count the whole reply.
 - `max_tokens` (or `max_completion_tokens`) and `stop` (up to 16 strings) work as in the OpenAI API; `n` must be 1.
+  Without `max_tokens` (and without `--max-tokens` on the server) a reply runs until the model stops or the context
+  is full.
 - A request whose last message has role `assistant` (and no tool calls) continues that message: the reply holds only
   the new text. The chat page's continue button uses this.
 - Thinking is on by default (`--think false` turns it off). A request overrides it with `chat_template_kwargs.enable_thinking`
@@ -225,7 +232,7 @@ OpenCode and other agents use the OpenAI address.
 
 `--device 0,1` splits the layers over the cards in proportion to their free VRAM, so more experts stay resident. The
 cards run one after the other, so one request gets more memory, not twice the speed of one card. MTP drafting is off on
-a split model.
+a split model. The HIP backend runs one device, so `--device 0,1` is refused with `--backend hip`.
 
 An index is the same card on both backends. NVIDIA cards are counted as CUDA counts them (by default the fastest card
 first, which is not the order of `nvidia-smi`), on Vulkan too; the other Vulkan devices follow, dedicated cards before
@@ -248,6 +255,39 @@ stores it. The load prints each card's layers and its measured host-to-VRAM copy
 /sys/class/drm/cardN/device/power_dpm_force_performance_level` (as root, per card) took a two-card split from 44 to 57
 tok/s in one report.
 
+### Inkling 2 on several GPUs
+
+Inkling 2 is the model this work targets, and `--device 0,1` is opt-in: the default is always one card, even on a
+machine with two. With two cards the 24 expert layers are placed as whole slabs (the load line says how many and
+where), a layer's FFN runs on the card that holds it, and the attention and tail stay on GPU 0.
+
+`STRATA_DS_FAST_KERNELS` selects the kernels:
+
+- `auto` (default): the tiled controllers, `ink_attn_128` and the 16-query prefill (`kp16`) only when the run has more
+  than one device. One card keeps the `main` kernels, so the greedy output does not change.
+- `1`: force them on one card (the one-card kernel numbers in the PR).
+- `0`: force the old kernels on two cards (the A/B).
+
+Per-kernel overrides: `STRATA_CTRL_TILE=0` (per-token controllers), `STRATA_DS_ATTN_OLD=1` (scalar decode and
+one-query-a-warp prefill), `STRATA_DS_ATTN_KP4=1` (four-query prefill).
+
+The two-card plan uses these knobs:
+
+| variable | default | effect |
+|---|---|---|
+| `STRATA_DS_FAST_KERNELS` | `auto` | as above; one card keeps the old kernels unless forced |
+| `STRATA_DS_PLAIN_FIRST` | unset; `chat`/`serve`/`bench` set `1` | keep the plain weights on GPU 0, where the decode state lives |
+| `STRATA_DS_PF_TOKENS` | 256 one card, 512 two | tokens of one prompt chunk (at most 2048) |
+| `STRATA_DS_KV_TOKENS` | `--ctx` | KV rows GPU 0 must still be able to take before it gives up a slab |
+| `STRATA_DS_PROF` | unset | print `inkling2: preloaded N/24 ...` and the per-chunk profile |
+| `STRATA_DS_NO_AFFINITY` | unset | pick the GPU per expert instead of per stacked tensor |
+| `STRATA_DS_NO_SEG_GRAPH` | unset | do not capture the segmented decode graph |
+| `STRATA_CTRL_TILE` | follows `FAST_KERNELS` | `0` forces the per-token controllers |
+| `STRATA_DS_ATTN_OLD` | off | `1` keeps the scalar decode and one-query-a-warp prefill |
+| `STRATA_DS_ATTN_KP4` | off | `1` selects the four-query 128-key prefill for the A/B |
+
+`STRATA_INKLING2_MODEL` (path to the GGUF) only selects the model for `tests/inkling2_forward.rs`.
+
 ## Page cache
 
 Experts that do not fit in VRAM are read from the GGUF through the page cache. A file system that keeps file data out
@@ -257,6 +297,8 @@ file system that caches data, or from a tmpfs copy.
 When the model files fit in RAM with 4 GiB to spare, they are read into the page cache in the background from the
 start and nothing is dropped, so experts that run on the CPU do not wait for the drive on their first use.
 `STRATA_PRELOAD=1` forces that, `STRATA_PRELOAD=0` turns it off.
+A file on a network file system (SMB, NFS, a FUSE mount) is not read ahead, because that asks the server for the whole
+file at once: its pages are read when they are used (`STRATA_PRELOAD=1` reads it ahead all the same).
 
 Otherwise bytes copied to VRAM are dropped from the page cache (`MADV_DONTNEED`), so on a model close to the machine's
 RAM the experts that missed VRAM keep their pages; `STRATA_COLD_KEEP=1` only marks them reclaimable instead. `serve` learns

@@ -44,9 +44,13 @@ struct DSlot { k: Buf, v: Buf, hist: Buf, cap: usize }
 /// prompt chunk on, a prefill scratch. The activations come over the host once per layer run (about 10 KB per token).
 struct Remote { part: usize, scr: Buf, s: Scratch, pf: Option<PrefillScratch> }
 
-/// Tokens of one prompt chunk on the device: `STRATA_DS_PF_TOKENS` (default 512, at most 2048).
+/// Tokens of one prompt chunk on the device: `STRATA_DS_PF_TOKENS` (default 256 on one card, 512 on two or more;
+/// at most 2048).
 pub(super) fn pf_tokens() -> usize {
-    std::env::var("STRATA_DS_PF_TOKENS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(512).clamp(1, 2048)
+    let multi = std::env::var("STRATA_DS_DEVICES")
+        .map_or(false, |v| v.split(',').filter(|d| !d.trim().is_empty()).count() > 1);
+    let default = if multi { 512 } else { 256 };
+    std::env::var("STRATA_DS_PF_TOKENS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(default).clamp(1, 2048)
 }
 
 /// Device addresses of the regions of the decode scratch buffer (`sc` lives in `Device::sc_buf` so `--ctx` scales dynamically).
@@ -200,6 +204,10 @@ fn up<T: crate::backend::Plain>(be: &dyn Backend, v: &[T]) -> Result<Buf> {
 
 fn f(floats: usize) -> u64 { 4 * floats as u64 }
 
+/// Rows of a K/V buffer that grows to hold `need`: a quarter more, so that a reply does not grow it at every token
+/// and a long prompt does not take twice its rows from the experts.
+fn grown(need: usize, max_ctx: usize) -> usize { (need + need / 4).next_multiple_of(1024).min(max_ctx) }
+
 /// Free expert slots until `need` bytes of VRAM are free.
 fn room(d: &mut dev::Dev, need: usize) {
     let free = d.parts[0].be.mem_info().map_or(0, |m| m.0);
@@ -343,7 +351,9 @@ impl Device {
                     let kv = 4 * n_att * kv_rows * be0.kv_words(kw) + sc_bytes(c, kv_rows);
                     let pf0 = PrefillScratch::bytes(be0, c, rank, vocab, pf_cap, false);
                     let pf1 = if n_parts > 1 { PrefillScratch::bytes(&*d.parts[1].be, c, rank, vocab, pf_cap, true) } else { 0 };
-                    (f_res + pf0 + kv, (192 << 20) + pf1 + Scratch::at(0, c, rank, 0).end as usize)
+                    // One card keeps the old 384 MiB reserve; the KV/prefill reserve is for the two-card plan.
+                    let res0 = if n_parts > 1 { f_res + pf0 + kv } else { f_res };
+                    (res0, (192 << 20) + pf1 + Scratch::at(0, c, rank, 0).end as usize)
                 };
                 let key = |s: &[u8]| Some((s.as_ptr() as usize, s.len()));
                 let on_loop = |ip: usize| (c.loop_start..c.loop_end).contains(&ip);
@@ -472,21 +482,40 @@ impl Device {
         let row_words = d.parts[0].be.kv_words(kw);
         let full_cap = self.slots.iter().enumerate().find(|&(il, _)| !c.swa[layer_of(c, il)]).map(|(_, s)| s.cap);
         if let Some(cap) = full_cap && need > cap {
-            let mut new_cap = cap;
-            while new_cap < need { new_cap = (new_cap * 2).min(m.max_ctx); }
+            let new_cap = grown(need, m.max_ctx);
             let n = (0..c.n_slot()).filter(|&il| !c.swa[layer_of(c, il)]).count();
-            room(&mut d, 4 * n * new_cap * row_words + sc_bytes(c, new_cap) + (128 << 20));
+            // The margin is the one of `new`: the prompt scratch and the graphs of the reply come after this.
+            let bytes = 4 * n * new_cap * row_words + sc_bytes(c, new_cap) + (512 << 20);
+            room(&mut d, bytes);
+            // The expert cache was not enough: whole layers of experts go, the last loaded first. Their experts
+            // then run through the expert cache or on the CPU, which costs less than a model without its device state.
+            let free = |d: &dev::Dev| d.parts[0].be.mem_info().map_or(0, |m| m.0);
+            if free(&d) < bytes {
+                d.parts[0].be.sync()?;
+                let order: Vec<usize> = (c.loop_start..c.loop_end).chain(0..c.loop_start).chain(c.loop_end..c.n_layer).collect();
+                // Counted here: the driver may report the freed bytes late.
+                let mut short = bytes - free(&d);
+                for &ip in order.iter().rev() {
+                    if short == 0 { break; }
+                    if let Some(fe) = self.layers[ip].full_exps.take() {
+                        // The budget falls too, so the expert cache does not take the room back.
+                        d.parts[0].budget = d.parts[0].budget.saturating_sub(fe.gu.len() + fe.dn.len());
+                        short = short.saturating_sub(fe.gu.len() + fe.dn.len());
+                        self.all_full = false;
+                    }
+                }
+            }
         }
         let be = &*d.parts[0].be;
-        let need_sc = sc_bytes(c, need);
+        // The score buffer follows the K/V rows: it is in the room made above, and a reply does not grow it every 64 tokens.
+        let need_sc = sc_bytes(c, full_cap.map_or(need, |cap| if need > cap { grown(need, m.max_ctx) } else { cap }));
         if self.sc_buf.len() < need_sc {
             be.sync()?;
             self.sc_buf = be.alloc(need_sc)?;
         }
         for (il, s) in self.slots.iter_mut().enumerate() {
             if c.swa[layer_of(c, il)] || need <= s.cap { continue; }
-            let mut new_cap = s.cap;
-            while new_cap < need { new_cap = (new_cap * 2).min(m.max_ctx); }
+            let new_cap = grown(need, m.max_ctx);
             for b in [&mut s.k, &mut s.v] {
                 let new = be.alloc(2 * new_cap * row_words)?;
                 be.dtod(b, 0, &new, 0, b.len())?;
@@ -530,7 +559,7 @@ impl Device {
     pub(super) fn to_host(&mut self, c: &Inkling2Config, layers: &[Layer], slots: &mut [Slot], pos: usize, max_ctx: usize) {
         if !self.ahead { return; }
         assert!(crate::cuda::kv_mode() == 0 || self.synced == pos,
-            "quantized KV cache (--kv q8/q4/q2) is only supported on the GPU path");
+            "the card has no room for the K/V cache, and a quantized KV cache (--kv q8/q4/q2) cannot move to the CPU: run with a smaller --ctx");
         let d = dev::get().unwrap().lock().unwrap();
         let be = &*d.parts[0].be;
         let (hd, (at, len)) = (c.head_dim, hists(c));
@@ -819,6 +848,42 @@ impl Device {
         be.put(h_corr, &self.scr, ((s.hn - o) / 4) as usize)?;
         be.gemvq(d.tensor(m.output.gpu.unwrap()), s.hn, c.n_embd, 0, s.logits, c.n_vocab, 1)?;
         be.argmax_rows(s.logits, c.n_vocab, 1, s.amax)?;
+        let id = be.get::<i32>(&self.scr, ((s.amax - o) / 4) as usize, 1)?[0] as u32;
+        Ok(id)
+    }
+
+    /// Project `nt` hidden vectors (`[nt, n_embd]`) through the target's LM head on GPU into `pf.logits_buf`
+    /// (`[nt, m.output.rows]`), keeping the logits on device for `markov_w2_argmax_gpu`.
+    pub(super) fn lm_head_batch_gpu(&mut self, m: &Inkling2Model, h_rows: &[f32], nt: usize) -> Result<()> {
+        let c = &m.cfg;
+        let vrows = m.output.rows;
+        let d = dev::get().context("no GPU device")?.lock().map_err(|_| anyhow::anyhow!("GPU device lock poisoned"))?;
+        let be = &*d.parts[0].be;
+        self.ensure_pf(be, c, vrows, nt)?;
+        let pf = self.pf.as_ref().unwrap();
+        let o = pf.buf.addr();
+        be.put(h_rows, &pf.buf, ((pf.p.hn - o) / 4) as usize)?;
+        be.gemvq(d.tensor(m.output.gpu.context("output.weight not on GPU")?), pf.p.hn, c.n_embd, 0, pf.logits_buf.addr(), vrows, nt)?;
+        Ok(())
+    }
+
+    /// Add low-rank `w2 @ latent + bias` onto `pf.logits_buf[step]` on GPU and return the argmax token ID.
+    pub(super) fn markov_w2_argmax_gpu(
+        &self, m: &Inkling2Model, w2: &crate::backend::GpuTensor, bias_addr: u64, bias_len: usize, latent: &[f32], step: usize,
+    ) -> Result<u32> {
+        let c = &m.cfg;
+        let vrows = m.output.rows;
+        let nv = c.n_vocab.min(w2.rows).min(bias_len);
+        ensure!(nv > 0, "markov_w2: empty vocabulary intersection");
+        let pf = self.pf.as_ref().context("lm_head_batch_gpu not called")?;
+        let (s, o) = (self.s, self.scr.addr());
+        let d = dev::get().context("no GPU device")?.lock().map_err(|_| anyhow::anyhow!("GPU device lock poisoned"))?;
+        let be = &*d.parts[0].be;
+        be.put(latent, &self.scr, ((s.hn - o) / 4) as usize)?;
+        be.gemvq(w2, s.hn, w2.cols, 0, s.logits, w2.rows, 1)?;
+        be.add(s.logits, pf.logits_buf.addr() + (step * vrows * 4) as u64, nv)?;
+        be.add(s.logits, bias_addr, nv)?;
+        be.argmax_rows(s.logits, nv, 1, s.amax)?;
         let id = be.get::<i32>(&self.scr, ((s.amax - o) / 4) as usize, 1)?[0] as u32;
         Ok(id)
     }
@@ -1596,13 +1661,15 @@ impl Device {
         let gpu_side = || -> Option<f32> {
             let t = std::time::Instant::now();
             let d = lock();
-            let (p, mut owned) = (&d.parts[0], vec![]);
+            let (p, mut staged) = (&d.parts[0], None);
             (|| -> Option<()> {
                 // One moe_gemv per matrix kind for all of them (8 small gemvs leave most of the card idle).
                 let Some((gu, dn, ..)) = list.first() else { return Some(()) };
                 let (k, gs) = (list.len(), list.iter().map(|e| e.3).collect::<Vec<f32>>());
-                let mut ptrs = |down: bool| list.iter().map(|e| d.weight(p, if down { &e.1 } else { &e.0 }, &mut owned).map(|t| t.ptr)).collect::<Option<Vec<u64>>>();
-                let (pg, pd) = (ptrs(false)?, ptrs(true)?);
+                let (gm, dm): (Vec<_>, Vec<_>) = list.iter().map(|e| (e.0, e.1)).unzip();
+                let (buf, ptrs) = d.weights(p, &[&gm, &dm])?;
+                let (pg, pd) = (ptrs[..k].to_vec(), ptrs[k..].to_vec());
+                staged = (buf.len() > 0).then_some(buf);
                 match (slab(&pg), slab(&pd)) {
                     (Some((bg, sg, ig)), Some((bd, sd, id))) => {
                         p.be.put(&[ig, id].concat(), &self.scr, ((s.ids - o) / 4) as usize).ok()?;
@@ -1628,7 +1695,7 @@ impl Device {
                 }
                 // Wait when an expert came from the file: its copy lives until the run ends, and the CPU share
                 // follows the time. With every expert in VRAM the queue runs on.
-                if adapt || !owned.is_empty() { p.be.sync().ok()?; }
+                if adapt || staged.is_some() { p.be.sync().ok()?; }
                 Some(())
             })()?;
             Some(t.elapsed().as_secs_f32())

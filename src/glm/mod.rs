@@ -422,17 +422,18 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a crate::tokenizer::Tokenizer, name: &'a st
         anyhow::ensure!(ids.len() < ctx, "prompt is {} tokens, the limit is {}", ids.len(), ctx - 1);
         let t = std::time::Instant::now();
         let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
-        let logits = m.prefill(&ids[keep..]);
-        let prefill_s = t.elapsed().as_secs_f64();
-        let n = q.max_tokens.unwrap_or(256).min(ctx - ids.len());
         if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
+        let logits = crate::serve::alive(c, q.stream, || m.prefill(&ids[keep..]));
+        let prefill_s = t.elapsed().as_secs_f64();
+        let n = q.max_tokens.unwrap_or(usize::MAX).min(ctx - ids.len());
         let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
         let stream = q.stream;
         let tools = q.tool_calls && !q.tools.is_empty();
         let mut hold = crate::chat::Hold::new(tools, vec![]);
+        let mut alive = std::time::Instant::now();
         let (out, done) = decode_greedy(&mut m, &tok, &stop, logits, n, &mut |t| {
             let t = hold.push(t);
-            !stream || t.is_empty() || write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok()
+            !stream || if t.is_empty() { crate::serve::held(c, &mut alive) } else { write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok() }
         });
         let calls = if tools { parse_calls(&hold.text, &q.tools) } else { None };
         let done = if calls.is_some() { "tool_calls" } else { done };

@@ -6,9 +6,15 @@ typedef unsigned short u16;
 typedef unsigned int u32;
 typedef unsigned long long u64;
 
+#if STRATA_HIP
+// AMD: the ISA converts f16 in one instruction, the compiler emits it for these.
+__device__ __forceinline__ float h2f(u16 h) { return (float)*(const _Float16*)&h; }
+__device__ __forceinline__ u16 f2h(float f) { _Float16 x = (_Float16)f; return *(const u16*)&x; }
+#else
 __device__ __forceinline__ float h2f(u16 h) { float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f; }
 __device__ __forceinline__ float2 ink_h2f2(unsigned w) { return make_float2(h2f((u16)(w & 0xFFFFu)), h2f((u16)(w >> 16))); }
 __device__ __forceinline__ u16 f2h(float f) { u16 h; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f)); return h; }
+#endif
 __device__ __forceinline__ u32 ld16(const u8* p) { return *(const u16*)p; }  // 2-aligned only (every quant field is)
 __device__ __forceinline__ u32 ld32(const u8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((u32)p[3] << 24); }
 __device__ __forceinline__ float ldh(const u8* p) { return h2f((u16)ld16(p)); }
@@ -1023,8 +1029,12 @@ __device__ __forceinline__ void ldsm4(u32* r, const u16* p) {
 #pragma unroll
     for (int m = 0; m < 4; m++) {
         int m_row = (RM ? (m & 1) : (m >> 1)) * 8, m_col = (RM ? (m >> 1) : (m & 1)) * 8;
+#if STRATA_HIP
+        r[m] = *(const u32*)(p + (m_row + row) * PQ + m_col + col);
+#else
         unsigned a = (unsigned)__cvta_generic_to_shared(p + (m_row + row) * PQ + m_col + col);
         asm("ld.shared.b32 %0, [%1];" : "=r"(r[m]) : "r"(a));
+#endif
     }
 #else
     unsigned a = (unsigned)__cvta_generic_to_shared(p);
@@ -1041,11 +1051,16 @@ __device__ __forceinline__ void ldsm4t(u32* r, const u16* p) {
 #pragma unroll
     for (int m = 0; m < 4; m++) {
         int m_row = (RM ? (m & 1) : (m >> 1)) * 8, m_col = (RM ? (m >> 1) : (m & 1)) * 8;
+#if STRATA_HIP
+        const u16* a = p + (m_row + row) * PQ + m_col + col;
+        r[m] = (u32)a[0] | ((u32)a[PQ] << 16);
+#else
         unsigned a = (unsigned)__cvta_generic_to_shared(p + (m_row + row) * PQ + m_col + col);
         unsigned short lo, hi;
         asm("ld.shared.u16 %0, [%1];" : "=h"(lo) : "r"(a));
         asm("ld.shared.u16 %0, [%1];" : "=h"(hi) : "r"(a + 2 * PQ));
         r[m] = (u32)lo | ((u32)hi << 16);
+#endif
     }
 #else
     unsigned a = (unsigned)__cvta_generic_to_shared(p);
@@ -1102,7 +1117,7 @@ __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 #endif
 }
-#if __CUDA_ARCH__ < 800
+#if __CUDA_ARCH__ < 800 && !STRATA_HIP
 // D[8,8] += A[8,4] * B[4,8] with the four independent computations of mma.m8n8k4 (Volta, SASS HMMA.884) selected
 // by g & 3. PTX ISA 8.5 §9.7.13.4.1: lane l = 4*g + t owns A row t + 4*(g >= 4) at k 0..3 and D elements by the
 // column/row formulas implemented in gemm_q's sm_70 path. mma.m16n8k16 is sm_80+, so this helper only exists for
@@ -1141,6 +1156,10 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
 #if __CUDA_ARCH__ < 800 && GEMM_TC
     // Same 32 f32 storage as acc, seen as 4 m8 tiles x 8 D registers: accv[j][i] == &acc[0][0][0][j*8+i].
     float (&accv)[4][8] = reinterpret_cast<float (&)[4][8]>(acc);
+#endif
+#if GEMM_WMMA
+    // The same 32 f32 as 4 WMMA tiles of 8 results: accw[t][i] is tile t, result i of this lane.
+    float (&accw)[4][8] = reinterpret_cast<float (&)[4][8]>(acc);
 #endif
     // W step kb is decoded into registers (as halves) during step kb - 1's mma and stored after it.
     constexpr int WQ = 64 * SUBS / NT;
@@ -1183,7 +1202,30 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
         if (wm < tl.cnt)
 #pragma unroll
         for (int kk = 0; kk < BK; kk += 16) {
-#if __CUDA_ARCH__ < 800 && GEMM_TC
+#if GEMM_WMMA
+            // AMD matrix cores: the tile in xs (positions, rows = m) and ws (rows = n) is fed straight in as A and B
+            // of D[16x16] += A * B^T. A warp owns MT x NT 16x16 tiles: (32 positions, 32 rows) for the big kernel and
+            // one (16 positions, 16 rows) for the small-tile one, whose 8 warps cover 32 positions x 64 rows. Each lane holds 8 results of every tile.
+            const int l16 = lane & 15, w0 = STRATA_WMMA_K0(lane);
+            constexpr int MT = SM ? 1 : 2, NTW = SM ? 1 : 2;
+            strata_hip::strata_hk wa[MT], wb[NTW];
+#pragma unroll
+            for (int mt = 0; mt < MT; mt++) wa[mt] = strata_hip::strata_ld_wmma(xs + (wm + mt * 16 + l16) * P + kk + w0);
+#pragma unroll
+            for (int nt = 0; nt < NTW; nt++) wb[nt] = strata_hip::strata_ld_wmma(ws + (wn + nt * 16 + l16) * P + kk + w0);
+#pragma unroll
+            for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+                for (int nt = 0; nt < NTW; nt++) {
+                    float* t = accw[mt * NTW + nt];
+                    strata_hip::strata_f8 c, r;
+#pragma unroll
+                    for (int i = 0; i < 8; i++) c[i] = t[i];
+                    r = strata_hip::strata_wmma(wa[mt], wb[nt], c);
+#pragma unroll
+                    for (int i = 0; i < 8; i++) t[i] = r[i];
+                }
+#elif __CUDA_ARCH__ < 800 && GEMM_TC
             // Volta: eight m8n8k4 ops replace one m16n8k16 for the same 16-deep k step. The four computations of
             // each instruction are selected by c = g & 3: SM == false maps them to the four n8 tiles (m8 = j, n8 =
             // c, 32 f32 per lane in accv[0..3]); SM == true maps them to the four 8x8 quadrants of the 16x16 warp
@@ -1223,7 +1265,28 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
         __syncthreads();
         if (kb + 1 < nk) stw();
     }
-#if __CUDA_ARCH__ < 800 && GEMM_TC
+#if GEMM_WMMA
+    // D layout of the AMD WMMA: the lane keeps column lane & 15 and rows STRATA_WMMA_ROW(lane, 0..7) of each tile.
+    {
+        const int l16 = lane & 15;
+        constexpr int MT = SM ? 1 : 2, NTW = SM ? 1 : 2;
+#pragma unroll
+        for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+            for (int nt = 0; nt < NTW; nt++) {
+                int n = n0 + wn + nt * 16 + l16;
+                if (n >= rows) continue;
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    int r = wm + mt * 16 + STRATA_WMMA_ROW(lane, i);
+                    if (r >= tl.cnt) continue;
+                    float* yr = y + (size_t)(tl.m0 + r) * y_stride;
+                    float v = accw[mt * NTW + nt][i];
+                    yr[n] = act == 0 ? v : act == 1 ? silu(yr[n]) * v : yr[n] + v;
+                }
+            }
+    }
+#elif __CUDA_ARCH__ < 800 && GEMM_TC
     // m8n8k4 D layout (PTX ISA 8.5 §9.7.13.4.1): register i = 4*p4 + 2*p2 + e sits at row (t & 1) + 2*p2 + 4*hi
     // and column (t & 2) + 4*p4 + e of the 8x8 tile. For each fixed c, lanes {4c..4c+3} and {16+4c..19+4c} cover
     // that tile exactly once; the tile itself is picked by c (n8 = c) and j (m8 = j), or by c alone for SM.
@@ -1558,6 +1621,214 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
         gemmi_q<T, SBB, 128, true>(tiles, wd, nd, x, xrow, y, y_stride, rows, n64, act, sc);                    \
     }
 ITYPES(DEF_GEMMI)
+
+// ---- small-batch int8 GEMM (batched decode: at most 64 positions) ----
+// grid = ks * ceil(rows / 128), block = 256, dynamic shared memory (Gpu::gemm_raw has the size); pb = 8, 16, 32 or 64
+// is nd rounded up.
+// A warp owns 16 W rows as the mma A operand. Lane (g, t) decodes the 8 weights 32 q + 8 t .. of rows g and g + 8
+// from global memory itself, so W is not staged in shared memory and the K loop has no barrier per step
+// (gemmi_q: two barriers per 64 columns and every warp of the block decodes for the mmas of half of them).
+// Both operands permute the k index of the mma the same way (column 8 t + j is k 4 t + j, column 8 t + 4 + j is
+// k 16 + 4 t + j), so a lane's 8 weights are one QI get and its 8 x values one load. A type with a scale per 16 runs
+// two mmas per 32 columns, each with the lanes of the other half zeroed.
+// X (q8 rows) is the B operand, from a shared-memory window of GEMMD_XW(pb) columns that cp.async double-buffers: one
+// barrier per window.
+// ks = 2: two blocks (seg 0, 1) share 128 rows, each over half of the columns (Gpu::gemm_raw has the rule and the
+// measurement). Both blocks store their partial sums in scr ([seg][position][row]); the one that ends second (flag:
+// the count of blocks done for these rows, over all launches) adds the other's and writes y. a + b is b + a, so the
+// result does not depend on which block that is.
+#define GEMMD_XW(pb) ((pb) >= 32 ? 128 : 4096 / (pb))
+template <int T, int SBB>
+__device__ __forceinline__ void gemmd_q(const u8* w, const u8* __restrict__ x, int nd, int pb, int ks, float* scr, int* flag,
+                                        float* y, int y_stride, int rows, int cols, int act, float sc) {
+    // One window: pb rows of xw + 32 int8 (the pitch puts two lanes on a bank, the least an 8-byte load allows),
+    // then xw / 32 scales and xw / 16 sums per row. Two windows, then pk.
+    extern __shared__ __align__(16) signed char gemmd_s[];
+    int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    int seg = blockIdx.x % ks, rb = blockIdx.x / ks, bs = blockDim.x, ts = tid;
+    int xw = GEMMD_XW(pb), lx = 31 - __clz(xw), pitch = xw + 32, od = pb * pitch, os = od + pb * (xw >> 3), xb_ = os + pb * (xw >> 2);
+    int nq = cols / 32, qw = xw >> 5, nwin = (cols + xw - 1) >> lx, nws = (nwin + ks - 1) / ks, w0 = seg * nws;
+    signed char* gx = gemmd_s;
+    float* pk = (float*)(gx + 2 * xb_);  // per (position pair, 32 columns): d0, d1, s0, s1, then the four half sums
+    int np = nd, npt = (np + 7) >> 3, r0 = (rb * (bs >> 5) + warp) * 16;
+    const u8* xr = x;
+    int nc0 = pb * (xw >> 4), nc1 = nc0 + pb * (xw >> 7), nc2 = nc1 + pb * (xw >> 6);
+    auto ldx = [&](int wi) {  // window wi of this block's columns
+        signed char* d = gx + (wi & 1) * xb_;
+        int k0 = (w0 + wi) * xw;
+        for (int c = ts; c < nc2; c += bs) {  // 16-byte chunks: int8, then scales, then sums
+            int pos, o; const u8* src; signed char* dst; bool ok;
+            if (c < nc0) {
+                pos = c >> (lx - 4); o = (c & ((xw >> 4) - 1)) * 16;
+                src = xr + (size_t)pos * Q8_ROW(cols) + k0 + o; dst = d + pos * pitch + o; ok = k0 + o < cols;
+            } else if (c < nc1) {
+                pos = (c - nc0) >> (lx - 7); o = ((c - nc0) & ((xw >> 7) - 1)) * 16;
+                src = xr + (size_t)pos * Q8_ROW(cols) + cols + (k0 >> 3) + o; dst = d + od + pos * (xw >> 3) + o; ok = k0 + o * 8 < cols;
+            } else {
+                pos = (c - nc1) >> (lx - 6); o = ((c - nc1) & ((xw >> 6) - 1)) * 16;
+                src = xr + (size_t)pos * Q8_ROW(cols) + cols + cols / 8 + (k0 >> 2) + o; dst = d + os + pos * (xw >> 2) + o; ok = k0 + o * 4 < cols;
+            }
+            cp_async16(dst, src, ok && pos < np);
+        }
+        cp_async_commit();
+    };
+    const bool live = r0 < rows;
+    const u8* pa = w + (size_t)min(r0 + g, rows - 1) * ROWB(cols, SBB);
+    const u8* pb_ = w + (size_t)min(r0 + g + 8, rows - 1) * ROWB(cols, SBB);
+    constexpr int KS = scale32<T>() ? 32 : 16;
+    float acc[8][4] = {};
+    const signed char* xb;
+    // The scales and sums of window wi, from the staged q8 rows into pk: one load per mma instead of four.
+    auto pack = [&](int wi) {
+        const float* xd = (const float*)(gx + (wi & 1) * xb_ + od); const float* xs = (const float*)(gx + (wi & 1) * xb_ + os);
+        for (int c = ts; c < (pb >> 1) * qw; c += bs) {
+            int p = 2 * (c % (pb >> 1)), kw = c / (pb >> 1);  // [kw][pair]: the four t of a warp load from 16 banks
+            float* o = pk + c * 8;
+            *(float2*)o = make_float2(xd[p * qw + kw], xd[(p + 1) * qw + kw]);
+            if (QI<T>::MIN) {
+                float2 s0 = *(const float2*)(xs + p * 2 * qw + 2 * kw), s1 = *(const float2*)(xs + (p + 1) * 2 * qw + 2 * kw);
+                *(float2*)(o + 2) = make_float2(s0.x + s0.y, s1.x + s1.y);
+                *(float4*)(o + 4) = make_float4(s0.x, s0.y, s1.x, s1.y);
+            }
+        }
+        __syncthreads();
+    };
+    // The mmas of one 32-column block (kw in the window): A fragment a0..a3, W scale and min of rows g and g + 8.
+    auto blk = [&](int kw, u32 a0, u32 a1, u32 a2, u32 a3, float wda, float wma, float wdb, float wmb) {
+        // Scale per 16: lanes t < 2 hold the first 16 columns of the 32, lane t ^ 2 the scale of the other 16.
+        float oda = 0.f, oma = 0.f, odb = 0.f, omb = 0.f;
+        if (KS == 16) {
+            oda = __shfl_xor_sync(0xffffffffu, wda, 2); odb = __shfl_xor_sync(0xffffffffu, wdb, 2);
+            if (QI<T>::MIN) { oma = __shfl_xor_sync(0xffffffffu, wma, 2); omb = __shfl_xor_sync(0xffffffffu, wmb, 2); }
+        }
+        #pragma unroll
+        for (int pt = 0; pt < 8; pt++) {  // 8 positions an mma
+            if (pt >= npt) break;
+            const uint2 bx = *(const uint2*)(xb + (pt * 8 + g) * pitch + kw * 32 + 8 * t);
+            const float* o = pk + (kw * (pb >> 1) + pt * 4 + t) * 8;
+            float dx[2], s32[2] = {0.f, 0.f};
+            float2 sx[2] = {make_float2(0.f, 0.f), make_float2(0.f, 0.f)};
+            if (QI<T>::MIN && KS == 32) { const float4 v = *(const float4*)o; dx[0] = v.x; dx[1] = v.y; s32[0] = v.z; s32[1] = v.w; }
+            else {
+                const float2 v = *(const float2*)o; dx[0] = v.x; dx[1] = v.y;
+                if (QI<T>::MIN) { const float4 u = *(const float4*)(o + 4); sx[0] = make_float2(u.x, u.y); sx[1] = make_float2(u.z, u.w); }
+            }
+            #pragma unroll
+            for (int h = 0; h < 32 / KS; h++) {
+                const bool mine = KS == 32 || (t >> 1) == h;
+                int c[4];
+                mma_s8_16832_b(c, mine ? a0 : 0, mine ? a1 : 0, mine ? a2 : 0, mine ? a3 : 0, bx.x, bx.y);
+                const float dw[2] = {mine ? wda : oda, mine ? wdb : odb}, mw[2] = {mine ? wma : oma, mine ? wmb : omb};
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    // Two fmas into the sum (a product, a subtraction and an add cost one instruction more).
+                    acc[pt][i] = fmaf(__int_as_float(c[i]) - 12582912.0f, dx[i & 1] * dw[i >> 1], acc[pt][i]);  // i2f_small
+                    if (QI<T>::MIN) acc[pt][i] = fmaf(-(KS == 32 ? s32[i & 1] : h ? sx[i & 1].y : sx[i & 1].x), mw[i >> 1], acc[pt][i]);
+                }
+            }
+        }
+    };
+    // Generic: block q + 1 is decoded during block q's mmas.
+    int la = 0, ha = 0, lb = 0, hb = 0; float da = 0.f, ma = 0.f, db = 0.f, mb = 0.f;
+    auto dec = [&](int q) {
+        ma = mb = 0.f;
+        int sub = (q & 7) * 4 + t; size_t o = (size_t)(q >> 3) * SBB;
+        QI<T>::get(pa + o, sub, la, ha, da, ma);
+        QI<T>::get(pb_ + o, sub, lb, hb, db, mb);
+    };
+    // Q4_K: 64 columns of a row are 32 bytes of nibbles (low: the first 32 columns), so the lane's two blocks are one
+    // 8-byte load a row; the pair after is loaded before this pair's mmas.
+    const bool k4 = T == 12 && ((size_t)w & 15) == 0 && cols % 256 == 0;
+    uint4 sa_ = make_uint4(0, 0, 0, 0), sb_ = sa_; uint2 ua = make_uint2(0, 0), ub = ua;
+    float sda = 0.f, sma = 0.f, sdb = 0.f, smb = 0.f;
+    auto ldp = [&](int p, bool hdr) {  // hdr: the pair is the first of its super-block that this block reads
+        size_t o = (size_t)(p >> 2) * 144; int j = 16 + 32 * (p & 3) + 8 * t;
+        if (hdr) { sa_ = *(const uint4*)(pa + o); sb_ = *(const uint4*)(pb_ + o); }
+        ua = *(const uint2*)(pa + o + j); ub = *(const uint2*)(pb_ + o + j);
+    };
+    ldx(0);
+    cp_async_wait<0>();
+    __syncthreads();
+    pack(0);
+    if (live && w0 * qw < nq) { if (k4) ldp(w0 * qw / 2, true); else dec(w0 * qw); }
+    for (int wi = 0; wi < nws; wi++) {
+        if (wi + 1 < nws) ldx(wi + 1);  // into the buffer of window wi - 1: every thread passed the barrier below
+        xb = gx + (wi & 1) * xb_;
+        int qa = (w0 + wi) * qw, q1 = min(nq, qa + qw);
+        if (live && k4) {
+            for (int p = qa / 2; p < q1 / 2; p++) {
+                const uint4 ca = sa_, cb = sb_; const uint2 va = ua, vb = ub;
+                if (p + 1 < nq / 2) ldp(p + 1, !((p + 1) & 3));
+                // The four lanes of a row would decode the same scale: at an even pair (a window starts at one: it
+                // is 128 columns or more) lane t decodes the scale of block t of the next four, and a shuffle
+                // hands each block's scale to the row's lanes.
+                if (!(p & 1)) {
+                    k4_dm_w(ca.x, ca.y, ca.z, ca.w, 2 * (p & 2) + t, sda, sma);
+                    k4_dm_w(cb.x, cb.y, cb.z, cb.w, 2 * (p & 2) + t, sdb, smb);
+                }
+                #pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    const int from = (lane & ~3) | (2 * (p & 1) + h);
+                    const float wda = __shfl_sync(0xffffffffu, sda, from), wma = __shfl_sync(0xffffffffu, sma, from);
+                    const float wdb = __shfl_sync(0xffffffffu, sdb, from), wmb = __shfl_sync(0xffffffffu, smb, from);
+                    blk(2 * p + h - qa, (va.x >> (4 * h)) & 0x0F0F0F0Fu, (vb.x >> (4 * h)) & 0x0F0F0F0Fu,
+                        (va.y >> (4 * h)) & 0x0F0F0F0Fu, (vb.y >> (4 * h)) & 0x0F0F0F0Fu, wda, wma, wdb, wmb);
+                }
+            }
+        } else if (live) {
+            for (int q = qa; q < q1; q++) {
+                const u32 a0 = la, a1 = lb, a2 = ha, a3 = hb;
+                const float wda = da, wma = ma, wdb = db, wmb = mb;
+                if (q + 1 < nq) dec(q + 1);
+                blk(q - qa, a0, a1, a2, a3, wda, wma, wdb, wmb);
+            }
+        }
+        cp_async_wait<0>(); __syncthreads();
+        if (wi + 1 < nws) pack(wi + 1);
+    }
+    if (ks > 1) {
+        float* mine = scr + (size_t)seg * nd * rows;
+        const volatile float* other = scr + (size_t)(seg ^ 1) * nd * rows;  // another block's stores: not cached
+        if (live) {
+            #pragma unroll
+            for (int j = 0; j < 32; j++) {
+                int r = r0 + g + 8 * ((j >> 1) & 1), p = (j >> 2) * 8 + 2 * t + (j & 1);
+                if (r < rows && p < np) mine[(size_t)p * rows + r] = acc[j >> 2][j & 3];
+            }
+        }
+        __threadfence();  // every thread's sums are in memory before the count says so
+        __syncthreads();
+        int* second = (int*)gemmd_s;
+        if (tid == 0) *second = atomicAdd(flag + rb, 1) & 1;
+        __syncthreads();
+        if (!*second) return;
+        if (live) {
+            #pragma unroll
+            for (int j = 0; j < 32; j++) {
+                int r = r0 + g + 8 * ((j >> 1) & 1), p = (j >> 2) * 8 + 2 * t + (j & 1);
+                if (r < rows && p < np) acc[j >> 2][j & 3] += other[(size_t)p * rows + r];
+            }
+        }
+    }
+    if (live) {
+        #pragma unroll
+        for (int pt = 0; pt < 8; pt++)
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int r = r0 + g + 8 * (i >> 1), p = pt * 8 + 2 * t + (i & 1);
+                if (r >= rows || p >= np) continue;
+                float* yp = y + (size_t)p * y_stride + r;
+                float v = acc[pt][i] * sc;
+                *yp = act == 0 ? v : act == 1 ? silu(*yp) * v : *yp + v;
+            }
+    }
+}
+#define DEF_GEMMD(T, NAME, SBB)                                                                                    \
+    extern "C" __global__ void __launch_bounds__(256, 2) gemmd_##NAME(const u8* w, const u8* x, int nd, int pb,        \
+            int ks, float* scr, int* flag, float* y, int y_stride, int rows, int cols, int act, float sc) {       \
+        gemmd_q<T, SBB>(w, x, nd, pb, ks, scr, flag, y, y_stride, rows, cols, act, sc);                           \
+    }
+ITYPES(DEF_GEMMD)
 #endif
 
 // ---- elementwise / norm ----
@@ -1997,6 +2268,71 @@ extern "C" __global__ void ink_ffn_sum(float* acc, const float* d, const float* 
     size_t db = (size_t)tok * ne * n + c, wb = (size_t)tok * ne;
     for (int e = 0; e < ne; e++) o += wts[wb + e] * d[db + (size_t)e * n];
     acc[(size_t)tok * n + c] = o;
+}
+
+// Attention of each query over its own list of keys (Kolibri sparse layers). Block = (query t, K/V head g); the
+// `per` = nh / nkv query heads of g are one warp each, so a tile of 32 keys is read once for all of them.
+// q: f32 [t][head][hd]; kc, vc: f16 rows [(pos * nkv + g) * hd]; idx: ns key positions per query, the first cnt[t]
+// valid. Online softmax: each head keeps its running maximum m, sum l and weighted V sum (hd / 32 values a thread).
+// A key row of the tile takes hd + 1 floats, so the 32 lanes that read one dimension of 32 keys hit 32 banks.
+// Shared memory: (per + 64) * hd + per * 32 + 32 floats.
+extern "C" __global__ void attn_sel(const float* q, const u16* kc, const u16* vc, const unsigned* idx, const int* cnt,
+                                    float* out, int nh, int nkv, int hd, int ns, float scale) {
+    extern __shared__ float sm[];
+    int t = blockIdx.x, g = blockIdx.y, per = nh / nkv;
+    int tid = threadIdx.x, h = tid >> 5, c = tid & 31, nthr = per * 32, n = cnt[t], nd = hd / 32;
+    float* qs = sm;
+    float* kt = qs + per * hd;
+    float* vt = kt + 32 * (hd + 1);
+    float* ps = vt + 32 * hd;
+    const float* qg = q + ((size_t)t * nh + (size_t)g * per) * hd;
+    for (int i = tid; i < per * hd; i += nthr) qs[i] = qg[i];
+    const unsigned* sel = idx + (size_t)t * ns;
+    float acc[8];
+    for (int i = 0; i < 8; i++) acc[i] = 0.0f;
+    float m = __int_as_float(0xff800000), l = 0.0f;
+    for (int j0 = 0; j0 < n; j0 += 32) {
+        __syncthreads();
+        for (int i = tid; i < 32 * hd; i += nthr) {
+            int j = j0 + i / hd;
+            if (j < n) {
+                size_t row = ((size_t)sel[j] * nkv + g) * hd + i % hd;
+                kt[i + i / hd] = h2f(kc[row]);
+                vt[i] = h2f(vc[row]);
+            } else {
+                kt[i + i / hd] = 0.0f;
+                vt[i] = 0.0f;
+            }
+        }
+        __syncthreads();
+        float s = __int_as_float(0xff800000);
+        if (j0 + c < n) {
+            const float* qh = qs + h * hd;
+            const float* kr = kt + c * (hd + 1);
+            float d = 0.0f;
+            for (int i = 0; i < hd; i++) d = fmaf(qh[i], kr[i], d);
+            s = d * scale;
+        }
+        float mx = s;
+        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+        float mn = fmaxf(m, mx);
+        float a = expf(m - mn);
+        float p = expf(s - mn);
+        float sum = p;
+        for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o);
+        l = l * a + sum;
+        m = mn;
+        ps[tid] = p;
+        __syncwarp();
+        const float* ph = ps + h * 32;
+        for (int r = 0; r < nd; r++) {
+            float v = 0.0f;
+            for (int k = 0; k < 32; k++) v = fmaf(ph[k], vt[k * hd + c + 32 * r], v);
+            acc[r] = acc[r] * a + v;
+        }
+    }
+    float* o = out + ((size_t)t * nh + (size_t)g * per + h) * hd;
+    for (int r = 0; r < nd; r++) o[c + 32 * r] = acc[r] / l;
 }
 
 __device__ __forceinline__ unsigned ink_f2key(float x) {
@@ -2530,8 +2866,18 @@ template <int PER> __device__ __forceinline__ void ldkv(const u16* c, size_t off
     // q * d rounded once to f16 equals f2h((float)q * d).
     auto deq = [&](unsigned x, unsigned sel) {
         unsigned h = __byte_perm(x ^ 0x80808080u, 0x64646464u, sel), r;
+#if STRATA_HIP
+        // Same two f16 lanes without <hip_fp16.h>: a 2-element _Float16 vector (the ISA's packed f16 sub/mul).
+        typedef _Float16 f16x2 __attribute__((ext_vector_type(2)));
+        unsigned c64 = 0x64806480u;
+        f16x2 hh = *(f16x2*)&h, cc = *(f16x2*)&c64, dd = *(f16x2*)&d, rr;
+        rr[0] = (hh[0] - cc[0]) * dd[0];
+        rr[1] = (hh[1] - cc[1]) * dd[1];
+        r = *(unsigned*)&rr;
+#else
         asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(h) : "r"(h), "r"(0x64806480u));
         asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(h), "r"(d));
+#endif
         return r;
     };
     if (PER % 8 == 0 && hd % 128 == 0) {  // rows 8-byte aligned
@@ -2786,11 +3132,14 @@ __device__ void ink_attn_prefill_t(const float* q, const float* r, const float* 
     float sink_val = sink[(size_t)t * nh + h];
     float r_reg = (nr <= 32 && lane < nr) ? r[((size_t)t * nh + h) * nr + lane] : 0.f;
     float m = 0.f, l = 1.f;
+    // Row of the key in the old rows: a ring of `ring` rows on a sliding layer, counted (no division a key).
+    int old_row = win > 0 ? start % ring : start;
     for (int kp = start; kp <= q_pos; kp++) {
         bool use_new = kc_new && kp >= pos;
         const u16* kbuf = use_new ? kc_new : kc;
         const u16* vbuf = use_new ? vc_new : vc;
-        size_t row = use_new ? (size_t)(kp - pos) : (win > 0 ? (size_t)(kp % ring) : (size_t)kp);
+        size_t row = use_new ? (size_t)(kp - pos) : (size_t)old_row;
+        if (++old_row == ring) old_row = 0;
         size_t kbase = row * kw + (size_t)kh * HD;
         float s = 0.f;
         for (int j = 0; j < PER; j++) s += qv[j] * ldkv1(kbuf, kbase + lane + 32 * j, HD);
@@ -3003,6 +3352,89 @@ extern "C" __global__ void __launch_bounds__(128) ink_attn_prefill_128_kp16(
         ink_attn_prefill_t<4>(q, r, sink, gate, kc, vc, kc_new, vc_new, bias, outp, pos, nt, nh, nkv, nr, ext, ring, win, blockIdx.x * 16 + q0);
 }
 #endif
+// The same attention for a layer that sees every key, where the K/V rows of a long prompt do not stay in the cache.
+// The arithmetic of a (query, key) pair and the order of the keys are those of ink_attn_prefill_t: same bits.
+template <int PER>
+__device__ void ink_attn_prefill_sh_t(const float* q, const float* r, const float* sink, const float* gate,
+                                   const u16* kc, const u16* vc, const u16* kc_new, const u16* vc_new,
+                                   const float* bias, float* outp,
+                                   int pos, int nt, int nh, int nkv, int nr, int ext, int ring, int win) {
+    // A block is one K/V head and a group of tokens: one warp for each (token, query head of the K/V head). The
+    // block reads the K and V rows of 32 keys once, into shared memory, and every warp takes them from there
+    // (each warp read them from the cache itself: the same rows, once a warp).
+    constexpr int HD = 32 * PER, TK = 32;
+    extern __shared__ float skv[];  // TK * HD values of K, then TK * HD values of V
+    float* sk = skv; float* sv = skv + TK * HD;
+    int g = nh / nkv, kh = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31, tb = (blockDim.x >> 5) / g;
+    int t0 = blockIdx.x * tb, t = t0 + w / g, h = kh * g + w % g, kw = nkv * HD;
+    bool live = t < nt;
+    if (!live) t = nt - 1;
+    int q_pos = pos + t;
+    int start = (win > 0 && q_pos + 1 > win) ? (q_pos + 1 - win) : 0;
+    int kbeg = (win > 0 && pos + t0 + 1 > win) ? (pos + t0 + 1 - win) : 0, kend = pos + min(nt, t0 + tb) - 1;
+    float scale = 1.f / sqrtf((float)HD);
+    float qv[PER], acc[PER];
+    for (int j = 0; j < PER; j++) {
+        qv[j] = q[((size_t)t * nh + h) * HD + lane + 32 * j] * scale;
+        acc[j] = 0.f;
+    }
+    float sink_val = sink[(size_t)t * nh + h];
+    float r_reg = (nr <= 32 && lane < nr) ? r[((size_t)t * nh + h) * nr + lane] : 0.f;
+    float m = 0.f, l = 1.f;
+    for (int k0 = kbeg; k0 <= kend; k0 += TK) {
+        int n = min(TK, kend + 1 - k0);
+        // Row of key k0 in the old rows: a ring of `ring` rows on a sliding layer.
+        int r0 = win > 0 ? k0 % ring : k0;
+        for (int i = threadIdx.x; i < n * HD; i += blockDim.x) {
+            int key = i / HD, kp = k0 + key;
+            bool use_new = kc_new && kp >= pos;
+            size_t row = use_new ? (size_t)(kp - pos) : (size_t)(r0 + key >= ring ? r0 + key - ring : r0 + key);
+            size_t off = row * kw + (size_t)kh * HD + i % HD;
+            sk[i] = ldkv1(use_new ? kc_new : kc, off, HD);
+            sv[i] = ldkv1(use_new ? vc_new : vc, off, HD);
+        }
+        __syncthreads();
+        if (live) for (int i = max(start - k0, 0); i < n && k0 + i <= q_pos; i++) {
+            const float* kr = sk + i * HD + lane;
+            const float* vr = sv + i * HD + lane;
+            float s = 0.f;
+            for (int j = 0; j < PER; j++) s += qv[j] * kr[32 * j];
+            s = warp_sum(s);
+            int dist = q_pos - k0 - i;
+            float b = 0.f;
+            if (dist < ext) {
+                if (nr <= 32) {
+                    b = lane < nr ? r_reg * bias[dist * nr + lane] : 0.f;
+                } else {
+                    for (int c = lane; c < nr; c += 32) b += r[((size_t)t * nh + h) * nr + c] * bias[dist * nr + c];
+                }
+                b = warp_sum(b);
+            }
+            float logit = s + b - sink_val;
+            float mn = fmaxf(m, logit), c = expf(m - mn), e = expf(logit - mn);
+            l = l * c + e;
+            for (int j = 0; j < PER; j++) acc[j] = e * vr[32 * j] + acc[j] * c;
+            m = mn;
+        }
+        __syncthreads();
+    }
+    if (!live) return;
+    float inv = 1.f / l;
+    for (int j = 0; j < PER; j++) {
+        int col = lane + 32 * j;
+        size_t idx = ((size_t)t * nh + h) * HD + col;
+        outp[idx] = acc[j] * inv * sigmoid(gate[idx]);
+    }
+}
+#define DEF_INK_PREFILL_SH(HD) \
+    extern "C" __global__ void __launch_bounds__(1024) ink_attn_prefill_sh_##HD( \
+            const float* q, const float* r, const float* sink, const float* gate, \
+            const u16* kc, const u16* vc, const u16* kc_new, const u16* vc_new, \
+            const float* bias, float* outp, \
+            int pos, int nt, int nh, int nkv, int nr, int ext, int ring, int win) { \
+        ink_attn_prefill_sh_t<HD / 32>(q, r, sink, gate, kc, vc, kc_new, vc_new, bias, outp, pos, nt, nh, nkv, nr, ext, ring, win); \
+    }
+DEF_INK_PREFILL_SH(32) DEF_INK_PREFILL_SH(64) DEF_INK_PREFILL_SH(128)
 template <int HD, int G>
 __device__ void attn_decode_llama(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
                                   const int* sel, int nh, int nkv, float scale, int bx, int win) {
@@ -3407,6 +3839,10 @@ extern "C" __global__ void moe_route(const float* p, int n, int k, float extra_s
 // One block per expert (grid.y) and line range (grid.x). STRATA_MOE_PREFETCH=1 only; a hint, never a correctness
 // dependency. Volta: prefetch.global.L2 exists since sm_20.
 extern "C" __global__ void moe_prefetch(const int* ids, int k, const int* table, const char* base, int stride, int bytes) {
+#if STRATA_HIP
+    // AMD has no L2 prefetch instruction to give: on HIP this hint does nothing.
+    (void)ids; (void)k; (void)table; (void)base; (void)stride; (void)bytes;
+#else
     int j = blockIdx.y;
     if (j >= k) return;
     int s = table[ids[j]];
@@ -3415,6 +3851,7 @@ extern "C" __global__ void moe_prefetch(const int* ids, int k, const int* table,
     int lines = bytes >> 7;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < lines; i += gridDim.x * blockDim.x)
         asm volatile("prefetch.global.L2 [%0];" ::"l"(p + ((size_t)i << 7)));
+#endif
 }
 
 // x += sum_j w[j] ye[j] + sigmoid(sg) sh + cpu. If a slot missed, wait for the CPU worker's done flag first.
@@ -3475,8 +3912,9 @@ extern "C" __global__ void moe_combine_seq(float* x, const float* ye, const floa
 #endif
 #define FA_BK_DEFAULT FA_BK
 // Turing's 64 KB shared memory cannot hold the HD = 256 tile at 32 keys either: 16 fit (the kernel keeps the same
-// 64 queries a block and four warps).
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 800
+// 64 queries a block and four warps). The HIP build has the same 64 KB a workgroup, and its score staging tile comes
+// on top of the qs/ks/vs/ps sizes, so it takes the same 16-key tile.
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 800) || STRATA_HIP
 #define FA_BK_FOR(HD) ((HD) == 256 ? 16 : FA_BK_DEFAULT)
 #else
 #define FA_BK_FOR(HD) FA_BK_DEFAULT
@@ -3502,6 +3940,14 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
     // Volta only: warp-private P tile for the PV A fragments (see the staging in the PV step below). Appended after
     // `vs` so the qs/ks/vs offsets above do not move; FA_BQ * (FA_BKL + 8) halves = 5120 B.
     u16* ps = vs + FA_BKL * PQ;
+#endif
+#if GEMM_WMMA
+    // HIP: the P staging tile in halves (the PV A fragments, as on Volta) and, after it, the f32 tile the matrix-core
+    // scores are staged through before they are read in the m16n8k16 layout the softmax below is written for. Both
+    // sit after `vs` so the qs/ks/vs offsets do not move; `hip::Gpu::attn_prefill_m` adds the f32 tile to the block's
+    // dynamic shared memory (FA_BQ * (FA_BKL + 8) floats: 10 KiB at 32 keys, 6 KiB at 16).
+    u16* ps = vs + FA_BKL * PQ;
+    float* st = (float*)(ps + FA_BQ * (FA_BKL + 8));
 #endif
     // The last query tiles see the most keys: start them first so the short ones fill the tail.
     int pos0 = step[0], q0 = (gridDim.x - 1 - blockIdx.x) * FA_BQ, h = blockIdx.y, kvh = h / (nh / nkv), kvd = nkv * HD;
@@ -3586,7 +4032,34 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
         bool skip = qm && !__any_sync(0xffffffff, (vis[0] | vis[1]) != 0);
 #endif
         float s[FA_BKL / 8][4] = {};
-#if __CUDA_ARCH__ < 800 && GEMM_TC
+#if GEMM_WMMA
+        // Q K^T on the matrix cores: one 16-query x 16-key tile per instruction against the 16-half qs/ks rows, then
+        // staged and read back so the softmax keeps its m16n8k16 lane layout (row g / g + 8, keys 2t / 2t + 1). The
+        // warp writes and reads only its own 16 rows of the tile, so a warp barrier publishes it.
+        if (!skip) {
+            const int l16 = lane & 15, w0 = STRATA_WMMA_K0(lane), PW = FA_BKL + 8;
+            float* sw = st + warp * 16 * PW;
+            const u16* qrow = qs + (warp * 16 + l16) * PQ + w0;
+#pragma unroll
+            for (int kg = 0; kg < FA_BKL / 16; kg++) {
+                strata_hip::strata_f8 acc;
+#pragma unroll
+                for (int i = 0; i < 8; i++) acc[i] = 0.0f;
+                const u16* krow = ks + (kg * 16 + l16) * PQ + w0;
+#pragma unroll
+                for (int kk = 0; kk < HD; kk += 16)
+                    acc = strata_hip::strata_wmma(strata_hip::strata_ld_wmma(qrow + kk), strata_hip::strata_ld_wmma(krow + kk), acc);
+#pragma unroll
+                for (int i = 0; i < 8; i++) sw[STRATA_WMMA_ROW(lane, i) * PW + kg * 16 + l16] = acc[i];
+            }
+            __syncwarp();
+#pragma unroll
+            for (int ng = 0; ng < FA_BKL / 8; ng++)
+#pragma unroll
+                for (int i = 0; i < 4; i++)
+                    s[ng][i] = sw[(g + 8 * (i >> 1)) * PW + ng * 8 + 2 * t4 + (i & 1)];
+        }
+#elif __CUDA_ARCH__ < 800 && GEMM_TC
         // Same 16 f32 storage as s, seen as m8n8k4 D registers: s2[ng][j][4*p4 + 2*p2 + e] is S[8*j + (t & 1) +
         // 2*p2 + 4*hi][8*(4*ng + c) + (t & 2) + 4*p4 + e] of the 16 x FA_BKL score tile. Every lane holds the four
         // computations its c selects, so the warp must stay in uniform control flow (`skip` is warp-uniform).
@@ -3715,7 +4188,47 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
         cp_async_wait<1>();  // sm_80+: this V tile, the next K tile may still be in flight; sm_70: already copied here
         __syncthreads();
 #endif
-#if __CUDA_ARCH__ < 800 && GEMM_TC
+#if GEMM_WMMA
+        // P * V on the matrix cores, the way the scores are: A = P (this warp's 16 query rows x the tile's keys, in
+        // halves), B = V^T (16 head dimensions x the same keys, one half a tile row apart). The lane's 8 results land
+        // in AMD's layout again (query rows STRATA_WMMA_ROW(lane, i), dim column lane & 15), so each 16 x 16 result tile is
+        // staged in f32 and read back as the two m16n8k16 dim tiles the rescale above, the epilogue below and the
+        // score stage all use (`st` is free again by now: it held the scores of this tile).
+        if (!skip) {
+            const int l16 = lane & 15, w0 = STRATA_WMMA_K0(lane), PW = FA_BKL + 8;
+#pragma unroll
+            for (int ng = 0; ng < FA_BKL / 8; ng++) {
+                // P in halves, one 32-bit store a half pair (keys 2t / 2t+1 are adjacent in this lane's registers)
+                *(u32*)(ps + (warp * 16 + g) * PW + ng * 8 + 2 * t4) = h2pack(s[ng][0], s[ng][1]);
+                *(u32*)(ps + (warp * 16 + g + 8) * PW + ng * 8 + 2 * t4) = h2pack(s[ng][2], s[ng][3]);
+            }
+            __syncwarp();
+            float* sw = st + warp * 256;
+#pragma unroll
+            for (int dt = 0; dt < HD / 16; dt++) {
+                strata_hip::strata_f8 acc;
+#pragma unroll
+                for (int i = 0; i < 8; i++) acc[i] = 0.0f;
+#pragma unroll
+                for (int kg = 0; kg < FA_BKL / 16; kg++) {
+                    const u16* pa = ps + (warp * 16 + l16) * PW + kg * 16 + w0;
+                    const u16* pb = vs + (kg * 16 + w0) * PQ + dt * 16 + l16;
+                    acc = strata_hip::strata_wmma(strata_hip::strata_ld_wmma(pa), strata_hip::strata_ld_wmma_t(pb, PQ), acc);
+                }
+#pragma unroll
+                for (int i = 0; i < 8; i++) sw[STRATA_WMMA_ROW(lane, i) * 16 + l16] = acc[i];
+                __syncwarp();
+#pragma unroll
+                for (int r = 0; r < 2; r++)
+#pragma unroll
+                    for (int e = 0; e < 2; e++) {
+                        o[2 * dt][2 * r + e] += sw[(g + 8 * r) * 16 + 2 * t4 + e];
+                        o[2 * dt + 1][2 * r + e] += sw[(g + 8 * r) * 16 + 8 + 2 * t4 + e];
+                    }
+                __syncwarp();
+            }
+        }
+#elif __CUDA_ARCH__ < 800 && GEMM_TC
         // P -> the warp-private staging tile: the m8n8k4 A fragment of the PV product wants row t + 4*hi and four
         // contiguous keys per lane, which the QK^T D layout does not give for free. One 32-bit store per half pair;
         // the __syncwarp() publishes the tile to the mma step below (the next tile's stores follow the loop's

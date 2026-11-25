@@ -5,7 +5,7 @@
 //! The prompt runs layer by layer over a chunk of tokens: one GPU GEMM per dense matrix and per routed expert.
 //! ponytail: the attention scores run on the CPU. Move them to the GPU when a long prompt waits on them.
 use super::Inkling2Config;
-use crate::deepseek::mat::{Mat, matvec_many, matvec_many_opt, matvec_rows, matvec_rows_many, matvec_rows_sets, situ_chunk, situ_experts};
+use crate::deepseek::mat::{Mat, matvec_many, matvec_many_cpu, matvec_many_opt, matvec_rows, matvec_rows_many, matvec_rows_sets, situ_chunk, situ_experts};
 use crate::deepseek::ops::{rms_norm, rms_norm_w};
 use crate::gguf::Gguf;
 use crate::quant::GgmlType;
@@ -243,7 +243,7 @@ fn hsum(v: std::arch::x86_64::__m256) -> f32 {
 
 /// `p[j * n + row]` += `scale` times the dot of f16 row `row` of `w` (`n` rows) with row j of `x`.
 /// One to three rows of `x` take the same sums in the same order, so a token gets the same bits alone or in a chunk.
-fn dots_h(p: &mut [f32], scale: f32, w: &[f16], x: &[f32], n: usize) {
+pub(crate) fn dots_h(p: &mut [f32], scale: f32, w: &[f16], x: &[f32], n: usize) {
     let hd = w.len() / n;
     #[cfg(all(target_feature = "f16c", target_feature = "fma"))]
     if hd % 32 == 0 && x.len() % hd == 0 && p.len() == x.len() / hd * n {
@@ -281,7 +281,7 @@ fn dots_k<const K: usize>(p: &mut [f32], scale: f32, w: &[f16], x: &[f32], n: us
 
 /// Dot of f16 weights and f32 values. The loop controllers are 113 MB of F32 in the file and every token reads them
 /// twice, at the speed of the memory: as f16 they take half the time (their values stay within 5e-4 relative).
-fn dot_h(w: &[f16], x: &[f32]) -> f32 {
+pub(crate) fn dot_h(w: &[f16], x: &[f32]) -> f32 {
     #[cfg(all(target_feature = "f16c", target_feature = "fma"))]
     {
         use std::arch::x86_64::*;
@@ -322,7 +322,7 @@ fn axpy_h(o: &mut [f32], p: f32, w: &[f16]) {
 
 /// Row j of `o` += the sum over the `n` f16 rows of `w` of `p[j * n + row]` times that row. One to three rows of
 /// `o` take the same sums in the same order.
-fn mix_h(o: &mut [f32], p: &[f32], w: &[f16], n: usize) {
+pub(crate) fn mix_h(o: &mut [f32], p: &[f32], w: &[f16], n: usize) {
     let hd = w.len() / n;
     #[cfg(all(target_feature = "f16c", target_feature = "fma"))]
     if hd % 32 == 0 && o.len() % hd == 0 && p.len() == o.len() / hd * n {
@@ -428,6 +428,20 @@ fn run_experts(list: &[(Mat, Mat, f32, f32)], x: &[f32], cfg: &Inkling2Config) -
             }
         }
         None => {
+            let gus: Vec<Mat> = list.iter().map(|e| e.0).collect();
+            let downs: Vec<Mat> = list.iter().map(|e| e.1).collect();
+            let gs: Vec<f32> = list.iter().map(|e| e.3).collect();
+            let gx: Vec<&[f32]> = vec![x; list.len()];
+            if let Some(y) = matvec_many_cpu(&gus, &gx) {
+                let a: Vec<f32> = y.chunks_exact(2 * nf).zip(&gs).flat_map(|(y, &s)| situ(y, s, cfg)).collect();
+                let acts: Vec<&[f32]> = a.chunks_exact(nf).collect();
+                if let Some(dy) = matvec_many_cpu(&downs, &acts) {
+                    for (e, dy) in list.iter().zip(dy.chunks_exact(nl)) {
+                        for (m, d) in mix.iter_mut().zip(dy) { *m += e.2 * d; }
+                    }
+                    return mix;
+                }
+            }
             let (mut y, mut dy) = (vec![0f32; 2 * nf], vec![0f32; nl]);
             for (gu, down, w, s) in list {
                 gu.matvec(x, &mut y);
@@ -562,12 +576,51 @@ impl<'a> Inkling2Model<'a> {
         self.ngram.as_ref().is_some_and(|ng| ng.cfg.is_enabled()) || self.dspark.is_some()
     }
 
+    /// Look up `tok` in `tok_embd`, writing the row to `out` (`[n_embd]`) with no norm.
+    pub fn embed_raw(&self, tok: u32, out: &mut [f32]) {
+        assert!((tok as usize) < self.tok_embd.rows, "token {tok} is outside the vocabulary");
+        self.tok_embd.row_into(tok as usize, out);
+    }
+
     /// Look up `tok` in `tok_embd` and RMS-normalize with `tok_norm` (`cfg.eps`), writing `out` (`[n_embd]`).
     pub fn embed_normed(&self, tok: u32, out: &mut [f32]) {
         assert!((tok as usize) < self.tok_embd.rows, "token {tok} is outside the vocabulary");
         let mut emb = vec![0.0f32; self.cfg.n_embd];
         self.tok_embd.row_into(tok as usize, &mut emb);
         rms_norm_w(&emb, &self.tok_norm, self.cfg.eps, out);
+    }
+
+    /// Project `nt` hidden states (`[nt, n_embd]`) through the target LM head on GPU, keeping the logits on device.
+    pub(super) fn lm_head_batch_gpu(&mut self, h_rows: &[f32], nt: usize) -> bool {
+        if let Some(mut d) = self.device.take() {
+            let ok = d.lm_head_batch_gpu(self, h_rows, nt).is_ok();
+            self.device = Some(d);
+            return ok;
+        }
+        false
+    }
+
+    /// Add `w2 @ latent + bias` onto `pf.logits_buf[step]` on GPU and return the argmax token ID.
+    pub(super) fn markov_w2_argmax_gpu(
+        &self, w2: &crate::backend::GpuTensor, bias_addr: u64, bias_len: usize, latent: &[f32], step: usize,
+    ) -> Option<u32> {
+        self.device.as_ref()?.markov_w2_argmax_gpu(self, w2, bias_addr, bias_len, latent, step).ok()
+    }
+
+    pub(super) fn output_rows(&self) -> usize { self.output.rows }
+
+    /// Project `nt` hidden states (`[nt, n_embd]`) through the target LM head on CPU only.
+    pub(super) fn lm_head_batch_cpu(&self, h_rows: &[f32], nt: usize) -> Vec<f32> {
+        let rows: Vec<&[f32]> = h_rows.chunks_exact(self.cfg.n_embd).take(nt).collect();
+        let raw = matvec_rows(&self.output, &rows);
+        if self.output.rows == self.cfg.n_vocab {
+            return raw;
+        }
+        let mut out = Vec::with_capacity(nt * self.cfg.n_vocab);
+        for row in raw.chunks_exact(self.output.rows) {
+            out.extend_from_slice(&row[..self.cfg.n_vocab]);
+        }
+        out
     }
 
     /// Project a single hidden state `h` (`[n_embd]`) through the target LM head (`output.weight`) and return the

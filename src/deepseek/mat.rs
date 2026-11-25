@@ -20,7 +20,7 @@ pub(crate) mod dev {
     /// A tensor id holds its GPU in the top 8 bits (so STAGED, GPU 255, is never a real id) and its index there below.
     const SHIFT: u32 = 24;
     pub fn gpu_of(id: u32) -> usize { (id >> SHIFT) as usize }
-    pub(crate) struct Part { pub(crate) be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, stage: Buf, bytes: usize, budget: usize, room: usize }
+    pub(crate) struct Part { pub(crate) be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, stage: Buf, bytes: usize, pub(crate) budget: usize, room: usize }
     pub struct SlabBuf { buf: Buf, bytes: usize, acct: usize, freed: std::sync::Arc<std::sync::atomic::AtomicUsize> }
     impl SlabBuf {
         pub fn addr(&self) -> u64 { self.buf.addr() }
@@ -145,6 +145,13 @@ pub(crate) mod dev {
             Some(Part { be, ts: vec![], x, y, stage, bytes: 0, budget, room })
         }).collect::<Option<Vec<_>>>()?;
         Some(Dev { parts, ..Default::default() })
+    }
+    /// One zeroed buffer for sections of these byte sizes, and the offset of each (a multiple of 8): one allocation
+    /// for a call, because an allocation a section costs Vulkan over a millisecond each.
+    fn sections(be: &dyn Backend, sizes: &[usize]) -> Option<(Buf, Vec<usize>)> {
+        let mut n = 0;
+        let offs = sizes.iter().map(|s| { n += s.next_multiple_of(8); n - s.next_multiple_of(8) }).collect();
+        Some((be.alloc(n).ok()?, offs))
     }
     impl Dev {
         fn reclaim(&mut self) {
@@ -363,28 +370,37 @@ pub(crate) mod dev {
             if nx > p.x.len() / 4 { return None; }
             let xsrc = &x[..nx];
             p.be.put(xsrc, &p.x, 0).ok()?;
-            let mut owned = vec![];
+            let (owned, ts) = self.tensors(p, &[ms])?;
             let mut off = 0;
             for (i, m) in ms.iter().enumerate() {
                 if off + m.rows > p.y.len() / 4 { return None; }
-                p.be.gemv(self.weight(p, m, &mut owned)?, p.x.addr() + (4 * i * xs) as u64, p.y.addr() + (4 * off) as u64).ok()?;
+                p.be.gemv(&ts[i], p.x.addr() + (4 * i * xs) as u64, p.y.addr() + (4 * off) as u64).ok()?;
                 off += m.rows;
             }
             let y = p.be.get(&p.y, 0, off).ok()?;
             drop(owned);
             Some(y)
         }
-        /// The device tensor of `m`. A staged expert is uploaded into a buffer that `owned` keeps until the readback.
-        pub(crate) fn weight<'b>(&'b self, p: &Part, m: &Mat, owned: &'b mut Vec<GpuTensor>) -> Option<&'b GpuTensor> {
-            Some(match m.gpu? {
-                STAGED => {
-                    let b = p.be.alloc(m.data.len()).ok()?;
-                    p.be.htod(m.data, &b, 0).ok()?;
-                    owned.push(GpuTensor::new(m.ty, m.rows, m.cols, b).with_scale(m.scale));
-                    owned.last().unwrap()
-                }
-                t => self.tensor(t),
-            })
+        /// `weights` as tensors for the GEMV: a view of each matrix (the staged ones live in the buffer returned first).
+        pub(crate) fn tensors(&self, p: &Part, sides: &[&[Mat]]) -> Option<(Buf, Vec<GpuTensor>)> {
+            let (b, ptrs) = self.weights(p, sides)?;
+            let ts = sides.iter().flat_map(|s| s.iter()).zip(ptrs).map(|(m, a)| GpuTensor::new(m.ty, m.rows, m.cols, Buf::new(a, m.data.len(), ())).with_scale(m.scale)).collect();
+            Some((b, ts))
+        }
+        /// The device addresses of the matrices of `sides`, in order. The staged ones are copied into one buffer (the
+        /// first value; the caller keeps it until the results are read): one allocation for the chunk, because an
+        /// allocation a matrix costs Vulkan over a millisecond each.
+        pub(crate) fn weights(&self, p: &Part, sides: &[&[Mat]]) -> Option<(Buf, Vec<u64>)> {
+            let pad = |m: &Mat| m.data.len().next_multiple_of(64);
+            let all = || sides.iter().flat_map(|s| s.iter());
+            let n: usize = all().filter(|m| m.gpu == Some(STAGED)).map(pad).sum();
+            let b = if n == 0 { Buf::new(0, 0, ()) } else { p.be.alloc(n).ok()? };
+            let mut off = 0;
+            let ptrs = all().map(|m| Some(match m.gpu? {
+                STAGED => { p.be.htod(m.data, &b, off).ok()?; off += pad(m); b.addr() + (off - pad(m)) as u64 }
+                t => self.tensor(t).ptr,
+            })).collect::<Option<Vec<_>>>()?;
+            Some((b, ptrs))
         }
         /// Inkling's routed experts of one token in one round trip: `gus[i]` x (n gates, then n ups), the activation
         /// on the device (`Backend::situ`, the gate and up rows of expert i times `gs[i]`), then `downs[i]` of that.
@@ -396,10 +412,10 @@ pub(crate) mod dev {
             if x.len() > p.x.len() / 4 || ne * (2 * nf + nl + 1) > p.y.len() / 4 { return None; }
             p.be.put(x, &p.x, 0).ok()?;
             p.be.put(gs, &p.y, ne * (2 * nf + nl)).ok()?;
-            let (mut owned, at) = (vec![], |i: usize| p.y.addr() + (4 * i) as u64);
-            for (i, m) in gus.iter().enumerate() { p.be.gemv(self.weight(p, m, &mut owned)?, p.x.addr(), at(i * 2 * nf)).ok()?; }
+            let ((owned, ts), at) = (self.tensors(p, &[gus, downs])?, |i: usize| p.y.addr() + (4 * i) as u64);
+            for i in 0..ne { p.be.gemv(&ts[i], p.x.addr(), at(i * 2 * nf)).ok()?; }
             p.be.situ(p.y.addr(), nf, ne, at(ne * (2 * nf + nl)), beta, lb).ok()?;
-            for (i, m) in downs.iter().enumerate() { p.be.gemv(self.weight(p, m, &mut owned)?, at(i * 2 * nf), at(ne * 2 * nf + i * nl)).ok()?; }
+            for i in 0..ne { p.be.gemv(&ts[ne + i], at(i * 2 * nf), at(ne * 2 * nf + i * nl)).ok()?; }
             let y = p.be.get(&p.y, ne * 2 * nf, ne * nl).ok()?;
             drop(owned);
             Some(y)
@@ -460,16 +476,18 @@ pub(crate) mod dev {
             let (nt, np) = (x.len() / nl, pairs.iter().map(|v| v.len()).sum::<usize>());
             // GEMM tiles [weights, first pair | pairs << 32] of the gate and up matrices, then of the down ones;
             // then per pair its token, and per (token, slot) the router weight and the pair (weight 0: not here).
-            let (mut owned, mut tiles, mut xrow) = (vec![], vec![], vec![]);
+            let (mut tiles, mut xrow) = (vec![], vec![]);
             let (mut wts, mut inv) = (vec![0f32; nt * k], vec![0i32; nt * k]);
             let mut shape = [(GgmlType::F32, 0, 0); 2];
+            let (owned, ptrs) = self.weights(p, &[gus, downs])?;
+            let mut ptrs = ptrs.into_iter();
             for (side, mats) in [gus, downs].into_iter().enumerate() {
                 let mut m0 = 0;
                 for (m, ps) in mats.iter().zip(pairs) {
-                    let w = self.weight(p, m, &mut owned)?;
-                    shape[side] = (w.ty, w.rows, w.cols);
+                    let w = ptrs.next()?;
+                    shape[side] = (m.ty, m.rows, m.cols);
                     for at in (0..ps.len()).step_by(GEMM_BM) {
-                        tiles.extend([w.ptr, (m0 + at) as u64 | (GEMM_BM.min(ps.len() - at) as u64) << 32]);
+                        tiles.extend([w, (m0 + at) as u64 | (GEMM_BM.min(ps.len() - at) as u64) << 32]);
                     }
                     m0 += ps.len();
                 }
@@ -500,6 +518,58 @@ pub(crate) mod dev {
             drop(owned);
             Some(y)
         }
+        /// SwiGLU experts of a chunk of tokens, all on the device, in four launches whatever the number of experts.
+        /// `x`: one row of activations a token. Expert i (`gates[i]`, `ups[i]`, `downs[i]`) runs on `pairs[i]`, a list
+        /// of (token, slot of the expert among the `k` of that token, router weight). Returns per token the weighted
+        /// sum of these experts' outputs. None when a matrix is on another GPU or the chunk does not fit.
+        pub fn swiglu_chunk(&self, gates: &[Mat], ups: &[Mat], downs: &[Mat], pairs: &[Vec<(usize, usize, f32)>], x: &[f32], k: usize) -> Option<Vec<f32>> {
+            use crate::backend::GEMM_BM;
+            let d = self.part_of(gates.first()?)?;
+            if gates.iter().chain(ups).chain(downs).any(|m| self.part_of(m) != Some(d) || m.scale != 1.0) { return None; }
+            let (p, nf, nl) = (&self.parts[d], downs[0].cols, downs[0].rows);
+            let (nt, np) = (x.len() / gates[0].cols, pairs.iter().map(|v| v.len()).sum::<usize>());
+            // GEMM tiles [weights, first pair | pairs << 32] of the gates, the ups, the downs.
+            let (mut tiles, mut xrow) = (vec![], vec![]);
+            let (mut wts, mut inv) = (vec![0f32; nt * k], vec![0i32; nt * k]);
+            let mut shape = [(GgmlType::F32, 0, 0); 3];
+            let (owned, ptrs) = self.weights(p, &[gates, ups, downs])?;
+            let mut ptrs = ptrs.into_iter();
+            for (side, mats) in [gates, ups, downs].into_iter().enumerate() {
+                let mut m0 = 0;
+                for (m, ps) in mats.iter().zip(pairs) {
+                    let w = ptrs.next()?;
+                    if m0 > 0 && shape[side] != (m.ty, m.rows, m.cols) { return None; }
+                    shape[side] = (m.ty, m.rows, m.cols);
+                    for at in (0..ps.len()).step_by(GEMM_BM) {
+                        tiles.extend([w, (m0 + at) as u64 | (GEMM_BM.min(ps.len() - at) as u64) << 32]);
+                    }
+                    m0 += ps.len();
+                }
+            }
+            for &(t, j, w) in pairs.iter().flatten() {
+                (wts[t * k + j], inv[t * k + j]) = (w, xrow.len() as i32);
+                xrow.push(t as i32);
+            }
+            let (n_tiles, ints) = (tiles.len() / 6, 2 * tiles.len());
+            if x.len() > p.x.len() / 4 || ints + np + 2 * nt * k > p.y.len() / 4 { return None; }
+            // Zeroed: the sums, then per pair the activation rows, then per pair the down rows.
+            let b = p.be.alloc(4 * (nt * nl + np * (nf + nl))).ok()?;
+            let (ia, ya) = (|i: usize| p.y.addr() + 4 * i as u64, |i: usize| b.addr() + 4 * i as u64);
+            let (act, down) = (nt * nl, nt * nl + np * nf);
+            p.be.put(x, &p.x, 0).ok()?;
+            p.be.put(&tiles, &p.y, 0).ok()?;
+            p.be.put(&xrow, &p.y, ints).ok()?;
+            p.be.put(&wts, &p.y, ints + np).ok()?;
+            p.be.put(&inv, &p.y, ints + np + nt * k).ok()?;
+            let [(gt, gr, gc), (ut, ur, uc), (dt, dr, dc)] = shape;
+            p.be.gemm(gt, gr, gc, ia(0), n_tiles, p.x.addr(), gc, nt, ia(ints), ya(act), nf, 0).ok()?;
+            p.be.gemm(ut, ur, uc, ia(4 * n_tiles), n_tiles, p.x.addr(), uc, nt, ia(ints), ya(act), nf, 1).ok()?;
+            p.be.gemm(dt, dr, dc, ia(8 * n_tiles), n_tiles, ya(act), nf, np, 0, ya(down), nl, 0).ok()?;
+            p.be.moe_combine_seq(b.addr(), ya(down), ia(ints + np), ia(ints + np + nt * k), k, 0, 0, nl, nt).ok()?;
+            let y = p.be.get(&b, 0, nt * nl).ok()?;
+            drop(owned);
+            Some(y)
+        }
         /// `rows` for several matrices on one chunk of `n` rows: matrix i reads input set `ms[i].1` of `x` (set after
         /// set). One upload of the sets and one readback for all matrices. None when a matrix is staged or on
         /// another GPU, or the chunk does not fit the scratch buffers.
@@ -515,6 +585,36 @@ pub(crate) mod dev {
                 yo += n * m.rows;
             }
             p.be.get(&p.y, 0, yo).ok()
+        }
+        /// Causal attention of `nt` consecutive queries (`q`: `nh` heads of `hd` each) over the f16 rows `k`, `v`
+        /// (`nkv` heads a position; the first query sits at row `base`), a query seeing its last `win` keys
+        /// (0: all). None when the backend has no kernel for it or the cache is not f16 there.
+        pub fn attn_rows(&self, q: &[f32], k: &[u16], v: &[u16], base: usize, nt: usize, nh: usize, nkv: usize, hd: usize, win: usize) -> Option<Vec<f32>> {
+            let be = &self.parts.first()?.be;
+            if be.kv_words(k.len()) != k.len() { return None; }
+            let (b, o) = sections(&**be, &[4 * q.len(), 2 * k.len(), 2 * v.len(), 4, 4 * q.len()])?;
+            be.put(q, &b, 0).ok()?;
+            be.put(k, &b, o[1] / 2).ok()?;
+            be.put(v, &b, o[2] / 2).ok()?;
+            be.put(&[base as i32], &b, o[3] / 4).ok()?;
+            let a = |i: usize| b.addr() + o[i] as u64;
+            be.attn_prefill_m(a(0), a(1), a(2), 0, a(4), a(3), nt, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), 0, 0, 0, win).ok()?;
+            be.get(&b, o[4] / 4, q.len()).ok()
+        }
+        /// Attention of `nt` queries over their own key lists (`Backend::attn_sel`): `idx` holds `idx.len() / nt`
+        /// positions a query, `cnt` how many of them count; `k`/`v` are all the f16 rows of the layer.
+        pub fn attn_sel(&self, q: &[f32], k: &[u16], v: &[u16], idx: &[u32], cnt: &[i32], nt: usize, nh: usize, nkv: usize, hd: usize) -> Option<Vec<f32>> {
+            let be = &self.parts.first()?.be;
+            if be.kv_words(k.len()) != k.len() { return None; }
+            let (b, o) = sections(&**be, &[4 * q.len(), 2 * k.len(), 2 * v.len(), 4 * idx.len(), 4 * nt, 4 * q.len()])?;
+            be.put(q, &b, 0).ok()?;
+            be.put(k, &b, o[1] / 2).ok()?;
+            be.put(v, &b, o[2] / 2).ok()?;
+            be.put(idx, &b, o[3] / 4).ok()?;
+            be.put(cnt, &b, o[4] / 4).ok()?;
+            let a = |i: usize| b.addr() + o[i] as u64;
+            be.attn_sel(a(0), a(1), a(2), a(3), a(4), a(5), nt, nh, nkv, hd, idx.len() / nt, 1.0 / (hd as f32).sqrt()).ok()?;
+            be.get(&b, o[5] / 4, q.len()).ok()
         }
         /// `rows` for several matrices: job i runs its matrix on its own `n` rows of `x` (after job i-1's rows).
         /// One upload and one readback for all jobs. None when the batch does not fit the scratch buffers.
@@ -567,6 +667,32 @@ pub fn matvec_many(ms: &[Mat], x: &[f32], xs: usize) -> Vec<f32> {
     y
 }
 
+/// Host integer dot of several matrices, one activation each, in a single Rayon pass: the rows of all matrices, in
+/// order. None when a matrix is on the GPU or `Mat::matvec` would not take the integer dot for it.
+pub fn matvec_many_cpu<'a>(ms: &[Mat<'a>], xs: &[&[f32]]) -> Option<Vec<f32>> {
+    let ty = ms.first()?.ty;
+    if ms.len() != xs.len() || ms.iter().any(|m| m.ty != ty || m.gpu.is_some() || m.cols != xs[0].len())
+        || xs.iter().any(|x| x.len() != xs[0].len()) { return None; }
+    if std::env::var_os("STRATA_CPU_REF").is_some() || xs[0].len() % ty.block_elems() != 0
+        || ms.iter().any(|m| !m.cpu && m.rows < 512) { return None; }
+    let dot = crate::cpu_moe::int_dot(ty)?;
+    let xq: Vec<_> = xs.par_iter().map(|x| crate::cpu_moe::quantize_q8k(x)).collect();
+    let rb = ty.row_bytes(xs[0].len() as u64);
+    let mut starts = Vec::with_capacity(ms.len());
+    let mut off = 0;
+    for m in ms { starts.push((off, *m)); off += m.rows; }
+    let mut y = vec![0f32; off];
+    y.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
+        for (k, o) in ys.iter_mut().enumerate() {
+            let r = c * 32 + k;
+            let i = starts.partition_point(|(s, _)| *s <= r) - 1;
+            let (s, m) = starts[i];
+            *o = dot(&m.data[(r - s) * rb..(r - s + 1) * rb], &xq[i]) * m.scale;
+        }
+    });
+    Some(y)
+}
+
 /// The batched path of `matvec_many`, or None when the matrices cannot share one GPU batch (or batching is off).
 pub fn matvec_many_opt(ms: &[Mat], x: &[f32], xs: usize) -> Option<Vec<f32>> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -578,6 +704,10 @@ pub fn matvec_many_opt(ms: &[Mat], x: &[f32], xs: usize) -> Option<Vec<f32>> {
 /// `Dev::situ_chunk` on the open GPU path (None without one).
 pub fn situ_chunk(gus: &[Mat], downs: &[Mat], gs: &[f32], pairs: &[Vec<(usize, usize, f32)>], x: &[f32], k: usize, beta: f32, lb: f32) -> Option<Vec<f32>> {
     dev::get().and_then(|d| d.lock().unwrap().situ_chunk(gus, downs, gs, pairs, x, k, beta, lb))
+}
+/// `Dev::swiglu_chunk` on the open GPU path (None without one).
+pub fn swiglu_chunk(gates: &[Mat], ups: &[Mat], downs: &[Mat], pairs: &[Vec<(usize, usize, f32)>], x: &[f32], k: usize) -> Option<Vec<f32>> {
+    dev::get().and_then(|d| d.lock().unwrap().swiglu_chunk(gates, ups, downs, pairs, x, k))
 }
 pub fn situ_experts(gus: &[Mat], downs: &[Mat], gs: &[f32], x: &[f32], beta: f32, lb: f32) -> Option<Vec<f32>> {
     dev::get().and_then(|d| d.lock().unwrap().situ_experts(gus, downs, gs, x, beta, lb))
@@ -663,6 +793,14 @@ pub fn budget_left() -> usize { dev::get().map_or(0, |d| d.lock().unwrap().budge
 /// (backend, resident expert slots, bytes of all uploaded weights) when the GPU path is open.
 pub fn dev_info() -> Option<(&'static str, usize, usize)> {
     dev::get().map(|d| d.lock().unwrap().info())
+}
+/// `Dev::attn_rows` on the open GPU path (None without one).
+pub fn attn_rows(q: &[f32], k: &[u16], v: &[u16], base: usize, nt: usize, nh: usize, nkv: usize, hd: usize, win: usize) -> Option<Vec<f32>> {
+    dev::get().and_then(|d| d.lock().unwrap().attn_rows(q, k, v, base, nt, nh, nkv, hd, win))
+}
+/// `Dev::attn_sel` on the first GPU. None without a GPU or when the backend has no such kernel.
+pub fn attn_sel(q: &[f32], k: &[u16], v: &[u16], idx: &[u32], cnt: &[i32], nt: usize, nh: usize, nkv: usize, hd: usize) -> Option<Vec<f32>> {
+    dev::get().and_then(|d| d.lock().unwrap().attn_sel(q, k, v, idx, cnt, nt, nh, nkv, hd))
 }
 /// `dev::free`, for a server that changes models.
 pub fn dev_free() { dev::free() }
@@ -868,3 +1006,4 @@ pub fn vec_f32(g: &Gguf, name: &str) -> anyhow::Result<Vec<f32>> {
     }
     Ok(v)
 }
+

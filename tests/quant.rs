@@ -221,3 +221,24 @@ fn nvfp4_and_f8_e4m3_blocks() {
     mat3d.expert_host(1, 2).row_into(0, &mut r1);
     assert_eq!(r1[0], -4.0);
 }
+
+/// `matvec_many_cpu` gives the bits of one `Mat::matvec` per matrix. The row counts are not multiples of the 32-row
+/// work chunk, so a chunk covers the end of one matrix and the start of the next.
+#[test]
+fn matvec_many_cpu_matches_matvec() {
+    use rusting_strata::deepseek::mat::{Mat, matvec_many_cpu};
+    let cols = 64;
+    let mut seed = 7u32;
+    let mut rnd = || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); (seed >> 16) as u8 };
+    // Q8_0 rows: per 32 values an f16 scale (0.5) and 32 int8.
+    let raw: Vec<Vec<u8>> = [5usize, 40, 33].iter().map(|&rows| {
+        (0..rows * cols / 32).flat_map(|_| [0x00, 0x38].into_iter().chain((0..32).map(|_| rnd())).collect::<Vec<u8>>()).collect()
+    }).collect();
+    let ms: Vec<Mat> = raw.iter().zip([1.0f32, -2.0, 0.25])
+        .map(|(d, scale)| Mat { data: d, ty: GgmlType::Q8_0, rows: d.len() / (cols / 32 * 34), cols, cpu: true, gpu: None, scale }).collect();
+    let xs: Vec<Vec<f32>> = (0..3).map(|i| (0..cols).map(|j| ((i * 31 + j * 7) % 23) as f32 / 11.0 - 1.0).collect()).collect();
+    let got = matvec_many_cpu(&ms, &xs.iter().map(|x| &x[..]).collect::<Vec<_>>()).expect("the integer dot takes Q8_0");
+    let want: Vec<f32> = ms.iter().zip(&xs).flat_map(|(m, x)| { let mut y = vec![0f32; m.rows]; m.matvec(x, &mut y); y }).collect();
+    assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), want.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+    assert!(want.iter().any(|&v| v != 0.0));
+}

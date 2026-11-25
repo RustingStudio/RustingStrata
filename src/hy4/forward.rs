@@ -105,16 +105,16 @@ pub struct Hy4Model<'a> {
 }
 
 /// A table that is only read row by row: never uploaded (the Engram table is 36 GB).
-fn host_mat<'a>(g: &'a Gguf, name: &str) -> Result<Mat<'a>> {
+pub(crate) fn host_mat<'a>(g: &'a Gguf, name: &str) -> Result<Mat<'a>> {
     let t = g.tensors.get(name).with_context(|| format!("missing tensor {name}"))?;
     Ok(Mat { data: g.bytes(t), ty: GgmlType::from_u32(t.ty)?, rows: t.dims[1] as usize, cols: t.dims[0] as usize, cpu: false, gpu: None, scale: 1.0 })
 }
 
-fn sigmoid(x: f32) -> f32 {
+pub(crate) fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-fn silu(x: f32) -> f32 {
+pub(crate) fn silu(x: f32) -> f32 {
     x * sigmoid(x)
 }
 
@@ -124,7 +124,7 @@ fn act(gate: f32, up: f32, limit: f32) -> f32 {
 
 /// Weighted sum of the listed experts' outputs, `(gate, up, down, weight)` each, for the latent input `x`. Experts
 /// that share a GPU run as two batched round trips; otherwise each matvec runs where its matrix lives.
-fn run_experts(list: &[(Mat, Mat, Mat, f32)], x: &[f32], clamp: f32, nl: usize) -> Vec<f32> {
+pub(crate) fn run_experts(list: &[(Mat, Mat, Mat, f32)], x: &[f32], clamp: f32, nl: usize) -> Vec<f32> {
     let mut mix = vec![0f32; nl];
     let Some(first) = list.first() else { return mix };
     let (k, nf) = (list.len(), first.0.rows);

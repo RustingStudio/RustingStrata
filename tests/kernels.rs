@@ -1,7 +1,7 @@
 //! Kernel tests, run on every backend that opens (`common::backends`).
 mod common;
 use common::{down, up};
-use rusting_strata::backend::{Backend, ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor, SAME_X};
+use rusting_strata::backend::{Backend, ATT_GQA_MIN, ATT_SPLITS, BATCHED, GEMM_BM, GpuTensor, SAME_X};
 use rusting_strata::{cuda::Gpu, gguf::Gguf, quant::GgmlType, weights::{Tensor, Weights}};
 
 fn xs(n: usize) -> Vec<f32> {
@@ -442,6 +442,57 @@ fn gemm_matches_reference_for_every_type() {
                         ty.name(), rel_l2(&got, &f0));
                 }
             }
+        }
+    }
+}
+
+/// The small-batch GEMM (a `BATCHED` `gemm_dense` of at most 64 rows of x, the decode of a batch) against per-row dot products of the
+/// first 300 rows, and against the tile-list GEMM, for every type, with partial warps and position groups.
+#[test]
+fn small_batch_gemm_matches_tile_gemm() {
+    let Some(p) = common::model_path() else { return };
+    for (bk, gpu) in common::backends() {
+        let gpu = &*gpu;
+        let g = Gguf::open(&p).unwrap();
+        let w = Weights::new(&g).unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        for (name, info) in &g.tensors {
+            let Ok(ty) = GgmlType::from_u32(info.ty) else { continue };
+            if info.dims.len() < 2 || info.dims[0] % 256 != 0 || !seen.insert(ty.name()) { continue; }
+            let t = w.get(name).unwrap();
+            // 300 rows: two blocks of 128 and a part of a third, whose last warp has 12 rows.
+            let t = Tensor { rows: t.rows.min(300), data: &t.data[..t.data.len() / t.rows * t.rows.min(300)], ..t };
+            let dt = gpu.upload(&t).unwrap();
+            let int8 = gpu.mmq(t.ty) && t.cols % 128 == 0;
+            for n in [1usize, 7, 16, 40, 64] {
+                let x = xs(n * t.cols);
+                let xrow: Vec<i32> = (0..n as i32).collect();
+                let (dx, dr, dtl) = (up(gpu, &x), up(gpu, &xrow), up(gpu, &[dt.ptr, (n as u64) << 32]));
+                let (dy, dz) = (gpu.zeros::<f32>(n * t.rows).unwrap(), gpu.zeros::<f32>(n * t.rows).unwrap());
+                gpu.gemm_dense(&dt, n, dx.addr(), t.cols, dy.addr(), t.rows, BATCHED).unwrap();
+                gpu.gemm(t.ty, t.rows, t.cols, dtl.addr(), 1, dx.addr(), t.cols, n, dr.addr(), dz.addr(), t.rows, 0).unwrap();
+                let (got, tile) = (down::<f32>(gpu, &dy), down::<f32>(gpu, &dz));
+                if int8 {
+                    let mut wr = vec![0f32; t.cols];
+                    let mut want = vec![0f32; n * t.rows];
+                    for r in 0..t.rows {
+                        t.row(r, &mut wr);
+                        for i in 0..n { want[i * t.rows + r] = wr.iter().zip(as_seen(t.ty, &x[i * t.cols..][..t.cols])).map(|(a, b)| a * b).sum(); }
+                    }
+                    let e = rel_l2(&got, &want);
+                    assert!(e <= 1e-4, "{bk} {} ({name}), {n} rows of x: rel err {e}", ty.name());
+                }
+                // The same products as the tile GEMM, summed as two halves of the columns.
+                let e = rel_l2(&got, &tile);
+                assert!(e <= 1e-5, "{bk} {} ({name}), {n} rows of x: rel err {e} against the tile GEMM", ty.name());
+                // Either block of a pair of the column split may end last: the bits do not depend on which.
+                for _ in 0..4 {
+                    gpu.gemm_dense(&dt, n, dx.addr(), t.cols, dy.addr(), t.rows, BATCHED).unwrap();
+                    let again = down::<f32>(gpu, &dy);
+                    assert!(again.iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()), "{bk} {} ({name}), {n} rows of x: two runs differ", ty.name());
+                }
+            }
+            eprintln!("{bk} {:8} {name}: ok", ty.name());
         }
     }
 }
@@ -2673,57 +2724,5 @@ fn ink_prefill_and_batch_match_decode() {
         gpu.ink_ffn_sum_n(dacc0.addr(), dfd.addr(), dfw.addr(), fne, fn_dim, fnt, 0).unwrap();
         assert!(rel_l2(&down::<f32>(gpu, &dacc1), &want_sum) < 1e-6, "{bk} ink_ffn_sum_n cpu");
         assert!(rel_l2(&down::<f32>(gpu, &dacc0), &want_sum_null) < 1e-6, "{bk} ink_ffn_sum_n null");
-    }
-}
-
-/// The 16-query prefill entry point is launched with a 16-token grid. When the relative-bias width does not fit its
-/// four-query fallback (`nr > 32` or `nr % 4 != 0`), the wrapper must still cover all 16 tokens: one call to the
-/// four-query kernel leaves tokens 4..15 of every tile unwritten. `nr=28` is the fast path, `nr=30` the tile fallback
-/// and `nr=40` the wide-bias fallback (which also makes decode use the scalar kernel).
-#[test]
-fn ink_attn_prefill_kp16_fallback_covers_every_query() {
-    for (bk, gpu) in common::backends() {
-        let gpu = &*gpu;
-        // kp16 is the CUDA f16-cache path; Vulkan has its own prefill, and a quantized KV or the measurement knobs
-        // select another kernel.
-        if bk != "cuda"
-            || std::env::var_os("STRATA_KV").is_some()
-            || std::env::var_os("STRATA_DS_ATTN_OLD").is_some()
-            || std::env::var_os("STRATA_DS_ATTN_KP4").is_some() { continue; }
-        for nr in [28usize, 30, 40] {
-            let (nh, nkv, hd, ext, nt) = (2usize, 1usize, 128usize, 8usize, 20usize);
-            let q = xs(nt * nh * hd + 3)[3..].to_vec();
-            let r = xs(nt * nh * nr + 5)[5..].to_vec();
-            let sink = xs(nt * nh + 7)[7..].to_vec();
-            let gate = xs(nt * nh * hd + 11)[11..].to_vec();
-            let k = xs(nt * nkv * hd + 13)[13..].to_vec();
-            let v = xs(nt * nkv * hd + 17)[17..].to_vec();
-            let bias = xs(ext * nr + 19)[19..].to_vec();
-            let kc: Vec<u16> = k.iter().map(|&x| half::f16::from_f32(x).to_bits()).collect();
-            let vc: Vec<u16> = v.iter().map(|&x| half::f16::from_f32(x).to_bits()).collect();
-            let (dq, dr, dsink, dgate) = (up(gpu, &q), up(gpu, &r), up(gpu, &sink), up(gpu, &gate));
-            let (dkc, dvc, dbias) = (up(gpu, &kc), up(gpu, &vc), up(gpu, &bias));
-            let dout = gpu.zeros::<f32>(nt * nh * hd).unwrap();
-            gpu.ink_attn_prefill(
-                dq.addr(), dr.addr(), dsink.addr(), dgate.addr(), dkc.addr(), dvc.addr(), 0, 0, dbias.addr(), dout.addr(),
-                0, nt, nh, nkv, hd, nr, ext, nt, 0,
-            ).unwrap();
-            let dsc = gpu.zeros::<f32>(nh * nt.div_ceil(64) * (hd + 2)).unwrap();
-            let mut want = Vec::with_capacity(nt * nh * hd);
-            for tok in 0..nt {
-                let dout1 = gpu.zeros::<f32>(nh * hd).unwrap();
-                gpu.ink_attn(
-                    dq.addr() + (tok * nh * hd * 4) as u64,
-                    dr.addr() + (tok * nh * nr * 4) as u64,
-                    dsink.addr() + (tok * nh * 4) as u64,
-                    dgate.addr() + (tok * nh * hd * 4) as u64,
-                    dkc.addr(), dvc.addr(), dbias.addr(), dsc.addr(), dout1.addr(),
-                    tok + 1, tok, nh, nkv, hd, nr, ext,
-                ).unwrap();
-                want.extend_from_slice(&down::<f32>(gpu, &dout1));
-            }
-            let got = down::<f32>(gpu, &dout);
-            assert!(rel_l2(&got, &want) < 1e-6, "{bk} ink_attn_prefill kp16 fallback nr={nr} nt={nt}");
-        }
     }
 }

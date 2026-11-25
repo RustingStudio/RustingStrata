@@ -146,7 +146,7 @@ struct Engine {
     /// 5.3x smaller KV memory for 512k-1M ctx; numerics differ from f16).
     #[arg(long, default_value = "f16", value_parser = ["f16", "q8", "q4", "q2"])]
     kv: String,
-    /// GPU backend: cuda or vulkan [default: cuda if it loads, else vulkan].
+    /// GPU backend: cuda, vulkan or hip [default: cuda if it loads, else vulkan].
     #[arg(long)]
     backend: Option<String>,
     /// GPU index, or several separated by commas (such as 0,1) to split the layers over those GPUs in proportion to
@@ -394,7 +394,7 @@ impl Engine {
         }
         if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
         set_kv_env(&self.kv);  // read by Gpu::new and Vk::new
-        let open = || self.device.iter().map(|&d| backend::open(self.backend.as_deref(), d)).collect::<anyhow::Result<Vec<_>>>();
+        let open = || backend::open_all(self.backend.as_deref(), &self.device);
         let bk = match self.gpu.then(open).transpose() {
             Err(e) if self.cpu_fallback => { say!("no GPU backend ({e:#}), running on the CPU"); None }
             r => r?,
@@ -1124,6 +1124,27 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let (prompt, cont) = (ids("prompt")?, ids("continuation")?);
             anyhow::ensure!(!prompt.is_empty() && !cont.is_empty(), "empty prompt or continuation");
             let g = Gguf::open(&model)?;
+            // Kolibri and Inkling 2 have their own forwards: the continuation goes in a token at a time.
+            macro_rules! score_tokenwise { ($chat:path, $model:path) => {{
+                use $chat as chat; use $model as Fwd;
+                engine.ds_env();
+                chat::gpu_defaults();
+                let mut m = Fwd::new(&g)?;
+                let (mut argmax, mut top5) = (Vec::new(), Vec::new());
+                let mut logits = m.prefill(&prompt);
+                for i in 0..cont.len() {
+                    if i > 0 { logits = m.step(cont[i - 1]); }
+                    let lse = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    let lse = lse + logits.iter().map(|x| (x - lse).exp()).sum::<f32>().ln();
+                    argmax.push(ops::argmax(&logits));
+                    top5.push(ops::top_k(&logits, 5).into_iter().map(|j| (j, logits[j] - lse)).collect::<Vec<_>>());
+                }
+                println!("{}", serde_json::json!({"argmax": argmax, "top5": top5}));
+                return Ok(());
+            }} }
+            let arch = g.get("general.architecture").ok().and_then(|v| v.as_str()).unwrap_or("");
+            if arch == rusting_strata::kolibri::ARCH { score_tokenwise!(rusting_strata::kolibri::chat, rusting_strata::kolibri::forward::KolibriModel) }
+            if rusting_strata::inkling2::is_arch(arch) { score_tokenwise!(rusting_strata::inkling2::chat, rusting_strata::inkling2::forward::Inkling2Model) }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             if let Some(&t) = prompt.iter().chain(&cont).find(|&&t| t as usize >= m.cfg.n_vocab) {
@@ -1169,6 +1190,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 anyhow::ensure!(image.is_empty(), "--image is not supported for hy_v4_flash");
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 return rusting_strata::hy4::chat::generate(&g, &prompt, n);
+            }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::kolibri::ARCH) {
+                anyhow::ensure!(image.is_empty(), "--image is not supported for kolibri1");
+                let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
+                return rusting_strata::kolibri::chat::generate(&g, &prompt, n);
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) .is_some_and(rusting_strata::inkling2::is_arch) {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
@@ -1294,7 +1320,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             engine.own_warn(&g);
             engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
             if let Some(arch) = g.get("general.architecture").ok().and_then(|v| v.as_str()) {
-                if arch == "deepseek41" || arch == "glm5-next" || arch == rusting_strata::hy4::ARCH || rusting_strata::inkling2::is_arch(arch) {
+                if arch == "deepseek41" || arch == "glm5-next" || arch == rusting_strata::hy4::ARCH || arch == rusting_strata::kolibri::ARCH || rusting_strata::inkling2::is_arch(arch) {
                     engine.ds_env();
                     // A --ctx below the test grows to fit it, as on the main engine.
                     if rusting_strata::CTX.load(std::sync::atomic::Ordering::Relaxed) != 0 { rusting_strata::CTX.store(engine.ctx, std::sync::atomic::Ordering::Relaxed); }
@@ -1302,6 +1328,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         bench_deepseek(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else if arch == rusting_strata::hy4::ARCH {
                         bench_hy4(&g, &model, &pp, tg, reps, json_out, &mut engine)
+                    } else if arch == rusting_strata::kolibri::ARCH {
+                        bench_kolibri(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else if rusting_strata::inkling2::is_arch(arch) {
                         bench_inkling2(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else {
@@ -1355,7 +1383,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     reps,
                 };
                 let unix_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                let record = bench_record(&meta, &results, r.expert_summary().as_ref(), unix_time);
+                let mut record = bench_record(&meta, &results, r.expert_summary().as_ref(), unix_time);
+                // The arch-specific benchners print this; putting it in the JSON too gives tools one reliable source.
+                let drafts = if let Runner::Gpu(g) = &r { g.drafts } else { (0, 0) };
+                record["drafts"] = json!({"made": drafts.0, "accepted": drafts.1});
                 let mut line = serde_json::to_string(&record)?;
                 line.push('\n');
                 std::fs::write(&path, line).with_context(|| format!("writing the JSON record to {}", path.display()))?;
@@ -1408,6 +1439,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 println!("check: hy_v4_flash ok: {} layers, {} experts ({} used), {} tensors, every tensor of the forward is present", m.cfg.n_layer, m.cfg.n_expert, m.cfg.n_used, g.tensors.len());
                 return Ok(());
             }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::kolibri::ARCH) {
+                let m = rusting_strata::kolibri::forward::KolibriModel::new(&g)?;
+                println!("check: kolibri1 ok: {} layers, {} experts ({} used), {} tensors, every tensor of the forward is present", m.cfg.n_layer, m.cfg.n_expert, m.cfg.n_used, g.tensors.len());
+                return Ok(());
+            }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
                 let c = rusting_strata::deepseek::DsConfig::from_gguf(&g)?;
                 c.validate(&g)?;
@@ -1442,9 +1478,23 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Interface { models_dir } => {
             println!("{}", term::paint(term::out(), "1", concat!("RustingStrata ", env!("CARGO_PKG_VERSION"))));
-            let mut models = serve::list_models(&models_dir.clone().unwrap_or_else(models_dir_default));
-            for m in serve::cached_models() { if !models.iter().any(|x| x.1 == m.1) { models.push(m); } }
+            // The models picked in earlier runs come first, the last one at the top (issue #82).
+            let hist = rusting_strata::expert_cache::cache_dir().join("interface-models.txt");
+            let old: Vec<PathBuf> = std::fs::read_to_string(&hist).unwrap_or_default().lines().map(PathBuf::from).filter(|p| p.is_file()).collect();
+            let mut models: Vec<_> = old.iter().map(|p| {
+                let name = p.file_name().map_or_else(|| p.to_string_lossy(), |n| n.to_string_lossy()).into_owned();
+                (name, p.clone(), std::fs::metadata(p).map_or(0, |m| m.len()))
+            }).collect();
+            let found = serve::list_models(&models_dir.clone().unwrap_or_else(models_dir_default)).into_iter().chain(serve::cached_models());
+            for m in found {
+                let p = m.1.canonicalize().unwrap_or_else(|_| m.1.clone());
+                if !models.iter().any(|x| x.1 == p) { models.push(m); }
+            }
             let mut args = interface_args(&mut std::io::stdin().lock(), models)?;
+            if let Ok(p) = std::path::Path::new(&args[2]).canonicalize() {
+                let keep: Vec<_> = std::iter::once(&p).chain(old.iter().filter(|&o| *o != p)).take(10).map(|p| p.to_string_lossy()).collect();
+                let _ = std::fs::create_dir_all(hist.parent().unwrap()).and_then(|_| std::fs::write(&hist, keep.join("\n") + "\n"));
+            }
             if let Some(d) = models_dir.filter(|_| args[0] == "serve") { args.extend(["--models-dir".into(), d.to_string_lossy().into()]); }
             let shown: Vec<_> = args.iter().map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() }).collect();
             println!("\n{} rustingstrata {}\n", term::paint(term::out(), "2", "running:"), shown.join(" "));
@@ -1483,6 +1533,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::hy4::ARCH) {
                 anyhow::ensure!(image.is_empty(), "--image is not supported for hy_v4_flash");
                 return rusting_strata::hy4::chat::chat(&g, system, n, think);
+            }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::kolibri::ARCH) {
+                anyhow::ensure!(image.is_empty(), "--image is not supported for kolibri1");
+                return rusting_strata::kolibri::chat::chat(&g, system, n, think);
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) .is_some_and(rusting_strata::inkling2::is_arch) {
                 let max_ctx = 0;
@@ -1982,6 +2036,7 @@ fn $name(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out:
     };
 }
 bench_tokenwise!(bench_hy4, rusting_strata::hy4::forward::Hy4Model);
+bench_tokenwise!(bench_kolibri, rusting_strata::kolibri::forward::KolibriModel);
 
 /// `strata bench` for Inkling 2 (uses GPU argmax decode, plus `--draft-model` DSpark / `--spec-type` context lookup).
 fn bench_inkling2(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {
@@ -2107,6 +2162,7 @@ fn best(f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<f64> {
 /// With `aux` (`--mtp-model`/`--draft-model`) the drafts are measured with that file, and runs given the same file use
 /// the measured draft count.
 fn calibrate(model: &Path, aux: Option<&Path>, ctx: usize, margin: &[usize], kind: Option<&str>, device: &[usize], mut split: Option<Vec<f64>>) -> anyhow::Result<()> {
+    backend::check_devices(kind, device)?;  // before the GGUF is read: a bad --device fails here, not after the load
     let g = Gguf::open(model)?;
     let aux_g = open_mtp_gguf(aux)?;
     let m = Model::load_with_aux(&g, aux_g.as_ref(), &[])?;
@@ -2117,7 +2173,7 @@ fn calibrate(model: &Path, aux: Option<&Path>, ctx: usize, margin: &[usize], kin
     anyhow::ensure!(n_pf >= 512, "--ctx too small to calibrate");
     let pf = prose(&tok, n_pf)?;
     let load = |chunk: usize, split: Option<&[f64]>| -> anyhow::Result<GpuModel> {
-        let bk = device.iter().map(|&d| backend::open(kind, d)).collect::<anyhow::Result<Vec<_>>>()?;
+        let bk = backend::open_all(kind, device)?;
         let mut gm = GpuModel::load_split_margins(&m, bk, ctx, chunk, margin, split, kload, 1).context(LOAD_HINT)?;
         gm.adapt_every = 0; // fixed placement: steadier timings
         Ok(gm)
@@ -2909,6 +2965,7 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
             "glm5-next" => rusting_strata::glm::serve(&g, &tok, &name)?,
             "deepseek41" => rusting_strata::deepseek::chat::serve(&g, &tok, &name)?,
             rusting_strata::hy4::ARCH => rusting_strata::hy4::chat::serve(&g, &tok, &name)?,
+            rusting_strata::kolibri::ARCH => rusting_strata::kolibri::chat::serve(&g, &tok, &name)?,
             _ => rusting_strata::inkling2::chat::serve(&g, &tok, &name, rusting_strata::inkling2::chat::Inkling2Opts {
                 max_ctx: 0, sampler: engine.sampler(), thinking_budget: engine.thinking_budget, think_default: engine.think_default,
                 mmproj, draft_model: engine.draft_model.clone(), ngram_cfg: engine.ngram_config()? })?,
@@ -3263,17 +3320,18 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let res = (|| -> anyhow::Result<(Vec<u32>, bool)> {
                 let logits;
                 if serve::gone(&w) { anyhow::bail!("client closed the connection"); }
-                let (chat_ids, chat_logits, chat_cached) = match &vision_prompt {
+                // The head goes out before the prompt runs, and comments follow it while the prompt runs (`serve::alive`).
+                if req.stream { write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?; }
+                let (chat_ids, chat_logits, chat_cached) = serve::alive(&w, req.stream, || anyhow::Ok(match &vision_prompt {
                     Some(p) => (p.ids.clone(), r.chat_image(p, &image_input.as_ref().unwrap().embeddings)?, 0),
                     None => r.chat(tok, &prompt, &tpl.render(&req.messages[..n_hist], &req.tools, req.think.unwrap_or(e.think_default), preserve, false), &system)?,
-                };
+                }))?;
                 (_, logits, cached) = (chat_ids, chat_logits, chat_cached);
                 if let Runner::Slot(c) = &*r && let Some(t) = c.started { t0 = t; start(&mut busy); }
                 prefilled = true;
                 t1 = Instant::now();
                 if serve::gone(&w) { anyhow::bail!("client closed the connection"); }
                 if req.stream {
-                    write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
                     if anth {
                         sse(&mut w, json!({"type": "message_start", "message": {"id": format!("msg_{i}"), "type": "message", "role": "assistant", "model": name,
                             "content": [], "stop_reason": null, "stop_sequence": null,

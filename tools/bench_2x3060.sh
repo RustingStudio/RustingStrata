@@ -8,7 +8,7 @@
 # the one in docs/BENCHMARKS.md is not comparable to it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-model=${STRATA_INKLING2_MODEL:-/home/andre/strata/models/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-IQ4_XS.gguf}
+model=${STRATA_INKLING2_MODEL:-}
 out=""
 pp_list="512,2048,4096"
 ctx_list="32768 200000"
@@ -24,11 +24,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 bin=${BIN:-target/release/rustingstrata}
+[ -n "$model" ] || { echo "set STRATA_INKLING2_MODEL or pass --model PATH" >&2; exit 1; }
 # `bench` turns the plain-weights path on itself (`gpu_defaults` sets STRATA_DS_PLAIN_FIRST=1 when it is unset), so
 # the environment is passed through: set STRATA_DS_PLAIN_FIRST=0 here to measure the other path (mat.rs reads "0" as off).
-# The runtime CUDA libraries the driver ships (cu13 here) come first: an older /usr/local/cuda libnvrtc compiles
-# the kernels and the forward falls back to the host.
-export LD_LIBRARY_PATH=$HOME/nvrtc13/lib/python3.11/site-packages/nvidia/cu13/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+# If NVRTC is not on the loader path, set NVRTC_LIB to the directory that holds libnvrtc.so.
+if [ -n "${NVRTC_LIB:-}" ]; then export LD_LIBRARY_PATH="$NVRTC_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; fi
 [ -f "$bin" ] || { echo "no $bin (cargo build --release)" >&2; exit 1; }
 printf '%-8s %-10s %10s %10s\n' ctx pp prefill decode
 fail=0

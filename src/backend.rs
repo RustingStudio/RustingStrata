@@ -58,12 +58,28 @@ unsafe impl Plain for u64 {}
 
 /// Device memory, recorded graphs and kernel ops. Host copies are synchronous; device work runs in queue order.
 /// Pointer arguments are device addresses; strides are in floats unless named otherwise.
-/// The backend `kind` ("cuda" or "vulkan") on GPU `device`; with no kind, CUDA if it loads, else Vulkan.
+/// The backend `kind` ("cuda", "vulkan" or "hip") on GPU `device`; with no kind, CUDA if it loads, else Vulkan.
+/// Refuses a `--device` list with several indices on the HIP backend: `hip::Gpu` opens one device per process
+/// (hipSetDevice runs once, in `Gpu::new`), so a split over two cards would run both layers on the first one.
+pub fn check_devices(kind: Option<&str>, devices: &[usize]) -> anyhow::Result<()> {
+    if kind == Some("hip") && devices.len() > 1 {
+        anyhow::bail!("the hip backend runs one device: --device {} needs cuda or vulkan", devices.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(","));
+    }
+    Ok(())
+}
+
+/// Opens every device of a `--device` list, after the check above. Callers open a list through this, not one device at a time.
+pub fn open_all(kind: Option<&str>, devices: &[usize]) -> anyhow::Result<Vec<Box<dyn Backend>>> {
+    check_devices(kind, devices)?;
+    devices.iter().map(|&d| open(kind, d)).collect()
+}
+
 pub fn open(kind: Option<&str>, device: usize) -> anyhow::Result<Box<dyn Backend>> {
     match kind {
         Some("cuda") => Ok(Box::new(crate::cuda::Gpu::new(device)?)),
         Some("vulkan") => Ok(Box::new(crate::vulkan::Vk::new(device)?)),
-        Some(k) => anyhow::bail!("unknown backend {k:?} (cuda or vulkan)"),
+        Some("hip") => Ok(Box::new(crate::hip::Gpu::new(device)?)),
+        Some(k) => anyhow::bail!("unknown backend {k:?} (cuda, vulkan or hip)"),
         None => match crate::cuda::Gpu::new(device) {
             Ok(g) => Ok(Box::new(g)),
             Err(c) if format!("{c}") == "CUDA init" => {
@@ -91,13 +107,17 @@ pub fn device_order<T: PartialEq>(cuda: &[Option<T>], vk: &[T]) -> Vec<Option<us
 
 /// `gemm` `act` flag: x is unchanged since the previous gemm call, which read the same x, so its int8 copy is reused.
 pub const SAME_X: i32 = 4;
+/// `gemm_dense` `act` flag: the call is a step of a batch of requests (`step_batch`), so the backend may take a kernel
+/// that sums the products in another order than the prefill GEMM. Paths of a single request leave it clear: their bits
+/// do not change.
+pub const BATCHED: i32 = 8;
 
 /// The weight type `Backend::upload` stores a tensor of type `ty` as: F16 as F32 (no F16 kernels; F32 holds every F16
 /// value exactly). Expert tensors are copied raw by `GpuModel::load_part`, not through `upload`.
 pub fn upload_type(ty: GgmlType) -> GgmlType { if ty == GgmlType::F16 { GgmlType::F32 } else { ty } }
 
 pub trait Backend: Send {
-    /// "cuda" or "vulkan".
+    /// "cuda", "vulkan" or "hip".
     fn name(&self) -> &'static str;
     /// The GPU's name as the driver reports it.
     fn device(&self) -> String;
@@ -369,6 +389,10 @@ pub trait Backend: Send {
     /// Inkling 2 sigmoid top-k router for `rows` tokens: picks top `k` from `logits` (`[rows, n_expert]`) using
     /// `sigmoid(logit) + bias`, writes indices `[rows, k]` to `ids`, normalized unbiased probs * `exp_scale` (* `dn_sc[id]`
     /// if non-null) to `wts`, and optional `gu_sc[id]` (or `1.0`) to `gsc_out`.
+    /// Attention of `nt` queries, each over its own key list: row t of `idx` (`ns` u32 positions, the first `cnt[t]`
+    /// valid) names the rows of the f16 caches `kc`/`vc` (`[(pos * nkv + g) * hd]`) that query t attends. `q` and
+    /// `out` are f32 `[t][head][hd]`. Kolibri's sparse layers.
+    fn attn_sel(&self, _q: u64, _kc: u64, _vc: u64, _idx: u64, _cnt: u64, _out: u64, _nt: usize, _nh: usize, _nkv: usize, _hd: usize, _ns: usize, _scale: f32) -> anyhow::Result<()> { anyhow::bail!("{}: attention over key lists not implemented", self.name()) }
     fn ink_route(&self, _logits: u64, _bias: u64, _ids: u64, _wts: u64, _gu_sc: u64, _dn_sc: u64, _gsc_out: u64, _n_expert: usize, _k: usize, _exp_scale: f32, _rows: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 router not implemented", self.name()) }
     /// Gyro files (`config::Hadamard`): each of `rows` rows of n floats at `x` (times silu(x) * u first when `u` is
     /// not 0) becomes H (s x) per `block` values, written to `out`, which may be `x`. `s`: the row's n signs as floats.
@@ -529,7 +553,15 @@ impl<'a> dyn Backend + 'a {
 
 #[cfg(test)]
 mod tests {
-    use super::device_order;
+    use super::{check_devices, device_order};
+
+    #[test]
+    fn hip_refuses_a_device_split_and_nothing_else() {
+        assert!(check_devices(Some("hip"), &[0, 1]).is_err());
+        assert!(check_devices(Some("hip"), &[0]).is_ok());
+        assert!(check_devices(Some("cuda"), &[0, 1]).is_ok());
+        assert!(check_devices(None, &[0, 1]).is_ok());
+    }
 
     /// Identifiers are letters here. Two cards of one model have one name and two identifiers, so names play no part.
     #[test]

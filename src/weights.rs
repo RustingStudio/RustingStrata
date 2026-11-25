@@ -280,6 +280,20 @@ fn madvise(p: usize, n: usize, advice: i32) {
 #[cfg(not(target_os = "linux"))]
 fn madvise(_: usize, _: usize, _: i32) {}
 
+/// Windows counts the file pages a process has touched as its memory, so a model on the card looked loaded twice in
+/// Task Manager. Emptying the working set after the upload leaves the pages in the file cache; the ones the CPU still
+/// reads come back on use (issue #100).
+pub fn trim_working_set() {
+    #[cfg(windows)]
+    {
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn SetProcessWorkingSetSize(p: isize, min: usize, max: usize) -> i32;
+        }
+        unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX) };
+    }
+}
+
 /// Starts reading mapped bytes p..p + n into the page cache without waiting (MADV_WILLNEED).
 pub fn will_need(p: usize, n: usize) {
     // One call reads at most one readahead window and silently skips the rest of its range (16 MB steps on a 4 MB
@@ -304,6 +318,36 @@ pub fn fits_ram() -> bool {
         Some(_) => true,
         None => { static RAM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new(); *RAM.get_or_init(crate::memory::total_ram) }.is_some_and(|t| MAPPED.load(std::sync::atomic::Ordering::Relaxed) + (4 << 30) <= t),
     }
+}
+
+/// Whether `path` is on a network file system (SMB, NFS, 9p, Ceph, Gluster or a FUSE mount), from
+/// `/proc/self/mountinfo`. `preload` asks for the whole file at once: a server on the network then gets every read
+/// together, and they take the link from all other programs (issue #94). So such a file is read when its pages are
+/// touched. `STRATA_PRELOAD=1` reads it ahead all the same.
+pub fn net_fs(path: &std::path::Path) -> bool {
+    if std::env::var_os("STRATA_PRELOAD").is_some() { return false; }
+    let (Ok(p), Ok(mounts)) = (path.canonicalize(), std::fs::read_to_string("/proc/self/mountinfo")) else { return false };
+    net_fs_in(&p, &mounts)
+}
+
+/// `net_fs` for the text of a mountinfo file: the type of the longest mount point that is a prefix of `p` decides.
+// ponytail: a mount point with a space is written with \040 and does not match, so the mount above it decides.
+fn net_fs_in(p: &std::path::Path, mounts: &str) -> bool {
+    mounts.lines().filter_map(|l| { let (a, b) = l.split_once(" - ")?; Some((a.split(' ').nth(4)?, b.split(' ').next()?)) })
+        .filter(|(m, _)| p.starts_with(m)).max_by_key(|(m, _)| m.len())
+        .is_some_and(|(_, t)| ["cifs", "smb3", "smbfs", "nfs", "nfs4", "9p", "ceph", "glusterfs"].contains(&t) || t.starts_with("fuse."))
+}
+
+#[test]
+fn net_fs_reads_mountinfo() {
+    let m = "22 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw\n\
+             40 22 0:35 / /mnt/nas rw,relatime shared:20 - cifs //nas/models rw,vers=3.1.1\n\
+             41 40 8:17 / /mnt/nas/local rw - xfs /dev/sdb1 rw\n\
+             42 22 0:40 / /home/u/remote rw,nosuid - fuse.sshfs u@host:/ rw\n\
+             43 22 8:33 / /mnt/win rw - fuseblk /dev/sdc1 rw\n";
+    let on = |p: &str| net_fs_in(std::path::Path::new(p), m);
+    assert!(on("/mnt/nas/a.gguf") && on("/home/u/remote/a.gguf"));
+    assert!(!on("/mnt/nas/local/a.gguf") && !on("/mnt/nasty/a.gguf") && !on("/home/u/a.gguf") && !on("/mnt/win/a.gguf"));
 }
 
 /// Counts a newly mapped model file; with `read`, when the files fit in RAM (`fits_ram`), a background thread starts
