@@ -35,7 +35,6 @@ pub struct Gpu {
     hip: Arc<ffi::Hip>,
     device: usize,
     stream: ffi::Stream,
-    module: ffi::Module,
     fns: HashMap<String, ffi::Func>,
     /// "gfx1201": the target hiprtc compiled for.
     arch: String,
@@ -45,13 +44,8 @@ pub struct Gpu {
     max_smem: usize,
     /// `argmax_rows` partials.
     am: Buf,
-    /// q8 rows of the last integer GEMM's X (see quant_q8 in kernels.cu) and which x they hold; `None` after a call
-    /// without `SAME_X` that did not quantize.
-    q8: Mutex<(Buf, Option<[u64; 4]>)>,
     /// Recorded graphs by `Backend::graph` key.
     graphs: Mutex<HashMap<u64, Graph>>,
-    /// Recorded by `sync`, so a wait can poll it instead of spinning in the driver.
-    done: ffi::Event,
     /// Rope frequency tables, `base` and `n_rot` to the device buffer that holds them.
     fr: Mutex<(HashMap<(u32, usize), Buf>, Vec<(f32, usize)>)>,
     /// Pinned staging for large `htod`, used as a ring: the copy returns before its DMA, so the host fills the next
@@ -208,20 +202,15 @@ impl Gpu {
         }
         // argmax_part writes an int2 (8 bytes) per partial: AMAX_PARTS per row, up to 64 rows.
         let am_buf = alloc_raw(&hip, 64 * AMAX_PARTS * 8)?;
-        let q8_buf = alloc_raw(&hip, 1)?;
         // Pinned ring for large host-to-device copies.
         let mut host: *mut c_void = std::ptr::null_mut();
         hip.check(unsafe { (hip.host_malloc)(&mut host, RING, ffi::HOST_MALLOC_PORTABLE | ffi::HOST_MALLOC_MAPPED) }, "hipHostMalloc(ring)")?;
         let mut dev: *mut c_void = std::ptr::null_mut();
         hip.check(unsafe { (hip.host_device_ptr)(&mut dev, host, 0) }, "hipHostGetDevicePointer(ring)")?;
-        let staging = Staging { pin: Buf::new(dev as u64, RING, PinnedHost { hip: hip.clone(), p: host }), host: host.cast(), head: 0, busy: VecDeque::new() };
-        let mut done: ffi::Event = std::ptr::null_mut();
-        hip.check(unsafe { (hip.event_create)(&mut done, ffi::EVENT_DISABLE_TIMING) }, "hipEventCreate")?;
-        Ok(Gpu { hip, device, stream, module, fns, arch, kv_q8, max_smem, am: am_buf, q8: Mutex::new((q8_buf, None)),
-                 graphs: Mutex::new(HashMap::new()), done, fr: Mutex::new((HashMap::new(), Vec::new())), staging: Mutex::new(staging) })
+        let staging = Staging { _pin: Buf::new(dev as u64, RING, PinnedHost { hip: hip.clone(), p: host }), host: host.cast(), head: 0, busy: VecDeque::new() };
+        Ok(Gpu { hip, device, stream, fns, arch, kv_q8, max_smem, am: am_buf,
+                 graphs: Mutex::new(HashMap::new()), fr: Mutex::new((HashMap::new(), Vec::new())), staging: Mutex::new(staging) })
     }
-
-    fn h(&self) -> &ffi::Hip { &self.hip }
 
     pub fn arch(&self) -> &str { &self.arch }
 
@@ -248,10 +237,6 @@ impl Gpu {
     }
 
     fn ptr(&self, b: &Buf) -> u64 { b.addr() }
-
-    fn f(&self, name: &str) -> anyhow::Result<ffi::Func> {
-        self.fns.get(name).copied().ok_or_else(|| anyhow::anyhow!("HIP kernel {name} is not loaded"))
-    }
 
     /// qwen35moe and the other models this backend targets dequantize in the kernel, so the ops below are the
     /// generic ones.
@@ -405,13 +390,14 @@ impl Drop for PinnedHost {
 
 /// Pinned host memory used as a ring for `htod`: a region is free again once the copy that read it has completed.
 struct Staging {
-    pin: Buf,
+    /// Owns the pinned allocation; dropping it frees the ring.
+    _pin: Buf,
     host: *mut u8,
     head: usize,
     busy: VecDeque<(usize, usize, Event)>,
 }
 
-/// A `hipEvent_t` that destroys itself; `query` reports completion.
+/// A `hipEvent_t` that destroys itself.
 struct Event { hip: Arc<ffi::Hip>, ev: ffi::Event }
 
 impl Event {
@@ -423,7 +409,6 @@ impl Event {
     fn record(&self, stream: ffi::Stream) -> anyhow::Result<()> {
         self.hip.check(unsafe { (self.hip.event_record)(self.ev, stream) }, "hipEventRecord")
     }
-    fn done(&self) -> bool { unsafe { (self.hip.event_query)(self.ev) == ffi::HIP_SUCCESS } }
 }
 
 impl Drop for Event {
