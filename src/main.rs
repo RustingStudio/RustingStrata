@@ -3769,8 +3769,8 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
     // Claude Code adds `?beta=true`.
     let route = path.split('?').next().unwrap_or_default();
     // Customer keys may not load models, download files or read the server's stats.
-    if !who.admin && !matches!(route, "/v1/chat/completions" | "/v1/messages" | "/v1/messages/count_tokens" | "/v1/models") {
-        return send(&mut w, "403 Forbidden", json!({"error": {"message": "this key may use only /v1/chat/completions, /v1/messages (and count_tokens) and /v1/models", "type": "permission_error"}}));
+    if !who.admin && !matches!(route, "/v1/chat/completions" | "/v1/messages" | "/v1/messages/count_tokens" | "/v1/models" | "/tokenize" | "/detokenize") {
+        return send(&mut w, "403 Forbidden", json!({"error": {"message": "this key may use only /v1/chat/completions, /v1/messages (and count_tokens), /v1/models, /tokenize and /detokenize", "type": "permission_error"}}));
     }
     match (method.as_str(), route) {
         ("GET", "/api/models") => {
@@ -3827,6 +3827,14 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 (g.running, g.error) = (false, r.err().map(|e| format!("{e:#}")));
             });
             send(&mut w, "202 Accepted", json!(*s.dl.lock().unwrap()))
+        }
+        // llama.cpp's tokenizer endpoints.
+        ("POST", p @ ("/tokenize" | "/detokenize")) => {
+            let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
+            match if p == "/tokenize" { serve::tokenize(l.tok, &body) } else { serve::detokenize(l.tok, &body) } {
+                Ok(v) => send(&mut w, "200 OK", v),
+                Err(err) => send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
+            }
         }
         // The prompt's tokens as the model would see them, template and tools included.
         ("POST", "/v1/messages/count_tokens") => {

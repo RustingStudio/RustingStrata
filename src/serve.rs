@@ -646,6 +646,34 @@ pub fn system() -> Value {
     v
 }
 
+/// llama.cpp's `POST /tokenize`: `{"content", "add_special", "with_pieces"}` to `{"tokens": [id, ...]}`, or with
+/// pieces `{"tokens": [{"id", "piece"}, ...]}`, a piece being a string, or its bytes when it is not whole UTF-8.
+pub fn tokenize(tok: &crate::tokenizer::Tokenizer, body: &[u8]) -> anyhow::Result<Value> {
+    let v: Value = serde_json::from_slice(body)?;
+    let content = v["content"].as_str().context("content: a string is required")?;
+    let flag = |k: &str| -> anyhow::Result<bool> { Ok(match &v[k] { Value::Null => false, x => x.as_bool().with_context(|| format!("{k}: not a boolean"))? }) };
+    let ids = tok.encode_special(content, flag("add_special")?)?;
+    if !flag("with_pieces")? { return Ok(serde_json::json!({"tokens": ids})); }
+    let tokens: Vec<Value> = ids.iter().map(|&id| {
+        let b = tok.token_bytes(id);
+        let piece = match std::str::from_utf8(b) { Ok(s) => Value::from(s), Err(_) => Value::from(b.to_vec()) };
+        serde_json::json!({"id": id, "piece": piece})
+    }).collect();
+    Ok(serde_json::json!({"tokens": tokens}))
+}
+
+/// llama.cpp's `POST /detokenize`: `{"tokens": [id, ...]}` to `{"content": text}`.
+pub fn detokenize(tok: &crate::tokenizer::Tokenizer, body: &[u8]) -> anyhow::Result<Value> {
+    let v: Value = serde_json::from_slice(body)?;
+    let ids = match &v["tokens"] {
+        Value::Null => vec![],
+        Value::Array(a) => a.iter().map(|t| t.as_u64().filter(|&t| (t as usize) < tok.vocab_size()).map(|t| t as u32)
+            .with_context(|| format!("tokens: {t} is not a token id"))).collect::<anyhow::Result<Vec<_>>>()?,
+        _ => bail!("tokens: an array of ids is required"),
+    };
+    Ok(serde_json::json!({"content": tok.decode(&ids)?}))
+}
+
 /// An Anthropic Messages API request (`POST /v1/messages`, what Claude Code sends) as the OpenAI chat request
 /// `chat_request` reads: the system blocks become a system message, `tool_use` blocks tool calls, `tool_result`
 /// blocks tool messages, and `thinking: {"type": "enabled"}` turns thinking on. Images and server tools are dropped.
