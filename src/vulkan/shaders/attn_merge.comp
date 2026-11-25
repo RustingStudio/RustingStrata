@@ -6,6 +6,7 @@ layout(local_size_x = 256) in;
 // quant_xq does (hd is a multiple of 32: a subgroup holds one scale's 32 values).
 layout(push_constant) uniform P { F32 part; F32 qg; F32 out_; I32 step; uint hd; uint ns; uint ns1; int gq_min; U8 xq; F32 sink; } p;
 shared float ws[256];  // split max, then split weight
+shared float ro[512];  // ungated output in the rotated domain
 void main() {
     uint h = gl_WorkGroupID.x, nh = gl_NumWorkGroups.x, z = gl_WorkGroupID.z, tid = gl_LocalInvocationID.x, hd = p.hd;
     uint ns = p.step.v[2 * z] + 1 < p.gq_min ? p.ns1 : p.ns;  // attn_decode ran, not attn_decode_gqa
@@ -25,8 +26,23 @@ void main() {
     for (uint d = tid; d < hd; d += 256) {
         precise float o = 0.0;
         for (uint s = 0; s < ns; s++) o = fma(p.part.v[pp + s * (hd + 2) + d], ws[s], o);
+        ro[d] = fdiv(o, L);
+    }
+    barrier();
+    if (TQ_V) {
+        for (uint g = 0u; g < hd / 128u; g++) {
+            if (tid < 32u) {
+                uint base = g * 128u + 4u * tid;
+                vec4 v = vec4(ro[base], ro[base + 1u], ro[base + 2u], ro[base + 3u]);
+                v = tq_wht4(v, tid, true);
+                ro[base] = v.x; ro[base + 1u] = v.y; ro[base + 2u] = v.z; ro[base + 3u] = v.w;
+            }
+        }
+        barrier();
+    }
+    for (uint d = tid; d < hd; d += 256) {
         float gate = uint64_t(p.qg) != 0 ? sigmoid(p.qg.v[(z * nh + h) * 2 * hd + hd + d]) : 1.0;
-        float v = fdiv(o, L) * gate;
+        float v = ro[d] * gate;
         p.out_.v[(z * nh + h) * hd + d] = v;
         if (uint64_t(p.xq) != 0) {
             float mx = warp_max(abs(v)), id = mx > 0.0 ? rcp_d(127.0, mx) : 0.0;

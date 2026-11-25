@@ -22,6 +22,19 @@ shared float ss[4 * 16 * BK];      // scores of each subgroup; at the start the 
 shared float16_t ps[4 * 16 * PP];  // softmax weights of each subgroup
 shared float rs[4 * 16];           // per row: the rescale factor, at the end the sum l
 shared float rm[4 * 16];           // per row: the final max
+shared float16_t tq_q[4][16][256]; // Q staging, reused for the inverse WHT output (warp, row, dim)
+float tq_kget(uint row, uint col) {
+    uvec4 u = kvs[row * PQ + col / 8u];
+    return unpackFloat2x16(u[(col % 8u) / 2u])[col % 2u];
+}
+void tq_kset(uint row, uint col, float x) {
+    uint a = row * PQ + col / 8u, w = (col % 8u) / 2u;
+    uvec4 u = kvs[a];
+    vec2 h = unpackFloat2x16(u[w]);
+    h[col % 2u] = x;
+    u[w] = packFloat2x16(f16vec2(h));
+    kvs[a] = u;
+}
 
 void main() {
     uint pos0 = uint(p.step.v[0]), q0 = (gl_NumWorkGroups.x - 1 - gl_WorkGroupID.x) * BQ, h = gl_WorkGroupID.y, kvh = h / (p.nh / p.nkv), kvd = p.nkv * HD;
@@ -42,6 +55,37 @@ void main() {
         ps[i] = float16_t(i / 16); ps[256 + i] = float16_t(i % 16);
     }
     barrier();
+    if (TQ_K) {
+        // Unpack Q into per-dim staging first: several lanes share a uvec4 word, so writing it in place races.
+        uint w0 = WARP;
+        for (uint i = tid; i < 4u * 16u * (HD / 8u); i += 128u) {
+            uint w = i / (16u * (HD / 8u)), r = (i / (HD / 8u)) % 16u, c = i % (HD / 8u);
+            uvec4 u = kvs[(w * 16u + r) * PQ + c];
+            [[unroll]] for (uint h = 0u; h < 8u; h++)
+                tq_q[w][r][c * 8u + h] = unpackFloat2x16(u[h / 2u])[h % 2u];
+        }
+        barrier();
+        uint lane = LANE;
+        for (uint r = 0u; r < 16u; r++)
+            for (uint gg = 0u; gg < HD / 128u; gg++) {
+                uint base = gg * 128u + 4u * lane;
+                vec4 v = vec4(float(tq_q[w0][r][base]), float(tq_q[w0][r][base + 1u]),
+                              float(tq_q[w0][r][base + 2u]), float(tq_q[w0][r][base + 3u]));
+                v = tq_wht4(v, lane, false);
+                tq_q[w0][r][base] = float16_t(v.x); tq_q[w0][r][base + 1u] = float16_t(v.y);
+                tq_q[w0][r][base + 2u] = float16_t(v.z); tq_q[w0][r][base + 3u] = float16_t(v.w);
+            }
+        barrier();
+        for (uint i = tid; i < 4u * 16u * (HD / 8u); i += 128u) {
+            uint w = i / (16u * (HD / 8u)), r = (i / (HD / 8u)) % 16u, c = i % (HD / 8u);
+            uvec4 u;
+            [[unroll]] for (uint h = 0u; h < 8u; h += 2u) {
+                u[h / 2u] = packFloat2x16(f16vec2(tq_q[w][r][c * 8u + h], tq_q[w][r][c * 8u + h + 1u]));
+            }
+            kvs[(w * 16u + r) * PQ + c] = u;
+        }
+        barrier();
+    }
     // Pack the 8 (row, col) indices in 0..15 of this lane's accumulator elements into 2 uint VGPRs instead of keeping 16 float VGPRs live.
     uint r_pack = 0u, c_pack = 0u;
     bool nv;
@@ -88,8 +132,8 @@ void main() {
             for (uint n = 0; n < N; n++) {
                 uint i = tid + n * 128, r = i / (HD / 8), c = i % (HD / 8), off = (min(k0 + r, last) * kvd + kvh * HD) / 8 + c, o = off * 8;
                 bool in_ = k0 + r <= last;
-                uvec4 kl = KV_MODE > 0u ? uvec4(ldkv4(p.kc, o, HD), ldkv4(p.kc, o + 4, HD)) : UV4(uint64_t(p.kc)).v[off];
-                uvec4 vl = KV_MODE > 0u ? uvec4(ldkv4(p.vc, o, HD), ldkv4(p.vc, o + 4, HD)) : UV4(uint64_t(p.vc)).v[off];
+                uvec4 kl = K_MODE > 0u ? uvec4(ldkv4_k(p.kc, o, HD), ldkv4_k(p.kc, o + 4, HD)) : UV4(uint64_t(p.kc)).v[off];
+                uvec4 vl = V_MODE > 0u ? uvec4(ldkv4_v(p.vc, o, HD), ldkv4_v(p.vc, o + 4, HD)) : UV4(uint64_t(p.vc)).v[off];
                 kvs[r * PQ + c] = in_ ? kl : uvec4(0);
                 kvs[(BK + r) * PQ + c] = in_ ? vl : uvec4(0);
             }
@@ -97,8 +141,8 @@ void main() {
             uvec4 kl[N], vl[N];
             [[unroll]] for (uint n = 0; n < N; n++) {
                 uint i = tid + n * 128, r = i / (HD / 8), c = i % (HD / 8), off = (min(k0 + r, last) * kvd + kvh * HD) / 8 + c, o = off * 8;
-                kl[n] = KV_MODE > 0u ? uvec4(ldkv4(p.kc, o, HD), ldkv4(p.kc, o + 4, HD)) : UV4(uint64_t(p.kc)).v[off];
-                vl[n] = KV_MODE > 0u ? uvec4(ldkv4(p.vc, o, HD), ldkv4(p.vc, o + 4, HD)) : UV4(uint64_t(p.vc)).v[off];
+                kl[n] = K_MODE > 0u ? uvec4(ldkv4_k(p.kc, o, HD), ldkv4_k(p.kc, o + 4, HD)) : UV4(uint64_t(p.kc)).v[off];
+                vl[n] = V_MODE > 0u ? uvec4(ldkv4_v(p.vc, o, HD), ldkv4_v(p.vc, o + 4, HD)) : UV4(uint64_t(p.vc)).v[off];
             }
             [[unroll]] for (uint n = 0; n < N; n++) {
                 uint i = tid + n * 128, r = i / (HD / 8), c = i % (HD / 8);
@@ -190,6 +234,30 @@ void main() {
     subgroupMemoryBarrierShared();
     subgroupBarrier();
     float sk = uint64_t(p.sink) != 0 ? p.sink.v[h] : ninf;
+    if (TQ_V) {
+        for (uint i = 0u; i < acc[0].length(); i++) {
+            uint row = (r_pack >> (4u * i)) & 15u;
+            float mx = rm[rb + row];
+            float M = max(mx, sk), sc = mx == ninf ? 0.0 : expf_(mx - M);
+            float den = rs[rb + row] * sc + (sk == ninf ? 0.0 : expf_(sk - M));
+            float inv = den > 0.0 ? fdiv(sc, den) : 0.0;
+            [[unroll]] for (uint d = 0u; d < HD / 16u; d++) {
+                uint col = d * 16u + ((c_pack >> (4u * i)) & 15u);
+                tq_q[w][row][col] = float16_t(acc[d][i] * inv);
+            }
+        }
+        barrier();
+        for (uint r = 0u; r < 16u; r++)
+            for (uint gg = 0u; gg < HD / 128u; gg++) {
+                uint lane = LANE, base = gg * 128u + 4u * lane;
+                vec4 v = vec4(float(tq_q[w][r][base]), float(tq_q[w][r][base + 1u]),
+                              float(tq_q[w][r][base + 2u]), float(tq_q[w][r][base + 3u]));
+                v = tq_wht4(v, lane, true);
+                tq_q[w][r][base] = float16_t(v.x); tq_q[w][r][base + 1u] = float16_t(v.y);
+                tq_q[w][r][base + 2u] = float16_t(v.z); tq_q[w][r][base + 3u] = float16_t(v.w);
+            }
+        barrier();
+    }
     [[unroll]] for (uint d = 0; d < HD / 16; d++)
         [[unroll]] for (uint i = 0; i < acc[d].length(); i++) {
             uint row = (r_pack >> (4u * i)) & 15u, col = d * 16 + ((c_pack >> (4u * i)) & 15u), t = q0 + w * 16 + row;
@@ -199,6 +267,6 @@ void main() {
             float den = rs[rb + row] * sc + (sk == ninf ? 0.0 : expf_(sk - M));
             float inv = den > 0.0 ? fdiv(sc, den) : 0.0;
             float gate = uint64_t(p.qg) != 0 ? sigmoid(p.qg.v[t * p.nh * 2 * HD + h * 2 * HD + HD + col]) : 1.0;
-            p.o.v[t * p.nh * HD + h * HD + col] = acc[d][i] * inv * gate;
+            p.o.v[t * p.nh * HD + h * HD + col] = (TQ_V ? float(tq_q[w][row][col]) : acc[d][i] * inv) * gate;
         }
 }

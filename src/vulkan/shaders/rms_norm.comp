@@ -5,7 +5,14 @@ layout(local_size_x = 256) in;
 // null, out is then rotated as rope_neox does (row r = a head of token r / per). With res not null, x += res first.
 // With kc not null, out and v (rows of n) are then stored as kv_store does.
 layout(push_constant) uniform P { F32 x; F32 w; F32 o; U32 q; uint xs; uint os; uint n; float eps; I32 step; double ts; uint per; uint n_rot; F32 res;
-                                  F32 v; U16 kc; U16 vc; } p;
+                                   F32 v; U16 kc; U16 vc; } p;
+shared float tqk[512], tqv[512];
+void rotate(inout float s[512], uint base, uint lane, bool inv) {
+    vec4 a = vec4(s[base + 4u * lane], s[base + 4u * lane + 1u], s[base + 4u * lane + 2u], s[base + 4u * lane + 3u]);
+    a = tq_wht4(a, lane, inv);
+    s[base + 4u * lane] = a.x; s[base + 4u * lane + 1u] = a.y;
+    s[base + 4u * lane + 2u] = a.z; s[base + 4u * lane + 3u] = a.w;
+}
 void main() {
     uint r = gl_WorkGroupID.x, xo = r * p.xs, oo = r * p.os, h = 0;
     float s = 0.0;
@@ -54,9 +61,23 @@ void main() {
         memoryBarrierBuffer();
         barrier();
         uint e = (uint(p.step.v[0]) * p.per + r) * p.n;
-        for (i = gl_LocalInvocationID.x; i < p.n; i += 256) {
-            kv_put(p.kc, e + i, p.n, p.o.v[oo + i]);
-            kv_put(p.vc, e + i, p.n, p.v.v[r * p.n + i]);
+        for (i = gl_LocalInvocationID.x; i < p.n; i += 256) { tqk[i] = p.o.v[oo + i]; tqv[i] = p.v.v[r * p.n + i]; }
+        barrier();
+        if (TQ_K || TQ_V) {
+            uint g = gl_LocalInvocationID.x >> 5u, lane = gl_LocalInvocationID.x & 31u;
+            if (g < p.n / 128u) {
+                if (TQ_K) rotate(tqk, g * 128u, lane, false);
+                if (TQ_V) rotate(tqv, g * 128u, lane, false);
+            }
+            barrier();
         }
-    }
+        for (i = gl_LocalInvocationID.x; i < p.n; i += 256) {
+            float ko = TQ_K ? tqk[i] : p.o.v[oo + i], vo = TQ_V ? tqv[i] : p.v.v[r * p.n + i];
+            uint slot = (r & 7u) * 8u + ((i / p.n) >> 7u);
+            float sk = TQ_K ? sqrt_(tq_group_reduce(ko * ko, slot)) : 1.0;
+            float sv = TQ_V ? sqrt_(tq_group_reduce(vo * vo, slot)) : 1.0;
+            kv_put_ex(p.kc, e + i, p.n, ko, sk, true, KV_MODE, TQ_KBITS);
+            kv_put_ex(p.vc, e + i, p.n, vo, sv, true, VKV_MODE, TQ_VBITS);
+        }
+}
 }

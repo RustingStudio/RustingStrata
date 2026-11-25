@@ -9,6 +9,7 @@ layout(push_constant) uniform P { F32 q; F32 r; F32 sink; U16 k; U16 v; F32 bias
 shared float qs[128];
 shared float ps[64];
 shared float acc[128];
+shared float tro[128];
 void main() {
     uint h = gl_WorkGroupID.x, kh = h / (p.nh / p.nkv), kw = p.nkv * p.hd, t = gl_LocalInvocationID.x;
     uint rows = p.rows, at = p.at;
@@ -20,13 +21,29 @@ void main() {
     uint i0 = gl_WorkGroupID.y * 64, n = i0 < rows ? min(64u, rows - i0) : 0u;
     if (t < p.hd) qs[t] = p.q.v[h * p.hd + t];
     barrier();
+    if (TQ_K) {
+        for (uint g = 0u; g < p.hd / 128u; g++) {
+            if (t < 32u) {
+                uint base = g * 128u + 4u * t;
+                vec4 qv = vec4(qs[base], qs[base + 1u], qs[base + 2u], qs[base + 3u]);
+                qv = tq_wht4(qv, t, false);
+                qs[base] = qv.x; qs[base + 1u] = qv.y; qs[base + 2u] = qv.z; qs[base + 3u] = qv.w;
+            }
+        }
+        if (p.hd == 64u && t < 32u) {
+            vec2 qv = vec2(qs[2u * t], qs[2u * t + 1u]);
+            qv = tq_wht2(qv, t, false);
+            qs[2u * t] = qv.x; qs[2u * t + 1u] = qv.y;
+        }
+        barrier();
+    }
     float scale = fdiv(1.0, sqrt_(float(p.hd)));
     for (uint j = WARP; j < 64; j += 4) {
         uint i = i0 + j, dist = at >= i ? at - i : at + rows - i;
         float d = 0.0;
         if (j < n) {
             uint ko = i * kw + kh * p.hd;
-            for (uint c = LANE; c < p.hd; c += 32) d += qs[c] * ldkv(p.k, ko + c, p.hd);
+            for (uint c = LANE; c < p.hd; c += 32) d += qs[c] * ldkv_k(p.k, ko + c, p.hd);
             d *= scale;
             if (dist < p.ext) for (uint c = LANE; c < p.nr; c += 32) d += p.r.v[h * p.nr + c] * p.bias.v[dist * p.nr + c];
         }
@@ -41,11 +58,31 @@ void main() {
     barrier();
     uint c = t % p.hd, parts = 128 / p.hd;
     float a = 0.0;
-    for (uint j = t / p.hd; j < n; j += parts) a += ps[j] * ldkv(p.v, (i0 + j) * kw + kh * p.hd + c, p.hd);
+    for (uint j = t / p.hd; j < n; j += parts) a += ps[j] * ldkv_v(p.v, (i0 + j) * kw + kh * p.hd + c, p.hd);
     acc[t] = a;
     barrier();
     uint o = (h * gl_NumWorkGroups.y + gl_WorkGroupID.y) * (p.hd + 2);
-    if (t < p.hd) {
+    if (TQ_V) {
+        float s = 0.0;
+        if (t < p.hd) for (uint j = 0; j < parts; j++) s += acc[j * p.hd + t];
+        tro[t] = s;
+        barrier();
+        for (uint g = 0u; g < p.hd / 128u; g++) {
+            if (t < 32u) {
+                uint base = g * 128u + 4u * t;
+                vec4 av = vec4(tro[base], tro[base + 1u], tro[base + 2u], tro[base + 3u]);
+                av = tq_wht4(av, t, true);
+                tro[base] = av.x; tro[base + 1u] = av.y; tro[base + 2u] = av.z; tro[base + 3u] = av.w;
+            }
+        }
+        if (p.hd == 64u && t < 32u) {
+            vec2 av = vec2(tro[2u * t], tro[2u * t + 1u]);
+            av = tq_wht2(av, t, true);
+            tro[2u * t] = av.x; tro[2u * t + 1u] = av.y;
+        }
+        barrier();
+        if (t < p.hd) p.sc.v[o + 2 + t] = tro[t];
+    } else if (t < p.hd) {
         float s = 0.0;
         for (uint j = 0; j < parts; j++) s += acc[j * p.hd + t];
         p.sc.v[o + 2 + t] = s;

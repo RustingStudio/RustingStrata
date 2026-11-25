@@ -1120,7 +1120,7 @@ impl Device {
                 let swa_base = il * VERIFY_MAX * rb;
                 if !ml.swa {
                     be.ink_clip_n(p.k2, 0, hd, nkv, nt, c.qk_clip, 0.0, 1.0, ds.k.addr(), pos0, ds.cap, 0, 0.0, 1.0)?;
-                    be.ink_clip_n(p.v2, 0, hd, nkv, nt, 0.0, c.eps, 1.0, ds.v.addr(), pos0, ds.cap, 0, 0.0, 1.0)?;
+                    be.ink_clip_n_v(p.v2, 0, hd, nkv, nt, 0.0, c.eps, 1.0, ds.v.addr(), pos0, ds.cap, 0, 0.0, 1.0)?;
                 }
                 for t in 0..nt {
                     let pos = pos0 + t;
@@ -1129,7 +1129,7 @@ impl Device {
                         be.dtod(&ds.k, at * rb, &pf.swa_kc_log, swa_base + t * rb, rb)?;
                         be.dtod(&ds.v, at * rb, &pf.swa_vc_log, swa_base + t * rb, rb)?;
                         be.ink_clip_n(p.k2 + f(t * kw), 0, hd, nkv, 1, c.qk_clip, 0.0, 1.0, ds.k.addr(), at, c.n_swa, 0, 0.0, 1.0)?;
-                        be.ink_clip_n(p.v2 + f(t * kw), 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), at, c.n_swa, 0, 0.0, 1.0)?;
+                        be.ink_clip_n_v(p.v2 + f(t * kw), 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), at, c.n_swa, 0, 0.0, 1.0)?;
                         ((pos + 1).min(c.n_swa), at)
                     } else {
                         (pos + 1, pos)
@@ -1147,7 +1147,7 @@ impl Device {
                     (ds.k.addr(), ds.v.addr(), pos0, ds.cap)
                 };
                 be.ink_clip_n(p.k2, 0, hd, nkv, nt, c.qk_clip, 0.0, 1.0, kd, at0, kvr, 0, 0.0, 1.0)?;
-                be.ink_clip_n(p.v2, 0, hd, nkv, nt, 0.0, c.eps, 1.0, vd, at0, kvr, 0, 0.0, 1.0)?;
+                be.ink_clip_n_v(p.v2, 0, hd, nkv, nt, 0.0, c.eps, 1.0, vd, at0, kvr, 0, 0.0, 1.0)?;
                 let (kc_new, vc_new, ring, win) = if ml.swa {
                     (kd, vd, c.n_swa, c.n_swa)
                 } else {
@@ -1370,7 +1370,7 @@ impl Device {
             be.batch(&mut || {
                 be.ink_clip_pos(s.q, l.q_clip.addr(), hd, nh, 1, c.qk_clip, 0.0, 1.0, 0, 1, s.pos, log_alpha, c.log_floor)?;
                 be.ink_clip_pos(s.k, 0, hd, nkv, 1, c.qk_clip, 0.0, 1.0, ds.k.addr(), ring, s.pos, 0.0, 1.0)?;
-                be.ink_clip_pos(s.v, 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), ring, s.pos, 0.0, 1.0)?;
+                be.ink_clip_pos_v(s.v, 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), ring, s.pos, 0.0, 1.0)?;
                 be.ink_clip_pos(s.r, l.rel_clip.addr(), nr, nh, 1, c.rel_clip, 0.0, 1.0, 0, 1, s.pos, log_alpha, c.log_floor)
             })?;
             be.ink_attn_pos(s.q, s.r, s.sink, s.og, ds.k.addr(), ds.v.addr(), l.rel_bias.addr(), self.sc_buf.addr(), s.att, max_rows, ring, s.pos, nh, nkv, hd, nr, c.rel_extent)?;
@@ -1379,7 +1379,7 @@ impl Device {
             be.batch(&mut || {
                 be.ink_clip_n(s.q, l.q_clip.addr(), hd, nh, 1, c.qk_clip, 0.0, 1.0, 0, 0, 1, pos, log_alpha, c.log_floor)?;
                 be.ink_clip_n(s.k, 0, hd, nkv, 1, c.qk_clip, 0.0, 1.0, ds.k.addr(), at, ring, 0, 0.0, 1.0)?;
-                be.ink_clip_n(s.v, 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), at, ring, 0, 0.0, 1.0)?;
+                be.ink_clip_n_v(s.v, 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), at, ring, 0, 0.0, 1.0)?;
                 be.ink_clip_n(s.r, l.rel_clip.addr(), nr, nh, 1, c.rel_clip, 0.0, 1.0, 0, 0, 1, pos, log_alpha, c.log_floor)
             })?;
             be.ink_attn(s.q, s.r, s.sink, s.og, ds.k.addr(), ds.v.addr(), l.rel_bias.addr(), self.sc_buf.addr(), s.att, rows, at, nh, nkv, hd, nr, c.rel_extent)?;

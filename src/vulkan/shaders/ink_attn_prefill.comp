@@ -10,6 +10,9 @@ layout(constant_id = 1) const uint PER = 4;  // head_dim / 32
 // Inkling 2 causal prefill attention with online softmax + virtual sink logit 0.
 // When kc_new != 0 and kp >= pos (SWA chunk prefill without overwriting history < pos), reads kp - pos from kc_new/vc_new.
 // One warp per query token (4 queries per workgroup x, head h = workgroup y).
+// The legacy cache keeps main's lane + 32*j layout; a turbo half uses the contiguous WHT layout.
+uint kidx(uint j, uint lane) { if (K_MODE >= 4u) return PER == 2u ? 2u * lane + (j & 1u) : (j >> 2u) * 128u + 4u * lane + (j & 3u); return lane + 32u * j; }
+uint vidx(uint j, uint lane) { if (V_MODE >= 4u) return PER == 2u ? 2u * lane + (j & 1u) : (j >> 2u) * 128u + 4u * lane + (j & 3u); return lane + 32u * j; }
 void main() {
     uint t = gl_WorkGroupID.x * 4u + WARP, h = gl_WorkGroupID.y, lane = LANE;
     if (t >= p.nt) return;
@@ -20,8 +23,16 @@ void main() {
     float scale = fdiv(1.0, sqrt_(float(HD)));
     float q[PER], acc[PER];
     [[unroll]] for (uint j = 0; j < PER; j++) {
-        q[j] = p.q.v[(t * p.nh + h) * HD + lane + 32u * j] * scale;
+        q[j] = p.q.v[(t * p.nh + h) * HD + kidx(j, lane)] * scale;
         acc[j] = 0.0;
+    }
+    if (TQ_K) {
+        for (uint g = 0u; g < PER / 4u; g++) {
+            vec4 qv = vec4(q[4u * g], q[4u * g + 1u], q[4u * g + 2u], q[4u * g + 3u]);
+            qv = tq_wht4(qv, lane, false);
+            q[4u * g] = qv.x; q[4u * g + 1u] = qv.y; q[4u * g + 2u] = qv.z; q[4u * g + 3u] = qv.w;
+        }
+        if (PER == 2u) { vec2 qv = vec2(q[0], q[1]); qv = tq_wht2(qv, lane, false); q[0] = qv.x; q[1] = qv.y; }
     }
     float sink_val = p.sink.v[t * p.nh + h];
     float r_reg = (p.nr <= 32u && lane < p.nr) ? p.r.v[(t * p.nh + h) * p.nr + lane] : 0.0;
@@ -34,7 +45,7 @@ void main() {
         uint row = use_new ? (kp - p.pos) : (p.win > 0u ? (kp % p.ring) : kp);
         uint kbase = row * kw + kh * HD;
         float s = 0.0;
-        [[unroll]] for (uint j = 0; j < PER; j++) s += q[j] * ldkv(kbuf, kbase + lane + 32u * j, HD);
+        [[unroll]] for (uint j = 0; j < PER; j++) s += q[j] * ldkv_k(kbuf, kbase + kidx(j, lane), HD);
         s = W64 ? warp_sum(s) : subgroupAdd(s);
         uint dist = q_pos - kp;
         float b = 0.0;
@@ -49,13 +60,23 @@ void main() {
         float logit = s + b - sink_val;
         float mn = max(m, logit), c = expf_(m - mn), e = expf_(logit - mn);
         l = fma(l, c, e);
-        [[unroll]] for (uint j = 0; j < PER; j++) acc[j] = fma(e, ldkv(vbuf, kbase + lane + 32u * j, HD), acc[j] * c);
+        [[unroll]] for (uint j = 0; j < PER; j++) acc[j] = fma(e, ldkv_v(vbuf, kbase + vidx(j, lane), HD), acc[j] * c);
         m = mn;
     }
     float inv = fdiv(1.0, l);
+    float ov[PER];
+    [[unroll]] for (uint j = 0; j < PER; j++) ov[j] = acc[j] * inv;
+    if (TQ_V) {
+        for (uint g = 0u; g < PER / 4u; g++) {
+            vec4 vv = vec4(ov[4u * g], ov[4u * g + 1u], ov[4u * g + 2u], ov[4u * g + 3u]);
+            vv = tq_wht4(vv, lane, true);
+            ov[4u * g] = vv.x; ov[4u * g + 1u] = vv.y; ov[4u * g + 2u] = vv.z; ov[4u * g + 3u] = vv.w;
+        }
+        if (PER == 2u) { vec2 vv = vec2(ov[0], ov[1]); vv = tq_wht2(vv, lane, true); ov[0] = vv.x; ov[1] = vv.y; }
+    }
     [[unroll]] for (uint j = 0; j < PER; j++) {
-        uint col = lane + 32u * j;
+        uint col = vidx(j, lane);
         uint idx = (t * p.nh + h) * HD + col;
-        p.outp.v[idx] = acc[j] * inv * sigmoid(p.gate.v[idx]);
+        p.outp.v[idx] = ov[j] * sigmoid(p.gate.v[idx]);
     }
 }

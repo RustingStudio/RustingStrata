@@ -251,11 +251,12 @@ impl Module {
         }
     }
 
-    /// Workgroup bytes the module needs with the pipeline's `spec` (constant ids 0 .. n-1) and constant 15 = `kv_mode`.
-    fn shared_bytes(&self, kernel: &str, spec: &[u32], kv_mode: u32) -> Result<u32> {
-        let mut map = HashMap::with_capacity(spec.len() + 1);
+    /// Workgroup bytes the module needs with the pipeline's `spec` (ids 0 .. n-1) and the split K/V modes.
+    fn shared_bytes_modes(&self, kernel: &str, spec: &[u32], kv_k: u32, kv_v: u32) -> Result<u32> {
+        let mut map = HashMap::with_capacity(spec.len() + 2);
         for (i, &v) in spec.iter().enumerate() { map.insert(i as u32, v); }
-        map.insert(15, kv_mode);  // as Vk::pipeline: KV_MODE, common.glsl
+        map.insert(15, kv_k);  // as Vk::pipeline: KV_MODE and VKV_MODE, common.glsl
+        map.insert(16, kv_v);
         let mut total = 0u64;
         for &ty in &self.workgroup {
             let (size, align) = self.layout(ty, &map).with_context(|| format!("kernel {kernel}"))?;
@@ -270,8 +271,13 @@ impl Module {
 fn round_up(v: u64, a: u64) -> u64 { v.div_ceil(a.max(1)) * a.max(1) }
 
 /// Bytes of `Workgroup` shared memory kernel `kernel` needs with specialization constants `spec` (ids 0 .. n-1, and
-/// constant 15 = `kv_mode`), computed from the committed SPIR-V in `src/vulkan/spv/`. No GPU and no pipeline.
+/// constant 15 = K mode and 16 = V mode), computed from the committed SPIR-V in `src/vulkan/spv/`. No GPU and no pipeline.
 pub fn shared_bytes(kernel: &str, spec: &[u32], kv_mode: u32) -> Result<u32> {
+    shared_bytes_split(kernel, spec, kv_mode, kv_mode)
+}
+
+/// `shared_bytes` with independent K and V cache modes (specialization constants 15 and 16).
+pub fn shared_bytes_split(kernel: &str, spec: &[u32], kv_k: u32, kv_v: u32) -> Result<u32> {
     let (name, code) = super::SPV.iter().find(|s| s.0 == kernel).map(|s| (s.0, s.1))
         .with_context(|| format!("no Vulkan kernel {kernel}"))?;
     // Parsed modules are immutable and reused: pipelines are created once per specialization, but a preflight
@@ -287,13 +293,13 @@ pub fn shared_bytes(kernel: &str, spec: &[u32], kv_mode: u32) -> Result<u32> {
             m
         }
     };
-    m.shared_bytes(name, spec, kv_mode)
+    m.shared_bytes_modes(name, spec, kv_k, kv_v)
 }
 
 /// `shared_bytes`, refusing when it exceeds `limit`: the driver accepts such a pipeline and faults at dispatch
 /// (`Xid 13 SKEDCHECK18_L1_CONFIG_TOO_SMALL` on Volta). Returns the size when it fits.
-pub fn check_shared_memory(kernel: &str, spec: &[u32], kv_mode: u32, limit: u32) -> Result<u32> {
-    let bytes = shared_bytes(kernel, spec, kv_mode)?;
+pub fn check_shared_memory(kernel: &str, spec: &[u32], kv_k: u32, kv_v: u32, limit: u32) -> Result<u32> {
+    let bytes = shared_bytes_split(kernel, spec, kv_k, kv_v)?;
     ensure!(bytes <= limit, "vulkan: kernel {kernel} with specialization [[{}]] needs {bytes} bytes of shared memory; \
         this device allows {limit} (maxComputeSharedMemorySize). If the card really has more (the AMD Windows driver reports 32768 on a 9070 XT), \
         set STRATA_VK_SMEM_LIMIT=49152; no kernel needs more", spec.iter().map(u32::to_string).collect::<Vec<_>>().join(", "));
@@ -317,11 +323,11 @@ mod tests {
 
     #[test]
     fn shared_memory_refusal_names_the_kernel_spec_and_both_sizes() {
-        let e = check_shared_memory("gemmi_dp", &[0, 10, 84, 0, 0], 0, 40960).unwrap_err().to_string();
+        let e = check_shared_memory("gemmi_dp", &[0, 10, 84, 0, 0], 0, 0, 40960).unwrap_err().to_string();
         for want in ["gemmi_dp", "[0, 10, 84, 0, 0]", "49152", "40960", "maxComputeSharedMemorySize"] {
             assert!(e.contains(want), "{e:?} does not contain {want:?}");
         }
-        assert_eq!(check_shared_memory("gemmi_dp", &[0, 10, 84, 0, 0], 0, 49152).unwrap(), 49152);
+        assert_eq!(check_shared_memory("gemmi_dp", &[0, 10, 84, 0, 0], 0, 0, 49152).unwrap(), 49152);
     }
 
     /// Every weight kernel the preflight names has a computable Workgroup size for every GPU weight type: a shader or

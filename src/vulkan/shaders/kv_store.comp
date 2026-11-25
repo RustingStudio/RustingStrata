@@ -3,7 +3,36 @@ layout(local_size_x = 256) in;
 #include "common.glsl"
 // Store `total` values (consecutive tokens of n each, heads of hd) of k and v into the caches from position step[0].
 layout(push_constant) uniform P { F32 k; F32 v; U16 kc; U16 vc; I32 step; uint n; uint total; uint hd; } p;
+shared float kq[128], vq[128];
+// A 128-value WHT group is gathered as 4*lane+j so all five butterfly stages stay inside one warp.
+void rotate(inout float s[128], uint gbase, uint lane, bool inv) {
+    vec4 a = vec4(s[gbase + 4u * lane], s[gbase + 4u * lane + 1u], s[gbase + 4u * lane + 2u], s[gbase + 4u * lane + 3u]);
+    a = tq_wht4(a, lane, inv);
+    s[gbase + 4u * lane] = a.x; s[gbase + 4u * lane + 1u] = a.y;
+    s[gbase + 4u * lane + 2u] = a.z; s[gbase + 4u * lane + 3u] = a.w;
+}
 void main() {
-    uint i = gl_GlobalInvocationID.x, e = uint(p.step.v[0]) * p.n + i;
-    if (i < p.total) { kv_put(p.kc, e, p.hd, p.k.v[i]); kv_put(p.vc, e, p.hd, p.v.v[i]); }
+    uint tid = gl_LocalInvocationID.x, i = gl_WorkGroupID.x * 256u + tid;
+    uint e = uint(p.step.v[0]) * p.n + i;
+    bool valid = i < p.total;
+    float kv = valid ? p.k.v[i] : 0.0, vv = valid ? p.v.v[i] : 0.0;
+    kq[tid] = kv; vq[tid] = vv;
+    barrier();
+    if (TQ_K || TQ_V) {
+        uint lane = tid & 31u, gbase = (tid >> 7u) * 128u;
+        if ((tid & 127u) < 32u) {
+            if (TQ_K) rotate(kq, gbase, lane, false);
+            if (TQ_V) rotate(vq, gbase, lane, false);
+        }
+        barrier();
+    }
+    uint slot = ((e / p.hd) & 7u) * 8u + ((e % p.hd) >> 7u);
+    float krot = TQ_K ? kq[tid] : kv, vrot = TQ_V ? vq[tid] : vv;
+    float sk = 1.0, sv = 1.0;
+    if (TQ_K) sk = sqrt_(tq_group_reduce(krot * krot, slot));
+    if (TQ_V) sv = sqrt_(tq_group_reduce(vrot * vrot, slot));
+    if (valid) {
+        kv_put_ex(p.kc, e, p.hd, krot, sk, true, KV_MODE, TQ_KBITS);
+        kv_put_ex(p.vc, e, p.hd, vrot, sv, true, VKV_MODE, TQ_VBITS);
+    }
 }

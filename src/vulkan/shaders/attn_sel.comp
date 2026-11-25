@@ -9,11 +9,25 @@ layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; U32 idx; I32 cnt; F32 o
 // idx[t * ns ..] of an f16 K/V cache. A workgroup is one query token and one K/V head, a warp one query head;
 // 32 keys of K and V are loaded into shared memory at a time.
 shared float qs[PERH * HD], kt[32 * HD], vt[32 * HD], ps[PERH * 32];
-
+shared float ro[PERH * HD];
 void main() {
     uint t = gl_WorkGroupID.x, g = gl_WorkGroupID.y, h = WARP, c = LANE, tid = h * 32u + c, nthr = PERH * 32u;
     uint n = uint(p.cnt.v[t]), qg = (t * p.nh + g * PERH) * HD;
     for (uint i = tid; i < PERH * HD; i += nthr) qs[i] = p.q.v[qg + i];
+    barrier();
+    if (TQ_K) {
+        for (uint hh = 0u; hh < PERH; hh++)
+            for (uint gg = 0u; gg < HD / 128u; gg++) {
+                uint lane = c;
+                if (h == hh && lane < 32u) {
+                    uint base = hh * HD + gg * 128u + 4u * lane;
+                    vec4 v = vec4(qs[base], qs[base + 1u], qs[base + 2u], qs[base + 3u]);
+                    v = tq_wht4(v, lane, false);
+                    qs[base] = v.x; qs[base + 1u] = v.y; qs[base + 2u] = v.z; qs[base + 3u] = v.w;
+                }
+            }
+        barrier();
+    }
     float acc[8];
     for (uint r = 0; r < 8u; r++) acc[r] = 0.0;
     float ninf = uintBitsToFloat(0xff800000u), m = ninf, l = 0.0;
@@ -23,8 +37,8 @@ void main() {
             uint j = j0 + i / HD;
             if (j < n) {
                 uint row = (p.idx.v[t * p.ns + j] * p.nkv + g) * HD + i % HD;
-                kt[i] = ldkv(p.kc, row, HD);
-                vt[i] = ldkv(p.vc, row, HD);
+                kt[i] = ldkv_k(p.kc, row, HD);
+                vt[i] = ldkv_v(p.vc, row, HD);
             } else {
                 kt[i] = 0.0;
                 vt[i] = 0.0;
@@ -51,5 +65,23 @@ void main() {
         }
     }
     uint o = (t * p.nh + g * PERH + h) * HD;
-    for (uint r = 0; r < HD / 32u; r++) p.outp.v[o + c + 32u * r] = fdiv(acc[r], l);
+    if (TQ_V) {
+        for (uint r = 0u; r < HD / 32u; r++) ro[h * HD + c + 32u * r] = fdiv(acc[r], l);
+        barrier();
+        for (uint gg = 0u; gg < HD / 128u; gg++) {
+            if (h < PERH && c < 32u) {
+                uint base = h * HD + gg * 128u + 4u * c;
+                vec4 v = vec4(ro[base], ro[base + 1u], ro[base + 2u], ro[base + 3u]);
+                v = tq_wht4(v, c, true);
+                ro[base] = v.x; ro[base + 1u] = v.y; ro[base + 2u] = v.z; ro[base + 3u] = v.w;
+            }
+        }
+        barrier();
+        for (uint gg = 0u; gg < HD / 128u; gg++) {
+            uint base = gg * 128u + 4u * c;
+            for (uint j = 0u; j < 4u; j++) p.outp.v[o + base + j] = ro[h * HD + base + j];
+        }
+    } else {
+        for (uint r = 0; r < HD / 32u; r++) p.outp.v[o + c + 32u * r] = fdiv(acc[r], l);
+    }
 }

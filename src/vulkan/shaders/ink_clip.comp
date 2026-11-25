@@ -5,12 +5,12 @@ layout(push_constant) uniform P {
     F32 x; F32 scale; U16 dst; I32 pos_ptr;
     uint w; float thr; float eps; float mul;
     uint dst_at0; uint dst_ring;
-    uint pos0; float log_alpha; float log_floor;
+    uint pos0; float log_alpha; float log_floor; uint which;
 } p;
 
-// Workgroup (row, tok): rows of w values (w at most 128, multiple of 32 when KV_MODE > 0 and dst != 0).
-// scale is shared across tokens: [gl_NumWorkGroups.x][w]. dst writes KV row (dst_at0 + tok) % dst_ring via kv_put.
-// When pos_ptr != 0, pos0 = uint(pos_ptr.v[0]) and dst_at0 = pos0 % dst_ring.
+// Workgroup (row, tok): rows of w values (w at most 128, multiple of 32 when a quantized KV half stores them).
+// `which` selects the K (0) or V (1) cache format when dst writes KV row (dst_at0 + tok) % dst_ring.
+shared float tq[128];
 void main() {
     uint t = gl_LocalInvocationID.x;
     uint row = gl_WorkGroupID.x, tok = gl_WorkGroupID.y, rows = gl_NumWorkGroups.x;
@@ -26,13 +26,26 @@ void main() {
     float mul = p.mul;
     if (p.log_alpha != 0.0) mul *= 1.0 + p.log_alpha * log(max(fdiv(float(pos0 + tok + 1u), p.log_floor), 1.0));
     float f = (p.thr > 0.0 ? min(fdiv(p.thr, sqrt_(ss) + 1e-6), 1.0) : fdiv(1.0, sqrt_(fdiv(ss, float(p.w)) + p.eps))) * mul;
-    if (t < p.w) {
-        v *= f;
-        p.x.v[at] = v;
-    }
-    if (uint64_t(p.dst) != 0 && t < p.w) {
+    if (t < p.w) { v *= f; p.x.v[at] = v; }
+    if (uint64_t(p.dst) != 0) {
+        tq[t] = t < p.w ? v : 0.0;
+        barrier();
+        uint mode = p.which == 0u ? KV_MODE : VKV_MODE;
+        if (mode >= 4u) {
+            if (p.w == 128u && t < 32u) {
+                vec4 a = vec4(tq[4u * t], tq[4u * t + 1u], tq[4u * t + 2u], tq[4u * t + 3u]);
+                a = tq_wht4(a, t, false);
+                tq[4u * t] = a.x; tq[4u * t + 1u] = a.y; tq[4u * t + 2u] = a.z; tq[4u * t + 3u] = a.w;
+            } else if (p.w == 64u && t < 32u) {
+                vec2 a = vec2(tq[2u * t], tq[2u * t + 1u]);
+                a = tq_wht2(a, t, false);
+                tq[2u * t] = a.x; tq[2u * t + 1u] = a.y;
+            }
+            barrier();
+        }
+        // All 128 invocations call the store so every WHT group's reduction slots are written, even at w = 64.
         uint dst_pos = (dst_at0 + tok) % p.dst_ring;
         uint dat = (dst_pos * rows + row) * p.w + t;
-        kv_put(p.dst, dat, p.w, v);
+        kv_put_tq_which(p.dst, dat, p.w, mode >= 4u ? tq[t] : v, sqrt_(ss) * f, t < p.w, p.which);
     }
 }
