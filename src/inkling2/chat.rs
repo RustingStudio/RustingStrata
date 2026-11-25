@@ -546,6 +546,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str, opts: Inkling2O
         if let Some(t) = q.temperature { smp.temp = t; }
         if let Some(k) = q.top_k { smp.top_k = k; }
         if let Some(p) = q.top_p { smp.top_p = p; }
+        if let Some(p) = q.min_p { smp.min_p = p; }
         if let Some(p) = q.presence_penalty { smp.presence = p; }
         if let Some(f) = q.frequency_penalty { smp.frequency = f; }
         if let Some(rp) = q.repeat_penalty { smp.repeat = rp; }

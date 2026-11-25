@@ -396,6 +396,7 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     pub top_k: Option<usize>,
     pub top_p: Option<f32>,
+    pub min_p: Option<f32>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     /// llama.cpp server names: the repeat penalty and how many of the reply's last tokens it looks at.
@@ -476,6 +477,7 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
         preserve_thinking: v["chat_template_kwargs"]["preserve_thinking"].as_bool(),
         temperature: num("temperature", |f| f >= 0.0, "a number >= 0")?, top_k: int("top_k", 0)?.map(|n| n as usize),
         top_p: num("top_p", |f| f > 0.0 && f <= 1.0, "a number in (0, 1]")?,
+        min_p: num("min_p", |f| (0.0..=1.0).contains(&f), "a number in [0, 1]")?,
         presence_penalty: num("presence_penalty", |f| (-2.0..=2.0).contains(&f), "a number in [-2, 2]")?,
         frequency_penalty: num("frequency_penalty", |f| (-2.0..=2.0).contains(&f), "a number in [-2, 2]")?,
         repeat_penalty: num("repeat_penalty", |f| f > 0.0 && f <= 5.0, "a number in (0, 5]")?,
@@ -744,7 +746,7 @@ pub fn messages_body(body: &[u8]) -> anyhow::Result<Vec<u8>> {
         Some("tool") => out.push(("tool_choice", obj(vec![("type", s("function")), ("function", obj(vec![("name", j.get("tool_choice").get("name").clone())]))]))),
         _ => {}
     }
-    for (from, to) in [("max_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k"), ("stop_sequences", "stop"), ("stream", "stream")] {
+    for (from, to) in [("max_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p"), ("min_p", "min_p"), ("top_k", "top_k"), ("stop_sequences", "stop"), ("stream", "stream")] {
         if !matches!(j.get(from), Json::Null) { out.push((to, j.get(from).clone())); }
     }
     if j.get("thinking").get("type").as_str() == Some("enabled") {

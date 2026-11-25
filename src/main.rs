@@ -83,6 +83,9 @@ struct Engine {
     top_k: usize,
     #[arg(long, default_value_t = 1.0)]
     top_p: f32,
+    /// Drop the tokens whose probability is below this times the best one's (llama.cpp min-p; 0 = off).
+    #[arg(long, default_value_t = 0.0)]
+    min_p: f32,
     /// Default presence penalty (OpenAI `presence_penalty`); needs --temp > 0. Qwen recommends 1.5 against loops.
     #[arg(long, default_value_t = 0.0)]
     presence_penalty: f32,
@@ -562,7 +565,7 @@ impl Engine {
         })
     }
     fn sampler(&self) -> Sampler {
-        Sampler { temp: self.temp, top_k: self.top_k, top_p: self.top_p, rng: seed(self.seed),
+        Sampler { temp: self.temp, top_k: self.top_k, top_p: self.top_p, min_p: self.min_p, rng: seed(self.seed),
             presence: self.presence_penalty, frequency: self.frequency_penalty, repeat: self.repeat_penalty,
             last_n: self.penalty_last_n, dry_mult: self.dry_multiplier,
             dry_base: self.dry_base, dry_allowed: self.dry_allowed_length, ..Sampler::greedy() }
@@ -3940,6 +3943,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             smp.temp = req.temperature.unwrap_or(smp.temp);
             smp.top_k = req.top_k.unwrap_or(smp.top_k);
             smp.top_p = req.top_p.unwrap_or(smp.top_p);
+            smp.min_p = req.min_p.unwrap_or(smp.min_p);
             smp.presence = req.presence_penalty.unwrap_or(smp.presence);
             smp.frequency = req.frequency_penalty.unwrap_or(smp.frequency);
             smp.repeat = req.repeat_penalty.unwrap_or(smp.repeat);
@@ -3949,7 +3953,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             smp.dry_allowed = req.dry_allowed_length.unwrap_or(smp.dry_allowed);
             if smp.dry_mult > 0.0 { smp.dry_breakers = dry_breakers(tok, name); }
             smp.tool_tags = tok.token_id("<tool_call>").zip(tok.token_id("</tool_call>")).map(|(a, b)| (a as usize, b as usize));
-            say!("sampling: temp={} top_k={} top_p={} presence={} frequency={} repeat={}/{} dry={}/{}/{}", smp.temp, smp.top_k, smp.top_p,
+            say!("sampling: temp={} top_k={} top_p={} min_p={} presence={} frequency={} repeat={}/{} dry={}/{}/{}", smp.temp, smp.top_k, smp.top_p, smp.min_p,
                 smp.presence, smp.frequency, smp.repeat, smp.last_n, smp.dry_mult, smp.dry_base, smp.dry_allowed);
             if req.seed.is_some() { smp.rng = seed(req.seed); }
             let n = room(e, ids.len(), req.max_tokens.unwrap_or(usize::MAX).min(s.max_tokens));
