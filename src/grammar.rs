@@ -41,7 +41,18 @@ enum Elem { Chars(bool, Vec<(u32, u32)>), Rule(usize) }
 #[derive(Debug)]
 pub struct Grammar { rules: Vec<Vec<Vec<Elem>>>, root: usize }
 
-struct Parser { c: Vec<char>, i: usize, names: Vec<String>, rules: Vec<Option<Vec<Vec<Elem>>>> }
+/// Limits for a grammar that comes with a request: its length, the nesting of groups, the elements and rules the
+/// parser writes out (repetitions copy their body), and the expansion steps a check may take.
+const MAX_CHARS: usize = 64 << 10;
+const MAX_NEST: usize = 64;
+const MAX_ELEMS: usize = 64 << 10;
+/// Expansion steps for one character (`advance`), and for checking every rule start at parse time.
+const STEPS: usize = 10_000;
+const CHECK_STEPS: usize = 200_000;
+/// Stacks kept after a character. ponytail: more are dropped (an odd ambiguous grammar may then refuse a valid text).
+const MAX_STACKS: usize = 1024;
+
+struct Parser { c: Vec<char>, i: usize, names: Vec<String>, rules: Vec<Option<Vec<Vec<Elem>>>>, nest: usize, elems: usize }
 
 impl Parser {
     fn peek(&self) -> Option<char> { self.c.get(self.i).copied() }
@@ -65,6 +76,12 @@ impl Parser {
     }
     fn id(&mut self, name: &str) -> usize {
         self.names.iter().position(|n| n == name).unwrap_or_else(|| { self.names.push(name.into()); self.rules.push(None); self.names.len() - 1 })
+    }
+    /// Counts `n` more elements written out, and fails past `MAX_ELEMS`.
+    fn grow(&mut self, n: usize) -> anyhow::Result<()> {
+        self.elems += n;
+        ensure!(self.elems <= MAX_ELEMS, "grammar: more than {MAX_ELEMS} elements once repetitions are written out");
+        Ok(())
     }
     fn new_rule(&mut self, alts: Vec<Vec<Elem>>) -> usize {
         self.names.push(String::new());
@@ -121,7 +138,10 @@ impl Parser {
                 '(' => {
                     self.i += 1;
                     self.ws(true);
+                    self.nest += 1;
+                    ensure!(self.nest <= MAX_NEST, "grammar: groups nested more than {MAX_NEST} deep");
                     let alts = self.alts(true)?;
+                    self.nest -= 1;
                     ensure!(self.peek() == Some(')'), "grammar: ')' expected at character {}", self.i);
                     self.i += 1;
                     out.push(Elem::Rule(self.new_rule(alts)));
@@ -146,7 +166,7 @@ impl Parser {
                         }
                     };
                     let body = out.split_off(last);
-                    self.repeat(&mut out, body, min, max);
+                    self.repeat(&mut out, body, min, max)?;
                     self.ws(nested);
                     continue;
                 }
@@ -167,7 +187,9 @@ impl Parser {
         Ok(out)
     }
     /// `body` from `min` to `max` (None: no limit) times, as llama.cpp writes it out.
-    fn repeat(&mut self, out: &mut Vec<Elem>, body: Vec<Elem>, min: usize, max: Option<usize>) {
+    fn repeat(&mut self, out: &mut Vec<Elem>, body: Vec<Elem>, min: usize, max: Option<usize>) -> anyhow::Result<()> {
+        // The copies, checked before they are made.
+        self.grow((body.len() + 1).saturating_mul(max.unwrap_or(min).max(1)))?;
         for _ in 0..min { out.extend(body.iter().cloned()); }
         match max {
             None => {
@@ -188,12 +210,14 @@ impl Parser {
                 out.extend(inner.map(Elem::Rule));
             }
         }
+        Ok(())
     }
 }
 
 impl Grammar {
     pub fn parse(src: &str) -> anyhow::Result<Grammar> {
-        let mut p = Parser { c: src.chars().collect(), i: 0, names: vec![], rules: vec![] };
+        ensure!(src.chars().count() <= MAX_CHARS, "grammar: longer than {MAX_CHARS} characters");
+        let mut p = Parser { c: src.chars().collect(), i: 0, names: vec![], rules: vec![], nest: 0, elems: 0 };
         p.ws(true);
         while p.i < p.c.len() {
             let name = p.name()?;
@@ -212,13 +236,31 @@ impl Grammar {
         let root = p.names.iter().position(|n| n == "root").context("grammar: no root rule")?;
         let rules = p.rules.into_iter().zip(&p.names).map(|(r, n)| r.with_context(|| format!("grammar: rule {n} is used but not defined")))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(Grammar { rules, root })
+        ensure!(rules.iter().flatten().map(Vec::len).sum::<usize>() <= MAX_ELEMS, "grammar: more than {MAX_ELEMS} elements");
+        let g = Grammar { rules, root };
+        // Every rule start expands within one budget, so a grammar whose expansion blows up is refused here and not
+        // while it runs.
+        let mut steps = CHECK_STEPS;
+        for (r, alts) in g.rules.iter().enumerate() {
+            for a in 0..alts.len() { g.expand(vec![(r, a, 0)], 0, &mut steps, &mut vec![]); }
+        }
+        ensure!(steps > 0, "grammar: its expansion takes too many steps (left recursion, or alternatives that multiply)");
+        Ok(g)
+    }
+
+    /// The stacks of the grammar's start.
+    fn start(&self) -> Vec<Vec<(usize, usize, usize)>> {
+        let (mut out, mut steps) = (vec![], CHECK_STEPS);
+        for alt in 0..self.rules[self.root].len() { self.expand(vec![(self.root, alt, 0)], 0, &mut steps, &mut out); }
+        out
     }
 
     /// The stacks `st` stands for with a character at the top of each (an empty stack: the grammar is complete).
-    fn expand(&self, mut st: Vec<(usize, usize, usize)>, depth: usize, out: &mut Vec<Vec<(usize, usize, usize)>>) {
+    /// `steps` is the budget of calls left; at 0 the rest is dropped (`parse` refuses a grammar that gets there).
+    fn expand(&self, mut st: Vec<(usize, usize, usize)>, depth: usize, steps: &mut usize, out: &mut Vec<Vec<(usize, usize, usize)>>) {
         // ponytail: a depth cut instead of rejecting left recursion when parsing.
-        if depth > 200 { return; }
+        if depth > 200 || *steps == 0 { *steps = 0; return; }
+        *steps -= 1;
         loop {
             let Some(&(r, a, e)) = st.last() else { out.push(st); return };
             match self.rules[r][a].get(e) {
@@ -231,7 +273,7 @@ impl Grammar {
                     for alt in 0..self.rules[k].len() {
                         let mut s = st.clone();
                         s.push((k, alt, 0));
-                        self.expand(s, depth + 1, out);
+                        self.expand(s, depth + 1, steps, out);
                     }
                     return;
                 }
@@ -241,16 +283,17 @@ impl Grammar {
 
     /// The stacks after the character `c`.
     fn advance(&self, stacks: &[Vec<(usize, usize, usize)>], c: u32) -> Vec<Vec<(usize, usize, usize)>> {
-        let mut out = vec![];
+        let (mut out, mut steps) = (vec![], STEPS);
         for st in stacks {
             let Some(&(r, a, e)) = st.last() else { continue };
             if let Elem::Chars(neg, rs) = &self.rules[r][a][e] && *neg != rs.iter().any(|&(lo, hi)| (lo..=hi).contains(&c)) {
                 let mut s = st.clone();
                 s.last_mut().unwrap().2 += 1;
-                self.expand(s, 0, &mut out);
+                self.expand(s, 0, &mut steps, &mut out);
             }
         }
         if out.len() > 1 { (out.sort_unstable(), out.dedup()); }
+        out.truncate(MAX_STACKS);
         out
     }
 
@@ -330,8 +373,7 @@ impl Constraint {
             }
         }
         let gram = grammar.map(|g| {
-            let mut stacks = vec![];
-            for alt in 0..g.rules[g.root].len() { g.expand(vec![(g.root, alt, 0)], 0, &mut stacks); }
+            let stacks = g.start();
             Matcher { g, stacks, part: vec![], bytes: tok.grammar_bytes() }
         });
         Ok(Some(Constraint { bias: b, gram, eos: tok.eos_ids() }))
@@ -392,14 +434,12 @@ mod tests {
 
     /// Whether the grammar takes `s` whole.
     fn full(g: &Grammar, s: &str) -> bool {
-        let mut st = vec![];
-        for alt in 0..g.rules[g.root].len() { g.expand(vec![(g.root, alt, 0)], 0, &mut st); }
+        let st = g.start();
         match g.feed(&st, &[], s.as_bytes()) { Some((st, part)) => part.is_empty() && st.iter().any(Vec::is_empty), None => false }
     }
     /// Whether `s` can start a text the grammar takes.
     fn prefix(g: &Grammar, s: &str) -> bool {
-        let mut st = vec![];
-        for alt in 0..g.rules[g.root].len() { g.expand(vec![(g.root, alt, 0)], 0, &mut st); }
+        let st = g.start();
         g.feed(&st, &[], s.as_bytes()).is_some()
     }
 
@@ -461,8 +501,7 @@ item ::= "- " [^\r\n\x0b\x0c\x85  ]+ "\n"
         assert!(prefix(&g, r#"{"key": [1, 2"#));
         assert!(!prefix(&g, "hello"));
         // A character split across tokens: the start of "é" is allowed inside a string, not after "{".
-        let mut st = vec![];
-        g.expand(vec![(g.root, 0, 0)], 0, &mut st);
+        let st = g.start();
         let (s1, p) = g.feed(&st, &[], b"{\"").unwrap();
         assert!(p.is_empty());
         let (s2, p) = g.feed(&s1, &[], &[0xc3]).unwrap();
@@ -494,8 +533,13 @@ item ::= "- " [^\r\n\x0b\x0c\x85  ]+ "\n"
         assert!(Grammar::parse("start ::= \"a\"").is_err());
         assert!(Grammar::parse("root ::= \"a\"\nroot ::= \"b\"").is_err());
         assert!(Grammar::parse("root ::= (\"a\"").is_err());
-        // Left recursion ends (at the depth cut) instead of hanging.
-        assert!(full(&Grammar::parse("root ::= root \"a\" | \"b\"").unwrap(), "baa"));
+        // Left recursion, and grammars that are too big to write out or expand, are refused (a request's grammar).
+        assert!(Grammar::parse("root ::= root \"a\" | \"b\"").is_err());
+        assert!(Grammar::parse(&format!("root ::= {}\"a\"{}", "(".repeat(100), ")".repeat(100))).is_err());
+        assert!(Grammar::parse("root ::= \"a\"{100000}").is_err() && Grammar::parse("root ::= ((\"a\"{1000}){1000}){1000}").is_ok());
+        let blow: String = (0..40).map(|i| format!("r{i} ::= r{} r{} | \"\"\n", i + 1, i + 1)).collect();
+        assert!(Grammar::parse(&format!("root ::= r0\n{blow}r40 ::= \"y\"")).is_err());
+        assert!(Grammar::parse(&"a".repeat(MAX_CHARS + 1)).is_err());
     }
 
     #[test]
