@@ -1653,7 +1653,8 @@ ITYPES(DEF_GEMMI)
 // result does not depend on which block that is.
 #define GEMMD_XW(pb) ((pb) >= 32 ? 128 : 4096 / (pb))
 // XW: the window width when it is known at compile time (its pitch then makes the x loads' offsets immediates), else 0.
-template <int T, int SBB, int XW>
+// FULL: 64 positions, so every one of the 8 tiles has positions (no test a tile).
+template <int T, int SBB, int XW, bool FULL = false>
 __device__ __forceinline__ void gemmd_qx(const u8* w, const u8* __restrict__ x, int nd, int pb, int ks, float* scr, int* flag,
                                          float* y, int y_stride, int rows, int cols, int act, float sc) {
     // One window: pb rows of xw + 32 int8 (the pitch puts two lanes on a bank, the least an 8-byte load allows),
@@ -1730,7 +1731,7 @@ __device__ __forceinline__ void gemmd_qx(const u8* w, const u8* __restrict__ x, 
         }
         #pragma unroll
         for (int pt = 0; pt < 8; pt++) {  // 8 positions an mma
-            if (pt >= npt) break;
+            if (!FULL && pt >= npt) break;
             const signed char* xp = xb + (pt * 8 + g) * pitch + kw * 32;
             const uint2 bx = KS == 32 ? *(const uint2*)(xp + 8 * t) : make_uint2(*(const u32*)(xp + 4 * t), *(const u32*)(xp + 16 + 4 * t));
             const float* o = pk + (kw * (pb >> 1) + pt * 4 + t) * 8;
@@ -1870,7 +1871,8 @@ __device__ __forceinline__ void gemmd_qx(const u8* w, const u8* __restrict__ x, 
 #define DEF_GEMMD(T, NAME, SBB)                                                                                    \
     extern "C" __global__ void __launch_bounds__(256, 2) gemmd_##NAME(const u8* w, const u8* x, int nd, int pb,        \
             int ks, float* scr, int* flag, float* y, int y_stride, int rows, int cols, int act, float sc) {       \
-        if (pb >= 32) gemmd_qx<T, SBB, GEMMD_XW(32)>(w, x, nd, pb, ks, scr, flag, y, y_stride, rows, cols, act, sc); \
+        if (nd == 64) gemmd_qx<T, SBB, GEMMD_XW(32), true>(w, x, nd, pb, ks, scr, flag, y, y_stride, rows, cols, act, sc); \
+        else if (pb >= 32) gemmd_qx<T, SBB, GEMMD_XW(32)>(w, x, nd, pb, ks, scr, flag, y, y_stride, rows, cols, act, sc); \
         else gemmd_qx<T, SBB, 0>(w, x, nd, pb, ks, scr, flag, y, y_stride, rows, cols, act, sc);                   \
     }
 ITYPES(DEF_GEMMD)
