@@ -487,6 +487,21 @@ template <> struct QI<14> {  // Q6_K (210 bytes: rows 2-aligned)
         lo = (int)__vsub4(a, 0x20202020u); hi = (int)__vsub4(c, 0x20202020u);
     }
 };
+// Q6_K, half n of a super-block for lane t (gemmd): the ql bytes of blocks 0, 2 and of 1, 3, the qh bytes, the 8
+// scales of the half and d. Block qt decodes as QI<14>::get(b, 4 (4 n + qt) + t).
+struct H6 { uint2 l0, l1, h, s; u32 d; };
+__device__ __forceinline__ void h6_ld(const u8* b, int n, int t, H6& r) {
+    r.l0 = ld8a2(b + 64 * n + 8 * t); r.l1 = ld8a2(b + 64 * n + 32 + 8 * t); r.h = ld8a2(b + 128 + 32 * n + 8 * t);
+    r.s = ld8a2(b + 192 + 8 * n); r.d = ld16(b + 208);
+}
+__device__ __forceinline__ void h6_get(const H6& r, int qt, int t, int& lo, int& hi, float& d) {
+    const uint2 L = qt & 1 ? r.l1 : r.l0;
+    const int ns = 4 * (qt >> 1), hs = 2 * qt, j = (t >> 1) + 2 * qt;
+    d = h2f((u16)r.d) * (float)(signed char)(((j & 4 ? r.s.y : r.s.x) >> (8 * (j & 3))) & 0xFF);
+    u32 a = ((L.x >> ns) & 0x0F0F0F0Fu) | (((r.h.x >> hs) & 0x03030303u) << 4);
+    u32 c = ((L.y >> ns) & 0x0F0F0F0Fu) | (((r.h.y >> hs) & 0x03030303u) << 4);
+    lo = (int)__vsub4(a, 0x20202020u); hi = (int)__vsub4(c, 0x20202020u);
+}
 // IQ1: weight = dl * (g +- 1/8) = (dl / 8) * (8 g +- 1), an exact int8 in {-9, -7, -1, 1, 7, 9}.
 template <int T> struct QI1 {
     static constexpr bool MIN = false;
@@ -1745,11 +1760,15 @@ __device__ __forceinline__ void gemmd_q(const u8* w, const u8* __restrict__ x, i
         if (hdr) { sa_ = *(const uint4*)(pa + o); sb_ = *(const uint4*)(pb_ + o); }
         ua = *(const uint2*)(pa + o + j); ub = *(const uint2*)(pb_ + o + j);
     };
+    // Q6_K: a half super-block (128 columns: a window holds whole ones) is loaded at once, the next during this one.
+    const bool k6 = T == 14 && cols % 256 == 0;
+    H6 h6a, h6b;
+    auto ld6 = [&](int hf) { size_t o = (size_t)(hf >> 1) * 210; h6_ld(pa + o, hf & 1, t, h6a); h6_ld(pb_ + o, hf & 1, t, h6b); };
     ldx(0);
     cp_async_wait<0>();
     __syncthreads();
     pack(0);
-    if (live && w0 * qw < nq) { if (k4) ldp(w0 * qw / 2, true); else dec(w0 * qw); }
+    if (live && w0 * qw < nq) { if (k4) ldp(w0 * qw / 2, true); else if (k6) ld6(w0 * qw / 4); else dec(w0 * qw); }
     for (int wi = 0; wi < nws; wi++) {
         if (wi + 1 < nws) ldx(wi + 1);  // into the buffer of window wi - 1: every thread passed the barrier below
         xb = gx + (wi & 1) * xb_;
@@ -1772,6 +1791,17 @@ __device__ __forceinline__ void gemmd_q(const u8* w, const u8* __restrict__ x, i
                     const float wdb = __shfl_sync(0xffffffffu, sdb, from), wmb = __shfl_sync(0xffffffffu, smb, from);
                     blk(2 * p + h - qa, (va.x >> (4 * h)) & 0x0F0F0F0Fu, (vb.x >> (4 * h)) & 0x0F0F0F0Fu,
                         (va.y >> (4 * h)) & 0x0F0F0F0Fu, (vb.y >> (4 * h)) & 0x0F0F0F0Fu, wda, wma, wdb, wmb);
+                }
+            }
+        } else if (live && k6) {
+            for (int hf = qa / 4; hf < q1 / 4; hf++) {
+                const H6 ca = h6a, cb = h6b;
+                if (hf + 1 < nq / 4) ld6(hf + 1);
+                #pragma unroll
+                for (int qt = 0; qt < 4; qt++) {
+                    int a0, a1, a2, a3; float wda, wdb;
+                    h6_get(ca, qt, t, a0, a2, wda); h6_get(cb, qt, t, a1, a3, wdb);
+                    blk(4 * hf + qt - qa, a0, a1, a2, a3, wda, 0.f, wdb, 0.f);
                 }
             }
         } else if (live) {
