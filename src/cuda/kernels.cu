@@ -2147,6 +2147,71 @@ extern "C" __global__ void ink_ffn_sum(float* acc, const float* d, const float* 
     acc[(size_t)tok * n + c] = o;
 }
 
+// Attention of each query over its own list of keys (Kolibri sparse layers). Block = (query t, K/V head g); the
+// `per` = nh / nkv query heads of g are one warp each, so a tile of 32 keys is read once for all of them.
+// q: f32 [t][head][hd]; kc, vc: f16 rows [(pos * nkv + g) * hd]; idx: ns key positions per query, the first cnt[t]
+// valid. Online softmax: each head keeps its running maximum m, sum l and weighted V sum (hd / 32 values a thread).
+// A key row of the tile takes hd + 1 floats, so the 32 lanes that read one dimension of 32 keys hit 32 banks.
+// Shared memory: (per + 64) * hd + per * 32 + 32 floats.
+extern "C" __global__ void attn_sel(const float* q, const u16* kc, const u16* vc, const unsigned* idx, const int* cnt,
+                                    float* out, int nh, int nkv, int hd, int ns, float scale) {
+    extern __shared__ float sm[];
+    int t = blockIdx.x, g = blockIdx.y, per = nh / nkv;
+    int tid = threadIdx.x, h = tid >> 5, c = tid & 31, nthr = per * 32, n = cnt[t], nd = hd / 32;
+    float* qs = sm;
+    float* kt = qs + per * hd;
+    float* vt = kt + 32 * (hd + 1);
+    float* ps = vt + 32 * hd;
+    const float* qg = q + ((size_t)t * nh + (size_t)g * per) * hd;
+    for (int i = tid; i < per * hd; i += nthr) qs[i] = qg[i];
+    const unsigned* sel = idx + (size_t)t * ns;
+    float acc[8];
+    for (int i = 0; i < 8; i++) acc[i] = 0.0f;
+    float m = __int_as_float(0xff800000), l = 0.0f;
+    for (int j0 = 0; j0 < n; j0 += 32) {
+        __syncthreads();
+        for (int i = tid; i < 32 * hd; i += nthr) {
+            int j = j0 + i / hd;
+            if (j < n) {
+                size_t row = ((size_t)sel[j] * nkv + g) * hd + i % hd;
+                kt[i + i / hd] = h2f(kc[row]);
+                vt[i] = h2f(vc[row]);
+            } else {
+                kt[i + i / hd] = 0.0f;
+                vt[i] = 0.0f;
+            }
+        }
+        __syncthreads();
+        float s = __int_as_float(0xff800000);
+        if (j0 + c < n) {
+            const float* qh = qs + h * hd;
+            const float* kr = kt + c * (hd + 1);
+            float d = 0.0f;
+            for (int i = 0; i < hd; i++) d = fmaf(qh[i], kr[i], d);
+            s = d * scale;
+        }
+        float mx = s;
+        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+        float mn = fmaxf(m, mx);
+        float a = expf(m - mn);
+        float p = expf(s - mn);
+        float sum = p;
+        for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o);
+        l = l * a + sum;
+        m = mn;
+        ps[tid] = p;
+        __syncwarp();
+        const float* ph = ps + h * 32;
+        for (int r = 0; r < nd; r++) {
+            float v = 0.0f;
+            for (int k = 0; k < 32; k++) v = fmaf(ph[k], vt[k * hd + c + 32 * r], v);
+            acc[r] = acc[r] * a + v;
+        }
+    }
+    float* o = out + ((size_t)t * nh + (size_t)g * per + h) * hd;
+    for (int r = 0; r < nd; r++) o[c + 32 * r] = acc[r] / l;
+}
+
 __device__ __forceinline__ unsigned ink_f2key(float x) {
     unsigned u = __float_as_uint(x == 0.0f ? 0.0f : x);
     return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
@@ -2874,11 +2939,14 @@ __device__ void ink_attn_prefill_t(const float* q, const float* r, const float* 
     float sink_val = sink[(size_t)t * nh + h];
     float r_reg = (nr <= 32 && lane < nr) ? r[((size_t)t * nh + h) * nr + lane] : 0.f;
     float m = 0.f, l = 1.f;
+    // Row of the key in the old rows: a ring of `ring` rows on a sliding layer, counted (no division a key).
+    int old_row = win > 0 ? start % ring : start;
     for (int kp = start; kp <= q_pos; kp++) {
         bool use_new = kc_new && kp >= pos;
         const u16* kbuf = use_new ? kc_new : kc;
         const u16* vbuf = use_new ? vc_new : vc;
-        size_t row = use_new ? (size_t)(kp - pos) : (win > 0 ? (size_t)(kp % ring) : (size_t)kp);
+        size_t row = use_new ? (size_t)(kp - pos) : (size_t)old_row;
+        if (++old_row == ring) old_row = 0;
         size_t kbase = row * kw + (size_t)kh * HD;
         float s = 0.f;
         for (int j = 0; j < PER; j++) s += qv[j] * ldkv1(kbuf, kbase + lane + 32 * j, HD);
@@ -2915,6 +2983,89 @@ __device__ void ink_attn_prefill_t(const float* q, const float* r, const float* 
         ink_attn_prefill_t<HD / 32>(q, r, sink, gate, kc, vc, kc_new, vc_new, bias, outp, pos, nt, nh, nkv, nr, ext, ring, win); \
     }
 DEF_INK_PREFILL(32) DEF_INK_PREFILL(64) DEF_INK_PREFILL(128)
+// The same attention for a layer that sees every key, where the K/V rows of a long prompt do not stay in the cache.
+// The arithmetic of a (query, key) pair and the order of the keys are those of ink_attn_prefill_t: same bits.
+template <int PER>
+__device__ void ink_attn_prefill_sh_t(const float* q, const float* r, const float* sink, const float* gate,
+                                   const u16* kc, const u16* vc, const u16* kc_new, const u16* vc_new,
+                                   const float* bias, float* outp,
+                                   int pos, int nt, int nh, int nkv, int nr, int ext, int ring, int win) {
+    // A block is one K/V head and a group of tokens: one warp for each (token, query head of the K/V head). The
+    // block reads the K and V rows of 32 keys once, into shared memory, and every warp takes them from there
+    // (each warp read them from the cache itself: the same rows, once a warp).
+    constexpr int HD = 32 * PER, TK = 32;
+    extern __shared__ float skv[];  // TK * HD values of K, then TK * HD values of V
+    float* sk = skv; float* sv = skv + TK * HD;
+    int g = nh / nkv, kh = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31, tb = (blockDim.x >> 5) / g;
+    int t0 = blockIdx.x * tb, t = t0 + w / g, h = kh * g + w % g, kw = nkv * HD;
+    bool live = t < nt;
+    if (!live) t = nt - 1;
+    int q_pos = pos + t;
+    int start = (win > 0 && q_pos + 1 > win) ? (q_pos + 1 - win) : 0;
+    int kbeg = (win > 0 && pos + t0 + 1 > win) ? (pos + t0 + 1 - win) : 0, kend = pos + min(nt, t0 + tb) - 1;
+    float scale = 1.f / sqrtf((float)HD);
+    float qv[PER], acc[PER];
+    for (int j = 0; j < PER; j++) {
+        qv[j] = q[((size_t)t * nh + h) * HD + lane + 32 * j] * scale;
+        acc[j] = 0.f;
+    }
+    float sink_val = sink[(size_t)t * nh + h];
+    float r_reg = (nr <= 32 && lane < nr) ? r[((size_t)t * nh + h) * nr + lane] : 0.f;
+    float m = 0.f, l = 1.f;
+    for (int k0 = kbeg; k0 <= kend; k0 += TK) {
+        int n = min(TK, kend + 1 - k0);
+        // Row of key k0 in the old rows: a ring of `ring` rows on a sliding layer.
+        int r0 = win > 0 ? k0 % ring : k0;
+        for (int i = threadIdx.x; i < n * HD; i += blockDim.x) {
+            int key = i / HD, kp = k0 + key;
+            bool use_new = kc_new && kp >= pos;
+            size_t row = use_new ? (size_t)(kp - pos) : (size_t)(r0 + key >= ring ? r0 + key - ring : r0 + key);
+            size_t off = row * kw + (size_t)kh * HD + i % HD;
+            sk[i] = ldkv1(use_new ? kc_new : kc, off, HD);
+            sv[i] = ldkv1(use_new ? vc_new : vc, off, HD);
+        }
+        __syncthreads();
+        if (live) for (int i = max(start - k0, 0); i < n && k0 + i <= q_pos; i++) {
+            const float* kr = sk + i * HD + lane;
+            const float* vr = sv + i * HD + lane;
+            float s = 0.f;
+            for (int j = 0; j < PER; j++) s += qv[j] * kr[32 * j];
+            s = warp_sum(s);
+            int dist = q_pos - k0 - i;
+            float b = 0.f;
+            if (dist < ext) {
+                if (nr <= 32) {
+                    b = lane < nr ? r_reg * bias[dist * nr + lane] : 0.f;
+                } else {
+                    for (int c = lane; c < nr; c += 32) b += r[((size_t)t * nh + h) * nr + c] * bias[dist * nr + c];
+                }
+                b = warp_sum(b);
+            }
+            float logit = s + b - sink_val;
+            float mn = fmaxf(m, logit), c = expf(m - mn), e = expf(logit - mn);
+            l = l * c + e;
+            for (int j = 0; j < PER; j++) acc[j] = e * vr[32 * j] + acc[j] * c;
+            m = mn;
+        }
+        __syncthreads();
+    }
+    if (!live) return;
+    float inv = 1.f / l;
+    for (int j = 0; j < PER; j++) {
+        int col = lane + 32 * j;
+        size_t idx = ((size_t)t * nh + h) * HD + col;
+        outp[idx] = acc[j] * inv * sigmoid(gate[idx]);
+    }
+}
+#define DEF_INK_PREFILL_SH(HD) \
+    extern "C" __global__ void __launch_bounds__(1024) ink_attn_prefill_sh_##HD( \
+            const float* q, const float* r, const float* sink, const float* gate, \
+            const u16* kc, const u16* vc, const u16* kc_new, const u16* vc_new, \
+            const float* bias, float* outp, \
+            int pos, int nt, int nh, int nkv, int nr, int ext, int ring, int win) { \
+        ink_attn_prefill_sh_t<HD / 32>(q, r, sink, gate, kc, vc, kc_new, vc_new, bias, outp, pos, nt, nh, nkv, nr, ext, ring, win); \
+    }
+DEF_INK_PREFILL_SH(32) DEF_INK_PREFILL_SH(64) DEF_INK_PREFILL_SH(128)
 template <int HD, int G>
 __device__ void attn_decode_llama(const float* q, const u16* kc, const u16* vc, float* part, const int* step,
                                   const int* sel, int nh, int nkv, float scale, int bx, int win) {

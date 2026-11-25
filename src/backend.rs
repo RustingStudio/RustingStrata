@@ -389,6 +389,10 @@ pub trait Backend: Send {
     /// Inkling 2 sigmoid top-k router for `rows` tokens: picks top `k` from `logits` (`[rows, n_expert]`) using
     /// `sigmoid(logit) + bias`, writes indices `[rows, k]` to `ids`, normalized unbiased probs * `exp_scale` (* `dn_sc[id]`
     /// if non-null) to `wts`, and optional `gu_sc[id]` (or `1.0`) to `gsc_out`.
+    /// Attention of `nt` queries, each over its own key list: row t of `idx` (`ns` u32 positions, the first `cnt[t]`
+    /// valid) names the rows of the f16 caches `kc`/`vc` (`[(pos * nkv + g) * hd]`) that query t attends. `q` and
+    /// `out` are f32 `[t][head][hd]`. Kolibri's sparse layers.
+    fn attn_sel(&self, _q: u64, _kc: u64, _vc: u64, _idx: u64, _cnt: u64, _out: u64, _nt: usize, _nh: usize, _nkv: usize, _hd: usize, _ns: usize, _scale: f32) -> anyhow::Result<()> { anyhow::bail!("{}: attention over key lists not implemented", self.name()) }
     fn ink_route(&self, _logits: u64, _bias: u64, _ids: u64, _wts: u64, _gu_sc: u64, _dn_sc: u64, _gsc_out: u64, _n_expert: usize, _k: usize, _exp_scale: f32, _rows: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 router not implemented", self.name()) }
     /// Gyro files (`config::Hadamard`): each of `rows` rows of n floats at `x` (times silu(x) * u first when `u` is
     /// not 0) becomes H (s x) per `block` values, written to `out`, which may be `x`. `s`: the row's n signs as floats.
