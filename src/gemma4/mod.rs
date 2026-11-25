@@ -101,7 +101,7 @@ fn strip_thinking(text: &str) -> String {
 
 /// GPU on, the weights in 90% of the free VRAM (a fixed 11 GB overcommitted a 12 GB card that other programs
 /// use, and left a larger card half empty).
-fn gpu_defaults() {
+pub fn gpu_defaults() {
     if std::env::var_os("STRATA_G4_CPU").is_some() { return; }
     for (k, v) in [("STRATA_DS_GPU", "1"), ("STRATA_DS_GPU_FRACTION", "0.9"), ("STRATA_DS_NOEVICT", "1")] {
         if std::env::var_os(k).is_none() { unsafe { std::env::set_var(k, v) } }

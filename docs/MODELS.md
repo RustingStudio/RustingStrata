@@ -22,8 +22,9 @@ The engine picks the code path from `general.architecture` in the file.
 | [Kolibri 1.1](#kolibri-11-q4_k_m-434-gb) | `kolibri1` | own forward, matvecs, expert cache and attention on CUDA or Vulkan, greedy only |
 | [Inkling 2 Mini](#inkling-2-mini-iq4_nl-176-gb) | `inkling2_loop`, `inkling2` | own forward, matvecs and expert cache on CUDA or Vulkan |
 
-The models with their own forward open the GPU by themselves (no `--gpu` flag), have nothing to calibrate and load
-from the chat page of one server like the others. Image input is in [VISION.md](VISION.md).
+The models with their own forward open the GPU by themselves (no `--gpu` flag) and load from the chat page of one
+server like the others. `rustingstrata calibrate` measures their prefill chunk too (DeepSeek has no chunk to tune);
+they read it from the same calibration file at load time. Image input is in [VISION.md](VISION.md).
 
 ## Qwen models
 
