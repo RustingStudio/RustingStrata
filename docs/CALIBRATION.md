@@ -75,8 +75,9 @@ rustingstrata calibrate --model $M --task prose --task user:prompts.txt --pp 256
 The search is deterministic for a given `--seed` and bounded by `--samples`:
 
 1. **Baseline** — current defaults, measured on the full workload matrix (not counted in the budget). It is also a
-   trial in the search, so a candidate that scores below it cannot win. If no candidate beats it, the file is written
-   with the baseline's own settings (score 1.0). A failed baseline warns and scores against a neutral `1x` reference; such a
+   trial in the search, entered at score 1.02: a candidate must be more than 2% better than today's defaults to win,
+   so run-to-run noise does not pick the winner. If no candidate beats it, the file is written with the baseline's own
+   settings (score 1.02). A failed baseline warns and scores against a neutral `1x` reference; such a
    run writes a file only when a point beats that reference.
 2. **Coarse sweep** — up to `min(samples/3, 8)` points from a low-discrepancy (radical-inverse) sequence over the
    joint knob space. Their scores only pick starting points; they are never compared with full-matrix scores and

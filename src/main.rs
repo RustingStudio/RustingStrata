@@ -2797,7 +2797,7 @@ fn calibrate_v2(s: &CalibSettings) -> anyhow::Result<()> {
     let cfg = SearchConfig { samples: s.samples, coarse: (s.samples / 3).min(8), starts: 3, patience: 2, seed: s.seed };
     let result = calibrate::search(&space, &workloads, &cfg, &Objective::balanced(), &base_knobs, baseline, &mut measure)?;
     anyhow::ensure!(result.best.error.is_none(), "no successful measurement; calibration not written");
-    // The baseline competes at score 1.0, so this only happens when the baseline measurement itself failed. Never
+    // The baseline competes at score calibrate::MIN_GAIN, so this only happens when the baseline measurement itself failed. Never
     // write a setting that cannot be shown to beat the defaults.
     if result.best.score < 1.0 {
         say!("best score {:.3} is below today's defaults; keeping the defaults and not writing a calibration", result.best.score);

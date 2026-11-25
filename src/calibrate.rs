@@ -201,6 +201,9 @@ fn default_knobs(space: &[KnobSpec]) -> Knobs {
     k
 }
 
+/// The gain over the baseline a candidate needs to be written (2%, about the spread of one bench run).
+pub const MIN_GAIN: f64 = 1.02;
+
 /// Run the search. `measure` is called once per sample with the workload matrix; it should apply the knobs, take its
 /// own repetitions and return one measurement per workload. `baseline` has one measurement per workload, taken with
 /// `baseline_knobs` (the settings a user gets without a calibration file). The baseline competes in the search: a
@@ -216,11 +219,12 @@ where F: FnMut(&Knobs, &[Workload]) -> Result<Vec<Measurement>>
     let start = Instant::now();
     let mut trials: Vec<Trial> = Vec::new();
     // The baseline is a real trial, measured outside the sample budget. Its ratios against itself are 1.0, so the
-    // search can never pick a slower point unless the baseline measurement itself failed.
+    // search can never pick a slower point unless the baseline measurement itself failed. It enters at MIN_GAIN: a
+    // candidate must beat today's defaults by more than run-to-run noise, or noise picks the winner.
     trials.push(Trial {
         knobs: baseline_knobs.clone(),
         measurements: baseline.clone(),
-        score: aggregate_score(&baseline, &baselines, obj),
+        score: aggregate_score(&baseline, &baselines, obj) * MIN_GAIN,
         error: if baseline.iter().any(|m| m.valid()) { None } else { Some("baseline measurement failed".to_string()) },
         elapsed_ms: 0,
         workloads: workloads.len(),
@@ -476,8 +480,8 @@ mod tests {
             Ok(vec![Measurement { prefill_tok_s: 50.0, decode_tok_s: 10.0, ..Default::default() }])
         }).unwrap();
         assert_eq!(r.best.knobs, base_knobs, "a slower point must not be written");
-        assert!((r.best.score - 1.0).abs() < 1e-9, "the baseline wins at score 1.0");
-        assert!(r.trials.iter().any(|t| t.knobs == base_knobs && t.score == 1.0));
+        assert!((r.best.score - MIN_GAIN).abs() < 1e-9, "the baseline wins at score MIN_GAIN");
+        assert!(r.trials.iter().any(|t| t.knobs == base_knobs && t.score == MIN_GAIN));
     }
 
     #[test]
