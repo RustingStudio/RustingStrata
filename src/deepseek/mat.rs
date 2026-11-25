@@ -682,12 +682,11 @@ pub fn matvec_many_cpu_shared<'a>(ms: &[Mat<'a>], x: &[f32]) -> Option<Vec<f32>>
 /// order. Supports mixed `GgmlType`s. None when a matrix is on the GPU or `Mat::matvec` would not take the integer dot.
 pub fn matvec_many_cpu<'a>(ms: &[Mat<'a>], xs: &[&[f32]]) -> Option<Vec<f32>> {
     if ms.is_empty() || ms.len() != xs.len() || std::env::var_os("STRATA_CPU_REF").is_some() { return None; }
-    let total_rows: usize = ms.iter().map(|m| m.rows).sum();
     let mut dots = Vec::with_capacity(ms.len());
     let mut starts = Vec::with_capacity(ms.len());
     let mut off = 0;
     for (m, x) in ms.iter().zip(xs) {
-        if m.gpu.is_some() || m.cols != x.len() || (!m.cpu && total_rows < 512) || m.cols % m.ty.block_elems() != 0 {
+        if m.gpu.is_some() || m.cols != x.len() || (!m.cpu && m.rows < 512) || m.cols % m.ty.block_elems() != 0 {
             return None;
         }
         let dot = crate::cpu_moe::int_dot(m.ty)?;
@@ -985,37 +984,6 @@ impl<'a> Mat<'a> {
                 let mut s = 0.0f32;
                 for (chunk, &xv) in bytes.chunks_exact(4).zip(x) {
                     s += f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) * xv;
-                }
-                *o = s * sc;
-            };
-            if self.rows <= 64 {
-                y.iter_mut().enumerate().for_each(calc);
-            } else {
-                y.par_iter_mut().enumerate().for_each(calc);
-            }
-            return;
-        }
-        if self.ty == GgmlType::BF16 {
-            let calc = |(r, o): (usize, &mut f32)| {
-                let bytes = &self.data[r * rb..(r + 1) * rb];
-                let mut s0 = 0.0f32;
-                let mut s1 = 0.0f32;
-                let mut s2 = 0.0f32;
-                let mut s3 = 0.0f32;
-                let mut i = 0;
-                while i + 4 <= self.cols {
-                    let b = &bytes[i * 2..i * 2 + 8];
-                    s0 += f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16) * x[i];
-                    s1 += f32::from_bits((u16::from_le_bytes([b[2], b[3]]) as u32) << 16) * x[i + 1];
-                    s2 += f32::from_bits((u16::from_le_bytes([b[4], b[5]]) as u32) << 16) * x[i + 2];
-                    s3 += f32::from_bits((u16::from_le_bytes([b[6], b[7]]) as u32) << 16) * x[i + 3];
-                    i += 4;
-                }
-                let mut s = (s0 + s1) + (s2 + s3);
-                while i < self.cols {
-                    let b = &bytes[i * 2..i * 2 + 2];
-                    s += f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16) * x[i];
-                    i += 1;
                 }
                 *o = s * sc;
             };
