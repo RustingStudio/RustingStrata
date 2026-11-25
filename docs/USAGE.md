@@ -163,8 +163,8 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   (`serve --model <file>`, or from the chat page of a running server, in either direction), with these limits: one
   request at a time, greedy (Inkling 2 also samples: `temperature`, `top_k`, `top_p`, `seed`; a seed repeats its
   text only with `STRATA_FIXED_EXPERTS=1`, because the adaptive expert split moves the logits a little),
-  `/v1/chat/completions` only (no `/v1/messages`), and no calibration (`calibrate` does
-  not cover them). The context limit is `--ctx` (or the page's context setting) when given, else the trained context.
+  `/v1/chat/completions` only (no `/v1/messages`). `calibrate` measures their prefill chunk only
+  ([CALIBRATION.md](CALIBRATION.md)). The context limit is `--ctx` (or the page's context setting) when given, else the trained context.
 - `--lora PATH:SCALE` applies a LoRA adapter at runtime, see [LORA.md](LORA.md).
 - `--mcp FILE` (`serve` only, or `STRATA_MCP`) lists the MCP servers whose tools the chat page may call, see
   [Tools (MCP)](#tools-mcp).

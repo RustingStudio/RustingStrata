@@ -885,7 +885,6 @@ fn bench_record(meta: &BenchMeta, results: &[BenchResult], expert: Option<&Exper
             "pp": r.pp,
             "prefill_tok_s": {"mean": r.prefill.mean, "min": r.prefill.min, "max": r.prefill.max},
             "decode_tok_s": {"mean": r.decode.mean, "min": r.decode.min, "max": r.decode.max},
-
         });
         if r.bytes_per_token > 0 {
             o["expert"] = json!({
@@ -2153,8 +2152,7 @@ fn $name(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out:
 bench_tokenwise!(bench_hy4, rusting_strata::hy4::forward::Hy4Model);
 bench_tokenwise!(bench_kolibri, rusting_strata::kolibri::forward::KolibriModel);
 
-/// `strata bench` for Gemma 4. Its `gpu_defaults` is private to the module, so mirror the three variables its
-/// generate/chat paths set; the timing loop is otherwise the shared token-by-token one.
+/// `strata bench` for Gemma 4, with the `gpu_defaults` of its generate and chat paths.
 fn bench_gemma4(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {
     // Use the engine's own defaults so the bench measures the same configuration as chat and generate.
     rusting_strata::gemma4::gpu_defaults();

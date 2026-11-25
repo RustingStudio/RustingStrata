@@ -5,7 +5,7 @@
 value. One calibration per model, backend and device combination is enough; re-run after changing GPU, driver, quant,
 KV format or a draft file.
 
-Every architecture the binary supports is measured, including Inkling 2, Hy4, GLM, DeepSeek and Gemma 4, which the
+Every architecture the binary supports is measured, including Inkling 2, Hy4, Kolibri, GLM, DeepSeek and Gemma 4, which the
 old command skipped because they run on their own code path. Measurement is delegated to the existing `bench`
 command (as a child process, reading its `strata.bench.v1` JSON), so there is a single timing implementation to trust.
 
@@ -47,7 +47,7 @@ so every prompt depth counts equally. Time to first token is *not* a separate si
 token's logits come out of the prefill, so TTFT would just reweight prefill.
 
 The baseline is what a user gets today **without** a calibration file: the engine's own chunk — 4096 for the main
-engine, 256 (Gemma 4), 512 (GLM), 1024 (Hy4) and 256 (Inkling 2, which clamps its GPU prefill to that size) for the
+engine, 256 (Gemma 4), 512 (GLM), 1024 (Hy4 and Kolibri) and 256 (Inkling 2, which clamps its GPU prefill to that size) for the
 architectures with their own forward, and no chunk at all for DeepSeek, which prefills one token at a time. Where the
 knobs apply, the baseline also uses short-prompt threshold 32, the physical core count and no drafts. The reported
 score is relative to that, not to the first point of the search space.
@@ -75,8 +75,8 @@ rustingstrata calibrate --model $M --task prose --task user:prompts.txt --pp 256
 The search is deterministic for a given `--seed` and bounded by `--samples`:
 
 1. **Baseline** — current defaults, measured on the full workload matrix (not counted in the budget). It is also a
-   trial in the search, so a candidate that scores below it cannot win. If no candidate beats it, no calibration is
-   written and the defaults stay in force. A failed baseline warns and scores against a neutral `1x` reference; such a
+   trial in the search, so a candidate that scores below it cannot win. If no candidate beats it, the file is written
+   with the baseline's own settings (score 1.0). A failed baseline warns and scores against a neutral `1x` reference; such a
    run writes a file only when a point beats that reference.
 2. **Coarse sweep** — up to `min(samples/3, 8)` points from a low-discrepancy (radical-inverse) sequence over the
    joint knob space. Their scores only pick starting points; they are never compared with full-matrix scores and
@@ -96,7 +96,7 @@ time.
 
 | knob | values | applies to |
 | --- | --- | --- |
-| `chunk` | `--chunk-values`, default `256,512,1024,2048,4096` | main engine and Gemma 4, GLM, Hy4, Inkling 2 (capped at 256); DeepSeek has no chunk knob |
+| `chunk` | `--chunk-values`, default `256,512,1024,2048,4096` | main engine and Gemma 4, GLM, Hy4, Kolibri, Inkling 2 (capped at 256); DeepSeek has no chunk knob |
 | `mtp` | `0,1,2,4` | main-engine models with a draft head, otherwise `0` only |
 | `short` | 32 plus one threshold just above each `--pp` depth (default `32,129,513,2049`) | main engine only |
 
@@ -104,7 +104,7 @@ Each `short` threshold flips exactly one prompt depth into the short-prompt path
 prefill when it is shorter than the threshold. The old fixed `16/32/64/128` list was below every default workload
 depth, so no candidate changed anything and the value written was noise.
 
-Inkling 2, Hy4, GLM and Gemma 4 read their chunk from the environment at prefill time, so `bench_sample` sets
+Inkling 2, Hy4, Kolibri, GLM and Gemma 4 read their chunk from the environment at prefill time, so `bench_sample` sets
 `STRATA_DS_CHUNK`, `STRATA_GLM_CHUNK` and `STRATA_G4_CHUNK` to the candidate value. Their engines apply a calibrated
 chunk the same way at load time. In `serve`, those variables are restored before a different model is loaded, so a
 model without a calibration never inherits the previous model's chunk. DeepSeek prefills one token at a time and
