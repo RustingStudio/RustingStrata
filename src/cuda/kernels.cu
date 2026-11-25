@@ -1715,10 +1715,23 @@ __device__ __forceinline__ void gemmd_q(const u8* w, const u8* __restrict__ x, i
             oda = __shfl_xor_sync(0xffffffffu, wda, 2); odb = __shfl_xor_sync(0xffffffffu, wdb, 2);
             if (QI<T>::MIN) { oma = __shfl_xor_sync(0xffffffffu, wma, 2); omb = __shfl_xor_sync(0xffffffffu, wmb, 2); }
         }
+        // Scale per 16: a 16-deep mma per half h, its A fragment in the mma's own order (lane t: columns 16 h + 4 t ..,
+        // which lane 2 h + t / 2 holds), so no lane is zero. The integer sums are the same as with 32-deep mmas.
+        u32 n0[2] = {0, 0}, n1[2] = {0, 0};
+        if (KS == 16) {
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int src = (lane & ~3) | (2 * h + (t >> 1));
+                const u32 l0 = __shfl_sync(0xffffffffu, a0, src), h0 = __shfl_sync(0xffffffffu, a2, src);
+                const u32 l1 = __shfl_sync(0xffffffffu, a1, src), h1 = __shfl_sync(0xffffffffu, a3, src);
+                n0[h] = t & 1 ? h0 : l0; n1[h] = t & 1 ? h1 : l1;
+            }
+        }
         #pragma unroll
         for (int pt = 0; pt < 8; pt++) {  // 8 positions an mma
             if (pt >= npt) break;
-            const uint2 bx = *(const uint2*)(xb + (pt * 8 + g) * pitch + kw * 32 + 8 * t);
+            const signed char* xp = xb + (pt * 8 + g) * pitch + kw * 32;
+            const uint2 bx = KS == 32 ? *(const uint2*)(xp + 8 * t) : make_uint2(*(const u32*)(xp + 4 * t), *(const u32*)(xp + 16 + 4 * t));
             const float* o = pk + (kw * (pb >> 1) + pt * 4 + t) * 8;
             float dx[2], s32[2] = {0.f, 0.f};
             float2 sx[2] = {make_float2(0.f, 0.f), make_float2(0.f, 0.f)};
@@ -1731,7 +1744,8 @@ __device__ __forceinline__ void gemmd_q(const u8* w, const u8* __restrict__ x, i
             for (int h = 0; h < 32 / KS; h++) {
                 const bool mine = KS == 32 || (t >> 1) == h;
                 int c[4];
-                mma_s8_16832_b(c, mine ? a0 : 0, mine ? a1 : 0, mine ? a2 : 0, mine ? a3 : 0, bx.x, bx.y);
+                if (KS == 32) mma_s8_16832_b(c, a0, a1, a2, a3, bx.x, bx.y);
+                else mma_s8_16816_b(c, n0[h], n1[h], h ? bx.y : bx.x);
                 const float dw[2] = {mine ? wda : oda, mine ? wdb : odb}, mw[2] = {mine ? wma : oma, mine ? wmb : omb};
                 #pragma unroll
                 for (int i = 0; i < 4; i++) {
