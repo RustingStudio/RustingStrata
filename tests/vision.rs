@@ -439,3 +439,25 @@ fn inkling2v_red_image_predicts_red() {
     eprintln!("inkling2v generated = {text:?}");
     assert!(text.to_ascii_lowercase().contains("red"), "generated {text:?}");
 }
+
+/// A projector next to the model that this build cannot load (another model's, here `pixtral`) is skipped,
+/// so a text-only run does not fail on it.
+#[test]
+fn find_sibling_skips_unknown_projector() {
+    fn s(b: &mut Vec<u8>, x: &str) { b.extend((x.len() as u64).to_le_bytes()); b.extend(x.as_bytes()); }
+    let dir = std::env::temp_dir().join(format!("strata-sibling-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut b = b"GGUF".to_vec();
+    b.extend(3u32.to_le_bytes());
+    b.extend(0u64.to_le_bytes());
+    b.extend(3u64.to_le_bytes());
+    for (k, v) in [("general.architecture", "clip"), ("general.type", "mmproj"), ("clip.projector_type", "pixtral")] {
+        s(&mut b, k);
+        b.extend(8u32.to_le_bytes());
+        s(&mut b, v);
+    }
+    std::fs::write(dir.join("mmproj-F16.gguf"), &b).unwrap();
+    let found = rusting_strata::vision::find_sibling(&dir.join("model.gguf"));
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(found, None);
+}

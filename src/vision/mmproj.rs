@@ -217,18 +217,19 @@ pub fn is_mmproj(path: &Path) -> bool {
     name.starts_with("mmproj") || name.contains("-mmproj") || name.contains("mmproj-")
 }
 
-/// Find `mmproj*.gguf` next to a text model.
+/// Find `mmproj*.gguf` next to a text model: the first one (by name) that opens as a projector this build
+/// knows. A file that does not (another model's projector, such as a `pixtral` one) is skipped with a
+/// warning, so a text-only run is not stopped by it; `--mmproj` still names a file explicitly.
 pub fn find_sibling(model: &Path) -> Option<std::path::PathBuf> {
     let dir = model.parent()?;
-    let mut found = None;
-    for e in std::fs::read_dir(dir).ok()? {
-        let p = e.ok()?.path();
-        if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("gguf")) && is_mmproj(&p) {
-            found = Some(p);
-            break;
-        }
-    }
-    found
+    let mut found: Vec<_> = std::fs::read_dir(dir).ok()?.filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("gguf")) && is_mmproj(p))
+        .collect();
+    found.sort();
+    found.into_iter().find(|p| match ClipModel::open(p) {
+        Ok(_) => true,
+        Err(e) => { eprintln!("note: skipping {}: {e:#}", p.display()); false }
+    })
 }
 
 /// Validate that the projector's output width matches the text model's embedding width.
