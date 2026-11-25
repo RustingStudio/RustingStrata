@@ -953,6 +953,13 @@ enum Cmd {
         #[command(flatten)]
         engine: Engine,
     },
+    /// Replace this binary with the newest GitHub release (Linux and Windows x86_64). The old one is kept as
+    /// `<name>.old`.
+    Update {
+        /// Only say whether a newer release is out.
+        #[arg(long)]
+        check: bool,
+    },
     /// OpenAI-compatible HTTP server: POST /v1/chat/completions (streaming or not), GET /v1/models.
     /// One request at a time; temperature, top_k, top_p and seed are honored, greedy when left out. A request that
     /// extends the previous one's messages prefills only the new part (usage.prompt_tokens_details.cached_tokens);
@@ -1230,6 +1237,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                    RUSTFLAGS=\"-C target-cpu=native\" (or x86-64-v3), or use a release binary.");
     }
     match cmd {
+        Cmd::Update { check } => rusting_strata::update::run(check)?,
         Cmd::Info { model } => {
             let g = Gguf::open(&model)?;
             println!("{:#?}", ModelConfig::from_gguf(&g)?);
@@ -1738,6 +1746,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             r.finish()?;
         }
         Cmd::Serve { model, models_dir, addr, api_key, mcp, open, host, mut engine } => {
+            rusting_strata::update::notice();
             engine.ds_env();
             anyhow::ensure!(host.auto_unload != Some(0), "--auto-unload must be at least 1 second");
             engine.parallel = host.parallel;

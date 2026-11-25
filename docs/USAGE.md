@@ -16,6 +16,12 @@ On a terminal the engine's notes on stderr are dim, `warning` and `error` are co
 the prompt in colour and the reasoning dim. Output that goes to a pipe or a file has no escape codes; `NO_COLOR=1`
 turns them off on a terminal too. A failed command prints one `error: ...` line and exits with status 1.
 
+`rustingstrata update` downloads the newest release from GitHub for Linux or Windows x86_64 and puts it in place of
+the running binary; the old binary stays next to it as `rustingstrata.old` until the next update. `update --check`
+only says whether a newer release is out. At start `serve` (and a double-clicked binary) asks GitHub once, with a
+5 s limit, and prints one line if a newer release is out; `STRATA_NO_UPDATE_CHECK=1` turns that off. A binary built
+from source is replaced by the release build too.
+
 ## Chat page
 
 `rustingstrata` with no arguments starts the server on http://127.0.0.1:8080 and opens a chat page. The page keeps chats in

@@ -29,6 +29,7 @@ pub mod serve;
 pub mod chat;
 pub mod vision;
 pub mod hf;
+pub mod update;
 pub mod mcp;
 pub mod deepseek;
 pub mod gemma4;

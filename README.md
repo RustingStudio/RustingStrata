@@ -53,6 +53,9 @@ or build it (Rust 2024 edition; on Windows install the Visual Studio C++ Build T
 cargo build --release    # the binary is target/release/rustingstrata
 ```
 
+`rustingstrata update` replaces a downloaded binary with the newest release (`--check` only says whether one is
+out); `serve` prints a line at start when a newer release is out.
+
 A GPU run needs one of:
 
 - an NVIDIA driver with the CUDA NVRTC library (loaded at run time). Volta (sm_70), Turing (sm_75) and Ampere or newer
