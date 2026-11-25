@@ -46,15 +46,31 @@ The method, the ranges, Vulkan, the other models and the quality checks are in
 
 ## Install
 
-Download a binary for Linux or Windows from the [releases page](https://github.com/RustingStudio/RustingStrata/releases),
-or build it (Rust 2024 edition; on Windows install the Visual Studio C++ Build Tools first):
+Windows (PowerShell; installs to `%LOCALAPPDATA%\Programs\RustingStrata`, adds it to PATH and makes a Start menu
+entry that opens the chat page):
+
+```powershell
+irm https://raw.githubusercontent.com/RustingStudio/RustingStrata/main/install.ps1 | iex
+```
+
+Linux x86_64 (installs to `~/.local/bin`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/RustingStudio/RustingStrata/main/install.sh | sh
+```
+
+Arch Linux: `yay -S rustingstrata-bin` (AUR). Or download a binary from the
+[releases page](https://github.com/RustingStudio/RustingStrata/releases), or build it (Rust 2024 edition; on Windows
+install the Visual Studio C++ Build Tools first):
 
 ```sh
 cargo build --release    # the binary is target/release/rustingstrata
 ```
 
-`rustingstrata update` replaces a downloaded binary with the newest release (`--check` only says whether one is
-out); `serve` prints a line at start when a newer release is out.
+Then `rustingstrata serve --gpu --open` opens the chat page, which downloads models, and `rustingstrata interface`
+asks a few questions in the terminal. `rustingstrata update` replaces the binary with the newest release (`--check`
+only says whether one is out); `serve` prints a line at start when a newer release is out. A binary installed by a
+package manager (the AUR package) is updated with that package manager.
 
 A GPU run needs one of:
 

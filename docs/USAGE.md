@@ -20,7 +20,8 @@ turns them off on a terminal too. A failed command prints one `error: ...` line 
 the running binary; the old binary stays next to it as `rustingstrata.old` until the next update. `update --check`
 only says whether a newer release is out. At start `serve` (and a double-clicked binary) asks GitHub once, with a
 5 s limit, and prints one line if a newer release is out; `STRATA_NO_UPDATE_CHECK=1` turns that off. A binary built
-from source is replaced by the release build too.
+from source is replaced by the release build too. A binary under `/usr/` or `/opt/` (the AUR package
+`rustingstrata-bin`) or in winget's or Scoop's folders is left alone: `update` says to use the package manager.
 
 ## Chat page
 

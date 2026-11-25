@@ -38,13 +38,31 @@ fn latest(whole: Duration) -> anyhow::Result<(String, Option<(String, u64)>)> {
     Ok((tag, asset))
 }
 
+/// A binary a package manager put in place (the AUR's rustingstrata-bin in /usr/bin, winget's portable folder) is
+/// updated by that package manager, so `update` leaves it alone.
+fn managed(exe: &std::path::Path) -> bool {
+    let p = exe.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    p.starts_with("/usr/") || p.starts_with("/opt/") || p.contains("/winget/packages/") || p.contains("/scoop/apps/")
+}
+
+fn exe() -> anyhow::Result<std::path::PathBuf> {
+    let e = std::env::current_exe().context("find the running binary")?;
+    Ok(e.canonicalize().unwrap_or(e))
+}
+
+/// The line that says a newer release is out, and how to get it.
+fn out_line(tag: &str) -> String {
+    let how = if exe().is_ok_and(|e| managed(&e)) { "update it with your package manager" } else { "run `rustingstrata update` to install it" };
+    format!("RustingStrata {tag} is out (this is {}): {how}", env!("CARGO_PKG_VERSION"))
+}
+
 /// Prints one line if a newer release is out. It runs on its own thread and gives up after 5 s, so a machine
 /// without internet starts as before.
 pub fn notice() {
     if std::env::var("STRATA_NO_UPDATE_CHECK").is_ok_and(|v| v == "1") || ASSET.is_none() { return; }
     std::thread::spawn(|| {
         if let Ok((tag, Some(_))) = latest(Duration::from_secs(5)) && newer(&tag, env!("CARGO_PKG_VERSION")) {
-            crate::say!("RustingStrata {tag} is out (this is {}): run `rustingstrata update` to install it", env!("CARGO_PKG_VERSION"));
+            crate::say!("{}", out_line(&tag));
         }
     });
 }
@@ -59,15 +77,18 @@ pub fn run(check: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     if check {
-        crate::say!("RustingStrata {tag} is out (this is {have}): run `rustingstrata update` to install it");
+        crate::say!("{}", out_line(&tag));
         return Ok(());
+    }
+    let exe = exe()?;
+    if managed(&exe) {
+        bail!("{} was installed by a package manager (on Arch: the AUR package rustingstrata-bin); update it with that, \
+               so the package manager knows the new version", exe.display());
     }
     let Some((url, size)) = asset else {
         bail!("release {tag} has no binary for this platform; build it from source or see \
                https://github.com/RustingStudio/RustingStrata/releases");
     };
-    let exe = std::env::current_exe().context("find the running binary")?;
-    let exe = exe.canonicalize().unwrap_or(exe);
     let (new, old) = (exe.with_extension("new"), exe.with_extension("old"));
     let _ = std::fs::remove_file(&old);
     crate::say!("downloading RustingStrata {tag} ({:.1} MB)", size as f64 / 1e6);
@@ -111,5 +132,14 @@ mod tests {
         assert!(!newer("v1.3.4", "1.3.4"));
         assert!(!newer("v1.3.3", "1.3.4"));
         assert!(!newer("nightly", "1.3.4"));
+    }
+
+    #[test]
+    fn package_manager_installs_are_left_alone() {
+        use std::path::Path;
+        assert!(managed(Path::new("/usr/bin/rustingstrata")));
+        assert!(managed(Path::new(r"C:\Users\a\AppData\Local\Microsoft\WinGet\Packages\x\rustingstrata.exe")));
+        assert!(!managed(Path::new("/home/a/.local/bin/rustingstrata")));
+        assert!(!managed(Path::new(r"C:\Users\a\AppData\Local\Programs\RustingStrata\rustingstrata.exe")));
     }
 }
