@@ -442,6 +442,8 @@ pub const SNAP_STRIDE: usize = 4;
 
 pub struct GpuModel<'a> {
     m: &'a Model<'a>,
+    /// `STRATA_KV_HOST` prefill: VRAM copies of one host layer's K and V cache (see `load_part`).
+    kv_stage: Option<(Buf, Buf)>,
     pub gpu: Box<dyn Backend>,
     layers: Vec<Layer>,
     output_norm: Option<GpuTensor>,
@@ -1074,6 +1076,16 @@ impl<'a> GpuModel<'a> {
         } else {
             None
         };
+        // STRATA_KV_HOST: one layer's cache-sized VRAM buffer pair. Prefill copies a host layer's cache prefix into it
+        // (a DMA copy, ~10x what the attention kernel reads from mapped memory) and runs the usual kernel on it.
+        let kv_stage = match layers.iter().enumerate().filter(|(il, _)| crate::host_attn::on_host(*il))
+            .filter_map(|(_, l)| match &l.mixer { Mixer::Attn { kc, .. } => kc.first().map(|b| b.len()), _ => None }).max() {
+            Some(b) if std::env::var_os("STRATA_HA_NO_STAGE").is_none() => match (gpu.alloc(b), gpu.alloc(b)) {
+                (Ok(k), Ok(v)) => Some((k, v)),
+                _ => { crate::say!("host KV: no VRAM for the {} MB prefill staging, prefill reads the cache over PCIe", 2 * b >> 20); None }
+            },
+            _ => None,
+        };
         let (free1, _) = gpu.mem_info()?;
         // Past the budget the driver spills buffers to system memory: RADV then runs a long prefill slowly enough to
         // hit amdgpu's job timeout and lose the device. A margin above 512 MB only leaves fewer expert slots.
@@ -1130,7 +1142,7 @@ impl<'a> GpuModel<'a> {
         let _ = &mut ext_draft;
         crate::weights::trim_working_set();
         Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], ple_undo: ([-1, -1], vec![]), bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, hada, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, nsnap, short: 32, pf, prompt_cache_path: None, bt, mtp, dflash, ext_draft, ext_draft_pend: Vec::new(), mhc_ones, graph_tag: 0, ngram: None, first: range.start, next: None,
-                      cur: 0, seqs, rows: vec![], row_tokens: 0 })
+                      cur: 0, seqs, rows: vec![], row_tokens: 0, kv_stage })
     }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).

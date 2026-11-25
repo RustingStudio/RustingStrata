@@ -482,7 +482,16 @@ impl GpuModel<'_> {
                     };
                     let sink_addr = sink.as_ref().map_or(0, |s| s.ptr);
                     let win = c.swa.get(il).copied().unwrap_or(false).then_some(c.n_swa).unwrap_or(0);
-                    g.attn_prefill_m(at(l.b), kc[self.cur].addr(), vc[self.cur].addr(), if c.q_gate { at(l.a) } else { 0 }, at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), qm, mw, sink_addr, win)?;
+                    let (kca, vca) = match &self.kv_stage {
+                        Some((sk, sv)) if crate::host_attn::on_host(il) => {
+                            let bytes = (g.kv_words((self.pos + t) * kv) * 2).min(sk.len());
+                            g.dtod(&kc[self.cur], 0, sk, 0, bytes)?;
+                            g.dtod(&vc[self.cur], 0, sv, 0, bytes)?;
+                            (sk.addr(), sv.addr())
+                        }
+                        _ => (kc[self.cur].addr(), vc[self.cur].addr()),
+                    };
+                    g.attn_prefill_m(at(l.b), kca, vca, if c.q_gate { at(l.a) } else { 0 }, at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), qm, mw, sink_addr, win)?;
                     probe(&mut tr, "q", &pf.slab, at(l.a), nh * qs, t)?;
                     probe(&mut tr, "k", &pf.slab, kk, kv, t)?;
                     probe(&mut tr, "v", &pf.slab, vv, kv, t)?;
