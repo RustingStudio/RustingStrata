@@ -1652,15 +1652,16 @@ ITYPES(DEF_GEMMI)
 // the count of blocks done for these rows, over all launches) adds the other's and writes y. a + b is b + a, so the
 // result does not depend on which block that is.
 #define GEMMD_XW(pb) ((pb) >= 32 ? 128 : 4096 / (pb))
-template <int T, int SBB>
-__device__ __forceinline__ void gemmd_q(const u8* w, const u8* __restrict__ x, int nd, int pb, int ks, float* scr, int* flag,
-                                        float* y, int y_stride, int rows, int cols, int act, float sc) {
+// XW: the window width when it is known at compile time (its pitch then makes the x loads' offsets immediates), else 0.
+template <int T, int SBB, int XW>
+__device__ __forceinline__ void gemmd_qx(const u8* w, const u8* __restrict__ x, int nd, int pb, int ks, float* scr, int* flag,
+                                         float* y, int y_stride, int rows, int cols, int act, float sc) {
     // One window: pb rows of xw + 32 int8 (the pitch puts two lanes on a bank, the least an 8-byte load allows),
     // then xw / 32 scales and xw / 16 sums per row. Two windows, then pk.
     extern __shared__ __align__(16) signed char gemmd_s[];
     int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     int seg = blockIdx.x % ks, rb = blockIdx.x / ks, bs = blockDim.x, ts = tid;
-    int xw = GEMMD_XW(pb), lx = 31 - __clz(xw), pitch = xw + 32, od = pb * pitch, os = od + pb * (xw >> 3), xb_ = os + pb * (xw >> 2);
+    int xw = XW ? XW : GEMMD_XW(pb), lx = 31 - __clz(xw), pitch = xw + 32, od = pb * pitch, os = od + pb * (xw >> 3), xb_ = os + pb * (xw >> 2);
     int nq = cols / 32, qw = xw >> 5, nwin = (cols + xw - 1) >> lx, nws = (nwin + ks - 1) / ks, w0 = seg * nws;
     signed char* gx = gemmd_s;
     float* pk = (float*)(gx + 2 * xb_);  // per (position pair, 32 columns): d0, d1, s0, s1, then the four half sums
@@ -1869,7 +1870,8 @@ __device__ __forceinline__ void gemmd_q(const u8* w, const u8* __restrict__ x, i
 #define DEF_GEMMD(T, NAME, SBB)                                                                                    \
     extern "C" __global__ void __launch_bounds__(256, 2) gemmd_##NAME(const u8* w, const u8* x, int nd, int pb,        \
             int ks, float* scr, int* flag, float* y, int y_stride, int rows, int cols, int act, float sc) {       \
-        gemmd_q<T, SBB>(w, x, nd, pb, ks, scr, flag, y, y_stride, rows, cols, act, sc);                           \
+        if (pb >= 32) gemmd_qx<T, SBB, GEMMD_XW(32)>(w, x, nd, pb, ks, scr, flag, y, y_stride, rows, cols, act, sc); \
+        else gemmd_qx<T, SBB, 0>(w, x, nd, pb, ks, scr, flag, y, y_stride, rows, cols, act, sc);                   \
     }
 ITYPES(DEF_GEMMD)
 #endif
