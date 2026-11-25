@@ -455,6 +455,10 @@ macro_rules! launch {
     }};
 }
 
+/// rms_norm_rope's block: 128 threads for a head of 128 or less (the threads past n held 0 for block_sum, so the bits
+/// are the same), else 256.
+fn nr_block(n: usize) -> u32 { if n <= 128 { 128 } else { 256 } }
+
 pub(crate) fn kname(prefix: &str, ty: GgmlType) -> String { format!("{prefix}_{}", ty.name().to_lowercase()) }
 
 /// The UUID of every CUDA device in CUDA's order, the order `Gpu::new` counts in: `None` for a device the driver
@@ -1066,7 +1070,7 @@ impl Backend for Gpu {
         anyhow::ensure!(n_rot <= n.min(512) && n % 32 == 0, "rms_norm_rope: head of {n}, n_rot {n_rot}");
         let fr = self.rope_fr(base, n_rot)?;
         let cs = self.rope_cs(step, 0, rows / per, n_rot, fr)?;
-        launch!(self, "rms_norm_rope", cfg((rows as u32, 1), 256, 0), x, x_stride as i32, w, out, n as i32, eps, per as i32, n_rot as i32, step, base, v, kc, vc,
+        launch!(self, "rms_norm_rope", cfg((rows as u32, 1), nr_block(n), 0), x, x_stride as i32, w, out, n as i32, eps, per as i32, n_rot as i32, step, base, v, kc, vc,
                 0i32, 0u64, 0i32, 0u64, 0u64, 0i32, fr, 0u64, cs);
         Ok(())
     }
@@ -1077,7 +1081,7 @@ impl Backend for Gpu {
         anyhow::ensure!(n_rot <= n.min(512) && n % 32 == 0, "rms_norm_rope: head of {n}, n_rot {n_rot}");
         let fr = self.rope_fr(base, n_rot)?;
         let cs = self.rope_cs(step, 0, krows / kper, n_rot, fr)?;
-        launch!(self, "rms_norm_rope", cfg(((qrows + krows) as u32, 1), 256, 0), k, n as i32, kw, ko, n as i32, eps, kper as i32, n_rot as i32, step, base, v, kc, vc,
+        launch!(self, "rms_norm_rope", cfg(((qrows + krows) as u32, 1), nr_block(n), 0), k, n as i32, kw, ko, n as i32, eps, kper as i32, n_rot as i32, step, base, v, kc, vc,
                 qrows as i32, q, q_stride as i32, qw, qo, qper as i32, fr, 0u64, cs);
         Ok(())
     }
@@ -1089,7 +1093,7 @@ impl Backend for Gpu {
         anyhow::ensure!(n_rot <= hd.min(512) && hd % 32 == 0, "rms_norm_rope: head of {hd}, n_rot {n_rot}");
         let fr = self.rope_fr(base, n_rot)?;
         let cs = self.rope_cs(step, kvt, nt, n_rot, fr)?;
-        launch!(self, "rms_norm_rope", cfg(((nt * (nh + nkv)) as u32, 1), 256, 0), k, hd as i32, kw, ko, hd as i32, eps, nkv as i32, n_rot as i32, step, base, v, 0u64, 0u64,
+        launch!(self, "rms_norm_rope", cfg(((nt * (nh + nkv)) as u32, 1), nr_block(hd), 0), k, hd as i32, kw, ko, hd as i32, eps, nkv as i32, n_rot as i32, step, base, v, 0u64, 0u64,
                 (nt * nh) as i32, q, q_stride as i32, qw, qo, nh as i32, fr, kvt, cs);
         Ok(())
     }

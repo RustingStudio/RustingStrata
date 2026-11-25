@@ -2684,7 +2684,7 @@ extern "C" __global__ void kv_store(const float* k, const float* v, u16* kc, u16
     if (i < total) { kv_put(kc, (size_t)pos * n + i, hd, k[i]); kv_put(vc, (size_t)pos * n + i, hd, v[i]); }
 }
 
-// grid = rows (heads of n), block 256: rms_norm (out rows of n) then rope_neox of the head, in one launch with the same
+// grid = rows (heads of n), block 256 (or 128 when n <= 128): rms_norm (out rows of n) then rope_neox of the head, in one launch with the same
 // bits. Head r belongs to token r / per. With kc, then kv_store of the head and its v (v rows of n, like out).
 // Blocks below qrows do the q heads (from qx etc., no cache store); the rest do x etc.
 __device__ __forceinline__ double rope_f(float base, int i, int n_rot) { return pow((double)base, -2.0 * i / n_rot); }
