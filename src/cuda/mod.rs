@@ -17,9 +17,9 @@ pub(crate) const QTYPES: [GgmlType; 29] = {
     use GgmlType::*;
     [F32, BF16, F8E4M3, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_1, Q5_1, Q4_0, Q5_0, NVFP4]
 };
-pub(crate) const KERNELS: [&str; 58] = [
+pub(crate) const KERNELS: [&str; 60] = [
     "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "situ_q", "softcap", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
-    "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
+    "kv_store", "attn_merge", "ha_post", "ha_wait", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "dflash2_conv", "hadamard",
     "ink_mix", "ink_ctrl_gate", "ink_ctrl_out", "ink_conv", "ink_conv_batch", "ink_clip", "ink_attn", "ink_attn_merge",
@@ -439,6 +439,14 @@ pub fn cfg(grid: (u32, u32), block: u32, smem: u32) -> LaunchConfig {
 /// `STRATA_CUDA_SYNC`: wait for every kernel right after its launch, so a device error (reported at the next sync
 /// otherwise) names the kernel that raised it. Debugging only: no graphs, and every launch pays a stream sync.
 static SYNC_EACH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("STRATA_CUDA_SYNC").is_some());
+
+/// `attn_host`: tokens and floats a token (nh * (hd + 2)) its mapped staging holds; queries, partials and positions,
+/// shared by all layers (the stream runs them in turn), never freed since captured graphs keep their addresses.
+const HA_T: usize = 64;
+const HA_W: usize = 64 * 514;
+/// Queries, partials, positions, the mailbox (mapped) and the sequence counter (device).
+static HA_STAGE: std::sync::Mutex<Option<(Buf, Buf, Buf, Buf, Buf)>> = std::sync::Mutex::new(None);
+static CTX: std::sync::Mutex<Vec<(u64, u64, usize, usize)>> = std::sync::Mutex::new(Vec::new());
 
 macro_rules! launch {
     ($g:expr, $name:expr, $cfg:expr, $($a:expr),* $(,)?) => {{
@@ -926,6 +934,76 @@ impl Backend for Gpu {
     fn graph_drop(&self, key: u64) -> anyhow::Result<()> {
         self.graphs.lock().unwrap().remove(&key);
         Ok(())
+    }
+
+    fn alloc_host(&self, bytes: usize) -> anyhow::Result<Buf> {
+        // Anonymous memory on 2 MB huge pages (the CPU attention walks it all each token: 4 KB pages cost ~30% in
+        // TLB misses), then pinned and mapped into the device with cuMemHostRegister.
+        struct Reg(#[allow(dead_code)] memmap2::MmapMut, usize);
+        impl Drop for Reg { fn drop(&mut self) { unsafe { let _ = sys::cuMemHostUnregister(self.1 as *mut _); } } }
+        const HP: usize = 2 << 20;
+        let len = bytes.max(1).next_multiple_of(HP);
+        let mut m = memmap2::MmapMut::map_anon(len + HP)?;
+        #[cfg(target_os = "linux")]
+        let _ = m.advise(memmap2::Advice::HugePage);
+        let base = m.as_mut_ptr() as usize;
+        let h = base.next_multiple_of(HP);
+        unsafe { std::ptr::write_bytes(h as *mut u8, 0, len) };
+        self.ctx.bind_to_thread()?;
+        let r = unsafe { sys::cuMemHostRegister_v2(h as *mut _, len, sys::CU_MEMHOSTREGISTER_DEVICEMAP | sys::CU_MEMHOSTREGISTER_PORTABLE) };
+        anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "cuMemHostRegister: {r:?}");
+        let mut dev = 0;
+        let r = unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev, h as *mut _, 0) };
+        anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "cuMemHostGetDevicePointer: {r:?}");
+        anyhow::ensure!(dev == h as u64, "mapped host memory has a device address other than its host one (no UVA)");
+        let b = Buf::new(dev, bytes, Reg(m, h));
+        // The staging of `attn_host`, made here at load time: allocating inside a graph capture breaks it.
+        let mut st = HA_STAGE.lock().unwrap();
+        if st.is_none() {
+            let raw = |n: usize| -> anyhow::Result<Buf> { let (b, _) = self.host_mailbox(n.div_ceil(4))?; Ok(b) };
+            let (mb, host) = self.host_mailbox(64)?;
+            *st = Some((raw(4 * HA_T * HA_W)?, raw(4 * HA_T * HA_W)?, raw(8 * HA_T)?, mb, self.alloc(64)?));
+            if std::env::var_os("STRATA_HA_MAILBOX").is_some() { crate::host_attn::start_worker(host as usize); }
+        }
+        Ok(b)
+    }
+
+    fn attn_host(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize) -> anyhow::Result<bool> {
+        if self.kv_mode > 2 || nt > HA_T || hd % 32 != 0 || nh % nkv != 0 || nh * (hd + 2) > HA_W { return Ok(false); }
+        let st = HA_STAGE.lock().unwrap();
+        let Some((bq, bp, bs, mb, seq)) = st.as_ref() else { return Ok(false) };
+        let (bq, bp, bs, mb, seq) = (bq.addr(), bp.addr(), bs.addr(), mb.addr(), seq.addr());
+        drop(st);
+        let ctx = {
+            let mut c = CTX.lock().unwrap();
+            match c.iter().find(|e| e.0 == kc && e.1 == vc && e.2 == nt) {
+                Some(e) => e.3,
+                None => {
+                    let a = Box::leak(Box::new(crate::host_attn::HostAttn { q: bq as usize, step: bs as usize, part: bp as usize,
+                        kc: kc as usize, vc: vc as usize, nh, nkv, hd, nt, scale, mode: self.kv_mode as u32 })) as *mut _ as usize;
+                    c.push((kc, vc, nt, a));
+                    a
+                }
+            }
+        };
+        // A stream host function by default; `STRATA_HA_MAILBOX` spins on a mapped flag instead (measured the same,
+        // 14.6 vs 14.7 tok/s at 52K, and a dead worker would trap the GPU).
+        if std::env::var_os("STRATA_HA_MAILBOX").is_none() {
+            self.ctx.bind_to_thread()?;
+            let cs = self.st().cu_stream();
+            unsafe {
+                result::memcpy_dtod_async(bq, q, 4 * nt * nh * hd, cs)?;
+                result::memcpy_dtod_async(bs, step, 8 * nt, cs)?;
+                let r = sys::cuLaunchHostFunc(cs, Some(crate::host_attn::callback), ctx as *mut _);
+                anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "cuLaunchHostFunc: {r:?}");
+            }
+        } else {
+            launch!(self, "ha_post", cfg((1, 1), 256, 0), q, step, bq, bs, (nt * nh * hd) as i32, (2 * nt) as i32, mb, seq, ctx as u64);
+            launch!(self, "ha_wait", cfg((1, 1), 32, 0), mb, seq);
+        }
+        launch!(self, "attn_merge", LaunchConfig { grid_dim: (nh as u32, 1, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                bp, qg, out, hd as i32, 1i32, step, 1i32, 0i32, 0u64, 0u64);
+        Ok(true)
     }
 
     /// Pinned host memory mapped into the device address space.
@@ -1535,12 +1613,12 @@ mod tests {
     }
 
     /// M1-T5, CPU-only: the loaded name list drops `gemmi_*`/`gemmis_*` only on a device where kernels.cu compiles
-    /// them out. 397 names today (sm_80); 23 non-float types x 3 fewer names = 328 on sm_70.
+    /// them out. 399 names today (sm_80); 23 non-float types x 3 fewer names = 330 on sm_70.
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 397);
-        assert_eq!(sm70.len(), 328);
+        assert_eq!(sm80.len(), 399);
+        assert_eq!(sm70.len(), 330);
         assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmd")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());

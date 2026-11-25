@@ -742,8 +742,8 @@ impl<'a> GpuModel<'a> {
                     q: lt(il, "attn_q.weight")?, k: lt(il, "attn_k.weight")?, v: lt(il, "attn_v.weight")?,
                     qn: lt(il, "attn_q_norm.weight")?, kn: lt(il, "attn_k_norm.weight")?, o: lt(il, "attn_output.weight")?,
                     sink: if c.attn_sinks { Some(lt(il, "attn_sinks.weight")?) } else { None },
-                    kc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words(ctx * kv))).collect::<anyhow::Result<_>>()?,
-                    vc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words(ctx * kv))).collect::<anyhow::Result<_>>()?,
+                    kc: (0..ns).map(|_| kv_alloc(gpu.as_ref(), il, gpu.kv_words(ctx * kv) * 2)).collect::<anyhow::Result<_>>()?,
+                    vc: (0..ns).map(|_| kv_alloc(gpu.as_ref(), il, gpu.kv_words(ctx * kv) * 2)).collect::<anyhow::Result<_>>()?,
                     qsa: if qsa_on && il < c.n_layer && m.w.layer(il, "indexer.k_proj.weight").is_ok() {
                         Some(Qsa {
                             kp: lt(il, "indexer.k_proj.weight")?, qp: lt(il, "indexer.q_proj.weight")?,
@@ -904,8 +904,8 @@ impl<'a> GpuModel<'a> {
                         qn: lt(il, "nextn.enorm.weight")?,
                         kn: lt(il, "nextn.hnorm.weight")?,
                         o: lt(il, "attn_output.weight")?,
-                        kc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words(ctx * eg_kv))).collect::<anyhow::Result<_>>()?,
-                        vc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words(ctx * eg_kv))).collect::<anyhow::Result<_>>()?,
+                        kc: (0..ns).map(|_| kv_alloc(gpu.as_ref(), il, gpu.kv_words(ctx * eg_kv) * 2)).collect::<anyhow::Result<_>>()?,
+                        vc: (0..ns).map(|_| kv_alloc(gpu.as_ref(), il, gpu.kv_words(ctx * eg_kv) * 2)).collect::<anyhow::Result<_>>()?,
                         qsa: None,
                         sink: None,
                     },
@@ -3008,8 +3008,11 @@ impl<'a> GpuModel<'a> {
                 g.rope_neox(eg.k.addr(), hd, nt * nkv, nkv, ec.n_rot, h.step_buf.addr(), ec.rope_base)
             })?;
             g.kv_store(eg.k.addr(), eg.v.addr(), kc[self.cur].addr(), vc[self.cur].addr(), kv, nt, h.step_buf.addr(), hd)?;
-            g.attn_decode_q(eg.q.addr(), kc[self.cur].addr(), vc[self.cur].addr(), 0, eg.att.addr(),
-                eg.attp.addr(), h.step_buf.addr(), nh, nkv, hd, 1.0 / (hd as f32).sqrt(), gq, nt, 0, 0, 0, 0, 0)?;
+            if !(crate::host_attn::on_host(self.m.cfg.n_layer)
+                && g.attn_host(eg.q.addr(), kc[self.cur].addr(), vc[self.cur].addr(), 0, eg.att.addr(), h.step_buf.addr(), nh, nkv, hd, 1.0 / (hd as f32).sqrt(), nt)?) {
+                g.attn_decode_q(eg.q.addr(), kc[self.cur].addr(), vc[self.cur].addr(), 0, eg.att.addr(),
+                    eg.attp.addr(), h.step_buf.addr(), nh, nkv, hd, 1.0 / (hd as f32).sqrt(), gq, nt, 0, 0, 0, 0, 0)?;
+            }
             self.mv(o, eg.att.addr(), nh * hd, self.bufs["mix"].addr(), ne, nt)?;
             g.rms_norm_q(x, ne, h.layer.post_norm.as_ref().unwrap().ptr, hp, ne, ne, nt, eps, 0, self.bufs["mix"].addr())?;
             g.batch(&mut || {
@@ -3265,8 +3268,10 @@ impl<'a> GpuModel<'a> {
                         _ => (0, 0),
                     };
                     let out_gemm = vg && (nh * hd) % 64 == 0;
-                    let aq = g.attn_decode_q(p("q"), kc[self.cur].addr(), vc[self.cur].addr(), if c.q_gate { p("qg") } else { 0 }, p("att"), p("attp"), step, nh, nkv, hd,
-                                             1.0 / (hd as f32).sqrt(), gq, nt, if out_gemm { 0 } else { p("attq") }, sel, sst, sink_addr, win)?;
+                    let host = sel == 0 && sink_addr == 0 && win == 0 && crate::host_attn::on_host(il)
+                        && g.attn_host(p("q"), kc[self.cur].addr(), vc[self.cur].addr(), if c.q_gate { p("qg") } else { 0 }, p("att"), step, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), nt)?;
+                    let aq = if host { 0 } else { g.attn_decode_q(p("q"), kc[self.cur].addr(), vc[self.cur].addr(), if c.q_gate { p("qg") } else { 0 }, p("att"), p("attp"), step, nh, nkv, hd,
+                                             1.0 / (hd as f32).sqrt(), gq, nt, if out_gemm { 0 } else { p("attq") }, sel, sst, sink_addr, win)? };
                     if out_gemm {
                         g.gemm_dense(o, nt, p("att"), nh * hd, p("mix"), ne, 0)?;
                     } else if aq != 0 {
@@ -3640,4 +3645,10 @@ mod tests {
     fn no_cache_has_no_fast_path_bytes() {
         fn _uses(g: &GpuModel) -> (bool, usize) { (g.expert_fast_path(), g.expert_bytes_per_token()) }
     }
+}
+
+/// `STRATA_KV_HOST=N`: the KV cache of the attention layers from block N on lives in host RAM (mapped pinned
+/// memory the GPU reads over PCIe), freeing VRAM for a longer context. `all` = every layer.
+fn kv_alloc(gpu: &dyn Backend, il: usize, bytes: usize) -> anyhow::Result<Buf> {
+    if crate::host_attn::on_host(il) { gpu.alloc_host(bytes) } else { gpu.alloc(bytes) }
 }

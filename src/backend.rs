@@ -127,6 +127,12 @@ pub trait Backend: Send {
     }
     /// Zeroed buffer of `bytes` (at least 1).
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf>;
+    /// Zeroed buffer of `bytes` in host RAM the device reads over PCIe (CUDA: mapped pinned memory). Backends
+    /// without it fall back to device memory.
+    fn alloc_host(&self, bytes: usize) -> anyhow::Result<Buf> { self.alloc(bytes) }
+    /// Decode attention of `nt` tokens over a host-RAM cache (`alloc_host`) computed on the CPU, written to `out`
+    /// with the output gate `qg` applied. Ok(false): not supported here, use `attn_decode_q`.
+    fn attn_host(&self, _q: u64, _kc: u64, _vc: u64, _qg: u64, _out: u64, _step: u64, _nh: usize, _nkv: usize, _hd: usize, _scale: f32, _nt: usize) -> anyhow::Result<bool> { Ok(false) }
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()>;
     fn dtoh(&self, src: &Buf, off: usize, dst: &mut [u8]) -> anyhow::Result<()>;
     fn dtod(&self, src: &Buf, src_off: usize, dst: &Buf, dst_off: usize, bytes: usize) -> anyhow::Result<()>;
