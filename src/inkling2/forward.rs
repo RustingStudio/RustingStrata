@@ -786,6 +786,11 @@ impl<'a> Inkling2Model<'a> {
             share.or(std::env::var_os("STRATA_FIXED_EXPERTS").map(|_| 0.0))
         });
         if crate::deepseek::mat::dev_info().is_none() { return (1.0, true); }
+        // A single token (and a draft check) gives every miss to the CPU: staging an expert costs an allocation,
+        // copies and a wait a layer run, which the balance does not see as a fixed cost. On an RTX 2060 under Windows
+        // the staged share cost 230-290 ms a token (decode 2.4 tok/s, 6.1 with none); on an RTX 3060 under Linux
+        // staging none was also the fastest (17.0 tok/s against 16.1).
+        let fixed = fixed.or(std::ptr::eq(share, &self.cpu_share).then_some(1.0));
         (fixed.unwrap_or(share.get()).clamp(0.0, 1.0), fixed.is_some())
     }
 
