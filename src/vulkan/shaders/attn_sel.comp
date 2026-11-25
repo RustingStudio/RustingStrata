@@ -1,0 +1,55 @@
+#version 460
+layout(constant_id = 1) const uint HD = 128;   // head_dim
+layout(constant_id = 2) const uint PERH = 4;   // query heads of one K/V head
+layout(local_size_x_id = 3) in;                // 32 * PERH
+#include "common.glsl"
+layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; U32 idx; I32 cnt; F32 outp; uint nh; uint nkv; uint ns; float scale; } p;
+
+// Attention of each query over its own list of keys (attn_sel of kernels.cu): query t reads the cnt[t] rows
+// idx[t * ns ..] of an f16 K/V cache. A workgroup is one query token and one K/V head, a warp one query head;
+// 32 keys of K and V are loaded into shared memory at a time.
+shared float qs[PERH * HD], kt[32 * HD], vt[32 * HD], ps[PERH * 32];
+
+void main() {
+    uint t = gl_WorkGroupID.x, g = gl_WorkGroupID.y, h = WARP, c = LANE, tid = h * 32u + c, nthr = PERH * 32u;
+    uint n = uint(p.cnt.v[t]), qg = (t * p.nh + g * PERH) * HD;
+    for (uint i = tid; i < PERH * HD; i += nthr) qs[i] = p.q.v[qg + i];
+    float acc[8];
+    for (uint r = 0; r < 8u; r++) acc[r] = 0.0;
+    float ninf = uintBitsToFloat(0xff800000u), m = ninf, l = 0.0;
+    for (uint j0 = 0; j0 < n; j0 += 32u) {
+        barrier();
+        for (uint i = tid; i < 32u * HD; i += nthr) {
+            uint j = j0 + i / HD;
+            if (j < n) {
+                uint row = (p.idx.v[t * p.ns + j] * p.nkv + g) * HD + i % HD;
+                kt[i] = ldkv(p.kc, row, HD);
+                vt[i] = ldkv(p.vc, row, HD);
+            } else {
+                kt[i] = 0.0;
+                vt[i] = 0.0;
+            }
+        }
+        barrier();
+        bool key = j0 + c < n;
+        float s = ninf;
+        if (key) {
+            float d = 0.0;
+            for (uint i = 0; i < HD; i++) d = fma(qs[h * HD + i], kt[c * HD + i], d);
+            s = d * p.scale;
+        }
+        float mn = max(m, warp_max(s));
+        float a = m == ninf ? 0.0 : expf_(m - mn), e = key ? expf_(s - mn) : 0.0;
+        l = l * a + warp_sum(e);
+        m = mn;
+        ps[tid] = e;
+        barrier();
+        for (uint r = 0; r < HD / 32u; r++) {
+            float v = 0.0;
+            for (uint k = 0; k < 32u; k++) v = fma(ps[h * 32u + k], vt[k * HD + c + 32u * r], v);
+            acc[r] = acc[r] * a + v;
+        }
+    }
+    uint o = (t * p.nh + g * PERH + h) * HD;
+    for (uint r = 0; r < HD / 32u; r++) p.outp.v[o + c + 32u * r] = fdiv(acc[r], l);
+}

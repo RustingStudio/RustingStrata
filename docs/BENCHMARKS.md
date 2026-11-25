@@ -21,7 +21,7 @@ Reference machine unless stated: RTX 3060 12 GB, Ryzen 5 7600X, 32 GB RAM.
 | Qwen3.8-Flash-Next GSQ-RCO IQ2_XS, 1262-token prompt | 33.0 tok/s (29.3-35.8) | 25.6 (23.2-26.9) | - | [below](#qwen38-flash-next-gsq-rco-iq2_xs) |
 | GLM-5.3-Flash UD-Q2_K_XL (119 GB) | 1.35-1.57 tok/s | 0.57-0.62 | - | [below](#glm-53-flash-ud-q2_k_xl-119-gb) |
 | DeepSeek-V4.1-Flash IQ2_XXS (249 GB) | 2-3.6 tok/s | 0.3-1.5 | - | [below](#deepseek-v41-flash-iq2_xxs-249-gb) |
-| Inkling 2 Mini IQ4_NL (17.6 GB), 512-token prompt | 31.2 tok/s (28.7-33.7) | 8.7-10.5 | - | [below](#inkling-2-mini-iq4_nl-176-gb) |
+| Inkling 2 Mini IQ4_NL (17.6 GB), 566-token prompt | 35.8 tok/s (35.6-36.1) | 31.1 (31.0-31.1) | - | [below](#inkling-2-mini-against-llamacpp-as-servers-05k-to-32k-prompts) |
 | Recursive Flint 39.8B UD-Q5_K_XL, 4102-token prompt | 64.6 tok/s (63.8-65.6) | 48.6 (47.5-49.3) | - | [below](#recursive-flint-398b-ud-q5_k_xl) |
 
 ## Qwen3.6-35B-A3B UD-Q5_K_M
@@ -261,9 +261,10 @@ temperature 0) are fed through RustingStrata's forward and the top token is comp
 (`tests/inkling2_forward.rs`). Short prompt: 24 of 24. Prompt of several hundred tokens: at least 47 of 48 (one near
 tie). The same on the CPU, CUDA and Vulkan paths.
 
-Caveats: llama.cpp reads the prompt faster (RustingStrata is at 0.6-0.7 of its speed from 512 tokens on): its CUDA
-build runs the batch on the GPU even with no layer offloaded, and RustingStrata computes the attention scores of a
-chunk on the CPU. `llama-bench` decodes 64 tokens from an empty context, `bench` decodes them after the prompt, so
+Caveats: in this run of 2026-11-21 llama.cpp read the prompt faster (RustingStrata was at 0.6-0.7 of its speed from
+512 tokens on): its CUDA build runs the batch on the GPU even with no layer offloaded, and RustingStrata computed the
+attention scores of a chunk on the CPU then. Prefill attention is on the GPU since; the
+[server comparison of 2026-11-25](#inkling-2-mini-against-llamacpp-as-servers-05k-to-32k-prompts) has the newer numbers. `llama-bench` decodes 64 tokens from an empty context, `bench` decodes them after the prompt, so
 the decode columns are not the same test. The first run of the 64-token prompt is the first work of the process and
 is the slow one of the two. A CPU-only llama.cpp build was not benchmarked with `llama-bench`; its server reported
 40.4 tok/s for the prompt and 11.0 tok/s for the reply earlier the same day (one run, not side by side). Vulkan was
@@ -274,6 +275,48 @@ The decode column was measured again later the same day, same command, after a d
 used part of the GPU during that run. Alternating runs of the old and new build at a 512-token prompt, same load:
 CUDA 25.4 to 33.5 tok/s, Vulkan 16.6 to 25.4 tok/s, prefill unchanged (within 1-4%). Most of the Vulkan gain is the
 IQ4_NL expert matvec (105 to 270 GB/s on 8 experts of 2304x2304).
+
+## Inkling 2 Mini against llama.cpp as servers, 0.5k to 32k prompts
+
+Three files (`Inkling-2-Mini-UD-IQ2_XXS.gguf`, `Inkling-2-Mini-UD-IQ3_XXS.gguf`, `Inkling-2-Mini-IQ4_NL.gguf`), measured
+2026-11-25 on the reference machine (RTX 3060 12 GB, 30 GB RAM) in one session, the two engines in turn for each file.
+Both run as servers and answer the same streamed `/v1/chat/completions` request with 128 reply tokens, greedy, no
+prompt cache: prefill is the prompt tokens over the time to the first piece, decode is the other 127 tokens over the
+rest, both timed by the client. Each server start answers one request that is not counted. RustingStrata a3a6968:
+`serve --ctx 8192` (0.5k and 3.8k) or `--ctx 40960` (16k and 32k), CUDA, no other flag. llama.cpp 0ce7f213b, CUDA
+build: `llama-server --device CUDA0 -np 1 -t 6` with the same `-c` and the flags of its row. Prefill / decode in tok/s,
+mean of 3 requests (0.5k, 3.8k) or 2 requests (16k, 32k):
+
+| File | Engine and flags | 0.5k (566 tokens) | 3.8k (4132) | 16k (16604) | 32k (32675) |
+|---|---|---|---|---|---|
+| UD-IQ2_XXS | RustingStrata | 487.7 / 59.0 | 386.6 / 51.1 | 286.5 / 42.1 | 217.9 / 34.5 |
+| | llama.cpp `-ngl 99` (`-ub 96` at 16k and 32k) | 407.9 / 43.0 | 378.3 / 39.8 | 240.0 / 36.2 | 194.2 / 31.2 |
+| UD-IQ3_XXS | RustingStrata | 440.1 / 52.0 | 344.5 / 44.2 | 252.9 / 35.0 | 190.1 / 28.6 |
+| | llama.cpp `-ngl 99 -ncmoe 6` | 328.6 / 33.5 | 335.9 / 31.6 | | |
+| | llama.cpp `-ngl 99 -ncmoe 8 -ub 64 -b 64` (a later run of the same day) | | | 138.9 / 26.8 | 122.9 / 24.2 |
+| IQ4_NL | RustingStrata | 295.5 / 35.8 | 256.5 / 31.2 | 202.7 / 27.6 | 162.9 / 23.6 |
+| | llama.cpp `-ngl 99 -cmoe -ub 16 -b 16 --moe-cache-mib 8192 --moe-cache-cpu-share 0.95` (6144 at 16k and 32k) | 93.7 / 31.1 | 94.7 / 29.6 | 70.6 / 25.9 | 64.4 / 22.3 |
+| | llama.cpp `-ngl 99 -cmoe -ub 256 --moe-cache-mib 1408 --moe-cache-cpu-share 0.95` | 137.9 / 23.0 | 170.5 / 22.8 | | |
+
+Caveats: the runs of one cell differ by at most 5% (the log has each request), but the prefill margin at 3.8k is
+small for UD-IQ2_XXS and UD-IQ3_XXS (llama.cpp's own server timings give it 382.9 and 339.7 tok/s there). The
+llama.cpp flags are the best found by hand for each file and context on this card, not a full search; for IQ4_NL
+one setting is best at decode and another at prefill, so both are in the table. The 16k and 32k prompts are the same text
+repeated. RustingStrata on UD-IQ3_XXS in the later run, from e14e8ca with the one-buffer copy of staged experts:
+263.6 / 37.8 at 16k and 184.1 / 28.1 at 32k. Decoding is greedy in both engines. A desktop used 389 MiB of VRAM during the session.
+
+Top token against llama.cpp (same day, same llama.cpp build and files): llama.cpp writes 48 greedy tokens after the
+prompt file sent as raw text (`/completion`), then `rustingstrata score` reads the same prompt and those 48 tokens and
+its top token is counted at each step. One run a cell, 48 steps each.
+
+| File | 540-token prompt | 4106-token prompt |
+|---|---|---|
+| UD-IQ2_XXS | 47 of 48 | 48 of 48 |
+| UD-IQ3_XXS | 47 of 48 | 46 of 48 |
+| IQ4_NL | 47 of 48 | 48 of 48 |
+
+At each of the five steps that differ, llama.cpp's own first and second tokens are 0.05 to 0.31 apart in log
+probability.
 
 ## Kolibri 1.1 Q4_K_M (43.4 GB)
 
@@ -313,6 +356,21 @@ change, run between the two llama.cpp rows, was 132.4 (110.0-148.0) / 33.2). The
 `--moe-cache-mib 5000` and `--moe-cache-mib 8000 --moe-cache-cpu-share 0.5` were also tried for llama.cpp at 3.8k
 and were slower in decode than `-cmoe` alone (34.9 / 3.8 and 37.6 / 6.6). Speed on this file depends on the drive
 and on how much of the file the page cache holds.
+
+Vulkan against CUDA on the same card, a later session of 2026-11-25 (after the change that copies the experts with
+no slot in VRAM into one device buffer a call), the same request and method, `serve --backend vulkan` then
+`serve --backend cuda`, 3 requests at 0.5k and 3.8k and 2 at 16k and 32k; no llama.cpp run in this session:
+
+| Prompt | Vulkan prefill (tok/s) | Vulkan decode | CUDA prefill | CUDA decode |
+|---|---|---|---|---|
+| 0.5k (562 tokens) | 128.8 (114.3-139.2) | 26.8 (24.2-28.6) | 208.9 (178.6-231.8) | 33.7 (33.3-34.0) |
+| 3.8k (3861) | 105.6 (100.3-110.7) | 19.5 (18.5-20.4) | 181.7 (172.6-188.1) | 26.4 (25.9-26.7) |
+| 16k (16166) | 103.0 (98.1-107.9) | 19.1 (18.7-19.4) | 155.3 (153.7-156.8) | 20.2 (20.0-20.4) |
+| 32k (31446) | 100.5 (100.4-100.5) | 19.2 (19.2-19.3) | 162.9 (159.2-166.5) | 21.6 (21.0-22.2) |
+
+VRAM in use: 10.2 GB with Vulkan, 9.7 GB with CUDA. Vulkan ran first, so CUDA had the warmer page cache. Top token
+against llama.cpp's greedy tokens (48 steps): 43 and 46 with Vulkan, 44 and 46 with CUDA after the 2k and 3.8k
+prompts. Vulkan was run on the RTX 3060 only.
 
 ## Not yet measured
 

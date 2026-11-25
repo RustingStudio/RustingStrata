@@ -1535,12 +1535,12 @@ mod tests {
     }
 
     /// M1-T5, CPU-only: the loaded name list drops `gemmi_*`/`gemmis_*` only on a device where kernels.cu compiles
-    /// them out. 393 names today (sm_80); 23 non-float types x 3 fewer names = 324 on sm_70.
+    /// them out. 397 names today (sm_80); 23 non-float types x 3 fewer names = 328 on sm_70.
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 393);
-        assert_eq!(sm70.len(), 324);
+        assert_eq!(sm80.len(), 397);
+        assert_eq!(sm70.len(), 328);
         assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmd")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());

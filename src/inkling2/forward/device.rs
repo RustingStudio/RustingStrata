@@ -1453,13 +1453,15 @@ impl Device {
             let t = std::time::Instant::now();
             let list = Inkling2Model::resident(ml, c.n_expert, &on_gpu);
             let d = lock();
-            let (p, mut owned) = (&d.parts[0], vec![]);
+            let (p, mut staged) = (&d.parts[0], None);
             (|| -> Option<()> {
                 // One moe_gemv per matrix kind for all of them (8 small gemvs leave most of the card idle).
                 let Some((gu, dn, ..)) = list.first() else { return Some(()) };
                 let (k, gs) = (list.len(), list.iter().map(|e| e.3).collect::<Vec<f32>>());
-                let mut ptrs = |down: bool| list.iter().map(|e| d.weight(p, if down { &e.1 } else { &e.0 }, &mut owned).map(|t| t.ptr)).collect::<Option<Vec<u64>>>();
-                let (pg, pd) = (ptrs(false)?, ptrs(true)?);
+                let (gm, dm): (Vec<_>, Vec<_>) = list.iter().map(|e| (e.0, e.1)).unzip();
+                let (buf, ptrs) = d.weights(p, &[&gm, &dm])?;
+                let (pg, pd) = (ptrs[..k].to_vec(), ptrs[k..].to_vec());
+                staged = (buf.len() > 0).then_some(buf);
                 match (slab(&pg), slab(&pd)) {
                     (Some((bg, sg, ig)), Some((bd, sd, id))) => {
                         p.be.put(&[ig, id].concat(), &self.scr, ((s.ids - o) / 4) as usize).ok()?;
@@ -1485,7 +1487,7 @@ impl Device {
                 }
                 // Wait when an expert came from the file: its copy lives until the run ends, and the CPU share
                 // follows the time. With every expert in VRAM the queue runs on.
-                if adapt || !owned.is_empty() { p.be.sync().ok()?; }
+                if adapt || staged.is_some() { p.be.sync().ok()?; }
                 Some(())
             })()?;
             Some(t.elapsed().as_secs_f32())

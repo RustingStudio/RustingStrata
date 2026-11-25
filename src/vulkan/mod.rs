@@ -54,6 +54,7 @@ const SPV: &[(&str, &[u8])] = &[
     ("ink_attn", include_bytes!("spv/ink_attn.spv")),
     ("ink_attn_merge", include_bytes!("spv/ink_attn_merge.spv")),
     ("ink_attn_prefill", include_bytes!("spv/ink_attn_prefill.spv")),
+    ("attn_sel", include_bytes!("spv/attn_sel.spv")),
     ("ink_clip", include_bytes!("spv/ink_clip.spv")),
     ("ink_conv", include_bytes!("spv/ink_conv.spv")),
     ("ink_conv_batch", include_bytes!("spv/ink_conv_batch.spv")),
@@ -139,6 +140,8 @@ const BAR: &[vk::MemoryPropertyFlags] = &[vk::MemoryPropertyFlags::from_raw(7), 
 const BAR_AMD: &[vk::MemoryPropertyFlags] = &[vk::MemoryPropertyFlags::from_raw(0xc7), vk::MemoryPropertyFlags::from_raw(0xc6),
     vk::MemoryPropertyFlags::from_raw(7), vk::MemoryPropertyFlags::from_raw(0xe), vk::MemoryPropertyFlags::from_raw(6)];
 
+/// How long a waiting submit polls its fence before it sleeps in the driver.
+const SPIN: std::time::Duration = std::time::Duration::from_micros(300);
 /// How long the host waits for a submission before it tells MoE combines still waiting for the CPU worker to give up
 /// (err[2], see `Inner::submit`).
 const GIVE_UP: std::time::Duration = std::time::Duration::from_secs(1);
@@ -705,6 +708,8 @@ impl Inner {
             let e = st.err.2 as *mut u32;
             let give_up = if self.cr.is_some() && !st.no_cond { GIVE_UP } else { 8 * GIVE_UP };
             let t0 = std::time::Instant::now();
+            // A short round trip (a matvec of one token) ends before a sleeping thread would wake: poll first.
+            while t0.elapsed() < SPIN && !unsafe { self.dev.get_fence_status(st.fence) }? { std::hint::spin_loop(); }
             loop {
                 match unsafe { self.dev.wait_for_fences(&[st.fence], true, 20_000_000) } {
                     Err(vk::Result::TIMEOUT) => if t0.elapsed() >= give_up && !e.is_null() { unsafe { e.add(2).write_volatile(1) } },
@@ -1430,6 +1435,11 @@ impl Backend for Vk {
             &q, &r, &sink, &gate, &kc, &vc, &kc_new, &vc_new, &bias, &out,
             &(pos as u32), &(nt as u32), &(nh as u32), &(nkv as u32), &(nr as u32), &(ext as u32), &(ring.max(1) as u32), &(win as u32),
         ])
+    }
+    fn attn_sel(&self, q: u64, kc: u64, vc: u64, idx: u64, cnt: u64, out: u64, nt: usize, nh: usize, nkv: usize, hd: usize, ns: usize, scale: f32) -> anyhow::Result<()> {
+        let per = nh / nkv.max(1);
+        ensure!(hd % 32 == 0 && hd <= 256 && nkv > 0 && nh % nkv == 0 && (1..=8).contains(&per), "attn_sel: unsupported shape nh={nh} nkv={nkv} hd={hd}");
+        self.run("attn_sel", &[0, hd as u32, per as u32, (32 * per) as u32], [nt, nkv, 1], &[&q, &kc, &vc, &idx, &cnt, &out, &(nh as u32), &(nkv as u32), &(ns as u32), &scale])
     }
     fn ink_ffn_sum_n(&self, acc: u64, d: u64, wts: u64, ne: usize, n: usize, nt: usize, cpu: u64) -> anyhow::Result<()> {
         self.run("ink_ffn_sum", &[], [n.div_ceil(256), nt, 1], &[&acc, &d, &wts, &cpu, &(ne as u32), &(n as u32)])

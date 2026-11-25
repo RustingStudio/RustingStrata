@@ -1124,10 +1124,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let (prompt, cont) = (ids("prompt")?, ids("continuation")?);
             anyhow::ensure!(!prompt.is_empty() && !cont.is_empty(), "empty prompt or continuation");
             let g = Gguf::open(&model)?;
-            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::kolibri::ARCH) {
+            // Kolibri and Inkling 2 have their own forwards: the continuation goes in a token at a time.
+            macro_rules! score_tokenwise { ($chat:path, $model:path) => {{
+                use $chat as chat; use $model as Fwd;
                 engine.ds_env();
-                rusting_strata::kolibri::chat::gpu_defaults();
-                let mut m = rusting_strata::kolibri::forward::KolibriModel::new(&g)?;
+                chat::gpu_defaults();
+                let mut m = Fwd::new(&g)?;
                 let (mut argmax, mut top5) = (Vec::new(), Vec::new());
                 let mut logits = m.prefill(&prompt);
                 for i in 0..cont.len() {
@@ -1139,7 +1141,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 }
                 println!("{}", serde_json::json!({"argmax": argmax, "top5": top5}));
                 return Ok(());
-            }
+            }} }
+            let arch = g.get("general.architecture").ok().and_then(|v| v.as_str()).unwrap_or("");
+            if arch == rusting_strata::kolibri::ARCH { score_tokenwise!(rusting_strata::kolibri::chat, rusting_strata::kolibri::forward::KolibriModel) }
+            if rusting_strata::inkling2::is_arch(arch) { score_tokenwise!(rusting_strata::inkling2::chat, rusting_strata::inkling2::forward::Inkling2Model) }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             if let Some(&t) = prompt.iter().chain(&cont).find(|&&t| t as usize >= m.cfg.n_vocab) {
