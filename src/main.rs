@@ -2585,7 +2585,7 @@ fn model_has_mtp(g: &Gguf, aux: bool) -> bool {
 fn arch_default_chunk(arch: &str) -> Option<usize> {
     if arch == "gemma4" { Some(256) }
     else if arch == "glm5-next" { Some(512) }
-    else if arch == rusting_strata::hy4::ARCH { Some(1024) }
+    else if arch == rusting_strata::hy4::ARCH || arch == rusting_strata::kolibri::ARCH { Some(1024) }
     else if rusting_strata::inkling2::is_arch(arch) { Some(256) }  // its GPU prefill clamps to 256
     else if arch == "deepseek41" { None }
     else { Some(4096) }
@@ -2634,7 +2634,7 @@ fn check_workload_ctx(s: &CalibSettings) -> anyhow::Result<()> {
 }
 
 /// The baseline must be what a user runs today without a calibration file: the engine's own chunk (4096 for the
-/// main engine, 256/512/1024 for Gemma 4/GLM/Hy4, 256 for Inkling 2, none for DeepSeek), short 32, the physical
+/// main engine, 256/512/1024 for Gemma 4/GLM/Hy4 and Kolibri, 256 for Inkling 2, none for DeepSeek), short 32, the physical
 /// core count (left to the engine's own default), and no drafts. Not the first point of the search space.
 fn baseline_knobs(space: &[KnobSpec], arch: &str) -> Knobs {
     let mut k = Knobs::default();
@@ -4591,7 +4591,7 @@ mod calibrate_cli_tests {
     #[test]
     fn the_baseline_chunk_is_each_engines_own_default() {
         let s = CalibSettings::new(PathBuf::from("m.gguf"));
-        for (arch, want) in [("gemma4", 256), ("glm5-next", 512), ("hy_v4_flash", 1024),
+        for (arch, want) in [("gemma4", 256), ("glm5-next", 512), ("hy_v4_flash", 1024), ("kolibri1", 1024),
                              ("inkling2_loop", 256), ("inkling2", 256), ("qwen35moe", 4096)] {
             let space = build_space(arch, &s, true);
             let base = baseline_knobs(&space, arch);
