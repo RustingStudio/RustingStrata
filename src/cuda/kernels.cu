@@ -2662,11 +2662,21 @@ __device__ __forceinline__ double rope_f(float base, int i, int n_rot) { return 
 extern "C" __global__ void rope_freq(double* fr, float base, int n_rot) {
     for (int i = threadIdx.x; i < n_rot / 2; i += blockDim.x) fr[i] = rope_f(base, i, n_rot);
 }
-// fr: the rope_freq table of base and n_rot, or null to compute it here.
+// cs[t * (n_rot / 2) + i] = (sin, cos) of angle i of token t, as rms_norm_rope computes them (tok and pos as there):
+// once a token instead of once a head (the f64 sincos is slow on consumer cards).
+extern "C" __global__ void rope_cs(float2* cs, const int* step, const u64* kvt, int nt, int n_rot, const double* fr) {
+    int half = n_rot / 2, e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= nt * half) return;
+    int tok = e / half, pos = kvt ? step[2 * tok] : step[0] + tok;
+    double ds, dc;
+    sincos((double)pos * fr[e % half], &ds, &dc);
+    cs[e] = make_float2((float)ds, (float)dc);
+}
+// fr: the rope_freq table of base and n_rot, or null to compute it here. cs: the rope_cs table of these tokens, or null.
 extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const float* w, float* out, int n, float eps, int per,
                                          int n_rot, const int* step, float base, const float* v, u16* kc, u16* vc,
                                          int qrows, const float* qx, int q_stride, const float* qw, float* qo, int qper,
-                                         const double* fr, const u64* kvt) {
+                                         const double* fr, const u64* kvt, const float2* cs) {
     int b = (int)blockIdx.x - qrows;
     bool store = kc || kvt;
     if (b < 0) { b = blockIdx.x; x = qx; x_stride = q_stride; w = qw; out = qo; per = qper; store = false; }
@@ -2681,10 +2691,14 @@ extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const flo
     __syncthreads();
     int i = threadIdx.x, half = n_rot / 2;
     if (i < half) {
-        double theta = (double)pos * (fr ? fr[i] : rope_f(base, i, n_rot));
-        double ds, dc;
-        sincos(theta, &ds, &dc);
-        float sn = (float)ds, c = (float)dc;
+        float sn, c;
+        if (cs) { float2 v = cs[tok * half + i]; sn = v.x; c = v.y; }
+        else {
+            double theta = (double)pos * (fr ? fr[i] : rope_f(base, i, n_rot));
+            double ds, dc;
+            sincos(theta, &ds, &dc);
+            sn = (float)ds; c = (float)dc;
+        }
         float a = o[i], b = o[i + half];
         o[i] = a * c - b * sn;
         o[i + half] = a * sn + b * c;
