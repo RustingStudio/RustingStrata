@@ -434,7 +434,7 @@ impl<'a> RaonDFlash<'a> {
             (0..k_eff)
                 .map(|i| {
                     let row = &logits[i * n_voc..(i + 1) * n_voc];
-                    row.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32
+                    crate::ops::argmax(row) as u32
                 })
                 .collect()
         }

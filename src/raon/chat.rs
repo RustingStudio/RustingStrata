@@ -161,7 +161,7 @@ fn decode(
         true
     };
     while out.len() < n {
-        let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+        let next = crate::ops::argmax(&logits) as u32;
         if eos.contains(&next) { return (out, true); }
         out.push(next);
         if !emit(&out, &mut shown) { break; }
@@ -176,7 +176,7 @@ fn decode(
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(4)
-                .clamp(2, dflash.block_size);
+                .clamp(2, dflash.block_size.max(2));
             let k_eff = rem.min(blk - 1);
             let draft = dflash.draft_block(next, m, k_eff);
             let t2 = std::time::Instant::now();

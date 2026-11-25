@@ -125,6 +125,9 @@ impl RaonConfig {
             }
         }
 
+        let (n_expert, n_used) = (u("expert_count")?, u("expert_used_count")?);
+        ensure!(n_embd > 0 && n_head > 0 && dt_rank > 0 && q_lora_rank > 0 && kv_lora_rank > 0, "raon1 has a zero dimension");
+        ensure!(n_dense == n_layer || (1..=n_expert).contains(&n_used), "raon1 expert_used_count {n_used} not in 1..={n_expert}");
         let n_vocab = g.tensors.get("token_embd.weight").context("missing token_embd.weight")?.dims[1] as usize;
         Ok(RaonConfig {
             n_layer,
@@ -152,8 +155,8 @@ impl RaonConfig {
             n_dense,
             n_ff: u("feed_forward_length")?,
             n_ff_exp,
-            n_expert: u("expert_count")?,
-            n_used: u("expert_used_count")?,
+            n_expert,
+            n_used,
             n_shared: u("expert_shared_count")?,
             exp_scale: f("expert_weights_scale")?,
             exp_norm,

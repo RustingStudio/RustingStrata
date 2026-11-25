@@ -285,7 +285,7 @@ pub fn route(logits: &[f32], bias: &[f32], top_k: usize, renorm: bool, scale: f3
         let sum: f32 = out.iter().map(|(_, w)| *w).sum::<f32>() + 1e-20;
         for (_, w) in &mut out { *w /= sum; }
     }
-    if scale != 1.0 {
+    if scale != 1.0 && scale != 0.0 {
         for (_, w) in &mut out { *w *= scale; }
     }
     out
@@ -1362,7 +1362,7 @@ impl<'a> RaonModel<'a> {
         let kw = self.cfg.kv_lora_rank + self.cfg.qk_rope_hd;
         let mut accepted = Vec::with_capacity(draft.len());
         for (j, &d) in draft.iter().enumerate() {
-            let pred = logits[j].iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+            let pred = crate::ops::argmax(&logits[j]) as u32;
             if pred == d && !eos.contains(&pred) {
                 accepted.push(d);
             } else {
