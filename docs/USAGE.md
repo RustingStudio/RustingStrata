@@ -5,9 +5,9 @@ Everything here applies to `rustingstrata chat`, `generate`, `bench` and `serve`
 
 ## Terminal
 
-`rustingstrata interface` is a short set of questions in the terminal: the model (a numbered list of the models
-folder and of the Hugging Face and llama.cpp caches; its last row takes a path to one file, or to a folder whose
-models it then lists), the mode (chat in the terminal,
+`rustingstrata interface` is a short set of questions in the terminal: the model (a numbered list of the last 10
+models picked here, the last one first, then the models folder and the Hugging Face and llama.cpp caches; its last
+row takes a path to one file, or to a folder whose models it then lists), the mode (chat in the terminal,
 chat page in the browser, API server, speed test), GPU or CPU, the context length and, for a server, the address.
 Enter takes the default in brackets. It prints the command the answers make and runs it, so the command can be
 copied for the next time. `--models-dir DIR` lists another folder.

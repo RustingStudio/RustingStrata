@@ -481,7 +481,7 @@ impl Device {
     pub(super) fn to_host(&mut self, c: &Inkling2Config, layers: &[Layer], slots: &mut [Slot], pos: usize, max_ctx: usize) {
         if !self.ahead { return; }
         assert!(crate::cuda::kv_mode() == 0 || self.synced == pos,
-            "quantized KV cache (--kv q8/q4/q2) is only supported on the GPU path");
+            "the card has no room for the K/V cache, and a quantized KV cache (--kv q8/q4/q2) cannot move to the CPU: run with a smaller --ctx");
         let d = dev::get().unwrap().lock().unwrap();
         let be = &*d.parts[0].be;
         let (hd, (at, len)) = (c.head_dim, hists(c));

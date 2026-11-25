@@ -280,6 +280,20 @@ fn madvise(p: usize, n: usize, advice: i32) {
 #[cfg(not(target_os = "linux"))]
 fn madvise(_: usize, _: usize, _: i32) {}
 
+/// Windows counts the file pages a process has touched as its memory, so a model on the card looked loaded twice in
+/// Task Manager. Emptying the working set after the upload leaves the pages in the file cache; the ones the CPU still
+/// reads come back on use (issue #100).
+pub fn trim_working_set() {
+    #[cfg(windows)]
+    {
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn SetProcessWorkingSetSize(p: isize, min: usize, max: usize) -> i32;
+        }
+        unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX) };
+    }
+}
+
 /// Starts reading mapped bytes p..p + n into the page cache without waiting (MADV_WILLNEED).
 pub fn will_need(p: usize, n: usize) {
     // One call reads at most one readahead window and silently skips the rest of its range (16 MB steps on a 4 MB
