@@ -117,9 +117,12 @@ struct Layer { attn_norm: Option<GpuTensor>, post_norm: Option<GpuTensor>, hc: O
 
 /// MTP draft head: the `nextn` block (layer n_layer) with its own KV cache and CPU worker.
 /// Buffers for a copy of the DeltaNet (conv, s) states of `layers` (all or none).
-fn alloc_saved(g: &dyn Backend, layers: &[Layer]) -> anyhow::Result<Vec<(Buf, Buf)>> {
+/// `host`: in host memory where the backend has it (`Backend::host_buf`), as for the saved state of each of several
+/// slots, which is copied only at a prompt's start and end; the VRAM goes to the slots' live state and the experts.
+fn alloc_saved(g: &dyn Backend, layers: &[Layer], host: bool) -> anyhow::Result<Vec<(Buf, Buf)>> {
+    let a = |n: usize| -> anyhow::Result<Buf> { match if host { g.host_buf(n)? } else { None } { Some(b) => Ok(b), None => g.alloc(n) } };
     layers.iter().filter_map(|l| match &l.mixer { Mixer::Delta { conv, s, .. } => Some((conv[0].len(), s[0].len())), _ => None })
-        .map(|(c, s)| Ok((g.alloc(c)?, g.alloc(s)?))).collect()
+        .map(|(c, s)| Ok((a(c)?, a(s)?))).collect()
 }
 
 /// A saved conversation state in host memory: its tokens, the PLE tokens before it, the `slot` buffers and the KV
@@ -704,6 +707,19 @@ impl<'a> GpuModel<'a> {
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
         let channels = c.ssm_d_inner + 2 * nk * dk;
         let kv = c.n_head_kv * c.head_dim;
+        // The slots' live state stays in VRAM; more slots than fit would end the load out of memory. A dense model's
+        // state may take the VRAM its weights leave (less 1 GB of scratch); an MoE's at most half, so that the other
+        // half holds experts. A request past the slots waits for one (`serve_slots`).
+        // ponytail: Vulkan keeps each slot's saved state in VRAM too (no `host_buf`), not counted here.
+        let ns = if ns > 1 {
+            let lay = &c.layers[range.clone()];
+            let per = lay.iter().map(|&k| if k == LayerKind::Delta { 4 * ((c.ssm_conv - 1) * channels + nv * c.ssm_dv() * dk) } else { 2 * 2 * gpu.kv_words(ctx * kv) }).sum::<usize>();
+            let w: usize = m.w.g.tensors.values().filter(|t| !t.name.contains("_exps.")).map(|t| m.w.g.bytes(t).len()).sum();
+            let room = free0.saturating_sub(w + vram_margin + (1 << 30)) / if c.is_moe() { 2 } else { 1 };
+            let fit = (room / per.max(1)).clamp(1, ns);
+            if fit < ns { crate::say!("--parallel {ns}: the state of {fit} slots fits in VRAM; the other requests wait for a free slot"); }
+            fit
+        } else { ns };
         let qsa_on = c.idx_top_k > 0 && (0..c.n_layer).any(|il| m.w.layer(il, "indexer.k_proj.weight").is_ok());
         if qsa_on { ensure!(c.idx_head_dim == QSA_D && c.idx_n_head == QSA_H, "QSA indexer: {} heads of {} (the GPU kernels take {QSA_H} of {QSA_D})", c.idx_n_head, c.idx_head_dim); }
         let ring = gpu.zeros::<f32>(if qsa_on { c.n_layer * QSA_RING } else { 1 })?;
@@ -1046,7 +1062,7 @@ impl<'a> GpuModel<'a> {
         // Each slot's `save_state` copy, before the expert plan so that it leaves room for them (one slot allocates it
         // at its first `save_state`).
         let mut seqs: Vec<Seq> = (0..ns).map(|_| Seq::default()).collect();
-        if ns > 1 { for q in &mut seqs { q.saved = alloc_saved(&*gpu, &layers)?; } }
+        if ns > 1 { for q in &mut seqs { q.saved = alloc_saved(&*gpu, &layers, true)?; } }
         let saved = std::mem::take(&mut seqs[0].saved);
         // `step_batch` covers plain dense attention models in one part; the rest decode `STEP_ROWS` rows a forward.
         let plain = output_norm.is_some() && output.is_some() && range.start == 0 && !mtp && c.hc_n == 0 && c.n_embd_ple == 0 && !qsa_on
@@ -1068,7 +1084,7 @@ impl<'a> GpuModel<'a> {
             let mut dg = Self::load_part(dm, d_gpu, ctx, chunk, vram_margin, 0, 0..dm.cfg.n_layer, 1)?;
             dg.graph_tag = 1u64 << 62;
             if dg.saved.is_empty() {
-                dg.saved = alloc_saved(&*dg.gpu, &dg.layers)?;
+                dg.saved = alloc_saved(&*dg.gpu, &dg.layers, false)?;
             }
             Some(Box::new(dg))
         } else {
@@ -1506,7 +1522,7 @@ impl<'a> GpuModel<'a> {
     pub fn save_state(&mut self) -> anyhow::Result<()> {
         self.dflash_commit_ctx()?;
         let g = &self.gpu;
-        if self.saved.is_empty() { self.saved = alloc_saved(&**g, &self.layers)?; }
+        if self.saved.is_empty() { self.saved = alloc_saved(&**g, &self.layers, self.seqs.len() > 1)?; }
         let mut it = self.saved.iter();
         for l in &self.layers {
             if let Mixer::Delta { conv, s, .. } = &l.mixer {

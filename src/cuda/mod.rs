@@ -949,6 +949,8 @@ impl Backend for Gpu {
     }
 
     /// Pinned host memory mapped into the device address space.
+    fn host_buf(&self, bytes: usize) -> anyhow::Result<Option<Buf>> { Ok(Some(self.host_mailbox(bytes.div_ceil(4))?.0)) }
+
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)> {
         let n = words.max(1);
         let flags = sys::CU_MEMHOSTALLOC_DEVICEMAP | sys::CU_MEMHOSTALLOC_PORTABLE;
