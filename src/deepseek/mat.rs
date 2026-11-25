@@ -349,14 +349,14 @@ pub(crate) mod dev {
             let (p, ne, nf, nl) = (&self.parts[d], gs.len(), downs[0].cols, downs[0].rows);
             if x.len() > p.x.len() / 4 || ne * (2 * nf + nl) > p.y.len() / 4 { return None; }
             p.be.put(x, &p.x, 0).ok()?;
-            let (mut owned, at) = (vec![], |i: usize| p.y.addr() + (4 * i) as u64);
+            let ((owned, ts), at) = (self.tensors(p, &[gs, us, downs])?, |i: usize| p.y.addr() + (4 * i) as u64);
             for i in 0..ne {
-                p.be.gemv(self.weight(p, &gs[i], &mut owned)?, p.x.addr(), at(i * 2 * nf)).ok()?;
-                p.be.gemv(self.weight(p, &us[i], &mut owned)?, p.x.addr(), at(i * 2 * nf + nf)).ok()?;
+                p.be.gemv(&ts[i], p.x.addr(), at(i * 2 * nf)).ok()?;
+                p.be.gemv(&ts[ne + i], p.x.addr(), at(i * 2 * nf + nf)).ok()?;
             }
             p.be.situ(p.y.addr(), nf, ne, 0, beta, lb).ok()?;
             for i in 0..ne {
-                p.be.gemv(self.weight(p, &downs[i], &mut owned)?, at(i * 2 * nf), at(ne * 2 * nf + i * nl)).ok()?;
+                p.be.gemv(&ts[2 * ne + i], at(i * 2 * nf), at(ne * 2 * nf + i * nl)).ok()?;
             }
             let y = p.be.get(&p.y, ne * 2 * nf, ne * nl).ok()?;
             drop(owned);

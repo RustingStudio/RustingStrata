@@ -370,7 +370,8 @@ impl<'a> RaonModel<'a> {
         let cfg = RaonConfig::from_gguf(g)?;
         let hcw = |p: &str| -> Result<Hcw<'a>> {
             Ok(Hcw {
-                f: Mat::load(g, &format!("{p}_fn.weight"))?,
+                // Tiny [10240, 17] BF16 hyper-connection projections: faster on CPU (0.07 ms, zero GPU syncs).
+                f: Mat::load_host(g, &format!("{p}_fn.weight"))?,
                 base: vec_f32(g, &format!("{p}_base.weight"))?,
                 scale: vec_f32(g, &format!("{p}_scale.weight"))?,
             })
@@ -378,6 +379,7 @@ impl<'a> RaonModel<'a> {
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for il in 0..cfg.n_layer {
             let m = |s: &str| Mat::load(g, &format!("blk.{il}.{s}.weight"));
+            let hm = |s: &str| Mat::load_host(g, &format!("blk.{il}.{s}.weight"));
             let v = |s: &str| vec_f32(g, &format!("blk.{il}.{s}.weight"));
             let attn = if cfg.is_rda[il] {
                 Attn::Rda(RdaWeights {
@@ -387,10 +389,11 @@ impl<'a> RaonModel<'a> {
                     q_conv: v("ssm_conv1d_q")?,
                     k_conv: v("ssm_conv1d_k")?,
                     v_conv: v("ssm_conv1d_v")?,
-                    f_a: m("ssm_f_a")?,
-                    f_b: m("ssm_f_b")?,
-                    beta: m("ssm_beta")?,
-                    rda: m("ssm_rda")?,
+                    // Tiny BF16 scalar/low-rank gating projections: run on CPU concurrently with GPU Q/K/V/G.
+                    f_a: hm("ssm_f_a")?,
+                    f_b: hm("ssm_f_b")?,
+                    beta: hm("ssm_beta")?,
+                    rda: hm("ssm_rda")?,
                     ssm_a: vec_f32(g, &format!("blk.{il}.ssm_a"))?,
                     dt_b: vec_f32(g, &format!("blk.{il}.ssm_dt.bias"))?,
                     g: m("ssm_g")?,
@@ -428,7 +431,8 @@ impl<'a> RaonModel<'a> {
                     None
                 };
                 Ffn::Moe {
-                    gate_inp: m("ffn_gate_inp")?,
+                    // Tiny [2560, 128] F32 router: 0.04 ms on CPU, avoids 24 GPU round-trips/token.
+                    gate_inp: hm("ffn_gate_inp")?,
                     bias: vec_f32(g, &format!("blk.{il}.exp_probs_b.bias"))?,
                     gexps: m("ffn_gate_exps")?,
                     uexps: m("ffn_up_exps")?,
@@ -550,13 +554,23 @@ impl<'a> RaonModel<'a> {
         let Attn::Rda(r) = &self.layers[il].attn else { unreachable!() };
         let (nh, hd) = (self.cfg.n_head, self.cfg.rda_hd);
         let d_inner = nh * hd;
-        let all = matvec_many(&[r.wq, r.wk, r.wv, r.g, r.beta, r.rda, r.f_a], cur, 0);
-        let (o1, o2, o3, o4) = (d_inner, 2 * d_inner, 3 * d_inner, 4 * d_inner);
-        let (o5, o6) = (o4 + r.beta.rows, o4 + r.beta.rows + r.rda.rows);
-        let (q_proj, k_proj, v_proj, gate) = (&all[..o1], &all[o1..o2], &all[o2..o3], &all[o3..o4]);
-        let (beta_raw, rda_delta, f_a) = (&all[o4..o5], &all[o5..o6], &all[o6..]);
-        let mut decay = vec![0.0f32; r.f_b.rows];
-        r.f_b.matvec(f_a, &mut decay);
+        // Run heavy Q/K/V/G on GPU (or 1-shot CPU) while tiny BF16 beta/rda/f_a/f_b overlap on CPU.
+        let (qkvg, (beta_raw, rda_delta, mut decay)) = rayon::join(
+            || matvec_many(&[r.wq, r.wk, r.wv, r.g], cur, 0),
+            || {
+                let mut br = vec![0.0f32; r.beta.rows];
+                let mut dr = vec![0.0f32; r.rda.rows];
+                let mut fa = vec![0.0f32; r.f_a.rows];
+                let mut fb = vec![0.0f32; r.f_b.rows];
+                r.beta.matvec(cur, &mut br);
+                r.rda.matvec(cur, &mut dr);
+                r.f_a.matvec(cur, &mut fa);
+                r.f_b.matvec(&fa, &mut fb);
+                (br, dr, fb)
+            },
+        );
+        let (o1, o2, o3) = (d_inner, 2 * d_inner, 3 * d_inner);
+        let (q_proj, k_proj, v_proj, gate) = (&qkvg[..o1], &qkvg[o1..o2], &qkvg[o2..o3], &qkvg[o3..]);
         for (d, &b) in decay.iter_mut().zip(&r.dt_b) { *d += b; }
 
         let st = self.rda_states[il].as_mut().unwrap();
@@ -914,16 +928,20 @@ impl<'a> RaonModel<'a> {
                 Attn::Rda(r) => {
                     let (nh, hd) = (self.cfg.n_head, self.cfg.rda_hd);
                     let d_inner = nh * hd;
-                    let all = matvec_rows_sets(
-                        &[(r.wq, 0), (r.wk, 0), (r.wv, 0), (r.g, 0), (r.beta, 0), (r.rda, 0), (r.f_a, 0)],
-                        &normed_flat, nt,
+                    let nrefs: Vec<&[f32]> = normed_flat.chunks_exact(n).collect();
+                    let (qkvg, (b_all, d_all, fb_all)) = rayon::join(
+                        || matvec_rows_sets(&[(r.wq, 0), (r.wk, 0), (r.wv, 0), (r.g, 0)], &normed_flat, nt),
+                        || {
+                            let b_all = matvec_rows(&r.beta, &nrefs);
+                            let d_all = matvec_rows(&r.rda, &nrefs);
+                            let fa_all = matvec_rows(&r.f_a, &nrefs);
+                            let fa_refs: Vec<&[f32]> = fa_all.chunks_exact(r.f_a.rows).collect();
+                            let fb_all = matvec_rows(&r.f_b, &fa_refs);
+                            (b_all, d_all, fb_all)
+                        },
                     );
-                    let (l1, l2, l3, l4) = (nt * d_inner, 2 * nt * d_inner, 3 * nt * d_inner, 4 * nt * d_inner);
-                    let (l5, l6) = (l4 + nt * r.beta.rows, l4 + nt * (r.beta.rows + r.rda.rows));
-                    let (q_all, k_all, v_all, g_all) = (&all[..l1], &all[l1..l2], &all[l2..l3], &all[l3..l4]);
-                    let (b_all, d_all, fa_all) = (&all[l4..l5], &all[l5..l6], &all[l6..]);
-                    let fa_refs: Vec<&[f32]> = fa_all.chunks_exact(r.f_a.rows).collect();
-                    let fb_all = matvec_rows(&r.f_b, &fa_refs);
+                    let (l1, l2, l3) = (nt * d_inner, 2 * nt * d_inner, 3 * nt * d_inner);
+                    let (q_all, k_all, v_all, g_all) = (&qkvg[..l1], &qkvg[l1..l2], &qkvg[l2..l3], &qkvg[l3..]);
 
                     let q_scale = 1.0 / (hd as f32).sqrt();
                     let mut gated_all = vec![0.0f32; nt * d_inner];
@@ -1070,12 +1088,14 @@ impl<'a> RaonModel<'a> {
                     matvec_rows(down, &grefs)
                 }
                 Ffn::Moe { gate_inp, bias, gexps, uexps, dexps, shared, effort_steer } => {
+                    let nrefs: Vec<&[f32]> = normed_flat.chunks_exact(n).collect();
                     let (logits_all, shared_gu) = if let Some((sg, su, _)) = shared {
-                        let all = matvec_rows_sets(&[(*gate_inp, 0), (*sg, 0), (*su, 0)], &normed_flat, nt);
-                        let r = nt * gate_inp.rows;
-                        (all[..r].to_vec(), Some(all[r..].to_vec()))
+                        let (lg, sgu) = rayon::join(
+                            || matvec_rows(gate_inp, &nrefs),
+                            || matvec_rows_sets(&[(*sg, 0), (*su, 0)], &normed_flat, nt),
+                        );
+                        (lg, Some(sgu))
                     } else {
-                        let nrefs: Vec<&[f32]> = normed_flat.chunks_exact(n).collect();
                         (matvec_rows(gate_inp, &nrefs), None)
                     };
                     let mut by_e: std::collections::BTreeMap<usize, Vec<(usize, f32)>> = std::collections::BTreeMap::new();
