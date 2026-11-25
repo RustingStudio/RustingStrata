@@ -17,13 +17,13 @@ pub(crate) const QTYPES: [GgmlType; 29] = {
     use GgmlType::*;
     [F32, BF16, F8E4M3, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_1, Q5_1, Q4_0, Q5_0, NVFP4]
 };
-pub(crate) const KERNELS: [&str; 54] = [
+pub(crate) const KERNELS: [&str; 58] = [
     "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "situ_q", "softcap", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "dflash2_conv", "hadamard",
     "ink_mix", "ink_ctrl_gate", "ink_ctrl_out", "ink_conv", "ink_conv_batch", "ink_clip", "ink_attn", "ink_attn_merge",
-    "ink_attn_prefill_32", "ink_attn_prefill_64", "ink_attn_prefill_128", "ink_ffn_sum", "ink_route",
+    "ink_attn_prefill_32", "ink_attn_prefill_64", "ink_attn_prefill_128", "ink_attn_prefill_sh_32", "ink_attn_prefill_sh_64", "ink_attn_prefill_sh_128", "ink_ffn_sum", "ink_route", "attn_sel",
 ];
 
 pub use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
@@ -1167,15 +1167,20 @@ impl Backend for Gpu {
         &self, q: u64, r: u64, sink: u64, gate: u64, kc: u64, vc: u64, kc_new: u64, vc_new: u64, bias: u64, out: u64,
         pos: usize, nt: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize, ring: usize, win: usize,
     ) -> anyhow::Result<()> {
-        let kn = match hd {
-            32 => "ink_attn_prefill_32",
-            64 => "ink_attn_prefill_64",
-            128 => "ink_attn_prefill_128",
-            _ => anyhow::bail!("ink_attn_prefill: unsupported hd={hd}"),
-        };
-        launch!(self, kn, cfg((nt.div_ceil(4) as u32, nh as u32), 128, 0),
-            q, r, sink, gate, kc, vc, kc_new, vc_new, bias, out,
-            pos as i32, nt as i32, nh as i32, nkv as i32, nr as i32, ext as i32, ring.max(1) as i32, win as i32);
+        anyhow::ensure!(matches!(hd, 32 | 64 | 128), "ink_attn_prefill: unsupported hd={hd}");
+        let g = nh / nkv.max(1);
+        if win == 0 && nkv > 0 && nh % nkv == 0 && g <= 4 {
+            // Every key: a block is one K/V head and `tb` tokens, with 32 keys of K and V in shared memory.
+            let tb = (32 / g).min(8);
+            launch!(self, &format!("ink_attn_prefill_sh_{hd}"), cfg((nt.div_ceil(tb) as u32, nkv as u32), (32 * tb * g) as u32, (2 * 32 * hd * 4) as u32),
+                q, r, sink, gate, kc, vc, kc_new, vc_new, bias, out,
+                pos as i32, nt as i32, nh as i32, nkv as i32, nr as i32, ext as i32, i32::MAX, win as i32);
+        } else {
+            // `ring` is the count of old rows that the kernel wraps at: only a sliding layer wraps.
+            launch!(self, &format!("ink_attn_prefill_{hd}"), cfg((nt.div_ceil(4) as u32, nh as u32), 128, 0),
+                q, r, sink, gate, kc, vc, kc_new, vc_new, bias, out,
+                pos as i32, nt as i32, nh as i32, nkv as i32, nr as i32, ext as i32, if win > 0 { ring.max(1) } else { i32::MAX as usize } as i32, win as i32);
+        }
         Ok(())
     }
     fn ink_ffn_sum_n(&self, acc: u64, d: u64, wts: u64, ne: usize, n: usize, nt: usize, cpu: u64) -> anyhow::Result<()> {
@@ -1235,6 +1240,14 @@ impl Backend for Gpu {
         let smem = attn_prefill_smem_bk(hd, bk) as u32;
         launch!(self, &format!("attn_prefill_{hd}"), cfg((t.div_ceil(64) as u32, nh as u32), 128, smem),
             q, kc, vc, qg, out, step, t as i32, nh as i32, nkv as i32, scale, qm, mw as i32, sink, win as i32);
+        Ok(())
+    }
+
+    fn attn_sel(&self, q: u64, kc: u64, vc: u64, idx: u64, cnt: u64, out: u64, nt: usize, nh: usize, nkv: usize, hd: usize, ns: usize, scale: f32) -> anyhow::Result<()> {
+        let per = nh / nkv.max(1);
+        anyhow::ensure!(hd % 32 == 0 && hd <= 256 && nkv > 0 && nh % nkv == 0 && per <= 32, "attn_sel: unsupported shape nh={nh} nkv={nkv} hd={hd}");
+        launch!(self, "attn_sel", cfg((nt as u32, nkv as u32), (per * 32) as u32, (((per + 64) * hd + per * 32 + 32) * 4) as u32),
+            q, kc, vc, idx, cnt, out, nh as i32, nkv as i32, hd as i32, ns as i32, scale);
         Ok(())
     }
 

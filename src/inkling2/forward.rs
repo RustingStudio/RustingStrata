@@ -243,7 +243,7 @@ fn hsum(v: std::arch::x86_64::__m256) -> f32 {
 
 /// `p[j * n + row]` += `scale` times the dot of f16 row `row` of `w` (`n` rows) with row j of `x`.
 /// One to three rows of `x` take the same sums in the same order, so a token gets the same bits alone or in a chunk.
-fn dots_h(p: &mut [f32], scale: f32, w: &[f16], x: &[f32], n: usize) {
+pub(crate) fn dots_h(p: &mut [f32], scale: f32, w: &[f16], x: &[f32], n: usize) {
     let hd = w.len() / n;
     #[cfg(all(target_feature = "f16c", target_feature = "fma"))]
     if hd % 32 == 0 && x.len() % hd == 0 && p.len() == x.len() / hd * n {
@@ -281,7 +281,7 @@ fn dots_k<const K: usize>(p: &mut [f32], scale: f32, w: &[f16], x: &[f32], n: us
 
 /// Dot of f16 weights and f32 values. The loop controllers are 113 MB of F32 in the file and every token reads them
 /// twice, at the speed of the memory: as f16 they take half the time (their values stay within 5e-4 relative).
-fn dot_h(w: &[f16], x: &[f32]) -> f32 {
+pub(crate) fn dot_h(w: &[f16], x: &[f32]) -> f32 {
     #[cfg(all(target_feature = "f16c", target_feature = "fma"))]
     {
         use std::arch::x86_64::*;
@@ -322,7 +322,7 @@ fn axpy_h(o: &mut [f32], p: f32, w: &[f16]) {
 
 /// Row j of `o` += the sum over the `n` f16 rows of `w` of `p[j * n + row]` times that row. One to three rows of
 /// `o` take the same sums in the same order.
-fn mix_h(o: &mut [f32], p: &[f32], w: &[f16], n: usize) {
+pub(crate) fn mix_h(o: &mut [f32], p: &[f32], w: &[f16], n: usize) {
     let hd = w.len() / n;
     #[cfg(all(target_feature = "f16c", target_feature = "fma"))]
     if hd % 32 == 0 && o.len() % hd == 0 && p.len() == o.len() / hd * n {

@@ -275,6 +275,45 @@ used part of the GPU during that run. Alternating runs of the old and new build 
 CUDA 25.4 to 33.5 tok/s, Vulkan 16.6 to 25.4 tok/s, prefill unchanged (within 1-4%). Most of the Vulkan gain is the
 IQ4_NL expert matvec (105 to 270 GB/s on 8 experts of 2304x2304).
 
+## Kolibri 1.1 Q4_K_M (43.4 GB)
+
+`Kolibri-1.1-Q4_K_M.gguf` (architecture `kolibri1`), measured 2026-11-25 on the reference machine (RTX 3060 12 GB,
+30 GB RAM, NVMe). The file does not fit in RAM plus VRAM. Both engines run as servers and answer the same streamed
+`/v1/chat/completions` request with 128 reply tokens, greedy: prefill is the prompt tokens over the time to the first
+token, decode is the other 127 tokens over the rest. Each server first answers a 0.5k-token request that is not
+counted. RustingStrata: `serve --model <file>` with default flags (9.7 GB of VRAM). llama.cpp: the Kolibri fork at
+5f4d22289, CUDA build, `llama-server -c 40000` with `-ngl 4` (its best prefill here) and with `-ngl 99 -cmoe` (its
+best decode here). Mean, the range of the runs in brackets, the number of runs after it.
+
+| Prompt | | Prefill (tok/s) | Decode (tok/s) | Runs |
+|---|---|---|---|---|
+| 0.5k (561 tokens) | RustingStrata | 181.0 (156.9-199.6) | 33.4 (32.0-35.8) | 5 |
+| | llama.cpp `-ngl 4` | 145.4 (93.8-165.5) | 15.5 (14.6-16.8) | 5 |
+| | llama.cpp `-ngl 99 -cmoe` | 98.5 (10.7-173.7) | 27.0 (9.7-34.8) | 5 |
+| 3.8k (3860) | RustingStrata | 148.7 (141.9-152.9) | 23.0 (22.4-23.4) | 3 |
+| | llama.cpp `-ngl 4` | 41.3 | 5.9 | 1 |
+| | llama.cpp `-ngl 99 -cmoe` | 27.9 | 10.6 | 1 |
+| 16k (16163) | RustingStrata | 139.1 (130.8-147.4) | 21.0 (20.9-21.1) | 2 |
+| | llama.cpp `-ngl 4` | 48.4 | 3.8 | 1 |
+| | llama.cpp `-ngl 99 -cmoe` | 30.0 | 8.7 | 1 |
+| 32k (31443) | RustingStrata | 158.8 (146.8-170.9) | 21.1 (20.1-22.0) | 2 |
+| | llama.cpp `-ngl 4` | 34.0 | 3.3 | 1 |
+| | llama.cpp `-ngl 99 -cmoe` | 32.9 | 9.3 | 1 |
+
+Quality vs llama.cpp, same GGUF, teacher-forced: the fork's greedy tokens (`-ngl 4`, 48 tokens) go through
+`rustingstrata score` and the top token is compared at every step: 45, 46, 44 and 46 of 48 after prompts of 2k, 3.8k,
+16k and 32k tokens. The fork against itself (CPU against GPU layers, or `-ngl 2` against `-ngl 4`) gives 45, 45, 40
+and 44 of 48. Every miss is at a step where the reference's two best tokens are close.
+
+Caveats: the llama.cpp rows at 3.8k and above are one run each, and the llama.cpp runs were made before the last
+RustingStrata prefill change, in the same night and not interleaved with it (the 0.5k RustingStrata row before that
+change, run between the two llama.cpp rows, was 132.4 (110.0-148.0) / 33.2). The low ends of the llama.cpp ranges at
+0.5k are its first runs, with the experts not yet in the page cache; its later runs reach 148-166 (`-ngl 4`) and
+129-174 (`-cmoe`) tok/s of prefill. llama.cpp counts 564 tokens for the 0.5k prompt.
+`--moe-cache-mib 5000` and `--moe-cache-mib 8000 --moe-cache-cpu-share 0.5` were also tried for llama.cpp at 3.8k
+and were slower in decode than `-cmoe` alone (34.9 / 3.8 and 37.6 / 6.6). Speed on this file depends on the drive
+and on how much of the file the page cache holds.
+
 ## Not yet measured
 
 - Qwen3-Next against llama.cpp in one table.

@@ -7,7 +7,7 @@ compiled at run time with NVRTC, and the same kernels run on Vulkan: no C++ buil
 fit in VRAM run on the CPU at the same time as the GPU work, and the expert placement adapts to the routing it sees.
 
 Supported models: Qwen3, Qwen3-Next, Qwen3.5/3.6, Qwen3.8-Flash-Next, Recursive Flint, Gemma 4, DeepSeek-V4.1-Flash,
-GLM-5.3-Flash, Hy4-flash and Inkling 2 Mini. The architectures, the GGUF types and the notes for each model are in
+GLM-5.3-Flash, Hy4-flash, Inkling 2 Mini and Kolibri 1.1. The architectures, the GGUF types and the notes for each model are in
 [docs/MODELS.md](docs/MODELS.md).
 
 Version 1.3.1.

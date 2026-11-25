@@ -72,7 +72,7 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 ## Flags
 
 - `--backend NAME` GPU backend: `cuda`, `vulkan` or `hip` (AMD cards through ROCm, one device per run, see [HIP.md](HIP.md)). Without it CUDA is used when it loads, else Vulkan.
-- `--ctx` KV cache size in tokens (default 4096). For Inkling 2, Hy4, GLM, DeepSeek and Gemma 4 it is the prompt plus reply limit instead, and the default is the context the model was trained on; their caches grow with the text.
+- `--ctx` KV cache size in tokens (default 4096). For Inkling 2, Hy4, GLM, DeepSeek, Kolibri and Gemma 4 it is the prompt plus reply limit instead, and the default is the context the model was trained on; their caches grow with the text.
 - `--mtp [N]` speculative decoding with the model's draft head. Greedy tokens stay the same; sampling keeps its
   distribution. Needs a GGUF with an MTP head (for example the Qwen3.6-35B-A3B MTP files).
   Qwen3.8-Flash-Next (`qwen4exp`) takes its head from a companion file: `--mtp-model mtp-...-shared-Q8_0.gguf`.
@@ -156,7 +156,7 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 - `--alias prism` (`serve`) is the model name in `/v1/models` and in the replies, whatever file is loaded (default: the
   file name), so clients set up for `prism` keep working when another model is loaded. Calibration and the expert
   profile stay per file.
-- Inkling 2, Hy4, GLM, DeepSeek and Gemma 4 run on their own code path. The server loads them like any other model
+- Inkling 2, Hy4, GLM, DeepSeek, Kolibri and Gemma 4 run on their own code path. The server loads them like any other model
   (`serve --model <file>`, or from the chat page of a running server, in either direction), with these limits: one
   request at a time, greedy (Inkling 2 also samples: `temperature`, `top_k`, `top_p`, `seed`; a seed repeats its
   text only with `STRATA_FIXED_EXPERTS=1`, because the adaptive expert split moves the logits a little),

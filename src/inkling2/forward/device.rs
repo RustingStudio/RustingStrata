@@ -168,6 +168,10 @@ fn up<T: crate::backend::Plain>(be: &dyn Backend, v: &[T]) -> Result<Buf> {
 
 fn f(floats: usize) -> u64 { 4 * floats as u64 }
 
+/// Rows of a K/V buffer that grows to hold `need`: a quarter more, so that a reply does not grow it at every token
+/// and a long prompt does not take twice its rows from the experts.
+fn grown(need: usize, max_ctx: usize) -> usize { (need + need / 4).next_multiple_of(1024).min(max_ctx) }
+
 /// Free expert slots until `need` bytes of VRAM are free.
 fn room(d: &mut dev::Dev, need: usize) {
     let free = d.parts[0].be.mem_info().map_or(0, |m| m.0);
@@ -400,21 +404,40 @@ impl Device {
         let row_words = d.parts[0].be.kv_words(kw);
         let full_cap = self.slots.iter().enumerate().find(|&(il, _)| !c.swa[layer_of(c, il)]).map(|(_, s)| s.cap);
         if let Some(cap) = full_cap && need > cap {
-            let mut new_cap = cap;
-            while new_cap < need { new_cap = (new_cap * 2).min(m.max_ctx); }
+            let new_cap = grown(need, m.max_ctx);
             let n = (0..c.n_slot()).filter(|&il| !c.swa[layer_of(c, il)]).count();
-            room(&mut d, 4 * n * new_cap * row_words + sc_bytes(c, new_cap) + (128 << 20));
+            // The margin is the one of `new`: the prompt scratch and the graphs of the reply come after this.
+            let bytes = 4 * n * new_cap * row_words + sc_bytes(c, new_cap) + (512 << 20);
+            room(&mut d, bytes);
+            // The expert cache was not enough: whole layers of experts go, the last loaded first. Their experts
+            // then run through the expert cache or on the CPU, which costs less than a model without its device state.
+            let free = |d: &dev::Dev| d.parts[0].be.mem_info().map_or(0, |m| m.0);
+            if free(&d) < bytes {
+                d.parts[0].be.sync()?;
+                let order: Vec<usize> = (c.loop_start..c.loop_end).chain(0..c.loop_start).chain(c.loop_end..c.n_layer).collect();
+                // Counted here: the driver may report the freed bytes late.
+                let mut short = bytes - free(&d);
+                for &ip in order.iter().rev() {
+                    if short == 0 { break; }
+                    if let Some(fe) = self.layers[ip].full_exps.take() {
+                        // The budget falls too, so the expert cache does not take the room back.
+                        d.parts[0].budget = d.parts[0].budget.saturating_sub(fe.gu.len() + fe.dn.len());
+                        short = short.saturating_sub(fe.gu.len() + fe.dn.len());
+                        self.all_full = false;
+                    }
+                }
+            }
         }
         let be = &*d.parts[0].be;
-        let need_sc = sc_bytes(c, need);
+        // The score buffer follows the K/V rows: it is in the room made above, and a reply does not grow it every 64 tokens.
+        let need_sc = sc_bytes(c, full_cap.map_or(need, |cap| if need > cap { grown(need, m.max_ctx) } else { cap }));
         if self.sc_buf.len() < need_sc {
             be.sync()?;
             self.sc_buf = be.alloc(need_sc)?;
         }
         for (il, s) in self.slots.iter_mut().enumerate() {
             if c.swa[layer_of(c, il)] || need <= s.cap { continue; }
-            let mut new_cap = s.cap;
-            while new_cap < need { new_cap = (new_cap * 2).min(m.max_ctx); }
+            let new_cap = grown(need, m.max_ctx);
             for b in [&mut s.k, &mut s.v] {
                 let new = be.alloc(2 * new_cap * row_words)?;
                 be.dtod(b, 0, &new, 0, b.len())?;
