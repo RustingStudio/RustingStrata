@@ -46,8 +46,11 @@ pub struct Grammar { rules: Vec<Vec<Vec<Elem>>>, root: usize }
 const MAX_CHARS: usize = 64 << 10;
 const MAX_NEST: usize = 64;
 const MAX_ELEMS: usize = 64 << 10;
-/// Expansion steps for one character (`advance`), and for checking every rule start at parse time.
-const STEPS: usize = 10_000;
+/// Expansion budgets: a step costs 1 + the frames of its stack. One token's bytes (`allows`, `accept`), a whole
+/// mask of the vocabulary, and checking every rule start at parse time. A budget that runs out drops the rest of the
+/// stacks, so the grammar stays enforced but may refuse a valid token (only grammars far past what JSON needs).
+const STEPS: usize = 200_000;
+const MASK_STEPS: usize = 50_000_000;
 const CHECK_STEPS: usize = 200_000;
 /// Stacks kept after a character. ponytail: more are dropped (an odd ambiguous grammar may then refuse a valid text).
 const MAX_STACKS: usize = 1024;
@@ -79,7 +82,7 @@ impl Parser {
     }
     /// Counts `n` more elements written out, and fails past `MAX_ELEMS`.
     fn grow(&mut self, n: usize) -> anyhow::Result<()> {
-        self.elems += n;
+        self.elems = self.elems.saturating_add(n);
         ensure!(self.elems <= MAX_ELEMS, "grammar: more than {MAX_ELEMS} elements once repetitions are written out");
         Ok(())
     }
@@ -259,8 +262,8 @@ impl Grammar {
     /// `steps` is the budget of calls left; at 0 the rest is dropped (`parse` refuses a grammar that gets there).
     fn expand(&self, mut st: Vec<(usize, usize, usize)>, depth: usize, steps: &mut usize, out: &mut Vec<Vec<(usize, usize, usize)>>) {
         // ponytail: a depth cut instead of rejecting left recursion when parsing.
-        if depth > 200 || *steps == 0 { *steps = 0; return; }
-        *steps -= 1;
+        if depth > 200 || *steps <= st.len() { *steps = 0; return; }
+        *steps -= 1 + st.len();
         loop {
             let Some(&(r, a, e)) = st.last() else { out.push(st); return };
             match self.rules[r][a].get(e) {
@@ -282,14 +285,14 @@ impl Grammar {
     }
 
     /// The stacks after the character `c`.
-    fn advance(&self, stacks: &[Vec<(usize, usize, usize)>], c: u32) -> Vec<Vec<(usize, usize, usize)>> {
-        let (mut out, mut steps) = (vec![], STEPS);
+    fn advance(&self, stacks: &[Vec<(usize, usize, usize)>], c: u32, steps: &mut usize) -> Vec<Vec<(usize, usize, usize)>> {
+        let mut out = vec![];
         for st in stacks {
             let Some(&(r, a, e)) = st.last() else { continue };
             if let Elem::Chars(neg, rs) = &self.rules[r][a][e] && *neg != rs.iter().any(|&(lo, hi)| (lo..=hi).contains(&c)) {
                 let mut s = st.clone();
                 s.last_mut().unwrap().2 += 1;
-                self.expand(s, 0, &mut steps, &mut out);
+                self.expand(s, 0, steps, &mut out);
             }
         }
         if out.len() > 1 { (out.sort_unstable(), out.dedup()); }
@@ -307,7 +310,7 @@ impl Grammar {
     }
 
     /// The stacks and the unfinished UTF-8 bytes after `bytes`, or None when the grammar does not allow them.
-    fn feed(&self, stacks: &[Vec<(usize, usize, usize)>], part: &[u8], bytes: &[u8]) -> Option<(Vec<Vec<(usize, usize, usize)>>, Vec<u8>)> {
+    fn feed(&self, stacks: &[Vec<(usize, usize, usize)>], part: &[u8], bytes: &[u8], steps: &mut usize) -> Option<(Vec<Vec<(usize, usize, usize)>>, Vec<u8>)> {
         let buf: std::borrow::Cow<[u8]> = if part.is_empty() { bytes.into() } else { [part, bytes].concat().into() };
         let mut cur = std::borrow::Cow::Borrowed(stacks);
         let mut i = 0;
@@ -329,7 +332,7 @@ impl Grammar {
                 return (lo <= hi && self.may(&cur, lo, hi)).then(|| (cur.into_owned(), buf[i..].to_vec()));
             }
             if c < least || c > 0x10ffff || (0xd800..0xe000).contains(&c) { return None; }
-            cur = self.advance(&cur, c).into();
+            cur = self.advance(&cur, c, steps).into();
             if cur.is_empty() { return None; }
             i += n;
         }
@@ -385,19 +388,22 @@ impl Constraint {
 
     /// Whether the grammar allows token `t` next: an end-of-turn token only once the grammar is complete, a special
     /// token never.
-    pub fn allows(&self, t: u32) -> bool {
+    pub fn allows(&self, t: u32) -> bool { self.allows_in(t, &mut STEPS.clone()) }
+
+    fn allows_in(&self, t: u32, steps: &mut usize) -> bool {
         let Some(m) = &self.gram else { return true };
         if self.eos.contains(&t) { return m.part.is_empty() && m.stacks.iter().any(Vec::is_empty); }
         let b = m.bytes.get(t as usize).map_or(&[][..], Vec::as_slice);
-        !b.is_empty() && m.g.feed(&m.stacks, &m.part, b).is_some()
+        !b.is_empty() && m.g.feed(&m.stacks, &m.part, b, steps).is_some()
     }
 
     /// Sets the logits of the tokens the grammar does not allow to -inf.
     /// ponytail: one walk of the whole vocabulary (about 10 ms for 150K tokens); a token trie if that matters.
     pub fn mask(&self, l: &mut [f32]) {
         if self.gram.is_none() { return; }
+        let mut steps = MASK_STEPS;
         for (t, x) in l.iter_mut().enumerate() {
-            if *x != f32::NEG_INFINITY && !self.allows(t as u32) { *x = f32::NEG_INFINITY; }
+            if *x != f32::NEG_INFINITY && !self.allows_in(t as u32, &mut steps) { *x = f32::NEG_INFINITY; }
         }
     }
 
@@ -412,7 +418,7 @@ impl Constraint {
         let Some(m) = &mut self.gram else { return };
         if self.eos.contains(&t) { return; }
         let b = m.bytes.get(t as usize).map_or(&[][..], Vec::as_slice);
-        (m.stacks, m.part) = m.g.feed(&m.stacks, &m.part, b).unwrap_or_default();
+        (m.stacks, m.part) = m.g.feed(&m.stacks, &m.part, b, &mut STEPS.clone()).unwrap_or_default();
     }
 }
 
@@ -435,12 +441,12 @@ mod tests {
     /// Whether the grammar takes `s` whole.
     fn full(g: &Grammar, s: &str) -> bool {
         let st = g.start();
-        match g.feed(&st, &[], s.as_bytes()) { Some((st, part)) => part.is_empty() && st.iter().any(Vec::is_empty), None => false }
+        match g.feed(&st, &[], s.as_bytes(), &mut STEPS.clone()) { Some((st, part)) => part.is_empty() && st.iter().any(Vec::is_empty), None => false }
     }
     /// Whether `s` can start a text the grammar takes.
     fn prefix(g: &Grammar, s: &str) -> bool {
         let st = g.start();
-        g.feed(&st, &[], s.as_bytes()).is_some()
+        g.feed(&st, &[], s.as_bytes(), &mut STEPS.clone()).is_some()
     }
 
     // llama.cpp grammars/json.gbnf.
@@ -502,12 +508,12 @@ item ::= "- " [^\r\n\x0b\x0c\x85  ]+ "\n"
         assert!(!prefix(&g, "hello"));
         // A character split across tokens: the start of "é" is allowed inside a string, not after "{".
         let st = g.start();
-        let (s1, p) = g.feed(&st, &[], b"{\"").unwrap();
+        let (s1, p) = g.feed(&st, &[], b"{\"", &mut STEPS.clone()).unwrap();
         assert!(p.is_empty());
-        let (s2, p) = g.feed(&s1, &[], &[0xc3]).unwrap();
+        let (s2, p) = g.feed(&s1, &[], &[0xc3], &mut STEPS.clone()).unwrap();
         assert_eq!(p, [0xc3]);
-        assert!(g.feed(&s2, &p, &[0xa9]).is_some_and(|(_, p)| p.is_empty()));
-        assert!(g.feed(&st, &[], b"{\xc3").is_none());
+        assert!(g.feed(&s2, &p, &[0xa9], &mut STEPS.clone()).is_some_and(|(_, p)| p.is_empty()));
+        assert!(g.feed(&st, &[], b"{\xc3", &mut STEPS.clone()).is_none());
     }
 
     #[test]
@@ -540,6 +546,9 @@ item ::= "- " [^\r\n\x0b\x0c\x85  ]+ "\n"
         let blow: String = (0..40).map(|i| format!("r{i} ::= r{} r{} | \"\"\n", i + 1, i + 1)).collect();
         assert!(Grammar::parse(&format!("root ::= r0\n{blow}r40 ::= \"y\"")).is_err());
         assert!(Grammar::parse(&"a".repeat(MAX_CHARS + 1)).is_err());
+        // Stacks that grow with the text spend the budget by their depth and end (refused) instead of running on.
+        let g = Grammar::parse("root ::= \"a\" root \"b\" | \"\"").unwrap();
+        assert!(full(&g, &format!("{}{}", "a".repeat(50), "b".repeat(50))) && !prefix(&g, &"a".repeat(5000)));
     }
 
     #[test]
