@@ -1029,7 +1029,7 @@ impl<'a> Inkling2Model<'a> {
                     return out;
                 }
                 Err(e) => {
-                    eprintln!("inkling2: no room in VRAM for the decode state ({e:#}); the tokens run as prompt chunks do");
+                    crate::say!("inkling2: no room in VRAM for the decode state ({e:#}); the tokens run as prompt chunks do");
                     d.to_host(&self.cfg, &self.layers, &mut self.slots, pos, self.max_ctx);
                     self.no_device = true;
                 }
@@ -1078,13 +1078,13 @@ impl<'a> Inkling2Model<'a> {
                         return res;
                     }
                     Err(e) => {
-                        eprintln!("inkling2: GPU verify failed ({e:#}); falling back to host");
+                        crate::say!("inkling2: GPU verify failed ({e:#}); falling back to host");
                         d.to_host(&self.cfg, &self.layers, &mut self.slots, pos0, self.max_ctx);
                         self.no_device = true;
                     }
                 },
                 Err(e) => {
-                    eprintln!("inkling2: no room in VRAM for verify ({e:#}); falling back to host");
+                    crate::say!("inkling2: no room in VRAM for verify ({e:#}); falling back to host");
                     d.to_host(&self.cfg, &self.layers, &mut self.slots, pos0, self.max_ctx);
                     self.no_device = true;
                 }
@@ -1317,13 +1317,14 @@ impl<'a> Inkling2Model<'a> {
                                         ds.inject_subset(pos0, c.len(), c.len(), f);
                                     }
                                     done += c.len();
+                                    crate::term::prefilled(c.len());
                                     if want { logits = l; }
                                 }
                                 Err(e) => { failed = Some(e); break; }
                             }
                         }
                         if let Some(e) = failed {
-                            eprintln!("inkling2: GPU prefill failed ({e:#}); falling back to host chunk path");
+                            crate::say!("inkling2: GPU prefill failed ({e:#}); falling back to host chunk path");
                             let pos = self.toks.len();
                             d.to_host(&self.cfg, &self.layers, &mut self.slots, pos, self.max_ctx);
                             self.no_device = true;
@@ -1339,7 +1340,7 @@ impl<'a> Inkling2Model<'a> {
                         return logits;
                     }
                     Err(e) => {
-                        eprintln!("inkling2: no room in VRAM for prefill ({e:#}); falling back to host chunk path");
+                        crate::say!("inkling2: no room in VRAM for prefill ({e:#}); falling back to host chunk path");
                         let pos = self.toks.len();
                         d.to_host(&self.cfg, &self.layers, &mut self.slots, pos, self.max_ctx);
                         self.no_device = true;
@@ -1350,7 +1351,7 @@ impl<'a> Inkling2Model<'a> {
         let mut chunk = env_chunk.unwrap_or(512);
         if dump_or_trace { chunk = 1; }
         let mut logits = vec![];
-        for (i, c) in seq.chunks(chunk.max(1)).enumerate() { logits = self.run_seq(c, (i + 1) * chunk.max(1) >= seq.len()); }
+        for (i, c) in seq.chunks(chunk.max(1)).enumerate() { logits = self.run_seq(c, (i + 1) * chunk.max(1) >= seq.len()); crate::term::prefilled(c.len()); }
         if let Some(ng) = &mut self.ngram { ng.begin(&self.toks); }
         logits
     }

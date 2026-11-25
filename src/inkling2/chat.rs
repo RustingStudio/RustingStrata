@@ -309,6 +309,7 @@ pub fn decode_with(
             }
         }
         i += 1;
+        crate::term::decoded(1);
         if part == Some(Part::Think)
             && thinking_budget > 0
             && think_tokens >= thinking_budget
@@ -398,6 +399,7 @@ pub fn generate_image_opts(
     for i in 0..max_gen {
         if eos.contains(&next) { break; }
         out.push(next);
+        crate::term::decoded(1);
         let s = tok.decode(&out).unwrap_or_default();
         if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
             print!("{}", &s[shown..]);

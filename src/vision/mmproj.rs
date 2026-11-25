@@ -228,7 +228,7 @@ pub fn find_sibling(model: &Path) -> Option<std::path::PathBuf> {
     found.sort();
     found.into_iter().find(|p| match ClipModel::open(p) {
         Ok(_) => true,
-        Err(e) => { eprintln!("note: skipping {}: {e:#}", p.display()); false }
+        Err(e) => { crate::say!("note: skipping {}: {e:#}", p.display()); false }
     })
 }
 

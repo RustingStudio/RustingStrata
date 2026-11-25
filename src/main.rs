@@ -242,7 +242,7 @@ impl Runner<'_> {
     /// Feed a prompt; returns the logits after its last token.
     fn prefill(&mut self, ts: &[u32]) -> anyhow::Result<Vec<f32>> {
         match self {
-            Runner::Cpu(m, st) => Ok(ts.iter().map(|&t| m.step(st, t)).last().unwrap_or_default()),
+            Runner::Cpu(m, st) => Ok(ts.iter().map(|&t| { let l = m.step(st, t); term::prefilled(1); l }).last().unwrap_or_default()),
             Runner::Gpu(g) => g.prefill(ts),
             Runner::Slot(_) | Runner::Own(_) => anyhow::bail!("prefill on a slot or a model outside the main engine"),
         }
@@ -1643,6 +1643,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Chat { model, system, n, image, mut engine } => {
             let think = engine.think_default;
+            term::live(false);
             engine.own_calib(&model);
             engine.ds_env();
             let g = Gguf::open(&model)?;
@@ -1717,6 +1718,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 if stdin.lock().read_line(&mut line)? == 0 { break; }
                 if line.trim().is_empty() { continue; }
                 msgs.push(Msg::new("user", line.trim_end()));
+                let _live = term::Live::start();
                 let prompt = tpl.render(&msgs, &[], think, engine.preserve_thinking, true);
                 let (ids, logits) = match &image_input {
                     Some(input) => {
@@ -1747,6 +1749,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Serve { model, models_dir, addr, api_key, mcp, open, host, mut engine } => {
             rusting_strata::update::notice();
+            term::live(true);
             engine.ds_env();
             anyhow::ensure!(host.auto_unload != Some(0), "--auto-unload must be at least 1 second");
             engine.parallel = host.parallel;
@@ -2982,6 +2985,7 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
             if eos.contains(&t) { stopped = true; break 'outer; }
             if out.len() == n { break; }
             out.push(t);
+            term::decoded(1);
             let s = tok.decode(&out[start..])?;
             if !s.ends_with('\u{fffd}') {
                 if budget > 0 && !saw_close {
@@ -3848,6 +3852,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let anth = p == "/v1/messages";
             let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
             if anth && anthropic_refused(&mut w, &l.r) { return Ok(()); }
+            let _live = term::Live::start();
             let (r, tok, tpl, name) = (&mut l.r, &l.tok, l.tpl, l.name.as_str());
             match r { Runner::Gpu(g) => g.owner = who.id, Runner::Slot(c) => (c.owner, c.conn) = (who.id, w.try_clone().ok()), _ => {} }
             let mut req = match if anth { serve::messages_body(&body) } else { Ok(body.clone()) }.and_then(|b| serve::chat_request(&b)) {

@@ -93,6 +93,7 @@ fn decode(m: &mut KolibriModel, tok: &Tokenizer, mut logits: Vec<f32>, n: usize,
         let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
         if eos.contains(&next) { return (out, true); }
         out.push(next);
+        crate::term::decoded(1);
         let s = tok.decode(&out).unwrap_or_default();
         if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
             if !piece(&s[shown..]) { break; }

@@ -253,6 +253,7 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
         if let Some(&f) = forced.get(i) { next = f; }
         if eos.contains(&next) { break; }
         out.push(next);
+        crate::term::decoded(1);
         let s = tok.decode(&out)?;
         if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
             print!("{}", &s[shown..]);
@@ -345,6 +346,7 @@ fn decode_greedy(m: &mut forward::GlmModel, tok: &crate::tokenizer::Tokenizer, e
         let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
         if eos.contains(&next) { done = "stop"; break; }
         out.push(next);
+        crate::term::decoded(1);
         let s = tok.decode(&out).unwrap_or_default();
         if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
             let ok = emit(&s[shown..]);

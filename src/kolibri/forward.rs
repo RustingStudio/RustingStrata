@@ -549,7 +549,7 @@ impl<'a> KolibriModel<'a> {
         let Some((&last, head)) = toks.split_last() else { return vec![] };
         let dump = self.trace || std::env::var_os("STRATA_DS_DUMP").is_some();
         let chunk: usize = std::env::var("STRATA_DS_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(if dump { 1 } else { 1024 });
-        for c in head.chunks(chunk.max(1)) { self.forward(c, false); }
+        for c in head.chunks(chunk.max(1)) { self.forward(c, false); crate::term::prefilled(c.len()); }
         self.step(last)
     }
 

@@ -172,7 +172,7 @@ impl Gpu {
         let rtc = ffi::Rtc::get().map_err(|e| anyhow::anyhow!("{e}")).context("HIP init").context("hiprtc is required to compile the kernels")?;
         let (maj, min) = rtc.version();
         let tag = format!("{maj}.{min}");
-        eprintln!("hip: {} ({arch}, wave{warp}, {} B shared memory a block)",
+        crate::say!("hip: {} ({arch}, wave{warp}, {} B shared memory a block)",
                   hip.device_name(device as i32), max_smem);
         let src = source(kv_q8);
         let obj = compile_cached(rtc, &src, &arch, &tag)?;
@@ -442,7 +442,7 @@ fn compile_cached(rtc: &ffi::Rtc, src: &str, arch: &str, tag: &str) -> anyhow::R
         .join("rusting_strata");
     let path = dir.join(format!("{:016x}.amdgcn", cache_key(src, arch, tag)));
     if let Ok(b) = std::fs::read(&path) { return Ok(b) }
-    eprintln!("compiling HIP kernels for {arch} with hiprtc {tag} (first run only)");
+    crate::say!("compiling HIP kernels for {arch} with hiprtc {tag} (first run only)");
     let b = rtc.compile(src, "kernels.cu", arch, &[])?;
     let _ = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &b));
     Ok(b)

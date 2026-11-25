@@ -398,7 +398,7 @@ impl Vk {
             unsafe { instance.destroy_instance(None) };
             return Err(anyhow!("no usable Vulkan device {device} ({} usable; {})", usable.len(), why.join("; "))).context("Vulkan init");
         };
-        eprintln!("vulkan device {device}: {name}");
+        crate::say!("vulkan device {device}: {name}");
         // ponytail: the instance leaks if device setup below fails; it is a one-time startup error.
         let mut sg = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
         unsafe { instance.get_physical_device_properties2(pd, &mut vk::PhysicalDeviceProperties2::default().push_next(&mut sg)) };
@@ -441,7 +441,7 @@ impl Vk {
         };
         if amd_coherent { exts.push(ash::amd::device_coherent_memory::NAME.as_ptr()) }
         let amd_plain = !amd_coherent && unsafe { instance.get_physical_device_properties(pd) }.vendor_id == 0x1002;
-        if amd_plain { eprintln!("warning: this AMD GPU has no VK_AMD_device_coherent_memory; experts on the CPU will make decode slow (the GPU \
+        if amd_plain { crate::say!("warning: this AMD GPU has no VK_AMD_device_coherent_memory; experts on the CPU will make decode slow (the GPU \
             does not see the CPU worker's answers in time)"); }
         let mut fcr = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
         let cond = has(ash::ext::conditional_rendering::NAME) && std::env::var_os("STRATA_VK_NO_COND").is_none() && {
@@ -531,7 +531,7 @@ impl Vk {
         v.htod(&t, &v.2, 0)?;
         if v.0.cr.is_some() && !v.cond_test()? {
             v.0.st().no_cond = true;
-            eprintln!("note: Vulkan conditional rendering failed its self-test; a CPU expert worker that is slow on \
+            crate::say!("note: Vulkan conditional rendering failed its self-test; a CPU expert worker that is slow on \
                 a layer will be an error");
         }
         // One line with what the device has, so a pasted bug report shows it.
@@ -541,9 +541,9 @@ impl Vk {
         let yn = |b: bool| if b { "yes" } else { "no" };
         let amd = if v.0.amd_plain || v.0.amd_coherent { format!(", device-coherent memory {}", yn(v.0.amd_coherent)) } else { String::new() };
         let i8_s = match v.0.coop_i8 { 32 => "yes (16x16x32)", 16 => "yes (16x16x16)", _ => "no" };
-        eprintln!("vulkan: {name} ({} {}){amd}, cooperative matrix f16 {} int8 {i8_s}, conditional rendering {}, maxComputeSharedMemorySize {}",
+        crate::say!("vulkan: {name} ({} {}){amd}, cooperative matrix f16 {} int8 {i8_s}, conditional rendering {}, maxComputeSharedMemorySize {}",
             s(&drv.driver_name), s(&drv.driver_info), yn(v.0.coop), yn(v.0.cr.is_some() && !v.0.st().no_cond), v.0.smem_limit);
-        if !v.0.coop { eprintln!("vulkan: prefill attention: {} (no cooperative matrices)", if v.0.dp_tile { "tiled" } else { "per-query" }); }
+        if !v.0.coop { crate::say!("vulkan: prefill attention: {} (no cooperative matrices)", if v.0.dp_tile { "tiled" } else { "per-query" }); }
         Ok(v)
     }
 

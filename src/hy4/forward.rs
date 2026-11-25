@@ -779,7 +779,7 @@ impl<'a> Hy4Model<'a> {
         let Some((&last, head)) = toks.split_last() else { return vec![] };
         let chunk: usize = std::env::var("STRATA_DS_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
         if chunk > 1 && !self.trace && std::env::var_os("STRATA_DS_DUMP").is_none() {
-            for c in head.chunks(chunk) { self.prefill_chunk(c); }
+            for c in head.chunks(chunk) { self.prefill_chunk(c); crate::term::prefilled(c.len()); }
         } else {
             for &t in head { self.step_opt(t, false); }
         }

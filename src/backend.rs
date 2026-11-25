@@ -84,7 +84,7 @@ pub fn open(kind: Option<&str>, device: usize) -> anyhow::Result<Box<dyn Backend
             Ok(g) => Ok(Box::new(g)),
             Err(c) if format!("{c}") == "CUDA init" => {
                 let v = crate::vulkan::Vk::new(device).map_err(|v| anyhow::anyhow!("no GPU backend loads: CUDA: {c:#}; Vulkan: {v:#}"))?;
-                eprintln!("CUDA unavailable ({c:#}), using Vulkan");
+                crate::say!("CUDA unavailable ({c:#}), using Vulkan");
                 Ok(Box::new(v))
             }
             Err(c) => Err(c),

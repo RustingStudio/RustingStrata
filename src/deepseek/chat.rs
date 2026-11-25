@@ -21,6 +21,7 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
         let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
         if eos.contains(&next) { break; }
         out.push(next);
+        crate::term::decoded(1);
         let s = tok.decode(&out)?;
         if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
             print!("{}", &s[shown..]);
@@ -65,6 +66,7 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
             let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
             if eos.contains(&next) { break; }
             out.push(next);
+            crate::term::decoded(1);
             let s = tok.decode(&out)?;
             if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
                 print!("{}", &s[shown..]);
@@ -114,6 +116,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str) -> anyhow::Resu
             let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
             if eos.contains(&next) { done = "stop"; break; }
             out.push(next);
+            crate::term::decoded(1);
             let s = tok.decode(&out).unwrap_or_default();
             if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
                 let t = hold.push(&s[shown..]);

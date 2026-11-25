@@ -295,7 +295,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a crate::tokenizer::Tokenizer, name: &'a st
                 m.reset();
                 // The head of a stream is out, so the error is its last line (a response with a status cannot follow).
                 if !q.stream { return Err(e); }
-                eprintln!("request: {e:#}");
+                crate::say!("request: {e:#}");
                 let _ = write!(c, "data: {}\n\n", json!({"error": {"message": format!("{e:#}"), "type": "server_error"}}));
                 return Ok(crate::serve::Done { prompt: ids.len(), cached: keep, completion: 0, prefill_s: t.elapsed().as_secs_f64(), finish: "error" });
             }
@@ -338,6 +338,7 @@ fn decode_greedy(
         let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
         if stop.contains(&next) { done = "stop"; break; }
         out.push(next);
+        crate::term::decoded(1);
         let s = tok.decode(&out).unwrap_or_default();
         if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
             let ok = emit(&s[shown..]);
