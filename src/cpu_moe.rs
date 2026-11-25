@@ -1557,7 +1557,18 @@ pub fn experts_multi(m: &Model, il: usize, hs: &[Vec<f32>], sels: &[Vec<(usize, 
     let mut ys = vec![vec![0f32; c.n_embd]; hs.len()];
     // (token, expert, weight) of every routed expert, in token and router order.
     let pairs: Vec<(usize, usize, f32)> = sels.iter().enumerate().flat_map(|(t, s)| s.iter().map(move |&(e, w)| (t, e, w))).collect();
-    if pairs.is_empty() { return ys; }
+    let o = expert_rows(m, il, hs, &pairs);
+    for (oj, &(t, _, w)) in o.chunks_exact(c.n_embd).zip(&pairs) {
+        for (yy, oo) in ys[t].iter_mut().zip(oj.iter()) { *yy += w * oo; }
+    }
+    ys
+}
+
+/// The output of each (token, expert, _) pair of layer `il`, unweighted, as rows of n_embd in pair order: the experts
+/// of every pair in the two parallel passes of `experts_multi`.
+pub fn expert_rows(m: &Model, il: usize, hs: &[Vec<f32>], pairs: &[(usize, usize, f32)]) -> Vec<f32> {
+    let c = &m.cfg;
+    if pairs.is_empty() { return vec![]; }
     let t = |s: &str| m.w.layer(il, s).unwrap_or_else(|e| panic!("{e:#}"));
     let (gate, up, down) = (t("ffn_gate_exps.weight"), t("ffn_up_exps.weight"), t("ffn_down_exps.weight"));
     let (n, ff, k) = (c.n_expert, c.n_ff_exp, pairs.len());
@@ -1578,11 +1589,10 @@ pub fn experts_multi(m: &Model, il: usize, hs: &[Vec<f32>], sels: &[Vec<(usize, 
     let ds: Vec<Tensor> = pairs.iter().map(|&(_, e, _)| down.expert(e, n)).collect();
     let mut o = vec![0f32; k * c.n_embd];
     batch_rows(&ds, &racts.as_ref().unwrap_or(&acts).iter().map(|v| v.as_slice()).collect::<Vec<_>>(), &mut o);
-    for (j, (oj, &(t, e, w))) in o.chunks_exact_mut(c.n_embd).zip(&pairs).enumerate() {
+    for (j, (oj, &(_, e, _))) in o.chunks_exact_mut(c.n_embd).zip(pairs).enumerate() {
         m.lora_delta(&format!("blk.{il}.ffn_down_exps.weight"), &acts[j], oj, Some(e));
-        for (yy, oo) in ys[t].iter_mut().zip(oj.iter()) { *yy += w * oo; }
     }
-    ys
+    o
 }
 
 #[cfg(test)]

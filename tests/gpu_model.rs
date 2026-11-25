@@ -758,7 +758,13 @@ fn batch_matches_single() {
     let tok = Tokenizer::from_gguf(&g).unwrap();
     let prompts: Vec<Vec<u32>> = ["The capital of France is", "def fib(n):\n    return", "Once upon a time, in a small village by the sea, there",
                                   "2 + 2 =", "The quick brown fox", "import numpy as np\n"].iter().map(|s| tok.encode(s).unwrap()).collect();
-    let Ok(gpu) = rusting_strata::cuda::Gpu::new(0) else { return };
+    // 64 slots: a step of 64 rows takes gemmd's full-tile path, the last step (63 rows) its other wide one.
+    let prompts: Vec<Vec<u32>> = prompts.iter().cycle().take(64).cloned().collect();
+    let gpu = match rusting_strata::cuda::Gpu::new(0) {
+        Ok(g) => g,
+        Err(e) if e.to_string().contains("NVRTC") => panic!("{e}"),
+        Err(_) => return,
+    };
     let mut gm = GpuModel::load_slots(&m, Box::new(gpu), 256, 64, 512 << 20, prompts.len()).unwrap();
     if gm.batch_cap() == 0 { eprintln!("batch_matches_single: no step_batch for this model, skipped"); return; }
     const STEPS: usize = 6;

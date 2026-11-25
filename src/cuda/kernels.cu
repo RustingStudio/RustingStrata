@@ -487,6 +487,21 @@ template <> struct QI<14> {  // Q6_K (210 bytes: rows 2-aligned)
         lo = (int)__vsub4(a, 0x20202020u); hi = (int)__vsub4(c, 0x20202020u);
     }
 };
+// Q6_K, half n of a super-block for lane t (gemmd): the ql bytes of blocks 0, 2 and of 1, 3, the qh bytes, the 8
+// scales of the half and d. Block qt decodes as QI<14>::get(b, 4 (4 n + qt) + t).
+struct H6 { uint2 l0, l1, h, s; u32 d; };
+__device__ __forceinline__ void h6_ld(const u8* b, int n, int t, H6& r) {
+    r.l0 = ld8a2(b + 64 * n + 8 * t); r.l1 = ld8a2(b + 64 * n + 32 + 8 * t); r.h = ld8a2(b + 128 + 32 * n + 8 * t);
+    r.s = ld8a2(b + 192 + 8 * n); r.d = ld16(b + 208);
+}
+__device__ __forceinline__ void h6_get(const H6& r, int qt, int t, int& lo, int& hi, float& d) {
+    const uint2 L = qt & 1 ? r.l1 : r.l0;
+    const int ns = 4 * (qt >> 1), hs = 2 * qt, j = (t >> 1) + 2 * qt;
+    d = h2f((u16)r.d) * (float)(signed char)(((j & 4 ? r.s.y : r.s.x) >> (8 * (j & 3))) & 0xFF);
+    u32 a = ((L.x >> ns) & 0x0F0F0F0Fu) | (((r.h.x >> hs) & 0x03030303u) << 4);
+    u32 c = ((L.y >> ns) & 0x0F0F0F0Fu) | (((r.h.y >> hs) & 0x03030303u) << 4);
+    lo = (int)__vsub4(a, 0x20202020u); hi = (int)__vsub4(c, 0x20202020u);
+}
 // IQ1: weight = dl * (g +- 1/8) = (dl / 8) * (8 g +- 1), an exact int8 in {-9, -7, -1, 1, 7, 9}.
 template <int T> struct QI1 {
     static constexpr bool MIN = false;
@@ -1637,15 +1652,17 @@ ITYPES(DEF_GEMMI)
 // the count of blocks done for these rows, over all launches) adds the other's and writes y. a + b is b + a, so the
 // result does not depend on which block that is.
 #define GEMMD_XW(pb) ((pb) >= 32 ? 128 : 4096 / (pb))
-template <int T, int SBB>
-__device__ __forceinline__ void gemmd_q(const u8* w, const u8* __restrict__ x, int nd, int pb, int ks, float* scr, int* flag,
-                                        float* y, int y_stride, int rows, int cols, int act, float sc) {
+// XW: the window width when it is known at compile time (its pitch then makes the x loads' offsets immediates), else 0.
+// FULL: 64 positions, so every one of the 8 tiles has positions (no test a tile).
+template <int T, int SBB, int XW, bool FULL = false>
+__device__ __forceinline__ void gemmd_qx(const u8* w, const u8* __restrict__ x, int nd, int pb, int ks, float* scr, int* flag,
+                                         float* y, int y_stride, int rows, int cols, int act, float sc) {
     // One window: pb rows of xw + 32 int8 (the pitch puts two lanes on a bank, the least an 8-byte load allows),
     // then xw / 32 scales and xw / 16 sums per row. Two windows, then pk.
     extern __shared__ __align__(16) signed char gemmd_s[];
     int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     int seg = blockIdx.x % ks, rb = blockIdx.x / ks, bs = blockDim.x, ts = tid;
-    int xw = GEMMD_XW(pb), lx = 31 - __clz(xw), pitch = xw + 32, od = pb * pitch, os = od + pb * (xw >> 3), xb_ = os + pb * (xw >> 2);
+    int xw = XW ? XW : GEMMD_XW(pb), lx = 31 - __clz(xw), pitch = xw + 32, od = pb * pitch, os = od + pb * (xw >> 3), xb_ = os + pb * (xw >> 2);
     int nq = cols / 32, qw = xw >> 5, nwin = (cols + xw - 1) >> lx, nws = (nwin + ks - 1) / ks, w0 = seg * nws;
     signed char* gx = gemmd_s;
     float* pk = (float*)(gx + 2 * xb_);  // per (position pair, 32 columns): d0, d1, s0, s1, then the four half sums
@@ -1700,10 +1717,23 @@ __device__ __forceinline__ void gemmd_q(const u8* w, const u8* __restrict__ x, i
             oda = __shfl_xor_sync(0xffffffffu, wda, 2); odb = __shfl_xor_sync(0xffffffffu, wdb, 2);
             if (QI<T>::MIN) { oma = __shfl_xor_sync(0xffffffffu, wma, 2); omb = __shfl_xor_sync(0xffffffffu, wmb, 2); }
         }
+        // Scale per 16: a 16-deep mma per half h, its A fragment in the mma's own order (lane t: columns 16 h + 4 t ..,
+        // which lane 2 h + t / 2 holds), so no lane is zero. The integer sums are the same as with 32-deep mmas.
+        u32 n0[2] = {0, 0}, n1[2] = {0, 0};
+        if (KS == 16) {
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int src = (lane & ~3) | (2 * h + (t >> 1));
+                const u32 l0 = __shfl_sync(0xffffffffu, a0, src), h0 = __shfl_sync(0xffffffffu, a2, src);
+                const u32 l1 = __shfl_sync(0xffffffffu, a1, src), h1 = __shfl_sync(0xffffffffu, a3, src);
+                n0[h] = t & 1 ? h0 : l0; n1[h] = t & 1 ? h1 : l1;
+            }
+        }
         #pragma unroll
         for (int pt = 0; pt < 8; pt++) {  // 8 positions an mma
-            if (pt >= npt) break;
-            const uint2 bx = *(const uint2*)(xb + (pt * 8 + g) * pitch + kw * 32 + 8 * t);
+            if (!FULL && pt >= npt) break;
+            const signed char* xp = xb + (pt * 8 + g) * pitch + kw * 32;
+            const uint2 bx = KS == 32 ? *(const uint2*)(xp + 8 * t) : make_uint2(*(const u32*)(xp + 4 * t), *(const u32*)(xp + 16 + 4 * t));
             const float* o = pk + (kw * (pb >> 1) + pt * 4 + t) * 8;
             float dx[2], s32[2] = {0.f, 0.f};
             float2 sx[2] = {make_float2(0.f, 0.f), make_float2(0.f, 0.f)};
@@ -1716,7 +1746,8 @@ __device__ __forceinline__ void gemmd_q(const u8* w, const u8* __restrict__ x, i
             for (int h = 0; h < 32 / KS; h++) {
                 const bool mine = KS == 32 || (t >> 1) == h;
                 int c[4];
-                mma_s8_16832_b(c, mine ? a0 : 0, mine ? a1 : 0, mine ? a2 : 0, mine ? a3 : 0, bx.x, bx.y);
+                if (KS == 32) mma_s8_16832_b(c, a0, a1, a2, a3, bx.x, bx.y);
+                else mma_s8_16816_b(c, n0[h], n1[h], h ? bx.y : bx.x);
                 const float dw[2] = {mine ? wda : oda, mine ? wdb : odb}, mw[2] = {mine ? wma : oma, mine ? wmb : omb};
                 #pragma unroll
                 for (int i = 0; i < 4; i++) {
@@ -1745,11 +1776,15 @@ __device__ __forceinline__ void gemmd_q(const u8* w, const u8* __restrict__ x, i
         if (hdr) { sa_ = *(const uint4*)(pa + o); sb_ = *(const uint4*)(pb_ + o); }
         ua = *(const uint2*)(pa + o + j); ub = *(const uint2*)(pb_ + o + j);
     };
+    // Q6_K: a half super-block (128 columns: a window holds whole ones) is loaded at once, the next during this one.
+    const bool k6 = T == 14 && cols % 256 == 0;
+    H6 h6a, h6b;
+    auto ld6 = [&](int hf) { size_t o = (size_t)(hf >> 1) * 210; h6_ld(pa + o, hf & 1, t, h6a); h6_ld(pb_ + o, hf & 1, t, h6b); };
     ldx(0);
     cp_async_wait<0>();
     __syncthreads();
     pack(0);
-    if (live && w0 * qw < nq) { if (k4) ldp(w0 * qw / 2, true); else dec(w0 * qw); }
+    if (live && w0 * qw < nq) { if (k4) ldp(w0 * qw / 2, true); else if (k6) ld6(w0 * qw / 4); else dec(w0 * qw); }
     for (int wi = 0; wi < nws; wi++) {
         if (wi + 1 < nws) ldx(wi + 1);  // into the buffer of window wi - 1: every thread passed the barrier below
         xb = gx + (wi & 1) * xb_;
@@ -1772,6 +1807,17 @@ __device__ __forceinline__ void gemmd_q(const u8* w, const u8* __restrict__ x, i
                     const float wdb = __shfl_sync(0xffffffffu, sdb, from), wmb = __shfl_sync(0xffffffffu, smb, from);
                     blk(2 * p + h - qa, (va.x >> (4 * h)) & 0x0F0F0F0Fu, (vb.x >> (4 * h)) & 0x0F0F0F0Fu,
                         (va.y >> (4 * h)) & 0x0F0F0F0Fu, (vb.y >> (4 * h)) & 0x0F0F0F0Fu, wda, wma, wdb, wmb);
+                }
+            }
+        } else if (live && k6) {
+            for (int hf = qa / 4; hf < q1 / 4; hf++) {
+                const H6 ca = h6a, cb = h6b;
+                if (hf + 1 < nq / 4) ld6(hf + 1);
+                #pragma unroll
+                for (int qt = 0; qt < 4; qt++) {
+                    int a0, a1, a2, a3; float wda, wdb;
+                    h6_get(ca, qt, t, a0, a2, wda); h6_get(cb, qt, t, a1, a3, wdb);
+                    blk(4 * hf + qt - qa, a0, a1, a2, a3, wda, 0.f, wdb, 0.f);
                 }
             }
         } else if (live) {
@@ -1825,7 +1871,9 @@ __device__ __forceinline__ void gemmd_q(const u8* w, const u8* __restrict__ x, i
 #define DEF_GEMMD(T, NAME, SBB)                                                                                    \
     extern "C" __global__ void __launch_bounds__(256, 2) gemmd_##NAME(const u8* w, const u8* x, int nd, int pb,        \
             int ks, float* scr, int* flag, float* y, int y_stride, int rows, int cols, int act, float sc) {       \
-        gemmd_q<T, SBB>(w, x, nd, pb, ks, scr, flag, y, y_stride, rows, cols, act, sc);                           \
+        if (nd == 64) gemmd_qx<T, SBB, GEMMD_XW(32), true>(w, x, nd, pb, ks, scr, flag, y, y_stride, rows, cols, act, sc); \
+        else if (pb >= 32) gemmd_qx<T, SBB, GEMMD_XW(32)>(w, x, nd, pb, ks, scr, flag, y, y_stride, rows, cols, act, sc); \
+        else gemmd_qx<T, SBB, 0>(w, x, nd, pb, ks, scr, flag, y, y_stride, rows, cols, act, sc);                   \
     }
 ITYPES(DEF_GEMMD)
 #endif
@@ -2654,7 +2702,7 @@ extern "C" __global__ void kv_store(const float* k, const float* v, u16* kc, u16
     if (i < total) { kv_put(kc, (size_t)pos * n + i, hd, k[i]); kv_put(vc, (size_t)pos * n + i, hd, v[i]); }
 }
 
-// grid = rows (heads of n), block 256: rms_norm (out rows of n) then rope_neox of the head, in one launch with the same
+// grid = rows (heads of n), block 256 (or 128 when n <= 128): rms_norm (out rows of n) then rope_neox of the head, in one launch with the same
 // bits. Head r belongs to token r / per. With kc, then kv_store of the head and its v (v rows of n, like out).
 // Blocks below qrows do the q heads (from qx etc., no cache store); the rest do x etc.
 __device__ __forceinline__ double rope_f(float base, int i, int n_rot) { return pow((double)base, -2.0 * i / n_rot); }
@@ -2662,11 +2710,21 @@ __device__ __forceinline__ double rope_f(float base, int i, int n_rot) { return 
 extern "C" __global__ void rope_freq(double* fr, float base, int n_rot) {
     for (int i = threadIdx.x; i < n_rot / 2; i += blockDim.x) fr[i] = rope_f(base, i, n_rot);
 }
-// fr: the rope_freq table of base and n_rot, or null to compute it here.
+// cs[t * (n_rot / 2) + i] = (sin, cos) of angle i of token t, as rms_norm_rope computes them (tok and pos as there):
+// once a token instead of once a head (the f64 sincos is slow on consumer cards).
+extern "C" __global__ void rope_cs(float2* cs, const int* step, const u64* kvt, int nt, int n_rot, const double* fr) {
+    int half = n_rot / 2, e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= nt * half) return;
+    int tok = e / half, pos = kvt ? step[2 * tok] : step[0] + tok;
+    double ds, dc;
+    sincos((double)pos * fr[e % half], &ds, &dc);
+    cs[e] = make_float2((float)ds, (float)dc);
+}
+// fr: the rope_freq table of base and n_rot, or null to compute it here. cs: the rope_cs table of these tokens, or null.
 extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const float* w, float* out, int n, float eps, int per,
                                          int n_rot, const int* step, float base, const float* v, u16* kc, u16* vc,
                                          int qrows, const float* qx, int q_stride, const float* qw, float* qo, int qper,
-                                         const double* fr, const u64* kvt) {
+                                         const double* fr, const u64* kvt, const float2* cs) {
     int b = (int)blockIdx.x - qrows;
     bool store = kc || kvt;
     if (b < 0) { b = blockIdx.x; x = qx; x_stride = q_stride; w = qw; out = qo; per = qper; store = false; }
@@ -2681,10 +2739,14 @@ extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const flo
     __syncthreads();
     int i = threadIdx.x, half = n_rot / 2;
     if (i < half) {
-        double theta = (double)pos * (fr ? fr[i] : rope_f(base, i, n_rot));
-        double ds, dc;
-        sincos(theta, &ds, &dc);
-        float sn = (float)ds, c = (float)dc;
+        float sn, c;
+        if (cs) { float2 v = cs[tok * half + i]; sn = v.x; c = v.y; }
+        else {
+            double theta = (double)pos * (fr ? fr[i] : rope_f(base, i, n_rot));
+            double ds, dc;
+            sincos(theta, &ds, &dc);
+            sn = (float)ds; c = (float)dc;
+        }
         float a = o[i], b = o[i + half];
         o[i] = a * c - b * sn;
         o[i + half] = a * sn + b * c;

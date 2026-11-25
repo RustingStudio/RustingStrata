@@ -185,9 +185,11 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   a client that stops after some minutes without a byte keeps reading. If the prompt fails after the head, the stream
   ends early.
 - It runs one request at a time; `--parallel N` (GPU) decodes up to N together (4 requests: 164 tok/s in total on the
-  RTX 3060, 41 each; see [HOSTING.md](HOSTING.md)). From 8 requests decoding at once (`STRATA_BATCH_MIN` sets the
-  count), a dense model without MTP, LoRA or recurrent layers on CUDA runs them in one batched forward, and the
-  prompts of requests that arrive together are prefilled together. That forward
+  RTX 3060, 41 each; see [HOSTING.md](HOSTING.md)). From 8 requests decoding at once (16 for a model with experts;
+  `STRATA_BATCH_MIN` sets the count), a model without MTP, LoRA, Hadamard rotation or hyper-connections on CUDA runs
+  them in one batched forward, and the prompts of requests that arrive together are prefilled together. For a MoE
+  model each expert is read once for all requests of the step, and the CPU runs the experts that are not in VRAM.
+  Slot state that does not fit in VRAM is kept in RAM, and `--parallel` is lowered to the slots that fit. That forward
   rounds differently from the single-request one, so greedy output under load can differ at near-ties from the same
   request run alone.
 - `temperature`, `top_k`, `top_p` and `seed` are honored; decoding is greedy when they are left out.

@@ -17,8 +17,8 @@ pub(crate) const QTYPES: [GgmlType; 29] = {
     use GgmlType::*;
     [F32, BF16, F8E4M3, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_1, Q5_1, Q4_0, Q5_0, NVFP4]
 };
-pub(crate) const KERNELS: [&str; 58] = [
-    "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "situ_q", "softcap", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
+pub(crate) const KERNELS: [&str; 59] = [
+    "rope_freq", "rope_cs", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "situ_q", "softcap", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "dflash2_conv", "hadamard",
@@ -66,6 +66,8 @@ pub struct Gpu {
     lag: std::sync::Mutex<Option<CudaEvent>>,
     /// rope_freq tables by (base bits, n_rot), and the ones a graph capture asked for (see `rope_fr`).
     fr: std::sync::Mutex<(HashMap<(u32, usize), CudaSlice<f64>>, Vec<(f32, usize)>)>,
+    /// rope_cs scratch (ROPE_CS (sin, cos) pairs), allocated with the first rope_freq table.
+    cs: std::sync::OnceLock<CudaSlice<f32>>,
 }
 
 const RING: usize = 64 << 20;
@@ -75,10 +77,11 @@ const RING_MIN: usize = 256 << 10;
 /// `nb` inside `beside`: launches stay on the main stream, copies go to the side stream.
 const BESIDE: usize = usize::MAX - 1;
 /// `gemmd_*` splits the columns of a matrix of at most this many rows between two blocks. Measured on an RTX 3060
-/// with Qwen3-4B: the 9728-row FFN matrices gain at 8 and 16 positions and are level at 64; the output head (151936
-/// rows) fills the card without the split.
+/// with Qwen3-4B: the 9728-row FFN matrices gain at 8 and 16 positions and lose 9% at 64 (split only up to half as
+/// many rows there); the output head (151936 rows) fills the card without the split.
 const GEMMD_SPLIT_ROWS: usize = 16384;
 /// A scratch slot of `gemmd_*`: a count per 128 rows, then the partial sums of both blocks for 64 positions.
+const ROPE_CS: usize = 1 << 17;
 const GEMMD_SLOT: usize = GEMMD_SPLIT_ROWS / 128 * 4 + 2 * 64 * GEMMD_SPLIT_ROWS * 4;
 
 /// A recorded graph. Its handles are plain CUDA driver handles, which any thread may launch once the context is
@@ -452,6 +455,10 @@ macro_rules! launch {
     }};
 }
 
+/// rms_norm_rope's block: 128 threads for a head of 128 or less (the threads past n held 0 for block_sum, so the bits
+/// are the same), else 256.
+fn nr_block(n: usize) -> u32 { if n <= 128 { 128 } else { 256 } }
+
 pub(crate) fn kname(prefix: &str, ty: GgmlType) -> String { format!("{prefix}_{}", ty.name().to_lowercase()) }
 
 /// The UUID of every CUDA device in CUDA's order, the order `Gpu::new` counts in: `None` for a device the driver
@@ -532,7 +539,7 @@ impl Gpu {
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = ctx.new_event(None)?;
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, gd: Default::default(), kv_mode, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default() })
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, gd: Default::default(), kv_mode, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default(), cs: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -553,9 +560,21 @@ impl Gpu {
         let (bs, nr) = (base, n_rot as i32);
         b.arg(&p); b.arg(&bs); b.arg(&nr);
         unsafe { b.launch(cfg((1, 1), 256, 0)) }.context("launch rope_freq")?;
+        if self.cs.get().is_none() { let _ = self.cs.set(self.stream.alloc_zeros::<f32>(2 * ROPE_CS)?); }
         self.stream.synchronize()?;
         fr.0.insert((base.to_bits(), n_rot), t);
         Ok(p)
+    }
+
+    /// The rope_cs table of nt tokens (positions as rms_norm_rope reads them), or 0 (the kernel computes them itself):
+    /// no fr table yet, too many tokens, or inside `batch` (two streams would share the scratch).
+    fn rope_cs(&self, step: u64, kvt: u64, nt: usize, n_rot: usize, fr: u64) -> anyhow::Result<u64> {
+        let n = nt * (n_rot / 2);
+        let Some(cs) = self.cs.get() else { return Ok(0) };
+        if fr == 0 || n == 0 || n > ROPE_CS || self.nb.load(Relaxed) != usize::MAX { return Ok(0); }
+        let cs = self.ptr(cs);
+        launch!(self, "rope_cs", cfg((n.div_ceil(256) as u32, 1), 256, 0), cs, step, kvt, nt as i32, n_rot as i32, fr);
+        Ok(cs)
     }
 
     /// The stream for the next launch: inside `batch`, odd launches go to `side`.
@@ -626,7 +645,7 @@ impl Gpu {
         if batched && tiles == 0 && xrow == 0 && nd <= 64 {
             let pb = nd.next_power_of_two().max(8);
             let xw = if pb >= 32 { 128 } else { 4096 / pb };  // GEMMD_XW
-            let ks = if rows <= GEMMD_SPLIT_ROWS && cols >= 2 * xw { 2 } else { 1 };
+            let ks = if rows <= if nd > 32 { GEMMD_SPLIT_ROWS / 2 } else { GEMMD_SPLIT_ROWS } && cols >= 2 * xw { 2 } else { 1 };
             // The launches of a stream run in order, so each stream has a slot (`st`: the odd launches of a batch go to `side`).
             let n = self.nb.load(Relaxed);
             if self.gd.get().is_none() { let _ = self.gd.set(self.stream.alloc_zeros(2 * GEMMD_SLOT)?); }
@@ -808,6 +827,7 @@ impl Backend for Gpu {
             done,
             lag: Default::default(),
             fr: Default::default(),
+            cs: Default::default(),
         }))
     }
     /// The type policy gated on this device: `gemm_raw` takes the f16 `gemm_*` path where the arch has no int8
@@ -929,6 +949,8 @@ impl Backend for Gpu {
     }
 
     /// Pinned host memory mapped into the device address space.
+    fn host_buf(&self, bytes: usize) -> anyhow::Result<Option<Buf>> { Ok(Some(self.host_mailbox(bytes.div_ceil(4))?.0)) }
+
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)> {
         let n = words.max(1);
         let flags = sys::CU_MEMHOSTALLOC_DEVICEMAP | sys::CU_MEMHOSTALLOC_PORTABLE;
@@ -1049,8 +1071,9 @@ impl Backend for Gpu {
     fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
         anyhow::ensure!(n_rot <= n.min(512) && n % 32 == 0, "rms_norm_rope: head of {n}, n_rot {n_rot}");
         let fr = self.rope_fr(base, n_rot)?;
-        launch!(self, "rms_norm_rope", cfg((rows as u32, 1), 256, 0), x, x_stride as i32, w, out, n as i32, eps, per as i32, n_rot as i32, step, base, v, kc, vc,
-                0i32, 0u64, 0i32, 0u64, 0u64, 0i32, fr, 0u64);
+        let cs = self.rope_cs(step, 0, rows / per, n_rot, fr)?;
+        launch!(self, "rms_norm_rope", cfg((rows as u32, 1), nr_block(n), 0), x, x_stride as i32, w, out, n as i32, eps, per as i32, n_rot as i32, step, base, v, kc, vc,
+                0i32, 0u64, 0i32, 0u64, 0u64, 0i32, fr, 0u64, cs);
         Ok(())
     }
 
@@ -1059,8 +1082,9 @@ impl Backend for Gpu {
                         n: usize, eps: f32, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
         anyhow::ensure!(n_rot <= n.min(512) && n % 32 == 0, "rms_norm_rope: head of {n}, n_rot {n_rot}");
         let fr = self.rope_fr(base, n_rot)?;
-        launch!(self, "rms_norm_rope", cfg(((qrows + krows) as u32, 1), 256, 0), k, n as i32, kw, ko, n as i32, eps, kper as i32, n_rot as i32, step, base, v, kc, vc,
-                qrows as i32, q, q_stride as i32, qw, qo, qper as i32, fr, 0u64);
+        let cs = self.rope_cs(step, 0, krows / kper, n_rot, fr)?;
+        launch!(self, "rms_norm_rope", cfg(((qrows + krows) as u32, 1), nr_block(n), 0), k, n as i32, kw, ko, n as i32, eps, kper as i32, n_rot as i32, step, base, v, kc, vc,
+                qrows as i32, q, q_stride as i32, qw, qo, qper as i32, fr, 0u64, cs);
         Ok(())
     }
 
@@ -1070,8 +1094,9 @@ impl Backend for Gpu {
                              step: u64, base: f32, v: u64, kvt: u64, nt: usize) -> anyhow::Result<()> {
         anyhow::ensure!(n_rot <= hd.min(512) && hd % 32 == 0, "rms_norm_rope: head of {hd}, n_rot {n_rot}");
         let fr = self.rope_fr(base, n_rot)?;
-        launch!(self, "rms_norm_rope", cfg(((nt * (nh + nkv)) as u32, 1), 256, 0), k, hd as i32, kw, ko, hd as i32, eps, nkv as i32, n_rot as i32, step, base, v, 0u64, 0u64,
-                (nt * nh) as i32, q, q_stride as i32, qw, qo, nh as i32, fr, kvt);
+        let cs = self.rope_cs(step, kvt, nt, n_rot, fr)?;
+        launch!(self, "rms_norm_rope", cfg(((nt * (nh + nkv)) as u32, 1), nr_block(hd), 0), k, hd as i32, kw, ko, hd as i32, eps, nkv as i32, n_rot as i32, step, base, v, 0u64, 0u64,
+                (nt * nh) as i32, q, q_stride as i32, qw, qo, nh as i32, fr, kvt, cs);
         Ok(())
     }
 
@@ -1535,12 +1560,12 @@ mod tests {
     }
 
     /// M1-T5, CPU-only: the loaded name list drops `gemmi_*`/`gemmis_*` only on a device where kernels.cu compiles
-    /// them out. 397 names today (sm_80); 23 non-float types x 3 fewer names = 328 on sm_70.
+    /// them out. 398 names today (sm_80); 23 non-float types x 3 fewer names = 329 on sm_70.
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 397);
-        assert_eq!(sm70.len(), 328);
+        assert_eq!(sm80.len(), 398);
+        assert_eq!(sm70.len(), 329);
         assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmd")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());

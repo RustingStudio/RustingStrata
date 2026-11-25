@@ -170,6 +170,10 @@ pub trait Backend: Send {
     /// Zeroed host memory of `words` u32 that kernels read and write at the `Buf` address. The host pointer is
     /// valid while the `Buf` lives.
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)>;
+    /// Host memory of `bytes` that `dtod`, `get` and `put` reach, for state the device copies in and out rarely (the
+    /// saved state of each `--parallel` slot), so that it takes RAM instead of VRAM. `None` where the backend has
+    /// none; the caller then allocates VRAM.
+    fn host_buf(&self, _bytes: usize) -> anyhow::Result<Option<Buf>> { Ok(None) }
 
     /// Refuse, before any weight is uploaded, if a pipeline these weight types (`GpuModel`'s upload types) need would
     /// exceed the device's shared-memory limit; `verbose` also lists each checked (kernel, specialization) pair.

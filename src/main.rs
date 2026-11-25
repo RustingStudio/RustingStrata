@@ -3346,8 +3346,9 @@ impl Sched {
     /// (fewer graphs to capture).
     fn run(&mut self, g: &mut GpuModel) {
         // ponytail: fixed row count from which the GEMM forward (`step_batch`) replaces the matvec one; `calibrate`
-        // should measure it per model and machine. STRATA_BATCH_MIN overrides.
-        let min = std::env::var("STRATA_BATCH_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        // should measure it per model and machine. STRATA_BATCH_MIN overrides. With experts 16: below it the step of
+        // `STEP_ROWS` rows, whose missed experts the CPU worker runs beside the GPU, was faster (Qwen3.6-35B-A3B, RTX 3060).
+        let min = std::env::var("STRATA_BATCH_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(if g.is_moe() { 16 } else { 8 });
         let big = g.batch_cap() > 0 && self.steps.len() >= min;
         let cap = if big { g.batch_cap() } else { rusting_strata::gpu_model::STEP_ROWS };
         let mut batch: Vec<_> = self.steps.drain(..self.steps.len().min(cap)).collect();

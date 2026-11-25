@@ -677,7 +677,7 @@ impl Backend for Gpu {
         anyhow::ensure!(n_rot <= n.min(512) && n % 32 == 0, "rms_norm_rope: head of {n}, n_rot {n_rot}");
         let fr = self.rope_fr(base, n_rot)?;
         launch!(self, "rms_norm_rope", cfg((rows as u32, 1), 256, 0), x, x_stride as i32, w, out, n as i32, eps, per as i32, n_rot as i32,
-                step, base, v, kc, vc, 0i32, 0u64, 0i32, 0u64, 0u64, 0i32, fr, 0u64);
+                step, base, v, kc, vc, 0i32, 0u64, 0i32, 0u64, 0u64, 0i32, fr, 0u64, 0u64);
         Ok(())
     }
 
@@ -686,7 +686,7 @@ impl Backend for Gpu {
         anyhow::ensure!(n_rot <= n.min(512) && n % 32 == 0, "rms_norm_rope: head of {n}, n_rot {n_rot}");
         let fr = self.rope_fr(base, n_rot)?;
         launch!(self, "rms_norm_rope", cfg(((qrows + krows) as u32, 1), 256, 0), k, n as i32, kw, ko, n as i32, eps, kper as i32, n_rot as i32,
-                step, base, v, kc, vc, qrows as i32, q, q_stride as i32, qw, qo, qper as i32, fr, 0u64);
+                step, base, v, kc, vc, qrows as i32, q, q_stride as i32, qw, qo, qper as i32, fr, 0u64, 0u64);
         Ok(())
     }
 
@@ -697,7 +697,7 @@ impl Backend for Gpu {
         anyhow::ensure!(n_rot <= hd.min(512) && hd % 32 == 0, "rms_norm_rope: head of {hd}, n_rot {n_rot}");
         let fr = self.rope_fr(base, n_rot)?;
         launch!(self, "rms_norm_rope", cfg(((nt * (nh + nkv)) as u32, 1), 256, 0), k, hd as i32, kw, ko, hd as i32, eps, nkv as i32, n_rot as i32,
-                step, base, v, 0u64, 0u64, (nt * nh) as i32, q, q_stride as i32, qw, qo, nh as i32, fr, kvt);
+                step, base, v, 0u64, 0u64, (nt * nh) as i32, q, q_stride as i32, qw, qo, nh as i32, fr, kvt, 0u64);
         Ok(())
     }
 

@@ -10,7 +10,7 @@ Supported models: Qwen3, Qwen3-Next, Qwen3.5/3.6, Qwen3.8-Flash-Next, Recursive 
 GLM-5.3-Flash, Hy4-flash, Inkling 2 Mini and Kolibri 1.1. The architectures, the GGUF types and the notes for each model are in
 [docs/MODELS.md](docs/MODELS.md).
 
-Version 1.3.2.
+Version 1.3.3.
 
 ## Numbers
 
@@ -23,6 +23,23 @@ file. Neither file fits in VRAM.
 | UD-Q5_K_M, prefill of a 4K prompt | **1530 tok/s** | 1118-1122 |
 | UD-Q2_K_XL (11.7 GiB), decode after a 4K prompt | **113.4 tok/s** | 66.5 |
 | UD-Q2_K_XL, prefill of a 4K prompt | 2216 tok/s | ~2236 |
+
+### Many users at once
+
+`serve --parallel N` decodes the requests together in one batched forward (CUDA). Same machine, same load script
+(`tools/loadtest.py`: N streamed chats at once, 128 reply tokens each, greedy), total decode tok/s:
+
+| Clients | Qwen3-4B, RustingStrata (Q4_K_M) | Qwen3-4B, vLLM 0.33 (bf16) | Qwen3.6-35B-A3B UD-Q5_K_M, RustingStrata |
+|---:|---:|---:|---:|
+| 1 | 91.3 | 36.7 | 49.0 |
+| 4 | 228.1 | 139.9 | 88.9 |
+| 16 | 799.0 | 520.1 | 100.7 |
+| 64 | 1698 | 1688-1765 | 129.3 |
+
+vLLM runs bf16 weights and RustingStrata Q4_K_M, so the dense columns are not like for like. The 27 GB MoE file does
+not fit on the 12 GB card, so vLLM was not run on it. RustingStrata reads each expert once for all requests of a step,
+runs the experts that are not in VRAM on the CPU, and keeps slot state that does not fit in VRAM in RAM. The MoE
+column moves by about 30% between runs on this machine (the 27 GB file is read through a 30 GB page cache).
 
 The method, the ranges, Vulkan, the other models and the quality checks are in
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
