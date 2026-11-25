@@ -83,6 +83,9 @@ struct Engine {
     top_k: usize,
     #[arg(long, default_value_t = 1.0)]
     top_p: f32,
+    /// Drop the tokens whose probability is below this times the best one's (llama.cpp min-p; 0 = off).
+    #[arg(long, default_value_t = 0.0)]
+    min_p: f32,
     /// Default presence penalty (OpenAI `presence_penalty`); needs --temp > 0. Qwen recommends 1.5 against loops.
     #[arg(long, default_value_t = 0.0)]
     presence_penalty: f32,
@@ -242,7 +245,7 @@ impl Runner<'_> {
     /// Feed a prompt; returns the logits after its last token.
     fn prefill(&mut self, ts: &[u32]) -> anyhow::Result<Vec<f32>> {
         match self {
-            Runner::Cpu(m, st) => Ok(ts.iter().map(|&t| m.step(st, t)).last().unwrap_or_default()),
+            Runner::Cpu(m, st) => Ok(ts.iter().map(|&t| { let l = m.step(st, t); term::prefilled(1); l }).last().unwrap_or_default()),
             Runner::Gpu(g) => g.prefill(ts),
             Runner::Slot(_) | Runner::Own(_) => anyhow::bail!("prefill on a slot or a model outside the main engine"),
         }
@@ -562,7 +565,7 @@ impl Engine {
         })
     }
     fn sampler(&self) -> Sampler {
-        Sampler { temp: self.temp, top_k: self.top_k, top_p: self.top_p, rng: seed(self.seed),
+        Sampler { temp: self.temp, top_k: self.top_k, top_p: self.top_p, min_p: self.min_p, rng: seed(self.seed),
             presence: self.presence_penalty, frequency: self.frequency_penalty, repeat: self.repeat_penalty,
             last_n: self.penalty_last_n, dry_mult: self.dry_multiplier,
             dry_base: self.dry_base, dry_allowed: self.dry_allowed_length, ..Sampler::greedy() }
@@ -1643,6 +1646,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Chat { model, system, n, image, mut engine } => {
             let think = engine.think_default;
+            term::live(false);
             engine.own_calib(&model);
             engine.ds_env();
             let g = Gguf::open(&model)?;
@@ -1717,6 +1721,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 if stdin.lock().read_line(&mut line)? == 0 { break; }
                 if line.trim().is_empty() { continue; }
                 msgs.push(Msg::new("user", line.trim_end()));
+                let _live = term::Live::start();
                 let prompt = tpl.render(&msgs, &[], think, engine.preserve_thinking, true);
                 let (ids, logits) = match &image_input {
                     Some(input) => {
@@ -1747,6 +1752,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Serve { model, models_dir, addr, api_key, mcp, open, host, mut engine } => {
             rusting_strata::update::notice();
+            term::live(true);
             engine.ds_env();
             anyhow::ensure!(host.auto_unload != Some(0), "--auto-unload must be at least 1 second");
             engine.parallel = host.parallel;
@@ -2954,34 +2960,37 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
     let (mut out, mut start, mut row, mut ahead, mut stopped) = (Vec::new(), 0, 0, None, false);
     let (mut in_think, budget) = think_cap.unwrap_or((false, 0));
     let (mut saw_close, mut tail) = (false, String::new());
+    // With a logit_bias or grammar every token is picked from the logits here: no speculation, no argmax on the GPU.
+    let free = smp.limit.is_none();
     'outer: while out.len() < n {
         let next = match ahead.take() { Some(t) => t, None => smp.pick(&logits)? as u32 };
         if eos.contains(&next) { stopped = true; break; }
         let toks = match r {
-            Runner::Gpu(g) if mtp && g.ngram.is_some() => {
+            Runner::Gpu(g) if free && mtp && g.ngram.is_some() => {
                 let (toks, nx, rw) = g.hybrid_spec_step(next, row, smp)?;
                 (ahead, row) = (Some(nx), rw);
                 toks
             }
-            Runner::Gpu(g) if mtp => {
+            Runner::Gpu(g) if free && mtp => {
                 let (toks, nx, rw) = g.spec_step(next, row, smp)?;
                 (ahead, row) = (Some(nx), rw);
                 toks
             }
-            Runner::Gpu(g) if g.ngram.is_some() => {
+            Runner::Gpu(g) if free && g.ngram.is_some() => {
                 let (toks, nx) = g.ngram_spec_step(next, smp)?;
                 ahead = Some(nx);
                 toks
             }
             // Greedy without MTP: the argmax on the GPU, so only the token id is copied back, not the logits.
-            Runner::Gpu(g) if smp.temp <= 0.0 => { ahead = Some(g.step_greedy(next)?); vec![next] }
-            Runner::Slot(c) if smp.temp <= 0.0 => { ahead = Some(c.step(next, false)?.0); vec![next] }
+            Runner::Gpu(g) if free && smp.temp <= 0.0 => { ahead = Some(g.step_greedy(next)?); vec![next] }
+            Runner::Slot(c) if free && smp.temp <= 0.0 => { ahead = Some(c.step(next, false)?.0); vec![next] }
             _ => { logits = r.step(next)?; vec![next] }
         };
         for t in toks {
             if eos.contains(&t) { stopped = true; break 'outer; }
             if out.len() == n { break; }
             out.push(t);
+            term::decoded(1);
             let s = tok.decode(&out[start..])?;
             if !s.ends_with('\u{fffd}') {
                 if budget > 0 && !saw_close {
@@ -3765,8 +3774,8 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
     // Claude Code adds `?beta=true`.
     let route = path.split('?').next().unwrap_or_default();
     // Customer keys may not load models, download files or read the server's stats.
-    if !who.admin && !matches!(route, "/v1/chat/completions" | "/v1/messages" | "/v1/messages/count_tokens" | "/v1/models") {
-        return send(&mut w, "403 Forbidden", json!({"error": {"message": "this key may use only /v1/chat/completions, /v1/messages (and count_tokens) and /v1/models", "type": "permission_error"}}));
+    if !who.admin && !matches!(route, "/v1/chat/completions" | "/v1/messages" | "/v1/messages/count_tokens" | "/v1/models" | "/tokenize" | "/detokenize") {
+        return send(&mut w, "403 Forbidden", json!({"error": {"message": "this key may use only /v1/chat/completions, /v1/messages (and count_tokens), /v1/models, /tokenize and /detokenize", "type": "permission_error"}}));
     }
     match (method.as_str(), route) {
         ("GET", "/api/models") => {
@@ -3824,6 +3833,14 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             });
             send(&mut w, "202 Accepted", json!(*s.dl.lock().unwrap()))
         }
+        // llama.cpp's tokenizer endpoints.
+        ("POST", p @ ("/tokenize" | "/detokenize")) => {
+            let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
+            match if p == "/tokenize" { serve::tokenize(l.tok, &body) } else { serve::detokenize(l.tok, &body) } {
+                Ok(v) => send(&mut w, "200 OK", v),
+                Err(err) => send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
+            }
+        }
         // The prompt's tokens as the model would see them, template and tools included.
         ("POST", "/v1/messages/count_tokens") => {
             let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
@@ -3848,6 +3865,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let anth = p == "/v1/messages";
             let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
             if anth && anthropic_refused(&mut w, &l.r) { return Ok(()); }
+            let _live = term::Live::start();
             let (r, tok, tpl, name) = (&mut l.r, &l.tok, l.tpl, l.name.as_str());
             match r { Runner::Gpu(g) => g.owner = who.id, Runner::Slot(c) => (c.owner, c.conn) = (who.id, w.try_clone().ok()), _ => {} }
             let mut req = match if anth { serve::messages_body(&body) } else { Ok(body.clone()) }.and_then(|b| serve::chat_request(&b)) {
@@ -3927,6 +3945,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             smp.temp = req.temperature.unwrap_or(smp.temp);
             smp.top_k = req.top_k.unwrap_or(smp.top_k);
             smp.top_p = req.top_p.unwrap_or(smp.top_p);
+            smp.min_p = req.min_p.unwrap_or(smp.min_p);
             smp.presence = req.presence_penalty.unwrap_or(smp.presence);
             smp.frequency = req.frequency_penalty.unwrap_or(smp.frequency);
             smp.repeat = req.repeat_penalty.unwrap_or(smp.repeat);
@@ -3936,9 +3955,13 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             smp.dry_allowed = req.dry_allowed_length.unwrap_or(smp.dry_allowed);
             if smp.dry_mult > 0.0 { smp.dry_breakers = dry_breakers(tok, name); }
             smp.tool_tags = tok.token_id("<tool_call>").zip(tok.token_id("</tool_call>")).map(|(a, b)| (a as usize, b as usize));
-            say!("sampling: temp={} top_k={} top_p={} presence={} frequency={} repeat={}/{} dry={}/{}/{}", smp.temp, smp.top_k, smp.top_p,
+            say!("sampling: temp={} top_k={} top_p={} min_p={} presence={} frequency={} repeat={}/{} dry={}/{}/{}", smp.temp, smp.top_k, smp.top_p, smp.min_p,
                 smp.presence, smp.frequency, smp.repeat, smp.last_n, smp.dry_mult, smp.dry_base, smp.dry_allowed);
             if req.seed.is_some() { smp.rng = seed(req.seed); }
+            smp.limit = match rusting_strata::grammar::Constraint::new(&req, tok) {
+                Ok(c) => c,
+                Err(err) => return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
+            };
             let n = room(e, ids.len(), req.max_tokens.unwrap_or(usize::MAX).min(s.max_tokens));
             if n == 0 { return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("prompt of {} tokens fills the context", ids.len()), "type": "invalid_request_error"}})); }
             let id = format!("chatcmpl-{i}");

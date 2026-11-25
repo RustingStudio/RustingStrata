@@ -133,8 +133,9 @@ impl GpuModel<'_> {
     /// `prefill`, calling `between` between two chunks (`serve --parallel` decodes the other slots there; it must
     /// leave the current slot's state alone).
     pub fn prefill_with(&mut self, tokens: &[u32], between: &mut dyn FnMut(&mut Self) -> anyhow::Result<()>) -> anyhow::Result<Vec<f32>> {
-        let Some(chunk) = self.pf.as_ref().map(|p| p.chunk) else { return self.step_all(tokens) };
-        if tokens.len() < self.short { return self.step_all(tokens); }
+        let short = |s: &mut Self| { let r = s.step_all(tokens); crate::term::prefilled(tokens.len()); r };
+        let Some(chunk) = self.pf.as_ref().map(|p| p.chunk) else { return short(self) };
+        if tokens.len() < self.short { return short(self); }
         anyhow::ensure!(self.pos + tokens.len() <= self.ctx, "context full ({} tokens; raise --ctx)", self.ctx);
         // STRATA_PF_ADAPT=N: place the hot experts after every N-th chunk of a long prompt, not only after all of it,
         // so the later chunks run with the placement the first ones showed (0 = off, the default; untested on real hardware).
@@ -143,6 +144,7 @@ impl GpuModel<'_> {
         for (i, ch) in tokens.chunks(chunk).enumerate() {
             if i > 0 { between(self)?; }
             self.prefill_chunk(ch, None, None)?;
+            crate::term::prefilled(ch.len());
             if every > 0 && (i + 1) % every == 0 && i + 1 < nchunks { self.adapt_experts()?; }
         }
         // The prompt's routing predicts the reply's: place its hot experts now instead of 64 per adapt during decode.

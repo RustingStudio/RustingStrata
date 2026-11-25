@@ -396,6 +396,7 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     pub top_k: Option<usize>,
     pub top_p: Option<f32>,
+    pub min_p: Option<f32>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     /// llama.cpp server names: the repeat penalty and how many of the reply's last tokens it looks at.
@@ -408,6 +409,9 @@ pub struct ChatRequest {
     pub seed: Option<u64>,
     /// The reply ends before the first of these strings (`stop`).
     pub stop: Vec<String>,
+    /// `logit_bias`, and a GBNF `grammar` the reply must follow (see `crate::grammar`).
+    pub logit_bias: Vec<(crate::grammar::BiasKey, f32)>,
+    pub grammar: Option<std::sync::Arc<crate::grammar::Grammar>>,
     /// The response head went out while the request waited in the queue (`Queued`): the handler must not write it.
     pub head_sent: bool,
 }
@@ -449,7 +453,14 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
     }.context("stop must be a string or an array of strings")?.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
     // Hold checks every prefix of every stop string at each token, so both are bounded.
     if stop.len() > 16 || stop.iter().any(|s| s.len() > 256) { bail!("stop takes at most 16 strings of at most 256 bytes"); }
-    let think = v["chat_template_kwargs"]["enable_thinking"].as_bool();
+    let grammar = match &v["grammar"] {
+        Value::Null => None,
+        Value::String(s) if s.trim().is_empty() => None,
+        Value::String(s) => Some(std::sync::Arc::new(crate::grammar::Grammar::parse(s)?)),
+        _ => bail!("grammar must be a string"),
+    };
+    // A grammar holds for the whole reply, thinking included, so thinking is off unless the request turns it on.
+    let think = v["chat_template_kwargs"]["enable_thinking"].as_bool().or(grammar.as_ref().map(|_| false));
     let include_usage = v["stream_options"]["include_usage"].as_bool().unwrap_or(false);
     let raw_effort = if !v["reasoning_effort"].is_null() {
         &v["reasoning_effort"]
@@ -476,6 +487,7 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
         preserve_thinking: v["chat_template_kwargs"]["preserve_thinking"].as_bool(),
         temperature: num("temperature", |f| f >= 0.0, "a number >= 0")?, top_k: int("top_k", 0)?.map(|n| n as usize),
         top_p: num("top_p", |f| f > 0.0 && f <= 1.0, "a number in (0, 1]")?,
+        min_p: num("min_p", |f| (0.0..=1.0).contains(&f), "a number in [0, 1]")?,
         presence_penalty: num("presence_penalty", |f| (-2.0..=2.0).contains(&f), "a number in [-2, 2]")?,
         frequency_penalty: num("frequency_penalty", |f| (-2.0..=2.0).contains(&f), "a number in [-2, 2]")?,
         repeat_penalty: num("repeat_penalty", |f| f > 0.0 && f <= 5.0, "a number in (0, 5]")?,
@@ -485,7 +497,8 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
         },
         dry_multiplier: num("dry_multiplier", |f| (0.0..=5.0).contains(&f), "a number in [0, 5]")?,
         dry_base: num("dry_base", |f| f > 1.0 && f <= 4.0, "a number in (1, 4]")?,
-        dry_allowed_length: int("dry_allowed_length", 1)?.map(|n| n as usize), seed: int("seed", 0)?, stop, head_sent: false })
+        dry_allowed_length: int("dry_allowed_length", 1)?.map(|n| n as usize), seed: int("seed", 0)?, stop,
+        logit_bias: crate::grammar::parse_bias(&v["logit_bias"])?, grammar, head_sent: false })
 }
 
 /// What the chat page's side panel shows about the server, kept by the request loop and answered by the reader
@@ -646,6 +659,34 @@ pub fn system() -> Value {
     v
 }
 
+/// llama.cpp's `POST /tokenize`: `{"content", "add_special", "with_pieces"}` to `{"tokens": [id, ...]}`, or with
+/// pieces `{"tokens": [{"id", "piece"}, ...]}`, a piece being a string, or its bytes when it is not whole UTF-8.
+pub fn tokenize(tok: &crate::tokenizer::Tokenizer, body: &[u8]) -> anyhow::Result<Value> {
+    let v: Value = serde_json::from_slice(body)?;
+    let content = v["content"].as_str().context("content: a string is required")?;
+    let flag = |k: &str| -> anyhow::Result<bool> { Ok(match &v[k] { Value::Null => false, x => x.as_bool().with_context(|| format!("{k}: not a boolean"))? }) };
+    let ids = tok.encode_special(content, flag("add_special")?)?;
+    if !flag("with_pieces")? { return Ok(serde_json::json!({"tokens": ids})); }
+    let tokens: Vec<Value> = ids.iter().map(|&id| {
+        let b = tok.token_bytes(id);
+        let piece = match std::str::from_utf8(b) { Ok(s) => Value::from(s), Err(_) => Value::from(b.to_vec()) };
+        serde_json::json!({"id": id, "piece": piece})
+    }).collect();
+    Ok(serde_json::json!({"tokens": tokens}))
+}
+
+/// llama.cpp's `POST /detokenize`: `{"tokens": [id, ...]}` to `{"content": text}`.
+pub fn detokenize(tok: &crate::tokenizer::Tokenizer, body: &[u8]) -> anyhow::Result<Value> {
+    let v: Value = serde_json::from_slice(body)?;
+    let ids = match &v["tokens"] {
+        Value::Null => vec![],
+        Value::Array(a) => a.iter().map(|t| t.as_u64().filter(|&t| (t as usize) < tok.vocab_size()).map(|t| t as u32)
+            .with_context(|| format!("tokens: {t} is not a token id"))).collect::<anyhow::Result<Vec<_>>>()?,
+        _ => bail!("tokens: an array of ids is required"),
+    };
+    Ok(serde_json::json!({"content": tok.decode(&ids)?}))
+}
+
 /// An Anthropic Messages API request (`POST /v1/messages`, what Claude Code sends) as the OpenAI chat request
 /// `chat_request` reads: the system blocks become a system message, `tool_use` blocks tool calls, `tool_result`
 /// blocks tool messages, and `thinking: {"type": "enabled"}` turns thinking on. Images and server tools are dropped.
@@ -716,7 +757,7 @@ pub fn messages_body(body: &[u8]) -> anyhow::Result<Vec<u8>> {
         Some("tool") => out.push(("tool_choice", obj(vec![("type", s("function")), ("function", obj(vec![("name", j.get("tool_choice").get("name").clone())]))]))),
         _ => {}
     }
-    for (from, to) in [("max_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k"), ("stop_sequences", "stop"), ("stream", "stream")] {
+    for (from, to) in [("max_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p"), ("min_p", "min_p"), ("top_k", "top_k"), ("stop_sequences", "stop"), ("stream", "stream")] {
         if !matches!(j.get(from), Json::Null) { out.push((to, j.get(from).clone())); }
     }
     if j.get("thinking").get("type").as_str() == Some("enabled") {

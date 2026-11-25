@@ -114,12 +114,15 @@ pub fn argmax(x: &[f32]) -> usize {
 const NON_FINITE: &str = "the forward pass produced NaN or infinite logits";
 
 /// Token choice after the logits: greedy when `temp` is 0, else softmax(logits / temp) cut to the `top_k` most likely
-/// tokens (0 = no cut) and then to the smallest set whose probability reaches `top_p`.
+/// tokens (0 = no cut), then to the smallest set whose probability reaches `top_p`, then to the tokens whose
+/// probability before the temperature is at least `min_p` times the best one's (llama.cpp's order and min-p).
 #[derive(Clone, Debug)]
 pub struct Sampler {
     pub temp: f32,
     pub top_k: usize,
     pub top_p: f32,
+    /// 0 is off.
+    pub min_p: f32,
     /// xorshift64 state; must not be 0.
     pub rng: u64,
     /// OpenAI `presence_penalty`: subtracted once from the logit of every token this sampler already returned.
@@ -146,6 +149,8 @@ pub struct Sampler {
     /// The returned tokens in order (outside tool calls), for DRY.
     pub hist: Vec<usize>,
     pub in_tool: bool,
+    /// The request's `logit_bias` and grammar, applied after the penalties.
+    pub limit: Option<crate::grammar::Constraint>,
 }
 
 /// DRY looks back this many reply tokens, and matches at most this long.
@@ -154,10 +159,10 @@ const DRY_MAX_MATCH: usize = 64;
 
 impl Sampler {
     pub fn greedy() -> Self {
-        Sampler { temp: 0.0, top_k: 0, top_p: 1.0, rng: 1, presence: 0.0, frequency: 0.0, repeat: 1.0, last_n: 64,
+        Sampler { temp: 0.0, top_k: 0, top_p: 1.0, min_p: 0.0, rng: 1, presence: 0.0, frequency: 0.0, repeat: 1.0, last_n: 64,
             seen: Default::default(),
             dry_mult: 0.0, dry_base: 1.75, dry_allowed: 2, dry_breakers: Default::default(), tool_tags: None,
-            hist: Vec::new(), in_tool: false }
+            hist: Vec::new(), in_tool: false, limit: None }
     }
 
     /// The logits with the repeat, presence, frequency and DRY penalties applied, or None when there is nothing to change.
@@ -185,6 +190,13 @@ impl Sampler {
         Some(l)
     }
 
+    /// `penalized`, then the bias and grammar of `limit`.
+    fn adjusted(&self, logits: &[f32]) -> Option<Vec<f32>> {
+        let mut l = self.penalized(logits);
+        if let Some(c) = &self.limit { c.apply(l.get_or_insert_with(|| logits.to_vec()), self.temp <= 0.0); }
+        l
+    }
+
     /// DRY penalties for the next token: for every earlier place where the reply's last tokens already appeared,
     /// the token that followed them there, with the longest such match (as llama.cpp's DRY sampler).
     pub fn dry_penalties(&self) -> Vec<(usize, f32)> {
@@ -208,6 +220,7 @@ impl Sampler {
 
     /// Records a token the reply now has (done by `pick` and `accept` for the tokens they return).
     pub fn note(&mut self, t: usize) {
+        if let Some(c) = &mut self.limit { c.accept(t as u32); }
         if let Some((open, close)) = self.tool_tags {
             if t == open { self.in_tool = true; return; }
             if t == close { self.in_tool = false; return; }
@@ -218,7 +231,7 @@ impl Sampler {
     }
 
     pub fn pick(&mut self, logits: &[f32]) -> anyhow::Result<usize> {
-        let pen = self.penalized(logits);
+        let pen = self.adjusted(logits);
         let logits = pen.as_deref().unwrap_or(logits);
         let i = if self.temp <= 0.0 {
             let i = argmax(logits);
@@ -235,7 +248,7 @@ impl Sampler {
     /// Speculative sampling with a fixed draft `d`: keeps `d` (None) with its probability under this sampler, else
     /// returns a token drawn from the others, renormalized. The result has the distribution of `pick`. `temp` > 0.
     pub fn accept(&mut self, logits: &[f32], d: usize) -> anyhow::Result<Option<usize>> {
-        let pen = self.penalized(logits);
+        let pen = self.adjusted(logits);
         let c = self.cands(pen.as_deref().unwrap_or(logits));
         anyhow::ensure!(!c.is_empty(), NON_FINITE);
         let q = c.iter().find(|x| x.0 == d).map_or(0.0, |x| x.1);
@@ -258,7 +271,7 @@ impl Sampler {
     /// Leviathan lossless speculative rejection sampling using draft distribution `q` and target `logits` (`temp > 0`).
     /// Keeps `d` (`None`) with probability `min(1, p(d)/q(d))`, otherwise samples from normalized `max(0, p - q)`.
     pub fn accept_dist(&mut self, logits: &[f32], d: usize, q: &[(usize, f32)]) -> anyhow::Result<Option<usize>> {
-        let pen = self.penalized(logits);
+        let pen = self.adjusted(logits);
         let c = self.cands(pen.as_deref().unwrap_or(logits));
         let total: f32 = c.iter().map(|x| x.1).sum();
         anyhow::ensure!(!c.is_empty() && total > 0.0, NON_FINITE);
@@ -298,6 +311,12 @@ impl Sampler {
             if acc >= self.top_p * total { n = j + 1; break; }
         }
         c.truncate(n);
+        // llama.cpp cuts at logit >= max + ln(min_p), before the temperature; a weight here is that difference
+        // divided by `temp`, exponentiated. The best token (weight 1) always stays.
+        if self.min_p > 0.0 {
+            let w = self.min_p.powf(1.0 / self.temp);
+            c.retain(|x| x.1 >= w);
+        }
         c
     }
 
@@ -325,6 +344,23 @@ impl Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn min_p_drops_the_unlikely_tokens() {
+        let l = [4.0f32.ln(), 2.0f32.ln(), 1.0f32.ln(), 0.5f32.ln()]; // probabilities relative to the best: 1, 1/2, 1/4, 1/8
+        let kept = |temp: f32, min_p: f32| Sampler { temp, min_p, ..Sampler::greedy() }.cands(&l).iter().map(|x| x.0).collect::<Vec<_>>();
+        assert_eq!(kept(1.0, 0.0), [0, 1, 2, 3]);
+        assert_eq!(kept(1.0, 0.3), [0, 1]);
+        assert_eq!(kept(1.0, 0.2), [0, 1, 2]);
+        // As llama.cpp: the cut is on the probabilities before the temperature.
+        assert_eq!(kept(2.0, 0.3), [0, 1]);
+        assert_eq!(kept(0.5, 0.2), [0, 1, 2]);
+        assert_eq!(kept(1.0, 1.0), [0]);
+        // After top_k.
+        assert_eq!(Sampler { temp: 1.0, top_k: 1, min_p: 0.01, ..Sampler::greedy() }.cands(&l).len(), 1);
+        let mut s = Sampler { temp: 1.0, min_p: 0.3, rng: 7, ..Sampler::greedy() };
+        assert!((0..200).all(|_| s.pick(&l).unwrap() < 2));
+    }
 
     #[test]
     fn mrope_matches_neox_for_text_positions() {

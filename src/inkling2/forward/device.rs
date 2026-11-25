@@ -338,12 +338,12 @@ impl Device {
                 }
             }
             if std::env::var_os("STRATA_DS_PROF").is_some() {
-                eprintln!("inkling2: preloaded {n_full}/{} expert layers ({:.2} GB) as contiguous slabs", c.n_layer, slab_bytes as f64 / 1e9);
+                crate::say!("inkling2: preloaded {n_full}/{} expert layers ({:.2} GB) as contiguous slabs", c.n_layer, slab_bytes as f64 / 1e9);
             }
             let all_full = layers.iter().all(|l| l.full_exps.is_some());
             Ok(Device { layers, loops, slots, out_query, out_norm, scr, sc_buf, pf: None, s, rank, all_full, graph_keys: [0; 2], synced: 0, ahead: false })
         })();
-        made.inspect_err(|e| eprintln!("inkling2: no room in VRAM for the decode state ({e:#}); the tokens run as prompt chunks do")).ok()
+        made.inspect_err(|e| crate::say!("inkling2: no room in VRAM for the decode state ({e:#}); the tokens run as prompt chunks do")).ok()
     }
 
     /// The model starts over: nothing is shared with the host's rows.

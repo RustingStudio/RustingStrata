@@ -244,7 +244,7 @@ pub fn chat(
         if keep >= seq.len() { m.reset(); keep = 0; }
         let logits = feed(&mut m, &seq[keep..])?;
         let room = n.min(ctx - ids.len());
-        let (out, _) = decode_greedy(&tok, &mut m, &stop, logits, room, &mut |t| {
+        let (out, _) = decode_greedy(&tok, &mut m, &stop, &mut None, logits, room, &mut |t| {
             print!("{t}");
             let _ = std::io::stdout().flush();
             true
@@ -268,6 +268,8 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a crate::tokenizer::Tokenizer, name: &'a st
     let stop = stop_ids(tok);
     let ctx = crate::ctx_limit(m.cfg.n_ctx_train);
     Ok(Box::new(move |c: &mut std::net::TcpStream, q: &crate::serve::ChatRequest| {
+        let mut lim = crate::grammar::Constraint::new(q, tok)?;
+        if let Some(l) = &mut lim { l.eos.extend(&stop); }
         anyhow::ensure!(q.tools.is_empty() && !q.messages.iter().any(|m| m.role == "tool"), "tools are not supported for gemma4");
         let mut grids = vec![];
         let mut embs = vec![];
@@ -295,7 +297,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a crate::tokenizer::Tokenizer, name: &'a st
                 m.reset();
                 // The head of a stream is out, so the error is its last line (a response with a status cannot follow).
                 if !q.stream { return Err(e); }
-                eprintln!("request: {e:#}");
+                crate::say!("request: {e:#}");
                 let _ = write!(c, "data: {}\n\n", json!({"error": {"message": format!("{e:#}"), "type": "server_error"}}));
                 return Ok(crate::serve::Done { prompt: ids.len(), cached: keep, completion: 0, prefill_s: t.elapsed().as_secs_f64(), finish: "error" });
             }
@@ -304,7 +306,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a crate::tokenizer::Tokenizer, name: &'a st
         let n = q.max_tokens.unwrap_or(usize::MAX).min(ctx - ids.len());
         let stream = q.stream;
         let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
-        let (out, done) = decode_greedy(&tok, &mut m, &stop, logits, n, &mut |t| {
+        let (out, done) = decode_greedy(&tok, &mut m, &stop, &mut lim, logits, n, &mut |t| {
             !stream || t.is_empty() || write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok()
         });
         if stream {
@@ -329,15 +331,17 @@ fn decode_greedy(
     tok: &crate::tokenizer::Tokenizer,
     m: &mut forward::Gemma4Model,
     stop: &[u32],
+    lim: &mut Option<crate::grammar::Constraint>,
     mut logits: Vec<f32>,
     n: usize,
     emit: &mut dyn FnMut(&str) -> bool,
 ) -> (Vec<u32>, &'static str) {
     let (mut out, mut shown, mut done) = (vec![], 0, "length");
     for i in 0..n {
-        let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+        let next = crate::grammar::greedy(lim, &mut logits);
         if stop.contains(&next) { done = "stop"; break; }
         out.push(next);
+        crate::term::decoded(1);
         let s = tok.decode(&out).unwrap_or_default();
         if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
             let ok = emit(&s[shown..]);

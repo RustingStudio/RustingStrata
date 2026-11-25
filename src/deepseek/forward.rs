@@ -338,7 +338,7 @@ impl<'a> DsModel<'a> {
     /// Feed prompt tokens; only the last one computes logits (the vocab matvec is wasted on the rest).
     pub fn prefill(&mut self, toks: &[u32]) -> Vec<f32> {
         let mut logits = vec![];
-        for (i, &t) in toks.iter().enumerate() { logits = self.step_opt(t, i + 1 == toks.len()); }
+        for (i, &t) in toks.iter().enumerate() { logits = self.step_opt(t, i + 1 == toks.len()); crate::term::prefilled(1); }
         logits
     }
 

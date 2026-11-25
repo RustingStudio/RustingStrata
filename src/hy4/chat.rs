@@ -102,13 +102,14 @@ pub fn parse_calls(text: &str) -> Option<(String, Vec<(String, String)>)> {
 
 /// Greedy decode of up to `n` tokens after `logits`; `piece` gets each new piece of text and returns false to stop.
 /// Returns the tokens and whether the model ended the reply itself.
-fn decode(m: &mut Hy4Model, tok: &Tokenizer, mut logits: Vec<f32>, n: usize, mut piece: impl FnMut(&str) -> bool) -> (Vec<u32>, bool) {
+fn decode(m: &mut Hy4Model, tok: &Tokenizer, lim: &mut Option<crate::grammar::Constraint>, mut logits: Vec<f32>, n: usize, mut piece: impl FnMut(&str) -> bool) -> (Vec<u32>, bool) {
     let eos = tok.eos_ids();
     let (mut out, mut shown) = (vec![], 0);
     for i in 0..n {
-        let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+        let next = crate::grammar::greedy(lim, &mut logits);
         if eos.contains(&next) { return (out, true); }
         out.push(next);
+        crate::term::decoded(1);
         let s = tok.decode(&out).unwrap_or_default();
         if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
             if !piece(&s[shown..]) { break; }
@@ -134,7 +135,7 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
     anyhow::ensure!(!ids.is_empty() && ids.len() < max_ctx, "prompt is {} tokens, the limit is {max_ctx}", ids.len());
     if std::env::var_os("STRATA_DS_TRACE").is_some() { crate::say!("prompt tokens: {ids:?}"); }
     let logits = m.prefill(&ids);
-    let (out, _) = decode(&mut m, &tok, logits, n.min(max_ctx - ids.len()), show);
+    let (out, _) = decode(&mut m, &tok, &mut None, logits, n.min(max_ctx - ids.len()), show);
     if std::env::var_os("STRATA_DS_TRACE").is_some() { crate::say!("\noutput tokens: {out:?}"); }
     println!();
     Ok(())
@@ -169,7 +170,7 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
         }
         let logits = m.prefill(&ids);
         let left = max_ctx - m.toks.len();
-        decode(&mut m, &tok, logits, n.min(left), show);
+        decode(&mut m, &tok, &mut None, logits, n.min(left), show);
         println!();
     }
     Ok(())
@@ -185,6 +186,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str) -> anyhow::Resu
     let mut m = Hy4Model::new(g)?;
     let max_ctx = m.cfg.n_ctx;
     Ok(Box::new(move |c: &mut std::net::TcpStream, q: &crate::serve::ChatRequest| {
+        let mut lim = crate::grammar::Constraint::new(q, tok)?;
         let ids = tok.encode(&render(&q.messages, &q.tools, q.think.unwrap_or(false), q.preserve_thinking)).ok().filter(|i| !i.is_empty()).context("cannot encode prompt")?;
         anyhow::ensure!(ids.len() < max_ctx, "prompt is {} tokens, the limit is {max_ctx}", ids.len());
         let t = std::time::Instant::now();
@@ -197,7 +199,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str) -> anyhow::Resu
         let tools = q.tool_calls && !q.tools.is_empty();
         let mut hold = crate::chat::Hold::new(tools, vec![]).tagged(CALLS);
         let mut alive = std::time::Instant::now();
-        let (out, stopped) = decode(&mut m, &tok, logits, n, |p| {
+        let (out, stopped) = decode(&mut m, &tok, &mut lim, logits, n, |p| {
             let t = hold.push(p);
             !q.stream || if t.is_empty() { crate::serve::held(c, &mut alive) } else { write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok() }
         });

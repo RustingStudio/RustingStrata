@@ -15,6 +15,7 @@ pub mod gguf;
 pub mod quant;
 pub mod weights;
 pub mod ops;
+pub mod grammar;
 pub mod tokenizer;
 pub mod model;
 pub mod backend;

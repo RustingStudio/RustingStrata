@@ -660,6 +660,7 @@ impl<'a> GlmModel<'a> {
         if chunk > 1 {
             for c in head.chunks(chunk) {
                 self.prefill_chunk(c);
+                crate::term::prefilled(c.len());
             }
         } else {
             for &t in head {

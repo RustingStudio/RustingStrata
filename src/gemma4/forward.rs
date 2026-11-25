@@ -427,6 +427,7 @@ impl<'a> Gemma4Model<'a> {
             }
             let x: Vec<f32> = c.iter().flat_map(|&(id, e)| match e { Some(e) => e.to_vec(), None => self.embed(id) }).collect();
             self.prefill_chunk(&c.iter().map(|c| c.0).collect::<Vec<_>>(), x);
+            crate::term::prefilled(c.len());
         }
         match emb { Some(e) => self.step_embed_opt(id, e, true), None => self.step_opt(id, true) }
     }

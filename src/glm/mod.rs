@@ -253,6 +253,7 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
         if let Some(&f) = forced.get(i) { next = f; }
         if eos.contains(&next) { break; }
         out.push(next);
+        crate::term::decoded(1);
         let s = tok.decode(&out)?;
         if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
             print!("{}", &s[shown..]);
@@ -339,12 +340,13 @@ fn parse_calls(text: &str, tools: &[Json]) -> Option<(String, Vec<(String, Strin
 }
 
 /// Greedy decode up to `n` tokens from `logits`; `emit` gets each new text piece. Returns (ids, finish reason).
-fn decode_greedy(m: &mut forward::GlmModel, tok: &crate::tokenizer::Tokenizer, eos: &[u32], mut logits: Vec<f32>, n: usize, emit: &mut dyn FnMut(&str) -> bool) -> (Vec<u32>, &'static str) {
+fn decode_greedy(m: &mut forward::GlmModel, tok: &crate::tokenizer::Tokenizer, eos: &[u32], lim: &mut Option<crate::grammar::Constraint>, mut logits: Vec<f32>, n: usize, emit: &mut dyn FnMut(&str) -> bool) -> (Vec<u32>, &'static str) {
     let (mut out, mut shown, mut done) = (vec![], 0, "length");
     for i in 0..n {
-        let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+        let next = crate::grammar::greedy(lim, &mut logits);
         if eos.contains(&next) { done = "stop"; break; }
         out.push(next);
+        crate::term::decoded(1);
         let s = tok.decode(&out).unwrap_or_default();
         if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
             let ok = emit(&s[shown..]);
@@ -400,7 +402,7 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize) -> anyhow::Result<()> {
         let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
         let logits = m.prefill(&ids[keep..]);
         let room = n.min(ctx_limit(&m) - ids.len());
-        let (out, _) = decode_greedy(&mut m, &tok, &stop, logits, room, &mut |t| { print!("{t}"); let _ = std::io::stdout().flush(); true });
+        let (out, _) = decode_greedy(&mut m, &tok, &stop, &mut None, logits, room, &mut |t| { print!("{t}"); let _ = std::io::stdout().flush(); true });
         println!();
         msgs.push(("assistant".into(), tok.decode(&out)?));
     }
@@ -418,6 +420,8 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a crate::tokenizer::Tokenizer, name: &'a st
     let stop = stop_ids(g, tok);
     let ctx = ctx_limit(&m);
     Ok(Box::new(move |c: &mut std::net::TcpStream, q: &crate::serve::ChatRequest| {
+        let mut lim = crate::grammar::Constraint::new(q, tok)?;
+        if let Some(l) = &mut lim { l.eos.extend(&stop); }
         let ids = tok.encode(&chat_prompt_tools(&q.messages, &q.tools)).ok().filter(|i| !i.is_empty()).context("cannot encode prompt")?;
         anyhow::ensure!(ids.len() < ctx, "prompt is {} tokens, the limit is {}", ids.len(), ctx - 1);
         let t = std::time::Instant::now();
@@ -431,7 +435,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a crate::tokenizer::Tokenizer, name: &'a st
         let tools = q.tool_calls && !q.tools.is_empty();
         let mut hold = crate::chat::Hold::new(tools, vec![]);
         let mut alive = std::time::Instant::now();
-        let (out, done) = decode_greedy(&mut m, &tok, &stop, logits, n, &mut |t| {
+        let (out, done) = decode_greedy(&mut m, &tok, &stop, &mut lim, logits, n, &mut |t| {
             let t = hold.push(t);
             !stream || if t.is_empty() { crate::serve::held(c, &mut alive) } else { write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok() }
         });
