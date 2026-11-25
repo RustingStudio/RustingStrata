@@ -101,7 +101,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str) -> anyhow::Resu
         anyhow::ensure!(ids.len() <= ctx, "prompt is {} tokens, the limit is {ctx}", ids.len());
         let t = std::time::Instant::now();
         let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
-        if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
+        if q.stream && !q.head_sent { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
         let mut logits = crate::serve::alive(c, q.stream, || m.prefill(&ids[keep..]));
         let prefill_s = t.elapsed().as_secs_f64();
         let n = q.max_tokens.unwrap_or(usize::MAX).min(ctx - ids.len());

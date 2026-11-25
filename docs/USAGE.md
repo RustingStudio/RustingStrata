@@ -184,6 +184,10 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   runs, and while the text of a tool call is held back, the stream sends the SSE comment `: keep-alive` every 15 s, so
   a client that stops after some minutes without a byte keeps reading. If the prompt fails after the head, the stream
   ends early.
+  A model with its own forward (Inkling 2, Kolibri, Gemma 4, DeepSeek, GLM, Hy4) answers one request at a time; a
+  streamed chat that waits behind another gets its head after 10 s in the queue and then the same comment every 15 s,
+  so a client with a time limit for the head (OpenCode) waits for its turn. A refusal after that head is one
+  `data: {"error": ...}` line.
 - It runs one request at a time; `--parallel N` (GPU) decodes up to N together (4 requests: 164 tok/s in total on the
   RTX 3060, 41 each; see [HOSTING.md](HOSTING.md)). From 8 requests decoding at once (16 for a model with experts;
   `STRATA_BATCH_MIN` sets the count), a model without MTP, LoRA, Hadamard rotation or hyper-connections on CUDA runs

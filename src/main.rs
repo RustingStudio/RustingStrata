@@ -1929,7 +1929,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         _ => {}
                     }
                     // A customer key over `--max-per-key` is refused here, before it takes a place in the queue.
-                    let hold = match (who, per_key) {
+                    let hold = match (who.as_ref(), per_key) {
                         (Some(w), Some(cap)) if !w.admin => match serve::Hold::take(&held, w.id, cap) {
                             Some(h) => Some(h),
                             None => {
@@ -1942,6 +1942,13 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         },
                         _ => None,
                     };
+                    // A streamed chat for a model that answers one request at a time gets its head while it waits.
+                    let mut q = q;
+                    if let Ok(r) = &mut q && st.lock().unwrap().own && r.method == "POST" && r.path == "/v1/chat/completions" && who.is_some()
+                        && (k.read().unwrap().any() || serve::host_ok(&r.host, &a, &allowed))
+                        && serde_json::from_slice::<serde_json::Value>(&r.body).is_ok_and(|v| v["stream"] == true) {
+                        r.queued = serve::Queued::start(&c).ok();
+                    }
                     let _ = tx.send((c, q, i, hold));
                 });
             });
@@ -3612,6 +3619,7 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
             Runner::Own(_) => { let d = rusting_strata::deepseek::mat::dev_stats(); (d.as_ref().map_or("cpu", |d| d.0).into(), d.map(|d| d.1).unwrap_or_default(), rusting_strata::ctx_limit(st.ctx_train.unwrap_or(0) as usize), 1) }
             _ => ("cpu".into(), String::new(), engine.ctx, 1),
         };
+        st.own = matches!(r, Runner::Own(_));
         gpu_stats(&r, &mut st);
     }
     let mut l = Loaded { r, tok: &tok, tpl: if _own.is_some() { Template::Xml } else { template(&g) }, name: name.clone(), path: model.to_path_buf() };
@@ -3721,8 +3729,12 @@ fn anthropic_refused(w: &mut TcpStream, r: &Runner) -> bool {
 
 fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Loaded>, e: &Engine, s: &Serving, i: usize,
     next: &mut Option<(PathBuf, TcpStream)>) -> anyhow::Result<()> {
+    // The response head of a streamed chat that waited in the queue may be out already: then a refusal is one
+    // error line of the stream.
+    let head_sent = q.as_ref().ok().and_then(|r| r.queued.as_ref()).is_some_and(|x| x.take());
     let send = |w: &mut TcpStream, status: &str, v: serde_json::Value| -> anyhow::Result<()> {
         let b = v.to_string();
+        if head_sent { return Ok(write!(w, "data: {b}\n\n")?) }
         Ok(write!(w, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len())?)
     };
     // A malformed request gets a 400 (best effort: the client may be gone) and is still logged.
@@ -3854,6 +3866,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             };
             // A model outside the main engine answers the request itself (greedy; it fails before it writes).
             if let Runner::Own(chat) = r {
+                req.head_sent = head_sent;
                 if s.max_tokens < usize::MAX { req.max_tokens = Some(req.max_tokens.unwrap_or(s.max_tokens).min(s.max_tokens)); }
                 say!("request: {method} {p} key={key_name} model={name} messages={} stream={} tools={}", req.messages.len(), req.stream, req.tools.len());
                 s.stats.lock().unwrap().busy += 1;
@@ -3877,6 +3890,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     }
                 };
             }
+            if head_sent { return send(&mut w, "", json!({"error": {"message": "the model changed while this request waited; send it again", "type": "server_error"}})); }
             // Room is checked on the full prompt before any state changes.
             let preserve = req.preserve_thinking.unwrap_or(e.preserve_thinking);
             // An assistant message at the end is continued, not answered: the prompt stops inside it.

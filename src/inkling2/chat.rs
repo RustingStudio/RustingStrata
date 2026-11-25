@@ -525,7 +525,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str, opts: Inkling2O
         ensure!(!ids.is_empty(), "cannot encode prompt");
         ensure!(ids.len() < m.max_ctx, "prompt is {} tokens, the limit is {}", ids.len(), m.max_ctx);
         let t = std::time::Instant::now();
-        if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
+        if q.stream && !q.head_sent { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
         let (keep, logits) = crate::serve::alive(c, q.stream, || if !has_images && m.toks.len() < ids.len() && ids.starts_with(&m.toks) {
             let k = m.toks.len();
             (k, m.prefill_embds(&seq[k..]))

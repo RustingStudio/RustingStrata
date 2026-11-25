@@ -16,6 +16,8 @@ pub struct Request {
     /// proxy's, not the client's.
     pub proxied: bool,
     pub body: Vec<u8>,
+    /// Set by the accept loop for a streamed chat that waits in the queue (`Queued`).
+    pub queued: Option<std::sync::Arc<Queued>>,
 }
 
 /// Reads one request, with a `Content-Length` or a chunked body (`Transfer-Encoding: chunked`, which wins when both
@@ -75,7 +77,7 @@ pub fn read_request(r: &mut impl BufRead) -> anyhow::Result<Request> {
         body.resize(len, 0);
         r.read_exact(&mut body)?;
     }
-    Ok(Request { method, path, host, auth, json, proxied, body })
+    Ok(Request { method, path, host, auth, json, proxied, body, queued: None })
 }
 
 /// Host header check against DNS rebinding: a loopback name, the host the server was bound to, or a name the user
@@ -104,6 +106,44 @@ const KEEP: std::time::Duration = std::time::Duration::from_secs(15);
 /// goes out every 15 s until `f` returns, so a client that waits a limited time for the next byte keeps waiting
 /// through a long prompt (`f` must not write to `c`).
 pub fn alive<T>(c: &std::net::TcpStream, stream: bool, f: impl FnOnce() -> T) -> T { alive_every(c, stream.then_some(KEEP), f) }
+
+/// A streamed chat in the queue of a model that answers one request at a time (a model outside the main engine,
+/// such as Inkling 2). After `QUEUE_HEAD` in the queue its response head goes out, then `: keep-alive` every 15 s,
+/// so a client with a time limit for the head (OpenCode) waits for its turn instead of giving up. `take` ends that
+/// when the model picks the request; the thread also ends when the request is dropped.
+pub struct Queued { picked: std::sync::Mutex<bool>, cv: std::sync::Condvar, head: std::sync::atomic::AtomicBool }
+
+pub const QUEUE_HEAD: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl Queued {
+    pub fn start(c: &std::net::TcpStream) -> std::io::Result<std::sync::Arc<Queued>> {
+        use std::io::Write;
+        let q = std::sync::Arc::new(Queued { picked: Default::default(), cv: Default::default(), head: Default::default() });
+        let (w, mut c) = (std::sync::Arc::downgrade(&q), c.try_clone()?);
+        std::thread::spawn(move || {
+            let mut wait = QUEUE_HEAD;
+            while let Some(q) = w.upgrade() {
+                let (g, _) = q.cv.wait_timeout_while(q.picked.lock().unwrap(), wait, |p| !*p).unwrap();
+                // A dropped request leaves only this thread's reference: write nothing for it.
+                if *g || std::sync::Arc::strong_count(&q) == 1 { return; }
+                // Written under the lock, so `take` returns after a write in progress.
+                let out = if q.head.swap(true, std::sync::atomic::Ordering::Relaxed) { c.write_all(b": keep-alive\n\n") } else { c.write_all(SSE_HEAD.as_bytes()) };
+                if out.is_err() { return; }
+                wait = KEEP;
+            }
+        });
+        Ok(q)
+    }
+    /// The model picked the request: stops the thread. True when the response head is already out.
+    pub fn take(&self) -> bool {
+        *self.picked.lock().unwrap() = true;
+        self.cv.notify_all();
+        self.head.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// The response head of a streamed chat.
+pub const SSE_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
 
 /// `alive` with the time between two comments (`None`: no stream, nothing is written).
 pub fn alive_every<T>(c: &std::net::TcpStream, every: Option<std::time::Duration>, f: impl FnOnce() -> T) -> T {
@@ -368,6 +408,8 @@ pub struct ChatRequest {
     pub seed: Option<u64>,
     /// The reply ends before the first of these strings (`stop`).
     pub stop: Vec<String>,
+    /// The response head went out while the request waited in the queue (`Queued`): the handler must not write it.
+    pub head_sent: bool,
 }
 
 pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
@@ -443,7 +485,7 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
         },
         dry_multiplier: num("dry_multiplier", |f| (0.0..=5.0).contains(&f), "a number in [0, 5]")?,
         dry_base: num("dry_base", |f| f > 1.0 && f <= 4.0, "a number in (1, 4]")?,
-        dry_allowed_length: int("dry_allowed_length", 1)?.map(|n| n as usize), seed: int("seed", 0)?, stop })
+        dry_allowed_length: int("dry_allowed_length", 1)?.map(|n| n as usize), seed: int("seed", 0)?, stop, head_sent: false })
 }
 
 /// What the chat page's side panel shows about the server, kept by the request loop and answered by the reader
@@ -466,6 +508,9 @@ pub struct Stats {
     pub ctx_train: Option<u64>,
     /// Requests decoded at once (`--parallel`).
     pub slots: usize,
+    /// The loaded model answers one request at a time outside the main engine (`Queued` applies).
+    #[serde(skip)]
+    pub own: bool,
     /// Device memory in use and in total, measured after the load and after each request.
     pub vram: Option<(u64, u64)>,
     /// Host RAM cap in bytes (`total - --ram-margin`, or `--max-ram`); `None` if undetectable.

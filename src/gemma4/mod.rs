@@ -288,7 +288,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a crate::tokenizer::Tokenizer, name: &'a st
         let t = std::time::Instant::now();
         let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
         // A failed feed leaves part of the prompt in the cache, so the next request starts over.
-        if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
+        if q.stream && !q.head_sent { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
         let logits = match crate::serve::alive(c, q.stream, || feed(&mut m, &seq[keep..])) {
             Ok(l) => l,
             Err(e) => {
