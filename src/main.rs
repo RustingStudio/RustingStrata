@@ -1605,9 +1605,23 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Interface { models_dir } => {
             println!("{}", term::paint(term::out(), "1", concat!("RustingStrata ", env!("CARGO_PKG_VERSION"))));
-            let mut models = serve::list_models(&models_dir.clone().unwrap_or_else(models_dir_default));
-            for m in serve::cached_models() { if !models.iter().any(|x| x.1 == m.1) { models.push(m); } }
+            // The models picked in earlier runs come first, the last one at the top (issue #82).
+            let hist = rusting_strata::expert_cache::cache_dir().join("interface-models.txt");
+            let old: Vec<PathBuf> = std::fs::read_to_string(&hist).unwrap_or_default().lines().map(PathBuf::from).filter(|p| p.is_file()).collect();
+            let mut models: Vec<_> = old.iter().map(|p| {
+                let name = p.file_name().map_or_else(|| p.to_string_lossy(), |n| n.to_string_lossy()).into_owned();
+                (name, p.clone(), std::fs::metadata(p).map_or(0, |m| m.len()))
+            }).collect();
+            let found = serve::list_models(&models_dir.clone().unwrap_or_else(models_dir_default)).into_iter().chain(serve::cached_models());
+            for m in found {
+                let p = m.1.canonicalize().unwrap_or_else(|_| m.1.clone());
+                if !models.iter().any(|x| x.1 == p) { models.push(m); }
+            }
             let mut args = interface_args(&mut std::io::stdin().lock(), models)?;
+            if let Ok(p) = std::path::Path::new(&args[2]).canonicalize() {
+                let keep: Vec<_> = std::iter::once(&p).chain(old.iter().filter(|&o| *o != p)).take(10).map(|p| p.to_string_lossy()).collect();
+                let _ = std::fs::create_dir_all(hist.parent().unwrap()).and_then(|_| std::fs::write(&hist, keep.join("\n") + "\n"));
+            }
             if let Some(d) = models_dir.filter(|_| args[0] == "serve") { args.extend(["--models-dir".into(), d.to_string_lossy().into()]); }
             let shown: Vec<_> = args.iter().map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() }).collect();
             println!("\n{} rustingstrata {}\n", term::paint(term::out(), "2", "running:"), shown.join(" "));

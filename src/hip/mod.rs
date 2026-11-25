@@ -147,7 +147,8 @@ fn cache_key(src: &str, arch: &str, rtc: &str) -> u64 {
 impl Gpu {
     pub fn new(device: usize) -> anyhow::Result<Gpu> {
         let hip = Arc::new(ffi::Hip::open()?);
-        hip.check(unsafe { (hip.init)(0) }, "hipInit")?;
+        hip.check(unsafe { (hip.init)(0) }, "hipInit")
+            .map_err(|e| anyhow::anyhow!("{e} (check that `rocminfo` lists the card and that this user can open /dev/kfd)"))?;
         let n = {
             let mut n = 0;
             hip.check(unsafe { (hip.device_count)(&mut n) }, "hipGetDeviceCount")?;
