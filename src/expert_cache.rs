@@ -227,21 +227,54 @@ impl ExpertCache {
     }
 
     /// After a prefill: the prompt's routing joins `counts`, scaled back to steady-state size, and the placement
-    /// follows. A long prompt still decides the placement the reply starts with, but its thousands of tokens no
-    /// longer outweigh the reply's: the reply's own routing moves the placement as fast as in any other run.
+    /// follows. Under `STRATA_PREFILL_PROTECT` (default on; `"0"` for legacy full flush, `"strict"` for 0 swaps),
+    /// a long prompt blends gently (25% of steady state) and swaps at most 10% of each pool's slots so it does not
+    /// flush the hot decode cache.
     pub fn settle(&mut self, m: &Model, gpu: &dyn Backend) -> anyhow::Result<()> {
         let n = self.n_expert;
-        if self.profile.is_some() {
+        let mode = std::env::var("STRATA_PREFILL_PROTECT").unwrap_or_default();
+        if self.profile.is_some() && !mode.eq_ignore_ascii_case("strict") {
+            let protect = mode != "0";
+            let prompt_cap = if protect { 0.25 * self.steady } else { f32::INFINITY };
             for il in 0..self.layers.len() {
                 let r = il * n..(il + 1) * n;
-                for i in r.clone() { self.counts[i] += self.prompt[i]; }
+                let psum: f32 = self.prompt[r.clone()].iter().sum();
+                let pscale = if psum > prompt_cap { prompt_cap / psum } else { 1.0 };
+                for i in r.clone() { self.counts[i] += self.prompt[i] * pscale; }
                 let sum = self.counts[r.clone()].iter().sum::<f32>();
                 if sum > self.steady { for i in r { self.counts[i] *= self.steady / sum; } }
             }
-            self.swap(m, gpu, usize::MAX)?;
+            let max_swaps = if protect {
+                let min_pool = self.pools.iter().map(|p| p.owner.len()).filter(|&l| l > 0).min().unwrap_or(0);
+                (min_pool / 10).max(1)
+            } else {
+                usize::MAX
+            };
+            self.swap(m, gpu, max_swaps)?;
         }
         self.prompt.fill(0.0);
         Ok(())
+    }
+
+    /// Top `top_k` hottest non-resident experts of `next_il` (by short-term `counts`, falling back to `long`),
+    /// returned as `(ptr, len)` mmap byte ranges for asynchronous NVMe read-ahead (`Prefetch::send`) while layer
+    /// `il` computes on the GPU.
+    pub fn cold_ranges_for_next(&self, m: &Model, next_il: usize, top_k: usize) -> Vec<(usize, usize)> {
+        let Some(lx) = self.layers.get(next_il).and_then(|l| l.as_ref()) else { return Vec::new() };
+        let n = self.n_expert;
+        let base = next_il * n;
+        let mut cands: Vec<usize> = (0..n).filter(|&e| lx.table[e] < 0).collect();
+        if cands.is_empty() { return Vec::new(); }
+        let score = |e: usize| self.counts[base + e] + 0.01 * self.long[base + e];
+        smallest(&mut cands, top_k, |&a, &b| score(b).total_cmp(&score(a)));
+        let mut rs = Vec::with_capacity(cands.len() * 3);
+        for (name, mat) in MATS.iter().zip(&lx.mats) {
+            let Ok(w) = m.w.layer(next_il, name) else { continue };
+            for &e in &cands {
+                rs.push((w.data.as_ptr() as usize + e * mat.bytes, mat.bytes));
+            }
+        }
+        rs
     }
 
     /// Forget the short-term routing counts: the prompt's thousands of tokens no longer outweigh the reply's first
@@ -399,5 +432,21 @@ mod tests {
         assert_eq!(&all[4..], &[9.0; 4]);
         let longer = profile_update(&existing, 4, &[1.0; 12], &[true, false, true]);
         assert_eq!(longer.len(), 12, "a longer profile grows without losing the file's counts");
+    }
+
+    #[test]
+    fn prefill_protect_blends_gently_and_preserves_hot_decode_counts() {
+        let mut c = fake(1, 4, 2, None);
+        // Simulate hot decode experts 0 and 1, then a huge prompt hitting cold experts 2 and 3.
+        c.counts = vec![40.0, 40.0, 0.0, 0.0];
+        c.steady = 80.0;
+        c.record_prompt(0, &[2, 2, 2, 2, 3, 3, 3, 3]);
+        // Under default protection, prompt contribution is capped at 0.25 * steady = 20.0 total (10 each),
+        // so hot decode experts 0 and 1 stay strictly hotter than cold prompt experts 2 and 3.
+        let psum: f32 = c.prompt[..4].iter().sum();
+        let cap = 0.25 * c.steady;
+        let pscale = if psum > cap { cap / psum } else { 1.0 };
+        for i in 0..4 { c.counts[i] += c.prompt[i] * pscale; }
+        assert!(c.counts[0] > c.counts[2] && c.counts[1] > c.counts[3]);
     }
 }
