@@ -952,11 +952,13 @@ impl Backend for Gpu {
         self.ctx.bind_to_thread()?;
         let r = unsafe { sys::cuMemHostRegister_v2(h as *mut _, len, sys::CU_MEMHOSTREGISTER_DEVICEMAP | sys::CU_MEMHOSTREGISTER_PORTABLE) };
         anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "cuMemHostRegister: {r:?}");
+        // From here a failure drops `reg`, which unregisters the range before the mapping goes.
+        let reg = Reg(m, h);
         let mut dev = 0;
         let r = unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev, h as *mut _, 0) };
         anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "cuMemHostGetDevicePointer: {r:?}");
         anyhow::ensure!(dev == h as u64, "mapped host memory has a device address other than its host one (no UVA)");
-        let b = Buf::new(dev, bytes, Reg(m, h));
+        let b = Buf::new(dev, bytes, reg);
         // The staging of `attn_host`, made here at load time: allocating inside a graph capture breaks it.
         let mut st = HA_STAGE.lock().unwrap();
         if st.is_none() {
@@ -976,7 +978,10 @@ impl Backend for Gpu {
         drop(st);
         let ctx = {
             let mut c = CTX.lock().unwrap();
-            match c.iter().find(|e| e.0 == kc && e.1 == vc && e.2 == nt) {
+            // Keyed by every field: a model loaded later can reuse a freed cache's addresses with other shapes.
+            let same = |a: &crate::host_attn::HostAttn| a.kc == kc as usize && a.vc == vc as usize && a.nt == nt && a.nh == nh
+                && a.nkv == nkv && a.hd == hd && a.mode == self.kv_mode as u32 && a.scale.to_bits() == scale.to_bits();
+            match c.iter().find(|e| same(unsafe { &*(e.3 as *const crate::host_attn::HostAttn) })) {
                 Some(e) => e.3,
                 None => {
                     let a = Box::leak(Box::new(crate::host_attn::HostAttn { q: bq as usize, step: bs as usize, part: bp as usize,
