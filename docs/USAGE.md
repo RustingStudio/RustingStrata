@@ -167,7 +167,7 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   profile stay per file.
 - Inkling 2, Hy4, GLM, DeepSeek, Kolibri and Gemma 4 run on their own code path. The server loads them like any other model
   (`serve --model <file>`, or from the chat page of a running server, in either direction), with these limits: one
-  request at a time, greedy (Inkling 2 also samples: `temperature`, `top_k`, `top_p`, `seed`; a seed repeats its
+  request at a time, greedy (`logit_bias` and `grammar` work; Inkling 2 also samples: `temperature`, `top_k`, `top_p`, `min_p`, `seed`; a seed repeats its
   text only with `STRATA_FIXED_EXPERTS=1`, because the adaptive expert split moves the logits a little),
   `/v1/chat/completions` only (no `/v1/messages`). `calibrate` measures their prefill chunk only
   ([CALIBRATION.md](CALIBRATION.md)). The context limit is `--ctx` (or the page's context setting) when given, else the trained context.
@@ -202,7 +202,19 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   Slot state that does not fit in VRAM is kept in RAM, and `--parallel` is lowered to the slots that fit. That forward
   rounds differently from the single-request one, so greedy output under load can differ at near-ties from the same
   request run alone.
-- `temperature`, `top_k`, `top_p` and `seed` are honored; decoding is greedy when they are left out.
+- `temperature`, `top_k`, `top_p`, `min_p` and `seed` are honored; decoding is greedy when they are left out.
+  `min_p` (0 to 1, `--min-p`, default 0 = off) drops the tokens whose probability is below `min_p` times the
+  best token's, as in llama.cpp.
+- `logit_bias` is added to the logits before the token is picked, greedy or sampled, on every model (also the
+  models with their own forward). Both forms work: the OpenAI object `{"15339": -100}` and llama.cpp's list
+  `[[15339, -100], ["hello", 5], ["hello", false]]`. A text applies to each of its tokens. The bias is -100 to 100;
+  -100 and `false` ban the token. A token id that is not in the vocabulary is a `400`.
+- `grammar` (llama.cpp's GBNF, as a string) limits the reply to the text the grammar allows, for example
+  `root ::= "yes" | "no"` or llama.cpp's `grammars/json.gbnf`. The reply ends only once the grammar is complete.
+  Thinking is off for the request unless `chat_template_kwargs.enable_thinking` turns it on, because the grammar
+  holds for the thinking text too. A grammar that does not parse is a `400` with the reason. With a grammar or a
+  bias the GPU drafts (`--mtp`, `--spec-type`) are off for that request, and each token checks the whole vocabulary
+  against the grammar (about 10 ms per token for a 150K vocabulary). `/v1/messages` takes neither field.
 - `presence_penalty` and `frequency_penalty` (OpenAI, -2 to 2) and `dry_multiplier`, `dry_base`, `dry_allowed_length`
   (the DRY sampler, llama.cpp server names) act against repetition loops. They count only the tokens of the reply,
   not the prompt, and do not apply inside a tool call. `--presence-penalty`, `--frequency-penalty`,
@@ -222,6 +234,14 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 - `tools` and `tool_choice` work as in the OpenAI API: calls come back as `tool_calls` with `finish_reason:
   "tool_calls"`. `tool_choice: "required"` does not force a call.
 - The prompt follows the model's own chat template, rendered like llama.cpp's `--jinja`.
+- `POST /tokenize` and `POST /detokenize` work as in llama.cpp's server: `{"content": "text", "add_special": false,
+  "with_pieces": false}` gives `{"tokens": [...]}` (with pieces each entry is `{"id", "piece"}`, and a piece that is
+  not whole UTF-8 is its list of bytes), and `{"tokens": [...]}` gives `{"content": "text"}`. `add_special` puts the
+  BOS token in front when the model asks for one.
+- Each status line on stderr starts with the local time (`[23:41:07]`). While a prompt runs or a reply is
+  generated, a line about every 2 s gives the speed: `prefill: X tok/s, N tok` (the prompt tokens so far over their
+  time), then `decode: X tok/s, N tok` (over the last 2 s). The terminal chat prints only the prefill line, so the
+  reply text is not broken up. Nothing is printed while the server is idle.
 
 `POST /v1/messages` speaks the Anthropic Messages API (text, `tool_use` and `tool_result` blocks, streamed or not, the
 key in `x-api-key`, and `POST /v1/messages/count_tokens`), so Claude Code can use the server:
