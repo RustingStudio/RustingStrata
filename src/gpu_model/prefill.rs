@@ -673,11 +673,15 @@ impl GpuModel<'_> {
                     let (pool, stride) = cache.base(lx);
                     let used = |e: &usize| off[e + 1] > off[*e];
                     let mut missed: Vec<usize> = (0..c.n_expert).filter(used).filter(|&e| cache.slot(il, e) < 0).collect();
-                    // A batch step: the CPU runs the missed experts (each read once for all rows, in RAM) beside the
-                    // resident GEMMs, instead of a PCIe copy of each that costs more than the CPU's pass.
+                    // A batch step: the CPU runs a share of the missed experts (each read once for all rows, in RAM)
+                    // beside the resident GEMMs, and the rest are staged over PCIe as in a prompt. The share follows
+                    // whichever side finishes first (`cpu_frac`); STRATA_CPU_FRAC fixes it. Qwen3.6-35B-A3B UD-Q2_K_XL,
+                    // RTX 3060, 28 clients with --fixed-experts: all on the CPU 96-100 tok/s, the balanced share 167-168.
                     let cpu = if rows.is_some() && c.hadamard.is_none() && !missed.is_empty() {
                         let hv = g.get::<f32>(&pf.slab, l.h, t * ne)?;
-                        Some((std::mem::take(&mut missed), hv.chunks_exact(ne).map(<[f32]>::to_vec).collect::<Vec<_>>()))
+                        let frac: f64 = std::env::var("STRATA_CPU_FRAC").ok().and_then(|v| v.parse().ok()).unwrap_or(self.cpu_frac);
+                        let keep = missed.len() - (missed.len() as f64 * frac).round() as usize;
+                        Some((missed.split_off(keep), hv.chunks_exact(ne).map(<[f32]>::to_vec).collect::<Vec<_>>()))
                     } else { None };
                     if let Some(pre) = &pre {
                         let w: Vec<_> = MATS.iter().map(|name| self.m.w.layer(il, name)).collect::<anyhow::Result<_>>()?;
@@ -774,25 +778,35 @@ impl GpuModel<'_> {
                     };
                     // `beside` starts a step's copies after the GEMMs before it. They queue last, so the GEMMs need not
                     // wait for the host to stage them.
-                    for ((_, cp), (gu, downs)) in steps.iter().zip(&spans) {
-                        g.beside(&mut || {
-                            if gu[0].1 > 0 {
-                                g.gemm(mg.ty, mg.rows, mg.cols, tp(gu[0].0), gu[0].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, same)?;
-                                g.gemm(mu.ty, mu.rows, mu.cols, tp(gu[1].0), gu[1].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X)?;
-                            }
-                            for &((s0, n0), lo, hi) in downs {
-                                let ge = at(l.ge) + (4 * lo * c.n_ff_exp) as u64;
-                                if let Some((s, r)) = rot { g.hadamard(ge, 0, s[1].addr(), ge, c.n_ff_exp, r.block, hi - lo)?; }
-                                g.gemm(md.ty, md.rows, md.cols, tp(s0), n0, at(l.ge) + (4 * lo * c.n_ff_exp) as u64, c.n_ff_exp, hi - lo, 0, at(l.ye) + (4 * lo * ne) as u64, ne, 0)?;
-                            }
-                            if let Some(j) = *cp { copy(j)?; }
-                            Ok(())
-                        })?;
-                    }
-                    if let Some((cm, hs)) = &cpu {
-                        // Slot s of expert e holds the pair of token xrow[s]; the rows go to `ye` in slot order.
-                        let pairs: Vec<(usize, usize, f32)> = { let (xr, of) = (&xrow, &off); cm.iter().flat_map(|&e| (of[e]..of[e + 1]).map(move |s| (xr[s] as usize, e, 0.0))).collect() };
-                        let o = crate::cpu_moe::expert_rows(&self.m, il, hs, &pairs);
+                    // The CPU experts run on their own thread, beside the host side of the staging copies below.
+                    let m = self.m;
+                    let cpu_out = std::thread::scope(|sc| -> anyhow::Result<_> {
+                        let job = cpu.as_ref().map(|(cm, hs)| {
+                            // Slot s of expert e holds the pair of token xrow[s]; the rows go to `ye` in slot order.
+                            let pairs: Vec<(usize, usize, f32)> = { let (xr, of) = (&xrow, &off); cm.iter().flat_map(|&e| (of[e]..of[e + 1]).map(move |s| (xr[s] as usize, e, 0.0))).collect() };
+                            sc.spawn(move || { let t0 = std::time::Instant::now(); let o = crate::cpu_moe::expert_rows(m, il, hs, &pairs); (o, t0.elapsed()) })
+                        });
+                        let t0 = std::time::Instant::now();
+                        for ((_, cp), (gu, downs)) in steps.iter().zip(&spans) {
+                            g.beside(&mut || {
+                                if gu[0].1 > 0 {
+                                    g.gemm(mg.ty, mg.rows, mg.cols, tp(gu[0].0), gu[0].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, same)?;
+                                    g.gemm(mu.ty, mu.rows, mu.cols, tp(gu[1].0), gu[1].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X)?;
+                                }
+                                for &((s0, n0), lo, hi) in downs {
+                                    let ge = at(l.ge) + (4 * lo * c.n_ff_exp) as u64;
+                                    if let Some((s, r)) = rot { g.hadamard(ge, 0, s[1].addr(), ge, c.n_ff_exp, r.block, hi - lo)?; }
+                                    g.gemm(md.ty, md.rows, md.cols, tp(s0), n0, at(l.ge) + (4 * lo * c.n_ff_exp) as u64, c.n_ff_exp, hi - lo, 0, at(l.ye) + (4 * lo * ne) as u64, ne, 0)?;
+                                }
+                                if let Some(j) = *cp { copy(j)?; }
+                                Ok(())
+                            })?;
+                        }
+                        let tl = t0.elapsed();
+                        Ok(job.map(|j| (j.join().expect("CPU expert thread"), tl)))
+                    })?;
+                    let bal = cpu_out.as_ref().map(|((_, tc), tl)| (*tc, *tl));
+                    if let (Some((cm, _)), Some(((o, _), _))) = (&cpu, cpu_out) {
                         let mut j = 0;
                         for &e in cm {
                             let len = (off[e + 1] - off[e]) * ne;
@@ -800,7 +814,14 @@ impl GpuModel<'_> {
                             j += len;
                         }
                     }
+                    let tj = std::time::Instant::now();
                     g.beside_join()?;
+                    let tj = tj.elapsed();
+                    // Balance the CPU against the host's staging loop plus the GPU's wait: move a little of the share
+                    // toward the side that finished first.
+                    if let Some((tc, tl)) = bal {
+                        self.cpu_frac = (self.cpu_frac + if tc > tl + tj { -0.02 } else { 0.02 }).clamp(0.0, 1.0);
+                    }
                     // The shared down runs last, so the routed gate and up above reuse the int8 h of the shared up.
                     if let Some(s) = shared { g.gemm_dense(&s.down, t, at(l.shg), c.n_ff_shexp, at(l.shy), ne, bf)?; }
                     // Expert rows are slots (token, j) sorted by expert, not tokens.
