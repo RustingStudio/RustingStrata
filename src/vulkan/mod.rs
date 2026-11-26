@@ -3,7 +3,7 @@
 //! command buffer, which a host copy or `sync` submits and waits for. Every op ends with a full compute and transfer
 //! barrier, which also orders it before the work of later submissions.
 
-use crate::backend::{ATT_SPLITS, ATT_SPLITS_1, Backend, Buf, GpuTensor, SAME_X};
+use crate::backend::{BATCHED, ATT_SPLITS, ATT_SPLITS_1, Backend, Buf, GpuTensor, SAME_X};
 use crate::quant::GgmlType;
 use anyhow::{Context, anyhow, ensure};
 use ash::vk;
@@ -44,6 +44,7 @@ const SPV: &[(&str, &[u8])] = &[
     ("gemmi_16", include_bytes!("spv/gemmi_16.spv")),
     ("gemmi_dp", include_bytes!("spv/gemmi_dp.spv")),
     ("gemmi_s", include_bytes!("spv/gemmi_s.spv")),
+    ("gemm_red", include_bytes!("spv/gemm_red.spv")),
     ("gemmi_s_16", include_bytes!("spv/gemmi_s_16.spv")),
     ("gemv_f", include_bytes!("spv/gemv_f.spv")),
     ("gemv_q", include_bytes!("spv/gemv_q.spv")),
@@ -92,8 +93,14 @@ const SPV: &[(&str, &[u8])] = &[
 ];
 
 /// The device, a scratch buffer of XQ bytes for x quantized by `quant_xq` when an op does that itself, the IQ lookup
-/// tables (`iq_tables`), the growable q8 rows for `gemmi` prefill, and a fixed q8 buffer for `<= TMAX` graphed forwards.
-pub struct Vk(Arc<Inner>, Buf, Buf, Mutex<(Buf, Option<[u64; 4]>)>, Mutex<(Buf, Option<[u64; 4]>)>);
+/// tables (`iq_tables`), the growable q8 rows for `gemmi` prefill, a fixed q8 buffer for `<= TMAX` graphed forwards,
+/// and the split-K slices of batched-decode GEMMs (`SPLIT_SCR` bytes, made at first use).
+pub struct Vk(Arc<Inner>, Buf, Buf, Mutex<(Buf, Option<[u64; 4]>)>, Mutex<(Buf, Option<[u64; 4]>)>, std::sync::OnceLock<Buf>);
+
+/// Split-K scratch of a batched GEMM: ks * nd * rows floats, ks chosen so ks * workgroups <= SPLIT_WG (so it fits:
+/// rows <= 64 g0 and nd <= 32 g1). 224, 448 and 896 measured alike at 16 rows; 448 was best at 64.
+const SPLIT_WG: usize = 448;
+const SPLIT_SCR: usize = SPLIT_WG * 64 * 32 * 4;
 
 /// The IQ lookup tables in one buffer, and the `tables.glsl` that names each at its offset from the buffer's address
 /// (spec constants 3 and 4). As GLSL const arrays the tables went to per-thread local memory on NVIDIA, which made
@@ -523,6 +530,7 @@ impl Vk {
             Buf::new(0, 0, ()),
             Mutex::new((Buf::new(0, 0, ()), None)),
             Mutex::new((Buf::new(0, 0, ()), None)),
+            Default::default(),
         );
         v.1 = v.buf(XQ, DEVICE)?.0;
         v.4.lock().unwrap().0 = v.alloc(1 << 20)?;
@@ -998,7 +1006,7 @@ impl Vk {
         ensure!(cols % 64 == 0, "{} matrix with {cols} columns: GEMM needs a multiple of 64", ty.name());
         if n_tiles == 0 { return Ok(()); }
         let (spec, grid, nk) = (self.wspec(ty), [rows.div_ceil(64), n_tiles, 1], (cols / 64) as u32);
-        let (same, act) = (act & SAME_X != 0, act & 3);  // BATCHED: the same kernels
+        let (same, batched, act) = (act & SAME_X != 0, act & BATCHED != 0, act & 3);
         let mut q8 = self.q8_mutex(n_x, cols).lock().unwrap();
         let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);  // as on CUDA
         let reuse = same && q8.1 == key;
@@ -1023,6 +1031,21 @@ impl Vk {
         // Only SAME_X promises that x still holds what was quantized (as on CUDA).
         if !same { q8.1 = None; }
         let xq = self.q8_x(&mut q8, ty, cols, n_x, x, x_stride)?.expect("int8 GEMM without a quantized x");
+        // A step of a batch of requests (at most 64 rows of x): gemmi_s, K split over ks workgroups so that the few
+        // weight-row tiles fill the device, each slice into the scratch, then gemm_red sums them (as gemmd on CUDA).
+        if batched && tiles == 0 && xrow == 0 && nd <= 64 && self.0.coop_i8 != 0 && !self.0.st().batch {
+            let g = [rows.div_ceil(64), nd.div_ceil(32), 1];
+            let ks = (SPLIT_WG / (g[0] * g[1])).clamp(1, 8).min(nk as usize / 4).max(1);
+            let (sk, scr) = if ks > 1 { (ks, self.5.get_or_init(|| self.alloc(SPLIT_SCR).expect("split-K scratch")).addr()) } else { (1, y) };
+            let (ys, a) = if ks > 1 { (rows, 0) } else { (y_stride, act) };
+            let args: [&dyn Arg; 11] = [&tiles, &wd, &xq, &xrow, &scr, &(nd as u32), &(ys as u32), tail[0], tail[1], &a, tail[3]];
+            self.run(if self.0.coop_i8 == 32 { "gemmi_s" } else { "gemmi_s_16" }, &spec, [g[0], g[1], sk], &args)?;
+            if ks > 1 {
+                self.run("gemm_red", &[], [(rows * nd).div_ceil(256), 1, 1],
+                    &[&scr, &y, &(rows as u32), &(nd as u32), &(y_stride as u32), &(ks as u32), &act])?;
+            }
+            return Ok(());
+        }
         let args: [&dyn Arg; 11] = [&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2], tail[3]];
         let (gk, gks) = match self.0.coop_i8 { 32 => ("gemmi", "gemmi_s"), 16 => ("gemmi_16", "gemmi_s_16"), _ => ("gemmi_dp", "gemmi_dp") };
         self.run(if self.0.coop_i8 == 0 { "gemmi_dp" } else if sm { gks } else { gk }, &spec, grid, &args)?;
@@ -1053,6 +1076,7 @@ impl Backend for Vk {
             self.2.clone(),
             Mutex::new((Buf::new(0, 0, ()), None)),
             Mutex::new((Buf::new(0, 0, ()), None)),
+            Default::default(),
         );
         v.4.lock().unwrap().0 = v.alloc(1 << 20)?;
         Ok(Box::new(v))

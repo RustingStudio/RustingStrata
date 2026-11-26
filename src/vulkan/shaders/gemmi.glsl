@@ -128,19 +128,27 @@ void main() {
     // W: invocation decodes the 16 weights (subs 2 wi, 2 wi + 1 of the step) of row wr.
     uint wr = tid >> 2, wi = tid & 3;
     bool wok = n0 + wr < p.rows;
+    // Split K (gemmi_s in batched decode, z = segment): this workgroup sums K steps k0 .. k1 into its own y slice.
+    // Only SM: the same code in gemmi cost a third of its prefill speed.
+#if SM
+    uint nkl = (p.nk + gl_NumWorkGroups.z - 1) / gl_NumWorkGroups.z, k0 = gl_WorkGroupID.z * nkl, k1 = min(p.nk, k0 + nkl), kz = gl_WorkGroupID.z;
+#else
+    const uint k0 = 0, kz = 0;
+    uint k1 = p.nk;
+#endif
     precise float acc[2][2][8];
     [[unroll]] for (uint a = 0; a < 2; a++) for (uint b = 0; b < 2; b++) for (uint i = 0; i < 8; i++) acc[a][b][i] = 0.0;
     // W step kb is decoded into registers during step kb - 1's products and stored after them, as kernels.cu.
     uvec4 wv; float d, m;
-    ldw(wt, wr, wi, wok, n0, 0, wv, d, m);
-    if (xr < XM) ldx(xr, xh, xok, xo, cols, 0, 0);
+    ldw(wt, wr, wi, wok, n0, k0, wv, d, m);
+    if (xr < XM) ldx(xr, xh, xok, xo, cols, k0, 0);
     [[unroll]] for (uint j = 0; j < 4; j++) wq[wr * PW + wi * WS + j] = wv[j];
     wsc[0][wr][wi] = d; wmn[0][wr][wi] = m;
-    for (uint kb = 0; kb < p.nk; kb++) {
-        uint xb = kb & 1;
+    for (uint kb = k0; kb < k1; kb++) {
+        uint xb = (kb - k0) & 1;
         barrier();
-        if (kb + 1 < p.nk && xr < XM) ldx(xr, xh, xok, xo, cols, kb + 1, xb ^ 1);
-        if (kb + 1 < p.nk) ldw(wt, wr, wi, wok, n0, kb + 1, wv, d, m);
+        if (kb + 1 < k1 && xr < XM) ldx(xr, xh, xok, xo, cols, kb + 1, xb ^ 1);
+        if (kb + 1 < k1) ldw(wt, wr, wi, wok, n0, kb + 1, wv, d, m);
         // Expert tiles are often part full; a subgroup whose 32 positions are all past cnt has nothing to multiply.
         if (bm < cnt)
         [[unroll]] for (uint h = 0; h < 64 / KS; h++) {
@@ -218,7 +226,7 @@ void main() {
 #endif
                 }
         }
-        if (kb + 1 < p.nk) {
+        if (kb + 1 < k1) {
             [[unroll]] for (uint j = 0; j < 4; j++) wq[((xb ^ 1) * 64 + wr) * PW + wi * WS + j] = wv[j];
             wsc[xb ^ 1][wr][wi] = d; wmn[xb ^ 1][wr][wi] = m;
         }
@@ -228,7 +236,7 @@ void main() {
             [[unroll]] for (uint i = 0; i < NE; i++) if (!sm || mt + nt == 0) {
                 uint r = bm + 16 * mt + RI(i), n = n0 + bn + 16 * nt + CI(i);
                 if (r >= cnt || n >= p.rows) continue;
-                uint o = (m0 + r) * p.ys + n;
+                uint o = (kz * p.nd + m0 + r) * p.ys + n;
                 float v = acc[mt][nt][i] * p.sc;
                 p.y.v[o] = p.act == 0 ? v : p.act == 1 ? silu(p.y.v[o]) * v : p.y.v[o] + v;
             }
