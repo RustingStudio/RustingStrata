@@ -224,6 +224,13 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   holds for the thinking text too. A grammar that does not parse is a `400` with the reason. With a grammar or a
   bias the GPU drafts (`--mtp`, `--spec-type`) are off for that request, and each token checks the whole vocabulary
   against the grammar (about 10 ms per token for a 150K vocabulary). `/v1/messages` takes neither field.
+- `response_format` (OpenAI) makes the reply JSON through the same grammar check: `{"type": "json_object"}` takes
+  any JSON object, and `{"type": "json_schema", "json_schema": {"schema": {...}}}` (or llama.cpp's
+  `{"type": "json_object", "schema": {...}}`) takes JSON that fits the schema. The schema may use `type` (one or a
+  list), `properties` and `required` (the properties come in the schema's order, the ones that are not required may
+  be left out), `items`, `enum`, `const`, `anyOf`/`oneOf`, `allOf` of one schema and local `$ref`s (`#/$defs/...`).
+  Lengths, counts, `pattern`, `format` and number bounds are not checked. `{"type": "text"}` is the default.
+  A request with both `grammar` and `response_format` is a `400`.
 - `presence_penalty` and `frequency_penalty` (OpenAI, -2 to 2) and `dry_multiplier`, `dry_base`, `dry_allowed_length`
   (the DRY sampler, llama.cpp server names) act against repetition loops. They count only the tokens of the reply,
   not the prompt, and do not apply inside a tool call. `--presence-penalty`, `--frequency-penalty`,

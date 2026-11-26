@@ -32,6 +32,256 @@ pub fn parse_bias(v: &Value) -> anyhow::Result<Vec<(BiasKey, f32)>> {
     }
 }
 
+/// llama.cpp's `grammars/json.gbnf`: any JSON object (`response_format` `json_object`).
+pub const JSON_GBNF: &str = r#"
+root   ::= object
+value  ::= object | array | string | number | ("true" | "false" | "null") ws
+
+object ::=
+  "{" ws (
+            string ":" ws value
+    ("," ws string ":" ws value)*
+  )? "}" ws
+
+array  ::=
+  "[" ws (
+            value
+    ("," ws value)*
+  )? "]" ws
+
+string ::=
+  "\"" (
+    [^"\\\x7F\x00-\x1F] |
+    "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4}) # escapes
+  )* "\"" ws
+
+number ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ("." [0-9]+)? ([eE] [-+]? [0-9] [1-9]{0,15})? ws
+
+# Optional space: by convention, applied in this grammar after literal chars when allowed
+ws ::= | " " | "\n" [ \t]{0,20}
+"#;
+
+/// The JSON rules a schema grammar uses (json.gbnf without its root).
+const JSON_RULES: &str = r#"
+value  ::= object | array | string | number | ("true" | "false" | "null") ws
+object ::= "{" ws ( string ":" ws value ("," ws string ":" ws value)* )? "}" ws
+array  ::= "[" ws ( value ("," ws value)* )? "]" ws
+string ::= "\"" ( [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4}) )* "\"" ws
+number ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ("." [0-9]+)? ([eE] [-+]? [0-9] [1-9]{0,15})? ws
+integer ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ws
+boolean ::= ("true" | "false") ws
+null ::= "null" ws
+ws ::= | " " | "\n" [ \t]{0,20}
+"#;
+
+/// JSON that keeps the order of an object's keys (`serde_json::Value` sorts them), so a schema's properties are
+/// written in the order the schema gives.
+#[derive(Debug)]
+pub enum Json { Map(Vec<(String, Json)>), List(Vec<Json>), Leaf(Value) }
+
+impl<'de> serde::Deserialize<'de> for Json {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Json, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Json;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("JSON") }
+            fn visit_bool<E>(self, b: bool) -> Result<Json, E> { Ok(Json::Leaf(b.into())) }
+            fn visit_i64<E>(self, n: i64) -> Result<Json, E> { Ok(Json::Leaf(n.into())) }
+            fn visit_u64<E>(self, n: u64) -> Result<Json, E> { Ok(Json::Leaf(n.into())) }
+            fn visit_f64<E>(self, n: f64) -> Result<Json, E> { Ok(Json::Leaf(n.into())) }
+            fn visit_str<E>(self, s: &str) -> Result<Json, E> { Ok(Json::Leaf(s.into())) }
+            fn visit_unit<E>(self) -> Result<Json, E> { Ok(Json::Leaf(Value::Null)) }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut a: A) -> Result<Json, A::Error> {
+                let mut v = vec![];
+                while let Some(x) = a.next_element()? { v.push(x); }
+                Ok(Json::List(v))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut a: A) -> Result<Json, A::Error> {
+                let mut v = vec![];
+                while let Some(kv) = a.next_entry()? { v.push(kv); }
+                Ok(Json::Map(v))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+static NULL: Json = Json::Leaf(Value::Null);
+
+impl Json {
+    pub fn get(&self, k: &str) -> &Json {
+        match self { Json::Map(m) => m.iter().rev().find(|(n, _)| n == k).map_or(&NULL, |(_, v)| v), _ => &NULL }
+    }
+    fn str(&self) -> Option<&str> { if let Json::Leaf(Value::String(s)) = self { Some(s) } else { None } }
+    fn null(&self) -> bool { matches!(self, Json::Leaf(Value::Null)) }
+    fn opt(&self) -> Option<&Json> { (!self.null()).then_some(self) }
+    /// The JSON text, keys in their order.
+    fn text(&self) -> String {
+        match self {
+            Json::Leaf(v) => v.to_string(),
+            Json::List(l) => format!("[{}]", l.iter().map(Json::text).collect::<Vec<_>>().join(",")),
+            Json::Map(m) => format!("{{{}}}", m.iter().map(|(k, v)| format!("{}:{}", Value::from(k.as_str()), v.text())).collect::<Vec<_>>().join(",")),
+        }
+    }
+    /// A JSON pointer (RFC 6901) into maps and lists.
+    fn pointer(&self, p: &str) -> Option<&Json> {
+        if p.is_empty() { return Some(self); }
+        p.strip_prefix('/')?.split('/').try_fold(self, |j, t| {
+            let t = t.replace("~1", "/").replace("~0", "~");
+            match j {
+                Json::Map(_) => j.opt().map(|j| j.get(&t)).and_then(Json::opt),
+                Json::List(l) => t.parse::<usize>().ok().and_then(|i| l.get(i)),
+                Json::Leaf(_) => None,
+            }
+        })
+    }
+}
+
+/// The grammar of a request's `response_format`: `text` is none, `json_object` any JSON object (or, with a
+/// `schema`, that schema as llama.cpp's server takes it), `json_schema` the OpenAI form `{"json_schema": {"schema"}}`.
+pub fn response_format(v: &Json) -> anyhow::Result<Option<Grammar>> {
+    let schema = match v.get("type").str() {
+        _ if v.null() => return Ok(None),
+        Some("text") => return Ok(None),
+        Some("json_object") if v.get("schema").null() => return Grammar::parse(JSON_GBNF).map(Some),
+        Some("json_object") => v.get("schema"),
+        Some("json_schema") => v.get("json_schema").get("schema").opt().unwrap_or(v.get("schema")),
+        _ => bail!("response_format.type must be text, json_object or json_schema"),
+    };
+    ensure!(matches!(schema, Json::Map(_) | Json::Leaf(Value::Bool(_))), "response_format: the schema must be an object");
+    let mut g = Schema { root: schema, rules: vec![], refs: vec![], size: 0, depth: 0 };
+    let root = g.rule(schema)?;
+    let mut src = format!("root ::= {root}\n");
+    for (i, r) in g.rules.iter().enumerate() { src += &format!("s{i} ::= {r}\n"); }
+    Grammar::parse(&(src + JSON_RULES)).map(Some)
+}
+
+/// A JSON schema written out as GBNF rules `s0`, `s1`, ...: `type` (one or a list), `properties` with `required`
+/// (in the schema's order), `items`, `enum`, `const`, `anyOf`/`oneOf`, `allOf` of one, and local `$ref`s.
+/// ponytail: lengths, counts, patterns, formats and numeric bounds are not enforced; any value that fits the
+/// structure passes them.
+/// `size` counts the bytes written so far and `depth` the schemas being written, both bounded, so a schema that
+/// repeats a large `const` through many `$ref`s or chains `$ref`s deep is refused before it takes memory or stack.
+struct Schema<'a> { root: &'a Json, rules: Vec<String>, refs: Vec<(*const Json, usize)>, size: usize, depth: usize }
+
+impl<'a> Schema<'a> {
+    fn add(&mut self, body: String) -> anyhow::Result<String> {
+        self.grow(body.len())?;
+        self.rules.push(body);
+        Ok(format!("s{}", self.rules.len() - 1))
+    }
+
+    /// Counts `n` more bytes of grammar.
+    fn grow(&mut self, n: usize) -> anyhow::Result<()> {
+        self.size += n;
+        ensure!(self.size <= MAX_CHARS, "response_format: the schema's grammar is longer than {MAX_CHARS} characters");
+        Ok(())
+    }
+
+    /// A GBNF literal of the JSON text of `v`, then `ws`.
+    fn lit(v: &Json) -> String {
+        let mut o = String::from("\"");
+        for c in v.text().chars() {
+            match c { '"' => o += "\\\"", '\\' => o += "\\\\", c => o.push(c) }
+        }
+        o + "\" ws"
+    }
+
+    /// The rule (or a GBNF expression) that takes the values of `s`.
+    fn rule(&mut self, s: &'a Json) -> anyhow::Result<String> {
+        ensure!(self.depth < 64, "response_format: the schema nests deeper than 64");
+        self.depth += 1;
+        let r = self.rule_in(s);
+        self.depth -= 1;
+        let r = r?;
+        self.grow(r.len())?;
+        Ok(r)
+    }
+
+    fn rule_in(&mut self, s: &'a Json) -> anyhow::Result<String> {
+        if !matches!(s, Json::Map(_)) {
+            ensure!(!matches!(s, Json::Leaf(Value::Bool(false))), "response_format: a false schema takes no value");
+            return Ok("value".into());
+        }
+        if let Some(r) = s.get("$ref").str() {
+            let path = r.strip_prefix('#').with_context(|| format!("response_format: only local $refs work, not {r}"))?;
+            let target = self.root.pointer(path).with_context(|| format!("response_format: $ref {r} is not in the schema"))?;
+            // Keyed by the node, so two spellings of one $ref share its rule.
+            if let Some(&(_, i)) = self.refs.iter().find(|(n, _)| std::ptr::eq(*n, target)) { return Ok(format!("s{i}")); }
+            // The rule gets its name first, so a schema that refers to itself is a recursive rule.
+            let i = self.rules.len();
+            self.rules.push(String::new());
+            self.refs.push((target, i));
+            self.rules[i] = self.rule(target)?;
+            return Ok(format!("s{i}"));
+        }
+        if let Some(c) = s.get("const").opt() { return Ok(Self::lit(c)); }
+        if let Some(e) = s.get("enum").opt() {
+            let Json::List(e) = e else { bail!("response_format: enum must be a non-empty array") };
+            ensure!(!e.is_empty(), "response_format: enum must be a non-empty array");
+            return Ok(format!("({})", e.iter().map(Self::lit).collect::<Vec<_>>().join(" | ")));
+        }
+        for k in ["anyOf", "oneOf"] {
+            if let Some(a) = s.get(k).opt() {
+                let Json::List(a) = a else { bail!("response_format: {k} must be a non-empty array") };
+                ensure!(!a.is_empty(), "response_format: {k} must be a non-empty array");
+                let alts = a.iter().map(|x| self.rule(x)).collect::<anyhow::Result<Vec<_>>>()?;
+                return Ok(format!("({})", alts.join(" | ")));
+            }
+        }
+        if let Json::List(a) = s.get("allOf") {
+            ensure!(a.len() == 1, "response_format: allOf works only with one schema");
+            return self.rule(&a[0]);
+        }
+        let types: Vec<&str> = match s.get("type") {
+            Json::Leaf(Value::Null) => return Ok(if !s.get("properties").null() { self.object(s)? } else if !s.get("items").null() { self.array(s)? } else { "value".into() }),
+            Json::Leaf(Value::String(t)) => vec![t],
+            Json::List(a) => a.iter().map(|t| t.str().context("response_format: a type must be a string")).collect::<anyhow::Result<_>>()?,
+            _ => bail!("response_format: type must be a string or an array"),
+        };
+        let alts = types.iter().map(|&t| Ok(match t {
+            "object" => self.object(s)?,
+            "array" => self.array(s)?,
+            "string" | "number" | "integer" | "boolean" | "null" => t.into(),
+            t => bail!("response_format: unknown type {t}"),
+        })).collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(if alts.len() == 1 { alts.into_iter().next().unwrap() } else { format!("({})", alts.join(" | ")) })
+    }
+
+    /// An object with the listed properties: the required ones always, the rest each optional, all in the schema's
+    /// order. Without `properties` any object.
+    fn object(&mut self, s: &'a Json) -> anyhow::Result<String> {
+        let Json::Map(props) = s.get("properties") else { return Ok("object".into()) };
+        if props.is_empty() { return Ok("object".into()); }
+        let req: Vec<&str> = match s.get("required") { Json::List(r) => r.iter().filter_map(Json::str).collect(), _ => vec![] };
+        let mut kv = vec![];
+        for (k, v) in props {
+            let val = self.rule(v)?;
+            kv.push((req.contains(&k.as_str()), format!("{} \":\" ws {val}", Self::lit(&Json::Leaf(k.as_str().into())))));
+        }
+        // rests[i]: the properties from i on, each after a comma; the optional ones may be left out.
+        let mut rests = vec![String::new(); kv.len() + 1];
+        for i in (0..kv.len()).rev() {
+            let (r, x) = &kv[i];
+            let tail = if rests[i + 1].is_empty() { String::new() } else { format!(" {}", rests[i + 1]) };
+            rests[i] = self.add(if *r { format!("\",\" ws {x}{tail}") } else { format!("(\",\" ws {x})?{tail}") })?;
+        }
+        // The first property written: the first required one, any optional one before it, or (none required) none.
+        let mut first = vec![];
+        for (i, (r, x)) in kv.iter().enumerate() {
+            first.push(format!("{x} {}", rests[i + 1]));
+            if *r { break; }
+        }
+        let empty = if kv.iter().any(|(r, _)| *r) { "" } else { " | " };
+        self.add(format!("\"{{\" ws ({}{empty}) \"}}\" ws", first.join(" | ")))
+    }
+
+    fn array(&mut self, s: &'a Json) -> anyhow::Result<String> {
+        let item = match s.get("items").opt() { Some(i) => self.rule(i)?, None => "value".into() };
+        self.add(format!("\"[\" ws ({item} (\",\" ws {item})*)? \"]\" ws"))
+    }
+}
+
 /// One element of a rule's sequence: a character (in or, negated, not in the ranges) or another rule.
 #[derive(Clone, Debug, PartialEq)]
 enum Elem { Chars(bool, Vec<(u32, u32)>), Rule(usize) }
@@ -454,34 +704,6 @@ mod tests {
         g.feed(&st, &[], s.as_bytes(), &mut STEPS.clone()).is_some()
     }
 
-    // llama.cpp grammars/json.gbnf.
-    const JSON: &str = r#"
-root   ::= object
-value  ::= object | array | string | number | ("true" | "false" | "null") ws
-
-object ::=
-  "{" ws (
-            string ":" ws value
-    ("," ws string ":" ws value)*
-  )? "}" ws
-
-array  ::=
-  "[" ws (
-            value
-    ("," ws value)*
-  )? "]" ws
-
-string ::=
-  "\"" (
-    [^"\\\x7F\x00-\x1F] |
-    "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4}) # escapes
-  )* "\"" ws
-
-number ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ("." [0-9]+)? ([eE] [-+]? [0-9] [1-9]{0,15})? ws
-
-# Optional space: by convention, applied in this grammar after literal chars when allowed
-ws ::= | " " | "\n" [ \t]{0,20}
-"#;
 
     // llama.cpp grammars/arithmetic.gbnf.
     const ARITH: &str = r#"
@@ -502,8 +724,46 @@ item ::= "- " [^\r\n\x0b\x0c\x85  ]+ "\n"
 "#;
 
     #[test]
+    fn response_format_schema() {
+        let rf = |v: &str| response_format(&serde_json::from_str(v).unwrap()).unwrap().unwrap();
+        let rv = |v: &str| response_format(&serde_json::from_str(v).unwrap());
+        let g = rf(r##"{"type": "json_object"}"##);
+        assert!(full(&g, r#"{"a": 1}"#) && !full(&g, "[1]"));
+        assert!(rv(r##"{"type": "text"}"##).unwrap().is_none());
+        assert!(rv(r##"{"type": "xml"}"##).is_err());
+        let g = rf(r##"{"type": "json_schema", "json_schema": {"name": "p", "schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "age": {"type": "integer"}, "tags": {"type": "array", "items": {"enum": ["a", "b\"c"]}},
+                "kind": {"$ref": "#/$defs/k"}},
+            "required": ["name", "kind"],
+            "$defs": {"k": {"anyOf": [{"const": 1}, {"type": "null"}]}}}}}"##);
+        assert!(full(&g, r#"{"name": "x", "kind": 1}"#));
+        assert!(full(&g, r#"{"name": "x", "age": -3, "tags": ["a", "b\"c"], "kind": null}"#));
+        assert!(!full(&g, r#"{"name": "x"}"#), "kind is required");
+        assert!(!full(&g, r#"{"kind": 1, "name": "x"}"#), "schema order");
+        assert!(!full(&g, r#"{"name": "x", "age": 1.5, "kind": 1}"#));
+        assert!(!full(&g, r#"{"name": "x", "tags": ["c"], "kind": 1}"#));
+        // No required property: any subset in order, or none.
+        let g = rf(r##"{"type": "json_object", "schema": {"type": "object", "properties": {"a": {"type": "boolean"}, "b": {"type": "number"}}}}"##);
+        for t in ["{}", r#"{"a": true}"#, r#"{"b": 2.5}"#, r#"{"a": false, "b": 1}"#] { assert!(full(&g, t), "{t}"); }
+        assert!(!full(&g, r#"{"b": 1, "a": true}"#) && !full(&g, r#"{,"b": 1}"#));
+        // A schema that refers to itself.
+        let g = rf(r##"{"type": "json_schema", "json_schema": {"schema": {"$ref": "#/$defs/n", "$defs": {"n": {
+            "type": "object", "properties": {"next": {"anyOf": [{"$ref": "#/$defs/n"}, {"type": "null"}]}}, "required": ["next"]}}}}}"##);
+        assert!(full(&g, r#"{"next": {"next": null}}"#) && !full(&g, "{}"));
+        // A large const repeated through $refs, and a $ref chain past the depth bound, are refused.
+        let big = "x".repeat(4000);
+        let refs = vec![r##"{"$ref": "#/$defs/a"}"##; 100].join(",");
+        assert!(rv(&format!(r##"{{"type": "json_object", "schema": {{"anyOf": [{refs}], "$defs": {{"a": {{"const": "{big}"}}}}}}}}"##)).is_ok());
+        let wide = (0..100).map(|_| format!(r#"{{"const": "{big}"}}"#)).collect::<Vec<_>>().join(",");
+        assert!(rv(&format!(r#"{{"type": "json_object", "schema": {{"anyOf": [{wide}]}}}}"#)).is_err());
+        let defs = (0..100).map(|i| format!(r##""d{i}": {{"$ref": "#/$defs/d{}"}}"##, i + 1)).collect::<Vec<_>>().join(",");
+        assert!(rv(&format!(r##"{{"type": "json_object", "schema": {{"$ref": "#/$defs/d0", "$defs": {{{defs}, "d100": {{"type": "null"}}}}}}}}"##)).is_err());
+    }
+
+    #[test]
     fn json_grammar() {
-        let g = Grammar::parse(JSON).unwrap();
+        let g = Grammar::parse(JSON_GBNF).unwrap();
         assert!(full(&g, r#"{"a": [1, -2.5e3, true, null], "b": {"c": "x\"é ✓"}}"#));
         assert!(full(&g, "{}"));
         assert!(!full(&g, r#"{"a": 1,}"#));

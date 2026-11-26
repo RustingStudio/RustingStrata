@@ -459,6 +459,15 @@ pub fn chat_request(body: &[u8]) -> anyhow::Result<ChatRequest> {
         Value::String(s) => Some(std::sync::Arc::new(crate::grammar::Grammar::parse(s)?)),
         _ => bail!("grammar must be a string"),
     };
+    let grammar = match crate::grammar::response_format(&{
+        #[derive(serde::Deserialize)]
+        struct R { #[serde(default)] response_format: Option<crate::grammar::Json> }
+        serde_json::from_slice::<R>(body)?.response_format.unwrap_or(crate::grammar::Json::Leaf(Value::Null))
+    })? {
+        Some(g) if grammar.is_none() => Some(std::sync::Arc::new(g)),
+        Some(_) => bail!("grammar and response_format do not go together"),
+        None => grammar,
+    };
     // A grammar holds for the whole reply, thinking included, so thinking is off unless the request turns it on.
     let think = v["chat_template_kwargs"]["enable_thinking"].as_bool().or(grammar.as_ref().map(|_| false));
     let include_usage = v["stream_options"]["include_usage"].as_bool().unwrap_or(false);
