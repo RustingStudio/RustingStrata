@@ -2963,7 +2963,12 @@ __device__ __forceinline__ float tq_group_sum(float cs, int g) {
     return warp_sum(t);
 }
 template<int BITS> __device__ __forceinline__ void kv_put_tq(u16* c, size_t e, int hd, float x, float norm, bool active) {
-    int q = tq_nearest<BITS>(x / norm);
+    // Centroids are calibrated for N(0, 1/128), the coordinates of a unit-L2 128-value WHT group. A 64-value
+    // group has twice that variance, so scale the norm by sqrt(128 / group) before quantizing and store the
+    // corrected norm in the same scaled units. Dequant then needs no width-dependent correction.
+    int gw = hd >= 128 ? 128 : hd;
+    float qnorm = norm * sqrtf(128.0f / (float)gw);
+    int q = tq_nearest<BITS>(x / qnorm);
     int we = e % hd;
     int w = we & 127;   // value within this 128-wide WHT group
     int g = we >> 7;    // WHT group within the head (0 when hd <= 128)

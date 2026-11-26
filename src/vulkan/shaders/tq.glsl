@@ -111,7 +111,11 @@ float tq_group_reduce(float cs, uint slot) {
 }
 // Store one rotated, quantized value. Active lanes join the reduction; inactive ones contribute no energy and write nothing.
 void tq_put(U16 c, uint e, uint hd, float x, float norm, bool valid, uint bits, uint slot) {
-    int q = tq_nearest(bits, fdiv(x, norm));
+    // Centroids are calibrated for a 128-value WHT group. A 64-value group has twice the variance, so scale
+    // the norm by sqrt(128 / group) on store and keep the corrected norm in the same scaled units.
+    uint gw = hd >= 128u ? 128u : hd;
+    float qnorm = norm * sqrt_(fdiv(128.0, float(gw)));
+    int q = tq_nearest(bits, fdiv(x, qnorm));
     uint we = e % hd, g = we >> 7u, w = we & 127u;
     float cen = tq_centroid(bits, q);
     float recon = sqrt_(tq_group_reduce(valid ? cen * cen : 0.0, slot));

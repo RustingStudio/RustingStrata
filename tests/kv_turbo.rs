@@ -177,7 +177,7 @@ fn turboquant_ink_clip_hd64() {
     let (pft, dect) = ink_run(&gt, hd, nh, nkv, nt, pos0, ring);
     eprintln!("turbo hd 64: prefill vs decode {:.2e}, vs f16 {:.2e}", rel_l2(&pft, &dect), rel_l2(&pft, &pf16));
     assert!(rel_l2(&pft, &dect) < 5e-4, "turbo hd 64 prefill vs decode");
-    assert!(rel_l2(&pft, &pf16) < 0.9, "turbo hd 64 vs f16");
+    assert!(rel_l2(&pft, &pf16) < 0.2, "turbo hd 64 vs f16");
 }
 
 /// TurboQuant 3-bit uses a 2-bit code plane plus a sign plane: 25 u16 words per 128 values, against 36 for the
