@@ -996,6 +996,76 @@ mod avx2 {
         }
     }
 
+    /// `dot_q5k` of one row with four activations (see `super::int_dot4`).
+    pub fn dot4_q5k(row: &[u8], xq: [&[Q8K]; 4]) -> [f32; 4] {
+        unsafe {
+            let (m4, one) = (_mm256_set1_epi8(0xF), _mm256_set1_epi8(1));
+            let hb = |qh: __m256i, k: i32| _mm256_slli_epi16(_mm256_and_si256(_mm256_srl_epi16(qh, _mm_cvtsi32_si128(k)), one), 4);
+            let (mut acc, mut sumf) = ([_mm256_setzero_ps(); 4], [0f32; 4]);
+            for (i, b) in row.chunks_exact(176).enumerate() {
+                let sm: [(u8, u8); 8] = std::array::from_fn(|j| crate::quant::scale_min_k4(j, &b[4..16]));
+                let qh = ld(b, 16);
+                let mut sumi = [_mm256_setzero_si256(); 4];
+                for j in 0..4 {
+                    let bits = ld(b, 48 + 32 * j);
+                    let (s0, s1) = (sm[2 * j].0 as i32, sm[2 * j + 1].0 as i32);
+                    let w0 = _mm256_or_si256(_mm256_and_si256(bits, m4), hb(qh, 2 * j as i32));
+                    let w1 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(bits, 4), m4), hb(qh, 2 * j as i32 + 1));
+                    for k in 0..4 {
+                        let y = &xq[k][i];
+                        sumi[k] = _mm256_add_epi32(sumi[k], udot32(w0, q8(y, 64 * j), s0, s0));
+                        sumi[k] = _mm256_add_epi32(sumi[k], udot32(w1, q8(y, 64 * j + 32), s1, s1));
+                    }
+                }
+                let (d, dm) = (d16(b), d16(&b[2..]));
+                for k in 0..4 {
+                    let y = &xq[k][i];
+                    let m: i32 = (0..8).map(|j| sm[j].1 as i32 * (y.bs[2 * j] + y.bs[2 * j + 1]) as i32).sum();
+                    acc[k] = _mm256_fmadd_ps(_mm256_set1_ps(y.d * d), _mm256_cvtepi32_ps(sumi[k]), acc[k]);
+                    sumf[k] -= y.d * dm * m as f32;
+                }
+            }
+            std::array::from_fn(|k| hsum(acc[k]) + sumf[k])
+        }
+    }
+
+    /// `dot_q6k` of one row with four activations (see `super::int_dot4`).
+    pub fn dot4_q6k(row: &[u8], xq: [&[Q8K]; 4]) -> [f32; 4] {
+        unsafe {
+            let m4 = _mm256_set1_epi8(0xF);
+            let (mut acc, mut sumf) = ([_mm256_setzero_ps(); 4], [0f32; 4]);
+            for (i, b) in row.chunks_exact(210).enumerate() {
+                let sc = |g: usize| b[192 + g] as i8 as i32;
+                let mut sumi = [_mm256_setzero_si256(); 4];
+                for n in 0..2 {
+                    let (la, lb, qh) = (ld(b, 64 * n), ld(b, 64 * n + 32), ld(b, 128 + 32 * n));
+                    let hi = |k: usize| _mm256_slli_epi16(crumb(qh, k), 4);
+                    let w = [
+                        _mm256_or_si256(_mm256_and_si256(la, m4), hi(0)),
+                        _mm256_or_si256(_mm256_and_si256(lb, m4), hi(1)),
+                        _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(la, 4), m4), hi(2)),
+                        _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(lb, 4), m4), hi(3)),
+                    ];
+                    for (kk, w) in w.into_iter().enumerate() {
+                        let g = 8 * n + 2 * kk;
+                        for k in 0..4 {
+                            sumi[k] = _mm256_add_epi32(sumi[k], udot32(w, q8(&xq[k][i], 128 * n + 32 * kk), sc(g), sc(g + 1)));
+                        }
+                    }
+                }
+                let d6 = d16(&b[208..]);
+                for k in 0..4 {
+                    let y = &xq[k][i];
+                    let m: i32 = (0..16).map(|g| sc(g) * y.bs[g] as i32).sum();
+                    let d = y.d * d6;
+                    acc[k] = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi[k]), acc[k]);
+                    sumf[k] -= 32.0 * d * m as f32;
+                }
+            }
+            std::array::from_fn(|k| hsum(acc[k]) + sumf[k])
+        }
+    }
+
     /// Q6_K with unsigned 6-bit codes (maddubs needs an unsigned first operand); the -32 offset comes off through
     /// the Q8_K group sums.
     pub fn dot_q6k(row: &[u8], xq: &[Q8K]) -> f32 {
@@ -1637,7 +1707,7 @@ pub fn int_dot4(ty: GgmlType) -> Option<fn(&[u8], [&[Q8K]; 4]) -> [f32; 4]> {
     }
     #[cfg(target_feature = "avx2")]
     if std::env::var_os("STRATA_SCALAR").is_none() && std::env::var_os("STRATA_AVX512").is_none() {
-        return match ty { GgmlType::Q8_0 => Some(avx2::dot4_q8_0), GgmlType::IQ4NL => Some(avx2::dot4_iq4nl), _ => None };
+        return match ty { GgmlType::Q8_0 => Some(avx2::dot4_q8_0), GgmlType::IQ4NL => Some(avx2::dot4_iq4nl), GgmlType::Q5K => Some(avx2::dot4_q5k), GgmlType::Q6K => Some(avx2::dot4_q6k), _ => None };
     }
     let _ = ty;
     None
@@ -1686,6 +1756,38 @@ fn batch_rows(mats: &[Tensor], xs: &[&[f32]], out: &mut [f32]) {
                 _ => { t.row(r, buf); buf.iter().zip(xs[x]).map(|(a, b)| a * b).sum() }
             };
         }
+    });
+}
+
+/// `batch_rows` for matrices that each read several inputs: matrix i takes the quantized inputs `xq[j]` for j in
+/// `mats[i].1`, and its outputs are row after row, each row the dots of its inputs in group order. Each weight row is
+/// read once for all its inputs; the dots are `int_dot`'s (or `int_dot4`'s), so the bits are those of `batch_rows`.
+fn group_rows(mats: &[(Tensor, &[usize])], xq: &[Vec<Q8K>], out: &mut [f32]) {
+    let (dot, dot4) = (int_dot(mats[0].0.ty).unwrap(), int_dot4(mats[0].0.ty));
+    let mut parts = Vec::with_capacity(mats.len());
+    let mut rest = out;
+    for (t, g) in mats {
+        let (a, b) = rest.split_at_mut(t.rows * g.len());
+        parts.push((t, *g, a));
+        rest = b;
+    }
+    parts.into_par_iter().for_each(|(t, g, o)| {
+        let rb = t.data.len() / t.rows;
+        o.par_chunks_mut(16 * g.len()).enumerate().for_each(|(c, o)| {
+            for (k, o) in o.chunks_exact_mut(g.len()).enumerate() {
+                let r = c * 16 + k;
+                let w = &t.data[r * rb..(r + 1) * rb];
+                let mut j = 0;
+                if let Some(dot4) = dot4 {
+                    while j + 4 <= g.len() {
+                        let v = dot4(w, [&xq[g[j]], &xq[g[j + 1]], &xq[g[j + 2]], &xq[g[j + 3]]]);
+                        for i in 0..4 { o[j + i] = v[i] * t.scale; }
+                        j += 4;
+                    }
+                }
+                for j in j..g.len() { o[j] = dot(w, &xq[g[j]]) * t.scale; }
+            }
+        });
     });
 }
 
@@ -1751,6 +1853,43 @@ pub fn expert_rows(m: &Model, il: usize, hs: &[Vec<f32>], pairs: &[(usize, usize
     let rot = c.hadamard.as_ref();
     let hr: Option<Vec<Vec<f32>>> = rot.map(|r| hs.iter().map(|h| r.rotated(h)).collect());
     let hs = hr.as_deref().unwrap_or(hs);
+    // The pairs of one expert read its weights once (`group_rows`), when its types have integer kernels.
+    if gate.ty == up.ty && int_dot(gate.ty).is_some() && int_dot(down.ty).is_some() && std::env::var_os("STRATA_PAIR_ROWS").is_none() {
+        let mut order: Vec<usize> = (0..k).collect();
+        order.sort_by_key(|&p| pairs[p].1);
+        let groups: Vec<&[usize]> = order.chunk_by(|&a, &b| pairs[a].1 == pairs[b].1).collect();
+        let toks: Vec<Vec<usize>> = groups.iter().map(|g| g.iter().map(|&p| pairs[p].0).collect()).collect();
+        let hq: Vec<Vec<Q8K>> = hs.par_iter().map(|h| quantize_q8k(h)).collect();
+        let gu: Vec<(Tensor, &[usize])> = groups.iter().zip(&toks).flat_map(|(g, t)| { let e = pairs[g[0]].1; [(gate.expert(e, n), t.as_slice()), (up.expert(e, n), t.as_slice())] }).collect();
+        // Pair p is input j of group g: (group start in units of rows, group size, j).
+        let mut loc = vec![(0, 0, 0); k];
+        let mut at = 0;
+        for g in &groups {
+            for (j, &p) in g.iter().enumerate() { loc[p] = (at, g.len(), j); }
+            at += g.len();
+        }
+        let mut tmp = vec![0f32; 2 * k * ff];
+        group_rows(&gu, &hq, &mut tmp);
+        // tmp: per group, gate then up, ff rows each of the group's inputs.
+        let acts: Vec<Vec<f32>> = loc.par_iter().map(|&(at, gl, j)| {
+            let (g, u) = (&tmp[2 * ff * at..], &tmp[2 * ff * at + ff * gl..]);
+            (0..ff).map(|i| ops::silu(g[i * gl + j]) * u[i * gl + j]).collect()
+        }).collect();
+        let racts: Option<Vec<Vec<f32>>> = rot.map(|r| acts.iter().map(|a| r.rotated(a)).collect());
+        let aq: Vec<Vec<Q8K>> = racts.as_ref().unwrap_or(&acts).par_iter().map(|a| quantize_q8k(a)).collect();
+        let ds: Vec<(Tensor, &[usize])> = groups.iter().map(|g| (down.expert(pairs[g[0]].1, n), *g)).collect();
+        let ne = c.n_embd;
+        let mut tmp = vec![0f32; k * ne];
+        group_rows(&ds, &aq, &mut tmp);
+        let mut o = vec![0f32; k * ne];
+        o.par_chunks_mut(ne).zip(&loc).for_each(|(o, &(at, gl, j))| {
+            for (r, v) in o.iter_mut().enumerate() { *v = tmp[ne * at + r * gl + j]; }
+        });
+        for (j, (oj, &(_, e, _))) in o.chunks_exact_mut(ne).zip(pairs).enumerate() {
+            m.lora_delta(&format!("blk.{il}.ffn_down_exps.weight"), &acts[j], oj, Some(e));
+        }
+        return o;
+    }
     let xs: Vec<&[f32]> = pairs.iter().map(|&(t, ..)| hs[t].as_slice()).collect();
     let mut a = vec![0f32; 2 * k * ff];
     if gate.ty == up.ty {
@@ -1776,16 +1915,45 @@ mod tests {
     /// A 4-activation kernel must give the bits of the single kernel (72 blocks, and 9: an odd count).
     #[test]
     fn dot4_matches_four_dots() {
-        for ty in [GgmlType::Q8_0, GgmlType::IQ4NL] {
+        for ty in [GgmlType::Q8_0, GgmlType::IQ4NL, GgmlType::Q5K, GgmlType::Q6K] {
             let (Some(dot), Some(dot4)) = (int_dot(ty), int_dot4(ty)) else { continue };
-            for cols in [2304usize, 288] {
+            for cols in [2304usize, 288].into_iter().filter(|c| c % ty.block_elems() == 0) {
                 let rb = ty.row_bytes(cols as u64);
                 let mut row: Vec<u8> = (0..rb).map(|i| (i * 37 % 251) as u8).collect();
                 // A valid f16 scale in each block (1.0, 1.5, ...).
-                for (i, b) in row.chunks_exact_mut(rb / (cols / 32)).enumerate() { b[..2].copy_from_slice(&[0, 0x3C + (i % 4) as u8]); }
+                for (i, b) in row.chunks_exact_mut(ty.block_bytes()).enumerate() { b[..2].copy_from_slice(&[0, 0x3C + (i % 4) as u8]); }
                 let xq: Vec<_> = (0..4).map(|t| quantize_q8k(&(0..cols).map(|i| ((i * 13 + t * 29) % 97) as f32 * 0.37 - 17.0).collect::<Vec<_>>())).collect();
                 let got = dot4(&row, [&xq[0], &xq[1], &xq[2], &xq[3]]);
                 for (g, x) in got.iter().zip(&xq) { assert_eq!(g.to_bits(), dot(&row, x).to_bits(), "{ty:?}, {cols} values"); }
+            }
+        }
+    }
+
+    /// `group_rows` gives the bits of one `int_dot` per (matrix, input), with groups of 1, 5 and 2 inputs.
+    #[test]
+    fn group_rows_match_single_dots() {
+        let (cols, rows) = (512, 37);
+        let xq: Vec<_> = (0..4).map(|t| quantize_q8k(&(0..cols).map(|i| ((i * 13 + t * 29) % 97) as f32 * 0.37 - 17.0).collect::<Vec<_>>())).collect();
+        let groups: [&[usize]; 3] = [&[2], &[0, 1, 3, 2, 0], &[3, 1]];
+        for ty in [GgmlType::Q8_0, GgmlType::IQ4NL, GgmlType::Q2_0] {
+            let rb = ty.row_bytes(cols as u64);
+            let bb = ty.block_bytes();
+            let data: Vec<Vec<u8>> = (0..3).map(|m| {
+                let mut v: Vec<u8> = (0..rows * rb).map(|i| ((i * 37 + m * 11) % 251) as u8).collect();
+                for (i, b) in v.chunks_exact_mut(bb).enumerate() { b[..2].copy_from_slice(&[0, 0x3C + (i % 4) as u8]); }
+                v
+            }).collect();
+            let mats: Vec<(Tensor, &[usize])> = data.iter().zip(groups).map(|(d, g)| (Tensor { ty, cols, rows, data: d, scale: 0.5 }, g)).collect();
+            let mut got = vec![0f32; rows * 8];
+            group_rows(&mats, &xq, &mut got);
+            let (dot, mut at) = (int_dot(ty).unwrap(), 0);
+            for (t, g) in &mats {
+                for r in 0..rows {
+                    for &x in g.iter() {
+                        assert_eq!(got[at].to_bits(), (dot(&t.data[r * rb..(r + 1) * rb], &xq[x]) * 0.5).to_bits(), "{ty:?} row {r}");
+                        at += 1;
+                    }
+                }
             }
         }
     }

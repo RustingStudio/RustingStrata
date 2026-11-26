@@ -1,0 +1,15 @@
+#version 460
+layout(local_size_x = 256) in;
+#include "common.glsl"
+// The ks split-K slices of a batched gemmi (s: [ks][nd][rows], each already times the weight scale) summed in slice
+// order into y (row stride ys), with act as gemm_f.
+layout(push_constant) uniform P { F32 s; F32 y; uint rows; uint nd; uint ys; uint ks; uint act; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.rows * p.nd) return;
+    uint m = i / p.rows, n = i % p.rows;
+    float v = 0.0;
+    for (uint z = 0; z < p.ks; z++) v += p.s.v[(z * p.nd + m) * p.rows + n];
+    uint o = m * p.ys + n;
+    p.y.v[o] = p.act == 0 ? v : p.act == 1 ? silu(p.y.v[o]) * v : p.y.v[o] + v;
+}

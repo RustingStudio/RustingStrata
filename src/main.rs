@@ -305,7 +305,8 @@ impl Runner<'_> {
         match self {
             Runner::Cpu(m, st) => { *st = State::new(&m.cfg); vision::feed_prompt(m, st, p, embs) }
             Runner::Gpu(g) => g.prefill_image(p, embs),
-            Runner::Slot(_) | Runner::Own(_) => anyhow::bail!("image input is not supported on a serve slot"),
+            Runner::Slot(c) => c.chat_image(p, embs),
+            Runner::Own(_) => anyhow::bail!("image input on a model outside the main engine"),
         }
     }
     /// Forget the sequence so far.
@@ -3392,6 +3393,8 @@ enum Job {
     /// `prefill_cached` in a free slot; answers the logits, the tokens reused, the slot and when the prefill began.
     /// `gone` is set when the client leaves while the chat waits for a slot; the chat is then dropped.
     Chat { ids: Vec<u32>, sys: usize, keep: usize, owner: u64, gone: std::sync::Arc<std::sync::atomic::AtomicBool>, back: std::sync::mpsc::Sender<anyhow::Result<(Vec<f32>, usize, usize, Instant)>> },
+    /// `prefill_image` in a free slot, answered as `Chat` (no tokens reused).
+    Image { p: vision::Prompt, embs: Vec<Vec<Vec<f32>>>, owner: u64, gone: std::sync::Arc<std::sync::atomic::AtomicBool>, back: std::sync::mpsc::Sender<anyhow::Result<(Vec<f32>, usize, usize, Instant)>> },
     /// One decode step in a slot the request holds; answers the greedy next token and the logits if `logits`.
     Step { slot: usize, token: u32, logits: bool, back: std::sync::mpsc::Sender<anyhow::Result<(u32, Vec<f32>)>> },
     /// The request is done with its slot.
@@ -3405,10 +3408,20 @@ struct Client { tx: std::sync::mpsc::Sender<Job>, slot: Option<usize>, owner: u6
 
 impl Client {
     fn chat(&mut self, ids: &[u32], sys: usize, keep: usize) -> anyhow::Result<(Vec<f32>, usize)> {
+        let ids = ids.to_vec();
+        self.submit(|owner, gone, back| Job::Chat { ids, sys, keep, owner, gone, back })
+    }
+    fn chat_image(&mut self, p: &vision::Prompt, embs: &[Vec<Vec<f32>>]) -> anyhow::Result<Vec<f32>> {
+        let (p, embs) = (p.clone(), embs.to_vec());
+        Ok(self.submit(|owner, gone, back| Job::Image { p, embs, owner, gone, back })?.0)
+    }
+    /// Send a prompt job and wait for its slot.
+    fn submit(&mut self, job: impl FnOnce(u64, std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::mpsc::Sender<anyhow::Result<(Vec<f32>, usize, usize, Instant)>>) -> Job)
+        -> anyhow::Result<(Vec<f32>, usize)> {
         if let Some(s) = self.slot.take() { let _ = self.tx.send(Job::Done(s)); }
         let (back, r) = std::sync::mpsc::channel();
         let gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.tx.send(Job::Chat { ids: ids.to_vec(), sys, keep, owner: self.owner, gone: gone.clone(), back }).map_err(|_| anyhow::anyhow!("model gone"))?;
+        self.tx.send(job(self.owner, gone.clone(), back)).map_err(|_| anyhow::anyhow!("model gone"))?;
         let (logits, reused, s, started) = loop {
             match r.recv_timeout(Duration::from_millis(250)) {
                 Ok(x) => break x?,
@@ -3461,7 +3474,7 @@ impl Sched {
     /// customer's burst of requests does not hold back the others'. With one key (or none) it is the oldest.
     fn next_chat(&self) -> Option<usize> {
         let holds = |o: u64| self.held.iter().zip(&self.who).filter(|&(&h, &w)| h && w == o).count();
-        (0..self.chats.len()).min_by_key(|&j| (if let Job::Chat { owner, .. } = &self.chats[j] { holds(*owner) } else { usize::MAX }, j))
+        (0..self.chats.len()).min_by_key(|&j| (if let Job::Chat { owner, .. } | Job::Image { owner, .. } = &self.chats[j] { holds(*owner) } else { usize::MAX }, j))
     }
 
     /// How long to wait for jobs: until the steps of all decoding slots are in, at most `GATHER` after the first.
@@ -3494,12 +3507,31 @@ impl Sched {
         // ponytail: fixed row count from which the GEMM forward (`step_batch`) replaces the matvec one; `calibrate`
         // should measure it per model and machine. STRATA_BATCH_MIN overrides. With experts 16: below it the step of
         // `STEP_ROWS` rows, whose missed experts the CPU worker runs beside the GPU, was faster (Qwen3.6-35B-A3B, RTX 3060).
-        let min = std::env::var("STRATA_BATCH_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(if g.is_moe() { 16 } else { 8 });
+        // Dense 4: at 4 rows step_batch took 15.9 ms against step_rows' 17.0 (Qwen3-4B Q4_K_M) and 29.4 against 36.9
+        // (BF16), and from 5 rows step_rows needs two forwards.
+        let min = std::env::var("STRATA_BATCH_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(if g.is_moe() { 16 } else { 4 });
         let big = g.batch_cap() > 0 && self.steps.len() >= min;
         let cap = if big { g.batch_cap() } else { rusting_strata::gpu_model::STEP_ROWS };
-        let mut batch: Vec<_> = self.steps.drain(..self.steps.len().min(cap)).collect();
-        batch.sort_by_key(|s| s.0);
+        let batch: Vec<_> = self.steps.drain(..self.steps.len().min(cap)).collect();
         self.since = if self.steps.is_empty() { None } else { Some(Instant::now() - Self::GATHER) };
+        // ponytail: a slot that holds an image prompt (RoPE offset from its KV rows) steps alone; give the batched
+        // forwards per-row offsets if image chats under --parallel get common.
+        let (lone, mut batch): (Vec<_>, Vec<_>) = batch.into_iter().partition(|b| g.slot_shifted(b.0));
+        for (sl, token, want, back) in lone {
+            g.use_slot(sl);
+            let _ = back.send(g.step(token).map(|l| (rusting_strata::ops::argmax(&l) as u32, if want { l } else { vec![] })));
+        }
+        // A slot whose KV cannot grow for its token (no VRAM left) fails alone, not the whole forward.
+        batch.retain(|b| match g.kv_step(b.0) { Ok(()) => true, Err(err) => { let _ = b.3.send(Err(err)); false } });
+        if batch.is_empty() { return; }
+        batch.sort_by_key(|s| s.0);
+        // The batched forwards read the current slot's RoPE offset: make an unshifted slot current.
+        g.use_slot(batch[0].0);
+        let big = big && batch.len() >= min;
+        if !big && batch.len() > rusting_strata::gpu_model::STEP_ROWS {
+            self.steps.extend(batch.drain(rusting_strata::gpu_model::STEP_ROWS..));
+            self.since = Some(Instant::now() - Self::GATHER);
+        }
         let rows: Vec<_> = batch.iter().map(|b| (b.0, b.1, b.2)).collect();
         match if big { g.step_batch(&rows) } else { g.step_rows(&rows) } {
             Ok(rows) => for (b, l) in batch.into_iter().zip(rows) { let _ = b.3.send(Ok(l)); },
@@ -3562,12 +3594,17 @@ impl Serving {
                 s.take(&jobs, s.wait());
                 // Prefill between decode steps, in the free slot whose saved state the prompt extends the furthest, else
                 // the least recently used one.
-                s.chats.retain(|j| !matches!(j, Job::Chat { gone, .. } if gone.load(Relaxed)));
+                s.chats.retain(|j| !matches!(j, Job::Chat { gone, .. } | Job::Image { gone, .. } if gone.load(Relaxed)));
                 // Models with a batched forward prefill the queued prompts together, one free slot each.
                 let lim = g.batch_cap().max(1);
                 let fits = |c: &Job| matches!(c, Job::Chat { ids, .. } if ids.len() <= g.ctx());
                 let mut adm: Vec<(usize, Job)> = vec![];
-                while adm.len() < lim {
+                // An image prompt runs alone, in the least recently used free slot.
+                if let Some(j) = s.next_chat().filter(|&j| matches!(s.chats[j], Job::Image { .. }))
+                    && let Some(sl) = (0..n).filter(|&i| !s.held[i]).min_by_key(|&i| s.freed[i]) {
+                    adm.push((sl, s.chats.remove(j).unwrap()));
+                }
+                while adm.len() < lim && !matches!(adm.first(), Some((_, Job::Image { .. }))) {
                     let Some(j) = s.next_chat() else { break };
                     if !adm.is_empty() && !(fits(&s.chats[j]) && fits(&adm[0].1)) { break; }
                     let Job::Chat { ids, keep, owner, .. } = &s.chats[j] else { break };
@@ -3605,14 +3642,23 @@ impl Serving {
                                 Err(e) => adm.iter().map(|_| Err(serve::copy_err(&e))).collect(),
                             }
                         } else {
-                            let (sl, Job::Chat { ids, sys, keep, owner, .. }) = &adm[0] else { unreachable!() };
-                            g.use_slot(*sl);
-                            g.owner = *owner;
-                            vec![g.prefill_cached_with(ids, *sys, *keep, &mut between)]
+                            match &adm[0] {
+                                (sl, Job::Chat { ids, sys, keep, owner, .. }) => {
+                                    g.use_slot(*sl);
+                                    g.owner = *owner;
+                                    vec![g.prefill_cached_with(ids, *sys, *keep, &mut between)]
+                                }
+                                (sl, Job::Image { p, embs, owner, .. }) => {
+                                    g.use_slot(*sl);
+                                    g.owner = *owner;
+                                    vec![g.prefill_image_with(p, embs, &mut between).map(|l| (l, 0))]
+                                }
+                                _ => unreachable!(),
+                            }
                         }
                     };
                     for ((sl, c), r) in adm.into_iter().zip(res) {
-                        let Job::Chat { owner, back, .. } = c else { unreachable!() };
+                        let (Job::Chat { owner, back, .. } | Job::Image { owner, back, .. }) = c else { unreachable!() };
                         (s.held[sl], s.who[sl]) = (r.is_ok(), owner);
                         // A client that left during the prefill takes no slot.
                         if back.send(r.map(|(l, u)| (l, u, sl, started))).is_err() && s.held[sl] {

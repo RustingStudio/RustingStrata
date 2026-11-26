@@ -148,6 +148,8 @@ pub trait Backend: Send {
     /// Free the graph recorded under `key`, if there is one. For a caller whose keys change as it runs (a graph holds
     /// device memory, and CUDA stops recording at a fixed number of them).
     fn graph_drop(&self, _key: u64) -> anyhow::Result<()> { Ok(()) }
+    /// Free every recorded graph, after buffers they use were replaced (a slot's KV cache grew).
+    fn graph_clear(&self) -> anyhow::Result<()> { Ok(()) }
     /// Queue the ops of `f`, none of which reads what another writes, with no ordering among them (Vulkan: no
     /// barriers between them); ops after the batch see all their results.
     fn batch(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> { f() }
@@ -448,6 +450,26 @@ pub trait Backend: Send {
     /// `interleave`: value head h reads key head h / (nv / nk), else h % nk.
     /// `dt_bias` not 0: beta and g are raw, and the kernel applies `ssm_gates` (with `dt_bias` and `a`) as it reads them.
     fn deltanet(&self, y: u64, s: u64, beta: u64, g: u64, dt_bias: u64, a: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize) -> anyhow::Result<()>;
+    /// `conv_silu` (no norm) of rows r = 0..states.len(), `ch` floats apart in qkv and y, each with its conv state
+    /// states[r]; `tab` is a device table that holds states[r] at tab[2r], for a backend that does all rows in one launch.
+    fn conv_silu_rows(&self, qkv: u64, tab: u64, states: &[u64], w: u64, y: u64, ch: usize, kw: usize, eps: f32) -> anyhow::Result<()> {
+        let _ = tab;
+        for (r, &s) in states.iter().enumerate() {
+            let o = (4 * r * ch) as u64;
+            self.conv_silu(qkv + o, s, w, y + o, ch, kw, 0, eps)?;
+        }
+        Ok(())
+    }
+    /// `deltanet` of one token a row (gates applied), row r at token r's place in y, beta, g and o, with its state
+    /// states[r]; `tab` holds states[r] at tab[2r + 1] (as in `conv_silu_rows`).
+    fn deltanet_rows(&self, y: u64, tab: u64, states: &[u64], beta: u64, g: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, ych: usize) -> anyhow::Result<()> {
+        let _ = tab;
+        for (r, &s) in states.iter().enumerate() {
+            self.deltanet(y + (4 * r * ych) as u64, s, beta + (4 * r * nv) as u64, g + (4 * r * nv) as u64, 0, 0, o + (4 * r * nv * dv) as u64,
+                          nk, nv, interleave, dk, dv, scale, 1, ych, 0, 0)?;
+        }
+        Ok(())
+    }
     /// Stride (in tokens) between saved DeltaNet checkpoints in `snap` (`1` saves every token, `4` saves every 4th token).
     fn delta_snap_stride(&self) -> usize { 1 }
     fn deltanet_strided(&self, y: u64, s: u64, beta: u64, g: u64, dt_bias: u64, a: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize, _snap_stride: usize) -> anyhow::Result<()> {

@@ -2,32 +2,42 @@
 layout(local_size_x = 256) in;
 #include "common.glsl"
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer FV4 { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64 { uint64_t v[]; };
 // Gated DeltaNet scan over T tokens, as deltanet_seq in kernels.cu (see there). Workgroup (value head, row block):
 // state row j (dk floats) is held by L = dk / 16 lanes, 16 floats each (4-float chunks s, s + L, ...), so a
 // subgroup holds R = 32 / L rows. The state after each of the first min(nsnap, T - 1) tokens goes to snap.
+// tab (not null): workgroup z is row z of one token, at token z's place in y, beta, g and o, with its state at
+// tab[2z + 1] (step_batch).
 // With dtb set, beta and g are raw and get ssm_gates' gates here (dtb, ga as its dt_bias, a).
-layout(push_constant) uniform P { F32 y; F32 S; F32 beta; F32 g; F32 o; F32 snap; F32 dtb; F32 ga; uint nk; uint nv; uint ilv; uint dk;
+layout(push_constant) uniform P { F32 y; F32 S; F32 beta; F32 g; F32 o; F32 snap; F32 dtb; F32 ga; U64 tab; uint nk; uint nv; uint ilv; uint dk;
                                   uint dv; float scale; uint T; uint ych; uint nsnap; } p;
 layout(constant_id = 1) const uint SNAP_STRIDE = 1;
+F32 Y, SS, BT, GG, OO;
 // Token tok's k and q (this lane's 4-float chunks), g, beta and v.
 void ld(uint tok, uint kh, uint vh, uint j, uint s, out vec4 k4[4], out vec4 q4[4], out float g, out float b, out float v) {
     uint dk = p.dk, L = dk >> 4, yt = tok * p.ych;  // 16-byte aligned: ych and dk are multiples of 4
-    bool need_q = uint64_t(p.o) != 0;
+    bool need_q = uint64_t(OO) != 0;
     [[unroll]] for (uint i = 0; i < 4; i++) {
-        k4[i] = FV4(uint64_t(p.y)).v[(yt + p.nk * dk + kh * dk) / 4 + s + L * i];
-        q4[i] = need_q ? FV4(uint64_t(p.y)).v[(yt + kh * dk) / 4 + s + L * i] : vec4(0.0);
+        k4[i] = FV4(uint64_t(Y)).v[(yt + p.nk * dk + kh * dk) / 4 + s + L * i];
+        q4[i] = need_q ? FV4(uint64_t(Y)).v[(yt + kh * dk) / 4 + s + L * i] : vec4(0.0);
     }
-    g = p.g.v[tok * p.nv + vh]; b = p.beta.v[tok * p.nv + vh]; v = p.y.v[yt + 2 * p.nk * dk + vh * p.dv + j];
+    g = GG.v[tok * p.nv + vh]; b = BT.v[tok * p.nv + vh]; v = Y.v[yt + 2 * p.nk * dk + vh * p.dv + j];
     if (uint64_t(p.dtb) != 0) { g = softplus(g + p.dtb.v[vh]) * p.ga.v[vh]; b = sigmoid(b); }
 }
 void main() {
+    Y = p.y; SS = p.S; BT = p.beta; GG = p.g; OO = p.o;
+    if (uint64_t(p.tab) != 0) {
+        uint z = gl_WorkGroupID.z;
+        SS = F32(p.tab.v[2 * z + 1]); Y = F32(uint64_t(p.y) + 4ul * z * p.ych);
+        BT = F32(uint64_t(p.beta) + 4ul * z * p.nv); GG = F32(uint64_t(p.g) + 4ul * z * p.nv); OO = F32(uint64_t(p.o) + 4ul * z * p.nv * p.dv);
+    }
     uint dk = p.dk, L = dk >> 4, R = 32 / L, lane = LANE, s = lane % L, vh = gl_WorkGroupID.x;
     uint kh = p.ilv != 0 ? vh / (p.nv / p.nk) : vh % p.nk;
     uint j0 = (gl_WorkGroupID.y * 8 + WARP) * R, j = j0 + lane / L;
     if (j0 >= p.dv) return;  // whole subgroup past the end (R divides dv)
     uint row = (vh * p.dv + j) * dk, ns = min(p.nsnap, p.T - 1);
     precise float r[16];
-    [[unroll]] for (uint i = 0; i < 4; i++) { vec4 t = FV4(uint64_t(p.S)).v[row / 4 + s + L * i]; [[unroll]] for (uint e = 0; e < 4; e++) r[4 * i + e] = t[e]; }
+    [[unroll]] for (uint i = 0; i < 4; i++) { vec4 t = FV4(uint64_t(SS)).v[row / 4 + s + L * i]; [[unroll]] for (uint e = 0; e < 4; e++) r[4 * i + e] = t[e]; }
     // Token inputs do not depend on the state: token tok + 1's are loaded while token tok computes.
     vec4 nk4[4], nq4[4];
     float ng, nb, nvv;
@@ -40,15 +50,15 @@ void main() {
         [[unroll]] for (uint e = 0; e < 16; e++) { r[e] *= decay; sk = fma(r[e], kk[e], sk); }
         [[unroll]] for (uint off = L >> 1; off > 0; off >>= 1) sk += subgroupShuffleXor(sk, off);
         float d = bt * (vt - sk);
-        if (uint64_t(p.o) != 0) {
+        if (uint64_t(OO) != 0) {
             [[unroll]] for (uint e = 0; e < 16; e++) { r[e] = fma(d, kk[e], r[e]); oq = fma(r[e], qv[e], oq); }
             [[unroll]] for (uint off = L >> 1; off > 0; off >>= 1) oq += subgroupShuffleXor(oq, off);
-            if (s == 0) p.o.v[tok * p.nv * p.dv + vh * p.dv + j] = oq * p.scale;
+            if (s == 0) OO.v[tok * p.nv * p.dv + vh * p.dv + j] = oq * p.scale;
         } else {
             [[unroll]] for (uint e = 0; e < 16; e++) r[e] = fma(d, kk[e], r[e]);
         }
         if ((tok % SNAP_STRIDE) == 0u && tok + 1 < p.T && (tok / SNAP_STRIDE) < p.nsnap)
             [[unroll]] for (uint i = 0; i < 4; i++) FV4(uint64_t(p.snap)).v[((tok / SNAP_STRIDE) * p.nv * p.dv * dk + row) / 4 + s + L * i] = vec4(r[4 * i], r[4 * i + 1], r[4 * i + 2], r[4 * i + 3]);
     }
-    [[unroll]] for (uint i = 0; i < 4; i++) FV4(uint64_t(p.S)).v[row / 4 + s + L * i] = vec4(r[4 * i], r[4 * i + 1], r[4 * i + 2], r[4 * i + 3]);
+    [[unroll]] for (uint i = 0; i < 4; i++) FV4(uint64_t(SS)).v[row / 4 + s + L * i] = vec4(r[4 * i], r[4 * i + 1], r[4 * i + 2], r[4 * i + 3]);
 }

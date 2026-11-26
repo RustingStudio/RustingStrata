@@ -175,3 +175,48 @@ fn batched_quantized_gemm_uses_prepared_x() {
         assert!(gemm(x.addr()) == want, "{backend}: GEMM used the quantization of the rows x held before");
     }
 }
+
+/// Q8_0 dense GEMM speed for batched-decode widths (`--ignored`): GB/s of weight read per call.
+#[test]
+#[ignore]
+fn gemm_speed() {
+    use rusting_strata::backend::BATCHED;
+    use rusting_strata::quant::GgmlType;
+    use rusting_strata::weights::Tensor;
+    for (rows, cols) in [(12288usize, 2048usize), (2048, 6144), (4096, 4096)] {
+        let mut data = vec![0u8; GgmlType::Q8_0.row_bytes(cols as u64) * rows];
+        for (i, b) in data.chunks_mut(34).enumerate() {
+            b[0] = 0; b[1] = 0x20;
+            for (j, v) in b[2..].iter_mut().enumerate() { *v = ((i * 7 + j * 13) % 255) as u8; }
+        }
+        let t = Tensor { ty: GgmlType::Q8_0, cols, rows, data: &data, scale: 1.0 };
+        for (bk, g) in common::backends() {
+            let w = g.upload(&t).unwrap();
+            let x = common::up(&*g, &(0..64 * cols).map(|i| (i % 97) as f32 / 50.0 - 1.0).collect::<Vec<_>>());
+            let y = g.zeros::<f32>(64 * rows).unwrap();
+            for nt in [1usize, 2, 4, 8] {
+                let run = || if nt == 1 { g.gemv(&w, x.addr(), y.addr()).unwrap() } else { g.gemvn(&w, x.addr(), cols, y.addr(), rows, nt).unwrap() };
+                for _ in 0..50 { run(); }
+                g.sync().unwrap();
+                let t0 = std::time::Instant::now();
+                for _ in 0..300 { run(); }
+                g.sync().unwrap();
+                let us = t0.elapsed().as_secs_f64() * 1e6 / 300.0;
+                println!("gemm_speed {bk} {rows}x{cols} gemv nt {nt}: {us:7.1} us, {:5.0} GB/s", data.len() as f64 / us / 1e3);
+            }
+            for n in [1usize, 8, 16, 32, 64] {
+                for flag in [0, BATCHED] {
+                    let run = || g.gemm_dense(&w, n, x.addr(), cols, y.addr(), rows, flag).unwrap();
+                    for _ in 0..50 { run(); }
+                    g.sync().unwrap();
+                    let it = 300;
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..it { run(); }
+                    g.sync().unwrap();
+                    let us = t0.elapsed().as_secs_f64() * 1e6 / it as f64;
+                    println!("gemm_speed {bk} {rows}x{cols} n {n:2} {}: {us:7.1} us, {:5.0} GB/s", if flag == 0 { "plain  " } else { "batched" }, data.len() as f64 / us / 1e3);
+                }
+            }
+        }
+    }
+}

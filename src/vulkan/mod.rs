@@ -3,7 +3,7 @@
 //! command buffer, which a host copy or `sync` submits and waits for. Every op ends with a full compute and transfer
 //! barrier, which also orders it before the work of later submissions.
 
-use crate::backend::{ATT_SPLITS, ATT_SPLITS_1, Backend, Buf, GpuTensor, SAME_X};
+use crate::backend::{BATCHED, ATT_SPLITS, ATT_SPLITS_1, Backend, Buf, GpuTensor, SAME_X};
 use crate::quant::GgmlType;
 use anyhow::{Context, anyhow, ensure};
 use ash::vk;
@@ -44,7 +44,10 @@ const SPV: &[(&str, &[u8])] = &[
     ("gemmi_16", include_bytes!("spv/gemmi_16.spv")),
     ("gemmi_dp", include_bytes!("spv/gemmi_dp.spv")),
     ("gemmi_s", include_bytes!("spv/gemmi_s.spv")),
+    ("gemm_red", include_bytes!("spv/gemm_red.spv")),
     ("gemmi_s_16", include_bytes!("spv/gemmi_s_16.spv")),
+    ("gemmi_s2", include_bytes!("spv/gemmi_s2.spv")),
+    ("gemmi_s2_16", include_bytes!("spv/gemmi_s2_16.spv")),
     ("gemv_f", include_bytes!("spv/gemv_f.spv")),
     ("gemv_q", include_bytes!("spv/gemv_q.spv")),
     ("hadamard", include_bytes!("spv/hadamard.spv")),
@@ -92,8 +95,14 @@ const SPV: &[(&str, &[u8])] = &[
 ];
 
 /// The device, a scratch buffer of XQ bytes for x quantized by `quant_xq` when an op does that itself, the IQ lookup
-/// tables (`iq_tables`), the growable q8 rows for `gemmi` prefill, and a fixed q8 buffer for `<= TMAX` graphed forwards.
-pub struct Vk(Arc<Inner>, Buf, Buf, Mutex<(Buf, Option<[u64; 4]>)>, Mutex<(Buf, Option<[u64; 4]>)>);
+/// tables (`iq_tables`), the growable q8 rows for `gemmi` prefill, a fixed q8 buffer for `<= TMAX` graphed forwards,
+/// and the split-K slices of batched-decode GEMMs (`SPLIT_SCR` bytes, made at first use).
+pub struct Vk(Arc<Inner>, Buf, Buf, Mutex<(Buf, Option<[u64; 4]>)>, Mutex<(Buf, Option<[u64; 4]>)>, std::sync::OnceLock<Buf>);
+
+/// Split-K scratch of a batched GEMM: ks * nd * rows floats, ks chosen so ks * workgroups <= SPLIT_WG (so it fits:
+/// rows <= 64 g0 and nd <= 64 g1). 224, 448 and 896 measured alike at 16 rows; 448 was best at 64.
+const SPLIT_WG: usize = 448;
+const SPLIT_SCR: usize = SPLIT_WG * 64 * 64 * 4;
 
 /// The IQ lookup tables in one buffer, and the `tables.glsl` that names each at its offset from the buffer's address
 /// (spec constants 3 and 4). As GLSL const arrays the tables went to per-thread local memory on NVIDIA, which made
@@ -530,6 +539,7 @@ impl Vk {
             Buf::new(0, 0, ()),
             Mutex::new((Buf::new(0, 0, ()), None)),
             Mutex::new((Buf::new(0, 0, ()), None)),
+            Default::default(),
         );
         v.1 = v.buf(XQ, DEVICE)?.0;
         v.4.lock().unwrap().0 = v.alloc(1 << 20)?;
@@ -880,20 +890,29 @@ impl Arg for f32 { fn put(&self, v: &mut Vec<u8>) { v.extend(self.to_le_bytes())
 impl Vk {
     /// As the CUDA one: both kernels run, the step decides which one works, then attn_merge combines the splits (and
     /// writes out quantized into xq when not null).
-    fn attn(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64, sel: u64, sst: usize, sink: u64, win: usize) -> anyhow::Result<()> {
+    fn attn(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64, sel: u64, sst: usize, sink: u64, win: usize, kvt: u64, splits: usize) -> anyhow::Result<()> {
         ensure!([64, 128, 256, 512].contains(&hd), "attention head_dim {hd} unsupported (64, 128, 256 or 512)");
-        let (per, pz) = ((hd / 32) as u32, (nh * ATT_SPLITS * (hd + 2)) as u32);
+        let (per, pz) = ((hd / 32) as u32, (nh * splits * (hd + 2)) as u32);  // splits: of attn_decode_gqa
         if self.0.llama != 0 {  // one head per workgroup, merged as the attn_decode splits (empty ones weigh 0)
             self.run("attn_decode_llama", &[0, hd as u32], [nh * nt, ATT_SPLITS_1, 1], &[&q, &kc, &vc, &part, &step, &sel, &(sst as u32), &(nh as u32), &(nkv as u32), &scale, &pz, &(nt as u32), &(win as i32)])?;
             return self.run("attn_merge", &[], [nh, 1, nt], &[&part, &qg, &out, &step, &(hd as u32), &(ATT_SPLITS as u32), &(ATT_SPLITS_1 as u32), &i32::MAX, &0u64, &sink]);
         }
         let g = [8, 4, 2, 1].into_iter().find(|&g| (nh / nkv) % g == 0 && g * hd <= 2048).unwrap();
-        let args: [&dyn Arg; 14] = [&q, &kc, &vc, &part, &step, &sel, &(sst as u32), &(nh as u32), &(nkv as u32), &scale, &gq_min, &pz, &(nt as u32), &(win as i32)];
+        let args: [&dyn Arg; 15] = [&q, &kc, &vc, &part, &step, &sel, &(sst as u32), &(nh as u32), &(nkv as u32), &scale, &gq_min, &pz, &(nt as u32), &(win as i32), &kvt];
         // gq_min i32::MAX or 0 fixes the regime, so the dispatch that would exit at once is skipped.
         let wide = (nt >= 2) as u32;
         if gq_min != 0 { self.run("attn_decode", &[0, per, 1, 0, wide], [nh * nt, ATT_SPLITS_1, 1], &args)?; }
-        if gq_min != i32::MAX { self.run("attn_decode", &[0, per, g as u32, 1, wide], [nh / g * nt, ATT_SPLITS, 1], &args)?; }
-        self.run("attn_merge", &[], [nh, 1, nt], &[&part, &qg, &out, &step, &(hd as u32), &(ATT_SPLITS as u32), &(ATT_SPLITS_1 as u32), &gq_min, &xq, &sink])
+        if gq_min != i32::MAX { self.run("attn_decode", &[0, per, g as u32, 1, wide], [nh / g * nt, splits, 1], &args)?; }
+        self.run("attn_merge", &[], [nh, 1, nt], &[&part, &qg, &out, &step, &(hd as u32), &(splits as u32), &(ATT_SPLITS_1 as u32), &gq_min, &xq, &sink])
+    }
+    /// rms_norm with rope and (kc, or kvt with v) the K/V store; see rms_norm.comp.
+    fn rope_rows(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64, kvt: u64) -> anyhow::Result<()> {
+        if kc != 0 || (kvt != 0 && v != 0) {
+            let turbo = self.0.kv_k_mode >= 4 || self.0.kv_v_mode >= 4;
+            ensure!(!turbo || n % 128 == 0, "turbo KV cache: head_dim {n} is not a multiple of 128");
+        }
+        let ts = (base as f64).powf(-2.0 / n_rot as f64);
+        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &0u64, &(x_stride as u32), &(n as u32), &(n as u32), &eps, &step, &ts, &(per as u32), &(n_rot as u32), &0u64, &v, &kc, &vc, &kvt])
     }
     /// Record kernel `name` over `groups` workgroups with push constants `args`.
     fn run(&self, name: &'static str, spec: &[u32], groups: [usize; 3], args: &[&dyn Arg]) -> anyhow::Result<()> {
@@ -1001,7 +1020,7 @@ impl Vk {
         ensure!(cols % 64 == 0, "{} matrix with {cols} columns: GEMM needs a multiple of 64", ty.name());
         if n_tiles == 0 { return Ok(()); }
         let (spec, grid, nk) = (self.wspec(ty), [rows.div_ceil(64), n_tiles, 1], (cols / 64) as u32);
-        let (same, act) = (act & SAME_X != 0, act & 3);  // BATCHED: the same kernels
+        let (same, batched, act) = (act & SAME_X != 0, act & BATCHED != 0, act & 3);
         let mut q8 = self.q8_mutex(n_x, cols).lock().unwrap();
         let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);  // as on CUDA
         let reuse = same && q8.1 == key;
@@ -1026,6 +1045,23 @@ impl Vk {
         // Only SAME_X promises that x still holds what was quantized (as on CUDA).
         if !same { q8.1 = None; }
         let xq = self.q8_x(&mut q8, ty, cols, n_x, x, x_stride)?.expect("int8 GEMM without a quantized x");
+        // A step of a batch of requests (at most 64 rows of x): gemmi_s, K split over ks workgroups so that the few
+        // weight-row tiles fill the device, each slice into the scratch, then gemm_red sums them (as gemmd on CUDA).
+        if batched && tiles == 0 && xrow == 0 && nd <= 64 && self.0.coop_i8 != 0 && !self.0.st().batch {
+            // More than 32 positions: gemmi_s2, one tile of 64, so each weight is decoded once.
+            let s2 = nd > 32;
+            let g = [rows.div_ceil(64), nd.div_ceil(if s2 { 64 } else { 32 }), 1];
+            let ks = (SPLIT_WG / (g[0] * g[1])).clamp(1, 8).min(nk as usize / 4).max(1);
+            let (sk, scr) = if ks > 1 { (ks, self.5.get_or_init(|| self.alloc(SPLIT_SCR).expect("split-K scratch")).addr()) } else { (1, y) };
+            let (ys, a) = if ks > 1 { (rows, 0) } else { (y_stride, act) };
+            let args: [&dyn Arg; 11] = [&tiles, &wd, &xq, &xrow, &scr, &(nd as u32), &(ys as u32), tail[0], tail[1], &a, tail[3]];
+            self.run(match (s2, self.0.coop_i8 == 32) { (false, true) => "gemmi_s", (false, false) => "gemmi_s_16", (true, true) => "gemmi_s2", (true, false) => "gemmi_s2_16" }, &spec, [g[0], g[1], sk], &args)?;
+            if ks > 1 {
+                self.run("gemm_red", &[], [(rows * nd).div_ceil(256), 1, 1],
+                    &[&scr, &y, &(rows as u32), &(nd as u32), &(y_stride as u32), &(ks as u32), &act])?;
+            }
+            return Ok(());
+        }
         let args: [&dyn Arg; 11] = [&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2], tail[3]];
         let (gk, gks) = match self.0.coop_i8 { 32 => ("gemmi", "gemmi_s"), 16 => ("gemmi_16", "gemmi_s_16"), _ => ("gemmi_dp", "gemmi_dp") };
         self.run(if self.0.coop_i8 == 0 { "gemmi_dp" } else if sm { gks } else { gk }, &spec, grid, &args)?;
@@ -1056,6 +1092,7 @@ impl Backend for Vk {
             self.2.clone(),
             Mutex::new((Buf::new(0, 0, ()), None)),
             Mutex::new((Buf::new(0, 0, ()), None)),
+            Default::default(),
         );
         v.4.lock().unwrap().0 = v.alloc(1 << 20)?;
         Ok(Box::new(v))
@@ -1247,6 +1284,14 @@ impl Backend for Vk {
         unsafe { self.0.dev.free_command_buffers(st.gpool, &[c]) };
         Ok(())
     }
+    fn graph_clear(&self) -> anyhow::Result<()> {
+        let mut st = self.0.st();
+        if st.graphs.is_empty() { return Ok(()) }
+        self.0.flush(&mut st)?;
+        let cs: Vec<_> = st.graphs.drain().map(|(_, c)| c).collect();
+        unsafe { self.0.dev.free_command_buffers(st.gpool, &cs) };
+        Ok(())
+    }
 
     fn moe_mailbox_optional(&self) -> bool { true }
     fn verify_rows(&self) -> usize { crate::cpu_worker::TMAX }
@@ -1345,18 +1390,22 @@ impl Backend for Vk {
         self.rms_norm_q(x, x_stride, w, out, out_stride, n, rows, eps, 0, 0)
     }
     fn rms_norm_q(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32, xq: u64, res: u64) -> anyhow::Result<()> {
-        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &xq, &(x_stride as u32), &(out_stride as u32), &(n as u32), &eps, &0u64, &0f64, &0u32, &0u32, &res, &0u64, &0u64, &0u64])
+        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &xq, &(x_stride as u32), &(out_stride as u32), &(n as u32), &eps, &0u64, &0f64, &0u32, &0u32, &res, &0u64, &0u64, &0u64, &0u64])
     }
     fn rms_norm_rope(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
         self.rms_norm_rope_kv(x, x_stride, w, out, n, rows, eps, per, n_rot, step, base, 0, 0, 0)
     }
     fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
-        if kc != 0 {
-            let turbo = self.0.kv_k_mode >= 4 || self.0.kv_v_mode >= 4;
-            ensure!(!turbo || n % 128 == 0, "turbo KV cache: head_dim {n} is not a multiple of 128");
-        }
-        let ts = (base as f64).powf(-2.0 / n_rot as f64);
-        self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &0u64, &(x_stride as u32), &(n as u32), &(n as u32), &eps, &step, &ts, &(per as u32), &(n_rot as u32), &0u64, &v, &kc, &vc])
+        self.rope_rows(x, x_stride, w, out, n, rows, eps, per, n_rot, step, base, v, kc, vc, 0)
+    }
+    fn kv_rows(&self) -> bool { self.0.llama == 0 }  // attn_decode_llama has no kvt
+    fn rms_norm_rope_qk_rows(&self, q: u64, q_stride: usize, qw: u64, qo: u64, nh: usize, k: u64, kw: u64, ko: u64, nkv: usize, hd: usize, eps: f32, n_rot: usize,
+                             step: u64, base: f32, v: u64, kvt: u64, nt: usize) -> anyhow::Result<()> {
+        self.rope_rows(q, q_stride, qw, qo, hd, nt * nh, eps, nh, n_rot, step, base, 0, 0, 0, kvt)?;
+        self.rope_rows(k, hd, kw, ko, hd, nt * nkv, eps, nkv, n_rot, step, base, v, 0, 0, kvt)
+    }
+    fn attn_rows(&self, q: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize, sink: u64, win: usize, kvt: u64, splits: usize) -> anyhow::Result<()> {
+        self.attn(q, 0, 0, qg, out, part, step, nh, nkv, hd, scale, 0, nt, 0, 0, 0, sink, win, kvt, splits)
     }
     fn argmax_rows(&self, x: u64, n: usize, rows: usize, out: u64) -> anyhow::Result<()> {
         // One workgroup per row reads 1 MB (a 248320-token vocabulary) in ~25 us; 64 per row share it. The partials go
@@ -1506,7 +1555,16 @@ impl Backend for Vk {
         self.run("ssm_gates", &[], [n.div_ceil(256), 1, 1], &[&beta, &g, &dt_bias, &a, &(n as u32), &(nv as u32)])
     }
     fn conv_silu(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, nn: usize, eps: f32) -> anyhow::Result<()> {
-        self.run("conv_silu", &[], [ch.div_ceil(128), 1, 1], &[&qkv, &state, &w, &y, &(ch as u32), &(kw as u32), &(nn as u32), &eps])
+        self.run("conv_silu", &[], [ch.div_ceil(128), 1, 1], &[&qkv, &state, &w, &y, &(ch as u32), &(kw as u32), &(nn as u32), &eps, &0u64])
+    }
+    fn conv_silu_rows(&self, qkv: u64, tab: u64, states: &[u64], w: u64, y: u64, ch: usize, kw: usize, eps: f32) -> anyhow::Result<()> {
+        self.run("conv_silu", &[], [ch.div_ceil(128), states.len(), 1], &[&qkv, &0u64, &w, &y, &(ch as u32), &(kw as u32), &0u32, &eps, &tab])
+    }
+    fn deltanet_rows(&self, y: u64, tab: u64, states: &[u64], beta: u64, g: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, ych: usize) -> anyhow::Result<()> {
+        let rows = 512 / dk.max(1);
+        ensure!(matches!(dk, 32 | 64 | 128 | 256) && dv % rows == 0, "deltanet: head dims {dk}/{dv} unsupported");
+        self.run("deltanet", &[], [nv, dv.div_ceil(8 * rows), states.len()], &[&y, &0u64, &beta, &g, &o, &0u64, &0u64, &0u64, &tab, &(nk as u32), &(nv as u32),
+            &(interleave as u32), &(dk as u32), &(dv as u32), &scale, &1u32, &(ych as u32), &0u32])
     }
     fn deltanet(&self, y: u64, s: u64, beta: u64, g: u64, dt_bias: u64, a: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> {
         self.deltanet_strided(y, s, beta, g, dt_bias, a, o, nk, nv, interleave, dk, dv, scale, t, ych, snap, nsnap, 1)
@@ -1516,7 +1574,7 @@ impl Backend for Vk {
         let rows = 512 / dk.max(1);  // state rows per subgroup
         ensure!(matches!(dk, 32 | 64 | 128 | 256) && dv % rows == 0, "deltanet: head dims {dk}/{dv} unsupported");
         let spec: &[u32] = if snap_stride > 1 { &[0, snap_stride as u32] } else { &[] };
-        self.run("deltanet", spec, [nv, dv.div_ceil(8 * rows), 1], &[&y, &s, &beta, &g, &o, &snap, &dt_bias, &a, &(nk as u32), &(nv as u32),
+        self.run("deltanet", spec, [nv, dv.div_ceil(8 * rows), 1], &[&y, &s, &beta, &g, &o, &snap, &dt_bias, &a, &0u64, &(nk as u32), &(nv as u32),
             &(interleave as u32), &(dk as u32), &(dv as u32), &scale, &(t as u32), &(ych as u32), &(nsnap as u32)])
     }
     fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> {
@@ -1615,11 +1673,11 @@ impl Backend for Vk {
         self.run("kv_store", &[], [(n * t).div_ceil(256), 1, 1], &[&k, &v, &kc, &vc, &step, &(n as u32), &((n * t) as u32), &(hd as u32)])
     }
     fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, sink: u64, win: usize) -> anyhow::Result<()> {
-        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, 0, 0, 0, sink, win)
+        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, 0, 0, 0, sink, win, 0, ATT_SPLITS)
     }
     fn attn_decode_q(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, xq: u64, sel: u64, sst: usize, sink: u64, win: usize) -> anyhow::Result<u64> {
         let xq = if self.0.llama != 0 { 0 } else { xq };
-        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, xq, sel, sst, sink, win)?;
+        self.attn(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, xq, sel, sst, sink, win, 0, ATT_SPLITS)?;
         Ok(xq)
     }
     fn qsa_pool(&self, ik: u64, ring: u64, pool: u64, w: u64, step: u64, t: usize, n_rot: usize, base: f32, eps: f32) -> anyhow::Result<()> {

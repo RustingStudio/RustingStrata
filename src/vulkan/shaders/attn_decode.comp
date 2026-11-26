@@ -11,10 +11,12 @@ layout(constant_id = 3) const bool GQA = false;
 // 0 ..= step (see qsa_select).
 // WIDE (nt >= 2): f16 rows in uvec4 loads. They cut two-token (MTP) calls by up to 18% at 32K but cost one-token calls
 // 4-11% at 16K+, so one token keeps the word loads.
+// kvt (not null): token t is a row of its own sequence, with its caches at kvt[2t] and kvt[2t + 1] (step_batch).
 layout(constant_id = 4) const bool WIDE = false;
 const uint HD = PER * 32, C = 32, J = 4, NW = 8;  // positions per chunk, per subgroup; subgroups
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64 { uint64_t v[]; };
 layout(push_constant) uniform P { F32 q; U32 kc; U32 vc; F32 part; I32 step; I32 sel; uint sst; uint nh; uint nkv; float scale; int gq_min;
-                                  uint pz; uint nt; int win; } p;
+                                  uint pz; uint nt; int win; U64 kvt; } p;
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer UV4 { uvec4 v[]; };
 shared float sq[PER * 256];  // G * HD query values, then NW * HD subgroup partials
 shared float ss[G * C], sc[G], sm[G], sl[G];
@@ -39,6 +41,8 @@ void main() {
         return;
     }
     uint g = h0 / (p.nh / p.nkv);
+    bool rows = uint64_t(p.kvt) != 0;
+    U32 kc = rows ? U32(p.kvt.v[2 * t]) : p.kc, vc = rows ? U32(p.kvt.v[2 * t + 1]) : p.vc;
     for (uint i = tid; i < G * HD; i += 256) sq[i] = p.q.v[qo + h0 * HD + i];
     precise float acc[G * PER], l = 0.0;  // l, m: running sum and max of head w (subgroups w < G)
     float m = ninf;
@@ -66,18 +70,18 @@ void main() {
             uint tt = c0 + w * J + j, r = ((cell(min(tt, p1 - 1)) * p.nkv + g) * HD + lane * PER) / 2;
             if (K_MODE > 0u && PER % 4 == 0) {
                 [[unroll]] for (uint d = 0; d < PER / 2; d += 2) {
-                    uvec2 k = ldkv4_k(U16(uint64_t(p.kc)), 2 * (r + d), HD);
+                    uvec2 k = ldkv4_k(U16(uint64_t(kc)), 2 * (r + d), HD);
                     if (tt >= p1) k = uvec2(0);
                     kr[d] = k.x; kr[d + 1] = k.y;
                 }
             } else if (K_MODE == 0u && WIDE && PER % 8 == 0) {
                 [[unroll]] for (uint d = 0; d < PER / 2; d += 4) {
-                    uvec4 k = UV4(uint64_t(p.kc)).v[(r + d) / 4];
+                    uvec4 k = UV4(uint64_t(kc)).v[(r + d) / 4];
                     [[unroll]] for (uint e = 0; e < 4; e++) kr[d + e] = tt >= p1 ? 0 : k[e];
                 }
             } else {
                 [[unroll]] for (uint d = 0; d < PER / 2; d++) {
-                    uint k = K_MODE > 0u ? ldkv2_k(U16(uint64_t(p.kc)), 2 * (r + d), HD) : p.kc.v[r + d];
+                    uint k = K_MODE > 0u ? ldkv2_k(U16(uint64_t(kc)), 2 * (r + d), HD) : kc.v[r + d];
                     kr[d] = tt >= p1 ? 0 : k;
                 }
             }
@@ -116,18 +120,18 @@ void main() {
             uint tt = c0 + w * J + j, r = ((cell(min(tt, p1 - 1)) * p.nkv + g) * HD + lane * PER) / 2;
             if (V_MODE > 0u && PER % 4 == 0) {
                 [[unroll]] for (uint d = 0; d < PER / 2; d += 2) {
-                    uvec2 v = ldkv4_v(U16(uint64_t(p.vc)), 2 * (r + d), HD);
+                    uvec2 v = ldkv4_v(U16(uint64_t(vc)), 2 * (r + d), HD);
                     if (tt >= p1) v = uvec2(0);
                     vr[d] = v.x; vr[d + 1] = v.y;
                 }
             } else if (V_MODE == 0u && WIDE && PER % 8 == 0) {
                 [[unroll]] for (uint d = 0; d < PER / 2; d += 4) {
-                    uvec4 v = UV4(uint64_t(p.vc)).v[(r + d) / 4];
+                    uvec4 v = UV4(uint64_t(vc)).v[(r + d) / 4];
                     [[unroll]] for (uint e = 0; e < 4; e++) vr[d + e] = tt >= p1 ? 0 : v[e];
                 }
             } else {
                 [[unroll]] for (uint d = 0; d < PER / 2; d++) {
-                    uint v = V_MODE > 0u ? ldkv2_v(U16(uint64_t(p.vc)), 2 * (r + d), HD) : p.vc.v[r + d];
+                    uint v = V_MODE > 0u ? ldkv2_v(U16(uint64_t(vc)), 2 * (r + d), HD) : vc.v[r + d];
                     vr[d] = tt >= p1 ? 0 : v;
                 }
             }

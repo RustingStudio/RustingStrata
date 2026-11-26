@@ -598,7 +598,11 @@ fn slots_match_single() {
         if cpu { unsafe { std::env::set_var("STRATA_EXPERT_MB", "0") } } else { unsafe { std::env::remove_var("STRATA_EXPERT_MB") } }
         let Some(gpu) = open(bk) else { continue };
         let mut gm = if split {
-            GpuModel::load_split(&m, vec![gpu, open(bk).unwrap()], 256, 4, 512 << 20, 0, 3).unwrap()
+            // Two parts on one card: a big file (BF16) leaves the second part too little VRAM for the slots.
+            match GpuModel::load_split(&m, vec![gpu, open(bk).unwrap()], 256, 4, 512 << 20, 0, 3) {
+                Ok(g) => g,
+                Err(e) => { eprintln!("slots_match_single {bk} split: skipped ({e})"); continue; }
+            }
         } else {
             GpuModel::load_slots(&m, gpu, 256, 4, 512 << 20, 3).unwrap()
         };
@@ -760,13 +764,10 @@ fn batch_matches_single() {
                                   "2 + 2 =", "The quick brown fox", "import numpy as np\n"].iter().map(|s| tok.encode(s).unwrap()).collect();
     // 64 slots: a step of 64 rows takes gemmd's full-tile path, the last step (63 rows) its other wide one.
     let prompts: Vec<Vec<u32>> = prompts.iter().cycle().take(64).cloned().collect();
-    let gpu = match rusting_strata::cuda::Gpu::new(0) {
-        Ok(g) => g,
-        Err(e) if e.to_string().contains("NVRTC") => panic!("{e}"),
-        Err(_) => return,
-    };
-    let mut gm = GpuModel::load_slots(&m, Box::new(gpu), 256, 64, 512 << 20, prompts.len()).unwrap();
-    if gm.batch_cap() == 0 { eprintln!("batch_matches_single: no step_batch for this model, skipped"); return; }
+    for (bk, gpu) in common::backends() {
+    let mut gm = GpuModel::load_slots(&m, gpu, 256, 64, 512 << 20, prompts.len()).unwrap();
+    if gm.batch_cap() == 0 { eprintln!("batch_matches_single {bk}: no step_batch for this model, skipped"); continue; }
+    let prompts = prompts[..gm.slots()].to_vec();  // fewer when the state of all does not fit in VRAM
     const STEPS: usize = 6;
     let mut want: Vec<Vec<Vec<f32>>> = vec![];
     for ids in &prompts {
@@ -790,16 +791,90 @@ fn batch_matches_single() {
             let w = &want[s][i + 1];
             let top = ops::argmax(w);
             let second = w.iter().enumerate().filter(|&(j, _)| j != top).map(|(_, &v)| v).fold(f32::MIN, f32::max);
-            assert!(*t as usize == top || w[top] - second < 0.5, "slot {s} step {i}: token {t}, single run {top} (margin {})", w[top] - second);
+            assert!(*t as usize == top || w[top] - second < 0.5, "{bk} slot {s} step {i}: token {t}, single run {top} (margin {})", w[top] - second);
             assert_eq!(l.is_empty(), !logits);
             if logits {
                 let d = l.iter().zip(w).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
                 worst = worst.max(d);
-                assert!(d < 0.5, "slot {s} step {i}: logits differ by {d}");
+                assert!(d < 0.5, "{bk} slot {s} step {i}: logits differ by {d}");
             }
         }
     }
-    eprintln!("batch_matches_single: largest logit difference {worst}");
+    eprintln!("batch_matches_single {bk}: largest logit difference {worst}");
+    }
+}
+
+/// Time of one `step_batch` forward at 16 to 128 rows (no logits read back). A speed check, not a test:
+/// `cargo test --release --test gpu_model batch_speed -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn batch_speed() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    for (bk, gpu) in common::backends() {
+        let mut gm = GpuModel::load_slots(&m, gpu, 4096, 128, 512 << 20, 128).unwrap();
+        if gm.batch_cap() == 0 { continue; }
+        for s in 0..gm.slots() { gm.use_slot(s); gm.reset().unwrap(); gm.prefill(&[1, 2, 3, 4]).unwrap(); }
+        let most = gm.batch_cap().min(gm.slots());
+        for n in std::env::var("STRATA_BATCH_N").map(|v| v.split(',').map(|x| x.parse().unwrap()).collect::<Vec<usize>>()).unwrap_or(vec![16, 32, 48, 64, 128]).into_iter().filter(|&n| n <= most) {
+            // Distinct tokens: a MoE routes them to different experts, as in real serving.
+            let rows: Vec<(usize, u32, bool)> = (0..n).map(|s| (s, 1000 + 131 * s as u32, false)).collect();
+            gm.step_batch(&rows).unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..20 { gm.step_batch(&rows).unwrap(); }
+            let ms = t.elapsed().as_secs_f64() * 1e3 / 20.0;
+            eprintln!("batch_speed {bk}: {n} rows {ms:.2} ms a step, {:.0} tok/s", n as f64 * 1e3 / ms);
+            if n <= rusting_strata::gpu_model::STEP_ROWS {
+                gm.step_rows(&rows).unwrap();
+                let t = std::time::Instant::now();
+                for _ in 0..20 { gm.step_rows(&rows).unwrap(); }
+                let ms = t.elapsed().as_secs_f64() * 1e3 / 20.0;
+                eprintln!("batch_speed {bk}: {n} rows step_rows {ms:.2} ms a step");
+            }
+        }
+    }
+}
+
+/// Slots of a model without experts start with a small KV cache and grow it on demand: a prompt past the start size
+/// and decode steps across a doubling give the logits of a model whose cache holds the whole context, and a reset
+/// slot (whose cache shrinks back) does too.
+#[test]
+fn slot_kv_grows() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    if m.cfg.is_moe() { return eprintln!("SKIP: MoE slots keep the whole context"); }
+    // Slot 0 grows to 1024 in its prefill and to 2048 while decoding; slot 1 grows to 1024 while decoding.
+    let ids = |n: usize, k: u32| -> Vec<u32> { (0..n as u32).map(|i| 100 + (i * 7919 + k) % 20000).collect() };
+    let prompts = [ids(1000, 0), ids(500, 3)];
+    let steps = 40;
+    for (bk, _) in common::backends() {
+        let run = |gm: &mut GpuModel, s: usize, ids: &[u32]| -> Vec<Vec<f32>> {
+            gm.use_slot(s);
+            gm.reset().unwrap();
+            vec![gm.prefill(ids).unwrap()]
+        };
+        let open = || common::backends().into_iter().find(|b| b.0 == bk).unwrap().1;
+        let mut one = GpuModel::load(&m, open(), 2048, 256, 512 << 20, 0).unwrap();
+        let mut want = vec![];
+        for p in &prompts {
+            let mut l = run(&mut one, 0, p);
+            for _ in 0..steps { let t = ops::argmax(l.last().unwrap()) as u32; l.push(one.step(t).unwrap()); }
+            want.push(l);
+        }
+        drop(one);
+        let mut gm = GpuModel::load_slots(&m, open(), 2048, 256, 512 << 20, 2).unwrap();
+        let mut got: Vec<Vec<Vec<f32>>> = prompts.iter().enumerate().map(|(s, p)| run(&mut gm, s, p)).collect();
+        for _ in 0..steps {
+            let rows: Vec<(usize, u32, bool)> = (0..2).map(|s| (s, ops::argmax(got[s].last().unwrap()) as u32, true)).collect();
+            for (s, (_, l)) in gm.step_rows(&rows).unwrap().into_iter().enumerate() { got[s].push(l); }
+        }
+        for s in 0..2 { assert_eq!(got[s], want[s], "{bk} slot {s}"); }
+        assert_eq!(run(&mut gm, 0, &prompts[1])[0], want[1][0], "{bk}: slot 0 after its reset");
+    }
 }
 
 /// `prefill_slots` (several prompts in shared forwards, one of them continuing a saved state) against `prefill_cached`
@@ -813,10 +888,10 @@ fn prefill_slots_matches_single() {
     let tok = Tokenizer::from_gguf(&g).unwrap();
     let prompts: Vec<Vec<u32>> = ["The capital of France is", "def fib(n):\n    return", "Once upon a time, in a small village by the sea, there lived",
                                   "2 + 2 ="].iter().map(|s| tok.encode(s).unwrap()).collect();
-    let Ok(gpu) = rusting_strata::cuda::Gpu::new(0) else { return };
-    // Chunk 16: the 4 prompts take more than one forward.
-    let mut gm = GpuModel::load_slots(&m, Box::new(gpu), 256, 16, 512 << 20, 6).unwrap();
-    if gm.batch_cap() == 0 { eprintln!("prefill_slots_matches_single: no step_batch for this model, skipped"); return; }
+    for (bk, gpu) in common::backends() {
+    // Chunk 16: the 4 prompts take more than one forward (and more rows than the 6 slots of attention partials).
+    let mut gm = GpuModel::load_slots(&m, gpu, 256, 16, 512 << 20, 6).unwrap();
+    if gm.batch_cap() == 0 { eprintln!("prefill_slots_matches_single {bk}: no step_batch for this model, skipped"); continue; }
     let want: Vec<Vec<f32>> = prompts.iter().map(|ids| { gm.reset().unwrap(); gm.prefill(ids).unwrap() }).collect();
     gm.reset().unwrap();
     // Slot 1 holds the first 3 tokens of prompt 2 as its saved state.
@@ -829,10 +904,10 @@ fn prefill_slots_matches_single() {
     assert!(calls > 0, "one forward took every row");
     let mut worst = 0f32;
     for (i, ((l, reused), w)) in got.iter().zip(&want).enumerate() {
-        assert_eq!(*reused, if i == 2 { 3 } else { 0 }, "prompt {i}");
+        assert_eq!(*reused, if i == 2 { 3 } else { 0 }, "{bk} prompt {i}");
         let d = l.iter().zip(w).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         worst = worst.max(d);
-        assert!(d < 0.5, "prompt {i}: logits differ by {d}");
+        assert!(d < 0.5, "{bk} prompt {i}: logits differ by {d}");
     }
     // Decode goes on from the prefilled slots.
     let rows: Vec<(usize, u32, bool)> = jobs.iter().zip(&want).map(|(j, w)| (j.0, ops::argmax(w) as u32, true)).collect();
@@ -844,7 +919,8 @@ fn prefill_slots_matches_single() {
         let w = gm.step(ops::argmax(&want[i]) as u32).unwrap();
         let d = next[i].1.iter().zip(&w).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         worst = worst.max(d);
-        assert!(d < 0.5, "prompt {i}: logits of the step after differ by {d}");
+        assert!(d < 0.5, "{bk} prompt {i}: logits of the step after differ by {d}");
     }
-    eprintln!("prefill_slots_matches_single: largest logit difference {worst}");
+    eprintln!("prefill_slots_matches_single {bk}: largest logit difference {worst}");
+    }
 }
