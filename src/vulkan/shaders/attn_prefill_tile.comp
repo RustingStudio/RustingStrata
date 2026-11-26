@@ -45,12 +45,13 @@ void main() {
     uint pos0 = uint(p.step.v[0]), last_max = pos0 + p.q_off + min(q0 + p.bq, p.t) - 1, last_q = pos0 + p.q_off + q;
     uint kvd = p.nkv * HD, kvo = kvh * HD;
     float qv[8], acc[8], m = 0.0, l = 0.0;
-    if (TQ_K) rotate_q(qv, lane);
     bool first = true;
     [[unroll]] for (uint j = 0; j < PER; j++) {
         qv[j] = live ? p.q.v[(qr * p.nh + hr) * HD + tq_idx(j, lane, KV_MODE)] * p.scale : 0.0;
         acc[j] = 0.0;
     }
+    // Rotate after loading: rotating first would scramble uninitialized values and leave Q unrotated.
+    if (TQ_K) rotate_q(qv, lane);
     for (uint k0 = 0; k0 <= last_max; k0 += BK) {
         barrier();
         // All threads load the tile (inactive tasks too, they still reach the barrier). Rows past the last key are

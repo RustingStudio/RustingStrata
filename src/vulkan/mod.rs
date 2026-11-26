@@ -369,10 +369,6 @@ impl Vk {
     /// The usable GPU with index `device` (`backend::device_order`). Fails with "Vulkan init" (and the reasons) when there is none.
     pub fn new(device: usize) -> anyhow::Result<Vk> {
         let (kv_k_mode, kv_v_mode) = (crate::cuda::kv_k_mode(), crate::cuda::kv_v_mode());
-        // ponytail: Vulkan turbo gave wrong text on Qwen3-4B (RTX 3060) and its hd 128 prefill needs 64000 B of shared
-        // memory; refused until fixed, `STRATA_VK_TURBO=1` opens it for tests.
-        ensure!((kv_k_mode < 4 && kv_v_mode < 4) || std::env::var_os("STRATA_VK_TURBO").is_some(),
-            "--kv turbo* is not ready on Vulkan yet; use the CUDA backend or --kv q8/q4");
         ensure!(!(crate::cuda::kv_mode() > 0 && crate::cuda::llama_numerics()), "--kv q8/q4/turbo* does not combine with --llama-numerics (its attention reads f16 KV)");
         // RADV hides VK_AMD_device_coherent_memory on RDNA4 (RX 9000) unless this driconf option is set, and without
         // it the GPU caches the CPU expert mailbox: MoE combines miss the worker's answer and wait until they give up.

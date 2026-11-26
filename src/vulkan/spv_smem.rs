@@ -321,6 +321,14 @@ mod tests {
         assert_eq!(shared_bytes("gemmi_s_16", &[0, 10, 84, 0, 0], 0).unwrap(), 20992);
     }
 
+    /// The turbo hd128 prefill staging must fit the smallest supported workgroup limit (49152 B).
+    #[test]
+    fn turbo_prefill_128_fits_49152() {
+        let bytes = shared_bytes_split("attn_prefill_128", &[], 4, 4).unwrap();
+        assert_eq!(bytes, 47616, "turbo attn_prefill_128 shared memory changed");
+        assert!(bytes <= 49152, "turbo attn_prefill_128 needs {bytes} B");
+    }
+
     #[test]
     fn shared_memory_refusal_names_the_kernel_spec_and_both_sizes() {
         let e = check_shared_memory("gemmi_dp", &[0, 10, 84, 0, 0], 0, 0, 40960).unwrap_err().to_string();

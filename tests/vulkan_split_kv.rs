@@ -19,7 +19,6 @@ fn set(k: &str, v: &str) {
     unsafe {
         std::env::set_var("STRATA_KV_K", k);
         std::env::set_var("STRATA_KV_V", v);
-        std::env::set_var("STRATA_VK_TURBO", "1");
         std::env::remove_var("STRATA_KV");
         std::env::remove_var("STRATA_KV_Q8");
     }
@@ -86,7 +85,6 @@ fn cu_caches(k: &str, v: &str, s: Shape) -> (Vec<u16>, Vec<u16>) {
 }
 
 #[test]
-#[ignore = "turbo attn_prefill_128 needs 64000 B of shared memory, more than the 49152 of an RTX 3060 under Vulkan"]
 fn vulkan_split_legacy_and_turbo() {
     let _lock = common::gpu_lock();
     let shape: Shape = (4, 2, 128, 16, 3);
@@ -168,4 +166,22 @@ fn vulkan_inkling_turbo_hd64() {
     let got = down::<f32>(g, &dout_pre);
     eprintln!("vulkan turbo hd64 prefill vs decode {:.2e}", rel_l2(&got, &want));
     assert!(rel_l2(&got, &want) < 5e-4, "vulkan turbo hd64 prefill vs decode");
+}
+
+/// Exercises the non-coop tiled prefill path, where Q used to be rotated before it was loaded.
+#[test]
+fn vulkan_turbo_tiled_prefill_matches_decode() {
+    let _lock = common::gpu_lock();
+    set("turbo4", "turbo4");
+    unsafe { std::env::set_var("STRATA_VK_NO_COOP", "1") };
+    let Some(vk) = open_vk() else {
+        unsafe { std::env::remove_var("STRATA_VK_NO_COOP") };
+        return;
+    };
+    for hd in [128, 256] {
+        let (_, _, pf, dec) = run(&vk, (4, 2, hd, 16, 3));
+        eprintln!("vulkan turbo4 tiled hd {hd} prefill vs decode {:.2e}", rel_l2(&pf, &dec));
+        assert!(rel_l2(&pf, &dec) < 5e-4, "vulkan turbo4 tiled hd {hd} prefill vs decode");
+    }
+    unsafe { std::env::remove_var("STRATA_VK_NO_COOP") };
 }

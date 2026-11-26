@@ -22,7 +22,7 @@ shared float ss[4 * 16 * BK];      // scores of each subgroup; at the start the 
 shared float16_t ps[4 * 16 * PP];  // softmax weights of each subgroup
 shared float rs[4 * 16];           // per row: the rescale factor, at the end the sum l
 shared float rm[4 * 16];           // per row: the final max
-shared float16_t tq_q[4][16][256]; // Q staging, reused for the inverse WHT output (warp, row, dim)
+shared float16_t tq_q[4][16][HD]; // Q staging, reused for the inverse WHT output (warp, row, dim)
 float tq_kget(uint row, uint col) {
     uvec4 u = kvs[row * PQ + col / 8u];
     return unpackFloat2x16(u[(col % 8u) / 2u])[col % 2u];
