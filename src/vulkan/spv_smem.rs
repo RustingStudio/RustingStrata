@@ -370,4 +370,14 @@ mod tests {
         assert!(worst_v100.0 <= 49152, "{} needs {} bytes of Workgroup memory with cooperative matrices off",
             worst_v100.1, worst_v100.0);
     }
+
+    #[test]
+    fn attn_prefill_non_turbo_fits_48kb() {
+        for kernel in ["attn_prefill_64", "attn_prefill_128", "attn_prefill_256"] {
+            for mode in 0..=3u32 {
+                let bytes = shared_bytes_split(kernel, &[], mode, mode).unwrap();
+                assert!(bytes <= 49152, "{kernel} with kv_mode={mode} needs {bytes} bytes (> 49152)");
+            }
+        }
+    }
 }
