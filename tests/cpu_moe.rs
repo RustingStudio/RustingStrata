@@ -65,3 +65,30 @@ fn kernel_throughput() {
         eprintln!("{name} {}: {:.1} us, {:.2} Gweights/s", t.ty.name(), s * 1e6, (t.rows * t.cols) as f64 / s / 1e9);
     }
 }
+
+/// expert_rows time for a decode batch of 16, 32 and 64 tokens, grouped by expert and per pair (STRATA_PAIR_ROWS),
+/// and the two give the same bits. The first size can include page faults of the experts.
+#[test]
+#[ignore]
+fn expert_rows_speed() {
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    if m.cfg.n_expert == 0 { return eprintln!("SKIP: dense model"); }
+    let il = 5;
+    for nt in [16usize, 32, 64] {
+        let hs: Vec<Vec<f32>> = (0..nt).map(|t| (0..m.cfg.n_embd).map(|i| (((i * 13 + t * 7919) % 1009) as f32 / 504.0 - 1.0)).collect()).collect();
+        let pairs: Vec<(usize, usize, f32)> = hs.iter().enumerate().flat_map(|(t, h)| m.route(il, h).into_iter().map(move |(e, w)| (t, e, w))).collect();
+        let mut out = [Vec::new(), Vec::new()];
+        for (k, mode) in ["group", "pair"].iter().enumerate() {
+            if k == 1 { unsafe { std::env::set_var("STRATA_PAIR_ROWS", "1") } } else { unsafe { std::env::remove_var("STRATA_PAIR_ROWS") } }
+            for _ in 0..3 { out[k] = cpu_moe::expert_rows(&m, il, &hs, &pairs); }
+            let t0 = std::time::Instant::now();
+            for _ in 0..20 { out[k] = cpu_moe::expert_rows(&m, il, &hs, &pairs); }
+            let distinct = { let mut e: Vec<_> = pairs.iter().map(|p| p.1).collect(); e.sort(); e.dedup(); e.len() };
+            eprintln!("{nt} tokens, {} pairs, {distinct} experts, {mode}: {:.2} ms", pairs.len(), t0.elapsed().as_secs_f64() * 50.0);
+        }
+        unsafe { std::env::remove_var("STRATA_PAIR_ROWS") }
+        assert_eq!(out[0], out[1], "{nt} tokens");
+    }
+}
