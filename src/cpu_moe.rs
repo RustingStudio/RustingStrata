@@ -1482,11 +1482,15 @@ pub fn matvec(t: &Tensor, x: &[f32], y: &mut [f32]) {
         });
     }
     let Some(dot) = int_dot(t.ty) else { return t.matvec(x, y) };
-    let xq = quantize_q8k(x);
+    matvec_q8k(t, &quantize_q8k(x), y, dot);
+}
+
+pub(crate) fn matvec_q8k(t: &Tensor, xq: &[Q8K], y: &mut [f32], dot: fn(&[u8], &[Q8K]) -> f32) {
+    let rb = t.ty.row_bytes(t.cols as u64);
     y.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
         for (k, v) in ys.iter_mut().enumerate() {
             let r = c * 32 + k;
-            *v = dot(&t.data[r * rb..(r + 1) * rb], &xq) * t.scale;
+            *v = dot(&t.data[r * rb..(r + 1) * rb], xq) * t.scale;
         }
     });
 }
