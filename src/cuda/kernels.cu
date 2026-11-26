@@ -4240,3 +4240,30 @@ extern "C" __global__ void __launch_bounds__(1024) qsa_select(const float* score
         if (tid == 0) sel[0] = 4 * top + pos + 1 - 4 * nb;
     }
 }
+
+// ---- CPU decode attention over a host-RAM KV cache (src/host_attn.rs), through a mapped mailbox ----
+// ha_post copies the queries and positions into mapped memory, then raises the request (word 0) with a fresh
+// sequence number and the layer's context address (words 4-5). The CPU worker spins on it, computes, writes the
+// partials and raises done (word 16). ha_wait holds the stream until then, so the next launch reads the partials.
+extern "C" __global__ void ha_post(const float* q, const int* step, float* mq, int* ms, int nq, int ns,
+                                   unsigned int* mb, unsigned int* seq, unsigned long long ctx) {
+    for (int i = threadIdx.x; i < nq; i += blockDim.x) mq[i] = q[i];
+    for (int i = threadIdx.x; i < ns; i += blockDim.x) ms[i] = step[i];
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned int s = seq[0] + 1;
+        seq[0] = s;
+        *(volatile unsigned long long*)(mb + 4) = ctx;
+        __threadfence_system();
+        *(volatile unsigned int*)mb = s;
+    }
+}
+extern "C" __global__ void ha_wait(const unsigned int* mb, const unsigned int* seq) {
+    unsigned int s = seq[0], spins = 0;
+    while (((volatile const unsigned int*)mb)[16] != s) {
+        __nanosleep(64);
+        if (++spins == (1u << 28)) __trap();  // tens of seconds: the CPU worker is gone
+    }
+    __threadfence_system();
+}

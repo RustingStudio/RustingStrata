@@ -1,4 +1,5 @@
 pub mod memory;
+pub mod host_attn;
 pub mod term;
 pub mod calibrate;
 
