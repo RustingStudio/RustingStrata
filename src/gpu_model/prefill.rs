@@ -647,8 +647,13 @@ impl GpuModel<'_> {
                     } else { None };
                     if let Some(pre) = &pre {
                         let w: Vec<_> = MATS.iter().map(|name| self.m.w.layer(il, name)).collect::<anyhow::Result<_>>()?;
-                        pre.send(missed.chunks(STAGE).flat_map(|grp| w.iter().zip(&lx.mats).flat_map(move |(w, mat)| grp.chunk_by(|a, b| *b == a + 1)
-                            .map(move |run| (w.data.as_ptr() as usize + run[0] * mat.bytes, run.len() * mat.bytes)))).collect());
+                        let mut rs: Vec<(usize, usize)> = missed.chunks(STAGE).flat_map(|grp| w.iter().zip(&lx.mats).flat_map(move |(w, mat)| grp.chunk_by(|a, b| *b == a + 1)
+                            .map(move |run| (w.data.as_ptr() as usize + run[0] * mat.bytes, run.len() * mat.bytes)))).collect();
+                        // Overlap NVMe read-ahead for the next MoE layer's hottest cold experts behind this layer's GEMMs.
+                        if let Some(next_il) = (il + 1..c.n_layer).find(|&j| cache.layer(j).is_some()) {
+                            rs.extend(cache.cold_ranges_for_next(self.m, next_il, 16));
+                        }
+                        pre.send(rs);
                     }
                     // Staged groups of at most STAGE missed experts, group j in staging third j % 3. Staging holds
                     // each matrix in its own section (all gates, then ups, then downs), so experts with consecutive
@@ -724,7 +729,10 @@ impl GpuModel<'_> {
                             let mut i = 0;
                             for run in grp.chunk_by(|a, b| b.0 == a.0 + 1) {
                                 let e = run[0].0;
-                                g.htod(&w.data[e * mat.bytes..(e + run.len()) * mat.bytes], &pf.staging, half(j) + STAGE * mat.off + i * mat.bytes)?;
+                                let slice = &w.data[e * mat.bytes..(e + run.len()) * mat.bytes];
+                                g.htod(slice, &pf.staging, half(j) + STAGE * mat.off + i * mat.bytes)?;
+                                // Release cold streamed prefill experts from OS page cache when the model exceeds RAM.
+                                crate::weights::cold(slice);
                                 i += run.len();
                             }
                         }
