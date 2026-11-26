@@ -597,6 +597,142 @@ pub struct Last {
     pub finish: String,
 }
 
+/// Totals of answered chat requests for one model or one API key, kept across server runs (`rustingstrata stats`).
+#[derive(Clone, Default, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Totals {
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub cached_tokens: u64,
+    pub completion_tokens: u64,
+    pub prefill_ms: f64,
+    pub decode_ms: f64,
+    /// Unix seconds of the first and the latest request.
+    pub first: u64,
+    pub last: u64,
+}
+
+/// The file behind `rustingstrata stats`: totals by model and by key name ("open" without `--api-keys`).
+#[derive(Default, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Usage {
+    pub models: std::collections::BTreeMap<String, Totals>,
+    pub keys: std::collections::BTreeMap<String, Totals>,
+}
+
+impl Totals {
+    fn add(&mut self, l: &Last) {
+        if self.requests == 0 { self.first = l.at; }
+        self.requests += 1;
+        self.prompt_tokens += l.prompt_tokens as u64;
+        self.cached_tokens += l.cached_tokens as u64;
+        self.completion_tokens += l.completion_tokens as u64;
+        self.prefill_ms += l.prefill_ms;
+        self.decode_ms += l.decode_ms;
+        self.last = l.at;
+    }
+}
+
+impl Usage {
+    pub fn load(path: &Path) -> anyhow::Result<Usage> {
+        match std::fs::read(path) {
+            Ok(b) => serde_json::from_slice(&b).with_context(|| format!("{}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Usage::default()),
+            Err(e) => Err(e).with_context(|| format!("{}", path.display())),
+        }
+    }
+
+    /// Adds one request to `path` (written to a temporary file and renamed, so a crash leaves the old totals).
+    // ponytail: read-modify-write per request under a process lock; two servers sharing the file can lose counts.
+    pub fn add(path: &Path, key: &str, l: &Last) -> anyhow::Result<()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut u = Usage::load(path)?;
+        u.models.entry(l.model.clone()).or_default().add(l);
+        u.keys.entry(key.to_string()).or_default().add(l);
+        if let Some(d) = path.parent() { std::fs::create_dir_all(d)?; }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&u)?)?;
+        Ok(std::fs::rename(&tmp, path)?)
+    }
+
+    /// The table `rustingstrata stats` prints.
+    pub fn table(&self) -> String {
+        let n = |v: u64| match v {
+            v if v >= 1_000_000_000 => format!("{:.2}B", v as f64 / 1e9),
+            v if v >= 1_000_000 => format!("{:.2}M", v as f64 / 1e6),
+            v if v >= 10_000 => format!("{:.1}k", v as f64 / 1e3),
+            v => v.to_string(),
+        };
+        let rate = |t: u64, ms: f64| if ms > 0.0 { format!("{:.1}", t as f64 * 1e3 / ms) } else { "-".into() };
+        let mut s = String::new();
+        for (title, m) in [("model", &self.models), ("key", &self.keys)] {
+            let w = m.keys().map(|k| k.chars().count()).max().unwrap_or(0).max(title.len());
+            s += &format!("{title:<w$}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>13}  {:>12}  {:<10}  {:<10}\n",
+                "requests", "prompt", "cached", "output", "total", "prefill tok/s", "decode tok/s", "first", "last");
+            let mut all = Totals::default();
+            for (k, t) in m {
+                s += &format!("{k:<w$}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>13}  {:>12}  {:<10}  {:<10}\n",
+                    t.requests, n(t.prompt_tokens), n(t.cached_tokens), n(t.completion_tokens), n(t.prompt_tokens + t.completion_tokens),
+                    rate(t.prompt_tokens - t.cached_tokens.min(t.prompt_tokens), t.prefill_ms), rate(t.completion_tokens, t.decode_ms),
+                    date(t.first), date(t.last));
+                all.requests += t.requests;
+                all.prompt_tokens += t.prompt_tokens;
+                all.cached_tokens += t.cached_tokens;
+                all.completion_tokens += t.completion_tokens;
+            }
+            if m.len() > 1 {
+                s += &format!("{:<w$}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}\n", "all", all.requests, n(all.prompt_tokens),
+                    n(all.cached_tokens), n(all.completion_tokens), n(all.prompt_tokens + all.completion_tokens));
+            }
+            s += "\n";
+        }
+        s
+    }
+}
+
+/// `YYYY-MM-DD` (UTC) of Unix seconds.
+fn date(secs: u64) -> String {
+    // Days to civil date (Howard Hinnant's algorithm).
+    let z = (secs / 86400) as i64 + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{m:02}-{d:02}", yoe + era * 400 + (m <= 2) as i64)
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::{Last, Usage, date};
+
+    #[test]
+    fn usage_adds_and_persists() {
+        assert_eq!(date(0), "1970-01-01");
+        assert_eq!(date(1795728053), "2026-11-26");
+        assert_eq!(date(951782400), "2000-02-29");
+        let p = std::env::temp_dir().join(format!("strata-usage-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let l = |at, model: &str| Last { at, model: model.into(), prompt_tokens: 100, cached_tokens: 40, completion_tokens: 20,
+            prefill_ms: 60.0, decode_ms: 400.0, ..Default::default() };
+        Usage::add(&p, "open", &l(10, "a")).unwrap();
+        Usage::add(&p, "open", &l(20, "a")).unwrap();
+        Usage::add(&p, "bob", &l(30, "b")).unwrap();
+        let u = Usage::load(&p).unwrap();
+        std::fs::remove_file(&p).unwrap();
+        let a = &u.models["a"];
+        assert_eq!((a.requests, a.prompt_tokens, a.cached_tokens, a.completion_tokens, a.first, a.last), (2, 200, 80, 40, 10, 20));
+        assert_eq!((u.keys["open"].requests, u.keys["bob"].requests, u.models["b"].first), (2, 1, 30));
+        let t = u.table();
+        // 120 new prompt tokens in 120 ms, 40 reply tokens in 800 ms.
+        assert!(t.lines().any(|r| r.starts_with("a ") && r.contains(" 1000.0 ") && r.contains(" 50.0 ")), "{t}");
+        assert!(t.lines().any(|r| r.starts_with("all ")), "{t}");
+    }
+}
+
 impl Stats {
     pub fn record(&mut self, l: Last) {
         self.requests += 1;

@@ -260,6 +260,13 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   Coder) a string argument as it is written, so a client can show a long file write while it runs. Other call formats
   send a call's arguments when the call is complete. This is the main engine; the Messages API and the separate
   forwards (Inkling 2, DeepSeek, GLM and the others) still send calls at the end.
+- Each reply carries `usage` and llama-server's `timings` block (`prompt_n`, `prompt_ms`, `prompt_per_second`,
+  `predicted_n`, `predicted_ms`, `predicted_per_second`, `cache_n`), in the body or in the last chunk of a stream, on
+  every model, so llama-swap shows the prefill and decode speed.
+- The server adds each answered chat to `usage.json` next to the default models folder
+  (`~/.local/share/rusting_strata/usage.json` on Linux). `rustingstrata stats` prints the totals over all runs, by model
+  and by API key name (`open` without `--api-keys`): requests, prompt, cached and reply tokens, prefill and decode
+  speed, and the first and last day. Delete the file to start again. `--usage-log` still writes one line per request.
 - The prompt follows the model's own chat template, rendered like llama.cpp's `--jinja`.
 - `POST /tokenize` and `POST /detokenize` work as in llama.cpp's server: `{"content": "text", "add_special": false,
   "with_pieces": false}` gives `{"tokens": [...]}` (with pieces each entry is `{"id", "piece"}`, and a piece that is

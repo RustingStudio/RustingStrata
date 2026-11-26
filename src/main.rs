@@ -1043,6 +1043,10 @@ enum Cmd {
         #[command(flatten)]
         engine: Engine,
     },
+    /// Print the tokens `serve` answered, by model and by API key name, over all runs. The totals are kept in
+    /// usage.json next to the default models folder; delete that file to start again.
+    #[command(alias = "statistics")]
+    Stats,
     /// Replace this binary with the newest GitHub release (Linux and Windows x86_64). The old one is kept as
     /// `<name>.old`.
     Update {
@@ -1331,6 +1335,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                    RUSTFLAGS=\"-C target-cpu=native\" (or x86-64-v3), or use a release binary.");
     }
     match cmd {
+        Cmd::Stats => {
+            let f = usage_file();
+            let u = serve::Usage::load(&f)?;
+            if u.models.is_empty() { println!("no requests recorded yet in {}", f.display()); }
+            else { print!("{}", u.table()); println!("({})", f.display()); }
+        }
         Cmd::Update { check } => rusting_strata::update::run(check)?,
         Cmd::Info { model } => {
             let g = Gguf::open(&model)?;
@@ -3874,6 +3884,9 @@ fn gpu_model_stats(g: &GpuModel, s: &mut serve::Stats) {
 }
 
 /// Default models folder: `$XDG_DATA_HOME`, `%LOCALAPPDATA%` on Windows, else `~/.local/share`.
+/// The totals behind `rustingstrata stats`, next to the default models folder.
+fn usage_file() -> PathBuf { models_dir_default().with_file_name("usage.json") }
+
 fn models_dir_default() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME").or_else(|| std::env::var_os("LOCALAPPDATA")).map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"))
@@ -4058,6 +4071,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     // A failed write must not fail the reply; it is reported.
                     if let Err(err) = writeln!(f.lock().unwrap(), "{v}") { say!("usage log: {err}"); }
                 }
+                if let Err(err) = serve::Usage::add(&usage_file(), key_name, last) { say!("stats: {err:#}"); }
             };
             // A model outside the main engine answers the request itself (greedy; it fails before it writes).
             if let Runner::Own(chat) = r {
