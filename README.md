@@ -124,6 +124,7 @@ Inkling 2 open the GPU by themselves.
 - [HOSTING.md](docs/HOSTING.md): running a server for other people.
 - [SUPPORTED_GPUS.md](docs/SUPPORTED_GPUS.md) and [AMD.md](docs/AMD.md): the GPUs tried so far and AMD notes.
 - [VISION.md](docs/VISION.md): image input. [LORA.md](docs/LORA.md): LoRA adapters.
+- [ROADMAP.md](ROADMAP.md): what is planned next, by section; ideas from users are welcome.
 
 ## Development
 
