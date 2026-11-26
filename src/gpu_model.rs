@@ -284,6 +284,10 @@ struct DFlashGpu {
     layers: Vec<DFlashLayer>,
     /// `[TMAX, n_target_layers * n_embd]` concatenated post-layer target hidden states.
     feat: Buf,
+    /// hc stream gate for the mean collapse (all large => plain mean), `[hc_n * n_embd]`.
+    dfg: Buf,
+    /// hc-mean collapse output, `[TMAX, n_embd]`.
+    dfm: Buf,
     /// `[TMAX, n_embd]` projected & normalized `target_hidden = hidden_norm(fc(feat))` from the last forward.
     th: Buf,
     x: Buf,
@@ -876,6 +880,10 @@ impl<'a> GpuModel<'a> {
                     norm: up("dflash.norm.weight")?,
                     layers: dl_layers,
                     feat: gpu.zeros::<f32>(TMAX * dc.target_layer_ids.len() * c.n_embd)?,
+                    // hc_mix indexes its gate buffer per position (g[t*hc*n + c*n + i]), so it needs
+                    // TMAX rows; 12.0 => sigmoid ~ 1 => plain stream mean.
+                    dfg: { let n = (TMAX * c.hc_n * c.n_embd).max(1); let b = gpu.zeros::<f32>(n)?; gpu.put(&vec![12.0f32; n], &b, 0)?; b },
+                    dfm: gpu.zeros::<f32>(TMAX * c.n_embd)?,
                     th: gpu.zeros::<f32>(TMAX * dc.n_embd)?,
                     x: gpu.zeros::<f32>(TMAX * dc.n_embd)?,
                     h: gpu.zeros::<f32>(TMAX * dc.n_embd)?,
@@ -2000,9 +2008,18 @@ impl<'a> GpuModel<'a> {
                 if let Some(idx) = df.cfg.target_layer_ids.iter().position(|&tl| tl == il) {
                     if res != 0 { g.add(x, res, nt * ne)?; res = 0; }
                     let n_ids = df.cfg.target_layer_ids.len();
+                    // hc targets (qwen4exp): the drafter reads the plain mean of the hc streams
+                    // (mirrors llama.cpp's hc_stream_mean); hc_mix with a constant large gate
+                    // yields sum * sigmoid(g) / hc = mean.
+                    let src = if self.m.cfg.hc_n > 0 {
+                        g.hc_mix(self.x.addr(), df.dfg.addr(), df.dfm.addr(), ne, self.m.cfg.hc_n, nt)?;
+                        &df.dfm
+                    } else {
+                        &self.x
+                    };
                     g.batch(&mut || {
                         for r in 0..nt {
-                            g.dtod(&self.x, 4 * r * ne, &df.feat, 4 * (r * n_ids + idx) * ne, 4 * ne)?;
+                            g.dtod(src, 4 * r * ne, &df.feat, 4 * (r * n_ids + idx) * ne, 4 * ne)?;
                         }
                         Ok(())
                     })?;
