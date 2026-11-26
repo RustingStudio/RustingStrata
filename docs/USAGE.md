@@ -145,7 +145,8 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 - `--kv turbo4` (CUDA) uses TurboQuant: each 128-value K/V block is signed-Walsh rotated, quantized with
   4-bit Lloyd-Max centroids, and stored in about 28% of the f16 cache size. Q is rotated by the same transform
   when the K cache is TurboQuant, and the attention output is de-rotated when the V cache is TurboQuant.
-  `--kv turbo4-3`, `turbo4-2`, `turbo3`, `turbo2` and `turbo3-2` select narrower K/V centroids.
+  `--kv turbo4-3`, `turbo4-2`, `turbo3`, `turbo2` and `turbo3-2` select narrower K/V centroids. All of them
+  currently use the same 4-bit nibble packing and cache size as `--kv turbo4`.
 - `--k TYPE` and `--v TYPE` set the two cache formats independently (CUDA). Either half may be `f16`, `q8`,
   `q4`, `q2`, `turbo4`, `turbo3` or `turbo2`; for example `--k f16 --v q4` or `--k turbo4 --v turbo3`.
   A mixed layout allocates each half with its own word width. The Vulkan backend only supports symmetric
