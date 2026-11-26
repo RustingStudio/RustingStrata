@@ -279,7 +279,19 @@ impl<'a> Gemma4Model<'a> {
             if k == 0 { return vec![]; }
             for (g, d, _) in &cpu_sel { g.prefetch_expert(0, 1); d.prefetch_expert(0, 1); }
             use crate::cpu_moe::{int_dot, quantize_q8k};
-            let (dgu, ddn) = (int_dot(cpu_sel[0].0.ty).unwrap(), int_dot(cpu_sel[0].1.ty).unwrap());
+            let (Some(dgu), Some(ddn)) = (int_dot(cpu_sel[0].0.ty), int_dot(cpu_sel[0].1.ty)) else {
+                // An expert type with no integer kernel (BF16 experts of a UD-Q8_K_XL file): each expert through
+                // Mat::matvec, which takes every type.
+                return cpu_sel.iter().flat_map(|(g, d, _)| {
+                    let mut gu = vec![0f32; 2 * nf];
+                    g.matvec(&moe_in, &mut gu);
+                    let mut a = vec![0f32; nf];
+                    act(&gu, nf, &mut a);
+                    let mut o = vec![0f32; n];
+                    d.matvec(&a, &mut o);
+                    o
+                }).collect();
+            };
             let xq = quantize_q8k(&moe_in);
             let mut gu = vec![0f32; k * 2 * nf];
             gu.par_chunks_mut(16).enumerate().for_each(|(c, ys)| for (j, v) in ys.iter_mut().enumerate() {
