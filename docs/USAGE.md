@@ -284,6 +284,39 @@ AMD cards clock down in the gaps while the other card works; `echo high >
 /sys/class/drm/cardN/device/power_dpm_force_performance_level` (as root, per card) took a two-card split from 44 to 57
 tok/s in one report.
 
+### Inkling 2 on several GPUs
+
+Inkling 2 is the model this work targets, and `--device 0,1` is opt-in: the default is always one card, even on a
+machine with two. With two cards the 24 expert layers are placed as whole slabs (the load line says how many and
+where), a layer's FFN runs on the card that holds it, and the attention and tail stay on GPU 0.
+
+`STRATA_DS_FAST_KERNELS` selects the kernels:
+
+- `auto` (default): the tiled controllers, `ink_attn_128` and the 16-query prefill (`kp16`) only when the run has more
+  than one device. One card keeps the `main` kernels, so the greedy output does not change.
+- `1`: force them on one card (the one-card kernel numbers in the PR).
+- `0`: force the old kernels on two cards (the A/B).
+
+Per-kernel overrides: `STRATA_CTRL_TILE=0` (per-token controllers), `STRATA_DS_ATTN_OLD=1` (scalar decode and
+one-query-a-warp prefill), `STRATA_DS_ATTN_KP4=1` (four-query prefill).
+
+The two-card plan uses these knobs:
+
+| variable | default | effect |
+|---|---|---|
+| `STRATA_DS_FAST_KERNELS` | `auto` | as above; one card keeps the old kernels unless forced |
+| `STRATA_DS_PLAIN_FIRST` | unset; `chat`/`serve`/`bench` set `1` | keep the plain weights on GPU 0, where the decode state lives |
+| `STRATA_DS_PF_TOKENS` | 256 one card, 512 two | tokens of one prompt chunk (at most 2048) |
+| `STRATA_DS_KV_TOKENS` | `--ctx` | KV rows GPU 0 must still be able to take before it gives up a slab |
+| `STRATA_DS_PROF` | unset | print `inkling2: preloaded N/24 ...` and the per-chunk profile |
+| `STRATA_DS_NO_AFFINITY` | unset | pick the GPU per expert instead of per stacked tensor |
+| `STRATA_DS_NO_SEG_GRAPH` | unset | do not capture the segmented decode graph |
+| `STRATA_CTRL_TILE` | follows `FAST_KERNELS` | `0` forces the per-token controllers |
+| `STRATA_DS_ATTN_OLD` | off | `1` keeps the scalar decode and one-query-a-warp prefill |
+| `STRATA_DS_ATTN_KP4` | off | `1` selects the four-query 128-key prefill for the A/B |
+
+`STRATA_INKLING2_MODEL` (path to the GGUF) only selects the model for `tests/inkling2_forward.rs`.
+
 ## Page cache
 
 Experts that do not fit in VRAM are read from the GGUF through the page cache. A file system that keeps file data out

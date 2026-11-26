@@ -1428,16 +1428,25 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Perplexity { model, file, ctx_len: n, chunks, kld_base, mut engine } => {
             let g = Gguf::open(&model)?;
-            let aux_g = open_mtp_gguf(engine.aux_model_path())?;
-            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             // ponytail: no BOS at chunk starts (llama-perplexity adds one where the vocabulary asks for it; Qwen does not)
             let ids = tok.encode(&std::fs::read_to_string(&file)?)?;
             let n_chunk = (ids.len() / n).min(chunks.unwrap_or(usize::MAX));
             anyhow::ensure!(n >= 4 && n_chunk > 0, "{} tokens: need at least one chunk of --ctx-len {n} (>= 4)", ids.len());
             engine.ctx = engine.ctx.max(n);
-            let mut r = engine.runner(&m, &model)?;
-            let nv = m.cfg.n_vocab;
+            // Inkling 2 runs its own forward (`Model` does not load that architecture); it scores the same way, so
+            // `--kld-base` compares it with another build the same as it compares llama.cpp with the others.
+            let mut ink = if g.get("general.architecture").ok().and_then(|v| v.as_str()).is_some_and(rusting_strata::inkling2::is_arch) {
+                rusting_strata::inkling2::chat::gpu_defaults();
+                engine.ds_env();
+                Some(rusting_strata::inkling2::forward::Inkling2Model::new_with_ctx(&g, n)?)
+            } else {
+                None
+            };
+            let aux_g = if ink.is_none() { open_mtp_gguf(engine.aux_model_path())? } else { None };
+            let m = if ink.is_none() { Some(Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?) } else { None };
+            let mut r = match &m { Some(m) => Some(engine.runner(m, &model)?), None => None };
+            let nv = match (&ink, &m) { (Some(im), _) => im.cfg.n_vocab, (_, Some(m)) => m.cfg.n_vocab, _ => unreachable!() };
             let mut out = kld_base.map(|p| std::fs::File::create(p).map(std::io::BufWriter::new)).transpose()?;
             if let Some(o) = &mut out {
                 o.write_all(b"_logits_")?;
@@ -1447,10 +1456,19 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let (mut nll, mut count, mut row) = (0f64, 0usize, Vec::new());
             let first = n / 2;
             for c in ids.chunks_exact(n).take(n_chunk) {
-                r.reset()?;
-                let mut logits = r.prefill(&c[..=first])?;
+                let mut logits = match (&mut ink, &mut r) {
+                    (Some(im), _) => { im.reset(); im.prefill(&c[..=first]) }
+                    (_, Some(run)) => { run.reset()?; run.prefill(&c[..=first])? }
+                    _ => unreachable!(),
+                };
                 for i in first..n - 1 {
-                    if i > first { logits = r.step(c[i])?; }
+                    if i > first {
+                        logits = match (&mut ink, &mut r) {
+                            (Some(im), _) => im.step(c[i]),
+                            (_, Some(run)) => run.step(c[i])?,
+                            _ => unreachable!(),
+                        };
+                    }
                     anyhow::ensure!(logits.len() == nv, "{} logits, vocabulary {nv}", logits.len());
                     nll += log_probs(&logits, c[i + 1], &mut row);
                     if let Some(o) = &mut out { for v in &row { o.write_all(&v.to_le_bytes())?; } }
@@ -1460,7 +1478,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             if let Some(o) = &mut out { o.flush()?; }
             println!("\nPPL = {:.4} over {n_chunk} chunks of {n} tokens ({count} scored)", (nll / count as f64).exp());
-            r.finish()?;
+            if let Some(run) = &mut r { run.finish()?; }
         }
         Cmd::Bench { model, pp, tg, reps, json_out, prompt_file, mut engine } => {
             if let Some(f) = &prompt_file {
@@ -2275,7 +2293,9 @@ fn gemma_bench_chunk(v: Option<&str>) -> usize {
 
 /// `strata bench` for Inkling 2 (uses GPU argmax decode, plus `--draft-model` DSpark / `--spec-type` context lookup).
 fn bench_inkling2(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {
-    rusting_strata::deepseek::chat::gpu_defaults();
+    // The same defaults `chat`, `generate` and `serve` set: without them the plain weights spread over both cards,
+    // `Device::new` refuses the second one and the whole benchmark runs the host path (about a fifth of the speed).
+    rusting_strata::inkling2::chat::gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
     let max_ctx = engine.ctx.max(pp.iter().copied().max().unwrap_or(0) + tg + 64);
     let opts = rusting_strata::inkling2::chat::Inkling2Opts {

@@ -17,17 +17,56 @@ pub(crate) const QTYPES: [GgmlType; 29] = {
     use GgmlType::*;
     [F32, BF16, F8E4M3, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_1, Q5_1, Q4_0, Q5_0, NVFP4]
 };
-pub(crate) const KERNELS: [&str; 61] = [
+pub(crate) const KERNELS: [&str; 67] = [
     "rope_freq", "rope_cs", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "situ_q", "softcap", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "ha_post", "ha_wait", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "dflash2_conv", "hadamard",
-    "ink_mix", "ink_ctrl_gate", "ink_ctrl_out", "ink_conv", "ink_conv_batch", "ink_clip", "ink_attn", "ink_attn_merge",
-    "ink_attn_prefill_32", "ink_attn_prefill_64", "ink_attn_prefill_128", "ink_attn_prefill_sh_32", "ink_attn_prefill_sh_64", "ink_attn_prefill_sh_128", "ink_ffn_sum", "ink_route", "attn_sel",
+    "ink_mix", "ink_ctrl_gate", "ink_ctrl_out", "ink_ctrl_gate_b", "ink_ctrl_out_b", "ink_conv", "ink_conv_batch", "ink_clip", "ink_attn", "ink_attn_128", "ink_attn_merge",
+    "ink_attn_prefill_32", "ink_attn_prefill_64", "ink_attn_prefill_128", "ink_attn_prefill_128_old", "ink_attn_prefill_128_kp", "ink_attn_prefill_128_kp16", "ink_attn_prefill_sh_32", "ink_attn_prefill_sh_64", "ink_attn_prefill_sh_128", "ink_ffn_sum", "ink_route", "attn_sel",
 ];
 
 pub use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
 use crate::backend::ATT_SPLITS_1;
+
+/// Kernel-choice flags read from the environment once, when the `Gpu` is made: they sit on the token path, so a
+/// lookup per launch is not worth it.
+#[derive(Clone, Copy)]
+struct InkFlags {
+    /// `STRATA_DS_FAST_KERNELS=auto` (default) uses the tiled controllers, `ink_attn_128` and `kp16` only when
+    /// the run has more than one device; `1` forces them on, `0` forces the old kernels. One card keeps the
+    /// `main` kernels (the greedy output must not change).
+    fast: bool,
+    /// `STRATA_CTRL_TILE=0` forces the per-token `ink_ctrl_*` pair; unset follows `fast`.
+    ctrl_tile: bool,
+    /// `STRATA_DS_ATTN_OLD=1` keeps the scalar/one-query-a-warp attention kernels for a measurement window.
+    attn_old: bool,
+    /// `STRATA_DS_ATTN_KP4=1` selects the four-query 128-key tile prefill kernel.
+    attn_kp4: bool,
+}
+
+impl InkFlags {
+    fn from_parts(fast: Option<&str>, multi: bool, ctrl: Option<&str>, attn_old: Option<&str>, attn_kp4: Option<&str>) -> Self {
+        let on = |v: Option<&str>, default: bool| v.map_or(default, |v| v != "0");
+        let fast = match fast {
+            None | Some("auto") => multi,
+            Some("0") => false,
+            Some(_) => true,
+        };
+        Self { fast, ctrl_tile: on(ctrl, fast), attn_old: on(attn_old, false), attn_kp4: on(attn_kp4, false) }
+    }
+    fn from_env() -> Self {
+        let multi = std::env::var("STRATA_DS_DEVICES")
+            .map_or(false, |v| v.split(',').filter(|d| !d.trim().is_empty()).count() > 1);
+        Self::from_parts(
+            std::env::var("STRATA_DS_FAST_KERNELS").ok().as_deref(),
+            multi,
+            std::env::var("STRATA_CTRL_TILE").ok().as_deref(),
+            std::env::var("STRATA_DS_ATTN_OLD").ok().as_deref(),
+            std::env::var("STRATA_DS_ATTN_KP4").ok().as_deref(),
+        )
+    }
+}
 
 pub struct Gpu {
     pub ctx: Arc<CudaContext>,
@@ -47,6 +86,8 @@ pub struct Gpu {
     gd: std::sync::OnceLock<CudaSlice<u8>>,
     /// The kernels were compiled for KV cache mode (0 = f16, 1 = q8, 2 = q4).
     pub kv_mode: u32,
+    /// The environment's kernel-choice flags, read once at creation.
+    flags: InkFlags,
     /// The GPU has int8 tensor-core mma (sm_80+). Turing runs the prefill GEMM on the f16 path instead.
     pub int8_mma: bool,
     /// sm_75: m16n8k8 mma, 64 KB of shared memory a block (no int8 mma, unlike sm_80+; unlike sm_70 it has no m8n8k4).
@@ -547,7 +588,7 @@ impl Gpu {
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = ctx.new_event(None)?;
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, gd: Default::default(), kv_mode, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default(), cs: Default::default() })
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, gd: Default::default(), kv_mode, flags: InkFlags::from_env(), int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default(), cs: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -808,6 +849,16 @@ impl Gpu {
     }
 }
 
+impl Gpu {
+    /// The decode attention entry point and its key positions per block: the f16 head_dim 128 kernel scores a
+    /// 128-key tile a block, the scalar one 64 keys (`STRATA_DS_ATTN_OLD=1` keeps it for a measurement window;
+    /// the flag is cached in `flags` at `Gpu` creation). The 128-key kernel keeps the relative-bias row in 32
+    /// shared floats, so a wider `nr` uses the scalar kernel.
+    pub(crate) fn ink_attn_kernel(&self, hd: usize, nr: usize) -> (&'static str, usize) {
+        if hd == 128 && nr <= 32 && self.kv_mode == 0 && self.flags.fast && !self.flags.attn_old { ("ink_attn_128", 128) } else { ("ink_attn", 64) }
+    }
+}
+
 impl Backend for Gpu {
     fn name(&self) -> &'static str { "cuda" }
     fn device(&self) -> String { self.ctx.name().unwrap_or_default() }
@@ -826,6 +877,7 @@ impl Backend for Gpu {
             q8,
             gd: Default::default(),
             kv_mode: self.kv_mode,
+            flags: self.flags,
             int8_mma: self.int8_mma,
             turing: self.turing,
             max_smem: self.max_smem,
@@ -1214,6 +1266,18 @@ impl Backend for Gpu {
         Ok(())
     }
     fn ink_ctrl_n(&self, down: u64, gain: u64, forget: u64, cur: u64, nins: usize, msg: u64, gate: u64, out: u64, n: usize, rank: usize, count: usize, nt: usize) -> anyhow::Result<()> {
+        // A prompt chunk uses the tiled pair (a weight row is read once per 64 tokens); a decoded token the
+        // per-token pair, which has no tile to reuse. Both pairs read and write the same gate layout.
+        // STRATA_CTRL_TILE=0 forces the per-token pair, to compare the two on the same text (the flag is cached
+        // in `flags` at `Gpu` creation).
+        let tiled = nt >= 64 && rank <= 64 && n % 64 == 0 && self.flags.ctrl_tile;
+        if tiled {
+            let g1 = cfg((count as u32, nt.div_ceil(64) as u32), 256, 0);
+            let g2 = LaunchConfig { grid_dim: (count as u32, n.div_ceil(64) as u32, nt.div_ceil(64) as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            launch!(self, "ink_ctrl_gate_b", g1, down, cur, nins as i32, msg, gate, n as i32, rank as i32, nt as i32);
+            launch!(self, "ink_ctrl_out_b", g2, gain, forget, gate, cur, nins as i32, msg, out, n as i32, rank as i32, nt as i32);
+            return Ok(());
+        }
         let g1 = LaunchConfig { grid_dim: (rank as u32, count as u32, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
         let g2 = LaunchConfig { grid_dim: (n.div_ceil(256) as u32, count as u32, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
         launch!(self, "ink_ctrl_gate", g1, down, cur, nins as i32, msg, gate, n as i32, rank as i32, nt as i32);
@@ -1238,7 +1302,7 @@ impl Backend for Gpu {
         pos0: usize, log_alpha: f32, log_floor: f32,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(w <= 128, "ink_clip_n: w={w} > 128");
-        anyhow::ensure!(kv_mode() == 0 || dst == 0 || w % 32 == 0, "ink_clip_n: quantized KV requires w % 32 == 0 (got {w})");
+        anyhow::ensure!(self.kv_mode == 0 || dst == 0 || w % 32 == 0, "ink_clip_n: quantized KV requires w % 32 == 0 (got {w})");
         let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
         let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
         launch!(self, "ink_clip", cfg((rows as u32, nt as u32), 128, 0),
@@ -1252,7 +1316,7 @@ impl Backend for Gpu {
         pos_ptr: u64, log_alpha: f32, log_floor: f32,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(w <= 128, "ink_clip_pos: w={w} > 128");
-        anyhow::ensure!(kv_mode() == 0 || dst == 0 || w % 32 == 0, "ink_clip_pos: quantized KV requires w % 32 == 0 (got {w})");
+        anyhow::ensure!(self.kv_mode == 0 || dst == 0 || w % 32 == 0, "ink_clip_pos: quantized KV requires w % 32 == 0 (got {w})");
         let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
         let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
         launch!(self, "ink_clip", cfg((rows as u32, nt as u32), 128, 0),
@@ -1260,14 +1324,16 @@ impl Backend for Gpu {
         Ok(())
     }
     fn ink_attn(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, rows: usize, at: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
-        let chunks = rows.div_ceil(64) as u32;
-        launch!(self, "ink_attn", cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, rows as i32, at as i32, 1i32, nkv as i32, hd as i32, nr as i32, ext as i32, 0u64);
+        let (kn, ck) = self.ink_attn_kernel(hd, nr);
+        let chunks = rows.div_ceil(ck) as u32;
+        launch!(self, kn, cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, rows as i32, at as i32, 1i32, nkv as i32, hd as i32, nr as i32, ext as i32, 0u64);
         launch!(self, "ink_attn_merge", cfg((nh as u32, 1), 128, 0), sc, gate, out, chunks as i32, hd as i32);
         Ok(())
     }
     fn ink_attn_pos(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, max_rows: usize, ring: usize, pos_ptr: u64, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
-        let chunks = max_rows.div_ceil(64) as u32;
-        launch!(self, "ink_attn", cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, 0i32, 0i32, ring.max(1) as i32, nkv as i32, hd as i32, nr as i32, ext as i32, pos_ptr);
+        let (kn, ck) = self.ink_attn_kernel(hd, nr);
+        let chunks = max_rows.div_ceil(ck) as u32;
+        launch!(self, kn, cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, 0i32, 0i32, ring.max(1) as i32, nkv as i32, hd as i32, nr as i32, ext as i32, pos_ptr);
         launch!(self, "ink_attn_merge", cfg((nh as u32, 1), 128, 0), sc, gate, out, chunks as i32, hd as i32);
         Ok(())
     }
@@ -1277,7 +1343,18 @@ impl Backend for Gpu {
     ) -> anyhow::Result<()> {
         anyhow::ensure!(matches!(hd, 32 | 64 | 128), "ink_attn_prefill: unsupported hd={hd}");
         let g = nh / nkv.max(1);
-        if win == 0 && nkv > 0 && nh % nkv == 0 && g <= 4 {
+        if hd == 128 && self.kv_mode == 0 && (self.flags.fast || self.flags.attn_kp4) && !self.flags.attn_old {
+            // The key-parallel kernels: kp16 (16 queries a block) by default, kp (4) for the A/B. The wrapper
+            // falls back to the four-query template for a relative-bias width it cannot read as float4.
+            let (kn, qb) = if self.flags.attn_kp4 { ("ink_attn_prefill_128_kp", 4) } else { ("ink_attn_prefill_128_kp16", 16) };
+            launch!(self, kn, cfg((nt.div_ceil(qb) as u32, nh as u32), 128, 0),
+                q, r, sink, gate, kc, vc, kc_new, vc_new, bias, out,
+                pos as i32, nt as i32, nh as i32, nkv as i32, nr as i32, ext as i32, ring.max(1) as i32, win as i32);
+        } else if hd == 128 && self.flags.attn_old {
+            launch!(self, "ink_attn_prefill_128_old", cfg((nt.div_ceil(4) as u32, nh as u32), 128, 0),
+                q, r, sink, gate, kc, vc, kc_new, vc_new, bias, out,
+                pos as i32, nt as i32, nh as i32, nkv as i32, nr as i32, ext as i32, ring.max(1) as i32, win as i32);
+        } else if win == 0 && nkv > 0 && nh % nkv == 0 && g <= 4 {
             // Every key: a block is one K/V head and `tb` tokens, with 32 keys of K and V in shared memory.
             let tb = (32 / g).min(8);
             launch!(self, &format!("ink_attn_prefill_sh_{hd}"), cfg((nt.div_ceil(tb) as u32, nkv as u32), (32 * tb * g) as u32, (2 * 32 * hd * 4) as u32),
@@ -1643,12 +1720,12 @@ mod tests {
     }
 
     /// M1-T5, CPU-only: the loaded name list drops `gemmi_*`/`gemmis_*` only on a device where kernels.cu compiles
-    /// them out. 400 names today (sm_80); 23 non-float types x 3 fewer names = 331 on sm_70.
+    /// them out. 406 names today (sm_80); 23 non-float types x 3 fewer names = 337 on sm_70.
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 400);
-        assert_eq!(sm70.len(), 331);
+        assert_eq!(sm80.len(), 406);
+        assert_eq!(sm70.len(), 337);
         assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmd")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());
@@ -1824,5 +1901,27 @@ mod tests {
             "cuda shared memory: opt-in 98304 B per block, attn_prefill_*: 0 B static, dynamic max 72704 B, carveout 82%");
         assert_eq!(super::smem_log("attn_decode_*", 98304, 2112, None, None),
             "cuda shared memory: opt-in 98304 B per block, attn_decode_*: 2112 B static, dynamic max default (48 KiB), carveout default");
+    }
+
+    /// `STRATA_CTRL_TILE` is read as text: unset or any value but "0" keeps the tiled `ink_ctrl_*` pair. The
+    /// attention flags are plain presence checks and must pass through unchanged.
+    #[test]
+    fn ink_flags_parse_ctrl_tile() {
+        // One card: the default is the old kernels (greedy output must match main).
+        let one = super::InkFlags::from_parts(None, false, None, None, None);
+        assert!(!one.fast && !one.ctrl_tile && !one.attn_old && !one.attn_kp4);
+        // Two cards: `auto` turns the fast kernels on.
+        let two = super::InkFlags::from_parts(None, true, None, None, None);
+        assert!(two.fast && two.ctrl_tile && !two.attn_old && !two.attn_kp4);
+        // Explicit opt-in/opt-out and per-kernel overrides.
+        assert!(super::InkFlags::from_parts(Some("1"), false, None, None, None).fast);
+        assert!(!super::InkFlags::from_parts(Some("0"), true, None, None, None).fast);
+        assert!(!super::InkFlags::from_parts(None, true, Some("0"), None, None).ctrl_tile);
+        let old = super::InkFlags::from_parts(None, true, None, Some("1"), None);
+        assert!(old.attn_old && !old.attn_kp4);
+        let kp4 = super::InkFlags::from_parts(None, true, None, None, Some("1"));
+        assert!(kp4.attn_kp4 && !kp4.attn_old);
+        let off = super::InkFlags::from_parts(None, true, Some("0"), Some("0"), Some("0"));
+        assert!(!off.ctrl_tile && !off.attn_old && !off.attn_kp4);
     }
 }

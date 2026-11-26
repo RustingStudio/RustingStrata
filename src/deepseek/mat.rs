@@ -21,14 +21,14 @@ pub(crate) mod dev {
     const SHIFT: u32 = 24;
     pub fn gpu_of(id: u32) -> usize { (id >> SHIFT) as usize }
     pub(crate) struct Part { pub(crate) be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, stage: Buf, bytes: usize, pub(crate) budget: usize, room: usize }
-    pub struct SlabBuf { buf: Buf, bytes: usize, freed: std::sync::Arc<std::sync::atomic::AtomicUsize> }
+    pub struct SlabBuf { buf: Buf, bytes: usize, acct: usize, freed: std::sync::Arc<std::sync::atomic::AtomicUsize> }
     impl SlabBuf {
         pub fn addr(&self) -> u64 { self.buf.addr() }
         pub fn len(&self) -> usize { self.bytes }
     }
     impl Drop for SlabBuf {
         fn drop(&mut self) {
-            self.freed.fetch_add(self.bytes, std::sync::atomic::Ordering::Relaxed);
+            self.freed.fetch_add(self.acct, std::sync::atomic::Ordering::Relaxed);
         }
     }
     #[derive(Default)]
@@ -42,6 +42,11 @@ pub(crate) mod dev {
         now: u64,
         cur: usize,
         lookups: u64,
+        /// Local patch (multi-GPU): the stacked expert tensor (base address, bytes) of the expert being looked up.
+        group: Option<(usize, usize)>,
+        /// Local patch: stacked expert tensor base address -> GPU that holds all of its experts; bytes promised per GPU.
+        aff: std::collections::HashMap<usize, usize>,
+        aff_bytes: Vec<usize>,
     }
     static DEV: LazyLock<Mutex<Dev>> = LazyLock::new(Default::default);
     /// Whether `DEV` is open: None before the first `get` and after `free`.
@@ -68,11 +73,43 @@ pub(crate) mod dev {
         let f: Vec<f64> = v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
         match f[..] { [small, large] => if free < 8 << 30 { small } else { large }, [v] => v, _ => 0.8 }
     }
+    /// Free VRAM GPU 0 keeps after the plain weights for the decode state, the KV growth and the prefill scratch.
+    /// Those buffers are allocated outside the weight budget, so the reserve is checked against live free VRAM.
+    const STATE_RESERVE: usize = 768 << 20;
+    /// Whether `len` more plain-weight bytes fit GPU 0's budget and still leave `STATE_RESERVE` free there.
+    fn plain_first_fits(bytes: usize, len: usize, budget: usize, free: usize) -> bool {
+        bytes.saturating_add(len) <= budget && free >= len.saturating_add(STATE_RESERVE)
+    }
+    fn plain_first_enabled_from(v: Option<&str>) -> bool { v.is_some_and(|v| v != "0") }
+    fn plain_first_enabled() -> bool { plain_first_enabled_from(std::env::var("STRATA_DS_PLAIN_FIRST").ok().as_deref()) }
     #[test]
     fn gpu_fraction_takes_one_value_or_a_pair() {
         let gb = |n: usize| n << 30;
         assert_eq!([gpu_fraction("", gb(4)), gpu_fraction("0.9", gb(4)), gpu_fraction("x", gb(4))], [0.8, 0.9, 0.8]);
         assert_eq!([gpu_fraction("0.6,0.9", gb(4)), gpu_fraction("0.6, 0.9", gb(11))], [0.6, 0.9]);
+    }
+    #[test]
+    fn plain_first_reserves_the_state() {
+        let budget = 1 << 30;
+        assert!(plain_first_fits(0, 100, budget, 100 + STATE_RESERVE));
+        assert!(!plain_first_fits(0, 100, budget, 100 + STATE_RESERVE - 1)); // free VRAM too low
+        assert!(!plain_first_fits(budget, 100, budget, 1 << 40));            // budget full
+    }
+    #[test]
+    fn plain_first_env_zero_is_off() {
+        assert!(!plain_first_enabled_from(None));
+        assert!(!plain_first_enabled_from(Some("0")));
+        assert!(plain_first_enabled_from(Some("1")));
+    }
+    #[test]
+    fn expert_group_is_consumed_on_a_cache_hit() {
+        let mut d = Dev::default();
+        let data = vec![0u8; 8];
+        let k = data.as_ptr() as usize;
+        d.ex.insert(k, 0);
+        d.exs.push((0, k, 1, 1.0));
+        assert_eq!(d.expert_grouped((0x1000, 64), &data, GgmlType::F32, 0, 0, 1.0, false), Some(0));
+        assert!(d.group.is_none());
     }
     fn open() -> Option<Dev> {
         // Unset or 0: every matvec runs on the CPU.
@@ -135,20 +172,22 @@ pub(crate) mod dev {
                 p.budget.saturating_sub(b)
             }).sum()
         }
-        /// Allocates and uploads a contiguous buffer inside GPU 0 when both `p.budget` and live `mem_info()` keep the
-        /// given byte reserves free. Static mmap slices with `cache_key` deduplicate across multiple model instances.
-        pub fn alloc_slab(&mut self, data: &[u8], cache_key: Option<(usize, usize)>, budget_reserve: usize, free_reserve: usize) -> Option<std::sync::Arc<SlabBuf>> {
+        /// Allocates and uploads a contiguous buffer on GPU `d` when both `p.budget` and live `mem_info()` keep the given byte
+        /// reserves free; static mmap slices with `cache_key` deduplicate across model instances. A slab on a GPU other than 0 is checked against
+        /// the live free VRAM only, and stays out of the expert budget bookkeeping (which `freed` tracks for GPU 0).
+        pub fn alloc_slab_on(&mut self, d: usize, data: &[u8], cache_key: Option<(usize, usize)>, budget_reserve: usize, free_reserve: usize) -> Option<std::sync::Arc<SlabBuf>> {
             self.reclaim();
+            let cache_key = cache_key.map(|k| (k.0, k.1 | d << 60));
             if let Some(k) = cache_key && let Some(hit) = self.slabs.get(&k).and_then(std::sync::Weak::upgrade) {
                 return Some(hit);
             }
-            let p = self.parts.first_mut()?;
-            if p.bytes + data.len() + budget_reserve > p.budget { return None; }
+            let p = self.parts.get_mut(d)?;
+            if d == 0 && p.bytes + data.len() + budget_reserve > p.budget { return None; }
             if let Ok((free, _)) = p.be.mem_info() && free < data.len() + free_reserve { return None; }
             let b = p.be.alloc(data.len()).ok()?;
             if p.be.htod(data, &b, 0).is_err() { return None; }
-            p.bytes += data.len();
-            let arc = std::sync::Arc::new(SlabBuf { buf: b, bytes: data.len(), freed: self.freed.clone() });
+            if d == 0 { p.bytes += data.len(); }
+            let arc = std::sync::Arc::new(SlabBuf { buf: b, bytes: data.len(), acct: if d == 0 { data.len() } else { 0 }, freed: self.freed.clone() });
             if let Some(k) = cache_key {
                 self.slabs.retain(|_, v| v.strong_count() > 0);
                 self.slabs.insert(k, std::sync::Arc::downgrade(&arc));
@@ -158,6 +197,14 @@ pub(crate) mod dev {
         /// The GPU that takes `len` more bytes of plain weights: the current one while they fit, then the next; the last takes all.
         pub fn pick(&mut self, len: usize) -> usize {
             self.reclaim();
+            // Local patch (Inkling 2 on several GPUs): the decode state lives on GPU 0 and reads the plain weights
+            // there, so they stay on GPU 0 while the budget has room and the live free VRAM keeps the state reserve.
+            // The state, KV and prefill scratch are allocated outside the budget; `room` alone would move the plain
+            // weights to GPU 1 (it is ~0.4 GB at 0.9), which is what this branch avoids.
+            if self.parts.len() > 1 && self.cur == 0 && plain_first_enabled() {
+                let free = self.parts[0].be.mem_info().map_or(usize::MAX, |m| m.0);
+                if plain_first_fits(self.parts[0].bytes, len, self.parts[0].budget, free) { return 0; }
+            }
             while self.cur + 1 < self.parts.len() && self.parts[self.cur].bytes + len > self.parts[self.cur].room { self.cur += 1; }
             self.cur
         }
@@ -209,7 +256,27 @@ pub(crate) mod dev {
         /// `evict` false: a miss with no free room returns None, so the caller can run that expert on the CPU.
         /// Whether the expert that starts at `data` has a VRAM slot (no lookup is counted).
         pub fn resident(&self, data: &[u8]) -> bool { self.ex.contains_key(&(data.as_ptr() as usize)) }
+        /// The GPU that holds the experts of the stacked tensor at `base` (`len` bytes): picked on first sight as the
+        /// GPU with the smallest share of its expert budget already promised. None with one GPU or
+        /// STRATA_DS_NO_AFFINITY set (the old per-expert choice).
+        fn affinity(&mut self, base: usize, len: usize) -> Option<usize> {
+            let n = self.parts.len();
+            if n < 2 || std::env::var_os("STRATA_DS_NO_AFFINITY").is_some() { return None; }
+            if let Some(&d) = self.aff.get(&base) { return Some(d); }
+            if self.aff_bytes.len() != n { self.aff_bytes = vec![0; n]; }
+            let frac = |d: usize| self.aff_bytes[d] as f64 / self.parts[d].budget.max(1) as f64;
+            let d = (0..n).min_by(|&a, &b| frac(a).total_cmp(&frac(b)))?;
+            self.aff_bytes[d] += len;
+            self.aff.insert(base, d);
+            Some(d)
+        }
+        /// `expert` for an expert that belongs to the stacked tensor (`base`, `len`): see `affinity`.
+        pub fn expert_grouped(&mut self, group: (usize, usize), data: &[u8], ty: GgmlType, rows: usize, cols: usize, scale: f32, evict: bool) -> Option<u32> {
+            self.group = Some(group);
+            self.expert(data, ty, rows, cols, scale, evict)
+        }
         pub fn expert(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize, scale: f32, evict: bool) -> Option<u32> {
+            let group = self.group.take();
             self.reclaim();
             let k = data.as_ptr() as usize;
             self.now += 1;
@@ -223,8 +290,14 @@ pub(crate) mod dev {
                 return Some(self.exs[p].0);
             }
             EX_LOOKUPS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Local patch: all experts of one stacked tensor (a layer's gate_up or down) go to the same GPU, so a
+            // layer's matvecs hit `batch_mats`' single-GPU path instead of two sequential batches with two readbacks.
+            // The GPU with the most free budget used to win per expert, which spread every layer over both cards.
+            let pref = group.and_then(|(base, len)| self.affinity(base, len));
             let room = |p: &Part| (p.bytes + data.len() <= p.budget).then(|| p.budget - p.bytes);
-            if let Some(d) = (0..self.parts.len()).filter_map(|d| room(&self.parts[d]).map(|r| (r, d))).max().map(|(_, d)| d) {
+            let pick = pref.filter(|&d| room(&self.parts[d]).is_some())
+                .or_else(|| (0..self.parts.len()).filter_map(|d| room(&self.parts[d]).map(|r| (r, d))).max().map(|(_, d)| d));
+            if let Some(d) = pick {
                 let i = self.upload_on(d, data, ty, rows, cols, scale)?;
                 self.ex.insert(k, self.exs.len());
                 self.exs.push((i, k, now, 1.0));
@@ -362,6 +435,8 @@ pub(crate) mod dev {
             drop(owned);
             Some(y)
         }
+        /// Whether `m` lives in VRAM of the first GPU (a staged matrix is copied up to it per use).
+        pub fn on_first(&self, m: &Mat) -> bool { self.part_of(m) == Some(0) }
         fn part_of(&self, m: &Mat) -> Option<usize> {
             let i = m.gpu?;
             Some(if i == STAGED { 0 } else { gpu_of(i) })
@@ -900,8 +975,15 @@ impl<'a> Mat<'a> {
     /// `expert` that never overwrites a VRAM slot when `evict` is false: an expert that is not resident and has no
     /// free room comes back host-only, for the CPU.
     pub fn expert_opt(&self, e: usize, n_expert: usize, evict: bool) -> Mat<'a> {
+        self.expert_opt_in(e, n_expert, evict, self, 0)
+    }
+
+    /// `expert_opt` where the GPU is chosen per `key` (a layer's gate_up tensor) instead of per tensor, so the gate_up
+    /// and down experts of a layer share a GPU: `extra` is the bytes of the other tensors of the group.
+    pub fn expert_opt_in(&self, e: usize, n_expert: usize, evict: bool, key: &Mat<'a>, extra: usize) -> Mat<'a> {
         let mut m = self.expert_host(e, n_expert);
-        m.gpu = dev::get().and_then(|d| d.lock().unwrap().expert(m.data, m.ty, m.rows, m.cols, m.scale, evict));
+        let group = (key.data.as_ptr() as usize, key.data.len() + extra);
+        m.gpu = dev::get().and_then(|d| d.lock().unwrap().expert_grouped(group, m.data, m.ty, m.rows, m.cols, m.scale, evict));
         m
     }
 
