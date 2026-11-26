@@ -38,6 +38,10 @@ fn names(windows: bool, forced: Option<PathBuf>, cuda_path: Option<PathBuf>) -> 
         if let Some(root) = cuda_path {
             for dir in ["bin", "bin/x64"] { for dll in DLLS { v.push(root.join(dir).join(dll)); } }
         }
+    } else {
+        // `libnvrtc.so` comes only with the -dev package; a runtime-only install has the versioned name, and some
+        // toolkits ship only the `.alt` build (same API, issue 41).
+        for n in ["libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.alt.so.13", "libnvrtc.alt.so.12", "libnvrtc.alt.so"] { v.push(n.into()); }
     }
     v
 }
@@ -138,7 +142,9 @@ mod tests {
         for want in ["nvrtc64_120_0.dll", "nvrtc64_130_0.dll", "C:/cuda/bin/nvrtc64_120_0.dll", "C:/cuda/bin/x64/nvrtc64_130_0.dll"] {
             assert!(v.contains(&PathBuf::from(want)), "{want} missing from {v:?}");
         }
-        assert!(!names(false, None, Some(PathBuf::from("/opt/cuda"))).iter().any(|p| p.to_string_lossy().contains("120_0")));
+        let linux = names(false, None, Some(PathBuf::from("/opt/cuda")));
+        assert!(!linux.iter().any(|p| p.to_string_lossy().contains("120_0")));
+        for want in ["libnvrtc.so.13", "libnvrtc.alt.so"] { assert!(linux.contains(&PathBuf::from(want)), "{want} missing"); }
         assert_eq!(names(true, Some(PathBuf::from("x.dll")), None), [PathBuf::from("x.dll")]);
     }
 }
