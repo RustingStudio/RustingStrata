@@ -341,6 +341,27 @@ pub(crate) mod dev {
             drop(owned);
             Some(y)
         }
+        /// Routed experts with separate gate/up/down matrices in one GPU round trip using `Backend::situ` on device.
+        pub fn situ_experts_split(&self, gs: &[Mat], us: &[Mat], downs: &[Mat], x: &[f32], beta: f32, lb: f32) -> Option<Vec<f32>> {
+            let d = self.part_of(gs.first()?)?;
+            if gs.len() != us.len() || gs.len() != downs.len() { return None; }
+            if gs.iter().chain(us).chain(downs).any(|m| self.part_of(m) != Some(d)) { return None; }
+            let (p, ne, nf, nl) = (&self.parts[d], gs.len(), downs[0].cols, downs[0].rows);
+            if x.len() > p.x.len() / 4 || ne * (2 * nf + nl) > p.y.len() / 4 { return None; }
+            p.be.put(x, &p.x, 0).ok()?;
+            let ((owned, ts), at) = (self.tensors(p, &[gs, us, downs])?, |i: usize| p.y.addr() + (4 * i) as u64);
+            for i in 0..ne {
+                p.be.gemv(&ts[i], p.x.addr(), at(i * 2 * nf)).ok()?;
+                p.be.gemv(&ts[ne + i], p.x.addr(), at(i * 2 * nf + nf)).ok()?;
+            }
+            p.be.situ(p.y.addr(), nf, ne, 0, beta, lb).ok()?;
+            for i in 0..ne {
+                p.be.gemv(&ts[2 * ne + i], at(i * 2 * nf), at(ne * 2 * nf + i * nl)).ok()?;
+            }
+            let y = p.be.get(&p.y, ne * 2 * nf, ne * nl).ok()?;
+            drop(owned);
+            Some(y)
+        }
         fn part_of(&self, m: &Mat) -> Option<usize> {
             let i = m.gpu?;
             Some(if i == STAGED { 0 } else { gpu_of(i) })
@@ -577,7 +598,47 @@ pub(crate) mod dev {
 /// `Mat::matvec`.
 pub fn matvec_many(ms: &[Mat], x: &[f32], xs: usize) -> Vec<f32> {
     if let Some(y) = matvec_many_opt(ms, x, xs) { return y; }
+    if xs > 0 && ms.len() > 1 {
+        let slices: Vec<&[f32]> = (0..ms.len()).map(|i| &x[i * xs..i * xs + ms[i].cols]).collect();
+        if let Some(y) = matvec_many_cpu(ms, &slices) { return y; }
+    }
     let mut y = vec![0f32; ms.iter().map(|m| m.rows).sum()];
+    if xs == 0 && ms.len() > 1 && std::env::var_os("STRATA_CPU_REF").is_none() {
+        let mut int_ms: Vec<(usize, usize, Mat, usize, fn(&[u8], &[crate::cpu_moe::Q8K]) -> f32)> = Vec::new();
+        let mut other: Vec<(usize, Mat)> = Vec::new();
+        let (mut off, mut int_total) = (0, 0);
+        for &m in ms {
+            if m.gpu.is_none() && m.cols == x.len() && (m.cpu || m.rows >= 512) && m.cols % m.ty.block_elems() == 0
+                && let Some(dot) = crate::cpu_moe::int_dot(m.ty)
+            {
+                let rb = m.ty.row_bytes(m.cols as u64);
+                int_ms.push((int_total, off, m, rb, dot));
+                int_total += m.rows;
+            } else {
+                other.push((off, m));
+            }
+            off += m.rows;
+        }
+        if int_ms.len() > 1 {
+            let xq = crate::cpu_moe::quantize_q8k(x);
+            let mut tmp = vec![0f32; int_total];
+            tmp.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
+                for (k, o) in ys.iter_mut().enumerate() {
+                    let r = c * 32 + k;
+                    let i = int_ms.partition_point(|(s, ..)| *s <= r) - 1;
+                    let (s, _, m, rb, dot) = int_ms[i];
+                    *o = dot(&m.data[(r - s) * rb..(r - s + 1) * rb], &xq) * m.scale;
+                }
+            });
+            for (s, dst_off, m, ..) in &int_ms {
+                y[*dst_off..*dst_off + m.rows].copy_from_slice(&tmp[*s..*s + m.rows]);
+            }
+            for (dst_off, m) in other {
+                m.matvec(x, &mut y[dst_off..dst_off + m.rows]);
+            }
+            return y;
+        }
+    }
     let mut off = 0;
     for (i, m) in ms.iter().enumerate() {
         m.matvec(&x[i * xs..i * xs + m.cols], &mut y[off..off + m.rows]);
@@ -586,27 +647,63 @@ pub fn matvec_many(ms: &[Mat], x: &[f32], xs: usize) -> Vec<f32> {
     y
 }
 
-/// Host integer dot of several matrices, one activation each, in a single Rayon pass: the rows of all matrices, in
-/// order. None when a matrix is on the GPU or `Mat::matvec` would not take the integer dot for it.
-pub fn matvec_many_cpu<'a>(ms: &[Mat<'a>], xs: &[&[f32]]) -> Option<Vec<f32>> {
-    let ty = ms.first()?.ty;
-    if ms.len() != xs.len() || ms.iter().any(|m| m.ty != ty || m.gpu.is_some() || m.cols != xs[0].len())
-        || xs.iter().any(|x| x.len() != xs[0].len()) { return None; }
-    if std::env::var_os("STRATA_CPU_REF").is_some() || xs[0].len() % ty.block_elems() != 0
-        || ms.iter().any(|m| !m.cpu && m.rows < 512) { return None; }
-    let dot = crate::cpu_moe::int_dot(ty)?;
-    let xq: Vec<_> = xs.par_iter().map(|x| crate::cpu_moe::quantize_q8k(x)).collect();
-    let rb = ty.row_bytes(xs[0].len() as u64);
+/// Host integer dot of several matrices sharing ONE activation `x`, in a single `quantize_q8k` + single Rayon pass.
+/// Supports mixed `GgmlType`s across `ms` as long as every matrix is host-only and has an integer dot kernel.
+pub fn matvec_many_cpu_shared<'a>(ms: &[Mat<'a>], x: &[f32]) -> Option<Vec<f32>> {
+    if ms.is_empty() || std::env::var_os("STRATA_CPU_REF").is_some() { return None; }
+    let cols = x.len();
+    let mut dots = Vec::with_capacity(ms.len());
     let mut starts = Vec::with_capacity(ms.len());
     let mut off = 0;
-    for m in ms { starts.push((off, *m)); off += m.rows; }
+    for m in ms {
+        if m.gpu.is_some() || m.cols != cols || (!m.cpu && m.rows < 512) || cols % m.ty.block_elems() != 0 {
+            return None;
+        }
+        let dot = crate::cpu_moe::int_dot(m.ty)?;
+        let rb = m.ty.row_bytes(cols as u64);
+        starts.push((off, *m, rb));
+        dots.push(dot);
+        off += m.rows;
+    }
+    let xq = crate::cpu_moe::quantize_q8k(x);
     let mut y = vec![0f32; off];
     y.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
         for (k, o) in ys.iter_mut().enumerate() {
             let r = c * 32 + k;
-            let i = starts.partition_point(|(s, _)| *s <= r) - 1;
-            let (s, m) = starts[i];
-            *o = dot(&m.data[(r - s) * rb..(r - s + 1) * rb], &xq[i]) * m.scale;
+            let i = starts.partition_point(|(s, ..)| *s <= r) - 1;
+            let (s, m, rb) = starts[i];
+            *o = dots[i](&m.data[(r - s) * rb..(r - s + 1) * rb], &xq) * m.scale;
+        }
+    });
+    Some(y)
+}
+
+/// Host integer dot of several matrices, one activation each, in a single Rayon pass: the rows of all matrices, in
+/// order. Supports mixed `GgmlType`s. None when a matrix is on the GPU or `Mat::matvec` would not take the integer dot.
+pub fn matvec_many_cpu<'a>(ms: &[Mat<'a>], xs: &[&[f32]]) -> Option<Vec<f32>> {
+    if ms.is_empty() || ms.len() != xs.len() || std::env::var_os("STRATA_CPU_REF").is_some() { return None; }
+    let total_rows: usize = ms.iter().map(|m| m.rows).sum();
+    let mut dots = Vec::with_capacity(ms.len());
+    let mut starts = Vec::with_capacity(ms.len());
+    let mut off = 0;
+    for (m, x) in ms.iter().zip(xs) {
+        if m.gpu.is_some() || m.cols != x.len() || (!m.cpu && total_rows < 512) || m.cols % m.ty.block_elems() != 0 {
+            return None;
+        }
+        let dot = crate::cpu_moe::int_dot(m.ty)?;
+        let rb = m.ty.row_bytes(m.cols as u64);
+        starts.push((off, *m, rb));
+        dots.push(dot);
+        off += m.rows;
+    }
+    let xq: Vec<_> = xs.par_iter().map(|x| crate::cpu_moe::quantize_q8k(x)).collect();
+    let mut y = vec![0f32; off];
+    y.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
+        for (k, o) in ys.iter_mut().enumerate() {
+            let r = c * 32 + k;
+            let i = starts.partition_point(|(s, ..)| *s <= r) - 1;
+            let (s, m, rb) = starts[i];
+            *o = dots[i](&m.data[(r - s) * rb..(r - s + 1) * rb], &xq[i]) * m.scale;
         }
     });
     Some(y)
@@ -630,6 +727,9 @@ pub fn swiglu_chunk(gates: &[Mat], ups: &[Mat], downs: &[Mat], pairs: &[Vec<(usi
 }
 pub fn situ_experts(gus: &[Mat], downs: &[Mat], gs: &[f32], x: &[f32], beta: f32, lb: f32) -> Option<Vec<f32>> {
     dev::get().and_then(|d| d.lock().unwrap().situ_experts(gus, downs, gs, x, beta, lb))
+}
+pub fn situ_experts_split(gs: &[Mat], us: &[Mat], downs: &[Mat], x: &[f32], beta: f32, lb: f32) -> Option<Vec<f32>> {
+    dev::get().and_then(|d| d.lock().unwrap().situ_experts_split(gs, us, downs, x, beta, lb))
 }
 
 /// W x[t] for each row of `xs` (all rows of one matrix). Batches on the GPU when the weight is resident.
@@ -759,6 +859,19 @@ impl<'a> Mat<'a> {
         Ok(Mat { data, ty, rows, cols, cpu, gpu, scale })
     }
 
+    /// Load a tensor strictly on the host mmap (never uploaded to VRAM, e.g. `token_embd.weight` read only via `row_into`).
+    pub fn load_host(g: &'a Gguf, name: &str) -> anyhow::Result<Self> {
+        let t: &TensorInfo = g.tensors.get(name).ok_or_else(|| anyhow::anyhow!("missing tensor {name}"))?;
+        let ty = GgmlType::from_u32(t.ty)?;
+        let cols = t.dims[0] as usize;
+        let rows = t.dims[1..].iter().product::<u64>() as usize;
+        let cpu = name.contains("_exps");
+        let data = g.bytes(t);
+        let scale = name.strip_suffix(".weight").and_then(|stem| g.tensors.get(&format!("{stem}.scale")))
+            .filter(|st| st.ty == 0).and_then(|st| g.bytes(st).try_into().ok()).map_or(1.0, f32::from_le_bytes);
+        Ok(Mat { data, ty, rows, cols, cpu, gpu: None, scale })
+    }
+
     /// Like `load` for a matrix used as `n` row groups (grouped output projection): each group gets its own VRAM copy.
     pub fn load_groups(g: &'a Gguf, name: &str, n: usize) -> anyhow::Result<Self> {
         let mut m = Self::load(g, name)?;
@@ -864,6 +977,53 @@ impl<'a> Mat<'a> {
                     *o = dot(&self.data[r * rb..(r + 1) * rb], &xq) * sc;
                 }
             });
+            return;
+        }
+        if self.ty == GgmlType::F32 {
+            let calc = |(r, o): (usize, &mut f32)| {
+                let bytes = &self.data[r * rb..(r + 1) * rb];
+                let mut s = 0.0f32;
+                for (chunk, &xv) in bytes.chunks_exact(4).zip(x) {
+                    s += f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) * xv;
+                }
+                *o = s * sc;
+            };
+            if self.rows <= 64 {
+                y.iter_mut().enumerate().for_each(calc);
+            } else {
+                y.par_iter_mut().enumerate().for_each(calc);
+            }
+            return;
+        }
+        if self.ty == GgmlType::BF16 {
+            let calc = |(r, o): (usize, &mut f32)| {
+                let bytes = &self.data[r * rb..(r + 1) * rb];
+                let mut s0 = 0.0f32;
+                let mut s1 = 0.0f32;
+                let mut s2 = 0.0f32;
+                let mut s3 = 0.0f32;
+                let mut i = 0;
+                while i + 4 <= self.cols {
+                    let b = &bytes[i * 2..i * 2 + 8];
+                    s0 += f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16) * x[i];
+                    s1 += f32::from_bits((u16::from_le_bytes([b[2], b[3]]) as u32) << 16) * x[i + 1];
+                    s2 += f32::from_bits((u16::from_le_bytes([b[4], b[5]]) as u32) << 16) * x[i + 2];
+                    s3 += f32::from_bits((u16::from_le_bytes([b[6], b[7]]) as u32) << 16) * x[i + 3];
+                    i += 4;
+                }
+                let mut s = (s0 + s1) + (s2 + s3);
+                while i < self.cols {
+                    let b = &bytes[i * 2..i * 2 + 2];
+                    s += f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16) * x[i];
+                    i += 1;
+                }
+                *o = s * sc;
+            };
+            if self.rows <= 64 {
+                y.iter_mut().enumerate().for_each(calc);
+            } else {
+                y.par_iter_mut().enumerate().for_each(calc);
+            }
             return;
         }
         let xq = q8_roundtrip(self.ty, self.cpu, x);

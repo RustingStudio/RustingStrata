@@ -21,6 +21,7 @@ The engine picks the code path from `general.architecture` in the file.
 | [Hy4-flash](#hy4-flash-iq2_siq2_xxs-85-gb) | `hy_v4_flash` | own forward, matvecs and expert cache on CUDA or Vulkan, greedy only |
 | [Kolibri 1.1](#kolibri-11-q4_k_m-434-gb) | `kolibri1` | own forward, matvecs, expert cache and attention on CUDA or Vulkan, greedy only |
 | [Inkling 2 Mini](#inkling-2-mini-iq4_nl-176-gb) | `inkling2_loop`, `inkling2` | own forward, matvecs and expert cache on CUDA or Vulkan |
+| Raon-1 mini | `raon1` | own forward (4-stream Raon-mHC, 18 RDA + 7 gated NoPE MLA, SiTU-GLU MoE, effort steering), matvecs on CUDA or Vulkan |
 
 The models with their own forward open the GPU by themselves (no `--gpu` flag) and load from the chat page of one
 server like the others. `rustingstrata calibrate` measures their prefill chunk too (DeepSeek has no chunk to tune);

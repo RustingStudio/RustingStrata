@@ -36,6 +36,9 @@ const FLINT_RE: [&str; 3] = [
     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 ];
 
+/// llama.cpp `LLAMA_VOCAB_PRE_TYPE_RAON` (KRAFTON Raon-1 mini): CJK runs, space-joined words, 3-digit groups, NFC normalized.
+const RAON_RE: &str = " ?[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+| ?(?:(?:(?![\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}])\\p{L})\\p{M}*)+(?: (?:(?:(?![\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}])\\p{L})\\p{M}*)+)*|\\p{N}{1,3}(?=(?:\\p{N}{3})*(?!\\p{N}))| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
     eos: Vec<u32>,
@@ -75,6 +78,7 @@ impl Tokenizer {
             "flint" => &FLINT_RE,
             "glm4" | "glm5" | "chatglm-bpe" => &[GLM4_RE],
             "inkling2" => &[GPT4O_RE],
+            "raon" => &[RAON_RE],
             _ => bail!("unsupported pre-tokenizer '{pre}'"),
         };
         let strs = |k: &str| -> anyhow::Result<Vec<String>> {
@@ -90,6 +94,9 @@ impl Tokenizer {
         let bpe = BPE::builder().vocab_and_merges(vocab, merges).build().map_err(|e| anyhow!("{e}"))?;
 
         let mut inner = tokenizers::Tokenizer::new(bpe);
+        if pre == "raon" {
+            inner.with_normalizer(Some(tokenizers::normalizers::unicode::NFC));
+        }
         let mut pre_tok = Vec::new();
         for re in res {
             let split = Split::new(SplitPattern::Regex((*re).into()), SplitDelimiterBehavior::Isolated, false)
