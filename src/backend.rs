@@ -142,6 +142,8 @@ pub trait Backend: Send {
     /// Free the graph recorded under `key`, if there is one. For a caller whose keys change as it runs (a graph holds
     /// device memory, and CUDA stops recording at a fixed number of them).
     fn graph_drop(&self, _key: u64) -> anyhow::Result<()> { Ok(()) }
+    /// Free every recorded graph, after buffers they use were replaced (a slot's KV cache grew).
+    fn graph_clear(&self) -> anyhow::Result<()> { Ok(()) }
     /// Queue the ops of `f`, none of which reads what another writes, with no ordering among them (Vulkan: no
     /// barriers between them); ops after the batch see all their results.
     fn batch(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> { f() }

@@ -137,6 +137,7 @@ impl GpuModel<'_> {
         let Some(chunk) = self.pf.as_ref().map(|p| p.chunk) else { return short(self) };
         if tokens.len() < self.short { return short(self); }
         anyhow::ensure!(self.pos + tokens.len() <= self.ctx, "context full ({} tokens; raise --ctx)", self.ctx);
+        self.kv_need(self.cur, self.pos + tokens.len())?;
         // STRATA_PF_ADAPT=N: place the hot experts after every N-th chunk of a long prompt, not only after all of it,
         // so the later chunks run with the placement the first ones showed (0 = off, the default; untested on real hardware).
         let every = std::env::var("STRATA_PF_ADAPT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
@@ -272,6 +273,7 @@ impl GpuModel<'_> {
         for &(sl, owner, tokens, sys, keep) in jobs {
             anyhow::ensure!(sys <= keep && keep < tokens.len() && tokens.len() <= self.ctx, "prefill_slots: sys {sys}, keep {keep} of {} tokens", tokens.len());
             self.use_slot(sl);
+            self.kv_need(sl, tokens.len())?;
             self.owner = owner;
             let n = self.cache_begin(tokens, keep)?;
             if dense {
@@ -881,6 +883,7 @@ impl GpuModel<'_> {
         let t = rows.len();
         let pos: Vec<usize> = rows.iter().enumerate().map(|(r, &(s, ..))| *self.slot_pos(s) + rows[..r].iter().filter(|x| x.0 == s).count()).collect();
         let heads: Vec<usize> = (0..t).filter(|&r| all || rows[r].2).collect();
+        for (&(s, ..), &p) in rows.iter().zip(&pos) { self.kv_need(s, p + 1)?; }
         // Recurrent layers or experts: the layers of `prefill_chunk` in rows mode (`Batch::dense` is the forward below).
         if self.bt.as_ref().is_some_and(|b| !b.dense) {
             let bt = self.bt.as_ref().unwrap();

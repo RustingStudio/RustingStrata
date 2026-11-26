@@ -1272,6 +1272,14 @@ impl Backend for Vk {
         unsafe { self.0.dev.free_command_buffers(st.gpool, &[c]) };
         Ok(())
     }
+    fn graph_clear(&self) -> anyhow::Result<()> {
+        let mut st = self.0.st();
+        if st.graphs.is_empty() { return Ok(()) }
+        self.0.flush(&mut st)?;
+        let cs: Vec<_> = st.graphs.drain().map(|(_, c)| c).collect();
+        unsafe { self.0.dev.free_command_buffers(st.gpool, &cs) };
+        Ok(())
+    }
 
     fn moe_mailbox_optional(&self) -> bool { true }
     fn verify_rows(&self) -> usize { crate::cpu_worker::TMAX }

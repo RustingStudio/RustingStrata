@@ -826,6 +826,46 @@ fn batch_speed() {
     }
 }
 
+/// Slots of a model without experts start with a small KV cache and grow it on demand: a prompt past the start size
+/// and decode steps across a doubling give the logits of a model whose cache holds the whole context, and a reset
+/// slot (whose cache shrinks back) does too.
+#[test]
+fn slot_kv_grows() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    if m.cfg.is_moe() { return eprintln!("SKIP: MoE slots keep the whole context"); }
+    // Slot 0 grows to 1024 in its prefill and to 2048 while decoding; slot 1 grows to 1024 while decoding.
+    let ids = |n: usize, k: u32| -> Vec<u32> { (0..n as u32).map(|i| 100 + (i * 7919 + k) % 20000).collect() };
+    let prompts = [ids(1000, 0), ids(500, 3)];
+    let steps = 40;
+    for (bk, _) in common::backends() {
+        let run = |gm: &mut GpuModel, s: usize, ids: &[u32]| -> Vec<Vec<f32>> {
+            gm.use_slot(s);
+            gm.reset().unwrap();
+            vec![gm.prefill(ids).unwrap()]
+        };
+        let open = || common::backends().into_iter().find(|b| b.0 == bk).unwrap().1;
+        let mut one = GpuModel::load(&m, open(), 2048, 256, 512 << 20, 0).unwrap();
+        let mut want = vec![];
+        for p in &prompts {
+            let mut l = run(&mut one, 0, p);
+            for _ in 0..steps { let t = ops::argmax(l.last().unwrap()) as u32; l.push(one.step(t).unwrap()); }
+            want.push(l);
+        }
+        drop(one);
+        let mut gm = GpuModel::load_slots(&m, open(), 2048, 256, 512 << 20, 2).unwrap();
+        let mut got: Vec<Vec<Vec<f32>>> = prompts.iter().enumerate().map(|(s, p)| run(&mut gm, s, p)).collect();
+        for _ in 0..steps {
+            let rows: Vec<(usize, u32, bool)> = (0..2).map(|s| (s, ops::argmax(got[s].last().unwrap()) as u32, true)).collect();
+            for (s, (_, l)) in gm.step_rows(&rows).unwrap().into_iter().enumerate() { got[s].push(l); }
+        }
+        for s in 0..2 { assert_eq!(got[s], want[s], "{bk} slot {s}"); }
+        assert_eq!(run(&mut gm, 0, &prompts[1])[0], want[1][0], "{bk}: slot 0 after its reset");
+    }
+}
+
 /// `prefill_slots` (several prompts in shared forwards, one of them continuing a saved state) against `prefill_cached`
 /// of each prompt alone, with the tolerance of `batch_matches_single`.
 #[test]

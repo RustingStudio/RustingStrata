@@ -200,7 +200,11 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   `STRATA_BATCH_MIN` sets the count), a model without MTP, LoRA, Hadamard rotation or hyper-connections (CUDA and
   Vulkan) runs them in one batched forward, and the prompts of requests that arrive together are prefilled together. For a MoE
   model each expert is read once for all requests of the step, and the CPU runs the experts that are not in VRAM.
-  Slot state that does not fit in VRAM is kept in RAM, and `--parallel` is lowered to the slots that fit. That forward
+  Slot state that does not fit in VRAM is kept in RAM, and `--parallel` is lowered to the slots that fit. For a model
+  without experts each slot's KV cache starts at 512 tokens and doubles when a request needs more, up to `--ctx`, so
+  short requests do not each hold a full context (Qwen3-4B Q4_K_M on the RTX 3060 at the default `--ctx 4096`: all 64
+  slots fit and 64 clients get 1725 tok/s in total, against 12 slots and 528 tok/s before); a request whose cache
+  cannot grow for lack of VRAM fails alone. That forward
   rounds differently from the single-request one, so greedy output under load can differ at near-ties from the same
   request run alone. An image request (`--mmproj`) takes a slot too: its prompt runs a token at a time between the
   other slots' steps, and its reply decodes beside the batched forward, one token a step.

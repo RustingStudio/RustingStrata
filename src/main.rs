@@ -3409,6 +3409,8 @@ impl Sched {
             g.use_slot(sl);
             let _ = back.send(g.step(token).map(|l| (rusting_strata::ops::argmax(&l) as u32, if want { l } else { vec![] })));
         }
+        // A slot whose KV cannot grow for its token (no VRAM left) fails alone, not the whole forward.
+        batch.retain(|b| match g.kv_step(b.0) { Ok(()) => true, Err(err) => { let _ = b.3.send(Err(err)); false } });
         if batch.is_empty() { return; }
         batch.sort_by_key(|s| s.0);
         // The batched forwards read the current slot's RoPE offset: make an unshifted slot current.

@@ -556,6 +556,12 @@ impl Backend for Gpu {
         Ok(())
     }
 
+    fn graph_clear(&self) -> anyhow::Result<()> {
+        self.sync()?;
+        self.graphs.lock().unwrap().clear();
+        Ok(())
+    }
+
     /// Pinned host memory mapped into the device address space (the CPU expert worker's mailbox).
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)> {
         let n = words.max(1);

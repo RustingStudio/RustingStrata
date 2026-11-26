@@ -956,6 +956,11 @@ impl Backend for Gpu {
         self.graphs.lock().unwrap().remove(&key);
         Ok(())
     }
+    fn graph_clear(&self) -> anyhow::Result<()> {
+        self.sync()?;
+        self.graphs.lock().unwrap().clear();
+        Ok(())
+    }
 
     /// Pinned host memory mapped into the device address space.
     fn host_buf(&self, bytes: usize) -> anyhow::Result<Option<Buf>> { Ok(Some(self.host_mailbox(bytes.div_ceil(4))?.0)) }

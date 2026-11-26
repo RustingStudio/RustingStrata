@@ -7,6 +7,8 @@ use crate::cpu_worker::{CpuWorker, TMAX};
 /// Slots that `step_rows` decodes in one forward (its graphs are keyed by up to this many slots); `TMAX` is the
 /// wider limit of a multi-token verify.
 pub const STEP_ROWS: usize = 4;
+/// Positions a slot's attention KV starts with when it grows on demand (`GpuModel::kv_need`).
+const KV_START: usize = 512;
 use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, Backend, Buf, GpuTensor};
 use crate::expert_cache::ExpertCache;
 use crate::model::Model;
@@ -560,6 +562,9 @@ pub struct GpuModel<'a> {
     /// The current slot (`load_slots`), whose state the other methods use, and the others' (entry `cur` is stale).
     cur: usize,
     seqs: Vec<Seq>,
+    /// Positions each slot's attention KV holds, when the slots' KV grows on demand (`kv_need`); empty when every
+    /// KV cache holds `ctx`.
+    kv_cap: Vec<usize>,
     /// The (slot, position) of each token of the `step_rows` forward being run (empty otherwise).
     rows: Vec<(usize, usize)>,
     /// Tokens `step_rows` ran, for the placement cadence.
@@ -708,13 +713,18 @@ impl<'a> GpuModel<'a> {
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
         let channels = c.ssm_d_inner + 2 * nk * dk;
         let kv = c.n_head_kv * c.head_dim;
+        // Several slots of a model without experts: each slot's attention KV starts at KV_START positions and doubles
+        // when a request needs more (`kv_need`), up to `ctx`, so that short requests do not each hold `ctx` of VRAM.
+        // ponytail: an MoE keeps `ctx` a slot, as its expert slots take the VRAM the KV would grow into.
+        let grow = ns > 1 && !c.is_moe() && ctx > KV_START;
+        let kv0 = if grow { KV_START } else { ctx };
         // The slots' live state stays in VRAM; more slots than fit would end the load out of memory. A dense model's
         // state may take the VRAM its weights leave (less 1 GB of scratch); an MoE's at most half, so that the other
         // half holds experts. A request past the slots waits for one (`serve_slots`).
         // ponytail: Vulkan keeps each slot's saved state in VRAM too (no `host_buf`), not counted here.
         let ns = if ns > 1 {
             let lay = &c.layers[range.clone()];
-            let per = lay.iter().map(|&k| if k == LayerKind::Delta { 4 * ((c.ssm_conv - 1) * channels + nv * c.ssm_dv() * dk) } else { 2 * 2 * gpu.kv_words(ctx * kv) }).sum::<usize>();
+            let per = lay.iter().map(|&k| if k == LayerKind::Delta { 4 * ((c.ssm_conv - 1) * channels + nv * c.ssm_dv() * dk) } else { 2 * 2 * gpu.kv_words(kv0 * kv) }).sum::<usize>();
             let w: usize = m.w.g.tensors.values().filter(|t| !t.name.contains("_exps.")).map(|t| m.w.g.bytes(t).len()).sum();
             let room = free0.saturating_sub(w + vram_margin + (1 << 30)) / if c.is_moe() { 2 } else { 1 };
             let fit = (room / per.max(1)).clamp(1, ns);
@@ -759,8 +769,8 @@ impl<'a> GpuModel<'a> {
                     q: lt(il, "attn_q.weight")?, k: lt(il, "attn_k.weight")?, v: lt(il, "attn_v.weight")?,
                     qn: lt(il, "attn_q_norm.weight")?, kn: lt(il, "attn_k_norm.weight")?, o: lt(il, "attn_output.weight")?,
                     sink: if c.attn_sinks { Some(lt(il, "attn_sinks.weight")?) } else { None },
-                    kc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words(ctx * kv))).collect::<anyhow::Result<_>>()?,
-                    vc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words(ctx * kv))).collect::<anyhow::Result<_>>()?,
+                    kc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words(kv0 * kv))).collect::<anyhow::Result<_>>()?,
+                    vc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words(kv0 * kv))).collect::<anyhow::Result<_>>()?,
                     qsa: if qsa_on && il < c.n_layer && m.w.layer(il, "indexer.k_proj.weight").is_ok() {
                         Some(Qsa {
                             kp: lt(il, "indexer.k_proj.weight")?, qp: lt(il, "indexer.q_proj.weight")?,
@@ -1127,9 +1137,10 @@ impl<'a> GpuModel<'a> {
         let pids = if prefetch { Some(gpu.zeros::<i32>((c.n_layer + 1) * c.n_expert_used)?) } else { None };
         let mb = |b: usize| b as f64 / 1048576.0;
         crate::say!(
-            "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {ctx} tokens{}, prefill {:.0} MB), expert slots {:.0} MB, resident experts {}/{}",
-            mb(free0.saturating_sub(free1)), mb(2 * 2 * gpu.kv_words(ctx * kv) * c.layers[range.clone()].iter().filter(|&&k| k == LayerKind::Attn).count()),
-            if ns > 1 { format!(" in each of {ns} slots") } else { String::new() }, mb(pf.as_ref().map_or(0, |p| p.bytes())),
+            "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {kv0} tokens{}{}, prefill {:.0} MB), expert slots {:.0} MB, resident experts {}/{}",
+            mb(free0.saturating_sub(free1)), mb(2 * 2 * gpu.kv_words(kv0 * kv) * c.layers[range.clone()].iter().filter(|&&k| k == LayerKind::Attn).count()),
+            if ns > 1 { format!(" in each of {ns} slots") } else { String::new() },
+            if grow { format!(", growing to {ctx} on demand") } else { String::new() }, mb(pf.as_ref().map_or(0, |p| p.bytes())),
             mb(cache.as_ref().map_or(0, |x| x.slot_bytes_total())),
             cache.as_ref().map_or(0, |x| x.resident_count()), cache.as_ref().map_or(0, |x| x.total_experts()),
         );
@@ -1149,7 +1160,7 @@ impl<'a> GpuModel<'a> {
         let _ = &mut ext_draft;
         crate::weights::trim_working_set();
         Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], ple_undo: ([-1, -1], vec![]), bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, hada, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, nsnap, short: 32, pf, prompt_cache_path: None, bt, mtp, dflash, ext_draft, ext_draft_pend: Vec::new(), mhc_ones, graph_tag: 0, ngram: None, first: range.start, next: None,
-                      cur: 0, seqs, rows: vec![], row_tokens: 0 })
+                      cur: 0, seqs, kv_cap: if grow { vec![kv0; ns] } else { vec![] }, rows: vec![], row_tokens: 0 })
     }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
@@ -1177,10 +1188,14 @@ impl<'a> GpuModel<'a> {
         }
         self.ext_draft_pend.clear();
         if let Some(ng) = self.ngram.as_mut() { ng.reset(); }
+        // A slot whose KV grew gives the VRAM back (its new caches are zeroed).
+        let shrink = self.kv_cap.get(self.cur).is_some_and(|&n| n > KV_START);
+        if shrink { self.kv_resize(self.cur, KV_START, false)?; }
         for l in self.layers.iter().chain(self.mtp.as_ref().map(|h| &h.layer)) {
             match &l.mixer {
                 Mixer::Delta { conv, s, .. } => { self.gpu.memset(&conv[self.cur])?; self.gpu.memset(&s[self.cur])?; }
-                Mixer::Attn { kc, vc, .. } => { self.gpu.memset(&kc[self.cur])?; self.gpu.memset(&vc[self.cur])?; }
+                Mixer::Attn { kc, vc, .. } if !shrink => { self.gpu.memset(&kc[self.cur])?; self.gpu.memset(&vc[self.cur])?; }
+                Mixer::Attn { .. } => {}
             }
         }
         self.pos = 0;
@@ -1274,6 +1289,7 @@ impl<'a> GpuModel<'a> {
     /// `step` for an image token: `x` is its embedding (a projector row), `pos` its M-RoPE positions [t, y, x, z].
     fn step_embed(&mut self, x: &[f32], pos: [i32; 4]) -> anyhow::Result<Vec<f32>> {
         if self.pos >= self.ctx { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
+        self.kv_need(self.cur, self.pos + 1)?;
         let seq = self.begin_seq();
         self.gpu.put(&x.repeat(self.m.cfg.hc_n.max(1)), &self.x, 0)?;
         self.gpu.put(&[self.pos as i32, seq as i32], &self.step_buf, 0)?;
@@ -1333,6 +1349,50 @@ impl<'a> GpuModel<'a> {
 
     fn slot_pos(&mut self, s: usize) -> &mut usize { if s == self.cur { &mut self.pos } else { &mut self.seqs[s].pos } }
 
+    /// `kv_need` for slot `s`'s next token.
+    pub fn kv_step(&mut self, s: usize) -> anyhow::Result<()> { let p = *self.slot_pos(s); self.kv_need(s, p + 1) }
+
+    /// Make slot `s`'s attention KV hold `upto` positions, when the slots' KV grows on demand: it doubles, to at least
+    /// `upto` and at most `ctx`, keeping its rows. Past `ctx` it leaves the "context full" error to the caller.
+    fn kv_need(&mut self, s: usize, upto: usize) -> anyhow::Result<()> {
+        if let Some(n) = self.next.as_mut() { n.kv_need(s, upto)?; }
+        let Some(&cap) = self.kv_cap.get(s) else { return Ok(()) };
+        if upto <= cap || upto > self.ctx { return Ok(()) }
+        self.kv_resize(s, upto.max(2 * cap).next_multiple_of(KV_START).min(self.ctx), true)
+    }
+
+    /// Give slot `s` attention KV caches of `new` positions (zeroed; `keep`: with the old caches' rows). Either all
+    /// of them change or, out of VRAM, none. The recorded graphs, which hold the old caches' addresses, go.
+    fn kv_resize(&mut self, s: usize, new: usize, keep: bool) -> anyhow::Result<()> {
+        let (g, cap) = (&*self.gpu, self.kv_cap[s]);
+        let mut fresh = vec![];
+        for l in &self.layers {
+            if let Mixer::Attn { kc, vc, .. } = &l.mixer {
+                for b in [&kc[s], &vc[s]] {
+                    fresh.push(g.alloc(b.len() / cap * new).map_err(|e| anyhow::anyhow!(
+                        "no VRAM to grow a slot's KV cache to {new} positions (lower --parallel or --ctx): {e:#}"))?);
+                }
+            }
+        }
+        g.sync()?;
+        let mut fresh = fresh.into_iter();
+        for l in &mut self.layers {
+            if let Mixer::Attn { kc, vc, .. } = &mut l.mixer {
+                for b in [&mut kc[s], &mut vc[s]] {
+                    let nb = fresh.next().unwrap();
+                    if keep { g.dtod(b, 0, &nb, 0, b.len().min(nb.len()))?; }
+                    *b = nb;
+                }
+            }
+        }
+        self.kv_cap[s] = new;
+        g.sync()?;
+        g.graph_clear()
+    }
+
+    /// Positions the current slot's attention KV holds.
+    fn kv_rows(&self) -> usize { self.kv_cap.get(self.cur).copied().unwrap_or(self.ctx) }
+
     /// One decode step for each of up to `STEP_ROWS` distinct slots in one forward (each weight read once): `rows` holds
     /// (slot, token, whether to return its logits). Returns per row the greedy next token (argmax, first on ties) and
     /// the logits if asked (else empty: greedy rows copy back only the token). Each forward is graphed by its slots
@@ -1342,6 +1402,7 @@ impl<'a> GpuModel<'a> {
         ensure!((1..=STEP_ROWS).contains(&nt) && self.mtp.is_none(), "step_rows: {nt} rows");
         let pos: Vec<usize> = rows.iter().map(|&(s, ..)| *self.slot_pos(s)).collect();
         if pos.iter().any(|&p| p >= self.ctx) { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
+        for (&(s, ..), &p) in rows.iter().zip(&pos) { self.kv_need(s, p + 1)?; }
         self.put_embed(&rows.iter().map(|r| r.1).collect::<Vec<_>>())?;
         let res = self.rows_pass(rows, &pos).and_then(|_| {
             let t = self.tail();
@@ -1452,6 +1513,7 @@ impl<'a> GpuModel<'a> {
     /// Run one token; returns logits over the vocabulary.
     pub fn step(&mut self, token: u32) -> anyhow::Result<Vec<f32>> {
         if self.pos >= self.ctx { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
+        self.kv_need(self.cur, self.pos + 1)?;
         self.dflash_commit_ctx()?;
         let prof = std::env::var_os("STRATA_VK_PROF").is_some();
         let t0 = prof.then(std::time::Instant::now);
@@ -1531,6 +1593,7 @@ impl<'a> GpuModel<'a> {
         let nt = tokens.len();
         if !(1..=self.tmax()).contains(&nt) { bail!("verify: {nt} tokens (1 to {})", self.tmax()); }
         if self.pos + nt > self.ctx { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
+        self.kv_need(self.cur, self.pos + nt)?;
         self.dflash_commit_ctx()?;
         let seq = self.begin_seq();
         self.put_embed(tokens)?;
@@ -1591,14 +1654,16 @@ impl<'a> GpuModel<'a> {
         Ok(())
     }
 
-    /// The KV caches of the attention layers (and of the draft head/DFlash) and their QSA pooled keys, whose rows are positions.
-    fn kv_bufs(&self) -> Vec<&Buf> {
-        self.layers.iter().chain(self.mtp.as_ref().map(|h| &h.layer))
-            .flat_map(|l| match &l.mixer {
-                Mixer::Attn { kc, vc, qsa, .. } => [&kc[self.cur], &vc[self.cur]].into_iter().chain(qsa.as_ref().map(|a| &a.pool)).collect(),
+    /// The KV caches of the attention layers (and of the draft head/DFlash) and their QSA pooled keys, whose rows are
+    /// positions, each with the positions it holds.
+    fn kv_bufs(&self) -> Vec<(&Buf, usize)> {
+        let (rows, ctx) = (self.kv_rows(), self.ctx);
+        self.layers.iter().map(|l| (l, rows)).chain(self.mtp.as_ref().map(|h| (&h.layer, ctx)))
+            .flat_map(|(l, n)| match &l.mixer {
+                Mixer::Attn { kc, vc, qsa, .. } => [(&kc[self.cur], n), (&vc[self.cur], n)].into_iter().chain(qsa.as_ref().map(|a| (&a.pool, ctx))).collect(),
                 _ => vec![],
             })
-            .chain(self.dflash.iter().flat_map(|df| df.layers.iter().flat_map(|dl| [&dl.kc[self.cur], &dl.vc[self.cur]])))
+            .chain(self.dflash.iter().flat_map(|df| df.layers.iter().flat_map(|dl| [(&dl.kc[self.cur], ctx), (&dl.vc[self.cur], ctx)])))
             .collect()
     }
 
@@ -1609,7 +1674,7 @@ impl<'a> GpuModel<'a> {
         let mut size = 0;
         let mut p = Some(self);
         while let Some(q) = p {
-            size += q.kv_bufs().iter().map(|b| b.len() / q.ctx * n).sum::<usize>() + q.slot().iter().map(|b| b.len()).sum::<usize>();
+            size += q.kv_bufs().iter().map(|(b, r)| b.len() / r * n).sum::<usize>() + q.slot().iter().map(|b| b.len()).sum::<usize>();
             p = q.next.as_deref();
         }
         if size > self.cache_ram { return Ok(None) }
@@ -1618,7 +1683,7 @@ impl<'a> GpuModel<'a> {
         while let Some(q) = p {
             let g = &q.gpu;
             let slot = q.slot().iter().map(|b| g.get::<u8>(b, 0, b.len())).collect::<anyhow::Result<_>>()?;
-            let kv = q.kv_bufs().iter().map(|b| g.get::<u8>(b, 0, b.len() / q.ctx * n)).collect::<anyhow::Result<_>>()?;
+            let kv = q.kv_bufs().iter().map(|(b, r)| g.get::<u8>(b, 0, b.len() / r * n)).collect::<anyhow::Result<_>>()?;
             parts.push(PartCopy { ple_prev: q.saved_ple_prev, slot, kv });
             p = q.next.as_deref();
         }
@@ -1670,7 +1735,7 @@ impl<'a> GpuModel<'a> {
         while let Some(q) = p {
             q.layers.len().hash(&mut h);
             q.kv_bufs().len().hash(&mut h);
-            for b in q.kv_bufs() { (b.len() / q.ctx).hash(&mut h); }
+            for (b, r) in q.kv_bufs() { (b.len() / r).hash(&mut h); }
             p = q.next.as_deref();
         }
         h.finish()
@@ -1813,13 +1878,14 @@ impl<'a> GpuModel<'a> {
     fn unpark(&mut self, i: usize) -> anyhow::Result<()> {
         let p = self.parked.remove(i);
         self.park()?;
+        self.kv_need(self.cur, p.ids.len())?;
         // A slot that never saved has no buffers to take the state yet.
         if self.saved.is_empty() { self.save_state()?; }
         let mut q = Some(&mut *self);
         for c in p.parts {
             let Some(m) = q else { break };
             for (b, d) in m.slot().iter().zip(&c.slot) { m.gpu.put(d, b, 0)?; }
-            for (b, d) in m.kv_bufs().iter().zip(&c.kv) { m.gpu.put(d, b, 0)?; }
+            for ((b, _), d) in m.kv_bufs().iter().zip(&c.kv) { m.gpu.put(d, b, 0)?; }
             (m.saved_pos, m.saved_ple_prev, m.saved_ids, m.saved_owner) = (p.ids.len(), c.ple_prev, p.ids.clone(), p.owner);
             q = m.next.as_deref_mut();
         }
