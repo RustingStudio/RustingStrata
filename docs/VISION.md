@@ -3,7 +3,8 @@
 Status: Qwen3-VL image input works on the CPU path and on the GPU path. The projector, image
 preprocessing, prompt expansion and M-RoPE text integration run against `qwen3.5-2b` +
 `qwen3.5-2b-mmproj.gguf`; `generate`/`chat --image` and `serve` image requests (OpenAI `image_url` and
-Anthropic image blocks) work with or without `--gpu`.
+Anthropic image blocks) work with or without `--gpu`. Without `--mmproj` the first `mmproj*.gguf` next to
+the model is used; `--mmproj none` loads no projector.
 
 Gemma 4 (`gemma4v`) image input works through `generate --image`, `chat --image` and `serve` (OpenAI
 `image_url`/Anthropic `image` blocks); `chat`/`serve` use the model's `tokenizer.chat_template` (system

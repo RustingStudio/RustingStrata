@@ -173,7 +173,8 @@ struct Engine {
     /// Sequences in GPU memory at once (`serve --parallel`).
     #[arg(skip)]
     parallel: usize,
-    /// Multimodal projector (mmproj) GGUF used by `--image`.
+    /// Multimodal projector (mmproj) GGUF used by `--image` (default: an `mmproj*.gguf` next to the model; `none`
+    /// loads no projector).
     #[arg(long)]
     mmproj: Option<PathBuf>,
 }
@@ -372,6 +373,15 @@ fn restore_calib_env() {
 }
 
 impl Engine {
+    /// The projector for `model`: `--mmproj`, else an `mmproj*.gguf` next to it; `--mmproj none` gives none.
+    fn mmproj_for(&self, model: &Path) -> Option<PathBuf> {
+        match &self.mmproj {
+            Some(p) if p.as_os_str() == "none" => None,
+            Some(p) => Some(p.clone()),
+            None => vision::find_sibling(model),
+        }
+    }
+
     /// Hand `--backend`, `--device`, and `--kv` to the DeepSeek, GLM, Gemma 4 and Inkling 2 paths.
     fn ds_env(&self) {
         // SAFETY: called at the start of a command, before any thread reads these variables.
@@ -1319,7 +1329,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 if image.is_empty() { return rusting_strata::gemma4::generate(&g, &prompt, n); }
-                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let mmproj = engine.mmproj_for(&model);
                 let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
                 let input = load_images(mmproj, &image)?;
                 return rusting_strata::gemma4::generate_image(&g, &prompt, &input.grids, &input.embeddings, n);
@@ -1347,7 +1357,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) .is_some_and(rusting_strata::inkling2::is_arch) {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 let max_ctx = 0;
-                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let mmproj = engine.mmproj_for(&model);
                 let opts = rusting_strata::inkling2::chat::Inkling2Opts {
                     max_ctx,
                     sampler: engine.sampler(),
@@ -1375,7 +1385,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let vision_prompt = if image.is_empty() {
                 None
             } else {
-                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let mmproj = engine.mmproj_for(&model);
                 let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
                 let input = load_images(mmproj, &image)?;
                 Some((build_image_prompt(&tok, &input, &image, &prompt)?, input))
@@ -1657,7 +1667,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             engine.own_warn(&g);
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
                 let input = if image.is_empty() { None } else {
-                    let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                    let mmproj = engine.mmproj_for(&model);
                     let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
                     Some(load_images(mmproj, &image)?)
                 };
@@ -1684,7 +1694,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) .is_some_and(rusting_strata::inkling2::is_arch) {
                 let max_ctx = 0;
-                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let mmproj = engine.mmproj_for(&model);
                 let opts = rusting_strata::inkling2::chat::Inkling2Opts {
                     max_ctx,
                     sampler: engine.sampler(),
@@ -1709,7 +1719,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let image_input = if image.is_empty() { None } else {
-                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let mmproj = engine.mmproj_for(&model);
                 let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
                 Some(load_images(mmproj, &image)?)
             };
@@ -3622,7 +3632,7 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
     let _own = rusting_strata::config::OWN_ARCHS.contains(&arch).then(OwnState::new);
     let (aux_g, m);
     let mut r = if _own.is_some() {
-        let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(model));
+        let mmproj = engine.mmproj_for(model);
         Runner::Own(match arch {
             "gemma4" => rusting_strata::gemma4::serve(&g, &tok, &name, mmproj.as_deref())?,
             "glm5-next" => rusting_strata::glm::serve(&g, &tok, &name)?,
@@ -3792,7 +3802,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
         ("GET", "/api/models") => {
             // The model `--auto-unload` freed counts as loaded: a chat loads it again.
             let asleep = s.asleep.lock().unwrap().clone();
-            let models: Vec<_> = s.models().into_iter().map(|(id, p, n)| json!({"id": id, "bytes": n, "image": e.mmproj.is_some() || vision::find_sibling(&p).is_some(), "loaded": l.as_ref().is_some_and(|l| l.path == p) || asleep.as_ref() == Some(&p)})).collect();
+            let models: Vec<_> = s.models().into_iter().map(|(id, p, n)| json!({"id": id, "bytes": n, "image": e.mmproj_for(&p).is_some(), "loaded": l.as_ref().is_some_and(|l| l.path == p) || asleep.as_ref() == Some(&p)})).collect();
             // The values in effect: with a model loaded, `chunk` and `mtp` include its calibration.
             let options = json!({"ctx": e.ctx, "kv": e.kv, "cache_ram": e.cache_ram, "vram_margin": e.vram_margin.join(","), "mtp": e.mtp, "chunk": e.chunk,
                 "gpu": e.gpu, "ctx_train": s.stats.lock().unwrap().ctx_train,
@@ -3861,7 +3871,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     let prompt = l.tpl.render(&req.messages, &req.tools, req.think.unwrap_or(e.think_default), req.preserve_thinking.unwrap_or(e.preserve_thinking), true);
                     let images: Vec<String> = req.messages.iter().flat_map(|m| m.images.iter().cloned()).collect();
                     let n = if images.is_empty() { l.tok.encode(&prompt)?.len() } else {
-                        let mmproj = e.mmproj.clone().or_else(|| vision::find_sibling(&l.path));
+                        let mmproj = e.mmproj_for(&l.path);
                         let mmproj = mmproj.as_deref().context("image input needs --mmproj")?;
                         let input = load_images(mmproj, &images)?;
                         build_image_prompt(l.tok, &input, &images, &prompt)?.ids.len()
@@ -3940,7 +3950,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let system = tpl.render(&req.messages[..n_sys], &req.tools, req.think.unwrap_or(e.think_default), preserve, false);
             let images: Vec<String> = req.messages.iter().flat_map(|m| m.images.iter().cloned()).collect();
             let image_input = if images.is_empty() { None } else {
-                let mmproj = e.mmproj.clone().or_else(|| vision::find_sibling(&l.path));
+                let mmproj = e.mmproj_for(&l.path);
                 let mmproj = mmproj.as_deref().context("image input needs --mmproj")?;
                 Some(load_images(mmproj, &images)?)
             };
