@@ -656,6 +656,9 @@ impl<'a> GpuModel<'a> {
             crate::say!("device {i} ({}): layers {}..{}, host-to-VRAM copy {:.0} MB/s", gpu.name(), r.start, r.end, rates[i]);
             parts.push(Self::load_part(m, gpu, ctx, chunk, vram_margin[i], k, r, ns)?);
         }
+        // Every part holds the state of every slot (a part short of VRAM takes fewer).
+        let fit: Vec<usize> = parts.iter().map(|p| p.slots()).collect();
+        ensure!(fit.iter().all(|&s| s == fit[0]), "--parallel {ns}: the devices fit {fit:?} slots; lower --parallel or --ctx");
         // One draft length for every part: each caps it by its own backend's verify rows.
         let k = parts.iter().map(|p| p.k).min().unwrap();
         let nsnap = parts.iter().map(|p| p.nsnap).min().unwrap();

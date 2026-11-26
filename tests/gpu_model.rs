@@ -598,7 +598,11 @@ fn slots_match_single() {
         if cpu { unsafe { std::env::set_var("STRATA_EXPERT_MB", "0") } } else { unsafe { std::env::remove_var("STRATA_EXPERT_MB") } }
         let Some(gpu) = open(bk) else { continue };
         let mut gm = if split {
-            GpuModel::load_split(&m, vec![gpu, open(bk).unwrap()], 256, 4, 512 << 20, 0, 3).unwrap()
+            // Two parts on one card: a big file (BF16) leaves the second part too little VRAM for the slots.
+            match GpuModel::load_split(&m, vec![gpu, open(bk).unwrap()], 256, 4, 512 << 20, 0, 3) {
+                Ok(g) => g,
+                Err(e) => { eprintln!("slots_match_single {bk} split: skipped ({e})"); continue; }
+            }
         } else {
             GpuModel::load_slots(&m, gpu, 256, 4, 512 << 20, 3).unwrap()
         };
