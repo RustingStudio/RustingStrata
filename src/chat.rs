@@ -561,6 +561,26 @@ impl Template {
         }
         Some((text[..start].trim_end().to_string(), calls))
     }
+    /// The calls of a reply that is still being written, as (name, arguments) for a stream: the arguments of each are
+    /// a prefix of what `parse_calls` gives for the finished reply. A finished call is whole; in the call still open
+    /// (`<function=` form, for a tool the request names) a string parameter grows as it comes, another value is added
+    /// when its `</parameter>` arrives. Other templates give finished calls only (DeepSeek and Flint none).
+    // ponytail: rescans the whole reply each token (quadratic); fine for the size of a reply.
+    pub fn partial_calls(&self, text: &str, tools: &[Json]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if matches!(self, Template::Ds | Template::Flint) { return out; }
+        let Some(start) = text.find(TAG) else { return out };
+        let mut rest = &text[start..];
+        while let Some(r) = rest.trim_start().strip_prefix(TAG) {
+            let Some((inner, after)) = r.split_once("</tool_call>") else {
+                if let Template::Xml = self && let Some(c) = xml_partial(r, tools) { out.push(c); }
+                break;
+            };
+            match if let Template::Xml = self { xml_call(inner, tools) } else { json_call(inner) } { Some(c) => out.push(c), None => break }
+            rest = after;
+        }
+        out
+    }
 }
 
 /// DeepSeek reply: a `<｜DSML｜ calls>` block of `invoke` items with `parameter name=".." string="true|false"`. A
@@ -621,14 +641,43 @@ fn xml_call(inner: &str, tools: &[Json]) -> Option<(String, String)> {
         let (k, x) = r.strip_prefix("<parameter=")?.split_once('>')?;
         let (v, x) = x.split_once("</parameter>")?;
         r = x;
-        let v = v.strip_prefix('\n').unwrap_or(v);
-        let v = v.strip_suffix('\n').unwrap_or(v);
-        let string = props.get(k).get("type").as_str() == Some("string");
-        // The template prints earlier calls' booleans and null in Python spelling, and the model copies it.
-        let py = |v: &str| match v.trim() { "True" => Some(Json::Bool(true)), "False" => Some(Json::Bool(false)), "None" => Some(Json::Null), _ => None };
-        args.push((k.to_string(), if string { Json::Str(v.into()) } else { serde_json::from_str(v).ok().or_else(|| py(v)).unwrap_or_else(|| Json::Str(v.into())) }));
+        args.push((k.to_string(), xml_value(v, props.get(k))));
     }
     Some((name.to_string(), Json::Obj(args).dump()))
+}
+
+fn xml_value(v: &str, prop: &Json) -> Json {
+    let v = v.strip_prefix('\n').unwrap_or(v);
+    let v = v.strip_suffix('\n').unwrap_or(v);
+    // The template prints earlier calls' booleans and null in Python spelling, and the model copies it.
+    let py = |v: &str| match v.trim() { "True" => Some(Json::Bool(true)), "False" => Some(Json::Bool(false)), "None" => Some(Json::Null), _ => None };
+    if prop.get("type").as_str() == Some("string") { Json::Str(v.into()) } else { serde_json::from_str(v).ok().or_else(|| py(v)).unwrap_or_else(|| Json::Str(v.into())) }
+}
+
+/// The open call of `partial_calls`: `r` is the text after its `<tool_call>`.
+fn xml_partial(r: &str, tools: &[Json]) -> Option<(String, String)> {
+    let (name, mut r) = r.trim_start().strip_prefix("<function=")?.split_once('>')?;
+    let props = tools.iter().map(|t| t.get("function")).find(|f| f.get("name").as_str() == Some(name))?.get("parameters").get("properties");
+    let key = |k: &str| serde_json::to_string(k).unwrap();
+    let mut s = String::from("{");
+    while let Some((k, x)) = r.trim_start().strip_prefix("<parameter=").and_then(|x| x.split_once('>')) {
+        let sep = if s.len() > 1 { ", " } else { "" };
+        if let Some((v, x)) = x.split_once("</parameter>") {
+            s += &format!("{sep}{}: {}", key(k), xml_value(v, props.get(k)).dump());
+            r = x;
+            continue;
+        }
+        if props.get(k).get("type").as_str() == Some("string") {
+            // The value so far, less a tail that could still be the `\n</parameter>` that ends it.
+            let v = x.strip_prefix('\n').unwrap_or(x);
+            let end = "\n</parameter>";
+            let hold = (1..=end.len().min(v.len())).rev().find(|&n| v.ends_with(&end[..n])).unwrap_or(0);
+            let q = key(&v[..v.len() - hold]);
+            s += &format!("{sep}{}: {}", key(k), &q[..q.len() - 1]);
+        }
+        break;
+    }
+    Some((name.to_string(), s))
 }
 
 /// Streams reply text but holds back everything from a `<tool_call>` tag on (unless `no_tag`), so a call is never
@@ -713,6 +762,28 @@ impl Think {
 #[cfg(test)]
 mod think_tests {
     use super::*;
+    /// Issue 122: at every point of a reply, each streamed call is a prefix of the call the finished reply parses to,
+    /// and a long string parameter streams before its call ends.
+    #[test]
+    fn partial_calls_are_prefixes() {
+        let tools: Vec<Json> = serde_json::from_str(r#"[{"type":"function","function":{"name":"write","parameters":{"properties":
+            {"path":{"type":"string"},"n":{"type":"integer"},"content":{"type":"string"}}}}}]"#).unwrap();
+        let text = "Ok.\n<tool_call>\n<function=write>\n<parameter=path>\na \"b\".rs\n</parameter>\n<parameter=n>\n3\n</parameter>\n\
+            <parameter=content>\nfn main() {\n\tprintln!(\"é\");\n}\n\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n\
+            <function=write>\n<parameter=path>\nx\n</parameter>\n</function>\n</tool_call>";
+        let (_, done) = Template::Xml.parse_calls(text, &tools).unwrap();
+        let mut grew = false;
+        for (p, _) in text.char_indices() {
+            for (k, (f, a)) in Template::Xml.partial_calls(&text[..p], &tools).iter().enumerate() {
+                assert_eq!(f, &done[k].0);
+                assert!(done[k].1.starts_with(a.as_str()), "at {p}: {a:?} vs {:?}", done[k].1);
+                grew |= k == 0 && a.contains("println");
+            }
+        }
+        assert!(grew);
+        assert_eq!(Template::Xml.partial_calls(text, &tools), done);
+        assert!(Template::Xml.partial_calls("<tool_call>\n<function=other>\n<parameter=a>\nx", &tools).is_empty());
+    }
     #[test]
     fn image_source_must_be_a_url() {
         let req = |url: &str| crate::serve::chat_request(format!(r#"{{"messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"{url}"}}}}]}}]}}"#).as_bytes());

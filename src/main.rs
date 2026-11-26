@@ -843,6 +843,23 @@ fn calibration_fits(v: &serde_json::Value, gpu: &str) -> bool {
 
 /// Values a calibrated chunk may write to the environment. An explicit value set by the user must win, so the
 /// caller skips names that are already present.
+/// OpenAI stream deltas for tool calls (issue 122): a call not sent yet goes out with its id and name, then the part
+/// of its arguments past what `sent` holds. Arguments that do not start with what was sent add nothing.
+fn call_deltas(calls: &[(String, String)], sent: &mut Vec<String>, i: impl std::fmt::Display) -> Vec<serde_json::Value> {
+    let mut v = Vec::new();
+    for (k, (f, a)) in calls.iter().enumerate() {
+        if k == sent.len() {
+            v.push(json!({"index": k, "id": format!("call_{i}_{k}"), "type": "function", "function": {"name": f, "arguments": ""}}));
+            sent.push(String::new());
+        }
+        if a.len() > sent[k].len() && a.starts_with(sent[k].as_str()) {
+            v.push(json!({"index": k, "function": {"arguments": &a[sent[k].len()..]}}));
+            sent[k] = a.clone();
+        }
+    }
+    v
+}
+
 fn chunk_env_updates(n: usize, present: impl Fn(&str) -> bool) -> Vec<(&'static str, String)> {
     if !(1..=(1 << 20)).contains(&n) { return vec![]; }
     ["STRATA_DS_CHUNK", "STRATA_GLM_CHUNK", "STRATA_G4_CHUNK"].into_iter()
@@ -4141,6 +4158,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let mut k = 0;  // tokens decoded
             let mut opened = false;  // Messages API stream: the text block has started
             let mut hold = Hold::new(tools, req.stop);
+            let mut streamed = Vec::new();  // the tool-call arguments a stream has sent
             // A prompt that ends in an open think block makes the reply start with reasoning, up to `</think>`.
             let think_open = prompt.trim_end().ends_with("<think>");
             let mut think = Think::new(think_open);
@@ -4196,6 +4214,12 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                         } else if last_stream_activity.elapsed() >= Duration::from_secs(15) {
                             w.write_all(b": keep-alive\n\n")?;
                             last_stream_activity = Instant::now();
+                        }
+                        if tools && !anth {
+                            for d in call_deltas(&tpl.partial_calls(&hold.text, &req.tools), &mut streamed, i) {
+                                write!(w, "data: {}\n\n", chunk(json!({"tool_calls": [d]}), None))?;
+                                last_stream_activity = Instant::now();
+                            }
                         }
                     }
                     Ok(hold.stopped)
@@ -4273,7 +4297,8 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 "prompt_tokens_details": {"cached_tokens": cached}});
             if req.stream {
                 match &calls {
-                    Some(c) => write!(w, "data: {}\n\n", chunk(calls_json(c, true), None))?,
+                    Some(c) => for d in call_deltas(&c.1, &mut streamed, i) { write!(w, "data: {}\n\n", chunk(json!({"tool_calls": [d]}), None))?; },
+                    // ponytail: a call that streamed and then fails to parse also goes out as text; the client saw part of a call.
                     None => {
                         let (r, a) = think.feed(hold.rest());
                         send_split(&mut w, &chunk, (r, a))?;

@@ -255,7 +255,11 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 - Thinking is on by default (`--think false` turns it off). A request overrides it with `chat_template_kwargs.enable_thinking`
   (Anthropic: `thinking: {"type": "enabled"}`; `enable_thinking: false` turns it off for that request).
 - `tools` and `tool_choice` work as in the OpenAI API: calls come back as `tool_calls` with `finish_reason:
-  "tool_calls"`. `tool_choice: "required"` does not force a call.
+  "tool_calls"`. `tool_choice: "required"` does not force a call. A streamed chat on `/v1/chat/completions` sends each
+  call's name as soon as the model writes it, and for a model with `<function=..>` calls (Qwen3.5, Qwen3.6, Qwen3
+  Coder) a string argument as it is written, so a client can show a long file write while it runs. Other call formats
+  send a call's arguments when the call is complete. This is the main engine; the Messages API and the separate
+  forwards (Inkling 2, DeepSeek, GLM and the others) still send calls at the end.
 - The prompt follows the model's own chat template, rendered like llama.cpp's `--jinja`.
 - `POST /tokenize` and `POST /detokenize` work as in llama.cpp's server: `{"content": "text", "add_special": false,
   "with_pieces": false}` gives `{"tokens": [...]}` (with pieces each entry is `{"id", "piece"}`, and a piece that is
