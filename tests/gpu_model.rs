@@ -815,7 +815,8 @@ fn batch_speed() {
         for s in 0..gm.slots() { gm.use_slot(s); gm.reset().unwrap(); gm.prefill(&[1, 2, 3, 4]).unwrap(); }
         let most = gm.batch_cap().min(gm.slots());
         for n in [16, 32, 48, 64, 128].into_iter().filter(|&n| n <= most) {
-            let rows: Vec<(usize, u32, bool)> = (0..n).map(|s| (s, 5, false)).collect();
+            // Distinct tokens: a MoE routes them to different experts, as in real serving.
+            let rows: Vec<(usize, u32, bool)> = (0..n).map(|s| (s, 1000 + 131 * s as u32, false)).collect();
             gm.step_batch(&rows).unwrap();
             let t = std::time::Instant::now();
             for _ in 0..20 { gm.step_batch(&rows).unwrap(); }
