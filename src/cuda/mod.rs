@@ -76,11 +76,12 @@ const RING: usize = 64 << 20;
 const RING_MIN: usize = 256 << 10;
 /// `nb` inside `beside`: launches stay on the main stream, copies go to the side stream.
 const BESIDE: usize = usize::MAX - 1;
-/// `gemmd_*` splits the columns of a matrix of at most this many rows between two blocks. Measured on an RTX 3060
+/// `gemmd_*` splits the columns of a matrix of at most this many rows between blocks. Measured on an RTX 3060
 /// with Qwen3-4B: the 9728-row FFN matrices gain at 8 and 16 positions and lose 9% at 64 (split only up to half as
 /// many rows there); the output head (151936 rows) fills the card without the split.
 const GEMMD_SPLIT_ROWS: usize = 16384;
-/// A scratch slot of `gemmd_*`: a count per 128 rows, then the partial sums of both blocks for 64 positions.
+/// A scratch slot of `gemmd_*`: a count per 128 rows, then the partial sums of the segments (ks x positions x rows
+/// floats, at most 2 x 64 x `GEMMD_SPLIT_ROWS`).
 const ROPE_CS: usize = 1 << 17;
 const GEMMD_SLOT: usize = GEMMD_SPLIT_ROWS / 128 * 4 + 2 * 64 * GEMMD_SPLIT_ROWS * 4;
 
@@ -646,6 +647,14 @@ impl Gpu {
             let pb = nd.next_power_of_two().max(8);
             let xw = if pb >= 32 { 128 } else { 4096 / pb };  // GEMMD_XW
             let ks = if rows <= if nd > 32 { GEMMD_SPLIT_ROWS / 2 } else { GEMMD_SPLIT_ROWS } && cols >= 2 * xw { 2 } else { 1 };
+            // Up to 16 positions, split the columns further so the launch has about 256 blocks, at most 8 segments,
+            // each at least one window. Measured on an RTX 3060, Q8_0, 16 positions: 2048 x 6144 128 -> 104 us (8
+            // segments), 4096 x 4096 175 -> 126 us (8), 12288 x 2048 185 -> 169 us (4); Qwen3.5-2B batch_speed 16
+            // rows 20.0 -> 19.3 ms a step. At 32 positions the step lost 0.5 ms (24.1 -> 24.6) and at 64 the GEMM.
+            let ks = if ks > 1 && nd <= 16 {
+                256usize.div_ceil(rows.div_ceil(128)).next_power_of_two().clamp(2, 8).min(cols / xw)
+                    .min(2 * 64 * GEMMD_SPLIT_ROWS / (nd * rows))  // scr holds the sums of every segment
+            } else { ks };
             // The launches of a stream run in order, so each stream has a slot (`st`: the odd launches of a batch go to `side`).
             let n = self.nb.load(Relaxed);
             if self.gd.get().is_none() { let _ = self.gd.set(self.stream.alloc_zeros(2 * GEMMD_SLOT)?); }

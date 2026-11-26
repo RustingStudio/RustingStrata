@@ -1647,10 +1647,10 @@ ITYPES(DEF_GEMMI)
 // two mmas per 32 columns, each with the lanes of the other half zeroed.
 // X (q8 rows) is the B operand, from a shared-memory window of GEMMD_XW(pb) columns that cp.async double-buffers: one
 // barrier per window.
-// ks = 2: two blocks (seg 0, 1) share 128 rows, each over half of the columns (Gpu::gemm_raw has the rule and the
-// measurement). Both blocks store their partial sums in scr ([seg][position][row]); the one that ends second (flag:
-// the count of blocks done for these rows, over all launches) adds the other's and writes y. a + b is b + a, so the
-// result does not depend on which block that is.
+// ks > 1: ks blocks (seg 0 .. ks - 1) share 128 rows, each over a ks-th of the column windows (Gpu::gemm_raw has the
+// rule and the measurement). Every block stores its partial sums in scr ([seg][position][row]); the one that ends last
+// (flag: the count of blocks done for these rows, reset to 0 by that block) adds them in segment order and writes y,
+// so the result does not depend on which block that is.
 #define GEMMD_XW(pb) ((pb) >= 32 ? 128 : 4096 / (pb))
 // XW: the window width when it is known at compile time (its pitch then makes the x loads' offsets immediates), else 0.
 // FULL: 64 positions, so every one of the 8 tiles has positions (no test a tile).
@@ -1833,7 +1833,7 @@ __device__ __forceinline__ void gemmd_qx(const u8* w, const u8* __restrict__ x, 
     }
     if (ks > 1) {
         float* mine = scr + (size_t)seg * nd * rows;
-        const volatile float* other = scr + (size_t)(seg ^ 1) * nd * rows;  // another block's stores: not cached
+        const volatile float* all = scr;  // other blocks' stores: not cached
         if (live) {
             #pragma unroll
             for (int j = 0; j < 32; j++) {
@@ -1843,16 +1843,32 @@ __device__ __forceinline__ void gemmd_qx(const u8* w, const u8* __restrict__ x, 
         }
         __threadfence();  // every thread's sums are in memory before the count says so
         __syncthreads();
-        int* second = (int*)gemmd_s;
-        if (tid == 0) *second = atomicAdd(flag + rb, 1) & 1;
+        int* last = (int*)gemmd_s;
+        if (tid == 0) {
+            *last = atomicAdd(flag + rb, 1) == ks - 1;
+            if (*last) flag[rb] = 0;  // every block of these rows has counted: the next launch starts from 0
+        }
         __syncthreads();
-        if (!*second) return;
-        if (live) {
+        if (!*last) return;
+        if (live && ks == 2) {  // a + b is b + a: the other block's sums onto this one's
             #pragma unroll
             for (int j = 0; j < 32; j++) {
                 int r = r0 + g + 8 * ((j >> 1) & 1), p = (j >> 2) * 8 + 2 * t + (j & 1);
-                if (r < rows && p < np) acc[j >> 2][j & 3] += other[(size_t)p * rows + r];
+                if (r < rows && p < np) acc[j >> 2][j & 3] += all[((size_t)(seg ^ 1) * nd + p) * rows + r];
             }
+        } else if (live) {
+            // Every segment from scr in segment order, whichever block ends last: the result does not depend on it.
+            for (int j = 0; j < 32; j++) {
+                int r = r0 + g + 8 * ((j >> 1) & 1), p = (j >> 2) * 8 + 2 * t + (j & 1);
+                if (r >= rows || p >= np) continue;
+                const volatile float* q = all + (size_t)p * rows + r;
+                float s = q[0];
+                for (int sg = 1; sg < ks; sg++) s += q[(size_t)sg * nd * rows];
+                float* yp = y + (size_t)p * y_stride + r;
+                float v = s * sc;
+                *yp = act == 0 ? v : act == 1 ? silu(*yp) * v : *yp + v;
+            }
+            return;
         }
     }
     if (live) {
