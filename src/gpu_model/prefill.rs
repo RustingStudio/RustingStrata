@@ -424,6 +424,8 @@ impl GpuModel<'_> {
                 rope += 8;
             }
             // Hyper-connections / mHC: mixer and FFN outputs go to "mix" and "mo", then into the streams.
+            // A batched step (`rows`) may take the decode GEMM; one request keeps the prefill GEMM's bits.
+            let bf = if rows.is_some() { BATCHED } else { 0 };
             let (mx, mact) = if c.hc_n > 0 || ly.mhc.is_some() { (at(l.mix), 0) } else { (x, 2) };
             if let Some(pl) = &ly.ple { self.ple(pl, x, step, t, &ha)?; }
             if let Some((mk, mhc_a, _)) = &ly.mhc {
@@ -462,7 +464,7 @@ impl GpuModel<'_> {
                         }
                         v
                     };
-                    g.gemm_dense(qkv, t, h, ne, at(l.a), channels, 0)?;
+                    g.gemm_dense(qkv, t, h, ne, at(l.a), channels, bf)?;
                     // The qkv GEMM above already quantized `h`; when it did not (IQ2_XS, or a shape the int8 GEMM
                     // skips), prepare it now so beta, alpha and the gate can all reuse one copy.
                     g.prequant_gemm_x(gate, t, h, ne)?;
@@ -476,9 +478,9 @@ impl GpuModel<'_> {
                     }
                     // The beta and alpha GEMMs (16 blocks each) run beside the norm: batch launches alternate streams.
                     g.batch(&mut || {
-                        g.gemm_dense(beta, t, h, ne, eb, nv, SAME_X)?;
+                        g.gemm_dense(beta, t, h, ne, eb, nv, SAME_X | bf)?;
                         g.l2_norm(at(l.c), dk, 2 * nk, channels, t * 2 * nk, eps)?;
-                        g.gemm_dense(alpha, t, h, ne, eg, nv, SAME_X)
+                        g.gemm_dense(alpha, t, h, ne, eg, nv, SAME_X | bf)
                     })?;
                     g.ssm_gates(eb, eg, dt_bias.ptr, a.ptr, t * nv, nv)?;
                     probe(&mut tr, "qkv", &pf.slab, at(l.a), channels, t)?;
@@ -501,15 +503,15 @@ impl GpuModel<'_> {
                     // one slot read each other's state, so those go in order, outside a batch.
                     if rows.is_some_and(|(sl, _)| runs(sl).len() > 1) {
                         scan()?;
-                        g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, SAME_X)?;
+                        g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, SAME_X | bf)?;
                     } else {
-                        g.batch(&mut || { scan()?; g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, SAME_X) })?;
+                        g.batch(&mut || { scan()?; g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, SAME_X | bf) })?;
                     }
                     probe(&mut tr, "deltanet", &pf.slab, at(l.d), c.ssm_d_inner, t)?;
                     probe(&mut tr, "state", &s[self.cur], s[self.cur].addr(), s[self.cur].len() / 4, 1)?;
                     probe(&mut tr, "z", &pf.slab, at(l.b), c.ssm_d_inner, t)?;
                     if ly.hc.is_some() { g.norm_gate_sig(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps, 0)?; } else { g.norm_gate(at(l.d), norm.ptr, at(l.b), dv, t * nv, eps)?; }
-                    g.gemm_dense(out, t, at(l.d), c.ssm_d_inner, mx, ne, mact)?;
+                    g.gemm_dense(out, t, at(l.d), c.ssm_d_inner, mx, ne, mact | bf)?;
                 }
                 Mixer::Attn { q, k, v, qn, kn, o, sink, .. } if let Some((_, splits)) = rows => {
                     // As `batch_rows` on a dense model: each row reads and extends its own slot's KV.
@@ -595,8 +597,8 @@ impl GpuModel<'_> {
             }
             match &ly.ffn {
                 Ffn::Dense { gate, up, down } => {
-                    g.gemm_dense(gate, t, h, ne, at(l.ge), c.n_ff, 0)?;
-                    g.gemm_dense(up, t, h, ne, at(l.ge), c.n_ff, 1 | SAME_X)?;
+                    g.gemm_dense(gate, t, h, ne, at(l.ge), c.n_ff, bf)?;
+                    g.gemm_dense(up, t, h, ne, at(l.ge), c.n_ff, 1 | SAME_X | bf)?;
                     probe(&mut tr, "gate_up", &pf.slab, at(l.ge), c.n_ff, t)?;
                     if let Some((mk, _, mhc_f)) = &ly.mhc {
                         g.gemm_dense(down, t, at(l.ge), c.n_ff, at(l.mo), ne, 0)?;
@@ -607,7 +609,7 @@ impl GpuModel<'_> {
                             g.dtod(&pf.slab, 4 * l.mo, &pf.slab, 0, 4 * t * ne)?;
                         }
                     } else {
-                        g.gemm_dense(down, t, at(l.ge), c.n_ff, x, ne, 2)?;
+                        g.gemm_dense(down, t, at(l.ge), c.n_ff, x, ne, 2 | bf)?;
                     }
                 }
                 Ffn::Moe { router, shared } => {
@@ -622,8 +624,8 @@ impl GpuModel<'_> {
                     g.router_topk(at(l.rl), c.n_expert, k, c.expert_weights_scale, ids_d, at(l.wts), t, c.router_sigmoid)?;
                     let (sh, sg) = match shared {
                         Some(s) => {
-                            g.gemm_dense(&s.gate, t, h, ne, at(l.shg), c.n_ff_shexp, SAME_X)?;
-                            g.gemm_dense(&s.up, t, h, ne, at(l.shg), c.n_ff_shexp, 1 | SAME_X)?;
+                            g.gemm_dense(&s.gate, t, h, ne, at(l.shg), c.n_ff_shexp, SAME_X | bf)?;
+                            g.gemm_dense(&s.up, t, h, ne, at(l.shg), c.n_ff_shexp, 1 | SAME_X | bf)?;
                             (at(l.shy), if s.gate_inp.is_some() { at(l.sg) } else { 0 })
                         }
                         None => (0, 0),
@@ -777,7 +779,7 @@ impl GpuModel<'_> {
                     }
                     g.beside_join()?;
                     // The shared down runs last, so the routed gate and up above reuse the int8 h of the shared up.
-                    if let Some(s) = shared { g.gemm_dense(&s.down, t, at(l.shg), c.n_ff_shexp, at(l.shy), ne, 0)?; }
+                    if let Some(s) = shared { g.gemm_dense(&s.down, t, at(l.shg), c.n_ff_shexp, at(l.shy), ne, bf)?; }
                     // Expert rows are slots (token, j) sorted by expert, not tokens.
                     probe(&mut tr, "experts_gate_up", &pf.slab, at(l.ge), c.n_ff_exp, t * k)?;
                     probe(&mut tr, "experts_down", &pf.slab, at(l.ye), ne, t * k)?;
