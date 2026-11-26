@@ -1065,6 +1065,10 @@ enum Cmd {
         /// Per-sample time limit in seconds (0 = no limit). A timeout is recorded as a failed sample.
         #[arg(long, default_value_t = 0)]
         timeout: u64,
+        /// Time limit of the search in minutes (0 = none): no sample starts after it, and the best point so far is
+        /// written. The baseline comes before it.
+        #[arg(long, default_value_t = 30)]
+        minutes: u64,
         /// Keep the full benchmark report and sample trace in this directory.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -1522,7 +1526,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Calibrate { model, ctx, vram_margin, backend, device, split, kv, lora, gpu: _, mtp_model, draft_model,
                          samples, reps, warmup, pp, tg, chunk_values, task, seed,
-                         dry_run, timeout, out, sub } => {
+                         dry_run, timeout, minutes, out, sub } => {
             set_kv_env(&kv);  // read by Gpu::new and Vk::new
             if !lora.is_empty() { say!("note: --lora is ignored by calibrate; calibration uses the base model"); }
             if split.is_some() { say!("note: --split is ignored by calibrate; measurements use the free-VRAM split"); }
@@ -1550,7 +1554,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             settings.aux = draft_model.map(|p| ("--draft-model", p)).or_else(|| mtp_model.map(|p| ("--mtp-model", p)));
             settings.samples = samples; settings.reps = reps; settings.warmup = warmup; settings.pp = pp;
             settings.tg = tg; settings.tasks = task;
-            settings.seed = seed; settings.dry_run = dry_run; settings.timeout = timeout; settings.out = out;
+            settings.seed = seed; settings.dry_run = dry_run; settings.timeout = timeout; settings.minutes = minutes; settings.out = out;
             if settings.pp.is_empty() || settings.pp.iter().any(|&n| n == 0) { anyhow::bail!("--pp needs at least one positive prompt depth"); }
             if settings.samples == 0 { anyhow::bail!("--samples must be positive"); }
             if !model.is_dir() { return calibrate_v2(&settings); }
@@ -2364,6 +2368,7 @@ struct CalibSettings {
     seed: u64,
     dry_run: bool,
     timeout: u64,
+    minutes: u64,
     out: Option<PathBuf>,
     /// Only used by the `spec` subcommand.
     spec_types: Vec<String>,
@@ -2378,7 +2383,7 @@ impl CalibSettings {
             model, backend: None, device: vec![0], vram_margin: vec!["512".into()], kv: "f16".into(),
             aux: None, ctx: 4096, samples: 24, reps: 3, warmup: 0, pp: vec![128, 512, 2048], tg: 128,
             chunk_values: vec![256, 512, 1024, 2048, 4096], tasks: vec!["prose".into()],
-            seed: 1, dry_run: false, timeout: 0, out: None,
+            seed: 1, dry_run: false, timeout: 0, minutes: 30, out: None,
             spec_types: vec![], draft_max: vec![], ngram_n: vec![], mtp_values: vec![],
         }
     }
@@ -2820,7 +2825,11 @@ fn calibrate_v2(s: &CalibSettings) -> anyhow::Result<()> {
     let mut measure = measure_fn(s, &backend);
     let base_knobs = baseline_knobs(&space, &arch);
     say!("baseline (current defaults): {}", base_knobs.label());
+    let t0 = std::time::Instant::now();
     let (baseline, ok) = baseline_samples(measure(&base_knobs, &workloads));
+    let each = t0.elapsed().as_secs_f64();
+    let limit = if s.minutes > 0 { format!(", stopping after {} min (--minutes)", s.minutes) } else { String::new() };
+    say!("baseline took {each:.0} s; up to {} more samples of about that, {:.0} min{limit}", s.samples, each * s.samples as f64 / 60.0);
     if !ok { say!("warning: baseline failed (e.g. OOM at the default chunk); searching from a neutral reference"); }
     let backend_name = calib_backend_name(s, &backend);
     let gpu = calib_gpu_name(s, &backend_name);
@@ -2830,7 +2839,8 @@ fn calibrate_v2(s: &CalibSettings) -> anyhow::Result<()> {
         say!("written to {}", path.display());
         return Ok(());
     }
-    let cfg = SearchConfig { samples: s.samples, coarse: (s.samples / 3).min(8), starts: 3, patience: 2, seed: s.seed };
+    let cfg = SearchConfig { samples: s.samples, coarse: (s.samples / 3).min(8), starts: 3, patience: 2, seed: s.seed,
+                             deadline: (s.minutes > 0).then(|| std::time::Instant::now() + std::time::Duration::from_secs(s.minutes * 60)) };
     let result = calibrate::search(&space, &workloads, &cfg, &Objective::balanced(), &base_knobs, baseline, &mut measure)?;
     anyhow::ensure!(result.best.error.is_none(), "no successful measurement; calibration not written");
     // The baseline competes at score calibrate::MIN_GAIN, so this only happens when the baseline measurement itself failed. Never
@@ -2892,7 +2902,8 @@ fn calibrate_spec(s: &CalibSettings) -> anyhow::Result<()> {
     let (baseline, ok) = baseline_samples(measure(&base, &workloads));
     if !ok { say!("warning: baseline failed; searching from a neutral reference"); }
     say!("baseline (current defaults): {}", base.label());
-    let cfg = SearchConfig { samples: s.samples, coarse: (s.samples / 3).min(8), starts: 3, patience: 2, seed: s.seed };
+    let cfg = SearchConfig { samples: s.samples, coarse: (s.samples / 3).min(8), starts: 3, patience: 2, seed: s.seed,
+                             deadline: (s.minutes > 0).then(|| std::time::Instant::now() + std::time::Duration::from_secs(s.minutes * 60)) };
     let result = calibrate::search(&space, &workloads, &cfg, &Objective::balanced(), &base, baseline, &mut measure)?;
     anyhow::ensure!(result.best.error.is_none(), "no successful spec measurement; calibration not written");
     if result.best.score < 1.0 {

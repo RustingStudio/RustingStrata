@@ -149,10 +149,12 @@ pub struct SearchConfig {
     pub patience: usize,
     /// Deterministic seed (also used for the low-discrepancy sequence).
     pub seed: u64,
+    /// Wall-clock end: no sample starts after it, and the best so far is the result (stop reason "time").
+    pub deadline: Option<Instant>,
 }
 
 impl Default for SearchConfig {
-    fn default() -> Self { Self { samples: 24, coarse: 8, starts: 3, patience: 2, seed: 1 } }
+    fn default() -> Self { Self { samples: 24, coarse: 8, starts: 3, patience: 2, seed: 1, deadline: None } }
 }
 
 /// Result of a search, including the full trace for the JSON report.
@@ -230,6 +232,9 @@ where F: FnMut(&Knobs, &[Workload]) -> Result<Vec<Measurement>>
         workloads: workloads.len(),
     });
     let mut used = 0usize;
+    let late = || cfg.deadline.is_some_and(|d| Instant::now() >= d);
+    let full = |used: usize| used >= cfg.samples || late();
+    let mut n = 0usize;
 
     let mut evaluate = |knobs: &Knobs, subset: &[Workload]| -> Result<Trial> {
         let t0 = Instant::now();
@@ -239,6 +244,9 @@ where F: FnMut(&Knobs, &[Workload]) -> Result<Vec<Measurement>>
             Err(e) => (vec![], Some(format!("{e:#}"))),
         };
         let score = if error.is_some() { 0.0 } else { aggregate_score(&measurements, &baselines, obj) };
+        n += 1;
+        let what = error.as_deref().map_or_else(|| format!("score {score:.3}"), |e| format!("failed: {}", e.lines().next().unwrap_or("")));
+        crate::say!("sample {n}/{}: {} on {} workload(s), {what} ({:.0} s)", cfg.samples, knobs.label(), subset.len(), t0.elapsed().as_secs_f64());
         Ok(Trial { knobs: knobs.clone(), measurements, score, error, elapsed_ms: t0.elapsed().as_millis(), workloads: subset.len() })
     };
 
@@ -256,12 +264,13 @@ where F: FnMut(&Knobs, &[Workload]) -> Result<Vec<Measurement>>
     // points for Stage B; they are never compared with full-matrix scores or allowed to win.
     let coarse = cfg.coarse.min(cfg.samples / 3).min(16).max(1);
     for i in 0..coarse {
+        if full(used) { break }
         let k = quantize(space, &low_discrepancy(i, space.len(), cfg.seed));
         if let Some(trial) = eval_unique(&k, &workloads[..1])? {
             used += 1;
             trials.push(trial);
         }
-        if used >= cfg.samples { break }
+        if full(used) { break }
     }
 
     // Stage B: multi-start coordinate descent on the full matrix.
@@ -277,7 +286,7 @@ where F: FnMut(&Knobs, &[Workload]) -> Result<Vec<Measurement>>
         let mut stop_reason = "budget".to_string();
         // Re-measure the seed on the full matrix before comparing it with full-matrix candidates. Otherwise a point
         // that only wins on the shortest prompt would start with an inflated score and reject real improvements.
-        let mut cur_trial = if used >= cfg.samples { break } else if let Some(t) = eval_unique(&cur, workloads)? {
+        let mut cur_trial = if full(used) { break } else if let Some(t) = eval_unique(&cur, workloads)? {
             used += 1;
             trials.push(t.clone());
             t
@@ -293,7 +302,7 @@ where F: FnMut(&Knobs, &[Workload]) -> Result<Vec<Measurement>>
                 let original = cur_trial.knobs.get(&s.name);
                 let mut local_best = cur_trial.clone();
                 for &v in &s.values {
-                    if Some(v) == original || used >= cfg.samples { continue }
+                    if Some(v) == original || full(used) { continue }
                     let mut candidate = cur_trial.knobs.clone();
                     candidate.set(&s.name, v);
                     if let Some(t) = eval_unique(&candidate, workloads)? {
@@ -301,19 +310,19 @@ where F: FnMut(&Knobs, &[Workload]) -> Result<Vec<Measurement>>
                         trials.push(t.clone());
                         if t.error.is_none() && t.score > local_best.score { local_best = t; }
                     }
-                    if used >= cfg.samples { break; }
+                    if full(used) { break; }
                 }
                 match local_best.error.clone() {
                     None if local_best.score > cur_trial.score => { cur_trial = local_best; improved = true; }
                     _ => {}
                 }
-                if used >= cfg.samples { break; }
+                if full(used) { break; }
             }
             if !improved { stale += 1; if stale >= cfg.patience.max(1) { stop_reason = "converged".into(); } }
             else { stale = 0; }
-            if used >= cfg.samples || stop_reason == "converged" { break; }
+            if full(used) || stop_reason == "converged" { break; }
         }
-        if used >= cfg.samples { converged_all = false; break; }
+        if full(used) { converged_all = false; break; }
         if stop_reason != "converged" { converged_all = false; }
     }
 
@@ -324,11 +333,11 @@ where F: FnMut(&Knobs, &[Workload]) -> Result<Vec<Measurement>>
         knobs: default_knobs(space), measurements: vec![], score: 0.0,
         error: Some("no successful full-matrix measurement".into()), elapsed_ms: 0, workloads: 0,
     });
-    if used < cfg.samples {
+    if !full(used) {
         for s in space.iter().filter(|s| !s.reload) {
             let original = best.knobs.get(&s.name);
             for &v in &s.values {
-                if Some(v) == original || used >= cfg.samples { continue }
+                if Some(v) == original || full(used) { continue }
                 let mut candidate = best.knobs.clone();
                 candidate.set(&s.name, v);
                 if let Some(t) = eval_unique(&candidate, workloads)? {
@@ -339,7 +348,7 @@ where F: FnMut(&Knobs, &[Workload]) -> Result<Vec<Measurement>>
             }
         }
     }
-    let stop_reason = if used >= cfg.samples || !converged_all { "budget" } else { "converged" }.to_string();
+    let stop_reason = if late() { "time" } else if full(used) || !converged_all { "budget" } else { "converged" }.to_string();
     Ok(SearchResult {
         best, baseline, trials, samples_used: used, stop_reason,
         elapsed_ms: start.elapsed().as_millis(), seed: cfg.seed,
@@ -381,7 +390,7 @@ mod tests {
     #[test]
     fn search_respects_the_sample_budget_and_finds_the_best_region() {
         let mut calls = 0;
-        let cfg = SearchConfig { samples: 12, coarse: 4, starts: 2, patience: 1, seed: 5 };
+        let cfg = SearchConfig { samples: 12, coarse: 4, starts: 2, patience: 1, seed: 5, deadline: None };
         let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), &baseline_knobs(), vec![base(), base()], |k, _| {
             calls += 1;
             let boost = if k.i("chunk") == Some(1024) { 2.0 } else { 1.0 } * if k.i("mtp") == Some(1) { 1.5 } else { 1.0 };
@@ -404,7 +413,7 @@ mod tests {
             KnobSpec::new("chunk", (1..=8).map(|i| i as f64 * 100.0), false),
             KnobSpec::new("mtp", (0..8).map(|i| i as f64), false),
         ];
-        let cfg = SearchConfig { samples: 40, coarse: 3, starts: 3, patience: 2, seed: 9 };
+        let cfg = SearchConfig { samples: 40, coarse: 3, starts: 3, patience: 2, seed: 9, deadline: None };
         let r = search(&big, &workloads(), &cfg, &Objective::balanced(), &baseline_knobs(), vec![base(), base()], |k, _| {
             let boost = 1.0 + k.i("chunk").unwrap() as f64 / 1000.0 + k.i("mtp").unwrap() as f64 / 100.0;
             Ok(vec![Measurement { prefill_tok_s: 100.0 * boost, decode_tok_s: 20.0 * boost, ..Default::default() }])
@@ -414,7 +423,7 @@ mod tests {
 
     #[test]
     fn short_prompt_only_gains_cannot_win_the_search() {
-        let cfg = SearchConfig { samples: 14, coarse: 6, starts: 3, patience: 1, seed: 3 };
+        let cfg = SearchConfig { samples: 14, coarse: 6, starts: 3, patience: 1, seed: 3, deadline: None };
         let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), &baseline_knobs(), vec![base(), base()], |k, subset| {
             let mtp = k.i("mtp").unwrap();
             Ok(subset.iter().map(|w| {
@@ -428,7 +437,7 @@ mod tests {
 
     #[test]
     fn failed_measurements_are_recorded_and_never_win() {
-        let cfg = SearchConfig { samples: 8, coarse: 4, starts: 1, patience: 1, seed: 2 };
+        let cfg = SearchConfig { samples: 8, coarse: 4, starts: 1, patience: 1, seed: 2, deadline: None };
         let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), &baseline_knobs(), vec![base(), base()], |k, _| {
             if k.i("mtp") == Some(1) { anyhow::bail!("out of memory") }
             Ok(vec![base(), base()])
@@ -439,7 +448,7 @@ mod tests {
 
     #[test]
     fn an_empty_baseline_still_allows_the_search_to_run() {
-        let cfg = SearchConfig { samples: 10, coarse: 3, starts: 1, patience: 1, seed: 6 };
+        let cfg = SearchConfig { samples: 10, coarse: 3, starts: 1, patience: 1, seed: 6, deadline: None };
         let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), &baseline_knobs(), vec![], |_, _| {
             Ok(vec![Measurement { prefill_tok_s: 100.0, decode_tok_s: 20.0, ..Default::default() }])
         }).unwrap();
@@ -449,7 +458,7 @@ mod tests {
 
     #[test]
     fn the_same_knob_point_is_never_measured_twice() {
-        let cfg = SearchConfig { samples: 60, coarse: 6, starts: 3, patience: 2, seed: 7 };
+        let cfg = SearchConfig { samples: 60, coarse: 6, starts: 3, patience: 2, seed: 7, deadline: None };
         let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), &baseline_knobs(), vec![base(), base()], |k, _| {
             let boost = 1.0 + k.i("chunk").unwrap() as f64 / 10000.0 + k.i("mtp").unwrap() as f64 / 10.0;
             Ok(vec![Measurement { prefill_tok_s: 100.0 * boost, decode_tok_s: 20.0 * boost, ..Default::default() }])
@@ -463,7 +472,7 @@ mod tests {
     #[test]
     fn every_start_converging_is_recorded_as_converged() {
         // A flat landscape: no move ever improves, so all starts stop on patience before the budget is used.
-        let cfg = SearchConfig { samples: 60, coarse: 3, starts: 2, patience: 2, seed: 4 };
+        let cfg = SearchConfig { samples: 60, coarse: 3, starts: 2, patience: 2, seed: 4, deadline: None };
         let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), &baseline_knobs(), vec![base(), base()], |_, _| {
             Ok(vec![base(), base()])
         }).unwrap();
@@ -472,8 +481,21 @@ mod tests {
     }
 
     #[test]
+    fn deadline_stops_the_search() {
+        let space = vec![KnobSpec::new("chunk", [256.0, 512.0, 1024.0], true)];
+        let ws = vec![Workload::new(128, 16, "prose")];
+        let mut calls = 0;
+        let cfg = SearchConfig { samples: 20, deadline: Some(Instant::now()), ..Default::default() };
+        let r = search(&space, &ws, &cfg, &Objective::balanced(), &Knobs::default(), vec![], |_, _| {
+            calls += 1;
+            Ok(vec![Measurement { prefill_tok_s: 1.0, decode_tok_s: 1.0, ..Default::default() }])
+        }).unwrap();
+        assert_eq!((calls, r.samples_used, r.stop_reason.as_str()), (0, 0, "time"));
+    }
+
+    #[test]
     fn a_slower_candidate_can_never_beat_the_baseline() {
-        let cfg = SearchConfig { samples: 20, coarse: 6, starts: 3, patience: 2, seed: 11 };
+        let cfg = SearchConfig { samples: 20, coarse: 6, starts: 3, patience: 2, seed: 11, deadline: None };
         let base_knobs = baseline_knobs();
         let r = search(&space(), &workloads(), &cfg, &Objective::balanced(), &base_knobs,
                        vec![base(), base()], |_, _| {
