@@ -175,6 +175,34 @@ pub const PAGE: &str = include_str!("web/index.html");
 /// What a chat of a model outside the main engine did, for the server's log and statistics.
 pub struct Done { pub prompt: usize, pub cached: usize, pub completion: usize, pub prefill_s: f64, pub finish: &'static str }
 
+impl Done {
+    /// The llama-server `timings` block of this reply; `t` is when its prefill started.
+    pub fn timings(&self, t: std::time::Instant) -> Value {
+        let decode_ms = (t.elapsed().as_secs_f64() - self.prefill_s).max(0.0) * 1e3;
+        timings(self.prompt, self.cached, self.completion, self.prefill_s * 1e3, decode_ms)
+    }
+}
+
+/// The `timings` block llama-server puts in its responses. llama-swap and other OpenAI-compatible clients read it for
+/// prefill/decode rates. `prompt_n` is the uncached part of the prompt and `cache_n` the part served from cache, as in
+/// llama-server.
+pub fn timings(prompt: usize, cached: usize, completion: usize, prefill_ms: f64, decode_ms: f64) -> Value {
+    let prompt_n = prompt.saturating_sub(cached);
+    let per_token_ms = |ms: f64, n: usize| if n == 0 { 0.0 } else { ms / n as f64 };
+    let per_second = |ms: f64, n: usize| if ms > 0.0 { n as f64 * 1e3 / ms } else { 0.0 };
+    serde_json::json!({
+        "prompt_n": prompt_n,
+        "prompt_ms": prefill_ms,
+        "prompt_per_token_ms": per_token_ms(prefill_ms, prompt_n),
+        "prompt_per_second": per_second(prefill_ms, prompt_n),
+        "predicted_n": completion,
+        "predicted_ms": decode_ms,
+        "predicted_per_token_ms": per_token_ms(decode_ms, completion),
+        "predicted_per_second": per_second(decode_ms, completion),
+        "cache_n": cached,
+    })
+}
+
 /// Writes one response with a body.
 pub fn send(c: &mut impl std::io::Write, status: &str, ty: &str, b: &str) {
     let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());

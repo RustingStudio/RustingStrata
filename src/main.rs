@@ -3899,25 +3899,8 @@ fn text_delta(w: &mut impl Write, opened: &mut bool, t: &str) -> anyhow::Result<
     sse(w, json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": t}}))
 }
 
-/// The `timings` block llama-server puts in its responses. llama-swap and other
-/// OpenAI-compatible clients read it for prefill/decode rates. `prompt_n` is the
-/// uncached part of the prompt and `cache_n` the part served from cache, as in
-/// llama-server.
 fn llama_timings(l: &serve::Last) -> serde_json::Value {
-    let prompt_n = l.prompt_tokens.saturating_sub(l.cached_tokens);
-    let per_token_ms = |ms: f64, n: usize| if n == 0 { 0.0 } else { ms / n as f64 };
-    let per_second = |ms: f64, n: usize| if ms > 0.0 { n as f64 * 1e3 / ms } else { 0.0 };
-    json!({
-        "prompt_n": prompt_n,
-        "prompt_ms": l.prefill_ms,
-        "prompt_per_token_ms": per_token_ms(l.prefill_ms, prompt_n),
-        "prompt_per_second": per_second(l.prefill_ms, prompt_n),
-        "predicted_n": l.completion_tokens,
-        "predicted_ms": l.decode_ms,
-        "predicted_per_token_ms": per_token_ms(l.decode_ms, l.completion_tokens),
-        "predicted_per_second": per_second(l.decode_ms, l.completion_tokens),
-        "cache_n": l.cached_tokens,
-    })
+    serve::timings(l.prompt_tokens, l.cached_tokens, l.completion_tokens, l.prefill_ms, l.decode_ms)
 }
 
 /// The chat page, served by the connection threads of `strata serve`.

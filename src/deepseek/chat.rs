@@ -138,20 +138,26 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str) -> anyhow::Resu
             }).collect();
             if stream { json!({"tool_calls": c}) } else { json!({"role": "assistant", "content": if content.is_empty() { None } else { Some(content) }, "tool_calls": c}) }
         };
+        let d = crate::serve::Done { prompt: ids.len(), cached: keep, completion: out.len(), prefill_s, finish: done };
+        let timings = d.timings(t);
+        let usage = json!({"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len(), "prompt_tokens_details": {"cached_tokens": keep}});
         if q.stream {
             match &calls {
                 Some(x) => { let _ = write!(c, "data: {}\n\n", chunk(calls_json(x, true), None)); }
                 None if !hold.rest().is_empty() => { let _ = write!(c, "data: {}\n\n", chunk(json!({"content": hold.rest()}), None)); }
                 None => {}
             }
-            let _ = write!(c, "data: {}\n\ndata: [DONE]\n\n", chunk(json!({}), Some(done)));
+            let mut last = chunk(json!({}), Some(done));
+            last["usage"] = usage;
+            last["timings"] = timings;
+            let _ = write!(c, "data: {last}\n\ndata: [DONE]\n\n");
         }
         else {
             let message = match &calls { Some(x) => calls_json(x, false), None => json!({"role": "assistant", "content": hold.text}) };
             let b = json!({"object": "chat.completion", "model": name, "choices": [{"index": 0, "message": message, "finish_reason": done}],
-                "usage": {"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len()}});
+                "usage": usage, "timings": timings});
             crate::serve::send(c, "200 OK", "application/json", &b.to_string());
         }
-        Ok(crate::serve::Done { prompt: ids.len(), cached: keep, completion: out.len(), prefill_s, finish: done })
+        Ok(d)
     }))
 }

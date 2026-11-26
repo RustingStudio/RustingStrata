@@ -309,14 +309,20 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a crate::tokenizer::Tokenizer, name: &'a st
         let (out, done) = decode_greedy(&tok, &mut m, &stop, &mut lim, logits, n, &mut |t| {
             !stream || t.is_empty() || write!(c, "data: {}\n\n", chunk(json!({"content": t}), None)).is_ok()
         });
+        let d = crate::serve::Done { prompt: ids.len(), cached: keep, completion: out.len(), prefill_s, finish: done };
+        let timings = d.timings(t);
+        let usage = json!({"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len(), "prompt_tokens_details": {"cached_tokens": keep}});
         if stream {
-            let _ = write!(c, "data: {}\n\ndata: [DONE]\n\n", chunk(json!({}), Some(done)));
+            let mut last = chunk(json!({}), Some(done));
+            last["usage"] = usage;
+            last["timings"] = timings;
+            let _ = write!(c, "data: {last}\n\ndata: [DONE]\n\n");
         } else {
             let b = json!({"object": "chat.completion", "model": name, "choices": [{"index": 0, "message": {"role": "assistant", "content": tok.decode(&out)?}, "finish_reason": done}],
-                "usage": {"prompt_tokens": ids.len(), "completion_tokens": out.len(), "total_tokens": ids.len() + out.len()}});
+                "usage": usage, "timings": timings});
             crate::serve::send(c, "200 OK", "application/json", &b.to_string());
         }
-        Ok(crate::serve::Done { prompt: ids.len(), cached: keep, completion: out.len(), prefill_s, finish: done })
+        Ok(d)
     }))
 }
 
