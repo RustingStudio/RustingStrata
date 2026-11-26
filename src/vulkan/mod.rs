@@ -1499,7 +1499,16 @@ impl Backend for Vk {
         self.run("ssm_gates", &[], [n.div_ceil(256), 1, 1], &[&beta, &g, &dt_bias, &a, &(n as u32), &(nv as u32)])
     }
     fn conv_silu(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, nn: usize, eps: f32) -> anyhow::Result<()> {
-        self.run("conv_silu", &[], [ch.div_ceil(128), 1, 1], &[&qkv, &state, &w, &y, &(ch as u32), &(kw as u32), &(nn as u32), &eps])
+        self.run("conv_silu", &[], [ch.div_ceil(128), 1, 1], &[&qkv, &state, &w, &y, &(ch as u32), &(kw as u32), &(nn as u32), &eps, &0u64])
+    }
+    fn conv_silu_rows(&self, qkv: u64, tab: u64, states: &[u64], w: u64, y: u64, ch: usize, kw: usize, eps: f32) -> anyhow::Result<()> {
+        self.run("conv_silu", &[], [ch.div_ceil(128), states.len(), 1], &[&qkv, &0u64, &w, &y, &(ch as u32), &(kw as u32), &0u32, &eps, &tab])
+    }
+    fn deltanet_rows(&self, y: u64, tab: u64, states: &[u64], beta: u64, g: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, ych: usize) -> anyhow::Result<()> {
+        let rows = 512 / dk.max(1);
+        ensure!(matches!(dk, 32 | 64 | 128 | 256) && dv % rows == 0, "deltanet: head dims {dk}/{dv} unsupported");
+        self.run("deltanet", &[], [nv, dv.div_ceil(8 * rows), states.len()], &[&y, &0u64, &beta, &g, &o, &0u64, &0u64, &0u64, &tab, &(nk as u32), &(nv as u32),
+            &(interleave as u32), &(dk as u32), &(dv as u32), &scale, &1u32, &(ych as u32), &0u32])
     }
     fn deltanet(&self, y: u64, s: u64, beta: u64, g: u64, dt_bias: u64, a: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> {
         self.deltanet_strided(y, s, beta, g, dt_bias, a, o, nk, nv, interleave, dk, dv, scale, t, ych, snap, nsnap, 1)
@@ -1509,7 +1518,7 @@ impl Backend for Vk {
         let rows = 512 / dk.max(1);  // state rows per subgroup
         ensure!(matches!(dk, 32 | 64 | 128 | 256) && dv % rows == 0, "deltanet: head dims {dk}/{dv} unsupported");
         let spec: &[u32] = if snap_stride > 1 { &[0, snap_stride as u32] } else { &[] };
-        self.run("deltanet", spec, [nv, dv.div_ceil(8 * rows), 1], &[&y, &s, &beta, &g, &o, &snap, &dt_bias, &a, &(nk as u32), &(nv as u32),
+        self.run("deltanet", spec, [nv, dv.div_ceil(8 * rows), 1], &[&y, &s, &beta, &g, &o, &snap, &dt_bias, &a, &0u64, &(nk as u32), &(nv as u32),
             &(interleave as u32), &(dk as u32), &(dv as u32), &scale, &(t as u32), &(ych as u32), &(nsnap as u32)])
     }
     fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> {
