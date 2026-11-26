@@ -1365,7 +1365,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 return rusting_strata::inkling2::chat::generate_image_opts(&g, &prompt, Some((&input.grids, &input.embeddings)), n, opts);
             }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
-            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
+            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?
+                .with_fast_matvec(!engine.gpu);
             let tok = Tokenizer::from_gguf(&g)?;
             let prompt = if prompt == "-" {
                 let mut s = String::new();
@@ -1470,7 +1471,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 }
             }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
-            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
+            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?
+                .with_fast_matvec(!engine.gpu);
             let tok = Tokenizer::from_gguf(&g)?;
             let mut r = engine.runner(&m, &model)?;
             let mut results = Vec::with_capacity(pp.len());
@@ -1706,7 +1708,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 };
             }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
-            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
+            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?
+                .with_fast_matvec(!engine.gpu);
             let tok = Tokenizer::from_gguf(&g)?;
             let image_input = if image.is_empty() { None } else {
                 let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
@@ -3635,7 +3638,10 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
         })
     } else {
         aux_g = open_mtp_gguf(engine.aux_model_path())?;
-        m = { let mut m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?; if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; } m };
+        let mut loaded = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?
+            .with_fast_matvec(!engine.gpu);
+        if !engine.lora.is_empty() { loaded.apply_lora(&engine.lora_specs())?; }
+        m = loaded;
         engine.runner(&m, model)?
     };
     // Serving decodes one reply after a (usually cached) prompt: follow the reply's routing, not the prompt's.

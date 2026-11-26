@@ -32,6 +32,7 @@ pub struct Model<'a> {
     pub loras: Vec<Lora>,
     pub draft_model: Option<Box<Model<'a>>>,
     ple: Option<Ple>,
+    fast_matvec: bool,
 }
 
 impl Model<'_> {
@@ -97,13 +98,23 @@ impl Default for Mtp {
     fn default() -> Mtp { Mtp { kv: LayerState::Attn { k: Vec::new(), v: Vec::new(), ik: Vec::new() }, pos: 0 } }
 }
 
-fn mv(t: &Tensor, x: &[f32]) -> Vec<f32> {
-    let mut y = vec![0f32; t.rows];
-    t.matvec(x, &mut y);
-    y
-}
-
 impl<'a> Model<'a> {
+    /// Use quantized CPU dot products for inference. Integer kernels quantize activations to Q8_K.
+    pub fn with_fast_matvec(mut self, enabled: bool) -> Self {
+        self.fast_matvec = enabled;
+        self
+    }
+
+    fn mv(&self, t: &Tensor, x: &[f32]) -> Vec<f32> {
+        let mut y = vec![0f32; t.rows];
+        if self.fast_matvec {
+            crate::cpu_moe::matvec(t, x, &mut y);
+        } else {
+            t.matvec(x, &mut y);
+        }
+        y
+    }
+
     pub fn load(g: &'a Gguf) -> anyhow::Result<Model<'a>> { Self::load_with_lora(g, &[]) }
     pub fn load_with_lora(g: &'a Gguf, loras: &[(String, f32)]) -> anyhow::Result<Model<'a>> {
         Self::load_with_aux(g, None, loras)
@@ -280,7 +291,7 @@ impl<'a> Model<'a> {
             w.get("output_norm.weight")?;
             None
         };
-        let mut m = Model { cfg, w, loras: Vec::new(), draft_model, ple };
+        let mut m = Model { cfg, w, loras: Vec::new(), draft_model, ple, fast_matvec: false };
         m.apply_lora(loras)?;
         Ok(m)
     }
@@ -413,7 +424,7 @@ impl<'a> Model<'a> {
         let norm: Vec<f32> = r.iter().map(|&v| v * scale).collect();
         let w = self.t(il, &format!("{prefix}.weight"));
         let b = self.f(il, &format!("{prefix}.bias"));
-        let mut logits = mv(&w, &norm);
+        let mut logits = self.mv(&w, &norm);
         for (l, &bi) in logits.iter_mut().zip(&b) { *l += bi; }
         let pre: Vec<f32> = logits[..streams].iter().map(|&v| ops::sigmoid(v)).collect();
         let post: Vec<f32> = logits[streams..2 * streams].iter().map(|&v| 2.0 * ops::sigmoid(v)).collect();
@@ -488,7 +499,7 @@ impl<'a> Model<'a> {
         st.pos += 1;
         st.rope_pos = [rope_pos[0] + 1; 4];
         let (h, _) = self.hc_read(&r, "output_hc_");
-        (mv(&self.w.get("output.weight").unwrap(), &h), r)
+        (self.mv(&self.w.get("output.weight").unwrap(), &h), r)
     }
 
     /// Hyper-connection read (`build_hc_mix`) of the stack `r` with the tensors `{p}norm/down/up/inject.weight`:
@@ -499,10 +510,10 @@ impl<'a> Model<'a> {
         let t = |s: &str| self.w.get(&format!("{p}{s}.weight"));
         let mut xn = vec![0f32; r.len()];
         self.gnorm(r, &t("norm").unwrap().to_f32(), &mut xn);
-        let lo: Vec<f32> = mv(&t("down").unwrap(), &xn).into_iter().map(|v| ops::silu(v / hc)).collect();
+        let lo: Vec<f32> = self.mv(&t("down").unwrap(), &xn).into_iter().map(|v| ops::silu(v / hc)).collect();
         let mut mixed = vec![0f32; n];
-        for (i, g) in mv(&t("up").unwrap(), &lo).into_iter().enumerate() { mixed[i % n] += xn[i] * ops::sigmoid(g) / hc; }
-        (mixed, t("inject").map(|w| mv(&w, &xn)).unwrap_or_default())
+        for (i, g) in self.mv(&t("up").unwrap(), &lo).into_iter().enumerate() { mixed[i % n] += xn[i] * ops::sigmoid(g) / hc; }
+        (mixed, t("inject").map(|w| self.mv(&w, &xn)).unwrap_or_default())
     }
 
     /// Hyper-connection write (`build_hc_combine`): stream c += out * 2 sigmoid(inject[c] / hc).
@@ -560,10 +571,10 @@ impl<'a> Model<'a> {
     fn ple(&self, il: usize, r: &mut [f32], emb: &[f32], hist: &mut [f32]) {
         let (n, d) = (self.cfg.n_embd, r.len());
         let mut key = vec![0f32; d];
-        self.gnorm(&mv(&self.t(il, "ple_key.weight"), emb), &self.f(il, "ple_norm_key.weight"), &mut key);
+        self.gnorm(&self.mv(&self.t(il, "ple_key.weight"), emb), &self.f(il, "ple_norm_key.weight"), &mut key);
         let mut query = vec![0f32; d];
         self.gnorm(r, &self.f(il, "ple_norm_query.weight"), &mut query);
-        let value = mv(&self.t(il, "ple_value.weight"), emb);
+        let value = self.mv(&self.t(il, "ple_value.weight"), emb);
         let mut gated = vec![0f32; d];
         for (c, gc) in gated.chunks_exact_mut(n).enumerate() {
             let s = key[c * n..(c + 1) * n].iter().zip(&query[c * n..(c + 1) * n]).map(|(a, b)| a * b).sum::<f32>() / (n as f32).sqrt();
@@ -603,7 +614,7 @@ impl<'a> Model<'a> {
         let mut h = vec![0f32; self.cfg.n_embd];
         ops::rms_norm(x, norm, self.cfg.eps, &mut h);
         let head = self.w.get("output.weight").or_else(|_| self.w.get("token_embd.weight")).unwrap();
-        mv(&head, &h)
+        self.mv(&head, &h)
     }
 
     /// MTP draft (`nextn` block, stored as layer n_layer): logits for the token after `token`, from `hid`, the main
@@ -615,7 +626,7 @@ impl<'a> Model<'a> {
         let mut eh = vec![0f32; 2 * n];
         ops::rms_norm(&self.embed(token), &self.f(il, "nextn.enorm.weight"), c.eps, &mut eh[..n]);
         ops::rms_norm(hid, &self.f(il, "nextn.hnorm.weight"), c.eps, &mut eh[n..]);
-        let mut x = mv(&self.t(il, "nextn.eh_proj.weight"), &eh);
+        let mut x = self.mv(&self.t(il, "nextn.eh_proj.weight"), &eh);
         let rope_pos = [ms.pos as i32; 4];
         self.block(il, &mut x, &mut ms.kv, ms.pos, rope_pos);
         ms.pos += 1;
@@ -633,7 +644,7 @@ impl<'a> Model<'a> {
         let mut hn = vec![0f32; hid.len()];
         self.gnorm(hid, &self.f(il, "nextn.hnorm.weight"), &mut hn);
         let proj = self.t(il, "nextn.eh_proj.weight");
-        let mut r: Vec<f32> = hn.chunks_exact(n).flat_map(|h| mv(&proj, &[&e, h].concat())).collect();
+        let mut r: Vec<f32> = hn.chunks_exact(n).flat_map(|h| self.mv(&proj, &[&e, h].concat())).collect();
         let (h, inj) = self.hc_read(&r, &format!("blk.{il}.hc_attn_"));
         let LayerState::Attn { k, v, ik } = &mut ms.kv else { unreachable!("the nextn block is an attention layer") };
         Self::hc_write(&mut r, &self.attention(il, &h, k, v, ik, ms.pos, [ms.pos as i32; 4]), &inj);
@@ -641,7 +652,7 @@ impl<'a> Model<'a> {
         Self::hc_write(&mut r, &self.moe(il, &h), &inj);
         ms.pos += 1;
         let (h, _) = self.hc_read(&r, &format!("blk.{il}.nextn.hc_head_"));
-        (mv(&self.w.get("output.weight").unwrap(), &h), r)
+        (self.mv(&self.w.get("output.weight").unwrap(), &h), r)
     }
 
     fn deltanet(&self, il: usize, h: &[f32], conv: &mut [f32], s: &mut [f32]) -> Vec<f32> {
@@ -651,11 +662,11 @@ impl<'a> Model<'a> {
         let channels = c.ssm_d_inner + 2 * nk * dk;
         let kw = c.ssm_conv;
 
-        let qkv = mv(&self.t(il, "attn_qkv.weight"), h);
-        let z = mv(&self.t(il, "attn_gate.weight"), h);
-        let beta: Vec<f32> = mv(&self.t(il, "ssm_beta.weight"), h).into_iter().map(ops::sigmoid).collect();
+        let qkv = self.mv(&self.t(il, "attn_qkv.weight"), h);
+        let z = self.mv(&self.t(il, "attn_gate.weight"), h);
+        let beta: Vec<f32> = self.mv(&self.t(il, "ssm_beta.weight"), h).into_iter().map(ops::sigmoid).collect();
         let (dt_bias, a) = (self.f(il, "ssm_dt.bias"), self.f(il, "ssm_a"));
-        let g: Vec<f32> = mv(&self.t(il, "ssm_alpha.weight"), h).iter().enumerate()
+        let g: Vec<f32> = self.mv(&self.t(il, "ssm_alpha.weight"), h).iter().enumerate()
             .map(|(i, &al)| ops::softplus(al + dt_bias[i]) * a[i]).collect();
 
         // Causal depthwise conv over [state..., current], then SiLU.
@@ -697,7 +708,7 @@ impl<'a> Model<'a> {
             let gate = if c.arch == "qwen4exp" { ops::sigmoid } else { ops::silu };
             for (x, zz) in oh.iter_mut().zip(&z[vh * dv..(vh + 1) * dv]) { *x *= gate(*zz); }
         }
-        mv(&self.t(il, "ssm_out.weight"), &out)
+        self.mv(&self.t(il, "ssm_out.weight"), &out)
     }
 
     /// RoPE for one head: 1-D when the model has no M-RoPE sections, otherwise `[t, y, x, z]`.
@@ -717,11 +728,11 @@ impl<'a> Model<'a> {
         let c = &self.cfg;
         let (nh, d) = (c.idx_n_head, c.idx_head_dim);
         if c.idx_top_k == 0 || il >= c.n_layer || self.w.layer(il, "indexer.k_proj.weight").is_err() { return None; }
-        ik.extend_from_slice(&mv(&self.t(il, "indexer.k_proj.weight"), h));
+        ik.extend_from_slice(&self.mv(&self.t(il, "indexer.k_proj.weight"), h));
         let (nb, top) = ((pos + 1) / QSA_POOL, c.idx_top_k / QSA_POOL);
         if nb <= top { return None; }
         let (qn, kn) = (self.f(il, "indexer.q_norm.weight"), self.f(il, "indexer.k_norm.weight"));
-        let qr = mv(&self.t(il, "indexer.q_proj.weight"), h);
+        let qr = self.mv(&self.t(il, "indexer.q_proj.weight"), h);
         let mut q = vec![0f32; nh * d];
         for i in 0..nh {
             ops::rms_norm(&qr[i * d..(i + 1) * d], &qn, c.eps, &mut q[i * d..(i + 1) * d]);
@@ -758,7 +769,7 @@ impl<'a> Model<'a> {
         let sinks = if c.attn_sinks { self.f(il, "attn_sinks.weight") } else { Vec::new() };
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
         let qs = if c.q_gate { 2 * hd } else { hd };  // per-head row of attn_q: query, then the gate if any
-        let qg = mv(&self.t(il, "attn_q.weight"), h);
+        let qg = self.mv(&self.t(il, "attn_q.weight"), h);
         let (qn, kn) = (self.f(il, "attn_q_norm.weight"), self.f(il, "attn_k_norm.weight"));
         let mut q = vec![0f32; nh * hd];
         for i in 0..nh {
@@ -766,8 +777,8 @@ impl<'a> Model<'a> {
             ops::rms_norm(&qg[i * qs..i * qs + hd], &qn, c.eps, qh);
             if use_rope { self.rope(qh, pos, rope_pos); }
         }
-        let kraw = mv(&self.t(il, "attn_k.weight"), h);
-        let v = mv(&self.t(il, "attn_v.weight"), h);
+        let kraw = self.mv(&self.t(il, "attn_k.weight"), h);
+        let v = self.mv(&self.t(il, "attn_v.weight"), h);
         let mut k = vec![0f32; nkv * hd];
         for i in 0..nkv {
             let kh = &mut k[i * hd..(i + 1) * hd];
@@ -797,7 +808,7 @@ impl<'a> Model<'a> {
                 for (o, gg) in oh.iter_mut().zip(gate) { *o *= ops::sigmoid(*gg); }
             }
         }
-        mv(&self.t(il, "attn_output.weight"), &out)
+        self.mv(&self.t(il, "attn_output.weight"), &out)
     }
 
     fn ffn(&self, il: usize, gate: &Tensor, up: &Tensor, down: &Tensor, down_name: &str, expert: Option<usize>, h: &[f32]) -> Vec<f32> {
@@ -806,9 +817,9 @@ impl<'a> Model<'a> {
         let rot = self.cfg.hadamard.as_ref().filter(|_| down_name == "ffn_down_exps.weight");
         let hr = rot.map(|r| r.rotated(h));
         let h = hr.as_deref().unwrap_or(h);
-        let mut a = mv(gate, h);
-        for (x, u) in a.iter_mut().zip(mv(up, h)) { *x = ops::silu(*x) * u; }
-        let mut y = match rot { Some(r) => mv(down, &r.rotated(&a)), None => mv(down, &a) };
+        let mut a = self.mv(gate, h);
+        for (x, u) in a.iter_mut().zip(self.mv(up, h)) { *x = ops::silu(*x) * u; }
+        let mut y = match rot { Some(r) => self.mv(down, &r.rotated(&a)), None => self.mv(down, &a) };
         if down_name == "ffn_down_exps.weight" {
             self.lora_delta(&format!("blk.{il}.{down_name}"), &a, &mut y, expert);
         }
@@ -824,7 +835,7 @@ impl<'a> Model<'a> {
         if self.w.layer(il, "ffn_up_shexp.weight").is_ok() {
             // Flint's shared expert is always on; Qwen's has a sigmoid gate.
             let s = match self.w.layer(il, "ffn_gate_inp_shexp.weight") {
-                Ok(sg) => ops::sigmoid(mv(&sg, h)[0]),
+                Ok(sg) => ops::sigmoid(self.mv(&sg, h)[0]),
                 Err(_) => 1.0,
             };
             let o = self.ffn(il, &self.t(il, "ffn_gate_shexp.weight"), &self.t(il, "ffn_up_shexp.weight"), &self.t(il, "ffn_down_shexp.weight"), "ffn_down_shexp.weight", Some(0), h);
@@ -836,7 +847,7 @@ impl<'a> Model<'a> {
     /// Router scores, top-k and normalized weights: (expert, weight) pairs.
     pub fn route(&self, il: usize, h: &[f32]) -> Vec<(usize, f32)> {
         let c = &self.cfg;
-        let mut p = mv(&self.t(il, "ffn_gate_inp.weight"), h);
+        let mut p = self.mv(&self.t(il, "ffn_gate_inp.weight"), h);
         if c.router_sigmoid {
             for v in &mut p { *v = ops::sigmoid(*v); }
         } else {
