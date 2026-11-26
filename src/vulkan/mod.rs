@@ -46,6 +46,8 @@ const SPV: &[(&str, &[u8])] = &[
     ("gemmi_s", include_bytes!("spv/gemmi_s.spv")),
     ("gemm_red", include_bytes!("spv/gemm_red.spv")),
     ("gemmi_s_16", include_bytes!("spv/gemmi_s_16.spv")),
+    ("gemmi_s2", include_bytes!("spv/gemmi_s2.spv")),
+    ("gemmi_s2_16", include_bytes!("spv/gemmi_s2_16.spv")),
     ("gemv_f", include_bytes!("spv/gemv_f.spv")),
     ("gemv_q", include_bytes!("spv/gemv_q.spv")),
     ("hadamard", include_bytes!("spv/hadamard.spv")),
@@ -98,9 +100,9 @@ const SPV: &[(&str, &[u8])] = &[
 pub struct Vk(Arc<Inner>, Buf, Buf, Mutex<(Buf, Option<[u64; 4]>)>, Mutex<(Buf, Option<[u64; 4]>)>, std::sync::OnceLock<Buf>);
 
 /// Split-K scratch of a batched GEMM: ks * nd * rows floats, ks chosen so ks * workgroups <= SPLIT_WG (so it fits:
-/// rows <= 64 g0 and nd <= 32 g1). 224, 448 and 896 measured alike at 16 rows; 448 was best at 64.
+/// rows <= 64 g0 and nd <= 64 g1). 224, 448 and 896 measured alike at 16 rows; 448 was best at 64.
 const SPLIT_WG: usize = 448;
-const SPLIT_SCR: usize = SPLIT_WG * 64 * 32 * 4;
+const SPLIT_SCR: usize = SPLIT_WG * 64 * 64 * 4;
 
 /// The IQ lookup tables in one buffer, and the `tables.glsl` that names each at its offset from the buffer's address
 /// (spec constants 3 and 4). As GLSL const arrays the tables went to per-thread local memory on NVIDIA, which made
@@ -1034,12 +1036,14 @@ impl Vk {
         // A step of a batch of requests (at most 64 rows of x): gemmi_s, K split over ks workgroups so that the few
         // weight-row tiles fill the device, each slice into the scratch, then gemm_red sums them (as gemmd on CUDA).
         if batched && tiles == 0 && xrow == 0 && nd <= 64 && self.0.coop_i8 != 0 && !self.0.st().batch {
-            let g = [rows.div_ceil(64), nd.div_ceil(32), 1];
+            // More than 32 positions: gemmi_s2, one tile of 64, so each weight is decoded once.
+            let s2 = nd > 32;
+            let g = [rows.div_ceil(64), nd.div_ceil(if s2 { 64 } else { 32 }), 1];
             let ks = (SPLIT_WG / (g[0] * g[1])).clamp(1, 8).min(nk as usize / 4).max(1);
             let (sk, scr) = if ks > 1 { (ks, self.5.get_or_init(|| self.alloc(SPLIT_SCR).expect("split-K scratch")).addr()) } else { (1, y) };
             let (ys, a) = if ks > 1 { (rows, 0) } else { (y_stride, act) };
             let args: [&dyn Arg; 11] = [&tiles, &wd, &xq, &xrow, &scr, &(nd as u32), &(ys as u32), tail[0], tail[1], &a, tail[3]];
-            self.run(if self.0.coop_i8 == 32 { "gemmi_s" } else { "gemmi_s_16" }, &spec, [g[0], g[1], sk], &args)?;
+            self.run(match (s2, self.0.coop_i8 == 32) { (false, true) => "gemmi_s", (false, false) => "gemmi_s_16", (true, true) => "gemmi_s2", (true, false) => "gemmi_s2_16" }, &spec, [g[0], g[1], sk], &args)?;
             if ks > 1 {
                 self.run("gemm_red", &[], [(rows * nd).div_ceil(256), 1, 1],
                     &[&scr, &y, &(rows as u32), &(nd as u32), &(y_stride as u32), &(ks as u32), &act])?;

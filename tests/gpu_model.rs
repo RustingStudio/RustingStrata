@@ -800,6 +800,31 @@ fn batch_matches_single() {
     }
 }
 
+/// Time of one `step_batch` forward at 16 to 128 rows (no logits read back). A speed check, not a test:
+/// `cargo test --release --test gpu_model batch_speed -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn batch_speed() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    for (bk, gpu) in common::backends() {
+        let mut gm = GpuModel::load_slots(&m, gpu, 512, 128, 512 << 20, 128).unwrap();
+        if gm.batch_cap() == 0 { continue; }
+        for s in 0..gm.slots() { gm.use_slot(s); gm.reset().unwrap(); gm.prefill(&[1, 2, 3, 4]).unwrap(); }
+        let most = gm.batch_cap().min(gm.slots());
+        for n in [16, 32, 48, 64, 128].into_iter().filter(|&n| n <= most) {
+            let rows: Vec<(usize, u32, bool)> = (0..n).map(|s| (s, 5, false)).collect();
+            gm.step_batch(&rows).unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..20 { gm.step_batch(&rows).unwrap(); }
+            let ms = t.elapsed().as_secs_f64() * 1e3 / 20.0;
+            eprintln!("batch_speed {bk}: {n} rows {ms:.2} ms a step, {:.0} tok/s", n as f64 * 1e3 / ms);
+        }
+    }
+}
+
 /// `prefill_slots` (several prompts in shared forwards, one of them continuing a saved state) against `prefill_cached`
 /// of each prompt alone, with the tolerance of `batch_matches_single`.
 #[test]
