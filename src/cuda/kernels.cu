@@ -2366,8 +2366,10 @@ extern "C" __global__ void ssm_gates(float* beta, float* g, const float* dt_bias
 
 // Causal depthwise conv over [state..., current] then SiLU; state keeps the last kw-1 inputs, oldest first.
 // Block = 128 channels; the first nn blocks are then l2-normalized as l2_norm does (the decode q and k heads).
+// tab: grid.y rows, row r at qkv and y + r * ch with its state at tab[2r] (the layer's part of Batch::kvt).
 extern "C" __global__ void conv_silu(const float* qkv, float* state, const float* w, float* y, int ch, int kw, int nn,
-                                     float eps) {
+                                     float eps, const u64* tab) {
+    if (tab) { state = (float*)tab[2 * blockIdx.y]; qkv += (size_t)blockIdx.y * ch; y += (size_t)blockIdx.y * ch; }
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     float v = 0.0f;
     if (c < ch) {
@@ -2434,10 +2436,15 @@ extern "C" __global__ void dflash2_conv(const float* x, const float* dyn, const 
 // Token t: y + t * ych = [q | k | v] after conv and l2 norm; beta, g at t * nv; output at o + t * nv * dv.
 // With dtb set, beta and g are raw and get ssm_gates' gates here (dtb, ga as its dt_bias, a).
 // The state after each of the first min(nsnap, T - 1) tokens also goes to snap (S's layout, one state each).
+// tab: grid.z rows of one token, row r as token r of y, beta, g and o, with its state at tab[2r + 1].
 // ponytail: sequential scan (latency-bound per token); a chunked WY form would use tensor cores for long prompts.
 extern "C" __global__ void deltanet_seq(const float* y, float* S, const float* beta, const float* g, float* o,
                                         int nk, int nv, int ilv, int dk, int dv, float scale, int T, int ych, float* snap, int nsnap,
-                                        const float* dtb, const float* ga) {
+                                        const float* dtb, const float* ga, const u64* tab) {
+    if (tab) {
+        size_t r = blockIdx.z;
+        S = (float*)tab[2 * r + 1]; y += r * ych; beta += r * nv; g += r * nv; o += r * nv * dv;
+    }
     int L = dk >> 4, R = 32 / L, lane = threadIdx.x & 31, s = lane % L, vh = blockIdx.x, kh = ilv ? vh / (nv / nk) : vh % nk;
     int j0 = (blockIdx.y * 8 + (threadIdx.x >> 5)) * R, j = j0 + lane / L;
     if (j0 >= dv) return;  // whole warp past the end (R divides dv)

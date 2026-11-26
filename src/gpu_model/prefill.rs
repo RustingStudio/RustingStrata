@@ -451,15 +451,26 @@ impl GpuModel<'_> {
             match &ly.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, .. } => {
                     let (eb, eg) = (at(l.e), at(l.e + n * nv));
+                    // Rows mode: this layer's part of `Batch::kvt` holds each row's conv and scan state (`batch_rows`).
+                    // Rows of one slot scan in order, so a launch takes a run of rows with distinct slots.
+                    let tab = |r0: usize| self.bt.as_ref().map_or(0, |bt| bt.kvt.addr() + (8 * ((il - self.first) * bt.rows + r0) * 2) as u64);
+                    let runs = |sl: &[usize]| {
+                        let mut v = vec![];
+                        let mut r0 = 0;
+                        for r in 1..=sl.len() {
+                            if r == sl.len() || sl[r0..r].contains(&sl[r]) { v.push((r0, r)); r0 = r; }
+                        }
+                        v
+                    };
                     g.gemm_dense(qkv, t, h, ne, at(l.a), channels, 0)?;
                     // The qkv GEMM above already quantized `h`; when it did not (IQ2_XS, or a shape the int8 GEMM
                     // skips), prepare it now so beta, alpha and the gate can all reuse one copy.
                     g.prequant_gemm_x(gate, t, h, ne)?;
                     match rows {
                         // A row a slot: each its own conv state, in row order.
-                        Some((sl, _)) => for (r, &s) in sl.iter().enumerate() {
-                            let o = (4 * r * channels) as u64;
-                            g.conv_silu(at(l.a) + o, conv[s].addr(), conv_w.ptr, at(l.c) + o, channels, c.ssm_conv, 0, eps)?;
+                        Some((sl, _)) => for (r0, r1) in runs(sl) {
+                            let (st, o) = (sl[r0..r1].iter().map(|&s| conv[s].addr()).collect::<Vec<_>>(), (4 * r0 * channels) as u64);
+                            g.conv_silu_rows(at(l.a) + o, tab(r0), &st, conv_w.ptr, at(l.c) + o, channels, c.ssm_conv, eps)?;
                         },
                         None => g.conv_seq(at(l.a), conv[self.cur].addr(), conv_w.ptr, at(l.c), channels, c.ssm_conv, t, 0, 0)?,
                     }
@@ -474,18 +485,26 @@ impl GpuModel<'_> {
                     probe(&mut tr, "conv", &pf.slab, at(l.c), channels, t)?;
                     probe(&mut tr, "beta", &pf.slab, eb, nv, t)?;
                     probe(&mut tr, "alpha", &pf.slab, eg, nv, t)?;
-                    // The z GEMM runs beside the scan, on the SMs its last wave of blocks leaves idle.
-                    g.batch(&mut || {
+                    let scan = || -> anyhow::Result<()> {
                         let scale = 1.0 / (dk as f32).sqrt();
                         match rows {
-                            Some((sl, _)) => for (r, &q) in sl.iter().enumerate() {
-                                g.deltanet(at(l.c) + (4 * r * channels) as u64, s[q].addr(), eb + (4 * r * nv) as u64, eg + (4 * r * nv) as u64, 0, 0,
-                                           at(l.d) + (4 * r * c.ssm_d_inner) as u64, nk, nv, c.k_interleave, dk, dv, scale, 1, channels, 0, 0)?;
+                            Some((sl, _)) => for (r0, r1) in runs(sl) {
+                                let st: Vec<u64> = sl[r0..r1].iter().map(|&q| s[q].addr()).collect();
+                                g.deltanet_rows(at(l.c) + (4 * r0 * channels) as u64, tab(r0), &st, eb + (4 * r0 * nv) as u64, eg + (4 * r0 * nv) as u64,
+                                                at(l.d) + (4 * r0 * c.ssm_d_inner) as u64, nk, nv, c.k_interleave, dk, dv, scale, channels)?;
                             },
                             None => g.deltanet(at(l.c), s[self.cur].addr(), eb, eg, 0, 0, at(l.d), nk, nv, c.k_interleave, dk, dv, scale, t, channels, 0, 0)?,
                         }
-                        g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, SAME_X)
-                    })?;
+                        Ok(())
+                    };
+                    // The z GEMM runs beside the scan, on the SMs its last wave of blocks leaves idle. Runs of rows of
+                    // one slot read each other's state, so those go in order, outside a batch.
+                    if rows.is_some_and(|(sl, _)| runs(sl).len() > 1) {
+                        scan()?;
+                        g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, SAME_X)?;
+                    } else {
+                        g.batch(&mut || { scan()?; g.gemm_dense(gate, t, h, ne, at(l.b), c.ssm_d_inner, SAME_X) })?;
+                    }
                     probe(&mut tr, "deltanet", &pf.slab, at(l.d), c.ssm_d_inner, t)?;
                     probe(&mut tr, "state", &s[self.cur], s[self.cur].addr(), s[self.cur].len() / 4, 1)?;
                     probe(&mut tr, "z", &pf.slab, at(l.b), c.ssm_d_inner, t)?;
@@ -869,8 +888,8 @@ impl GpuModel<'_> {
             g.put(&pos.iter().flat_map(|&p| [p as i32, 0]).collect::<Vec<_>>(), &bt.step, 0)?;
             let mut table = vec![0u64; self.layers.len() * 2 * bt.rows];
             for (i, ly) in self.layers.iter().enumerate() {
-                let Mixer::Attn { kc, vc, .. } = &ly.mixer else { continue };
-                for (r, &(sl, ..)) in rows.iter().enumerate() { table[(i * bt.rows + r) * 2..][..2].copy_from_slice(&[kc[sl].addr(), vc[sl].addr()]); }
+                let (a, b) = match &ly.mixer { Mixer::Attn { kc, vc, .. } => (kc, vc), Mixer::Delta { conv, s, .. } => (conv, s) };
+                for (r, &(sl, ..)) in rows.iter().enumerate() { table[(i * bt.rows + r) * 2..][..2].copy_from_slice(&[a[sl].addr(), b[sl].addr()]); }
             }
             g.put(&table, &bt.kvt, 0)?;
             let splits = (pos.iter().max().unwrap() + 1).div_ceil(256).clamp(1, crate::backend::ATT_SPLITS);
