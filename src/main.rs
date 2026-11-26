@@ -29,6 +29,9 @@ struct Engine {
     /// Run on the GPU (experts that do not fit in VRAM run on the CPU) instead of the CPU reference.
     #[arg(long)]
     gpu: bool,
+    /// Accelerate CPU generation using Q8_K activations. This can change logits and generated tokens.
+    #[arg(long)]
+    fast_cpu: bool,
     /// GPU context length (KV cache size) in tokens. Inkling 2, Hy4, GLM, DeepSeek and Gemma 4: the prompt plus reply
     /// limit, the model's trained context when not given (their caches grow with the text).
     #[arg(long, default_value_t = 4096)]
@@ -796,6 +799,10 @@ fn chunk_env_updates(n: usize, present: impl Fn(&str) -> bool) -> Vec<(&'static 
 }
 
 impl Engine {
+    fn load_inference_model<'a>(&self, g: &'a Gguf, aux: Option<&'a Gguf>) -> anyhow::Result<Model<'a>> {
+        Model::load_with_matvec(g, aux, &self.lora_specs(), self.fast_cpu && !self.gpu)
+    }
+
     pub fn lora_specs(&self) -> Vec<(String, f32)> {
         self.lora.iter().map(|s| {
             if let Some(idx) = s.rfind(':') {
@@ -1375,7 +1382,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 return rusting_strata::inkling2::chat::generate_image_opts(&g, &prompt, Some((&input.grids, &input.embeddings)), n, opts);
             }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
-            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
+            let m = engine.load_inference_model(&g, aux_g.as_ref())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let prompt = if prompt == "-" {
                 let mut s = String::new();
@@ -1480,7 +1487,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 }
             }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
-            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
+            let m = engine.load_inference_model(&g, aux_g.as_ref())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let mut r = engine.runner(&m, &model)?;
             let mut results = Vec::with_capacity(pp.len());
@@ -1716,7 +1723,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 };
             }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
-            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
+            let m = engine.load_inference_model(&g, aux_g.as_ref())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let image_input = if image.is_empty() { None } else {
                 let mmproj = engine.mmproj_for(&model);
@@ -3645,7 +3652,7 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
         })
     } else {
         aux_g = open_mtp_gguf(engine.aux_model_path())?;
-        m = { let mut m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?; if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; } m };
+        m = engine.load_inference_model(&g, aux_g.as_ref())?;
         engine.runner(&m, model)?
     };
     // Serving decodes one reply after a (usually cached) prompt: follow the reply's routing, not the prompt's.
@@ -4329,6 +4336,29 @@ mod bench_tests {
     use clap::Parser;
     use serde_json::Value;
     use std::path::Path;
+
+    #[test]
+    fn cpu_inference_loader_selects_requested_numerics() {
+        use super::{Cmd, Gguf, Model, State, ops};
+        let Some(path) = std::env::var_os("STRATA_CPU_PARITY_MODEL") else { return };
+        let g = Gguf::open(Path::new(&path)).unwrap();
+        let reference = Model::load(&g).unwrap();
+        let Some(Cmd::Bench { mut engine, .. }) = Cli::parse_from(["rustingstrata", "bench", "--model", "fixture"]).cmd else { unreachable!() };
+        let model = engine.load_inference_model(&g, None).unwrap();
+        let mut a = State::new(&reference.cfg);
+        let mut b = State::new(&model.cfg);
+        let mut token = 42;
+        for _ in 0..4 {
+            let want = reference.step(&mut a, token);
+            let got = model.step(&mut b, token);
+            assert_eq!(got, want, "CPU generation logits changed at step {}", b.pos);
+            token = ops::argmax(&want) as u32;
+        }
+        engine.fast_cpu = true;
+        let fast = engine.load_inference_model(&g, None).unwrap();
+        let expected = Model::load_with_matvec(&g, None, &[], true).unwrap();
+        assert_eq!(fast.step(&mut State::new(&fast.cfg), token), expected.step(&mut State::new(&expected.cfg), token));
+    }
 
     fn meta() -> BenchMeta<'static> {
         BenchMeta {

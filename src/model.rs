@@ -4,6 +4,8 @@
 use crate::config::{DFlashConfig, Eagle3Config, LayerKind, ModelConfig};
 use crate::gguf::Gguf;
 use crate::ops;
+use crate::cpu_moe::{self, Q8K};
+use std::cell::OnceCell;
 use crate::weights::{Tensor, Weights};
 use anyhow::Context;
 use std::collections::HashMap;
@@ -32,6 +34,7 @@ pub struct Model<'a> {
     pub loras: Vec<Lora>,
     pub draft_model: Option<Box<Model<'a>>>,
     ple: Option<Ple>,
+    fast_matvec: bool,
 }
 
 impl Model<'_> {
@@ -97,18 +100,35 @@ impl Default for Mtp {
     fn default() -> Mtp { Mtp { kv: LayerState::Attn { k: Vec::new(), v: Vec::new(), ik: Vec::new() }, pos: 0 } }
 }
 
-fn mv(t: &Tensor, x: &[f32]) -> Vec<f32> {
-    let mut y = vec![0f32; t.rows];
-    t.matvec(x, &mut y);
-    y
-}
-
 impl<'a> Model<'a> {
+    fn integer_kernel(&self, t: &Tensor) -> Option<fn(&[u8], &[Q8K]) -> f32> {
+        if self.fast_matvec && t.cols % 256 == 0 { cpu_moe::int_dot(t.ty) } else { None }
+    }
+
+    fn mv(&self, t: &Tensor, x: &[f32]) -> Vec<f32> {
+        self.mv_cached(t, x, &OnceCell::new())
+    }
+
+    fn mv_cached(&self, t: &Tensor, x: &[f32], activation: &OnceCell<Vec<Q8K>>) -> Vec<f32> {
+        assert_eq!(t.cols, x.len());
+        let mut y = vec![0.0; t.rows];
+        if let Some(dot) = self.integer_kernel(t) {
+            cpu_moe::matvec_q8k(t, activation.get_or_init(|| cpu_moe::quantize_q8k(x)), &mut y, dot);
+        } else {
+            t.matvec(x, &mut y);
+        }
+        y
+    }
+
     pub fn load(g: &'a Gguf) -> anyhow::Result<Model<'a>> { Self::load_with_lora(g, &[]) }
     pub fn load_with_lora(g: &'a Gguf, loras: &[(String, f32)]) -> anyhow::Result<Model<'a>> {
         Self::load_with_aux(g, None, loras)
     }
     pub fn load_with_aux(g: &'a Gguf, aux: Option<&'a Gguf>, loras: &[(String, f32)]) -> anyhow::Result<Model<'a>> {
+        Self::load_with_matvec(g, aux, loras, false)
+    }
+
+    pub fn load_with_matvec(g: &'a Gguf, aux: Option<&'a Gguf>, loras: &[(String, f32)], fast_matvec: bool) -> anyhow::Result<Model<'a>> {
         let mut cfg = ModelConfig::from_gguf(g)?;
         // A DFlash draft given on the command line replaces the target's own MTP head; without this the draft was
         // ignored without a word for a target GGUF that carries one.
@@ -127,7 +147,7 @@ impl<'a> Model<'a> {
         let mut draft_model = None;
         if is_standalone_draft {
             let ag = aux.unwrap();
-            let dm = Model::load(ag)?;
+            let dm = Self::load_with_matvec(ag, None, &[], fast_matvec)?;
             anyhow::ensure!(
                 dm.cfg.n_vocab == cfg.n_vocab,
                 "standalone draft model vocab ({}) != target vocab ({})",
@@ -280,7 +300,7 @@ impl<'a> Model<'a> {
             w.get("output_norm.weight")?;
             None
         };
-        let mut m = Model { cfg, w, loras: Vec::new(), draft_model, ple };
+        let mut m = Model { cfg, w, loras: Vec::new(), draft_model, ple, fast_matvec };
         m.apply_lora(loras)?;
         Ok(m)
     }
@@ -413,7 +433,7 @@ impl<'a> Model<'a> {
         let norm: Vec<f32> = r.iter().map(|&v| v * scale).collect();
         let w = self.t(il, &format!("{prefix}.weight"));
         let b = self.f(il, &format!("{prefix}.bias"));
-        let mut logits = mv(&w, &norm);
+        let mut logits = self.mv(&w, &norm);
         for (l, &bi) in logits.iter_mut().zip(&b) { *l += bi; }
         let pre: Vec<f32> = logits[..streams].iter().map(|&v| ops::sigmoid(v)).collect();
         let post: Vec<f32> = logits[streams..2 * streams].iter().map(|&v| 2.0 * ops::sigmoid(v)).collect();
@@ -488,7 +508,7 @@ impl<'a> Model<'a> {
         st.pos += 1;
         st.rope_pos = [rope_pos[0] + 1; 4];
         let (h, _) = self.hc_read(&r, "output_hc_");
-        (mv(&self.w.get("output.weight").unwrap(), &h), r)
+        (self.mv(&self.w.get("output.weight").unwrap(), &h), r)
     }
 
     /// Hyper-connection read (`build_hc_mix`) of the stack `r` with the tensors `{p}norm/down/up/inject.weight`:
@@ -499,10 +519,10 @@ impl<'a> Model<'a> {
         let t = |s: &str| self.w.get(&format!("{p}{s}.weight"));
         let mut xn = vec![0f32; r.len()];
         self.gnorm(r, &t("norm").unwrap().to_f32(), &mut xn);
-        let lo: Vec<f32> = mv(&t("down").unwrap(), &xn).into_iter().map(|v| ops::silu(v / hc)).collect();
+        let lo: Vec<f32> = self.mv(&t("down").unwrap(), &xn).into_iter().map(|v| ops::silu(v / hc)).collect();
         let mut mixed = vec![0f32; n];
-        for (i, g) in mv(&t("up").unwrap(), &lo).into_iter().enumerate() { mixed[i % n] += xn[i] * ops::sigmoid(g) / hc; }
-        (mixed, t("inject").map(|w| mv(&w, &xn)).unwrap_or_default())
+        for (i, g) in self.mv(&t("up").unwrap(), &lo).into_iter().enumerate() { mixed[i % n] += xn[i] * ops::sigmoid(g) / hc; }
+        (mixed, t("inject").map(|w| self.mv(&w, &xn)).unwrap_or_default())
     }
 
     /// Hyper-connection write (`build_hc_combine`): stream c += out * 2 sigmoid(inject[c] / hc).
@@ -560,10 +580,10 @@ impl<'a> Model<'a> {
     fn ple(&self, il: usize, r: &mut [f32], emb: &[f32], hist: &mut [f32]) {
         let (n, d) = (self.cfg.n_embd, r.len());
         let mut key = vec![0f32; d];
-        self.gnorm(&mv(&self.t(il, "ple_key.weight"), emb), &self.f(il, "ple_norm_key.weight"), &mut key);
+        self.gnorm(&self.mv(&self.t(il, "ple_key.weight"), emb), &self.f(il, "ple_norm_key.weight"), &mut key);
         let mut query = vec![0f32; d];
         self.gnorm(r, &self.f(il, "ple_norm_query.weight"), &mut query);
-        let value = mv(&self.t(il, "ple_value.weight"), emb);
+        let value = self.mv(&self.t(il, "ple_value.weight"), emb);
         let mut gated = vec![0f32; d];
         for (c, gc) in gated.chunks_exact_mut(n).enumerate() {
             let s = key[c * n..(c + 1) * n].iter().zip(&query[c * n..(c + 1) * n]).map(|(a, b)| a * b).sum::<f32>() / (n as f32).sqrt();
@@ -603,7 +623,7 @@ impl<'a> Model<'a> {
         let mut h = vec![0f32; self.cfg.n_embd];
         ops::rms_norm(x, norm, self.cfg.eps, &mut h);
         let head = self.w.get("output.weight").or_else(|_| self.w.get("token_embd.weight")).unwrap();
-        mv(&head, &h)
+        self.mv(&head, &h)
     }
 
     /// MTP draft (`nextn` block, stored as layer n_layer): logits for the token after `token`, from `hid`, the main
@@ -615,11 +635,34 @@ impl<'a> Model<'a> {
         let mut eh = vec![0f32; 2 * n];
         ops::rms_norm(&self.embed(token), &self.f(il, "nextn.enorm.weight"), c.eps, &mut eh[..n]);
         ops::rms_norm(hid, &self.f(il, "nextn.hnorm.weight"), c.eps, &mut eh[n..]);
-        let mut x = mv(&self.t(il, "nextn.eh_proj.weight"), &eh);
+        let mut x = self.mv(&self.t(il, "nextn.eh_proj.weight"), &eh);
         let rope_pos = [ms.pos as i32; 4];
         self.block(il, &mut x, &mut ms.kv, ms.pos, rope_pos);
         ms.pos += 1;
         (self.head(&x, &self.f(il, "nextn.shared_head_norm.weight")), x)
+    }
+
+    fn project_streams(&self, proj: &Tensor, e: &[f32], hn: &[f32]) -> Vec<f32> {
+        let n = e.len();
+        assert_eq!(proj.cols, 2 * n);
+        let mut out = vec![0.0; hn.len() / n * proj.rows];
+        let kernel = self.integer_kernel(proj);
+        // Only whole Q8_K blocks are independent of the following stream's values.
+        let shared = if kernel.is_some() { n / 256 * 256 } else { 0 };
+        let mut blocks = cpu_moe::quantize_q8k(&e[..shared]);
+        let mut tail = vec![0.0; proj.cols - shared];
+        tail[..n - shared].copy_from_slice(&e[shared..]);
+        for (h, y) in hn.chunks_exact(n).zip(out.chunks_exact_mut(proj.rows)) {
+            tail[n - shared..].copy_from_slice(h);
+            if let Some(dot) = kernel {
+                blocks.truncate(shared / 256);
+                blocks.extend(cpu_moe::quantize_q8k(&tail));
+                cpu_moe::matvec_q8k(proj, &blocks, y, dot);
+            } else {
+                proj.matvec(&tail, y);
+            }
+        }
+        out
     }
 
     /// qwen4exp draft step (llama.cpp `graph_mtp`): `hid` is the hc_n x n_embd stack. Every stream is projected
@@ -633,7 +676,7 @@ impl<'a> Model<'a> {
         let mut hn = vec![0f32; hid.len()];
         self.gnorm(hid, &self.f(il, "nextn.hnorm.weight"), &mut hn);
         let proj = self.t(il, "nextn.eh_proj.weight");
-        let mut r: Vec<f32> = hn.chunks_exact(n).flat_map(|h| mv(&proj, &[&e, h].concat())).collect();
+        let mut r = self.project_streams(&proj, &e, &hn);
         let (h, inj) = self.hc_read(&r, &format!("blk.{il}.hc_attn_"));
         let LayerState::Attn { k, v, ik } = &mut ms.kv else { unreachable!("the nextn block is an attention layer") };
         Self::hc_write(&mut r, &self.attention(il, &h, k, v, ik, ms.pos, [ms.pos as i32; 4]), &inj);
@@ -641,7 +684,7 @@ impl<'a> Model<'a> {
         Self::hc_write(&mut r, &self.moe(il, &h), &inj);
         ms.pos += 1;
         let (h, _) = self.hc_read(&r, &format!("blk.{il}.nextn.hc_head_"));
-        (mv(&self.w.get("output.weight").unwrap(), &h), r)
+        (self.mv(&self.w.get("output.weight").unwrap(), &h), r)
     }
 
     fn deltanet(&self, il: usize, h: &[f32], conv: &mut [f32], s: &mut [f32]) -> Vec<f32> {
@@ -651,11 +694,11 @@ impl<'a> Model<'a> {
         let channels = c.ssm_d_inner + 2 * nk * dk;
         let kw = c.ssm_conv;
 
-        let qkv = mv(&self.t(il, "attn_qkv.weight"), h);
-        let z = mv(&self.t(il, "attn_gate.weight"), h);
-        let beta: Vec<f32> = mv(&self.t(il, "ssm_beta.weight"), h).into_iter().map(ops::sigmoid).collect();
+        let qkv = self.mv(&self.t(il, "attn_qkv.weight"), h);
+        let z = self.mv(&self.t(il, "attn_gate.weight"), h);
+        let beta: Vec<f32> = self.mv(&self.t(il, "ssm_beta.weight"), h).into_iter().map(ops::sigmoid).collect();
         let (dt_bias, a) = (self.f(il, "ssm_dt.bias"), self.f(il, "ssm_a"));
-        let g: Vec<f32> = mv(&self.t(il, "ssm_alpha.weight"), h).iter().enumerate()
+        let g: Vec<f32> = self.mv(&self.t(il, "ssm_alpha.weight"), h).iter().enumerate()
             .map(|(i, &al)| ops::softplus(al + dt_bias[i]) * a[i]).collect();
 
         // Causal depthwise conv over [state..., current], then SiLU.
@@ -697,7 +740,7 @@ impl<'a> Model<'a> {
             let gate = if c.arch == "qwen4exp" { ops::sigmoid } else { ops::silu };
             for (x, zz) in oh.iter_mut().zip(&z[vh * dv..(vh + 1) * dv]) { *x *= gate(*zz); }
         }
-        mv(&self.t(il, "ssm_out.weight"), &out)
+        self.mv(&self.t(il, "ssm_out.weight"), &out)
     }
 
     /// RoPE for one head: 1-D when the model has no M-RoPE sections, otherwise `[t, y, x, z]`.
@@ -717,11 +760,11 @@ impl<'a> Model<'a> {
         let c = &self.cfg;
         let (nh, d) = (c.idx_n_head, c.idx_head_dim);
         if c.idx_top_k == 0 || il >= c.n_layer || self.w.layer(il, "indexer.k_proj.weight").is_err() { return None; }
-        ik.extend_from_slice(&mv(&self.t(il, "indexer.k_proj.weight"), h));
+        ik.extend_from_slice(&self.mv(&self.t(il, "indexer.k_proj.weight"), h));
         let (nb, top) = ((pos + 1) / QSA_POOL, c.idx_top_k / QSA_POOL);
         if nb <= top { return None; }
         let (qn, kn) = (self.f(il, "indexer.q_norm.weight"), self.f(il, "indexer.k_norm.weight"));
-        let qr = mv(&self.t(il, "indexer.q_proj.weight"), h);
+        let qr = self.mv(&self.t(il, "indexer.q_proj.weight"), h);
         let mut q = vec![0f32; nh * d];
         for i in 0..nh {
             ops::rms_norm(&qr[i * d..(i + 1) * d], &qn, c.eps, &mut q[i * d..(i + 1) * d]);
@@ -758,7 +801,7 @@ impl<'a> Model<'a> {
         let sinks = if c.attn_sinks { self.f(il, "attn_sinks.weight") } else { Vec::new() };
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
         let qs = if c.q_gate { 2 * hd } else { hd };  // per-head row of attn_q: query, then the gate if any
-        let qg = mv(&self.t(il, "attn_q.weight"), h);
+        let qg = self.mv(&self.t(il, "attn_q.weight"), h);
         let (qn, kn) = (self.f(il, "attn_q_norm.weight"), self.f(il, "attn_k_norm.weight"));
         let mut q = vec![0f32; nh * hd];
         for i in 0..nh {
@@ -766,8 +809,8 @@ impl<'a> Model<'a> {
             ops::rms_norm(&qg[i * qs..i * qs + hd], &qn, c.eps, qh);
             if use_rope { self.rope(qh, pos, rope_pos); }
         }
-        let kraw = mv(&self.t(il, "attn_k.weight"), h);
-        let v = mv(&self.t(il, "attn_v.weight"), h);
+        let kraw = self.mv(&self.t(il, "attn_k.weight"), h);
+        let v = self.mv(&self.t(il, "attn_v.weight"), h);
         let mut k = vec![0f32; nkv * hd];
         for i in 0..nkv {
             let kh = &mut k[i * hd..(i + 1) * hd];
@@ -797,7 +840,7 @@ impl<'a> Model<'a> {
                 for (o, gg) in oh.iter_mut().zip(gate) { *o *= ops::sigmoid(*gg); }
             }
         }
-        mv(&self.t(il, "attn_output.weight"), &out)
+        self.mv(&self.t(il, "attn_output.weight"), &out)
     }
 
     fn ffn(&self, il: usize, gate: &Tensor, up: &Tensor, down: &Tensor, down_name: &str, expert: Option<usize>, h: &[f32]) -> Vec<f32> {
@@ -806,9 +849,10 @@ impl<'a> Model<'a> {
         let rot = self.cfg.hadamard.as_ref().filter(|_| down_name == "ffn_down_exps.weight");
         let hr = rot.map(|r| r.rotated(h));
         let h = hr.as_deref().unwrap_or(h);
-        let mut a = mv(gate, h);
-        for (x, u) in a.iter_mut().zip(mv(up, h)) { *x = ops::silu(*x) * u; }
-        let mut y = match rot { Some(r) => mv(down, &r.rotated(&a)), None => mv(down, &a) };
+        let activation = OnceCell::new();
+        let mut a = self.mv_cached(gate, h, &activation);
+        for (x, u) in a.iter_mut().zip(self.mv_cached(up, h, &activation)) { *x = ops::silu(*x) * u; }
+        let mut y = match rot { Some(r) => self.mv(down, &r.rotated(&a)), None => self.mv(down, &a) };
         if down_name == "ffn_down_exps.weight" {
             self.lora_delta(&format!("blk.{il}.{down_name}"), &a, &mut y, expert);
         }
@@ -824,7 +868,7 @@ impl<'a> Model<'a> {
         if self.w.layer(il, "ffn_up_shexp.weight").is_ok() {
             // Flint's shared expert is always on; Qwen's has a sigmoid gate.
             let s = match self.w.layer(il, "ffn_gate_inp_shexp.weight") {
-                Ok(sg) => ops::sigmoid(mv(&sg, h)[0]),
+                Ok(sg) => ops::sigmoid(self.mv(&sg, h)[0]),
                 Err(_) => 1.0,
             };
             let o = self.ffn(il, &self.t(il, "ffn_gate_shexp.weight"), &self.t(il, "ffn_up_shexp.weight"), &self.t(il, "ffn_down_shexp.weight"), "ffn_down_shexp.weight", Some(0), h);
@@ -836,7 +880,7 @@ impl<'a> Model<'a> {
     /// Router scores, top-k and normalized weights: (expert, weight) pairs.
     pub fn route(&self, il: usize, h: &[f32]) -> Vec<(usize, f32)> {
         let c = &self.cfg;
-        let mut p = mv(&self.t(il, "ffn_gate_inp.weight"), h);
+        let mut p = self.mv(&self.t(il, "ffn_gate_inp.weight"), h);
         if c.router_sigmoid {
             for v in &mut p { *v = ops::sigmoid(*v); }
         } else {
@@ -1422,68 +1466,117 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn make_qwen3(path: &Path, seed_off: usize) {
+        let mut kvs = Vec::new();
+        let w_s = |b: &mut Vec<u8>, s: &str| { b.extend((s.len() as u64).to_le_bytes()); b.extend(s.as_bytes()); };
+        let w_kv = |b: &mut Vec<u8>, k: &str, t: u32, p: &[u8]| { w_s(b, k); b.extend(t.to_le_bytes()); b.extend(p); };
+        let s = |b: &mut Vec<u8>, k: &str, v: &str| { let mut p = Vec::new(); w_s(&mut p, v); w_kv(b, k, 8, &p); };
+        s(&mut kvs, "general.architecture", "qwen3");
+        w_kv(&mut kvs, "qwen3.block_count", 4, &1u32.to_le_bytes());
+        w_kv(&mut kvs, "qwen3.embedding_length", 4, &64u32.to_le_bytes());
+        w_kv(&mut kvs, "qwen3.feed_forward_length", 4, &64u32.to_le_bytes());
+        w_kv(&mut kvs, "qwen3.attention.head_count", 4, &1u32.to_le_bytes());
+        w_kv(&mut kvs, "qwen3.attention.head_count_kv", 4, &1u32.to_le_bytes());
+        w_kv(&mut kvs, "qwen3.attention.key_length", 4, &64u32.to_le_bytes());
+        w_kv(&mut kvs, "qwen3.attention.layer_norm_rms_epsilon", 6, &1e-6f32.to_le_bytes());
+
+        let mut hdr = Vec::new();
+        let mut body = Vec::new();
+        let mut seed = 1 + seed_off;
+        let mut add_t = |name: &str, dims: &[u64], scale: f32| {
+            w_s(&mut hdr, name);
+            hdr.extend((dims.len() as u32).to_le_bytes());
+            for &d in dims { hdr.extend(d.to_le_bytes()); }
+            hdr.extend(0u32.to_le_bytes());
+            hdr.extend((body.len() as u64).to_le_bytes());
+            let n: usize = dims.iter().product::<u64>() as usize;
+            for i in 0..n {
+                let v = if scale == 0.0 { 1.0f32 } else { (((seed * 29 + i * 13 + 3) % 89) as f32 - 44.0) * scale };
+                body.extend_from_slice(&v.to_le_bytes());
+            }
+            seed += 1;
+            while body.len() % 32 != 0 { body.push(0); }
+        };
+        add_t("token_embd.weight", &[64, 8], 0.02);
+        add_t("output_norm.weight", &[64], 0.0);
+        add_t("output.weight", &[64, 8], 0.02);
+        add_t("blk.0.attn_norm.weight", &[64], 0.0);
+        add_t("blk.0.ffn_norm.weight", &[64], 0.0);
+        add_t("blk.0.attn_q_norm.weight", &[64], 0.0);
+        add_t("blk.0.attn_k_norm.weight", &[64], 0.0);
+        add_t("blk.0.attn_q.weight", &[64, 64], 0.01);
+        add_t("blk.0.attn_k.weight", &[64, 64], 0.01);
+        add_t("blk.0.attn_v.weight", &[64, 64], 0.01);
+        add_t("blk.0.attn_output.weight", &[64, 64], 0.01);
+        add_t("blk.0.ffn_gate.weight", &[64, 64], 0.01);
+        add_t("blk.0.ffn_up.weight", &[64, 64], 0.01);
+        add_t("blk.0.ffn_down.weight", &[64, 64], 0.01);
+        let mut gg = Vec::new();
+        gg.extend(b"GGUF");
+        gg.extend(3u32.to_le_bytes());
+        gg.extend(14u64.to_le_bytes());
+        gg.extend(8u64.to_le_bytes());
+        gg.extend(kvs);
+        gg.extend(hdr);
+        while gg.len() % 32 != 0 { gg.push(0); }
+        gg.extend(body);
+        std::fs::write(path, &gg).unwrap();
+    }
+
+    #[test]
+    fn cpu_projection_modes() {
+        use crate::quant::GgmlType::{F16, F32, Q8_0};
+        let path = std::env::temp_dir().join(format!("strata_cpu_projection_{}.gguf", std::process::id()));
+        make_qwen3(&path, 0);
+        let g = Gguf::open(&path).unwrap();
+        let adapter = tiny_adapter("cpu_projection");
+        let model = Model::load_with_matvec(&g, Some(&g), &[(adapter.display().to_string(), 1.0)], true).unwrap();
+        assert!(model.fast_matvec && model.draft_model.as_ref().unwrap().fast_matvec);
+        assert_eq!(model.loras.len(), 1);
+        assert!(!Model::load(&g).unwrap().fast_matvec);
+        for (ty, cols) in [(F32, 256), (F16, 30), (Q8_0, 96), (Q8_0, 256), (Q8_0, 512), (Q8_0, 768)] {
+            let rows = 8;
+            let mut data = vec![0; rows * ty.row_bytes(cols as u64)];
+            match ty {
+                Q8_0 => for (i, b) in data.chunks_exact_mut(34).enumerate() {
+                    b[..2].copy_from_slice(&half::f16::from_f32(0.025).to_le_bytes());
+                    for (j, q) in b[2..].iter_mut().enumerate() { *q = ((i * 19 + j * 13) % 89) as u8; }
+                },
+                F16 => for b in data.chunks_exact_mut(2) { b.copy_from_slice(&half::f16::ONE.to_le_bytes()); },
+                F32 => for b in data.chunks_exact_mut(4) { b.copy_from_slice(&1f32.to_le_bytes()); },
+                _ => unreachable!(),
+            }
+            let t = Tensor { ty, cols, rows, data: &data, scale: 0.75 };
+            let x: Vec<f32> = (0..cols).map(|i| ((i * 31 % 193) as f32 - 90.0) / 97.0).collect();
+            let cache = OnceCell::new();
+            let got = model.mv_cached(&t, &x, &cache);
+            let mut reference = vec![0.0; rows];
+            t.matvec(&x, &mut reference);
+            if ty == Q8_0 && cols % 256 == 0 {
+                assert!(cache.get().is_some());
+                let up = Tensor { scale: 1.25, ..t };
+                assert_eq!(model.mv_cached(&up, &x, &cache), model.mv(&up, &x));
+                let peak = reference.iter().copied().map(f32::abs).fold(0.0, f32::max);
+                for (a, b) in got.iter().zip(&reference) { assert!((a - b).abs() < 0.01 * peak); }
+            } else {
+                assert!(cache.get().is_none());
+                assert_eq!(got, reference);
+            }
+            let (e, h) = x.split_at(cols / 2);
+            let streams = [h, e].concat();
+            let expected = [model.mv(&t, &x), model.mv(&t, &[e, e].concat())].concat();
+            assert_eq!(model.project_streams(&t, e, &streams), expected);
+        }
+        std::fs::remove_file(adapter).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn standalone_external_draft_model_spec_step_matches_greedy() {
         let dir = std::env::temp_dir().join(format!("strata_extdraft_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let make_qwen3 = |path: &std::path::Path, seed_off: usize| {
-            let mut kvs = Vec::new();
-            let w_s = |b: &mut Vec<u8>, s: &str| { b.extend((s.len() as u64).to_le_bytes()); b.extend(s.as_bytes()); };
-            let w_kv = |b: &mut Vec<u8>, k: &str, t: u32, p: &[u8]| { w_s(b, k); b.extend(t.to_le_bytes()); b.extend(p); };
-            let s = |b: &mut Vec<u8>, k: &str, v: &str| { let mut p = Vec::new(); w_s(&mut p, v); w_kv(b, k, 8, &p); };
-            s(&mut kvs, "general.architecture", "qwen3");
-            w_kv(&mut kvs, "qwen3.block_count", 4, &1u32.to_le_bytes());
-            w_kv(&mut kvs, "qwen3.embedding_length", 4, &64u32.to_le_bytes());
-            w_kv(&mut kvs, "qwen3.feed_forward_length", 4, &64u32.to_le_bytes());
-            w_kv(&mut kvs, "qwen3.attention.head_count", 4, &1u32.to_le_bytes());
-            w_kv(&mut kvs, "qwen3.attention.head_count_kv", 4, &1u32.to_le_bytes());
-            w_kv(&mut kvs, "qwen3.attention.key_length", 4, &64u32.to_le_bytes());
-            w_kv(&mut kvs, "qwen3.attention.layer_norm_rms_epsilon", 6, &1e-6f32.to_le_bytes());
-
-            let mut hdr = Vec::new();
-            let mut body = Vec::new();
-            let mut seed = 1 + seed_off;
-            let mut add_t = |name: &str, dims: &[u64], scale: f32| {
-                w_s(&mut hdr, name);
-                hdr.extend((dims.len() as u32).to_le_bytes());
-                for &d in dims { hdr.extend(d.to_le_bytes()); }
-                hdr.extend(0u32.to_le_bytes());
-                hdr.extend((body.len() as u64).to_le_bytes());
-                let n: usize = dims.iter().product::<u64>() as usize;
-                for i in 0..n {
-                    let v = if scale == 0.0 { 1.0f32 } else { (((seed * 29 + i * 13 + 3) % 89) as f32 - 44.0) * scale };
-                    body.extend_from_slice(&v.to_le_bytes());
-                }
-                seed += 1;
-                while body.len() % 32 != 0 { body.push(0); }
-            };
-            add_t("token_embd.weight", &[64, 8], 0.02);
-            add_t("output_norm.weight", &[64], 0.0);
-            add_t("output.weight", &[64, 8], 0.02);
-            add_t("blk.0.attn_norm.weight", &[64], 0.0);
-            add_t("blk.0.ffn_norm.weight", &[64], 0.0);
-            add_t("blk.0.attn_q_norm.weight", &[64], 0.0);
-            add_t("blk.0.attn_k_norm.weight", &[64], 0.0);
-            add_t("blk.0.attn_q.weight", &[64, 64], 0.01);
-            add_t("blk.0.attn_k.weight", &[64, 64], 0.01);
-            add_t("blk.0.attn_v.weight", &[64, 64], 0.01);
-            add_t("blk.0.attn_output.weight", &[64, 64], 0.01);
-            add_t("blk.0.ffn_gate.weight", &[64, 64], 0.01);
-            add_t("blk.0.ffn_up.weight", &[64, 64], 0.01);
-            add_t("blk.0.ffn_down.weight", &[64, 64], 0.01);
-            let mut gg = Vec::new();
-            gg.extend(b"GGUF");
-            gg.extend(3u32.to_le_bytes());
-            gg.extend(14u64.to_le_bytes());
-            gg.extend(8u64.to_le_bytes());
-            gg.extend(kvs);
-            gg.extend(hdr);
-            while gg.len() % 32 != 0 { gg.push(0); }
-            gg.extend(body);
-            std::fs::write(path, &gg).unwrap();
-        };
         let pt = dir.join("target.gguf");
         let pd = dir.join("draft.gguf");
         make_qwen3(&pt, 0);
