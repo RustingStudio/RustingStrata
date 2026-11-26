@@ -132,10 +132,8 @@ fn vulkan_split_legacy_and_turbo() {
 }
 
 /// Inkling 2 uses head_dim 64, where TurboQuant needs WHT-64 on both store and attention.
-#[test]
-fn vulkan_inkling_turbo_hd64() {
-    let _lock = common::gpu_lock();
-    set("turbo4", "turbo4");
+fn ink_turbo_hd64_check(mode: &str) {
+    set(mode, mode);
     let Some(vk) = open_vk() else { return };
     let (nh, nkv, hd, nt, pos0, ring) = (4usize, 2usize, 64usize, 6usize, 3usize, 16usize);
     let (nr, ext) = (16usize, 8usize);
@@ -166,6 +164,18 @@ fn vulkan_inkling_turbo_hd64() {
         want.extend_from_slice(&down::<f32>(g, &dout));
     }
     let got = down::<f32>(g, &dout_pre);
-    eprintln!("vulkan turbo hd64 prefill vs decode {:.2e}", rel_l2(&got, &want));
-    assert!(rel_l2(&got, &want) < 5e-4, "vulkan turbo hd64 prefill vs decode");
+    eprintln!("vulkan {mode} hd64 prefill vs decode {:.2e}", rel_l2(&got, &want));
+    assert!(rel_l2(&got, &want) < 5e-4, "vulkan {mode} hd64 prefill vs decode");
+}
+
+#[test]
+fn vulkan_inkling_turbo_hd64() {
+    let _lock = common::gpu_lock();
+    ink_turbo_hd64_check("turbo4");
+}
+
+#[test]
+fn vulkan_inkling_turbo3_hd64() {
+    let _lock = common::gpu_lock();
+    ink_turbo_hd64_check("turbo3");
 }

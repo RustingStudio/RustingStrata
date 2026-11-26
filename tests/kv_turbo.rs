@@ -177,5 +177,26 @@ fn turboquant_ink_clip_hd64() {
     let (pft, dect) = ink_run(&gt, hd, nh, nkv, nt, pos0, ring);
     eprintln!("turbo hd 64: prefill vs decode {:.2e}, vs f16 {:.2e}", rel_l2(&pft, &dect), rel_l2(&pft, &pf16));
     assert!(rel_l2(&pft, &dect) < 5e-4, "turbo hd 64 prefill vs decode");
-    assert!(rel_l2(&pft, &pf16) < 0.9, "turbo hd 64 vs f16");
+    assert!(rel_l2(&pft, &pf16) < 0.2, "turbo hd 64 vs f16");
+}
+
+/// TurboQuant 3-bit uses a 2-bit code plane plus a sign plane: 25 u16 words per 128 values, against 36 for the
+/// 4-bit modes. Prefill and decode still have to agree, and the result stays close to f16.
+#[test]
+fn turbo3_uses_3_bit_packing() {
+    let _gpu = common::gpu_lock();
+    let Some(g3) = open("turbo3", "turbo3") else { return };
+    let Some(g4) = open("turbo4", "turbo4") else { return };
+    let Some(g16) = open("f16", "f16") else { return };
+    let (nh, nkv, hd, t, pos0) = (4usize, 2usize, 128usize, 32usize, 5usize);
+    let n = (pos0 + t) * nkv * hd;
+    assert_eq!(g3.kv_words(n), n * 25 / 128);
+    assert_eq!(g4.kv_words(n), n * 9 / 32);
+    assert_eq!(g3.kv_words(n) * 36, g4.kv_words(n) * 25, "3-bit must use 25/36 of the 4-bit words");
+    let (_, _, pf3, dec3) = run(&g3, nh, nkv, hd, t, pos0);
+    let (_, _, _, dec16) = run(&g16, nh, nkv, hd, t, pos0);
+    let e = rel_l2(&pf3, &dec3);
+    eprintln!("turbo3 prefill vs decode {e:.2e}, vs f16 {:.2e}", rel_l2(&dec3, &dec16));
+    assert!(e < 5e-4, "turbo3 prefill vs decode {e}");
+    assert!(rel_l2(&dec3, &dec16) < 1.0, "turbo3 decode drifted from f16");
 }

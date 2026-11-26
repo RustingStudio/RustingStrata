@@ -111,25 +111,61 @@ float tq_group_reduce(float cs, uint slot) {
 }
 // Store one rotated, quantized value. Active lanes join the reduction; inactive ones contribute no energy and write nothing.
 void tq_put(U16 c, uint e, uint hd, float x, float norm, bool valid, uint bits, uint slot) {
-    int q = tq_nearest(bits, fdiv(x, norm));
-    uint nib = uint(q), pair = nib | (subgroupShuffleXor(nib, 1u) << 4);
+    // Centroids are calibrated for a 128-value WHT group. A 64-value group has twice the variance, so scale
+    // the norm by sqrt(128 / group) on store and keep the corrected norm in the same scaled units.
+    uint gw = hd >= 128u ? 128u : hd;
+    float qnorm = norm * sqrt_(fdiv(128.0, float(gw)));
+    int q = tq_nearest(bits, fdiv(x, qnorm));
     uint we = e % hd, g = we >> 7u, w = we & 127u;
-    uint r = e / hd * (hd / 2u + hd / 16u);
-    if (valid && (we & 1u) == 0u) U8(uint64_t(c)).v[r + we / 2u] = uint8_t(pair);
     float cen = tq_centroid(bits, q);
     float recon = sqrt_(tq_group_reduce(valid ? cen * cen : 0.0, slot));
+    if (bits == 3u) {
+        // 2-bit code plane plus 1-bit sign plane, then one corrected fp16 norm per 128 values: 50 B per group.
+        uint mag = uint(q & 3), sign = uint(q >> 2);
+        uint r = e / hd * (3u * hd / 8u + hd / 64u);
+        uint m4 = mag | (subgroupShuffleXor(mag, 1u) << 2) | (subgroupShuffleXor(mag, 2u) << 4) | (subgroupShuffleXor(mag, 3u) << 6);
+        uint s8 = sign | (subgroupShuffleXor(sign, 1u) << 1) | (subgroupShuffleXor(sign, 2u) << 2)
+                | (subgroupShuffleXor(sign, 3u) << 3) | (subgroupShuffleXor(sign, 4u) << 4)
+                | (subgroupShuffleXor(sign, 5u) << 5) | (subgroupShuffleXor(sign, 6u) << 6)
+                | (subgroupShuffleXor(sign, 7u) << 7);
+        if (valid && (we & 3u) == 0u) U8(uint64_t(c)).v[r + we / 4u] = uint8_t(m4);
+        if (valid && (we & 7u) == 0u) U8(uint64_t(c)).v[r + hd / 4u + we / 8u] = uint8_t(s8);
+        if (valid && w == 0u) c.v[(r + 3u * hd / 8u) / 2u + g] = uint16_t(f2h(fdiv(norm, max(recon, 1e-6))));
+        return;
+    }
+    uint nib = uint(q), pair = nib | (subgroupShuffleXor(nib, 1u) << 4);
+    uint r = e / hd * (hd / 2u + hd / 16u);
+    if (valid && (we & 1u) == 0u) U8(uint64_t(c)).v[r + we / 2u] = uint8_t(pair);
     if (valid && w == 0u)
         c.v[(r + hd / 2u) / 2u + g] = uint16_t(f2h(fdiv(norm, max(recon, 1e-6))));
 }
 float tq_ldkv(U16 c, uint off, uint hd, uint bits) {
-    uint we = off % hd, r = off / hd * (hd / 2u + hd / 16u);
+    uint we = off % hd;
+    if (bits == 3u) {
+        uint r = off / hd * (3u * hd / 8u + hd / 64u);
+        float norm = float(uint16BitsToHalf(c.v[(r + 3u * hd / 8u) / 2u + (we >> 7u)]));
+        uint m = (uint(U8(uint64_t(c)).v[r + we / 4u]) >> (2u * (we & 3u))) & 3u;
+        uint s = (uint(U8(uint64_t(c)).v[r + hd / 4u + we / 8u]) >> (we & 7u)) & 1u;
+        return rh(tq_centroid(3u, int(m | (s << 2u))) * norm);
+    }
+    uint r = off / hd * (hd / 2u + hd / 16u);
     float norm = float(uint16BitsToHalf(c.v[(r + hd / 2u) / 2u + (we >> 7u)]));
     uint b = uint(U8(uint64_t(c)).v[r + we / 2u]);
     int q = int((we & 1u) == 0u ? b & 15u : b >> 4);
     return rh(tq_centroid(bits, q) * norm);
 }
 uint tq_ldkv2(U16 c, uint off, uint hd, uint bits) {
-    uint a0 = off % hd, r = off / hd * (hd / 2u + hd / 16u);
+    uint a0 = off % hd;
+    if (bits == 3u) {
+        uint r = off / hd * (3u * hd / 8u + hd / 64u);
+        uint lo = f2h(tq_ldkv(c, off, hd, bits));
+        uint a1 = (off + 1u) % hd;
+        float n1 = float(uint16BitsToHalf(c.v[(r + 3u * hd / 8u) / 2u + (a1 >> 7u)]));
+        uint m1 = (uint(U8(uint64_t(c)).v[r + a1 / 4u]) >> (2u * (a1 & 3u))) & 3u;
+        uint s1 = (uint(U8(uint64_t(c)).v[r + hd / 4u + a1 / 8u]) >> (a1 & 7u)) & 1u;
+        return lo | (f2h(tq_centroid(3u, int(m1 | (s1 << 2u))) * n1) << 16);
+    }
+    uint r = off / hd * (hd / 2u + hd / 16u);
     float n0 = float(uint16BitsToHalf(c.v[(r + hd / 2u) / 2u + (a0 >> 7u)]));
     uint b = uint(U8(uint64_t(c)).v[r + a0 / 2u]);
     uint lo = f2h(tq_centroid(bits, int(b & 15u)) * n0);

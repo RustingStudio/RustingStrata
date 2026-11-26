@@ -119,6 +119,32 @@ pub fn dequantize4(codes: &[u8; D / 2], norm: f32) -> [f32; D] {
     out
 }
 
+/// Pack 128 rotated, unit-L2 coordinates into 32 bytes of 2-bit codes plus 16 bytes of sign bits and the
+/// reconstruction-corrected norm. Mirrors TheTom's `block_turbo3_0` layout: 50 B per 128 values.
+pub fn quantize3(x: &[f32; D], l2: f32) -> ([u8; D / 4], [u8; D / 8], f32) {
+    let mut qs = [0u8; D / 4];
+    let mut signs = [0u8; D / 8];
+    let mut recon2 = 0f32;
+    for i in 0..D {
+        let q = nearest(x[i] / l2, 3);
+        qs[i / 4] |= ((q & 3) as u8) << (2 * (i % 4));
+        if q >= 4 { signs[i / 8] |= 1 << (i % 8); }
+        recon2 += CENTROIDS3[q] * CENTROIDS3[q];
+    }
+    (qs, signs, l2 / recon2.sqrt().max(1e-6))
+}
+
+/// Unpack 3-bit codes into 128 rotated values, scaled by the stored corrected norm.
+pub fn dequantize3(qs: &[u8; D / 4], signs: &[u8; D / 8], norm: f32) -> [f32; D] {
+    let mut out = [0f32; D];
+    for i in 0..D {
+        let mag = (qs[i / 4] >> (2 * (i % 4))) & 3;
+        let sign = (signs[i / 8] >> (i % 8)) & 1;
+        out[i] = CENTROIDS3[(mag | (sign << 2)) as usize] * norm;
+    }
+    out
+}
+
 /// Deterministic Gaussian PRNG and QJL projection matrix, matching the reference (LCG + Box-Muller, seed 1042).
 struct Prng(u64);
 impl Prng {
@@ -244,5 +270,38 @@ mod tests {
         // The 1-bit estimator is noisy; require only that it is in the right ballpark, not exact.
         let mean = err / (trials as f64);
         assert!(mean < 5.0, "mean absolute QJL error {mean} too high");
+    }
+
+    #[test]
+    fn turbo3_packs_50_bytes_per_128_and_round_trips() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 11) as f32 / (1u64 << 53) as f32) * 2.0 - 1.0
+        };
+        for _ in 0..8 {
+            let mut v = [0f32; D];
+            for x in &mut v { *x = next(); }
+            let l2 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in &mut v { *x /= l2; }
+            let mut rotated = v;
+            rotate_forward(&mut rotated);
+            let (qs, signs, norm) = quantize3(&rotated, 1.0);
+            assert_eq!(qs.len() + signs.len() + 2, 50, "turbo3 block must be 50 B");
+            // The first eight values exercise both sign halves and all four magnitude code positions.
+            for i in 0..8 {
+                let mag = (qs[i / 4] >> (2 * (i % 4))) & 3;
+                let sign = (signs[0] >> i) & 1;
+                assert_eq!((mag | (sign << 2)) as usize, nearest(rotated[i], 3));
+            }
+            let back_rot = dequantize3(&qs, &signs, norm);
+            let mean_err = rotated.iter().zip(&back_rot).map(|(a, b)| (a - b).abs()).sum::<f32>() / D as f32;
+            assert!(mean_err < 0.09, "3-bit rotated error {mean_err} too high");
+            let mut restored = back_rot;
+            rotate_inverse(&mut restored);
+            let dot = v.iter().zip(&restored).map(|(a, b)| a * b).sum::<f32>();
+            let cos = dot / restored.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(cos > 0.97, "round-trip cosine {cos} too low");
+        }
     }
 }

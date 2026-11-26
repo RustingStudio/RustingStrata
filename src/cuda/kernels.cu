@@ -2963,18 +2963,43 @@ __device__ __forceinline__ float tq_group_sum(float cs, int g) {
     return warp_sum(t);
 }
 template<int BITS> __device__ __forceinline__ void kv_put_tq(u16* c, size_t e, int hd, float x, float norm, bool active) {
-    int q = tq_nearest<BITS>(x / norm);
-    unsigned nib = (unsigned)q;
-    unsigned pair = nib | (__shfl_xor_sync(0xffffffff, nib, 1) << 4);
+    // Centroids are calibrated for N(0, 1/128), the coordinates of a unit-L2 128-value WHT group. A 64-value
+    // group has twice that variance, so scale the norm by sqrt(128 / group) before quantizing and store the
+    // corrected norm in the same scaled units. Dequant then needs no width-dependent correction.
+    int gw = hd >= 128 ? 128 : hd;
+    float qnorm = norm * sqrtf(128.0f / (float)gw);
+    int q = tq_nearest<BITS>(x / qnorm);
     int we = e % hd;
     int w = we & 127;   // value within this 128-wide WHT group
     int g = we >> 7;    // WHT group within the head (0 when hd <= 128)
-    unsigned char* r = (unsigned char*)c + e / hd * (hd / 2 + hd / 16);
-    if (active && (we & 1) == 0) r[we / 2] = (unsigned char)pair;
+    float recon = sqrtf(tq_group_sum(active ? tq_centroid<BITS>(q) * tq_centroid<BITS>(q) : 0.f, g));
     // The reference stores norm / ||reconstructed centroids||; without it dequant is systematically low.
     // Inactive lanes of a short head width still join the reduction but contribute no centroid energy.
-    float recon = sqrtf(tq_group_sum(active ? tq_centroid<BITS>(q) * tq_centroid<BITS>(q) : 0.f, g));
-    if (active && w == 0) *(u16*)(r + hd / 2 + 2 * g) = f2h(norm / fmaxf(recon, 1e-6f));
+    if constexpr (BITS == 3) {
+        // True 3-bit layout: a 2-bit code plane (4 values per byte) and a 1-bit sign plane (8 per byte),
+        // followed by one fp16 corrected norm per 128 values. 50 B per group instead of 66.
+        unsigned mag = (unsigned)(q & 3), sign = (unsigned)(q >> 2);
+        unsigned char* r = (unsigned char*)c + e / hd * (3 * hd / 8 + hd / 64);
+        unsigned m4 = mag | (__shfl_xor_sync(0xffffffffu, mag, 1) << 2)
+                          | (__shfl_xor_sync(0xffffffffu, mag, 2) << 4)
+                          | (__shfl_xor_sync(0xffffffffu, mag, 3) << 6);
+        unsigned s8 = sign | (__shfl_xor_sync(0xffffffffu, sign, 1) << 1)
+                           | (__shfl_xor_sync(0xffffffffu, sign, 2) << 2)
+                           | (__shfl_xor_sync(0xffffffffu, sign, 3) << 3)
+                           | (__shfl_xor_sync(0xffffffffu, sign, 4) << 4)
+                           | (__shfl_xor_sync(0xffffffffu, sign, 5) << 5)
+                           | (__shfl_xor_sync(0xffffffffu, sign, 6) << 6)
+                           | (__shfl_xor_sync(0xffffffffu, sign, 7) << 7);
+        if (active && (we & 3) == 0) r[we / 4] = (unsigned char)m4;
+        if (active && (we & 7) == 0) r[hd / 4 + we / 8] = (unsigned char)s8;
+        if (active && w == 0) *(u16*)(r + 3 * hd / 8 + 2 * g) = f2h(norm / fmaxf(recon, 1e-6f));
+    } else {
+        unsigned nib = (unsigned)q;
+        unsigned pair = nib | (__shfl_xor_sync(0xffffffffu, nib, 1) << 4);
+        unsigned char* r = (unsigned char*)c + e / hd * (hd / 2 + hd / 16);
+        if (active && (we & 1) == 0) r[we / 2] = (unsigned char)pair;
+        if (active && w == 0) *(u16*)(r + hd / 2 + 2 * g) = f2h(norm / fmaxf(recon, 1e-6f));
+    }
 }
 #endif
 __device__ __forceinline__ float warp_min(float v) {
@@ -3203,12 +3228,23 @@ template <int M, int PER, int BITS = TQ_KBITS> __device__ __forceinline__ void l
     if constexpr (M >= 4) {
         // Dequantize to the rotated domain; Q is rotated in attention, so no inverse here.
         int we = off % hd;
-        const unsigned char* r = (const unsigned char*)c + off / hd * (hd / 2 + hd / 16);
-        float norm = h2f(*(const u16*)(r + hd / 2 + 2 * (we >> 7)));
-        for (int i = 0; i < PER / 2; i++) {
-            unsigned b = r[we / 2 + i];
-            int q0 = b & 15, q1 = b >> 4;
-            o[i] = (unsigned)f2h(tq_centroid<BITS>(q0) * norm) | ((unsigned)f2h(tq_centroid<BITS>(q1) * norm) << 16);
+        if constexpr (BITS == 3) {
+            const unsigned char* r = (const unsigned char*)c + off / hd * (3 * hd / 8 + hd / 64);
+            float norm = h2f(*(const u16*)(r + 3 * hd / 8 + 2 * (we >> 7)));
+            for (int i = 0; i < PER / 2; i++) {
+                int a = we + 2 * i, b = a + 1;
+                int q0 = ((r[a / 4] >> (2 * (a & 3))) & 3) | (((r[hd / 4 + a / 8] >> (a & 7)) & 1) << 2);
+                int q1 = ((r[b / 4] >> (2 * (b & 3))) & 3) | (((r[hd / 4 + b / 8] >> (b & 7)) & 1) << 2);
+                o[i] = (unsigned)f2h(tq_centroid<BITS>(q0) * norm) | ((unsigned)f2h(tq_centroid<BITS>(q1) * norm) << 16);
+            }
+        } else {
+            const unsigned char* r = (const unsigned char*)c + off / hd * (hd / 2 + hd / 16);
+            float norm = h2f(*(const u16*)(r + hd / 2 + 2 * (we >> 7)));
+            for (int i = 0; i < PER / 2; i++) {
+                unsigned b = r[we / 2 + i];
+                int q0 = b & 15, q1 = b >> 4;
+                o[i] = (unsigned)f2h(tq_centroid<BITS>(q0) * norm) | ((unsigned)f2h(tq_centroid<BITS>(q1) * norm) << 16);
+            }
         }
     } else if constexpr (M == 3) {
         int w = off % hd;
@@ -3304,11 +3340,18 @@ __device__ __forceinline__ float rh(float x) { return h2f(f2h(x)); }
 template <int M, int BITS = TQ_KBITS> __device__ __forceinline__ float ldkv1(const u16* c, size_t off, int hd) {
     if constexpr (M >= 4) {
         int we = off % hd;
-        const unsigned char* r = (const unsigned char*)c + off / hd * (hd / 2 + hd / 16);
-        float norm = h2f(*(const u16*)(r + hd / 2 + 2 * (we >> 7)));
-        unsigned b = r[we / 2];
-        int q = (we & 1) == 0 ? (int)(b & 15u) : (int)(b >> 4);
-        return rh(tq_centroid<BITS>(q) * norm);
+        if constexpr (BITS == 3) {
+            const unsigned char* r = (const unsigned char*)c + off / hd * (3 * hd / 8 + hd / 64);
+            float norm = h2f(*(const u16*)(r + 3 * hd / 8 + 2 * (we >> 7)));
+            int q = ((r[we / 4] >> (2 * (we & 3))) & 3) | (((r[hd / 4 + we / 8] >> (we & 7)) & 1) << 2);
+            return rh(tq_centroid<BITS>(q) * norm);
+        } else {
+            const unsigned char* r = (const unsigned char*)c + off / hd * (hd / 2 + hd / 16);
+            float norm = h2f(*(const u16*)(r + hd / 2 + 2 * (we >> 7)));
+            unsigned b = r[we / 2];
+            int q = (we & 1) == 0 ? (int)(b & 15u) : (int)(b >> 4);
+            return rh(tq_centroid<BITS>(q) * norm);
+        }
     } else if constexpr (M == 3) {
         int w = off % hd;
         const unsigned char* r = (const unsigned char*)c + off / hd * (3 * hd / 8);
