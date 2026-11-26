@@ -1303,10 +1303,10 @@ impl Backend for Vk {
     }
     fn preflight(&self, types: &[GgmlType], verbose: bool) -> anyhow::Result<()> { Vk::preflight(self, types, verbose) }
     fn kv_words(&self, n: usize) -> usize {
-        match self.0.kv_k_mode { 0 => n, 1 => n * 17 / 32, 2 | 4..=6 => n * 9 / 32, 3 => n * 3 / 16, _ => unreachable!() }
+        match self.0.kv_k_mode { 0 => n, 1 => n * 17 / 32, 2 | 4 | 6 => n * 9 / 32, 5 => n * 25 / 128, 3 => n * 3 / 16, _ => unreachable!() }
     }
     fn kv_words_v(&self, n: usize) -> usize {
-        match self.0.kv_v_mode { 0 => n, 1 => n * 17 / 32, 2 | 4..=6 => n * 9 / 32, 3 => n * 3 / 16, _ => unreachable!() }
+        match self.0.kv_v_mode { 0 => n, 1 => n * 17 / 32, 2 | 4 | 6 => n * 9 / 32, 5 => n * 25 / 128, 3 => n * 3 / 16, _ => unreachable!() }
     }
 
     fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {

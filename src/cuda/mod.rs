@@ -204,7 +204,7 @@ pub fn kv_mode() -> u32 {
 
 /// u16 words a cache row of `n` values occupies in mode `m`.
 fn kv_mode_words(m: u32, n: usize) -> usize {
-    match m { 1 => n * 17 / 32, 2 | 4..=6 => n * 9 / 32, 3 => n * 3 / 16, _ => n }
+    match m { 1 => n * 17 / 32, 2 | 4 | 6 => n * 9 / 32, 5 => n * 25 / 128, 3 => n * 3 / 16, _ => n }
 }
 
 /// `--kv q8`: KV cache rows in ggml q8_0 form (`kv_mode() == 1`).
