@@ -95,7 +95,7 @@ float tq_c2(int q) { bool p = q >= 2; float m = p ? 0.133462 : 0.039994; return 
 int tq_nearest(uint bits, float v) { return bits == 3u ? tq_q3(v) : bits == 2u ? tq_q2(v) : tq_q4(v); }
 float tq_centroid(uint bits, int q) { return bits == 3u ? tq_c3(q) : bits == 2u ? tq_c2(q) : tq_c4(q); }
 
-shared float tq_red[256];
+shared float tq_red[(TQ_K || TQ_V) ? 256u : 1u];
 // Per-128-group sum, in the same butterfly order as CUDA tq_group_sum. `slot` must be unique per (row, group)
 // within the workgroup; every invocation of that group calls this with the same slot.
 float tq_group_reduce(float cs, uint slot) {
