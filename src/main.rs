@@ -154,8 +154,14 @@ struct Engine {
     thinking_budget: usize,
     /// KV cache format (GPU): f16, q8 (q8_0, half KV memory), q4 (q4_0, quarter KV memory), or q2 (2-bit affine,
     /// 5.3x smaller KV memory for 512k-1M ctx; numerics differ from f16).
-    #[arg(long, default_value = "f16", value_parser = ["f16", "q8", "q4", "q2"])]
+    #[arg(long, default_value = "f16", value_parser = ["f16", "q8", "q4", "q2", "turbo4", "turbo4-3", "turbo4-2", "turbo3", "turbo2", "turbo3-2"])]
     kv: String,
+    /// K cache type; overrides the K half of `--kv`. Supported: f16, q8, q4, q2, turbo4, turbo3, turbo2.
+    #[arg(long, value_parser = ["f16", "q8", "q4", "q2", "turbo4", "turbo3", "turbo2"])]
+    k: Option<String>,
+    /// V cache type; overrides the V half of `--kv`. Supported: f16, q8, q4, q2, turbo4, turbo3, turbo2.
+    #[arg(long, value_parser = ["f16", "q8", "q4", "q2", "turbo4", "turbo3", "turbo2"])]
+    v: Option<String>,
     /// GPU backend: cuda, vulkan or hip [default: cuda if it loads, else vulkan].
     #[arg(long)]
     backend: Option<String>,
@@ -182,18 +188,42 @@ struct Engine {
     mmproj: Option<PathBuf>,
 }
 
-fn set_kv_env(kv: &str) {
-    match kv {
-        "q8" | "q4" | "q2" => {
-            unsafe { std::env::set_var("STRATA_KV", kv) };
-            if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") }; }
-            else { unsafe { std::env::remove_var("STRATA_KV_Q8") }; }
-        }
-        _ => {
-            unsafe { std::env::remove_var("STRATA_KV") };
-            unsafe { std::env::remove_var("STRATA_KV_Q8") };
-        }
+/// Resolve the independent K and V cache types. `--kv` supplies both unless `--k`/`--v` override a half.
+fn effective_kv(kv: &str, k: Option<&str>, v: Option<&str>) -> anyhow::Result<(String, String)> {
+    let valid = |s: &str| matches!(s, "f16" | "q8" | "q4" | "q2" | "turbo4" | "turbo3" | "turbo2");
+    let base = match kv {
+        "turbo4-3" => ("turbo4", "turbo3"),
+        "turbo4-2" => ("turbo4", "turbo2"),
+        "turbo3-2" => ("turbo3", "turbo2"),
+        other => (other, other),
+    };
+    let (k, v) = match (k, v) {
+        (None, None) => base,
+        (Some(k), None) => (k, base.1),
+        (None, Some(v)) => (base.0, v),
+        (Some(k), Some(v)) => (k, v),
+    };
+    anyhow::ensure!(valid(k) && valid(v), "unsupported KV combination K={k}, V={v}");
+    Ok((k.to_string(), v.to_string()))
+}
+
+/// Publish the resolved types to both backends. `STRATA_KV_K`/`STRATA_KV_V` are independent; `STRATA_KV` is
+/// kept as a symmetric-only alias for code paths that have not been split yet (serve/Vulkan).
+fn set_kv_env(k: &str, v: &str) {
+    unsafe {
+        std::env::set_var("STRATA_KV_K", k);
+        std::env::set_var("STRATA_KV_V", v);
+        if k == v { std::env::set_var("STRATA_KV", k); }
+        else { std::env::remove_var("STRATA_KV"); }
+        if k == "q8" || v == "q8" { std::env::set_var("STRATA_KV_Q8", "1"); }
+        else { std::env::remove_var("STRATA_KV_Q8"); }
     }
+}
+
+fn set_kv_env_for(kv: &str, k: Option<&str>, v: Option<&str>) -> anyhow::Result<()> {
+    let (k, v) = effective_kv(kv, k, v)?;
+    set_kv_env(&k, &v);
+    Ok(())
 }
 
 /// `serve` options for a server that other people use (docs/HOSTING.md).
@@ -386,12 +416,17 @@ impl Engine {
     }
 
     /// Hand `--backend`, `--device`, and `--kv` to the DeepSeek, GLM, Gemma 4 and Inkling 2 paths.
-    fn ds_env(&self) {
+    fn ds_env(&self) -> anyhow::Result<()> {
         // SAFETY: called at the start of a command, before any thread reads these variables.
         if let Some(b) = &self.backend { unsafe { std::env::set_var("STRATA_DS_BACKEND", b) } }
         if self.device != [0] { unsafe { std::env::set_var("STRATA_DS_DEVICES", self.device.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")) } }
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // Hy4: every expert on the GPU
-        if self.kv != "f16" && std::env::var_os("STRATA_KV").is_none() { set_kv_env(&self.kv); }
+        // `--k`/`--v` must take effect even when `--kv` is left at its f16 default; otherwise an Inkling 2
+        // mixed layout silently degrades to plain f16.
+        if (self.kv != "f16" || self.k.is_some() || self.v.is_some()) && std::env::var_os("STRATA_KV_K").is_none() {
+            set_kv_env_for(&self.kv, self.k.as_deref(), self.v.as_deref())?;
+        }
+        Ok(())
     }
 
     /// Models on their own code path never call `Engine::runner`, the only place that reads a calibration file.
@@ -455,7 +490,7 @@ impl Engine {
             }
         }
         if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
-        set_kv_env(&self.kv);  // read by Gpu::new and Vk::new
+        set_kv_env_for(&self.kv, self.k.as_deref(), self.v.as_deref())?;  // read by Gpu::new and Vk::new
         let open = || backend::open_all(self.backend.as_deref(), &self.device);
         let bk = match self.gpu.then(open).transpose() {
             Err(e) if self.cpu_fallback => { say!("no GPU backend ({e:#}), running on the CPU"); None }
@@ -1291,7 +1326,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             // Kolibri and Inkling 2 have their own forwards: the continuation goes in a token at a time.
             macro_rules! score_tokenwise { ($chat:path, $model:path) => {{
                 use $chat as chat; use $model as Fwd;
-                engine.ds_env();
+                engine.ds_env()?;
                 chat::gpu_defaults();
                 let mut m = Fwd::new(&g)?;
                 let (mut argmax, mut top5) = (Vec::new(), Vec::new());
@@ -1330,7 +1365,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Generate { model, prompt, n, image, mut engine } => {
             engine.own_calib(&model);
-            engine.ds_env();
+            let _ = effective_kv(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
+            engine.ds_env()?;
             let g = Gguf::open(&model)?;
             engine.own_warn(&g);
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
@@ -1438,7 +1474,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             // `--kld-base` compares it with another build the same as it compares llama.cpp with the others.
             let mut ink = if g.get("general.architecture").ok().and_then(|v| v.as_str()).is_some_and(rusting_strata::inkling2::is_arch) {
                 rusting_strata::inkling2::chat::gpu_defaults();
-                engine.ds_env();
+                engine.ds_env()?;
                 Some(rusting_strata::inkling2::forward::Inkling2Model::new_with_ctx(&g, n)?)
             } else {
                 None
@@ -1481,6 +1517,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             if let Some(run) = &mut r { run.finish()?; }
         }
         Cmd::Bench { model, pp, tg, reps, json_out, prompt_file, mut engine } => {
+            let _ = effective_kv(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
             if let Some(f) = &prompt_file {
                 let text = std::fs::read_to_string(f).with_context(|| format!("--prompt-file {}", f.display()))?;
                 anyhow::ensure!(!text.trim().is_empty(), "--prompt-file {} is empty", f.display());
@@ -1491,7 +1528,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
             if let Some(arch) = g.get("general.architecture").ok().and_then(|v| v.as_str()) {
                 if arch == "deepseek41" || arch == "glm5-next" || arch == "gemma4" || arch == rusting_strata::hy4::ARCH || arch == rusting_strata::kolibri::ARCH || arch == rusting_strata::raon::ARCH || rusting_strata::inkling2::is_arch(arch) {
-                    engine.ds_env();
+                    engine.ds_env()?;
                     // A --ctx below the test grows to fit it, as on the main engine.
                     if rusting_strata::CTX.load(std::sync::atomic::Ordering::Relaxed) != 0 { rusting_strata::CTX.store(engine.ctx, std::sync::atomic::Ordering::Relaxed); }
                     return if arch == "deepseek41" {
@@ -1569,7 +1606,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Calibrate { model, ctx, vram_margin, backend, device, split, kv, lora, gpu: _, mtp_model, draft_model,
                          samples, reps, warmup, pp, tg, chunk_values, task, seed,
                          dry_run, timeout, minutes, out, sub } => {
-            set_kv_env(&kv);  // read by Gpu::new and Vk::new
+            set_kv_env_for(&kv, None, None)?;  // read by Gpu::new and Vk::new; expands turbo pair aliases
             if !lora.is_empty() { say!("note: --lora is ignored by calibrate; calibration uses the base model"); }
             if split.is_some() { say!("note: --split is ignored by calibrate; measurements use the free-VRAM split"); }
 
@@ -1696,10 +1733,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             std::process::exit(cmd.status()?.code().unwrap_or(1));
         }
         Cmd::Chat { model, system, n, image, mut engine } => {
+            let _ = effective_kv(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
             let think = engine.think_default;
             term::live(false);
             engine.own_calib(&model);
-            engine.ds_env();
+            engine.ds_env()?;
             let g = Gguf::open(&model)?;
             engine.own_warn(&g);
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
@@ -1808,7 +1846,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Serve { model, models_dir, addr, api_key, mcp, open, host, mut engine } => {
             rusting_strata::update::notice();
             term::live(true);
-            engine.ds_env();
+            let _ = effective_kv(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
+            engine.ds_env()?;
             anyhow::ensure!(host.auto_unload != Some(0), "--auto-unload must be at least 1 second");
             engine.parallel = host.parallel;
             // Before the model is loaded: a slot count outside 1..=255 is an invalid request, not a downgrade.
@@ -2047,13 +2086,13 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     // The models outside the main engine read their limit here (`ctx_limit`).
                     if !o["ctx"].is_null() { rusting_strata::CTX.store(engine.ctx, Relaxed); }
                     // `runner` also sets it, and calibrate runs before `runner`.
-                    set_kv_env(&engine.kv);
+                    set_kv_env_for(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
                 }
                 // The page's calibrate button: measure with no model loaded, then load with the measured chunk and MTP
                 // (they replace `--chunk`/`--mtp` and the page's earlier values).
                 let cal = if o["calibrate"] == true && engine.gpu {
                     (engine.chunk, engine.mtp) = (None, None);
-                    set_kv_env(&engine.kv);
+                    set_kv_env_for(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
                     s.stats.lock().unwrap().unload(Some(s.name(&p)));
                     vram_margins(&engine.vram_margin, &engine.device)
                         .and_then(|mb| calibrate(&p, engine.aux_model_path(), engine.ctx, &mb.into_iter().map(|mb| mb << 20).collect::<Vec<_>>(), engine.backend.as_deref(), &engine.device,
@@ -2086,7 +2125,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     Err(e) => {
                         engine = old;
                         rusting_strata::CTX.store(old_ctx, Relaxed);
-                        set_kv_env(&engine.kv);
+                        set_kv_env_for(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
                         s.stats.lock().unwrap().unload(None);
                         say!("loading {}: {e:#}", p.display());
                         let b = json!({"error": {"message": format!("{e:#}"), "type": "server_error"}}).to_string();
@@ -4777,5 +4816,43 @@ mod calibrate_cli_tests {
         let b = spec_baseline(&s);
         assert_eq!((b.i("spec_type"), b.i("draft_max"), b.i("ngram_n"), b.i("mtp")),
                    (Some(1), Some(2), Some(2), Some(0)));
+    }
+}
+
+#[cfg(test)]
+mod kv_type_tests {
+    use super::effective_kv;
+
+    fn pair(kv: &str, k: Option<&str>, v: Option<&str>) -> (String, String) {
+        effective_kv(kv, k, v).unwrap()
+    }
+
+    #[test]
+    fn symmetric_flag_and_overrides() {
+        assert_eq!(pair("f16", None, None), ("f16".into(), "f16".into()));
+        assert_eq!(pair("turbo4", None, None), ("turbo4".into(), "turbo4".into()));
+        assert_eq!(pair("f16", Some("turbo4"), None), ("turbo4".into(), "f16".into()));
+        assert_eq!(pair("f16", None, Some("q8")), ("f16".into(), "q8".into()));
+    }
+
+    #[test]
+    fn turbo_aliases_expand_to_independent_types() {
+        assert_eq!(pair("turbo4-3", None, None), ("turbo4".into(), "turbo3".into()));
+        assert_eq!(pair("turbo4-2", None, None), ("turbo4".into(), "turbo2".into()));
+        assert_eq!(pair("turbo3-2", None, None), ("turbo3".into(), "turbo2".into()));
+    }
+
+    #[test]
+    fn arbitrary_kv_pairs_are_allowed() {
+        assert_eq!(pair("f16", Some("f16"), Some("q4")), ("f16".into(), "q4".into()));
+        assert_eq!(pair("f16", Some("q8"), Some("turbo4")), ("q8".into(), "turbo4".into()));
+        assert_eq!(pair("f16", Some("turbo3"), Some("turbo2")), ("turbo3".into(), "turbo2".into()));
+        assert_eq!(pair("f16", Some("turbo4"), Some("turbo3")), ("turbo4".into(), "turbo3".into()));
+    }
+
+    #[test]
+    fn invalid_types_are_rejected() {
+        assert!(effective_kv("f16", Some("bogus"), None).is_err());
+        assert!(effective_kv("f16", None, Some("turbo9")).is_err());
     }
 }

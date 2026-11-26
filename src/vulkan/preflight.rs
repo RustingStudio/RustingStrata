@@ -14,7 +14,7 @@ use std::time::Instant;
 impl Vk {
     /// The `Workgroup` bytes of kernel `name` with `spec` and this device's KV cache mode.
     pub fn shared_bytes(&self, name: &str, spec: &[u32]) -> Result<u32> {
-        spv_smem::shared_bytes(name, spec, self.0.kv_mode)
+        spv_smem::shared_bytes_split(name, spec, self.0.kv_k_mode, self.0.kv_v_mode)
     }
 
     /// Check the (kernel, specialization) pairs the weight types `types` reach (see `gpu_model::gpu_weight_types`)
@@ -30,7 +30,7 @@ impl Vk {
         let (mut n, mut worst) = (0usize, (0u32, "", Vec::new()));
         for (name, spec) in self.shared_memory_pairs(types) {
             if !checked.insert((name, spec.clone())) { continue; }
-            let bytes = spv_smem::check_shared_memory(name, &spec, self.0.kv_mode, self.0.smem_limit)?;
+            let bytes = spv_smem::check_shared_memory(name, &spec, self.0.kv_k_mode, self.0.kv_v_mode, self.0.smem_limit)?;
             n += 1;
             if verbose { crate::say!("vulkan: preflight {name} {spec:?}: {bytes} bytes"); }
             if bytes > worst.0 { worst = (bytes, name, spec); }
@@ -75,7 +75,7 @@ impl Vk {
         let mut max = 0;
         for (name, spec) in self.shared_memory_pairs(types) {
             if !checked.insert((name, spec.clone())) { continue; }
-            max = max.max(spv_smem::check_shared_memory(name, &spec, self.0.kv_mode, self.0.smem_limit)?);
+            max = max.max(spv_smem::check_shared_memory(name, &spec, self.0.kv_k_mode, self.0.kv_v_mode, self.0.smem_limit)?);
         }
         Ok(max)
     }

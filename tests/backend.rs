@@ -90,12 +90,12 @@ fn shared_memory_matches_the_committed_spirv() {
 fn shared_memory_refusal_names_kernel_spec_bytes_and_limit() {
     use rusting_strata::vulkan::spv_smem::check_shared_memory;
     let spec = [0u32, 10, 84, 0, 0];
-    let e = format!("{:#}", check_shared_memory("gemmi_dp", &spec, 0, 40960).unwrap_err());
+    let e = format!("{:#}", check_shared_memory("gemmi_dp", &spec, 0, 0, 40960).unwrap_err());
     for want in ["gemmi_dp", "[0, 10, 84, 0, 0]", "49152", "40960", "maxComputeSharedMemorySize"] {
         assert!(e.contains(want), "{e:?} does not contain {want:?}");
     }
     // Exactly at the limit is accepted: the V100 reports 49152 and `gemmi_dp` with Q2_K needs 49152.
-    assert_eq!(check_shared_memory("gemmi_dp", &spec, 0, 49152).unwrap(), 49152);
+    assert_eq!(check_shared_memory("gemmi_dp", &spec, 0, 0, 49152).unwrap(), 49152);
 }
 
 /// The preflight over the reference model's weight types only (no weights uploaded): every pair must fit. Skips

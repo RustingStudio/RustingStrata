@@ -45,25 +45,39 @@ void main() {
     [[unroll]] for (uint i = 0; i < G * PER; i++) acc[i] = 0.0;
 #define cell(i) (sp ? uint(p.sel.v[so + 1 + (i)]) : (base + (i)))
     barrier();
+    if (TQ_K) {
+        // Rotate each query head's 128-value groups into the KV domain (4 dims per lane).
+        for (uint i = 0u; i < G; i++)
+            for (uint gg = 0u; gg < HD / 128u; gg++) {
+                uint lane = tid & 31u;
+                if ((tid >> 5u) == (i * (HD / 128u) + gg) % 8u) {
+                    uint base = i * HD + gg * 128u + 4u * lane;
+                    vec4 qv = vec4(sq[base], sq[base + 1u], sq[base + 2u], sq[base + 3u]);
+                    qv = tq_wht4(qv, lane, false);
+                    sq[base] = qv.x; sq[base + 1u] = qv.y; sq[base + 2u] = qv.z; sq[base + 3u] = qv.w;
+                }
+            }
+        barrier();
+    }
     for (uint c0 = p0; c0 < p1; c0 += C) {
         float s_part[J * G];
         [[unroll]] for (uint j = 0; j < J; j++) {
             uint kr[PER / 2];
             uint tt = c0 + w * J + j, r = ((cell(min(tt, p1 - 1)) * p.nkv + g) * HD + lane * PER) / 2;
-            if (KV_MODE > 0u && PER % 4 == 0) {
+            if (K_MODE > 0u && PER % 4 == 0) {
                 [[unroll]] for (uint d = 0; d < PER / 2; d += 2) {
-                    uvec2 k = ldkv4(U16(uint64_t(p.kc)), 2 * (r + d), HD);
+                    uvec2 k = ldkv4_k(U16(uint64_t(p.kc)), 2 * (r + d), HD);
                     if (tt >= p1) k = uvec2(0);
                     kr[d] = k.x; kr[d + 1] = k.y;
                 }
-            } else if (KV_MODE == 0u && WIDE && PER % 8 == 0) {
+            } else if (K_MODE == 0u && WIDE && PER % 8 == 0) {
                 [[unroll]] for (uint d = 0; d < PER / 2; d += 4) {
                     uvec4 k = UV4(uint64_t(p.kc)).v[(r + d) / 4];
                     [[unroll]] for (uint e = 0; e < 4; e++) kr[d + e] = tt >= p1 ? 0 : k[e];
                 }
             } else {
                 [[unroll]] for (uint d = 0; d < PER / 2; d++) {
-                    uint k = KV_MODE > 0u ? ldkv2(U16(uint64_t(p.kc)), 2 * (r + d), HD) : p.kc.v[r + d];
+                    uint k = K_MODE > 0u ? ldkv2_k(U16(uint64_t(p.kc)), 2 * (r + d), HD) : p.kc.v[r + d];
                     kr[d] = tt >= p1 ? 0 : k;
                 }
             }
@@ -100,20 +114,20 @@ void main() {
         [[unroll]] for (uint j = 0; j < J; j++) {
             uint vr[PER / 2];
             uint tt = c0 + w * J + j, r = ((cell(min(tt, p1 - 1)) * p.nkv + g) * HD + lane * PER) / 2;
-            if (KV_MODE > 0u && PER % 4 == 0) {
+            if (V_MODE > 0u && PER % 4 == 0) {
                 [[unroll]] for (uint d = 0; d < PER / 2; d += 2) {
-                    uvec2 v = ldkv4(U16(uint64_t(p.vc)), 2 * (r + d), HD);
+                    uvec2 v = ldkv4_v(U16(uint64_t(p.vc)), 2 * (r + d), HD);
                     if (tt >= p1) v = uvec2(0);
                     vr[d] = v.x; vr[d + 1] = v.y;
                 }
-            } else if (KV_MODE == 0u && WIDE && PER % 8 == 0) {
+            } else if (V_MODE == 0u && WIDE && PER % 8 == 0) {
                 [[unroll]] for (uint d = 0; d < PER / 2; d += 4) {
                     uvec4 v = UV4(uint64_t(p.vc)).v[(r + d) / 4];
                     [[unroll]] for (uint e = 0; e < 4; e++) vr[d + e] = tt >= p1 ? 0 : v[e];
                 }
             } else {
                 [[unroll]] for (uint d = 0; d < PER / 2; d++) {
-                    uint v = KV_MODE > 0u ? ldkv2(U16(uint64_t(p.vc)), 2 * (r + d), HD) : p.vc.v[r + d];
+                    uint v = V_MODE > 0u ? ldkv2_v(U16(uint64_t(p.vc)), 2 * (r + d), HD) : p.vc.v[r + d];
                     vr[d] = tt >= p1 ? 0 : v;
                 }
             }

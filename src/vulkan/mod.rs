@@ -188,8 +188,10 @@ struct Inner {
     cr: Option<ash::ext::conditional_rendering::Device>,
     /// Specialization constant 0 of kernels that quantize x: llama.cpp q8_K numerics (`--llama-numerics`).
     llama: u32,
-    /// Specialization constant 15 of every kernel: KV cache mode (0 = f16, 1 = q8, 2 = q4).
-    kv_mode: u32,
+    /// Specialization constants 15 and 16 of every kernel: independent K and V cache modes
+    /// (0 = f16, 1 = q8, 2 = q4, 3 = q2, 4 = turbo4, 5 = turbo3, 6 = turbo2).
+    kv_k_mode: u32,
+    kv_v_mode: u32,
     /// `maxComputeSharedMemorySize` of the device (or STRATA_VK_SMEM_LIMIT, a test hook): no pipeline may need more
     /// `Workgroup` bytes than this (`Vk::pipeline`), or the driver accepts it and faults at dispatch (Xid 13 on Volta).
     smem_limit: u32,
@@ -366,7 +368,12 @@ fn features<'a>(f11: &'a mut vk::PhysicalDeviceVulkan11Features<'static>, f12: &
 impl Vk {
     /// The usable GPU with index `device` (`backend::device_order`). Fails with "Vulkan init" (and the reasons) when there is none.
     pub fn new(device: usize) -> anyhow::Result<Vk> {
-        ensure!(!(crate::cuda::kv_mode() > 0 && crate::cuda::llama_numerics()), "--kv q8/q4 does not combine with --llama-numerics (its attention reads f16 KV)");
+        let (kv_k_mode, kv_v_mode) = (crate::cuda::kv_k_mode(), crate::cuda::kv_v_mode());
+        // ponytail: Vulkan turbo gave wrong text on Qwen3-4B (RTX 3060) and its hd 128 prefill needs 64000 B of shared
+        // memory; refused until fixed, `STRATA_VK_TURBO=1` opens it for tests.
+        ensure!((kv_k_mode < 4 && kv_v_mode < 4) || std::env::var_os("STRATA_VK_TURBO").is_some(),
+            "--kv turbo* is not ready on Vulkan yet; use the CUDA backend or --kv q8/q4");
+        ensure!(!(crate::cuda::kv_mode() > 0 && crate::cuda::llama_numerics()), "--kv q8/q4/turbo* does not combine with --llama-numerics (its attention reads f16 KV)");
         // RADV hides VK_AMD_device_coherent_memory on RDNA4 (RX 9000) unless this driconf option is set, and without
         // it the GPU caches the CPU expert mailbox: MoE combines miss the worker's answer and wait until they give up.
         // Mesa reads the option from the environment when the device is created; other drivers ignore it.
@@ -505,7 +512,7 @@ impl Vk {
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
         let ts_period = limits.timestamp_period;
         let rcp_d = dev_props.vendor_id == 0x1002;
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, gfx11, wave64, rcp_d, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_mode: crate::cuda::kv_mode(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, gfx11, wave64, rcp_d, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_k_mode, kv_v_mode, smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -815,15 +822,16 @@ impl Inner {
         if let Some(&p) = st.pipes.get(&(name, spec.to_vec())) { return Ok(p); }
         let code = SPV.iter().find(|s| s.0 == name).with_context(|| format!("no Vulkan kernel {name}"))?.1;
         // One choke point for Workgroup shared memory: the driver creates such a pipeline and faults at dispatch.
-        spv_smem::check_shared_memory(name, spec, self.kv_mode, self.smem_limit)?;
+        spv_smem::check_shared_memory(name, spec, self.kv_k_mode, self.kv_v_mode, self.smem_limit)?;
         let words = ash::util::read_spv(&mut std::io::Cursor::new(code))?;
         let m = unsafe { self.dev.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None) }?;
         let n = spec.len() as u32;
         let entries: Vec<_> = (0..n).map(|i| vk::SpecializationMapEntry::default().constant_id(i).offset(4 * i).size(4))
             .chain([vk::SpecializationMapEntry::default().constant_id(15).offset(4 * n).size(4),
-                    vk::SpecializationMapEntry::default().constant_id(14).offset(4 * n + 4).size(4),
-                    vk::SpecializationMapEntry::default().constant_id(13).offset(4 * n + 8).size(4)]).collect();
-        let data: Vec<u8> = spec.iter().chain([&self.kv_mode, &(self.wave64 as u32), &(self.rcp_d as u32)]).flat_map(|v| v.to_le_bytes()).collect();
+                    vk::SpecializationMapEntry::default().constant_id(16).offset(4 * n + 4).size(4),
+                    vk::SpecializationMapEntry::default().constant_id(14).offset(4 * n + 8).size(4),
+                    vk::SpecializationMapEntry::default().constant_id(13).offset(4 * n + 12).size(4)]).collect();
+        let data: Vec<u8> = spec.iter().chain([&self.kv_k_mode, &self.kv_v_mode, &(self.wave64 as u32), &(self.rcp_d as u32)]).flat_map(|v| v.to_le_bytes()).collect();
         let si = vk::SpecializationInfo::default().map_entries(&entries).data(&data);
         let mut sub = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32);
         let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(m).name(c"main").specialization_info(&si);
@@ -1250,7 +1258,10 @@ impl Backend for Vk {
     }
     fn preflight(&self, types: &[GgmlType], verbose: bool) -> anyhow::Result<()> { Vk::preflight(self, types, verbose) }
     fn kv_words(&self, n: usize) -> usize {
-        match self.0.kv_mode { 0 => n, 1 => n * 17 / 32, 2 => n * 9 / 32, 3 => n * 3 / 16, _ => unreachable!() }
+        match self.0.kv_k_mode { 0 => n, 1 => n * 17 / 32, 2 | 4..=6 => n * 9 / 32, 3 => n * 3 / 16, _ => unreachable!() }
+    }
+    fn kv_words_v(&self, n: usize) -> usize {
+        match self.0.kv_v_mode { 0 => n, 1 => n * 17 / 32, 2 | 4..=6 => n * 9 / 32, 3 => n * 3 / 16, _ => unreachable!() }
     }
 
     fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
@@ -1340,6 +1351,10 @@ impl Backend for Vk {
         self.rms_norm_rope_kv(x, x_stride, w, out, n, rows, eps, per, n_rot, step, base, 0, 0, 0)
     }
     fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
+        if kc != 0 {
+            let turbo = self.0.kv_k_mode >= 4 || self.0.kv_v_mode >= 4;
+            ensure!(!turbo || n % 128 == 0, "turbo KV cache: head_dim {n} is not a multiple of 128");
+        }
         let ts = (base as f64).powf(-2.0 / n_rot as f64);
         self.run("rms_norm", &[self.0.llama], [rows, 1, 1], &[&x, &w, &out, &0u64, &(x_stride as u32), &(n as u32), &(n as u32), &eps, &step, &ts, &(per as u32), &(n_rot as u32), &0u64, &v, &kc, &vc])
     }
@@ -1393,12 +1408,13 @@ impl Backend for Vk {
         pos0: usize, log_alpha: f32, log_floor: f32,
     ) -> anyhow::Result<()> {
         ensure!(w <= 128, "ink_clip_n: w={w} > 128");
-        ensure!(self.0.kv_mode == 0 || dst == 0 || w % 32 == 0, "ink_clip_n: quantized KV requires w % 32 == 0 (got {w})");
+        let quant = |m: u32| m > 0;
+        ensure!(!(quant(self.0.kv_k_mode) || quant(self.0.kv_v_mode)) || dst == 0 || w % 32 == 0, "ink_clip_n: quantized KV requires w % 32 == 0 (got {w})");
         let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
         let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
         self.run("ink_clip", &[], [rows, nt, 1], &[
             &x, &scale, &dst, &0u64, &(w as u32), &thr, &eps, &mul,
-            &(dst_at0 as u32), &(ring as u32), &(pos0 as u32), &log_alpha, &fl,
+            &(dst_at0 as u32), &(ring as u32), &(pos0 as u32), &log_alpha, &fl, &0u32,
         ])
     }
     fn ink_clip_pos(
@@ -1408,12 +1424,44 @@ impl Backend for Vk {
         pos_ptr: u64, log_alpha: f32, log_floor: f32,
     ) -> anyhow::Result<()> {
         ensure!(w <= 128, "ink_clip_pos: w={w} > 128");
-        ensure!(self.0.kv_mode == 0 || dst == 0 || w % 32 == 0, "ink_clip_pos: quantized KV requires w % 32 == 0 (got {w})");
+        ensure!(!(self.0.kv_k_mode > 0 || self.0.kv_v_mode > 0) || dst == 0 || w % 32 == 0, "ink_clip_pos: quantized KV requires w % 32 == 0 (got {w})");
         let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
         let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
         self.run("ink_clip", &[], [rows, nt, 1], &[
             &x, &scale, &dst, &pos_ptr, &(w as u32), &thr, &eps, &mul,
-            &0u32, &(ring as u32), &0u32, &log_alpha, &fl,
+            &0u32, &(ring as u32), &0u32, &log_alpha, &fl, &0u32,
+        ])
+    }
+    fn ink_clip_n_v(
+        &self, x: u64, scale: u64, w: usize, rows: usize, nt: usize,
+        thr: f32, eps: f32, mul: f32,
+        dst: u64, dst_at0: usize, dst_ring: usize,
+        pos0: usize, log_alpha: f32, log_floor: f32,
+    ) -> anyhow::Result<()> {
+        ensure!(w <= 128, "ink_clip_n: w={w} > 128");
+        let quant = self.0.kv_k_mode > 0 || self.0.kv_v_mode > 0;
+        ensure!(!quant || dst == 0 || w % 32 == 0, "ink_clip_n: quantized KV requires w % 32 == 0 (got {w})");
+        let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
+        let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
+        self.run("ink_clip", &[], [rows, nt, 1], &[
+            &x, &scale, &dst, &0u64, &(w as u32), &thr, &eps, &mul,
+            &(dst_at0 as u32), &(ring as u32), &(pos0 as u32), &log_alpha, &fl, &1u32,
+        ])
+    }
+    fn ink_clip_pos_v(
+        &self, x: u64, scale: u64, w: usize, rows: usize, nt: usize,
+        thr: f32, eps: f32, mul: f32,
+        dst: u64, dst_ring: usize,
+        pos_ptr: u64, log_alpha: f32, log_floor: f32,
+    ) -> anyhow::Result<()> {
+        ensure!(w <= 128, "ink_clip_pos: w={w} > 128");
+        let quant = self.0.kv_k_mode > 0 || self.0.kv_v_mode > 0;
+        ensure!(!quant || dst == 0 || w % 32 == 0, "ink_clip_pos: quantized KV requires w % 32 == 0 (got {w})");
+        let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
+        let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
+        self.run("ink_clip", &[], [rows, nt, 1], &[
+            &x, &scale, &dst, &pos_ptr, &(w as u32), &thr, &eps, &mul,
+            &0u32, &(ring as u32), &0u32, &log_alpha, &fl, &1u32,
         ])
     }
     fn ink_attn(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, rows: usize, at: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
@@ -1561,7 +1609,9 @@ impl Backend for Vk {
     }
     fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()> {
         // q8/q4: each subgroup quantizes one 32-value block of one row.
-        ensure!(self.0.kv_mode == 0 || (hd % 32 == 0 && n % hd == 0), "quantized KV cache: head_dim {hd} is not a multiple of 32");
+        ensure!((self.0.kv_k_mode == 0 && self.0.kv_v_mode == 0) || (hd % 32 == 0 && n % hd == 0), "quantized KV cache: head_dim {hd} is not a multiple of 32");
+        let turbo = self.0.kv_k_mode >= 4 || self.0.kv_v_mode >= 4;
+        ensure!(!turbo || hd % 128 == 0, "turbo KV cache: head_dim {hd} is not a multiple of 128");
         self.run("kv_store", &[], [(n * t).div_ceil(256), 1, 1], &[&k, &v, &kc, &vc, &step, &(n as u32), &((n * t) as u32), &(hd as u32)])
     }
     fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, sink: u64, win: usize) -> anyhow::Result<()> {

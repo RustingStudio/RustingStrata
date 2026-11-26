@@ -134,7 +134,7 @@ impl PrefillScratch {
     /// Bytes `alloc` takes (plus a little for the allocator).
     fn bytes(be: &dyn Backend, c: &Inkling2Config, rank: usize, vocab_rows: usize, max_nt: usize, light: bool) -> usize {
         let (kw, n_slot) = (c.n_head_kv * c.head_dim, c.n_slot());
-        let rb = 2 * be.kv_words(kw);
+        let rb = 2 * be.kv_words(kw).max(be.kv_words_v(kw));
         let lay = PrefillLayout::at(0, c, rank, max_nt).end as usize;
         let swa = (n_slot * VERIFY_MAX * rb).max(1024);
         let extra = if light { 0 } else {
@@ -151,7 +151,8 @@ impl PrefillScratch {
         let p = PrefillLayout::at(buf.addr(), c, rank, max_nt);
         let acc_buf = be.alloc(4 * max_nt * c.n_embd)?;
         let kw = c.n_head_kv * c.head_dim;
-        let rb = 2 * be.kv_words(kw);
+        // Row bytes of the wider side: the scratch holds K rows or V rows, each at its own stride.
+        let rb = 2 * be.kv_words(kw).max(be.kv_words_v(kw));
         let kv_bytes = if light { 256 } else { max_nt * rb };
         let (kc_tmp, vc_tmp) = (be.alloc(kv_bytes)?, be.alloc(kv_bytes)?);
         let max_np = max_nt * c.n_used;
@@ -295,8 +296,8 @@ impl Device {
                 [l.wq, l.wk, l.wv, l.wo, l.gate, l.rel, l.sink].iter().chain(l.conv_proj.iter().flatten()).all(dense)
             }) { return None; }
             let rows: usize = (0..c.n_slot()).map(|il| if c.swa[layer_of(c, il)] { c.n_swa } else { full }).sum();
-            let row_words = d.parts[0].be.kv_words(kw);
-            room(&mut d, 4 * rows * row_words + sc_bytes(c, full) + Scratch::at(0, c, rank, m.output.rows).end as usize + (512 << 20));
+            let kv_bytes = 2 * rows * d.parts[0].be.kv_row_words(kw);
+            room(&mut d, kv_bytes + sc_bytes(c, full) + Scratch::at(0, c, rank, m.output.rows).end as usize + (512 << 20));
         }
         let made = (|| -> Result<Self> {
             let (mut layers, loops, slots, out_query, out_norm, scr, sc_buf) = {
@@ -318,10 +319,10 @@ impl Device {
                 let loops = m.loops.iter().map(|l| {
                     Ok(DLoop { msg_query: up(be, &l.msg_query)?, down: half(&l.down)?, gain: half(&l.gain)?, forget: half(&l.forget)? })
                 }).collect::<Result<Vec<_>>>()?;
-                let row_words = be.kv_words(kw);
+                let (kwk, kwv) = (be.kv_words(kw), be.kv_words_v(kw));
                 let slots = (0..c.n_slot()).map(|il| {
                     let rows = if c.swa[layer_of(c, il)] { c.n_swa } else { full };
-                    Ok(DSlot { k: be.alloc(2 * rows * row_words)?, v: be.alloc(2 * rows * row_words)?, hist: be.zeros::<f32>(hists(c).1)?, cap: rows })
+                    Ok(DSlot { k: be.alloc(2 * rows * kwk)?, v: be.alloc(2 * rows * kwv)?, hist: be.zeros::<f32>(hists(c).1)?, cap: rows })
                 }).collect::<Result<Vec<_>>>()?;
                 let sc_buf = be.alloc(sc_bytes(c, (pos + 1).max(64)))?;
                 let (out_query, out_norm, scr) = (up(be, &m.out_query)?, up(be, &m.out_norm)?, be.alloc(Scratch::at(0, c, rank, m.output.rows).end as usize)?);
@@ -436,14 +437,14 @@ impl Device {
         let be = &*d.parts[0].be;
         let len = hists(c).1;
         let kw = c.n_head_kv * c.head_dim;
-        let swa_words = c.n_swa * be.kv_words(kw);
+        let (swa_k, swa_v) = (c.n_swa * be.kv_words(kw), c.n_swa * be.kv_words_v(kw));
         let mut dev_hist = Vec::with_capacity(self.slots.len());
         let mut dev_swa = Vec::with_capacity(self.slots.len());
         for (il, ds) in self.slots.iter().enumerate() {
             dev_hist.push(be.get(&ds.hist, 0, len).expect("inkling2 save_checkpoint hist"));
             if c.swa[layer_of(c, il)] {
-                let k: Vec<u16> = be.get(&ds.k, 0, swa_words).expect("inkling2 save_checkpoint swa k");
-                let v: Vec<u16> = be.get(&ds.v, 0, swa_words).expect("inkling2 save_checkpoint swa v");
+                let k: Vec<u16> = be.get(&ds.k, 0, swa_k).expect("inkling2 save_checkpoint swa k");
+                let v: Vec<u16> = be.get(&ds.v, 0, swa_v).expect("inkling2 save_checkpoint swa v");
                 dev_swa.push(Some((k, v)));
             } else {
                 dev_swa.push(None);
@@ -479,13 +480,13 @@ impl Device {
         let need = need_pos + 1;
         ensure!(need <= m.max_ctx, "context is limited to {} tokens", m.max_ctx);
         let mut d = dev::get().unwrap().lock().unwrap();
-        let row_words = d.parts[0].be.kv_words(kw);
+        let (kwk, kwv) = (d.parts[0].be.kv_words(kw), d.parts[0].be.kv_words_v(kw));
         let full_cap = self.slots.iter().enumerate().find(|&(il, _)| !c.swa[layer_of(c, il)]).map(|(_, s)| s.cap);
         if let Some(cap) = full_cap && need > cap {
             let new_cap = grown(need, m.max_ctx);
             let n = (0..c.n_slot()).filter(|&il| !c.swa[layer_of(c, il)]).count();
             // The margin is the one of `new`: the prompt scratch and the graphs of the reply come after this.
-            let bytes = 4 * n * new_cap * row_words + sc_bytes(c, new_cap) + (512 << 20);
+            let bytes = 2 * n * new_cap * (kwk + kwv) + sc_bytes(c, new_cap) + (512 << 20);
             room(&mut d, bytes);
             // The expert cache was not enough: whole layers of experts go, the last loaded first. Their experts
             // then run through the expert cache or on the CPU, which costs less than a model without its device state.
@@ -516,8 +517,9 @@ impl Device {
         for (il, s) in self.slots.iter_mut().enumerate() {
             if c.swa[layer_of(c, il)] || need <= s.cap { continue; }
             let new_cap = grown(need, m.max_ctx);
-            for b in [&mut s.k, &mut s.v] {
-                let new = be.alloc(2 * new_cap * row_words)?;
+            // K and V are separate buffers with their own word width; sizing both with their sum doubles f16.
+            for (b, words) in [(&mut s.k, kwk), (&mut s.v, kwv)] {
+                let new = be.alloc(2 * new_cap * words)?;
                 be.dtod(b, 0, &new, 0, b.len())?;
                 be.sync()?;  // the copy reads the buffer that `*b = new` frees
                 *b = new;
@@ -1143,15 +1145,15 @@ impl Device {
         let d = dev::get().unwrap().lock().unwrap();
         let be = &*d.parts[0].be;
         let pf = self.pf.as_ref().unwrap();
-        let rb = 2 * be.kv_words(kw);
+        let (rk, rv) = (2 * be.kv_words(kw), 2 * be.kv_words_v(kw));
         for (il, ds) in self.slots.iter().enumerate() {
             let ip = layer_of(c, il);
             if m.layers[ip].swa {
-                let swa_base = il * VERIFY_MAX * rb;
+                let (bk, bv) = (il * VERIFY_MAX * rk, il * VERIFY_MAX * rv);
                 for t in (keep..nt).rev() {
                     let at = (pos0 + t) % c.n_swa;
-                    be.dtod(&pf.swa_kc_log, swa_base + t * rb, &ds.k, at * rb, rb)?;
-                    be.dtod(&pf.swa_vc_log, swa_base + t * rb, &ds.v, at * rb, rb)?;
+                    be.dtod(&pf.swa_kc_log, bk + t * rk, &ds.k, at * rk, rk)?;
+                    be.dtod(&pf.swa_vc_log, bv + t * rv, &ds.v, at * rv, rv)?;
                 }
             }
             let bak_base = il * 4 * h_total;
@@ -1255,23 +1257,23 @@ impl Device {
             be.ink_conv_batch(p.k, l.convs[0].addr(), taps[0], hist(0), p.k2, kw, nc, hd, nt)?;
             be.ink_conv_batch(p.v, l.convs[1].addr(), taps[1], hist(1), p.v2, kw, nc, hd, nt)?;
             let log_alpha = if ml.swa { 0.0 } else { c.log_alpha };
-            let rb = 2 * be.kv_words(kw);
+            let (rk, rv) = (2 * be.kv_words(kw), 2 * be.kv_words_v(kw));
             be.ink_clip_n(p.q, l.q_clip.addr(), hd, nh, nt, c.qk_clip, 0.0, 1.0, 0, 0, 1, pos0, log_alpha, c.log_floor)?;
             be.ink_clip_n(p.r, l.rel_clip.addr(), nr, nh, nt, c.rel_clip, 0.0, 1.0, 0, 0, 1, pos0, log_alpha, c.log_floor)?;
             if verify_mode {
-                let swa_base = il * VERIFY_MAX * rb;
+                let (bk, bv) = (il * VERIFY_MAX * rk, il * VERIFY_MAX * rv);
                 if !ml.swa {
                     be.ink_clip_n(p.k2, 0, hd, nkv, nt, c.qk_clip, 0.0, 1.0, ds.k.addr(), pos0, ds.cap, 0, 0.0, 1.0)?;
-                    be.ink_clip_n(p.v2, 0, hd, nkv, nt, 0.0, c.eps, 1.0, ds.v.addr(), pos0, ds.cap, 0, 0.0, 1.0)?;
+                    be.ink_clip_n_v(p.v2, 0, hd, nkv, nt, 0.0, c.eps, 1.0, ds.v.addr(), pos0, ds.cap, 0, 0.0, 1.0)?;
                 }
                 for t in 0..nt {
                     let pos = pos0 + t;
                     let (rows, at) = if ml.swa {
                         let at = pos % c.n_swa;
-                        be.dtod(&ds.k, at * rb, &pf.swa_kc_log, swa_base + t * rb, rb)?;
-                        be.dtod(&ds.v, at * rb, &pf.swa_vc_log, swa_base + t * rb, rb)?;
+                        be.dtod(&ds.k, at * rk, &pf.swa_kc_log, bk + t * rk, rk)?;
+                        be.dtod(&ds.v, at * rv, &pf.swa_vc_log, bv + t * rv, rv)?;
                         be.ink_clip_n(p.k2 + f(t * kw), 0, hd, nkv, 1, c.qk_clip, 0.0, 1.0, ds.k.addr(), at, c.n_swa, 0, 0.0, 1.0)?;
-                        be.ink_clip_n(p.v2 + f(t * kw), 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), at, c.n_swa, 0, 0.0, 1.0)?;
+                        be.ink_clip_n_v(p.v2 + f(t * kw), 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), at, c.n_swa, 0, 0.0, 1.0)?;
                         ((pos + 1).min(c.n_swa), at)
                     } else {
                         (pos + 1, pos)
@@ -1289,7 +1291,7 @@ impl Device {
                     (ds.k.addr(), ds.v.addr(), pos0, ds.cap)
                 };
                 be.ink_clip_n(p.k2, 0, hd, nkv, nt, c.qk_clip, 0.0, 1.0, kd, at0, kvr, 0, 0.0, 1.0)?;
-                be.ink_clip_n(p.v2, 0, hd, nkv, nt, 0.0, c.eps, 1.0, vd, at0, kvr, 0, 0.0, 1.0)?;
+                be.ink_clip_n_v(p.v2, 0, hd, nkv, nt, 0.0, c.eps, 1.0, vd, at0, kvr, 0, 0.0, 1.0)?;
                 let (kc_new, vc_new, ring, win) = if ml.swa {
                     (kd, vd, c.n_swa, c.n_swa)
                 } else {
@@ -1302,11 +1304,11 @@ impl Device {
                     let src0 = nt - keep;
                     let dst0 = (pos0 + src0) % c.n_swa;
                     let first = keep.min(c.n_swa - dst0);
-                    be.dtod(&pf.kc_tmp, src0 * rb, &ds.k, dst0 * rb, first * rb)?;
-                    be.dtod(&pf.vc_tmp, src0 * rb, &ds.v, dst0 * rb, first * rb)?;
+                    be.dtod(&pf.kc_tmp, src0 * rk, &ds.k, dst0 * rk, first * rk)?;
+                    be.dtod(&pf.vc_tmp, src0 * rv, &ds.v, dst0 * rv, first * rv)?;
                     if first < keep {
-                        be.dtod(&pf.kc_tmp, (src0 + first) * rb, &ds.k, 0, (keep - first) * rb)?;
-                        be.dtod(&pf.vc_tmp, (src0 + first) * rb, &ds.v, 0, (keep - first) * rb)?;
+                        be.dtod(&pf.kc_tmp, (src0 + first) * rk, &ds.k, 0, (keep - first) * rk)?;
+                        be.dtod(&pf.vc_tmp, (src0 + first) * rv, &ds.v, 0, (keep - first) * rv)?;
                     }
                 }
             }
@@ -1541,7 +1543,7 @@ impl Device {
             be.batch(&mut || {
                 be.ink_clip_pos(s.q, l.q_clip.addr(), hd, nh, 1, c.qk_clip, 0.0, 1.0, 0, 1, s.pos, log_alpha, c.log_floor)?;
                 be.ink_clip_pos(s.k, 0, hd, nkv, 1, c.qk_clip, 0.0, 1.0, ds.k.addr(), ring, s.pos, 0.0, 1.0)?;
-                be.ink_clip_pos(s.v, 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), ring, s.pos, 0.0, 1.0)?;
+                be.ink_clip_pos_v(s.v, 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), ring, s.pos, 0.0, 1.0)?;
                 be.ink_clip_pos(s.r, l.rel_clip.addr(), nr, nh, 1, c.rel_clip, 0.0, 1.0, 0, 1, s.pos, log_alpha, c.log_floor)
             })?;
             be.ink_attn_pos(s.q, s.r, s.sink, s.og, ds.k.addr(), ds.v.addr(), l.rel_bias.addr(), self.sc_buf.addr(), s.att, max_rows, ring, s.pos, nh, nkv, hd, nr, c.rel_extent)?;
@@ -1550,7 +1552,7 @@ impl Device {
             be.batch(&mut || {
                 be.ink_clip_n(s.q, l.q_clip.addr(), hd, nh, 1, c.qk_clip, 0.0, 1.0, 0, 0, 1, pos, log_alpha, c.log_floor)?;
                 be.ink_clip_n(s.k, 0, hd, nkv, 1, c.qk_clip, 0.0, 1.0, ds.k.addr(), at, ring, 0, 0.0, 1.0)?;
-                be.ink_clip_n(s.v, 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), at, ring, 0, 0.0, 1.0)?;
+                be.ink_clip_n_v(s.v, 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), at, ring, 0, 0.0, 1.0)?;
                 be.ink_clip_n(s.r, l.rel_clip.addr(), nr, nh, 1, c.rel_clip, 0.0, 1.0, 0, 0, 1, pos, log_alpha, c.log_floor)
             })?;
             be.ink_attn(s.q, s.r, s.sink, s.og, ds.k.addr(), ds.v.addr(), l.rel_bias.addr(), self.sc_buf.addr(), s.att, rows, at, nh, nkv, hd, nr, c.rel_extent)?;

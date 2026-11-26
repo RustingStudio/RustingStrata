@@ -7,7 +7,26 @@ layout(local_size_x = 128) in;
 layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 qg; F32 o; I32 step; uint t; uint nh; uint nkv; float scale; U32 qm; uint mw; uint q_off; F32 sink; int win; } p;
 layout(constant_id = 1) const uint PER = 4;  // head_dim / 32
 const uint HD = 32 * PER;
-
+uint tq_idx(uint j, uint lane, uint mode) {
+    if (mode >= 4u) return PER == 2u ? 2u * lane + (j & 1u) : (j >> 2u) * 128u + 4u * lane + (j & 3u);
+    return lane + 32u * j;
+}
+void rotate_q(inout float q[PER], uint lane) {
+    for (uint g = 0u; g < PER / 4u; g++) {
+        vec4 v = vec4(q[4u * g], q[4u * g + 1u], q[4u * g + 2u], q[4u * g + 3u]);
+        v = tq_wht4(v, lane, false);
+        q[4u * g] = v.x; q[4u * g + 1u] = v.y; q[4u * g + 2u] = v.z; q[4u * g + 3u] = v.w;
+    }
+    if (PER == 2u) { vec2 v = vec2(q[0], q[1]); v = tq_wht2(v, lane, false); q[0] = v.x; q[1] = v.y; }
+}
+void rotate_v(inout float v[PER], uint lane) {
+    for (uint g = 0u; g < PER / 4u; g++) {
+        vec4 a = vec4(v[4u * g], v[4u * g + 1u], v[4u * g + 2u], v[4u * g + 3u]);
+        a = tq_wht4(a, lane, true);
+        v[4u * g] = a.x; v[4u * g + 1u] = a.y; v[4u * g + 2u] = a.z; v[4u * g + 3u] = a.w;
+    }
+    if (PER == 2u) { vec2 a = vec2(v[0], v[1]); a = tq_wht2(a, lane, true); v[0] = a.x; v[1] = a.y; }
+}
 void main() {
     uint t = gl_WorkGroupID.x * 4 + WARP, h = gl_WorkGroupID.y, lane = LANE;
     if (t >= p.t) return;
@@ -15,29 +34,33 @@ void main() {
     uint kvo = h / (p.nh / p.nkv) * HD + lane, kvd = p.nkv * HD, last = uint(p.step.v[0]) + row;
     float q[PER], acc[PER], m = 0.0, l = 0.0;
     [[unroll]] for (uint j = 0; j < PER; j++) {
-        q[j] = p.q.v[(t * p.nh + h) * HD + lane + 32 * j] * p.scale;
+        q[j] = p.q.v[(t * p.nh + h) * HD + tq_idx(j, lane, KV_MODE)] * p.scale;
         acc[j] = 0.0;
     }
+    if (TQ_K) rotate_q(q, lane);
     bool first = true;
     for (uint k = 0; k <= last; k++) {
         if (p.win > 0 && k + uint(p.win) <= last) continue;
         if (uint64_t(p.qm) != 0 && !qsa_bit(p.qm, p.mw, row, k)) continue;
         float s = 0.0;
-        [[unroll]] for (uint j = 0; j < PER; j++) s += q[j] * ldkv(p.kc, k * kvd + kvo + 32 * j, HD);
+        [[unroll]] for (uint j = 0; j < PER; j++) s += q[j] * ldkv_k(p.kc, k * kvd + h / (p.nh / p.nkv) * HD + tq_idx(j, lane, KV_MODE), HD);
         s = W64 ? warp_sum(s) : subgroupAdd(s);
         float mn = first ? s : max(m, s), c = first ? 0.0 : expf_(m - mn), e = expf_(s - mn);
         l = first ? e : fma(l, c, e);
         first = false;
-        [[unroll]] for (uint j = 0; j < PER; j++) acc[j] = fma(e, ldkv(p.vc, k * kvd + kvo + 32 * j, HD), acc[j] * c);
+        [[unroll]] for (uint j = 0; j < PER; j++) acc[j] = fma(e, ldkv_v(p.vc, k * kvd + h / (p.nh / p.nkv) * HD + tq_idx(j, lane, VKV_MODE), HD), acc[j] * c);
         m = mn;
     }
     float sk = uint64_t(p.sink) != 0 ? p.sink.v[h] : uintBitsToFloat(0xff800000u);
     float M = max(m, sk), sc = m == uintBitsToFloat(0xff800000u) ? 0.0 : expf_(m - M);
     float den = l * sc + (uint64_t(p.sink) == 0 ? 0.0 : expf_(sk - M));
     float inv = den > 0.0 ? fdiv(sc, den) : 0.0;
+    float ov[PER];
+    [[unroll]] for (uint j = 0; j < PER; j++) ov[j] = acc[j] * inv;
+    if (TQ_V) rotate_v(ov, lane);
     [[unroll]] for (uint j = 0; j < PER; j++) {
-        uint col = lane + 32 * j;
+        uint col = tq_idx(j, lane, VKV_MODE);
         float gate = uint64_t(p.qg) != 0 ? sigmoid(p.qg.v[t * p.nh * 2 * HD + h * 2 * HD + HD + col]) : 1.0;
-        p.o.v[t * p.nh * HD + h * HD + col] = acc[j] * inv * gate;
+        p.o.v[t * p.nh * HD + h * HD + col] = ov[j] * gate;
     }
 }
