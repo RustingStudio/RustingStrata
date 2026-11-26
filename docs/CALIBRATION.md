@@ -57,7 +57,7 @@ win must not silently double someone's KV cache. `--ctx` and `--kv` only set the
 
 ## Workloads and tasks
 
-`--pp` lists prompt depths (default `128,512,2048`); `--tg` sets decoded tokens (default 128). All depths of one task
+`--pp` lists prompt depths (default `128,512,2048`); `--tg` sets decoded tokens (default 64). All depths of one task
 are measured in a single child process.
 
 - `prose` (default): the built-in repeated paragraph, a stable machine-level baseline.
@@ -122,10 +122,10 @@ layer split, and `--split` is ignored with a note.
 | flag | default | meaning |
 | --- | --- | --- |
 | `--samples N` | 24 | hard cap on benchmark samples |
-| `--reps N` | 3 | repetitions per point (their mean is used) |
+| `--reps N` | 2 | repetitions per point (their mean is used) |
 | `--warmup N` | 0 | extra discarded run before each sample |
 | `--pp A,B,C` | `128,512,2048` | prompt depths |
-| `--tg N` | 128 | decoded tokens |
+| `--tg N` | 64 | decoded tokens |
 | `--chunk-values A,B` | `256,…,4096` | prefill chunks to search |
 | `--task LABEL` | `prose` | corpus (repeatable) |
 | `--seed N` | 1 | deterministic search seed |

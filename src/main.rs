@@ -1039,7 +1039,7 @@ enum Cmd {
         #[arg(long, default_value_t = 24)]
         samples: usize,
         /// Benchmark repetitions inside each sample; their mean is used and run-to-run spread is reported.
-        #[arg(long, default_value_t = 3)]
+        #[arg(long, default_value_t = 2)]
         reps: usize,
         /// Extra discarded run before each sample (off by default: it loads the model a second time).
         #[arg(long, default_value_t = 0)]
@@ -1048,7 +1048,7 @@ enum Cmd {
         #[arg(long, value_delimiter = ',', default_value = "128,512,2048")]
         pp: Vec<usize>,
         /// Tokens greedily decoded per workload.
-        #[arg(long, default_value_t = 128)]
+        #[arg(long, default_value_t = 64)]
         tg: usize,
         /// Prefill chunk sizes to search, comma-separated. [default: 256,512,1024,2048,4096]
         #[arg(long, value_delimiter = ',')]
@@ -2381,7 +2381,7 @@ impl CalibSettings {
     fn new(model: PathBuf) -> Self {
         Self {
             model, backend: None, device: vec![0], vram_margin: vec!["512".into()], kv: "f16".into(),
-            aux: None, ctx: 4096, samples: 24, reps: 3, warmup: 0, pp: vec![128, 512, 2048], tg: 128,
+            aux: None, ctx: 4096, samples: 24, reps: 2, warmup: 0, pp: vec![128, 512, 2048], tg: 64,
             chunk_values: vec![256, 512, 1024, 2048, 4096], tasks: vec!["prose".into()],
             seed: 1, dry_run: false, timeout: 0, minutes: 30, out: None,
             spec_types: vec![], draft_max: vec![], ngram_n: vec![], mtp_values: vec![],
