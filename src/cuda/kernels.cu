@@ -2484,6 +2484,86 @@ extern "C" __global__ void attn_sel(const float* q, const u16* kc, const u16* vc
     for (int r = 0; r < nd; r++) o[c + 32 * r] = acc[r] / l;
 }
 
+// Vision encoder attention: each of the n query rows sees all n keys, no mask. q, k, v and out are f32 [n][nh][hd],
+// A block takes 32 query rows of head blockIdx.y (8 a warp) and walks the keys 32 at a time through shared memory,
+// one key a lane, with an online softmax. The 8 rows of a warp share each K and V load; the probabilities go through
+// shared memory, and each lane keeps its own part of the softmax sum until the end. A key row takes hd + 1 floats so
+// the 32 lanes, each on its own key, hit 32 banks. Shared memory: (64 * hd + 32 * (hd + 1) + 1024) floats.
+extern "C" __global__ void vit_attn(const float* q, const float* k, const float* v, float* out, int n, int nh, int hd, float scale) {
+    extern __shared__ float sm[];
+    float* qs = sm;
+    float* vs = qs + 32 * hd;
+    float* ks = vs + 32 * hd;
+    const int h = blockIdx.y, q0 = blockIdx.x * 32, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    float* ps = ks + 32 * (hd + 1) + w * 256;
+    const float* qw = qs + w * 8 * hd;
+    const size_t ld = (size_t)nh * hd;
+    for (int i = threadIdx.x; i < 32 * hd; i += blockDim.x) {
+        const int r = i / hd, d = i - r * hd;
+        qs[i] = q0 + r < n ? q[(q0 + r) * ld + h * hd + d] * scale : 0.f;
+    }
+    float m[8], l[8], o[8][4];
+#pragma unroll
+    for (int r = 0; r < 8; r++) {
+        m[r] = __int_as_float(0xff800000); l[r] = 0.f;
+#pragma unroll
+        for (int c = 0; c < 4; c++) o[r][c] = 0.f;
+    }
+    for (int k0 = 0; k0 < n; k0 += 32) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < 32 * hd; i += blockDim.x) {
+            const int r = i / hd, d = i - r * hd;
+            const bool in = k0 + r < n;
+            const size_t g = (k0 + r) * ld + h * hd + d;
+            ks[r * (hd + 1) + d] = in ? k[g] : 0.f;
+            vs[i] = in ? v[g] : 0.f;
+        }
+        __syncthreads();
+        const bool valid = k0 + lane < n;
+        const float* kr = ks + lane * (hd + 1);
+        float s[8];
+#pragma unroll
+        for (int r = 0; r < 8; r++) s[r] = 0.f;
+        for (int d = 0; d < hd; d++) {
+            const float kd = kr[d];
+#pragma unroll
+            for (int r = 0; r < 8; r++) s[r] += qw[r * hd + d] * kd;
+        }
+#pragma unroll
+        for (int r = 0; r < 8; r++) {
+            // The first tile always holds key 0, so mn is finite from then on and corr is 0 on the first tile.
+            const float mn = fmaxf(m[r], warp_max(valid ? s[r] : __int_as_float(0xff800000)));
+            const float p = valid ? __expf(s[r] - mn) : 0.f;
+            const float corr = __expf(m[r] - mn);
+            l[r] = l[r] * corr + p;
+            m[r] = mn;
+#pragma unroll
+            for (int c = 0; c < 4; c++) o[r][c] *= corr;
+            ps[r * 32 + lane] = p;
+        }
+        __syncwarp();
+        for (int j = 0; j < 32; j++) {
+            const float* vr = vs + j * hd;
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                if (lane + 32 * c >= hd) continue;
+                const float vv = vr[lane + 32 * c];
+#pragma unroll
+                for (int r = 0; r < 8; r++) o[r][c] += ps[r * 32 + j] * vv;
+            }
+        }
+        __syncwarp();
+    }
+#pragma unroll
+    for (int r = 0; r < 8; r++) {
+        const int t = q0 + w * 8 + r;
+        const float lt = warp_sum(l[r]);
+        if (t >= n) continue;
+#pragma unroll
+        for (int c = 0; c < 4; c++) if (lane + 32 * c < hd) out[t * ld + h * hd + lane + 32 * c] = o[r][c] / lt;
+    }
+}
+
 __device__ __forceinline__ unsigned ink_f2key(float x) {
     unsigned u = __float_as_uint(x == 0.0f ? 0.0f : x);
     return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);

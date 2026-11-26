@@ -418,6 +418,7 @@ impl Engine {
 
     /// Hand `--backend`, `--device`, and `--kv` to the DeepSeek, GLM, Gemma 4 and Inkling 2 paths.
     fn ds_env(&self) -> anyhow::Result<()> {
+        if self.gpu { vision::use_gpu(self.backend.clone(), self.device.first().copied().unwrap_or(0)); }
         // SAFETY: called at the start of a command, before any thread reads these variables.
         if let Some(b) = &self.backend { unsafe { std::env::set_var("STRATA_DS_BACKEND", b) } }
         if self.device != [0] { unsafe { std::env::set_var("STRATA_DS_DEVICES", self.device.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")) } }

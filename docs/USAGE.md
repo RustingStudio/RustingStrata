@@ -217,7 +217,8 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   cannot grow for lack of VRAM fails alone. That forward
   rounds differently from the single-request one, so greedy output under load can differ at near-ties from the same
   request run alone. An image request (`--mmproj`) takes a slot too: its prompt runs a token at a time between the
-  other slots' steps, and its reply decodes beside the batched forward, one token a step.
+  other slots' steps, and its reply decodes beside the batched forward, one token a step. With `--gpu` the image encoder runs on the GPU too
+  (`STRATA_VISION_CPU=1` keeps it on the CPU; see docs/VISION.md).
 - `temperature`, `top_k`, `top_p`, `min_p` and `seed` are honored; decoding is greedy when they are left out.
   `min_p` (0 to 1, `--min-p`, default 0 = off) drops the tokens whose probability is below `min_p` times the
   best token's, as in llama.cpp.

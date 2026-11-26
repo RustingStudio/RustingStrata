@@ -7,10 +7,14 @@
 use crate::ops;
 use crate::vision::image::{PreprocessedImage, Rgb, resize_bilinear, resize_bilinear_antialias_f32, resize_bilinear_f32, smart_resize};
 use crate::vision::mmproj::{ClipConfig, ClipModel, FfnKind, ProjectorKind};
+use crate::backend::{Backend, GpuTensor};
+use crate::quant::GgmlType;
 use crate::weights::Tensor;
 use anyhow::{Context, bail};
 use rayon::prelude::*;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::{Mutex, OnceLock};
 
 fn dbg() -> bool { std::env::var_os("STRATA_VISION_DEBUG").is_some() }
 
@@ -121,8 +125,8 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resul
     let patch_area = c.patch_size * c.patch_size * 3;
 
     // 1. patch convolution. `v.patch_embd.weight` is [kx, ky, c, out]; flatten it to [out][kx,ky,c].
-    let w0 = p.model.tensor_as("v.patch_embd.weight", Some(patch_area))?;
-    let w1 = p.model.tensor_as("v.patch_embd.weight.1", Some(patch_area))?;
+    let w0 = rows_f32(&p.model.tensor_as("v.patch_embd.weight", Some(patch_area))?);
+    let w1 = rows_f32(&p.model.tensor_as("v.patch_embd.weight.1", Some(patch_area))?);
     let bias = p.model.tensor("v.patch_embd.bias")?;
     let mut patch_bias = vec![0f32; n_embd];
     bias.row(0, &mut patch_bias);
@@ -139,12 +143,9 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resul
                 }
             }
         }
-        let mut buf = vec![0f32; patch_area];
-        for o in 0..n_embd {
-            w0.row(o, &mut buf);
-            let mut v = buf.iter().zip(&patch).map(|(a, b)| a * b).sum::<f32>();
-            w1.row(o, &mut buf);
-            v += buf.iter().zip(&patch).map(|(a, b)| a * b).sum::<f32>();
+        for (o, (r0, r1)) in w0.chunks_exact(patch_area).zip(w1.chunks_exact(patch_area)).enumerate() {
+            let mut v = r0.iter().zip(&patch).map(|(a, b)| a * b).sum::<f32>();
+            v += r1.iter().zip(&patch).map(|(a, b)| a * b).sum::<f32>();
             xs[o] = v + patch_bias[o];
         }
     });
@@ -197,7 +198,7 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resul
         let qkv_w = p.model.tensor(&format!("v.blk.{il}.attn_qkv.weight"))?;
         let qkv_b = p.model.tensor(&format!("v.blk.{il}.attn_qkv.bias"))?;
         let mut qkv = vec![0f32; n_patches * 3 * n_embd];
-        qkv_w.matmul(&h, n_patches, &mut qkv);
+        matmul(&qkv_w, &h, n_patches, &mut qkv);
         add_bias_rows(&mut qkv, &qkv_b, 3 * n_embd);
 
         let mut q = vec![0f32; n_patches * n_embd];
@@ -230,7 +231,7 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resul
         let wo_w = p.model.tensor(&format!("v.blk.{il}.attn_out.weight"))?;
         let wo_b = p.model.tensor(&format!("v.blk.{il}.attn_out.bias"))?;
         let mut attn_out = vec![0f32; n_patches * n_embd];
-        wo_w.matmul(&attn, n_patches, &mut attn_out);
+        matmul(&wo_w, &attn, n_patches, &mut attn_out);
         add_bias_rows(&mut attn_out, &wo_b, n_embd);
         for (a, b) in x.iter_mut().zip(&attn_out) { *a += *b; }
 
@@ -238,13 +239,13 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resul
         let up_w = p.model.tensor(&format!("v.blk.{il}.ffn_up.weight"))?;
         let up_b = p.model.tensor(&format!("v.blk.{il}.ffn_up.bias"))?;
         let mut up = vec![0f32; n_patches * c.n_ff];
-        up_w.matmul(&h, n_patches, &mut up);
+        matmul(&up_w, &h, n_patches, &mut up);
         add_bias_rows(&mut up, &up_b, c.n_ff);
         up.par_iter_mut().for_each(|v| *v = activate(c.ffn, *v));
         let down_w = p.model.tensor(&format!("v.blk.{il}.ffn_down.weight"))?;
         let down_b = p.model.tensor(&format!("v.blk.{il}.ffn_down.bias"))?;
         let mut down = vec![0f32; n_patches * n_embd];
-        down_w.matmul(&up, n_patches, &mut down);
+        matmul(&down_w, &up, n_patches, &mut down);
         add_bias_rows(&mut down, &down_b, n_embd);
         for (a, b) in x.iter_mut().zip(&down) { *a += *b; }
     }
@@ -263,13 +264,13 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resul
     let mm0 = p.model.tensor("mm.0.weight")?;
     let mm0_b = p.model.tensor("mm.0.bias")?;
     let mut proj = vec![0f32; n_merged * feat];
-    mm0.matmul(&x, n_merged, &mut proj);
+    matmul(&mm0, &x, n_merged, &mut proj);
     add_bias_rows(&mut proj, &mm0_b, feat);
     proj.par_iter_mut().for_each(|v| *v = activate(c.ffn, *v));
     let mm2 = p.model.tensor("mm.2.weight")?;
     let mm2_b = p.model.tensor("mm.2.bias")?;
     let mut out = vec![0f32; n_merged * c.projection_dim];
-    mm2.matmul(&proj, n_merged, &mut out);
+    matmul(&mm2, &proj, n_merged, &mut out);
     add_bias_rows(&mut out, &mm2_b, c.projection_dim);
 
     rows(out, n_merged, c.projection_dim)
@@ -283,7 +284,7 @@ fn encode_gemma4v(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resul
     let n_patches = nx * ny;
     let n_embd = c.n_embd;
     let patch_area = c.patch_size * c.patch_size * 3;
-    let w = p.model.tensor_as("v.patch_embd.weight", Some(patch_area))?;
+    let w = rows_f32(&p.model.tensor_as("v.patch_embd.weight", Some(patch_area))?);
     let mut x = vec![0f32; n_patches * n_embd];
     x.par_chunks_mut(n_embd).enumerate().for_each(|(q, xs)| {
         let px = q % nx;
@@ -297,10 +298,8 @@ fn encode_gemma4v(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resul
                 }
             }
         }
-        let mut buf = vec![0f32; patch_area];
-        for o in 0..n_embd {
-            w.row(o, &mut buf);
-            xs[o] = buf.iter().zip(&patch).map(|(a, b)| a * b).sum();
+        for (o, r) in w.chunks_exact(patch_area).enumerate() {
+            xs[o] = r.iter().zip(&patch).map(|(a, b)| a * b).sum();
         }
     });
 
@@ -326,9 +325,9 @@ fn encode_gemma4v(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resul
         let k_w = p.model.tensor(&format!("v.blk.{il}.attn_k.weight"))?;
         let v_w = p.model.tensor(&format!("v.blk.{il}.attn_v.weight"))?;
         let (mut q, mut k, mut v) = (vec![0f32; n_patches * n_embd], vec![0f32; n_patches * n_embd], vec![0f32; n_patches * n_embd]);
-        q_w.matmul(&h, n_patches, &mut q);
-        k_w.matmul(&h, n_patches, &mut k);
-        v_w.matmul(&h, n_patches, &mut v);
+        matmul(&q_w, &h, n_patches, &mut q);
+        matmul(&k_w, &h, n_patches, &mut k);
+        matmul(&v_w, &h, n_patches, &mut v);
 
         let q_norm = p.model.to_f32(&format!("v.blk.{il}.attn_q_norm.weight"))?;
         let k_norm = p.model.to_f32(&format!("v.blk.{il}.attn_k_norm.weight"))?;
@@ -357,7 +356,7 @@ fn encode_gemma4v(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resul
         let attn = attention(&q, &k, &v, n_patches, c.n_head, c.d_head, 1.0);
         let o_w = p.model.tensor(&format!("v.blk.{il}.attn_out.weight"))?;
         let mut attn_out = vec![0f32; n_patches * n_embd];
-        o_w.matmul(&attn, n_patches, &mut attn_out);
+        matmul(&o_w, &attn, n_patches, &mut attn_out);
         let apn = p.model.to_f32(&format!("v.blk.{il}.attn_post_norm.weight"))?;
         let attn_out = rms_norm_all(&attn_out, n_embd, &apn, c.eps);
         if dbg() && il == 0 { eprintln!("g4 attn_post sum = {} row0 = {:?}", attn_out.iter().sum::<f32>(), &attn_out[..3]); }
@@ -369,10 +368,10 @@ fn encode_gemma4v(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resul
         let up_w = p.model.tensor(&format!("v.blk.{il}.ffn_up.weight"))?;
         let down_w = p.model.tensor(&format!("v.blk.{il}.ffn_down.weight"))?;
         let (mut gate, mut up, mut down) = (vec![0f32; n_patches * c.n_ff], vec![0f32; n_patches * c.n_ff], vec![0f32; n_patches * n_embd]);
-        gate_w.matmul(&h, n_patches, &mut gate);
-        up_w.matmul(&h, n_patches, &mut up);
+        matmul(&gate_w, &h, n_patches, &mut gate);
+        matmul(&up_w, &h, n_patches, &mut up);
         for (u, g) in up.iter_mut().zip(&gate) { *u *= activate(c.ffn, *g); }
-        down_w.matmul(&up, n_patches, &mut down);
+        matmul(&down_w, &up, n_patches, &mut down);
         let fpn = p.model.to_f32(&format!("v.blk.{il}.ffn_post_norm.weight"))?;
         let down = rms_norm_all(&down, n_embd, &fpn, c.eps);
         for (a, b) in x.iter_mut().zip(&down) { *a += *b; }
@@ -410,7 +409,7 @@ fn encode_gemma4v(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resul
     if dbg() { eprintln!("g4 preproj sum = {} row0 = {:?}", y.iter().sum::<f32>(), &y[..3]); }
     let proj = p.model.tensor("mm.input_projection.weight")?;
     let mut out = vec![0f32; ox * oy * c.projection_dim];
-    proj.matmul(&y, ox * oy, &mut out);
+    matmul(&proj, &y, ox * oy, &mut out);
     if dbg() {
         eprintln!("g4 proj sum = {} row0 = {:?}", out.iter().sum::<f32>(), &out[..3]);
         for t in 0..(ox * oy) {
@@ -435,7 +434,7 @@ fn encode_gemma4uv(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resu
     let n2b = p.model.to_f32("v.patch_norm.2.bias")?;
     let n3w = p.model.to_f32("v.patch_norm.3.weight")?;
     let n3b = p.model.to_f32("v.patch_norm.3.bias")?;
-    let w = p.model.tensor_as("v.patch_embd.weight", Some(patch_area))?;
+    let w = rows_f32(&p.model.tensor_as("v.patch_embd.weight", Some(patch_area))?);
     let bias = p.model.tensor("v.patch_embd.bias")?;
     let mut patch_bias = vec![0f32; n_embd];
     bias.row(0, &mut patch_bias);
@@ -455,11 +454,9 @@ fn encode_gemma4uv(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resu
         }
         let mut normed = vec![0f32; patch_area];
         ops::layer_norm(&patch, &n1w, &n1b, eps, &mut normed);
-        let mut buf = vec![0f32; patch_area];
         let mut emb = vec![0f32; n_embd];
-        for o in 0..n_embd {
-            w.row(o, &mut buf);
-            emb[o] = buf.iter().zip(&normed).map(|(a, b)| a * b).sum::<f32>() + patch_bias[o];
+        for (o, r) in w.chunks_exact(patch_area).enumerate() {
+            emb[o] = r.iter().zip(&normed).map(|(a, b)| a * b).sum::<f32>() + patch_bias[o];
         }
         ops::layer_norm(&emb, &n2w, &n2b, eps, xs);
     });
@@ -478,7 +475,7 @@ fn encode_gemma4uv(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resu
     let x = rms_norm_nw_all(&x, n_embd, c.eps);
     let proj = p.model.tensor("mm.input_projection.weight")?;
     let mut out = vec![0f32; n_patches * c.projection_dim];
-    proj.matmul(&x, n_patches, &mut out);
+    matmul(&proj, &x, n_patches, &mut out);
     rows(out, n_patches, c.projection_dim)
 }
 
@@ -498,7 +495,7 @@ fn encode_inkling2v(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Res
     let patch_area = c.patch_size * c.patch_size * 3;
 
     // 1. Patch convolution (`v.patch_embd.weight`, optional `v.patch_embd.bias`).
-    let w0 = p.model.tensor_as("v.patch_embd.weight", Some(patch_area))?;
+    let w0 = rows_f32(&p.model.tensor_as("v.patch_embd.weight", Some(patch_area))?);
     let patch_bias = if p.model.has("v.patch_embd.bias") {
         p.model.to_f32("v.patch_embd.bias")?
     } else {
@@ -517,10 +514,8 @@ fn encode_inkling2v(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Res
                 }
             }
         }
-        let mut buf = vec![0f32; patch_area];
-        for o in 0..n_embd {
-            w0.row(o, &mut buf);
-            xs[o] = buf.iter().zip(&patch).map(|(a, b)| a * b).sum::<f32>() + patch_bias[o];
+        for (o, r) in w0.chunks_exact(patch_area).enumerate() {
+            xs[o] = r.iter().zip(&patch).map(|(a, b)| a * b).sum::<f32>() + patch_bias[o];
         }
     });
 
@@ -581,7 +576,7 @@ fn encode_inkling2v(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Res
         if p.model.has(&format!("v.blk.{il}.attn_qkv.weight")) {
             let qkv_w = p.model.tensor(&format!("v.blk.{il}.attn_qkv.weight"))?;
             let mut qkv = vec![0f32; n_pos * 3 * n_embd];
-            qkv_w.matmul(&h, n_pos, &mut qkv);
+            matmul(&qkv_w, &h, n_pos, &mut qkv);
             if p.model.has(&format!("v.blk.{il}.attn_qkv.bias")) {
                 let qkv_b = p.model.tensor(&format!("v.blk.{il}.attn_qkv.bias"))?;
                 add_bias_rows(&mut qkv, &qkv_b, 3 * n_embd);
@@ -596,9 +591,9 @@ fn encode_inkling2v(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Res
             let q_w = p.model.tensor(&format!("v.blk.{il}.attn_q.weight"))?;
             let k_w = p.model.tensor(&format!("v.blk.{il}.attn_k.weight"))?;
             let v_w = p.model.tensor(&format!("v.blk.{il}.attn_v.weight"))?;
-            q_w.matmul(&h, n_pos, &mut q);
-            k_w.matmul(&h, n_pos, &mut k);
-            v_w.matmul(&h, n_pos, &mut v);
+            matmul(&q_w, &h, n_pos, &mut q);
+            matmul(&k_w, &h, n_pos, &mut k);
+            matmul(&v_w, &h, n_pos, &mut v);
             if p.model.has(&format!("v.blk.{il}.attn_q.bias")) {
                 add_bias_rows(&mut q, &p.model.tensor(&format!("v.blk.{il}.attn_q.bias"))?, n_embd);
             }
@@ -616,7 +611,7 @@ fn encode_inkling2v(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Res
         let attn = attention(&q, &k, &v, n_pos, c.n_head, c.d_head, scale);
         let wo_w = p.model.tensor(&format!("v.blk.{il}.attn_out.weight"))?;
         let mut attn_out = vec![0f32; n_pos * n_embd];
-        wo_w.matmul(&attn, n_pos, &mut attn_out);
+        matmul(&wo_w, &attn, n_pos, &mut attn_out);
         if p.model.has(&format!("v.blk.{il}.attn_out.bias")) {
             add_bias_rows(&mut attn_out, &p.model.tensor(&format!("v.blk.{il}.attn_out.bias"))?, n_embd);
         }
@@ -633,14 +628,14 @@ fn encode_inkling2v(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Res
         let h = layer_norm_all(&x, n_embd, &ln2w, &ln2b, c.eps);
         let up_w = p.model.tensor(&format!("v.blk.{il}.ffn_up.weight"))?;
         let mut up = vec![0f32; n_pos * c.n_ff];
-        up_w.matmul(&h, n_pos, &mut up);
+        matmul(&up_w, &h, n_pos, &mut up);
         if p.model.has(&format!("v.blk.{il}.ffn_up.bias")) {
             add_bias_rows(&mut up, &p.model.tensor(&format!("v.blk.{il}.ffn_up.bias"))?, c.n_ff);
         }
         up.par_iter_mut().for_each(|v| *v = activate(c.ffn, *v));
         let down_w = p.model.tensor(&format!("v.blk.{il}.ffn_down.weight"))?;
         let mut down = vec![0f32; n_pos * n_embd];
-        down_w.matmul(&up, n_pos, &mut down);
+        matmul(&down_w, &up, n_pos, &mut down);
         if p.model.has(&format!("v.blk.{il}.ffn_down.bias")) {
             add_bias_rows(&mut down, &p.model.tensor(&format!("v.blk.{il}.ffn_down.bias"))?, n_embd);
         }
@@ -673,14 +668,14 @@ fn encode_inkling2v(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Res
     // 7. Projector MLP: `mm.1` -> `GeluErf` -> `mm.2`.
     let mm1 = p.model.tensor("mm.1.weight")?;
     let mut proj = vec![0f32; n_merged * mm1.rows];
-    mm1.matmul(&merged, n_merged, &mut proj);
+    matmul(&mm1, &merged, n_merged, &mut proj);
     if p.model.has("mm.1.bias") {
         add_bias_rows(&mut proj, &p.model.tensor("mm.1.bias")?, mm1.rows);
     }
     proj.par_iter_mut().for_each(|v| *v = activate(FfnKind::GeluErf, *v));
     let mm2 = p.model.tensor("mm.2.weight")?;
     let mut out = vec![0f32; n_merged * c.projection_dim];
-    mm2.matmul(&proj, n_merged, &mut out);
+    matmul(&mm2, &proj, n_merged, &mut out);
     if p.model.has("mm.2.bias") {
         add_bias_rows(&mut out, &p.model.tensor("mm.2.bias")?, c.projection_dim);
     }
@@ -749,8 +744,99 @@ fn add_bias_rows(out: &mut [f32], bias: &Tensor, cols: usize) {
     });
 }
 
+/// The GPU the encoders run their matmuls and attention on (`--gpu`): backend kind and device. Unset: the CPU.
+static GPU_AT: OnceLock<(Option<String>, usize)> = OnceLock::new();
+/// The backend, opened at the first image (`Some(None)`: it did not open). Encodes take turns on it.
+static GPU: Mutex<Option<Option<Box<dyn Backend>>>> = Mutex::new(None);
+
+/// Run the encoders on GPU `device` of backend `kind` (`None`: CUDA, else Vulkan). `STRATA_VISION_CPU` keeps the CPU.
+pub fn use_gpu(kind: Option<String>, device: usize) {
+    if std::env::var_os("STRATA_VISION_CPU").is_none() { let _ = GPU_AT.set((kind, device)); }
+}
+
+/// `f` on the encoder's GPU; `None` without one, or when `f` fails, so the caller runs the CPU code. A failure is
+/// said and sets `off`: that operation stays on the CPU from then on.
+// ponytail: one failure (out of VRAM too) keeps the operation on the CPU for the rest of the run.
+fn on_gpu<T>(off: &AtomicBool, f: impl FnOnce(&dyn Backend) -> anyhow::Result<T>) -> Option<T> {
+    let (kind, device) = GPU_AT.get()?;
+    if off.load(Relaxed) { return None; }
+    let mut g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let b = g.get_or_insert_with(|| crate::backend::open(kind.as_deref(), *device)
+        .inspect_err(|e| crate::say!("vision: no GPU ({e:#}), images encode on the CPU")).ok());
+    f(b.as_deref()?).inspect_err(|e| {
+        off.store(true, Relaxed);
+        crate::say!("vision: {e:#}; that part runs on the CPU");
+    }).ok()
+}
+
+/// The rows of `w` as f32, one after another.
+fn rows_f32(w: &Tensor) -> Vec<f32> {
+    let mut f = vec![0f32; w.rows * w.cols];
+    f.par_chunks_mut(w.cols).enumerate().for_each(|(r, row)| w.row(r, row));
+    f
+}
+
+fn f32_bytes(x: &[f32]) -> &[u8] {
+    // SAFETY: any f32 is 4 plain bytes; u8 has no alignment.
+    unsafe { std::slice::from_raw_parts(x.as_ptr().cast(), 4 * x.len()) }
+}
+
+fn put(b: &dyn Backend, x: &[f32]) -> anyhow::Result<crate::backend::Buf> {
+    let buf = b.alloc(4 * x.len())?;
+    b.htod(f32_bytes(x), &buf, 0)?;
+    Ok(buf)
+}
+
+fn get(b: &dyn Backend, buf: &crate::backend::Buf, out: &mut [f32]) -> anyhow::Result<()> {
+    // SAFETY: as in f32_bytes; every byte pattern is a valid f32.
+    b.dtoh(buf, 0, unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast(), 4 * out.len()) })
+}
+
+/// `out = w x` for `n` rows of x: on the GPU when there is one (the weight is uploaded for this call: each is used
+/// once an image), else `Tensor::matmul`.
+fn matmul(w: &Tensor, x: &[f32], n: usize, out: &mut [f32]) {
+    // The GPU path does not bound-check like the CPU slices do: a mmproj with mismatched shapes must stop here.
+    assert!(x.len() == n * w.cols && out.len() == n * w.rows, "vision matmul: shape mismatch");
+    static OFF: AtomicBool = AtomicBool::new(false);
+    let done = on_gpu(&OFF, |b| {
+        // The GEMM takes columns in steps of 64; a weight with other widths (Qwen3-VL's ffn_down: 4304) goes up with
+        // zero columns added (BF16 and F32 as they are, other types as F32), x with them too.
+        let cols = w.cols.next_multiple_of(64);
+        let (gw, cols) = if w.cols % 64 == 0 { (b.upload(w)?, w.cols) } else if matches!(w.ty, GgmlType::BF16 | GgmlType::F32) {
+            let (rb, pb) = (w.data.len() / w.rows, w.data.len() / w.rows / w.cols * cols);
+            let mut raw = vec![0u8; w.rows * pb];
+            for (d, s) in raw.chunks_exact_mut(pb).zip(w.data.chunks_exact(rb)) { d[..rb].copy_from_slice(s); }
+            let buf = b.alloc(raw.len())?;
+            b.htod(&raw, &buf, 0)?;
+            (GpuTensor::new(w.ty, w.rows, cols, buf).with_scale(w.scale), cols)
+        } else {
+            let mut f = vec![0f32; w.rows * cols];
+            for (r, row) in f.chunks_exact_mut(cols).enumerate() { w.row(r, &mut row[..w.cols]); }
+            (GpuTensor::new(GgmlType::F32, w.rows, cols, put(b, &f)?), cols)
+        };
+        let xb = if cols == w.cols { put(b, x)? } else {
+            let mut p = vec![0f32; n * cols];
+            for (d, s) in p.chunks_exact_mut(cols).zip(x.chunks_exact(w.cols)) { d[..w.cols].copy_from_slice(s); }
+            put(b, &p)?
+        };
+        let y = b.alloc(4 * out.len())?;
+        b.gemm_dense(&gw, n, xb.addr(), cols, y.addr(), w.rows, 0)?;
+        get(b, &y, out)
+    });
+    if done.is_none() { w.matmul(x, n, out); }
+}
+
+/// Unmasked attention over `n` rows of `n_head` heads (`[n][n_head][d_head]`): on the GPU when there is one.
 fn attention(q: &[f32], k: &[f32], v: &[f32], n: usize, n_head: usize, d_head: usize, scale: f32) -> Vec<f32> {
     let mut out = vec![0f32; n * n_head * d_head];
+    assert!(q.len() == out.len() && k.len() == out.len() && v.len() == out.len(), "vision attention: shape mismatch");
+    static OFF: AtomicBool = AtomicBool::new(false);
+    let done = on_gpu(&OFF, |b| {
+        let (qb, kb, vb, ob) = (put(b, q)?, put(b, k)?, put(b, v)?, b.alloc(4 * out.len())?);
+        b.vit_attn(qb.addr(), kb.addr(), vb.addr(), ob.addr(), n, n_head, d_head, scale)?;
+        get(b, &ob, &mut out)
+    });
+    if done.is_some() { return out; }
     out.par_chunks_mut(n_head * d_head).enumerate().for_each(|(t, o)| {
         let mut scores = vec![0f32; n];
         for h in 0..n_head {
@@ -779,3 +865,4 @@ pub fn encode_image(projector: &VisionProjector, img: &Rgb) -> anyhow::Result<(V
     anyhow::ensure!(feats.len() == nx * ny, "encoder returned {} tokens, expected {}x{}", feats.len(), nx, ny);
     Ok((feats, nx, ny))
 }
+

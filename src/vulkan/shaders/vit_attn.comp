@@ -1,0 +1,67 @@
+#version 460
+layout(constant_id = 1) const uint HD = 72;   // head_dim, at most 128
+layout(local_size_x = 128) in;
+#include "common.glsl"
+layout(push_constant) uniform P { F32 q; F32 k; F32 v; F32 outp; uint n; uint nh; float scale; } p;
+
+// Attention of a vision encoder (vit_attn of kernels.cu): every query row sees all n keys, no mask; q, k, v and out
+// are f32 [n][nh][HD]. A workgroup takes 32 query rows of head gl_WorkGroupID.y (8 a warp) and walks the keys 32 at
+// a time through shared memory, one key a lane, with an online softmax. The 8 rows of a warp share each K and V load;
+// each lane keeps its own part of the softmax sum until the end. A key row takes HD + 1 floats so the 32 lanes, each
+// on its own key, hit 32 banks.
+shared float qs[32 * HD], vs[32 * HD], ks[32 * (HD + 1)], ps[4 * 256];
+void main() {
+    uint h = gl_WorkGroupID.y, q0 = gl_WorkGroupID.x * 32u, lane = LANE, w = WARP, tid = gl_LocalInvocationID.x;
+    uint n = p.n, ld = p.nh * HD;
+    for (uint i = tid; i < 32u * HD; i += 128u) {
+        uint r = i / HD, d = i - r * HD;
+        qs[i] = q0 + r < n ? p.q.v[(q0 + r) * ld + h * HD + d] * p.scale : 0.0;
+    }
+    float ninf = uintBitsToFloat(0xff800000u);
+    float m[8], l[8], o[8][4];
+    [[unroll]] for (uint r = 0u; r < 8u; r++) {
+        m[r] = ninf; l[r] = 0.0;
+        [[unroll]] for (uint c = 0u; c < 4u; c++) o[r][c] = 0.0;
+    }
+    for (uint k0 = 0u; k0 < n; k0 += 32u) {
+        barrier();
+        for (uint i = tid; i < 32u * HD; i += 128u) {
+            uint r = i / HD, d = i - r * HD, g = (k0 + r) * ld + h * HD + d;
+            bool inr = k0 + r < n;
+            ks[r * (HD + 1u) + d] = inr ? p.k.v[g] : 0.0;
+            vs[i] = inr ? p.v.v[g] : 0.0;
+        }
+        barrier();
+        bool valid = k0 + lane < n;
+        float s[8];
+        [[unroll]] for (uint r = 0u; r < 8u; r++) s[r] = 0.0;
+        for (uint d = 0u; d < HD; d++) {
+            float kd = ks[lane * (HD + 1u) + d];
+            [[unroll]] for (uint r = 0u; r < 8u; r++) s[r] = fma(qs[(w * 8u + r) * HD + d], kd, s[r]);
+        }
+        [[unroll]] for (uint r = 0u; r < 8u; r++) {
+            // The first tile always holds key 0, so mn is finite from then on and corr is 0 on the first tile.
+            float mn = max(m[r], warp_max(valid ? s[r] : ninf));
+            float e = valid ? expf_(s[r] - mn) : 0.0;
+            float corr = m[r] == ninf ? 0.0 : expf_(m[r] - mn);
+            l[r] = l[r] * corr + e;
+            m[r] = mn;
+            [[unroll]] for (uint c = 0u; c < 4u; c++) o[r][c] *= corr;
+            ps[w * 256u + r * 32u + lane] = e;
+        }
+        barrier();
+        for (uint j = 0u; j < 32u; j++) {
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                if (lane + 32u * c >= HD) continue;
+                float vv = vs[j * HD + lane + 32u * c];
+                [[unroll]] for (uint r = 0u; r < 8u; r++) o[r][c] = fma(ps[w * 256u + r * 32u + j], vv, o[r][c]);
+            }
+        }
+    }
+    [[unroll]] for (uint r = 0u; r < 8u; r++) {
+        uint t = q0 + w * 8u + r;
+        float lt = warp_sum(l[r]);
+        if (t >= n) continue;
+        [[unroll]] for (uint c = 0u; c < 4u; c++) if (lane + 32u * c < HD) p.outp.v[t * ld + h * HD + lane + 32u * c] = fdiv(o[r][c], lt);
+    }
+}

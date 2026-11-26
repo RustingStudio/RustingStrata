@@ -8,5 +8,5 @@ pub mod prompt;
 
 pub use image::{PreprocessedImage, Rgb, decode_bytes, decode_path, load_image, smart_resize};
 pub use mmproj::{ClipConfig, ClipModel, FfnKind, MergeKind, ProjectorKind, find_sibling, is_mmproj, validate_projection};
-pub use projector::{VisionProjector, encode_image};
+pub use projector::{VisionProjector, encode_image, use_gpu};
 pub use prompt::{ImageSpan, Prompt, expand_image, expand_images, feed_prompt, next_text_position};

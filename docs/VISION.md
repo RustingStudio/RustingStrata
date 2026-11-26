@@ -17,6 +17,16 @@ LayerNorms, x/y position tables, unweighted RMS norm, `mm.input_projection`) is 
 `llama-mtmd-debug -p encode` with the 0.8B unified mmproj. GLM-4V and DeepSeek-OCR have no matching text
 forward in this repo and stay rejected.
 
+With `--gpu` the encoders (Qwen3-VL, Gemma 4, Inkling 2) run their matmuls and attention on the GPU (CUDA or
+Vulkan) through a second backend on the same device; patch convolution, norms, RoPE and activations stay on the CPU.
+Each weight is uploaded for its one use in an image, so the encoder holds little VRAM. An operation that fails on the
+GPU (out of VRAM, say) is reported once and stays on the CPU for the rest of the run; `STRATA_VISION_CPU=1` keeps
+the whole encoder on the CPU. The GPU encoder rounds differently, so its embeddings differ slightly from the CPU ones
+(`tests/vision_gpu.rs`, lowest token cosine on the Qwen3.6 mmproj: 0.99988 with CUDA, 0.99976 with Vulkan). A
+1024x768 image with the Qwen3.6-35B-A3B mmproj-BF16 on the RTX 3060 encodes in 4.1 to 4.5 s with CUDA and 3.8 to
+4.7 s with Vulkan, against 24 s on the CPU (12 threads; 28.5 s before the patch convolution stopped dequantizing its
+weight for every patch). The Inkling 2 mmproj-F16 takes 2.7 s against 9.4 s.
+
 GPU image prompts prefill on the CPU (`vision::feed_prompt` with `Model::step_embed`), upload the KV and
 recurrent state into `GpuModel::load_state`, and decode on the GPU. The GPU's RoPE position is decoupled
 from the KV row through `GpuModel::rope_offset`/`rope_buf`, so text after an image resumes at the
