@@ -120,6 +120,8 @@ impl Inkling2Config {
         ensure!(cfg.loop_end <= cfg.n_layer, "bad loop range");
         ensure!(cfg.n_conv >= 2 && cfg.block_size >= 1 && cfg.rel_extent >= 1 && cfg.n_swa >= 1, "bad shortconv, block or window size");
         ensure!(u("attention.value_length")? == cfg.head_dim, "key and value head widths differ");
+        // The device K store tells K from V by a positive clip, so a K cache with its own type needs one.
+        ensure!(cfg.qk_clip > 0.0, "attention.qk_clip must be positive (got {})", cfg.qk_clip);
         ensure!(g.meta.get(&k("loop.varying")).and_then(|v| v.as_u64()).unwrap_or(0) == 0, "loop.varying is not supported");
         Ok(cfg)
     }
