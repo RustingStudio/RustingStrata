@@ -119,6 +119,8 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   differently from one-token decoding, so greedy output can differ at a near tie.
 - `--chunk`, `--threads` prefill chunk size and CPU expert threads. On a GPU `--threads` defaults to the physical
   core count (SMT siblings only add contention; on the 6-core/12-thread reference machine 6 beats 12 by ~20%).
+  Without `--chunk`, a GPU load that runs VRAM out with the default (4096) or calibrated chunk halves it down to
+  512 and loads again, saying which chunk it took; a `--chunk` given on the command line is kept and fails as before.
   `rustingstrata calibrate` measures the best chunk, draft count and short-prompt threshold and later runs read them
   from `~/.cache/rusting_strata/strata-<model>[-backend][-dev…].json` unless flags override. The suffix uses the
   backend that actually opened (so a CUDA to Vulkan fallback writes the Vulkan file). The models with their own

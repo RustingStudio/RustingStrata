@@ -515,6 +515,7 @@ impl Engine {
         }
         let mut ngram_cfg = self.ngram_config()?;
         ngram_cfg.n_vocab = m.cfg.n_vocab;
+        let auto_chunk = self.chunk.is_none();
         self.chunk.get_or_insert(get("chunk").unwrap_or(4096));
         // The draft count was measured with this draft file (`calibrate --mtp-model/--draft-model`), or with none.
         let aux = self.aux_model_path().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
@@ -574,10 +575,20 @@ impl Engine {
             Some(s) => Some(s),
             None => calibrated_split(&v, &self.device, &bk.iter().map(|b| b.device()).collect::<Vec<_>>()),
         };
-        let mut g = if self.parallel > 1 {
-            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, split.as_deref(), 0, self.parallel).context(LOAD_HINT)?
-        } else {
-            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, split.as_deref(), mtp, 1).context(LOAD_HINT)?
+        let (ns, k) = if self.parallel > 1 { (self.parallel, 0) } else { (1, mtp) };
+        let mut bk = Some(bk);
+        let mut g = loop {
+            match GpuModel::load_split_margins(m, bk.take().unwrap(), self.ctx, self.chunk(), &margins, split.as_deref(), k, ns) {
+                // The prefill scratch grows with the chunk: when the default or calibrated chunk runs VRAM out or
+                // leaves it under the margin, halve it (down to 512) and load again on freshly opened devices.
+                Err(e) if auto_chunk && self.chunk() > 512 && vram_short(&e) => {
+                    let half = self.chunk() / 2;
+                    say!("prefill chunk {} leaves too little VRAM, loading again with {half} (--chunk sets it)", self.chunk());
+                    self.chunk = Some(half);
+                    bk = Some(backend::open_all(self.backend.as_deref(), &self.device)?);
+                }
+                r => break r.context(LOAD_HINT)?,
+            }
         };
         if ngram_cfg.is_enabled() && self.parallel <= 1 {
             let tok = Tokenizer::from_gguf(&m.w.g).ok();
@@ -765,6 +776,12 @@ fn seed(s: Option<u64>) -> u64 {
         .wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1
 }
 
+/// Whether a load failed for VRAM: the driver's out-of-memory error (CUDA, HIP, Vulkan) or `GpuModel::load`'s check
+/// that the loaded model leaves the margin free.
+fn vram_short(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}").to_lowercase();
+    ["out_of_memory", "out of memory", "outofmemory", "out_of_device_memory", "of vram free, under the"].iter().any(|k| s.contains(k))
+}
 const LOAD_HINT: &str = "loading the model onto the GPU failed (if VRAM ran out: lower --ctx, add --kv q8, or close programs using VRAM)";
 
 /// Settle the flag combinations that cannot all take effect: an invalid request (`--parallel` outside 1..=255) is an
