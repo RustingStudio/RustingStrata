@@ -536,7 +536,7 @@ impl Gpu {
         }
         for (family, (stat, set, co)) in &smem { crate::say!("{}", smem_log(family, optin, *stat, *set, *co)); }
         let q8 = std::sync::Mutex::new((stream.alloc_zeros::<u8>(1)?, None));
-        let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
+        let am = stream.alloc_zeros(128 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = ctx.new_event(None)?;
         Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, gd: Default::default(), kv_mode, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default(), cs: Default::default() })
@@ -805,7 +805,7 @@ impl Backend for Gpu {
     fn device(&self) -> String { self.ctx.name().unwrap_or_default() }
     fn share(&self) -> anyhow::Result<Box<dyn Backend>> {
         let q8 = std::sync::Mutex::new((self.stream.alloc_zeros::<u8>(1)?, None));
-        let am = self.stream.alloc_zeros(64 * AMAX_PARTS)?;
+        let am = self.stream.alloc_zeros(128 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { self.ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = self.ctx.new_event(None)?;
         Ok(Box::new(Gpu {

@@ -1073,8 +1073,8 @@ impl<'a> GpuModel<'a> {
         let dense = layers.iter().all(|l| matches!(l.mixer, Mixer::Attn { .. }) && matches!(l.ffn, Ffn::Dense { .. }));
         let bt = match &pf {
             Some(p) if ns > STEP_ROWS && plain && gpu.kv_rows() => {
-                // ponytail: 64 rows a forward, the size of the backend's argmax scratch; split the argmax to go past it.
-                let cap = ns.min(p.chunk).min(64);
+                // ponytail: 128 rows a forward, the size of the CUDA argmax scratch; split the argmax to go past it.
+                let cap = ns.min(p.chunk).min(128);
                 let rows = p.chunk;
                 Some(Batch { dense, cap, rows, step: gpu.zeros::<i32>(2 * rows)?, kvt: gpu.zeros::<u64>(layers.len() * 2 * rows)?, logits: gpu.zeros::<f32>(cap * c.n_vocab)?,
                              amax: gpu.zeros::<i32>(cap)?, attp: gpu.zeros::<f32>(cap * c.n_head * ATT_SPLITS * (c.head_dim + 2))? })
