@@ -227,14 +227,15 @@ impl ExpertCache {
     }
 
     /// After a prefill: the prompt's routing joins `counts`, scaled back to steady-state size, and the placement
-    /// follows. Under `STRATA_PREFILL_PROTECT` (default on; `"0"` for legacy full flush, `"strict"` for 0 swaps),
-    /// a long prompt blends gently (25% of steady state) and swaps at most 10% of each pool's slots so it does not
-    /// flush the hot decode cache.
+    /// follows. A long prompt still decides the placement the reply starts with. `STRATA_PREFILL_PROTECT=1` makes it
+    /// blend gently instead (25% of steady state) and swap at most 10% of each pool's slots, so it does not flush the
+    /// hot decode cache; `strict` swaps nothing. Off by default: on Qwen3.6-35B-A3B (8k prompt, 128-token reply) it
+    /// lowered the reply's expert hit rate from 83% to 76%.
     pub fn settle(&mut self, m: &Model, gpu: &dyn Backend) -> anyhow::Result<()> {
         let n = self.n_expert;
         let mode = std::env::var("STRATA_PREFILL_PROTECT").unwrap_or_default();
         if self.profile.is_some() && !mode.eq_ignore_ascii_case("strict") {
-            let protect = mode != "0";
+            let protect = !mode.is_empty() && mode != "0";
             let prompt_cap = if protect { 0.25 * self.steady } else { f32::INFINITY };
             for il in 0..self.layers.len() {
                 let r = il * n..(il + 1) * n;
