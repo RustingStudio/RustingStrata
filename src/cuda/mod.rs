@@ -49,6 +49,12 @@ pub struct Gpu {
     sk: std::sync::OnceLock<CudaSlice<f32>>,
     /// gemmm_*'s x as halves: two slots of `XH_SLOT` (by stream, as `sk`).
     xh: std::sync::OnceLock<CudaSlice<u16>>,
+    /// What `xh` holds ([x, x_stride, nd, cols, slot]), for a gemm with SAME_X.
+    xk: std::sync::Mutex<Option<[u64; 5]>>,
+    /// Tile counters of gemmm_*'s split K: two slots of `SPLITK_TILES` (by stream, as `sk`).
+    skc: std::sync::OnceLock<CudaSlice<i32>>,
+    /// Streaming multiprocessors.
+    sms: usize,
     /// The kernels were compiled for KV cache mode (0 = f16, 1 = q8, 2 = q4).
     pub kv_mode: u32,
     /// The GPU has int8 tensor-core mma (sm_80+). Turing runs the prefill GEMM on the f16 path instead.
@@ -87,11 +93,15 @@ const GEMMD_SPLIT_ROWS: usize = 16384;
 /// A scratch slot of `gemmd_*`: a count per 128 rows, then the partial sums of the segments (ks x positions x rows
 /// floats, at most 2 x 64 x `GEMMD_SPLIT_ROWS`).
 const ROPE_CS: usize = 1 << 17;
-/// Blocks a split-K batched f16 GEMM aims for (`STRATA_SPLITK` overrides), and the floats of its partial sums a stream.
-const SPLITK_BLOCKS: usize = 168;
+/// Blocks a split-K batched f16 GEMM aims for a SM (`STRATA_SPLITK` overrides the total), and the floats of its
+/// partial sums a stream. Qwen3-4B BF16 on the RTX 3060 (28 SMs), batch_speed step at 64 rows: 42.4 ms at 1 a SM,
+/// 39.0 at 2, 41.3 at 6; at 16 rows 29.9, 29.0, 29.6.
+const SPLITK_PER_SM: usize = 2;
 const SPLITK_SLOT: usize = 1 << 21;
 /// Halves in one slot of `xh`: 64 positions of 32768.
 const XH_SLOT: usize = 1 << 21;
+/// Tiles a split gemmm_* launch may have (a split one has fewer than its target blocks).
+const SPLITK_TILES: usize = 256;
 const GEMMD_SLOT: usize = GEMMD_SPLIT_ROWS / 128 * 4 + 2 * 64 * GEMMD_SPLIT_ROWS * 4;
 
 /// A recorded graph. Its handles are plain CUDA driver handles, which any thread may launch once the context is
@@ -549,7 +559,8 @@ impl Gpu {
         let am = stream.alloc_zeros(128 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = ctx.new_event(None)?;
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, gd: Default::default(), sk: Default::default(), xh: Default::default(), kv_mode, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default(), cs: Default::default() })
+        let sms = ctx.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize;
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, gd: Default::default(), sk: Default::default(), xh: Default::default(), xk: Default::default(), skc: Default::default(), sms, kv_mode, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default(), cs: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -651,11 +662,17 @@ impl Gpu {
                 if self.xh.get().is_none() { let _ = self.xh.set(self.stream.alloc_zeros::<u16>(2 * XH_SLOT)?); }
                 let n = self.nb.load(Relaxed);
                 let xh = self.ptr(self.xh.get().unwrap()) + if n < BESIDE && n % 2 == 1 { 2 * XH_SLOT as u64 } else { 0 };
-                launch!(self, "x_to_f16", Self::grid(nd * cols / 4), x, x_stride as i32, nd as i32, cols as i32, xh);
+                // k and v after q, up after gate: SAME_X promises x still holds what was converted.
+                let key = Some([x, x_stride as u64, nd as u64, cols as u64, xh]);
+                let mut xk = self.xk.lock().unwrap();
+                if !(same && *xk == key) {
+                    launch!(self, "x_to_f16", Self::grid(nd * cols / 4), x, x_stride as i32, nd as i32, cols as i32, xh);
+                    *xk = key;
+                }
                 (xh, cols)
             } else { (x, x_stride) };
             let ks = if batched && (sm || md) && tiles == 0 && xrow == 0 {
-                let target = std::env::var("STRATA_SPLITK").ok().and_then(|v| v.parse().ok()).unwrap_or(SPLITK_BLOCKS);
+                let target = std::env::var("STRATA_SPLITK").ok().and_then(|v| v.parse().ok()).unwrap_or(SPLITK_PER_SM * self.sms);
                 target.div_ceil(grid.0 as usize * grid.1 as usize).min(8).min(cols / 64 / 4).min(SPLITK_SLOT / (nd * rows)).max(1)
             } else { 1 };
             if ks > 1 {
@@ -664,9 +681,22 @@ impl Gpu {
                 let part = self.ptr(self.sk.get().unwrap()) + if n < BESIDE && n % 2 == 1 { 4 * SPLITK_SLOT as u64 } else { 0 };
                 let mut c = cfg(grid, 2 * GEMM_BM as u32, 0);
                 c.grid_dim.2 = ks as u32;
+                // gemmm_* adds the segments itself (its last segment of a tile to finish); gemms_* takes gemm_splitk_sum.
+                if md && rows % 4 == 0 && (grid.0 * grid.1) as usize <= SPLITK_TILES {
+                    if self.skc.get().is_none() { let _ = self.skc.set(self.stream.alloc_zeros::<i32>(2 * SPLITK_TILES)?); }
+                    let cnt = self.ptr(self.skc.get().unwrap()) + if n < BESIDE && n % 2 == 1 { 4 * SPLITK_TILES as u64 } else { 0 };
+                    launch!(self, &kname(kn, ty), c,
+                        0u64, wd, nd as i32, x, x_stride as i32, 0u64, part, rows as i32, rows as i32, (cols / 64) as i32, 0i32, w_scale, y, y_stride as i32, act, cnt);
+                    return Ok(());
+                }
                 launch!(self, &kname(kn, ty), c,
                     0u64, wd, nd as i32, x, x_stride as i32, 0u64, part, rows as i32, rows as i32, (cols / 64) as i32, 0i32, w_scale);
                 launch!(self, "gemm_splitk_sum", Self::grid(nd * rows), part, ks as i32, nd as i32, rows as i32, y, y_stride as i32, act);
+                return Ok(());
+            }
+            if md {
+                launch!(self, &kname(kn, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
+                    tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act, w_scale, 0u64, 0i32, 0i32, 0u64);
                 return Ok(());
             }
             launch!(self, &kname(kn, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
@@ -867,6 +897,9 @@ impl Backend for Gpu {
             gd: Default::default(),
             sk: Default::default(),
             xh: Default::default(),
+            xk: Default::default(),
+            skc: Default::default(),
+            sms: self.sms,
             kv_mode: self.kv_mode,
             int8_mma: self.int8_mma,
             turing: self.turing,

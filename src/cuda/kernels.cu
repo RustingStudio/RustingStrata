@@ -1155,7 +1155,8 @@ __device__ __forceinline__ u32 h2pack(float a, float b) { return (u32)f2h(a) | (
 // XH: x holds halves (x_to_f16), x_stride counted in halves.
 template <int T, int SBB, int BM, int BK, bool SM, int SMX = 1, bool XH = false>
 __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int nd, const float* __restrict__ x, int x_stride,
-                                       const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc) {
+                                       const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc,
+                                       float* yo = nullptr, int yo_stride = 0, int yact = 0, int* cnt = nullptr) {
     constexpr bool PF = SM;  // X prefetch (below)
     constexpr int P = BK + 8, NT = BM * 2, SUBS = BK / 8, XM = SM ? 32 * SMX : BM;  // smem pitch in halves (padding: conflict-free fragments)
     __shared__ __align__(16) u16 xs[XM * P], ws[64 * P];
@@ -1360,6 +1361,39 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
                 }
             }
 #endif
+    // Split K with cnt: the last segment of a tile to finish adds the partial sums of all segments into yo, in
+    // gemm_splitk_sum's order (the same bits), and clears the tile's counter for the next launch.
+    if (cnt && gridDim.z > 1) {
+        __shared__ int last;
+        __threadfence();
+        __syncthreads();
+        int* c = cnt + blockIdx.y * gridDim.x + blockIdx.x;
+        if (tid == 0) last = atomicAdd(c, 1) == (int)gridDim.z - 1;
+        __syncthreads();
+        if (!last) return;
+        __threadfence();
+        const float* part = y - (size_t)blockIdx.z * nd * y_stride;
+        // 4 consecutive results a thread, all segments' loads in flight before the adds (gemm_raw splits at most 8).
+        const int ks = gridDim.z;
+        for (int i = tid * 4; i < tl.cnt * 64; i += NT * 4) {
+            int r = tl.m0 + i / 64, n = n0 + i % 64;
+            if (n >= rows) continue;
+            float4 p[8];
+            #pragma unroll
+            for (int z = 0; z < 8; z++)
+                if (z < ks) p[z] = __ldcg((const float4*)(part + (size_t)z * nd * y_stride + (size_t)r * y_stride + n));
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            #pragma unroll
+            for (int z = 0; z < 8; z++)
+                if (z < ks) { v.x += p[z].x; v.y += p[z].y; v.z += p[z].z; v.w += p[z].w; }
+            float* yr = yo + (size_t)r * yo_stride + n;
+            float vv[4] = {v.x, v.y, v.z, v.w};
+            #pragma unroll
+            for (int e = 0; e < 4; e++)
+                if (n + e < rows) yr[e] = yact == 0 ? vv[e] : yact == 1 ? silu(yr[e]) * vv[e] : yr[e] + vv[e];
+        }
+        if (tid == 0) *c = 0;
+    }
 }
 
 #ifndef GEMM_BM
@@ -1382,9 +1416,9 @@ static_assert((64 * (GEMM_BK / 8)) % (2 * GEMM_BM) == 0, "whole W groups per thr
 // gemmm_* (batched decode of 33 to 64 positions, tiles == 0): 64 positions a block, x as halves (x_to_f16). With mma16816, the SM layout
 // over two 32-position halves; elsewhere gemm_*'s big tile.
 #if GEMM_WMMA || (__CUDA_ARCH__ < 800 && GEMM_TC)
-#define GEMMM_BODY(T, SBB) gemm_q<T, SBB, GEMM_BM, GEMM_BK, false, 1, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act, sc)
+#define GEMMM_BODY(T, SBB) gemm_q<T, SBB, GEMM_BM, GEMM_BK, false, 1, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act, sc, yo, yo_stride, yact, cnt)
 #else
-#define GEMMM_BODY(T, SBB) gemm_q<T, SBB, GEMM_BM, GEMM_BK, true, 2, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act, sc)
+#define GEMMM_BODY(T, SBB) gemm_q<T, SBB, GEMM_BM, GEMM_BK, true, 2, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act, sc, yo, yo_stride, yact, cnt)
 #endif
 #define DEF_GEMM(T, NAME, SBB)                                                                                    \
     extern "C" __global__ void GEMM_LAUNCH_BOUNDS gemm_##NAME(const GemmTile* tiles, const u8* wd, int nd,         \
@@ -1396,7 +1430,8 @@ static_assert((64 * (GEMM_BK / 8)) % (2 * GEMM_BM) == 0, "whole W groups per thr
         gemm_q<T, SBB, GEMM_BM, GEMM_BK, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act, sc);  \
     }                                                                                                             \
     extern "C" __global__ void __launch_bounds__(GEMM_BM * 2, 3) gemmm_##NAME(const GemmTile* tiles, const u8* wd, int nd,  \
-            const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc) {  \
+            const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc,  \
+            float* yo, int yo_stride, int yact, int* cnt) {                                                             \
         GEMMM_BODY(T, SBB);                                                                                             \
     }
 QTYPES(DEF_GEMM)
