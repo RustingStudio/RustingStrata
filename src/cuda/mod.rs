@@ -738,6 +738,13 @@ impl Gpu {
         let sm = tiles == 0 && (grid.0 * grid.1 < 112 || nd <= 32);
         let grid = if sm { (grid.0, nd.div_ceil(32) as u32) } else { grid };
         let (same, batched, act) = (act & SAME_X != 0, act & BATCHED != 0, act & 3);
+        // Inside `batch` each launch takes the next stream (`st`). An op of several launches (split K and its sum,
+        // x_to_f16 and gemmm) must keep them all on its first launch's stream, with that stream's scratch slot: else
+        // the second launch runs on the other stream, beside the first (the batched DeltaNet GEMMs gave other bits
+        // from run to run).
+        let n0 = self.nb.load(Relaxed);
+        let odd = n0 < BESIDE && n0 % 2 == 1;
+        let pin = || if n0 < BESIDE { self.nb.store(n0, Relaxed) };
         let mut q8 = self.q8.lock().unwrap();
         let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
         let reuse = same && q8.1 == key;
@@ -758,12 +765,12 @@ impl Gpu {
             // gemmm_* reads x as halves (X is a quarter of the L2 traffic of a 64-position step in f32, half in f16).
             let (x, x_stride) = if md {
                 if self.xh.get().is_none() { let _ = self.xh.set(self.stream.alloc_zeros::<u16>(2 * XH_SLOT)?); }
-                let n = self.nb.load(Relaxed);
-                let xh = self.ptr(self.xh.get().unwrap()) + if n < BESIDE && n % 2 == 1 { 2 * XH_SLOT as u64 } else { 0 };
+                let xh = self.ptr(self.xh.get().unwrap()) + if odd { 2 * XH_SLOT as u64 } else { 0 };
                 // k and v after q, up after gate: SAME_X promises x still holds what was converted.
                 let key = Some([x, x_stride as u64, nd as u64, cols as u64, xh]);
                 let mut xk = self.xk.lock().unwrap();
                 if !(same && *xk == key) {
+                    pin();
                     launch!(self, "x_to_f16", Self::grid(nd * cols / 4), x, x_stride as i32, nd as i32, cols as i32, xh);
                     *xk = key;
                 }
@@ -775,32 +782,37 @@ impl Gpu {
             } else { 1 };
             if ks > 1 {
                 if self.sk.get().is_none() { let _ = self.sk.set(self.stream.alloc_zeros::<f32>(2 * SPLITK_SLOT)?); }
-                let n = self.nb.load(Relaxed);
-                let part = self.ptr(self.sk.get().unwrap()) + if n < BESIDE && n % 2 == 1 { 4 * SPLITK_SLOT as u64 } else { 0 };
+                let part = self.ptr(self.sk.get().unwrap()) + if odd { 4 * SPLITK_SLOT as u64 } else { 0 };
                 let mut c = cfg(grid, 2 * GEMM_BM as u32, 0);
                 c.grid_dim.2 = ks as u32;
                 // gemmm_* adds the segments itself (its last segment of a tile to finish); gemms_* takes gemm_splitk_sum.
                 if md && rows % 4 == 0 && (grid.0 * grid.1) as usize <= SPLITK_TILES {
                     if self.skc.get().is_none() { let _ = self.skc.set(self.stream.alloc_zeros::<i32>(2 * SPLITK_TILES)?); }
-                    let cnt = self.ptr(self.skc.get().unwrap()) + if n < BESIDE && n % 2 == 1 { 4 * SPLITK_TILES as u64 } else { 0 };
+                    let cnt = self.ptr(self.skc.get().unwrap()) + if odd { 4 * SPLITK_TILES as u64 } else { 0 };
+                    pin();
                     launch!(self, &kname(kn, ty), c,
                         0u64, wd, nd as i32, x, x_stride as i32, 0u64, part, rows as i32, rows as i32, (cols / 64) as i32, 0i32, w_scale, y, y_stride as i32, act, cnt);
                     return Ok(());
                 }
+                pin();
                 launch!(self, &kname(kn, ty), c,
                     0u64, wd, nd as i32, x, x_stride as i32, 0u64, part, rows as i32, rows as i32, (cols / 64) as i32, 0i32, w_scale);
+                pin();
                 launch!(self, "gemm_splitk_sum", Self::grid(nd * rows), part, ks as i32, nd as i32, rows as i32, y, y_stride as i32, act);
                 return Ok(());
             }
             if md {
+                pin();
                 launch!(self, &kname(kn, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
                     tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act, w_scale, 0u64, 0i32, 0i32, 0u64);
                 return Ok(());
             }
+            pin();
             launch!(self, &kname(kn, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
                 tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act, w_scale);
             // Tile lists: gemm_* skips the tiles of at most 32 positions, which gemms_* takes.
             if tiles != 0 {
+                pin();
                 launch!(self, &kname("gemms", ty), cfg(grid, 2 * GEMM_BM as u32, 0),
                     tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act, w_scale);
             }
@@ -823,17 +835,19 @@ impl Gpu {
                     .min(2 * 64 * GEMMD_SPLIT_ROWS / (nd * rows))  // scr holds the sums of every segment
             } else { ks };
             // The launches of a stream run in order, so each stream has a slot (`st`: the odd launches of a batch go to `side`).
-            let n = self.nb.load(Relaxed);
             if self.gd.get().is_none() { let _ = self.gd.set(self.stream.alloc_zeros(2 * GEMMD_SLOT)?); }
-            let slot = self.ptr(self.gd.get().unwrap()) + if n < BESIDE && n % 2 == 1 { GEMMD_SLOT as u64 } else { 0 };
+            let slot = self.ptr(self.gd.get().unwrap()) + if odd { GEMMD_SLOT as u64 } else { 0 };
+            pin();
             launch!(self, &kname("gemmd", ty),
                 cfg(((ks * rows.div_ceil(128)) as u32, 1), 256, (2 * pb * (xw + 32 + xw / 8 + xw / 4) + pb / 2 * (xw / 32) * 32) as u32),
                 wd, xq, nd as i32, pb as i32, ks as i32, slot + (GEMMD_SPLIT_ROWS / 128 * 4) as u64, slot, y, y_stride as i32, rows as i32, cols as i32, act, w_scale);
             return Ok(());
         }
+        pin();
         launch!(self, &kname(if sm { "gemmis" } else { "gemmi" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
             tiles, wd, nd as i32, xq, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act, w_scale);
         if tiles != 0 {
+            pin();
             launch!(self, &kname("gemmis", ty), cfg(grid, 2 * GEMM_BM as u32, 0),
                 tiles, wd, nd as i32, xq, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act, w_scale);
         }
