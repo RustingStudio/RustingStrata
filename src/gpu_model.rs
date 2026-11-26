@@ -433,7 +433,7 @@ struct MtpHead {
 
 /// What a slot keeps while another slot is current (`use_slot`): the `GpuModel` fields of the same names.
 #[derive(Default)]
-struct Seq { pos: usize, saved: Vec<(Buf, Buf)>, saved_pos: usize, saved_ids: Vec<u32>, saved_owner: u64, sys: Option<Stash>, sys_owner: u64 }
+struct Seq { pos: usize, rope: i32, saved: Vec<(Buf, Buf)>, saved_pos: usize, saved_ids: Vec<u32>, saved_owner: u64, sys: Option<Stash>, sys_owner: u64 }
 
 /// See `GpuModel::sys`.
 type Stash = (Vec<Vec<u8>>, usize, [i64; 2], Vec<u32>);
@@ -1236,11 +1236,21 @@ impl<'a> GpuModel<'a> {
     /// Run an image prompt as a fresh sequence and return its last logits: text tokens through `step`, image tokens
     /// through `step_embed` with their M-RoPE positions. `step` then uses the RoPE offset for text past the image.
     pub fn prefill_image(&mut self, p: &crate::vision::Prompt, embs: &[Vec<Vec<f32>>]) -> anyhow::Result<Vec<f32>> {
+        self.prefill_image_with(p, embs, &mut |_| Ok(()))
+    }
+
+    /// `prefill_image` with `between` every 64 tokens (the other slots' decode steps, under `--parallel`); this slot
+    /// is made current again after it.
+    pub fn prefill_image_with(&mut self, p: &crate::vision::Prompt, embs: &[Vec<Vec<f32>>], between: &mut dyn FnMut(&mut Self) -> anyhow::Result<()>)
+        -> anyhow::Result<Vec<f32>> {
         let c = &self.m.cfg;
         ensure!(c.n_embd_ple == 0 && c.idx_top_k == 0, "image input is not supported for this model yet ({} with PLE or QSA layers)", c.arch);
         self.reset()?;
         self.rows.clear();
         self.parked.clear();
+        // The saved and stashed states of a model without recurrent state are positions in the KV just cleared.
+        (self.saved_ids, self.sys) = (vec![], None);
+        let cur = self.cur;
         // The draft head has not seen the image rows; image prompts decode without MTP/DFlash.
         let t = self.tail_mut();
         t.mtp = None;
@@ -1251,6 +1261,7 @@ impl<'a> GpuModel<'a> {
         let mut logits = Vec::new();
         // ponytail: one token per forward (decode speed); a batched prefill needs M-RoPE in the prefill kernels.
         for (i, &id) in p.ids.iter().enumerate() {
+            if i > 0 && i % 64 == 0 { between(self)?; self.use_slot(cur); }
             logits = match rows.next_if(|r| r.0 == i) {
                 Some((_, x)) => self.step_embed(x, p.positions[i])?,
                 None => { self.rope_offset = p.positions[i][0] - self.pos as i32; self.step(id)? }
@@ -1287,6 +1298,7 @@ impl<'a> GpuModel<'a> {
         if s == self.cur { return; }
         let mut q = std::mem::take(&mut self.seqs[s]);
         std::mem::swap(&mut self.pos, &mut q.pos);
+        std::mem::swap(&mut self.rope_offset, &mut q.rope);
         std::mem::swap(&mut self.saved, &mut q.saved);
         std::mem::swap(&mut self.saved_pos, &mut q.saved_pos);
         std::mem::swap(&mut self.saved_ids, &mut q.saved_ids);
@@ -1296,6 +1308,10 @@ impl<'a> GpuModel<'a> {
         self.seqs[self.cur] = q;
         self.cur = s;
     }
+
+    /// Whether slot `s` holds an image prompt (its RoPE positions are offset from its KV rows): `step_rows` and
+    /// `step_batch` do not take it.
+    pub fn slot_shifted(&self, s: usize) -> bool { if s == self.cur { self.rope_offset != 0 } else { self.seqs[s].rope != 0 } }
 
     /// The tokens behind slot `s`'s saved state and their owner (see `prefill_cached`).
     pub fn slot_saved(&self, s: usize) -> (&[u32], u64) {

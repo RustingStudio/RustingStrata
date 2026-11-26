@@ -197,12 +197,13 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   `data: {"error": ...}` line.
 - It runs one request at a time; `--parallel N` (GPU) decodes up to N together (4 requests: 164 tok/s in total on the
   RTX 3060, 41 each; see [HOSTING.md](HOSTING.md)). From 8 requests decoding at once (16 for a model with experts;
-  `STRATA_BATCH_MIN` sets the count), a model without MTP, LoRA, Hadamard rotation or hyper-connections on CUDA runs
-  them in one batched forward, and the prompts of requests that arrive together are prefilled together. For a MoE
+  `STRATA_BATCH_MIN` sets the count), a model without MTP, LoRA, Hadamard rotation or hyper-connections (CUDA and
+  Vulkan) runs them in one batched forward, and the prompts of requests that arrive together are prefilled together. For a MoE
   model each expert is read once for all requests of the step, and the CPU runs the experts that are not in VRAM.
   Slot state that does not fit in VRAM is kept in RAM, and `--parallel` is lowered to the slots that fit. That forward
   rounds differently from the single-request one, so greedy output under load can differ at near-ties from the same
-  request run alone.
+  request run alone. An image request (`--mmproj`) takes a slot too: its prompt runs a token at a time between the
+  other slots' steps, and its reply decodes beside the batched forward, one token a step.
 - `temperature`, `top_k`, `top_p`, `min_p` and `seed` are honored; decoding is greedy when they are left out.
   `min_p` (0 to 1, `--min-p`, default 0 = off) drops the tokens whose probability is below `min_p` times the
   best token's, as in llama.cpp.

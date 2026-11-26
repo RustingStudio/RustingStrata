@@ -218,6 +218,8 @@ impl GpuModel<'_> {
     /// The start of `prefill_cached`: return to the longest state (saved, stashed or parked) that `tokens[..keep]`
     /// continues, and return its length.
     fn cache_begin(&mut self, tokens: &[u32], keep: usize) -> anyhow::Result<usize> {
+        // A text prompt: positions are KV rows again (after an image prompt they were offset).
+        self.rope_offset = 0;
         let (hit, own) = (self.saved_ids.len(), self.owner);
         let stashed = self.sys.as_ref().filter(|_| self.sys_owner == own).map_or(0, |s| if tokens[..keep].starts_with(&s.3) { s.3.len() } else { 0 });
         let extends = hit > 0 && hit >= stashed && self.saved_owner == own && tokens[..keep].starts_with(&self.saved_ids);
