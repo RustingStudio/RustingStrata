@@ -9,6 +9,8 @@ use crate::cpu_worker::{CpuWorker, TMAX};
 pub const STEP_ROWS: usize = 4;
 /// Positions a slot's attention KV starts with when it grows on demand (`GpuModel::kv_need`).
 const KV_START: usize = 512;
+/// The start when the slots do not all fit at `KV_START`.
+const KV_MIN: usize = 256;
 use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, Backend, Buf, GpuTensor};
 use crate::expert_cache::ExpertCache;
 use crate::model::Model;
@@ -565,6 +567,8 @@ pub struct GpuModel<'a> {
     /// Positions each slot's attention KV holds, when the slots' KV grows on demand (`kv_need`); empty when every
     /// KV cache holds `ctx`.
     kv_cap: Vec<usize>,
+    /// Positions a growing slot starts with and shrinks back to (`KV_START` or `KV_MIN`).
+    kv0: usize,
     /// The (slot, position) of each token of the `step_rows` forward being run (empty otherwise).
     rows: Vec<(usize, usize)>,
     /// Tokens `step_rows` ran, for the placement cadence.
@@ -717,17 +721,19 @@ impl<'a> GpuModel<'a> {
         // when a request needs more (`kv_need`), up to `ctx`, so that short requests do not each hold `ctx` of VRAM.
         // ponytail: an MoE keeps `ctx` a slot, as its expert slots take the VRAM the KV would grow into.
         let grow = ns > 1 && !c.is_moe() && ctx > KV_START;
-        let kv0 = if grow { KV_START } else { ctx };
+        let mut kv0 = if grow { KV_START } else { ctx };
         // The slots' live state stays in VRAM; more slots than fit would end the load out of memory. A dense model's
-        // state may take the VRAM its weights leave (less 1 GB of scratch); an MoE's at most half, so that the other
+        // state may take the VRAM its weights leave (less 512 MB of scratch); an MoE's at most half, so that the other
         // half holds experts. A request past the slots waits for one (`serve_slots`).
         // ponytail: Vulkan keeps each slot's saved state in VRAM too (no `host_buf`), not counted here.
         let ns = if ns > 1 {
             let lay = &c.layers[range.clone()];
-            let per = lay.iter().map(|&k| if k == LayerKind::Delta { 4 * ((c.ssm_conv - 1) * channels + nv * c.ssm_dv() * dk) } else { 2 * 2 * gpu.kv_words(kv0 * kv) }).sum::<usize>();
+            let per = |kv0: usize| lay.iter().map(|&k| if k == LayerKind::Delta { 4 * ((c.ssm_conv - 1) * channels + nv * c.ssm_dv() * dk) } else { 2 * 2 * gpu.kv_words(kv0 * kv) }).sum::<usize>();
             let w: usize = m.w.g.tensors.values().filter(|t| !t.name.contains("_exps.")).map(|t| m.w.g.bytes(t).len()).sum();
-            let room = free0.saturating_sub(w + vram_margin + (1 << 30)) / if c.is_moe() { 2 } else { 1 };
-            let fit = (room / per.max(1)).clamp(1, ns);
+            let room = free0.saturating_sub(w + vram_margin + (1 << 29)) / if c.is_moe() { 2 } else { 1 };
+            // Short of VRAM for every slot (a BF16 4B on 12 GB): start at KV_MIN positions, which holds a short chat.
+            if grow && room / per(kv0).max(1) < ns { kv0 = KV_MIN; }
+            let fit = (room / per(kv0).max(1)).clamp(1, ns);
             if fit < ns { crate::say!("--parallel {ns}: the state of {fit} slots fits in VRAM; the other requests wait for a free slot"); }
             fit
         } else { ns };
@@ -1160,7 +1166,7 @@ impl<'a> GpuModel<'a> {
         let _ = &mut ext_draft;
         crate::weights::trim_working_set();
         Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], ple_undo: ([-1, -1], vec![]), bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, hada, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, nsnap, short: 32, pf, prompt_cache_path: None, bt, mtp, dflash, ext_draft, ext_draft_pend: Vec::new(), mhc_ones, graph_tag: 0, ngram: None, first: range.start, next: None,
-                      cur: 0, seqs, kv_cap: if grow { vec![kv0; ns] } else { vec![] }, rows: vec![], row_tokens: 0 })
+                      cur: 0, seqs, kv_cap: if grow { vec![kv0; ns] } else { vec![] }, kv0, rows: vec![], row_tokens: 0 })
     }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
@@ -1189,8 +1195,8 @@ impl<'a> GpuModel<'a> {
         self.ext_draft_pend.clear();
         if let Some(ng) = self.ngram.as_mut() { ng.reset(); }
         // A slot whose KV grew gives the VRAM back (its new caches are zeroed).
-        let shrink = self.kv_cap.get(self.cur).is_some_and(|&n| n > KV_START);
-        if shrink { self.kv_resize(self.cur, KV_START, false)?; }
+        let shrink = self.kv_cap.get(self.cur).is_some_and(|&n| n > self.kv0);
+        if shrink { self.kv_resize(self.cur, self.kv0, false)?; }
         for l in self.layers.iter().chain(self.mtp.as_ref().map(|h| &h.layer)) {
             match &l.mixer {
                 Mixer::Delta { conv, s, .. } => { self.gpu.memset(&conv[self.cur])?; self.gpu.memset(&s[self.cur])?; }
@@ -1358,7 +1364,7 @@ impl<'a> GpuModel<'a> {
         if let Some(n) = self.next.as_mut() { n.kv_need(s, upto)?; }
         let Some(&cap) = self.kv_cap.get(s) else { return Ok(()) };
         if upto <= cap || upto > self.ctx { return Ok(()) }
-        self.kv_resize(s, upto.max(2 * cap).next_multiple_of(KV_START).min(self.ctx), true)
+        self.kv_resize(s, upto.max(2 * cap).next_multiple_of(self.kv0).min(self.ctx), true)
     }
 
     /// Give slot `s` attention KV caches of `new` positions (zeroed; `keep`: with the old caches' rows). Either all

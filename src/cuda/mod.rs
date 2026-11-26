@@ -17,10 +17,10 @@ pub(crate) const QTYPES: [GgmlType; 29] = {
     use GgmlType::*;
     [F32, BF16, F8E4M3, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_1, Q5_1, Q4_0, Q5_0, NVFP4]
 };
-pub(crate) const KERNELS: [&str; 59] = [
+pub(crate) const KERNELS: [&str; 61] = [
     "rope_freq", "rope_cs", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "situ_q", "softcap", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
-    "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
+    "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8", "gemm_splitk_sum", "x_to_f16",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "dflash2_conv", "hadamard",
     "ink_mix", "ink_ctrl_gate", "ink_ctrl_out", "ink_conv", "ink_conv_batch", "ink_clip", "ink_attn", "ink_attn_merge",
     "ink_attn_prefill_32", "ink_attn_prefill_64", "ink_attn_prefill_128", "ink_attn_prefill_sh_32", "ink_attn_prefill_sh_64", "ink_attn_prefill_sh_128", "ink_ffn_sum", "ink_route", "attn_sel",
@@ -45,6 +45,10 @@ pub struct Gpu {
     /// `gemmd_*` scratch for a GEMM that two blocks share the columns of: a slot per stream (see `GEMMD_SLOT`),
     /// allocated by the first such GEMM.
     gd: std::sync::OnceLock<CudaSlice<u8>>,
+    /// Split-K partial sums of the batched f16 GEMM, a slot per stream as `gd`.
+    sk: std::sync::OnceLock<CudaSlice<f32>>,
+    /// gemmm_*'s x as halves: two slots of `XH_SLOT` (by stream, as `sk`).
+    xh: std::sync::OnceLock<CudaSlice<u16>>,
     /// The kernels were compiled for KV cache mode (0 = f16, 1 = q8, 2 = q4).
     pub kv_mode: u32,
     /// The GPU has int8 tensor-core mma (sm_80+). Turing runs the prefill GEMM on the f16 path instead.
@@ -83,6 +87,11 @@ const GEMMD_SPLIT_ROWS: usize = 16384;
 /// A scratch slot of `gemmd_*`: a count per 128 rows, then the partial sums of the segments (ks x positions x rows
 /// floats, at most 2 x 64 x `GEMMD_SPLIT_ROWS`).
 const ROPE_CS: usize = 1 << 17;
+/// Blocks a split-K batched f16 GEMM aims for (`STRATA_SPLITK` overrides), and the floats of its partial sums a stream.
+const SPLITK_BLOCKS: usize = 168;
+const SPLITK_SLOT: usize = 1 << 21;
+/// Halves in one slot of `xh`: 64 positions of 32768.
+const XH_SLOT: usize = 1 << 21;
 const GEMMD_SLOT: usize = GEMMD_SPLIT_ROWS / 128 * 4 + 2 * 64 * GEMMD_SPLIT_ROWS * 4;
 
 /// A recorded graph. Its handles are plain CUDA driver handles, which any thread may launch once the context is
@@ -374,7 +383,7 @@ fn smem_log(family: &str, optin: usize, stat: usize, set: Option<usize>, carveou
 pub(crate) fn kernel_names(sm80: bool) -> Vec<String> {
     let int8 = move |&&t: &&GgmlType| sm80 && !t.float_x();
     KERNELS.iter().map(|s| s.to_string())
-        .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm", "gemms"].map(|p| kname(p, t))))
+        .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm", "gemms", "gemmm"].map(|p| kname(p, t))))
         .chain(QTYPES.iter().flat_map(|&t| ["gemv", "gemvn", "moe_gemv"].map(|p| kname(p, t) + "_p")))
         .chain(QTYPES.iter().filter(int8).flat_map(|&t| [kname("gemmi", t), kname("gemmis", t), kname("gemmd", t)]))
         .chain([64, 128, 256, 512].iter().flat_map(|h| [format!("attn_decode_{h}"), format!("attn_decode_gqa_{h}")]))
@@ -540,7 +549,7 @@ impl Gpu {
         let am = stream.alloc_zeros(128 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = ctx.new_event(None)?;
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, gd: Default::default(), kv_mode, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default(), cs: Default::default() })
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, gd: Default::default(), sk: Default::default(), xh: Default::default(), kv_mode, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default(), cs: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -630,7 +639,37 @@ impl Gpu {
         let int8 = self.i8_gemm && self.int8_mma && Self::mmq(ty) && cols.is_multiple_of(128);
         if !int8 || (!reuse && self.nb.load(Relaxed) < BESIDE) {
             if !same { q8.1 = None; }
-            launch!(self, &kname(if sm { "gemms" } else { "gemm" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
+            // A batched decode step of few blocks (an f16-path type such as BF16: k_proj is 16 blocks of 64 rows,
+            // ffn_down 40, on 28 SMs) splits its K steps into segments so the weights stream from more blocks at once;
+            // gemm_splitk_sum adds the segments in a fixed order. The order differs from one segment's.
+            // A batched step of 33 to 64 positions: one block of 64 (gemmm_*), not two of 32 (each weight read twice)
+            // or the big tile of 128 (half its warps idle, 128 registers: two blocks a SM).
+            let md = batched && tiles == 0 && xrow == 0 && nd > 32 && nd <= 64 && nd * cols <= XH_SLOT;
+            let (kn, grid) = if md { ("gemmm", (grid.0, 1)) } else { (if sm { "gemms" } else { "gemm" }, grid) };
+            // gemmm_* reads x as halves (X is a quarter of the L2 traffic of a 64-position step in f32, half in f16).
+            let (x, x_stride) = if md {
+                if self.xh.get().is_none() { let _ = self.xh.set(self.stream.alloc_zeros::<u16>(2 * XH_SLOT)?); }
+                let n = self.nb.load(Relaxed);
+                let xh = self.ptr(self.xh.get().unwrap()) + if n < BESIDE && n % 2 == 1 { 2 * XH_SLOT as u64 } else { 0 };
+                launch!(self, "x_to_f16", Self::grid(nd * cols / 4), x, x_stride as i32, nd as i32, cols as i32, xh);
+                (xh, cols)
+            } else { (x, x_stride) };
+            let ks = if batched && (sm || md) && tiles == 0 && xrow == 0 {
+                let target = std::env::var("STRATA_SPLITK").ok().and_then(|v| v.parse().ok()).unwrap_or(SPLITK_BLOCKS);
+                target.div_ceil(grid.0 as usize * grid.1 as usize).min(8).min(cols / 64 / 4).min(SPLITK_SLOT / (nd * rows)).max(1)
+            } else { 1 };
+            if ks > 1 {
+                if self.sk.get().is_none() { let _ = self.sk.set(self.stream.alloc_zeros::<f32>(2 * SPLITK_SLOT)?); }
+                let n = self.nb.load(Relaxed);
+                let part = self.ptr(self.sk.get().unwrap()) + if n < BESIDE && n % 2 == 1 { 4 * SPLITK_SLOT as u64 } else { 0 };
+                let mut c = cfg(grid, 2 * GEMM_BM as u32, 0);
+                c.grid_dim.2 = ks as u32;
+                launch!(self, &kname(kn, ty), c,
+                    0u64, wd, nd as i32, x, x_stride as i32, 0u64, part, rows as i32, rows as i32, (cols / 64) as i32, 0i32, w_scale);
+                launch!(self, "gemm_splitk_sum", Self::grid(nd * rows), part, ks as i32, nd as i32, rows as i32, y, y_stride as i32, act);
+                return Ok(());
+            }
+            launch!(self, &kname(kn, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
                 tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act, w_scale);
             // Tile lists: gemm_* skips the tiles of at most 32 positions, which gemms_* takes.
             if tiles != 0 {
@@ -826,6 +865,8 @@ impl Backend for Gpu {
             i8_gemm: self.i8_gemm,
             q8,
             gd: Default::default(),
+            sk: Default::default(),
+            xh: Default::default(),
             kv_mode: self.kv_mode,
             int8_mma: self.int8_mma,
             turing: self.turing,
@@ -1592,8 +1633,8 @@ mod tests {
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 398);
-        assert_eq!(sm70.len(), 329);
+        assert_eq!(sm80.len(), 429);
+        assert_eq!(sm70.len(), 360);
         assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmd")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());

@@ -1151,10 +1151,13 @@ __device__ __forceinline__ u32 h2pack(float a, float b) { return (u32)f2h(a) | (
 // SM (gemms_*, tile lists only): the tiles of at most 32 positions (most expert tiles), which the SM = false kernel
 // skips; their 32 x 64 outputs go 16 x 16 per warp (positions wm, rows wn, in acc[0][0..1]). Each output sums the
 // same products in the same order either way. (A runtime branch in one kernel costs the big tiles a third.)
-template <int T, int SBB, int BM, int BK, bool SM>
+// SMX (SM, mma16816 path only): 32-position halves a block, each warp taking 16 x 16 outputs in each half.
+// XH: x holds halves (x_to_f16), x_stride counted in halves.
+template <int T, int SBB, int BM, int BK, bool SM, int SMX = 1, bool XH = false>
 __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int nd, const float* __restrict__ x, int x_stride,
                                        const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc) {
-    constexpr int P = BK + 8, NT = BM * 2, SUBS = BK / 8, XM = SM ? 32 : BM;  // smem pitch in halves (padding: conflict-free fragments)
+    constexpr bool PF = SM;  // X prefetch (below)
+    constexpr int P = BK + 8, NT = BM * 2, SUBS = BK / 8, XM = SM ? 32 * SMX : BM;  // smem pitch in halves (padding: conflict-free fragments)
     __shared__ __align__(16) u16 xs[XM * P], ws[64 * P];
     GemmTile tl = tiles ? tiles[blockIdx.y] : GemmTile{wd, (int)blockIdx.y * XM, min(XM, nd - (int)blockIdx.y * XM)};
     if (tiles && (tl.cnt <= 32) != SM) return;
@@ -1164,7 +1167,8 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
     #pragma unroll
     for (int q = 0; q < XM * BK / 4 / NT; q++) {
         int r = (tid + q * NT) / (BK / 4);
-        xr[q] = r < tl.cnt ? x + (size_t)(xrow ? xrow[tl.m0 + r] : tl.m0 + r) * x_stride : nullptr;
+        size_t off = (size_t)(xrow ? xrow[tl.m0 + r] : tl.m0 + r) * x_stride;
+        xr[q] = r >= tl.cnt ? nullptr : XH ? (const float*)((const u16*)x + off) : x + off;
     }
     float acc[2][4][4] = {};
 #if __CUDA_ARCH__ < 800 && GEMM_TC
@@ -1199,19 +1203,35 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
         #pragma unroll
         for (int q = 0; q < WQ; q++) { int i = tid + q * NT; *(uint4*)(ws + (i / SUBS) * P + (i % SUBS) * 8) = wv[q]; }
     };
-    const int nk = n64 * 64 / BK;
+    // Split K (gemm_raw, a batched decode step of few blocks): grid.z segments of the K steps, segment z writing
+    // its partial sums at y + z * nd * y_stride for gemm_splitk_sum to add up in a fixed order.
+    const int nk = n64 * 64 / BK, kb0 = nk * blockIdx.z / gridDim.z, kb1 = nk * (blockIdx.z + 1) / gridDim.z;
+    y += (size_t)blockIdx.z * nd * y_stride;
     if constexpr (T == 17 || T == 18 || T == 21 || T == 22) { QS<T>::load(); __syncthreads(); }
-    ldw(0);
+    // SM: X step kb + 1 is loaded into registers with W's, during step kb's mma (2 float4 a thread; the big tile's
+    // 8 cost more registers than they save: 48 rows of a batched BF16 step took 57.7 ms against 50.4).
+    float4 xv[XM * BK / 4 / NT];
+    uint2 xh[XM * BK / 4 / NT];
+    auto ldx = [&](int kb) {
+        #pragma unroll
+        for (int q = 0; q < XM * BK / 4 / NT; q++) {
+            int c = kb * BK + (tid + q * NT) % (BK / 4) * 4;
+            if constexpr (XH) xh[q] = xr[q] ? *(const uint2*)((const u16*)xr[q] + c) : make_uint2(0, 0);
+            else xv[q] = xr[q] ? *(const float4*)(xr[q] + c) : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+    };
+    ldw(kb0);
+    if constexpr (PF) ldx(kb0);
     stw();
-    for (int kb = 0; kb < nk; kb++) {
+    for (int kb = kb0; kb < kb1; kb++) {
+        if constexpr (!PF) ldx(kb);
         #pragma unroll
         for (int q = 0; q < XM * BK / 4 / NT; q++) {
             int i = tid + q * NT, r = i / (BK / 4), c = (i % (BK / 4)) * 4;
-            float4 v = xr[q] ? *(const float4*)(xr[q] + kb * BK + c) : make_float4(0.f, 0.f, 0.f, 0.f);
-            *(uint2*)(xs + r * P + c) = make_uint2(h2pack(v.x, v.y), h2pack(v.z, v.w));
+            *(uint2*)(xs + r * P + c) = XH ? xh[q] : make_uint2(h2pack(xv[q].x, xv[q].y), h2pack(xv[q].z, xv[q].w));
         }
         __syncthreads();
-        if (kb + 1 < nk) ldw(kb + 1);
+        if (kb + 1 < kb1) { ldw(kb + 1); if constexpr (PF) ldx(kb + 1); }
         // Expert tiles are often part full; a warp whose 32 positions are all past cnt has nothing to multiply.
         if (wm < tl.cnt)
 #pragma unroll
@@ -1258,11 +1278,11 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
                 }
             }
 #else
-            constexpr int MT = SM ? 1 : 2, NT8 = SM ? 2 : 4;
+            constexpr int MT = SM ? SMX : 2, NT8 = SM ? 2 : 4, MS = SM ? 32 : 16;
             u32 a[2][4], b[4][2];
             #pragma unroll
             for (int mt = 0; mt < MT; mt++) {
-                const u16* p = xs + (wm + mt * 16 + g) * P + kk + 2 * t;
+                const u16* p = xs + (wm + mt * MS + g) * P + kk + 2 * t;
                 a[mt][0] = ld_s32(p); a[mt][1] = ld_s32(p + 8 * P); a[mt][2] = ld_s32(p + 8); a[mt][3] = ld_s32(p + 8 * P + 8);
             }
             #pragma unroll
@@ -1277,7 +1297,7 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
 #endif
         }
         __syncthreads();
-        if (kb + 1 < nk) stw();
+        if (kb + 1 < kb1) stw();
     }
 #if GEMM_WMMA
     // D layout of the AMD WMMA: the lane keeps column lane & 15 and rows STRATA_WMMA_ROW(lane, 0..7) of each tile.
@@ -1324,12 +1344,12 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
             }
 #else
     #pragma unroll
-    for (int mt = 0; mt < (SM ? 1 : 2); mt++)
+    for (int mt = 0; mt < (SM ? SMX : 2); mt++)
         #pragma unroll
         for (int nt = 0; nt < (SM ? 2 : 4); nt++)
             #pragma unroll
             for (int h = 0; h < 2; h++) {
-                int r = wm + mt * 16 + g + 8 * h, n = n0 + wn + nt * 8 + 2 * t;
+                int r = wm + mt * (SM ? 32 : 16) + g + 8 * h, n = n0 + wn + nt * 8 + 2 * t;
                 if (r >= tl.cnt) continue;
                 float* yr = y + (size_t)(tl.m0 + r) * y_stride;
                 #pragma unroll
@@ -1359,6 +1379,13 @@ static_assert((64 * (GEMM_BK / 8)) % (2 * GEMM_BM) == 0, "whole W groups per thr
 #else
 #define GEMM_LAUNCH_BOUNDS __launch_bounds__(GEMM_BM * 2)
 #endif
+// gemmm_* (batched decode of 33 to 64 positions, tiles == 0): 64 positions a block, x as halves (x_to_f16). With mma16816, the SM layout
+// over two 32-position halves; elsewhere gemm_*'s big tile.
+#if GEMM_WMMA || (__CUDA_ARCH__ < 800 && GEMM_TC)
+#define GEMMM_BODY(T, SBB) gemm_q<T, SBB, GEMM_BM, GEMM_BK, false, 1, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act, sc)
+#else
+#define GEMMM_BODY(T, SBB) gemm_q<T, SBB, GEMM_BM, GEMM_BK, true, 2, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act, sc)
+#endif
 #define DEF_GEMM(T, NAME, SBB)                                                                                    \
     extern "C" __global__ void GEMM_LAUNCH_BOUNDS gemm_##NAME(const GemmTile* tiles, const u8* wd, int nd,         \
             const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc) {  \
@@ -1367,8 +1394,31 @@ static_assert((64 * (GEMM_BK / 8)) % (2 * GEMM_BM) == 0, "whole W groups per thr
     extern "C" __global__ void GEMM_LAUNCH_BOUNDS gemms_##NAME(const GemmTile* tiles, const u8* wd, int nd,        \
             const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc) {  \
         gemm_q<T, SBB, GEMM_BM, GEMM_BK, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act, sc);  \
+    }                                                                                                             \
+    extern "C" __global__ void __launch_bounds__(GEMM_BM * 2, 3) gemmm_##NAME(const GemmTile* tiles, const u8* wd, int nd,  \
+            const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc) {  \
+        GEMMM_BODY(T, SBB);                                                                                             \
     }
 QTYPES(DEF_GEMM)
+
+// x (nd rows of cols floats, cols % 4 == 0) as halves for gemmm_*: the same h2pack rounding gemm_q applies.
+extern "C" __global__ void x_to_f16(const float* x, int x_stride, int nd, int cols, u16* out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x, c4 = cols / 4;
+    if (i >= nd * c4) return;
+    int r = i / c4, c = i % c4 * 4;
+    float4 v = *(const float4*)(x + (size_t)r * x_stride + c);
+    *(uint2*)(out + (size_t)r * cols + c) = make_uint2(h2pack(v.x, v.y), h2pack(v.z, v.w));
+}
+
+// Sums the ks segments of a split-K gemm (part: ks x nd x rows) in order into y, with gemm_q's act.
+extern "C" __global__ void gemm_splitk_sum(const float* part, int ks, int nd, int rows, float* y, int y_stride, int act) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nd * rows) return;
+    float v = 0.f;
+    for (int z = 0; z < ks; z++) v += part[(size_t)z * nd * rows + i];
+    float* yr = y + (size_t)(i / rows) * y_stride + i % rows;
+    *yr = act == 0 ? v : act == 1 ? silu(*yr) * v : *yr + v;
+}
 
 // ---- prefill GEMM on int8 tensor cores (integer weight types) ----
 // X is first quantized by quant_q8 into q8 rows: cols int8, then cols / 32 f32 scales, then cols / 16 f32 sums of the

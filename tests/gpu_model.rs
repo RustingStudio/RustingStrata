@@ -810,11 +810,11 @@ fn batch_speed() {
     let g = Gguf::open(&p).unwrap();
     let m = Model::load(&g).unwrap();
     for (bk, gpu) in common::backends() {
-        let mut gm = GpuModel::load_slots(&m, gpu, 512, 128, 512 << 20, 128).unwrap();
+        let mut gm = GpuModel::load_slots(&m, gpu, 4096, 128, 512 << 20, 128).unwrap();
         if gm.batch_cap() == 0 { continue; }
         for s in 0..gm.slots() { gm.use_slot(s); gm.reset().unwrap(); gm.prefill(&[1, 2, 3, 4]).unwrap(); }
         let most = gm.batch_cap().min(gm.slots());
-        for n in [16, 32, 48, 64, 128].into_iter().filter(|&n| n <= most) {
+        for n in std::env::var("STRATA_BATCH_N").map(|v| v.split(',').map(|x| x.parse().unwrap()).collect::<Vec<usize>>()).unwrap_or(vec![16, 32, 48, 64, 128]).into_iter().filter(|&n| n <= most) {
             // Distinct tokens: a MoE routes them to different experts, as in real serving.
             let rows: Vec<(usize, u32, bool)> = (0..n).map(|s| (s, 1000 + 131 * s as u32, false)).collect();
             gm.step_batch(&rows).unwrap();
@@ -822,6 +822,13 @@ fn batch_speed() {
             for _ in 0..20 { gm.step_batch(&rows).unwrap(); }
             let ms = t.elapsed().as_secs_f64() * 1e3 / 20.0;
             eprintln!("batch_speed {bk}: {n} rows {ms:.2} ms a step, {:.0} tok/s", n as f64 * 1e3 / ms);
+            if n <= rusting_strata::gpu_model::STEP_ROWS {
+                gm.step_rows(&rows).unwrap();
+                let t = std::time::Instant::now();
+                for _ in 0..20 { gm.step_rows(&rows).unwrap(); }
+                let ms = t.elapsed().as_secs_f64() * 1e3 / 20.0;
+                eprintln!("batch_speed {bk}: {n} rows step_rows {ms:.2} ms a step");
+            }
         }
     }
 }
