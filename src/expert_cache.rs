@@ -178,7 +178,8 @@ impl ExpertCache {
         Ok(())
     }
 
-    pub fn layer(&self, il: usize) -> Option<&LayerExperts> { self.layers[il].as_ref() }
+    // A part of a --device split holds layers up to the end of its range only; later layers have no experts here.
+    pub fn layer(&self, il: usize) -> Option<&LayerExperts> { self.layers.get(il)?.as_ref() }
     pub fn base(&self, lx: &LayerExperts) -> (u64, usize) {
         let p = &self.pools[lx.pool];
         (p.buf.addr(), p.slot_bytes)
