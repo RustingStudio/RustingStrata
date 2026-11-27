@@ -1824,6 +1824,9 @@ mod tests {
         super::nvrtc::cubin(&super::source(2, 2, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q4 must compile: {e:#}"));
         super::nvrtc::cubin(&super::source(3, 3, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q2 must compile: {e:#}"));
         super::nvrtc::cubin(&super::source(4, 4, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_turbo4 must compile: {e:#}"));
+        // The GTX 16 build: the CUDA-core branch of mma16816 on sm_75 (see `turing_fma`).
+        let fma = format!("#define MMA_FMA 1\n{}", super::source(0, 0, false));
+        super::nvrtc::cubin(&fma, "sm_75").unwrap_or_else(|e| panic!("sm_75 MMA_FMA (GTX 16) must compile: {e:#}"));
     }
 
     #[test]
@@ -1838,6 +1841,20 @@ mod tests {
         for cc in [(7, 5), (8, 0), (8, 6), (9, 0)] {
             assert_eq!(super::arch_support_error(cc, (13, 1)), None, "sm_{}{}", cc.0, cc.1);
         }
+    }
+
+    #[test]
+    fn turing_fma_only_for_gtx16_on_sm75() {
+        // Reads STRATA_GEMM_TC; the test does not set it, so skip when the caller did.
+        if std::env::var_os("STRATA_GEMM_TC").is_some() { return; }
+        assert!(super::turing_fma("NVIDIA GeForce GTX 1660 SUPER", (7, 5), false));
+        assert!(super::turing_fma("NVIDIA GeForce GTX 1650", (7, 5), false));
+        assert!(!super::turing_fma("NVIDIA GeForce RTX 2070", (7, 5), false));
+        assert!(super::turing_fma("NVIDIA GeForce RTX 2070", (7, 5), true));  // STRATA_GEMM_FMA
+        assert!(!super::turing_fma("NVIDIA GeForce GTX 1660 SUPER", (8, 6), false));
+        assert!(!super::turing_fma("Tesla V100-SXM2-32GB", (7, 0), true));
+        assert!(super::device_log(0, "x", "sm_75", (7, 5), true).contains("CUDA-core FMA"));
+        assert!(super::device_log(0, "x", "sm_75", (7, 5), false).contains("m16n8k8"));
     }
 
     #[test]
