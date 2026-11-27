@@ -65,8 +65,17 @@ pub fn backends() -> Vec<(&'static str, Box<dyn Backend>)> {
     } else {
         eprintln!("SKIP: vulkan (filtered)");
     }
+    if wanted("hip") {
+        match rusting_strata::hip::Gpu::new(0) {
+            Ok(g) => v.push(("hip", Box::new(g))),
+            Err(e) if format!("{e}") == "HIP init" => eprintln!("SKIP: hip: {e:#}"),
+            Err(e) => panic!("{e:#}"),
+        }
+    } else {
+        eprintln!("SKIP: hip (filtered)");
+    }
     if let Some(sel) = sel {
-        for name in sel.iter().filter(|n| !matches!(n.as_str(), "cuda" | "vulkan")) {
+        for name in sel.iter().filter(|n| !matches!(n.as_str(), "cuda" | "vulkan" | "hip")) {
             eprintln!("SKIP: {name} (filtered)");
         }
     }

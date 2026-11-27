@@ -32,21 +32,22 @@ use crate::backend::ATT_SPLITS_1;
 /// Kernel-choice flags read from the environment once, when the `Gpu` is made: they sit on the token path, so a
 /// lookup per launch is not worth it.
 #[derive(Clone, Copy)]
-struct InkFlags {
+pub(crate) struct InkFlags {
     /// `STRATA_DS_FAST_KERNELS=auto` (default) uses the tiled controllers, `ink_attn_128` and `kp16` only when
     /// the run has more than one device; `1` forces them on, `0` forces the old kernels. One card keeps the
-    /// `main` kernels (the greedy output must not change).
-    fast: bool,
+    /// `main` kernels (the greedy output must not change). The HIP backend passes its own default here (see
+    /// `hip::ink_flags_from`).
+    pub(crate) fast: bool,
     /// `STRATA_CTRL_TILE=0` forces the per-token `ink_ctrl_*` pair; unset follows `fast`.
-    ctrl_tile: bool,
+    pub(crate) ctrl_tile: bool,
     /// `STRATA_DS_ATTN_OLD=1` keeps the scalar/one-query-a-warp attention kernels for a measurement window.
-    attn_old: bool,
+    pub(crate) attn_old: bool,
     /// `STRATA_DS_ATTN_KP4=1` selects the four-query 128-key tile prefill kernel.
-    attn_kp4: bool,
+    pub(crate) attn_kp4: bool,
 }
 
 impl InkFlags {
-    fn from_parts(fast: Option<&str>, multi: bool, ctrl: Option<&str>, attn_old: Option<&str>, attn_kp4: Option<&str>) -> Self {
+    pub(crate) fn from_parts(fast: Option<&str>, multi: bool, ctrl: Option<&str>, attn_old: Option<&str>, attn_kp4: Option<&str>) -> Self {
         let on = |v: Option<&str>, default: bool| v.map_or(default, |v| v != "0");
         let fast = match fast {
             None | Some("auto") => multi,
