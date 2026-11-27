@@ -1101,7 +1101,7 @@ mod avx2 {
 
     /// A trellis row (blocks of B bytes for 128 values) times Q8_K activations: the int16 codebook of
     /// `quant::TQ_STATES_I16`, one 8-byte table row per state, `_mm256_madd_epi16` against the sign-extended
-    /// activations. Two trellis blocks share one Q8_K block. Not the bits of the f32 kernel (`STRATA_TQ_INT`).
+    /// activations. Two trellis blocks share one Q8_K block. Not the bits of the f32 kernel (`STRATA_TQ_F32=1` keeps that one).
     pub fn dot_tq_i<const B: usize>(row: &[u8], xq: &[Q8K]) -> f32 {
         unsafe {
             let tab = crate::quant::TQ_STATES_I16.as_ptr() as *const i64;
@@ -1710,7 +1710,7 @@ pub fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
         }
     }
     #[cfg(target_feature = "avx2")]
-    if std::env::var_os("STRATA_SCALAR").is_none() && std::env::var_os("STRATA_TQ_INT").is_some() {
+    if std::env::var_os("STRATA_SCALAR").is_none() && std::env::var_os("STRATA_TQ_F32").is_none() {
         match ty {
             GgmlType::TQ2T => return Some(avx2::dot_tq_i::<34>),
             GgmlType::TQK6 => return Some(avx2::dot_tq_i::<26>),
