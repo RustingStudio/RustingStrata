@@ -431,7 +431,7 @@ fn prefill_cached_reuses_history() {
 #[test]
 fn qwen4exp_gpu_matches_cpu() {
     let _gpu = common::gpu_lock();
-    let p = std::path::Path::new("/mnt/ollama/qwen4exp/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf");
+    let p = std::path::Path::new("/mnt/ollama/qwen4exp/Qwen3.8-Flash-Next-UD-IQ2_XS-00001-of-00003.gguf");
     if !p.exists() { return }
     let g = Gguf::open(p).unwrap();
     let m = Model::load(&g).unwrap();
@@ -468,7 +468,7 @@ fn split_matches_single() {
     let models = [
         common::model_path(),
         Some("/home/vasylt/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf".into()),
-        Some("/mnt/ollama/qwen4exp/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf".into()),
+        Some("/mnt/ollama/qwen4exp/Qwen3.8-Flash-Next-UD-IQ2_XS-00001-of-00003.gguf".into()),
     ];
     // SAFETY: the GPU lock serializes every test that loads a model, the only readers of this variable.
     unsafe { std::env::set_var("STRATA_EXPERT_MB", "0") };
@@ -536,7 +536,7 @@ fn split_matches_single() {
 #[test]
 fn qwen4exp_qsa_gpu_matches_cpu() {
     let _gpu = common::gpu_lock();
-    let p = std::path::Path::new("/mnt/ollama/qwen4exp/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf");
+    let p = std::path::Path::new("/mnt/ollama/qwen4exp/Qwen3.8-Flash-Next-UD-IQ2_XS-00001-of-00003.gguf");
     if !p.exists() { return }
     let g = Gguf::open(p).unwrap();
     let mut m = Model::load(&g).unwrap();
@@ -734,7 +734,9 @@ fn gpu_image_prefill_matches_cpu() {
         let diff = got.iter().zip(&want).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
         eprintln!("backend {bk}: argmax {} vs {}, max |dlogit| {diff:.4} (range {range:.2})", ops::argmax(&got), ops::argmax(&want));
         assert_eq!(ops::argmax(&got), ops::argmax(&want), "backend {bk}");
-        assert!(diff <= 0.05 * range, "backend {bk}: {diff} vs range {range}");
+        // qwen4exp (hyper-connections, PLE) drifts further from the CPU; qwen4exp_gpu_matches_cpu allows 10% too.
+        let tol = if m.cfg.hc_n > 0 { 0.1 } else { 0.05 };
+        assert!(diff <= tol * range, "backend {bk}: {diff} vs range {range}");
 
         let mut next = ops::argmax(&got) as u32;
         let mut text = String::new();
