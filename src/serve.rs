@@ -869,7 +869,8 @@ pub fn detokenize(tok: &crate::tokenizer::Tokenizer, body: &[u8]) -> anyhow::Res
 
 /// An Anthropic Messages API request (`POST /v1/messages`, what Claude Code sends) as the OpenAI chat request
 /// `chat_request` reads: the system blocks become a system message, `tool_use` blocks tool calls, `tool_result`
-/// blocks tool messages, and `thinking: {"type": "enabled"}` turns thinking on. Images and server tools are dropped.
+/// blocks tool messages, and `thinking: {"type": "enabled"}` / `{"type": "disabled"}` turns thinking on / off.
+/// Images and server tools are dropped.
 pub fn messages_body(body: &[u8]) -> anyhow::Result<Vec<u8>> {
     let j: Json = serde_json::from_slice(body)?;
     let s = |x: &str| Json::Str(x.into());
@@ -940,11 +941,34 @@ pub fn messages_body(body: &[u8]) -> anyhow::Result<Vec<u8>> {
     for (from, to) in [("max_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p"), ("min_p", "min_p"), ("top_k", "top_k"), ("stop_sequences", "stop"), ("stream", "stream")] {
         if !matches!(j.get(from), Json::Null) { out.push((to, j.get(from).clone())); }
     }
-    if j.get("thinking").get("type").as_str() == Some("enabled") {
-        out.push(("chat_template_kwargs", obj(vec![("enable_thinking", Json::Bool(true))])));
-        if !matches!(j.get("thinking").get("budget_tokens"), Json::Null) {
-            out.push(("thinking_budget", j.get("thinking").get("budget_tokens").clone()));
+    match j.get("thinking").get("type").as_str() {
+        Some("enabled") => {
+            out.push(("chat_template_kwargs", obj(vec![("enable_thinking", Json::Bool(true))])));
+            if !matches!(j.get("thinking").get("budget_tokens"), Json::Null) {
+                out.push(("thinking_budget", j.get("thinking").get("budget_tokens").clone()));
+            }
         }
+        // Without this the server default (`--think`) applies, and a client could not turn thinking off.
+        Some("disabled") => out.push(("chat_template_kwargs", obj(vec![("enable_thinking", Json::Bool(false))]))),
+        _ => {}
     }
     Ok(obj(out).dump().into_bytes())
+}
+
+#[cfg(test)]
+mod messages_tests {
+    use super::messages_body;
+
+    /// `thinking` maps to the template's `enable_thinking`, both ways, and its budget to `thinking_budget`.
+    #[test]
+    fn thinking_turns_thinking_on_and_off() {
+        let mapped = |thinking: &str| {
+            let body = format!(r#"{{"model":"m","max_tokens":8,"messages":[{{"role":"user","content":"hi"}}]{thinking}}}"#);
+            let v: serde_json::Value = serde_json::from_slice(&messages_body(body.as_bytes()).unwrap()).unwrap();
+            (v["chat_template_kwargs"]["enable_thinking"].clone(), v["thinking_budget"].clone())
+        };
+        assert_eq!(mapped(r#","thinking":{"type":"enabled","budget_tokens":512}"#), (serde_json::json!(true), serde_json::json!(512)));
+        assert_eq!(mapped(r#","thinking":{"type":"disabled"}"#), (serde_json::json!(false), serde_json::Value::Null));
+        assert_eq!(mapped(""), (serde_json::Value::Null, serde_json::Value::Null));  // the server default
+    }
 }

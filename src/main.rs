@@ -3936,10 +3936,68 @@ fn open_browser(url: &str) {
 /// One Messages API stream event.
 fn sse(w: &mut impl Write, v: serde_json::Value) -> anyhow::Result<()> { Ok(write!(w, "event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap_or_default())?) }
 
-/// Streamed reply text as a Messages API text block (index 0), started by the first piece.
-fn text_delta(w: &mut impl Write, opened: &mut bool, t: &str) -> anyhow::Result<()> {
-    if !std::mem::replace(opened, true) { sse(w, json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}))?; }
-    sse(w, json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": t}}))
+/// A whole reply split into (reasoning, answer) at `</think>`, as a streamed reply is split piece by piece.
+fn split_think(open: bool, text: &str) -> (String, String) {
+    let mut th = Think::new(open);
+    let (mut r, mut a) = th.feed(text);
+    let (r2, a2) = th.finish();
+    r += &r2;
+    a += &a2;
+    (r, a)
+}
+
+/// The content of a whole Messages API reply: the reasoning as a `thinking` block (its signature empty: a local model
+/// has none to give), then the answer as a `text` block, then the tool calls.
+fn anthropic_content(reasoning: &str, text: &str, uses: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let thinking = (!reasoning.is_empty()).then(|| json!({"type": "thinking", "thinking": reasoning, "signature": ""}));
+    let text = (!text.is_empty()).then(|| json!({"type": "text", "text": text}));
+    thinking.into_iter().chain(text).chain(uses).collect()
+}
+
+/// A streamed Messages API reply: the reasoning as a `thinking` block, then the answer as a `text` block. Each block
+/// starts with its first piece and stops before the next one starts; `next` is the index the next block (a tool
+/// call) takes. A thinking block gets an empty `signature_delta` before it stops, as the API requires.
+struct AnthStream { think: Think, open: Option<bool>, next: usize }
+
+impl AnthStream {
+    fn new(think_open: bool) -> AnthStream { AnthStream { think: Think::new(think_open), open: None, next: 0 } }
+    /// Sends what is safe to send of `t` (a `</think>` split over two pieces waits for the second).
+    fn feed(&mut self, w: &mut impl Write, t: &str) -> anyhow::Result<()> {
+        let p = self.think.feed(t);
+        self.send(w, p)
+    }
+    /// Sends `rest` and what the splitter still holds, then stops the open block.
+    fn finish(&mut self, w: &mut impl Write, rest: &str) -> anyhow::Result<()> {
+        let p = self.think.feed(rest);
+        self.send(w, p)?;
+        let p = self.think.finish();
+        self.send(w, p)?;
+        self.close(w)
+    }
+    fn send(&mut self, w: &mut impl Write, (r, a): (String, String)) -> anyhow::Result<()> {
+        self.piece(w, true, &r)?;
+        self.piece(w, false, &a)
+    }
+    fn piece(&mut self, w: &mut impl Write, thinking: bool, t: &str) -> anyhow::Result<()> {
+        if t.is_empty() { return Ok(()); }
+        if self.open != Some(thinking) {
+            self.close(w)?;
+            let block = if thinking { json!({"type": "thinking", "thinking": ""}) } else { json!({"type": "text", "text": ""}) };
+            sse(w, json!({"type": "content_block_start", "index": self.next, "content_block": block}))?;
+            self.open = Some(thinking);
+        }
+        let delta = if thinking { json!({"type": "thinking_delta", "thinking": t}) } else { json!({"type": "text_delta", "text": t}) };
+        sse(w, json!({"type": "content_block_delta", "index": self.next, "delta": delta}))
+    }
+    fn close(&mut self, w: &mut impl Write) -> anyhow::Result<()> {
+        let Some(thinking) = self.open.take() else { return Ok(()) };
+        if thinking {
+            sse(w, json!({"type": "content_block_delta", "index": self.next, "delta": {"type": "signature_delta", "signature": ""}}))?;
+        }
+        sse(w, json!({"type": "content_block_stop", "index": self.next}))?;
+        self.next += 1;
+        Ok(())
+    }
 }
 
 fn llama_timings(l: &serve::Last) -> serde_json::Value {
@@ -4186,12 +4244,12 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let tools = req.tool_calls && !req.tools.is_empty();
             let mut cached = 0;
             let mut k = 0;  // tokens decoded
-            let mut opened = false;  // Messages API stream: the text block has started
             let mut hold = Hold::new(tools, req.stop);
             let mut streamed = Vec::new();  // the tool-call arguments a stream has sent
             // A prompt that ends in an open think block makes the reply start with reasoning, up to `</think>`.
             let think_open = prompt.trim_end().ends_with("<think>");
             let mut think = Think::new(think_open);
+            let mut blocks = AnthStream::new(think_open);  // a Messages API stream's content blocks
             let n_system = tok.encode(&system)?.len();
             let (mut t0, mut t1) = (Instant::now(), Instant::now());
             // Under `--parallel` a request is busy (and its prefill timed) from when the model takes it, not while it
@@ -4239,7 +4297,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     let t = hold.push(t);
                     if req.stream {
                         if !t.is_empty() {
-                            if !anth { send_split(&mut w, &chunk, think.feed(&t))?; } else { text_delta(&mut w, &mut opened, &t)?; }
+                            if !anth { send_split(&mut w, &chunk, think.feed(&t))?; } else { blocks.feed(&mut w, &t)?; }
                             last_stream_activity = Instant::now();
                         } else if last_stream_activity.elapsed() >= Duration::from_secs(15) {
                             w.write_all(b": keep-alive\n\n")?;
@@ -4308,15 +4366,15 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 let uses: Vec<_> = calls.iter().flat_map(|c| &c.1).enumerate().map(|(k, (f, a))| json!({"type": "tool_use", "id": format!("toolu_{i}_{k}"),
                     "name": f, "input": serde_json::from_str::<serde_json::Value>(a).unwrap_or(json!({}))})).collect();
                 if !req.stream {
-                    let text = calls.as_ref().map_or(&hold.text, |c| &c.0);
-                    let content: Vec<_> = (!text.is_empty()).then(|| json!({"type": "text", "text": text})).into_iter().chain(uses).collect();
+                    let (reasoning, text) = split_think(think_open, calls.as_ref().map_or(&hold.text, |c| &c.0));
+                    let content = anthropic_content(&reasoning, &text, uses);
                     return send(&mut w, "200 OK", json!({"id": format!("msg_{i}"), "type": "message", "role": "assistant", "model": name, "content": content,
                         "stop_reason": reason, "stop_sequence": null, "usage": usage, "timings": timings}));
                 }
-                if calls.is_none() && !hold.rest().is_empty() { text_delta(&mut w, &mut opened, hold.rest())?; }
-                if opened { sse(&mut w, json!({"type": "content_block_stop", "index": 0}))?; }
+                // A parsed call's text stays held back: only the text before it (already sent) goes out.
+                blocks.finish(&mut w, if calls.is_none() { hold.rest() } else { "" })?;
                 for (k, u) in uses.iter().enumerate() {
-                    let (index, input) = (k + opened as usize, u["input"].to_string());
+                    let (index, input) = (blocks.next + k, u["input"].to_string());
                     let mut start = u.clone();
                     start["input"] = json!({});
                     sse(&mut w, json!({"type": "content_block_start", "index": index, "content_block": start}))?;
@@ -4345,10 +4403,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 Ok(write!(w, "data: {last}\n\ndata: [DONE]\n\n")?)
             } else {
                 let message = match &calls { Some(c) => calls_json(c, false), None => {
-                    let mut th = Think::new(think_open);
-                    let (mut r, mut a) = th.feed(&hold.text);
-                    let (r2, a2) = th.finish();
-                    r += &r2; a += &a2;
+                    let (r, a) = split_think(think_open, &hold.text);
                     if r.is_empty() { json!({"role": "assistant", "content": a}) } else { json!({"role": "assistant", "content": a, "reasoning_content": r}) }
                 } };
                 send(&mut w, "200 OK", json!({"id": id, "object": "chat.completion", "created": created, "model": name,
@@ -4356,6 +4411,66 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             }
         }
         _ => send(&mut w, "404 Not Found", json!({"error": {"message": format!("no route {method} {path}"), "type": "not_found"}})),
+    }
+}
+
+#[cfg(test)]
+mod messages_api_tests {
+    use super::*;
+
+    /// The events a Messages API stream wrote, one line each.
+    fn events(out: &[u8]) -> Vec<String> {
+        String::from_utf8_lossy(out).split("\n\n").filter_map(|e| e.lines().find_map(|l| l.strip_prefix("data: "))).map(|d| {
+            let e: serde_json::Value = serde_json::from_str(d).unwrap();
+            let (i, d) = (&e["index"], &e["delta"]);
+            match e["type"].as_str().unwrap() {
+                "content_block_start" => format!("start {i} {}", e["content_block"]["type"].as_str().unwrap()),
+                "content_block_stop" => format!("stop {i}"),
+                _ => match d["type"].as_str().unwrap() {
+                    "thinking_delta" => format!("{i} thinking {:?}", d["thinking"].as_str().unwrap()),
+                    "text_delta" => format!("{i} text {:?}", d["text"].as_str().unwrap()),
+                    t => format!("{i} {t} {:?}", d["signature"].as_str().unwrap_or("")),
+                },
+            }
+        }).collect()
+    }
+
+    #[test]
+    fn streamed_reasoning_is_a_thinking_block_before_the_text() {
+        let (mut out, mut b) = (Vec::new(), AnthStream::new(true));
+        for p in ["Let me", " think.\n</th", "ink>\n\nThe answer", " is 4."] { b.feed(&mut out, p).unwrap(); }
+        b.finish(&mut out, "").unwrap();
+        assert_eq!(events(&out), ["start 0 thinking", r#"0 thinking "Let me""#, r#"0 thinking " think.\n""#, r#"0 signature_delta """#,
+            "stop 0", "start 1 text", r#"1 text "The answer""#, r#"1 text " is 4.""#, "stop 1"]);
+        assert_eq!(b.next, 2);  // a tool call would be block 2
+    }
+
+    #[test]
+    fn streamed_reply_without_think_block_is_one_text_block() {
+        let (mut out, mut b) = (Vec::new(), AnthStream::new(false));
+        b.feed(&mut out, "Hi").unwrap();
+        b.finish(&mut out, " there").unwrap();
+        assert_eq!(events(&out), ["start 0 text", r#"0 text "Hi""#, r#"0 text " there""#, "stop 0"]);
+        assert_eq!(b.next, 1);
+    }
+
+    #[test]
+    fn reasoning_cut_off_by_max_tokens_still_stops_its_block() {
+        let (mut out, mut b) = (Vec::new(), AnthStream::new(true));
+        b.feed(&mut out, "still thinking").unwrap();
+        b.finish(&mut out, "").unwrap();
+        assert_eq!(events(&out), ["start 0 thinking", r#"0 thinking "still thinking""#, r#"0 signature_delta """#, "stop 0"]);
+    }
+
+    #[test]
+    fn whole_reply_puts_reasoning_in_a_thinking_block() {
+        let (r, a) = split_think(true, "Reasoning.\n</think>\n\n391");
+        assert_eq!((r.as_str(), a.as_str()), ("Reasoning.", "391"));
+        assert_eq!(split_think(false, "no think block"), (String::new(), "no think block".to_string()));
+        let types = |c: Vec<serde_json::Value>| c.iter().map(|b| b["type"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(types(anthropic_content(&r, &a, vec![json!({"type": "tool_use"})])), ["thinking", "text", "tool_use"]);
+        assert_eq!(types(anthropic_content("", "391", vec![])), ["text"]);
+        assert_eq!(anthropic_content(&r, &a, vec![])[0], json!({"type": "thinking", "thinking": "Reasoning.", "signature": ""}));
     }
 }
 
