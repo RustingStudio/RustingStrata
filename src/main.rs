@@ -3968,8 +3968,7 @@ impl AnthStream {
     }
     /// Sends `rest` and what the splitter still holds, then stops the open block.
     fn finish(&mut self, w: &mut impl Write, rest: &str) -> anyhow::Result<()> {
-        let p = self.think.feed(rest);
-        self.send(w, p)?;
+        self.feed(w, rest)?;
         let p = self.think.finish();
         self.send(w, p)?;
         self.close(w)
@@ -3982,7 +3981,8 @@ impl AnthStream {
         if t.is_empty() { return Ok(()); }
         if self.open != Some(thinking) {
             self.close(w)?;
-            let block = if thinking { json!({"type": "thinking", "thinking": ""}) } else { json!({"type": "text", "text": ""}) };
+            // The same shape as a whole reply's block; the (empty) signature also comes as a `signature_delta` at the end.
+            let block = if thinking { json!({"type": "thinking", "thinking": "", "signature": ""}) } else { json!({"type": "text", "text": ""}) };
             sse(w, json!({"type": "content_block_start", "index": self.next, "content_block": block}))?;
             self.open = Some(thinking);
         }
@@ -4357,12 +4357,16 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     if stream { c["index"] = k.into(); }
                     c
                 }).collect();
-                if stream { return json!({"tool_calls": c}); }
-                // The text before the calls opens with the reasoning when the prompt ended in an open think block.
-                let (r, a) = split_think(think_open, content);
-                let mut m = json!({"role": "assistant", "content": if a.is_empty() { None } else { Some(a) }, "tool_calls": c});
-                if !r.is_empty() { m["reasoning_content"] = r.into(); }
-                m
+                if stream {
+                    // A stream sent the reasoning already, as `reasoning_content` deltas before the calls.
+                    json!({"tool_calls": c})
+                } else {
+                    // The text before the calls opens with the reasoning when the prompt ended in an open think block.
+                    let (r, a) = split_think(think_open, content);
+                    let mut m = json!({"role": "assistant", "content": if a.is_empty() { None } else { Some(a) }, "tool_calls": c});
+                    if !r.is_empty() { m["reasoning_content"] = r.into(); }
+                    m
+                }
             };
             if anth {
                 let reason = if calls.is_some() { "tool_use" } else if stop { "end_turn" } else { "max_tokens" };
@@ -4447,6 +4451,10 @@ mod messages_api_tests {
         assert_eq!(events(&out), ["start 0 thinking", r#"0 thinking "Let me""#, r#"0 thinking " think.\n""#, r#"0 signature_delta """#,
             "stop 0", "start 1 text", r#"1 text "The answer""#, r#"1 text " is 4.""#, "stop 1"]);
         assert_eq!(b.next, 2);  // a tool call would be block 2
+        // The thinking block starts with the same fields as a whole reply's: an empty signature included.
+        let start: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out).lines()
+            .find_map(|l| l.strip_prefix("data: ")).unwrap()).unwrap();
+        assert_eq!(start["content_block"], json!({"type": "thinking", "thinking": "", "signature": ""}));
     }
 
     #[test]
