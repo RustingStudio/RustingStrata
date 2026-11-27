@@ -24,8 +24,6 @@ pub const MEMCPY_D2H: c_int = 2;
 pub const MEMCPY_D2D: c_int = 3;
 pub const HOST_MALLOC_PORTABLE: u32 = 1;
 pub const HOST_MALLOC_MAPPED: u32 = 2;
-pub const HOST_REGISTER_PORTABLE: u32 = 1;
-pub const HOST_REGISTER_READ_ONLY: u32 = 8;
 pub const EVENT_DISABLE_TIMING: u32 = 2;
 pub const STREAM_NON_BLOCKING: u32 = 1;
 pub const CAPTURE_MODE_THREAD_LOCAL: c_int = 1;
@@ -89,12 +87,9 @@ pub struct Hip {
     pub event_record: unsafe extern "C" fn(Event, Stream) -> c_int,
     pub event_sync: unsafe extern "C" fn(Event) -> c_int,
     pub event_destroy: unsafe extern "C" fn(Event) -> c_int,
-    pub stream_wait_event: unsafe extern "C" fn(Stream, Event, u32) -> c_int,
     pub host_malloc: unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> c_int,
     pub host_free: unsafe extern "C" fn(*mut c_void) -> c_int,
     pub host_device_ptr: unsafe extern "C" fn(*mut *mut c_void, *mut c_void, u32) -> c_int,
-    pub host_register: unsafe extern "C" fn(*mut c_void, usize, u32) -> c_int,
-    pub host_unregister: unsafe extern "C" fn(*mut c_void) -> c_int,
     pub module_load: unsafe extern "C" fn(*mut Module, *const c_void) -> c_int,
     pub function: unsafe extern "C" fn(*mut Func, Module, *const c_char) -> c_int,
     pub launch: unsafe extern "C" fn(Func, u32, u32, u32, u32, u32, u32, u32, Stream, *mut *mut c_void, *mut *mut c_void) -> c_int,
@@ -152,12 +147,9 @@ impl Hip {
             event_record: g!("hipEventRecord"),
             event_sync: g!("hipEventSynchronize"),
             event_destroy: g!("hipEventDestroy"),
-            stream_wait_event: g!("hipStreamWaitEvent"),
             host_malloc: g!("hipHostMalloc"),
             host_free: g!("hipHostFree"),
             host_device_ptr: g!("hipHostGetDevicePointer"),
-            host_register: g!("hipHostRegister"),
-            host_unregister: g!("hipHostUnregister"),
             module_load: g!("hipModuleLoadData"),
             function: g!("hipModuleGetFunction"),
             launch: g!("hipModuleLaunchKernel"),
@@ -197,14 +189,6 @@ impl Hip {
         let r = unsafe { f(buf.as_mut_ptr().cast(), device) };
         if r != HIP_SUCCESS { return None }
         find_gfx(unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), PROP_BUF) })
-    }
-
-    /// The device's PCI address as sysfs names it ("0000:0c:00.0"), or None when the runtime does not give it.
-    pub fn pci_bus_id(&self, device: c_int) -> Option<String> {
-        let f: unsafe extern "C" fn(*mut c_char, c_int, c_int) -> c_int = unsafe { Self::sym(&self._lib, "hipDeviceGetPCIBusId") }?;
-        let mut buf = [0 as c_char; 64];
-        if unsafe { f(buf.as_mut_ptr(), 64, device) } != HIP_SUCCESS { return None }
-        Some(unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().to_lowercase())
     }
 
     pub fn device_name(&self, device: c_int) -> String {

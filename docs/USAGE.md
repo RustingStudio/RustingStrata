@@ -344,7 +344,7 @@ The two-card plan uses these knobs:
 |---|---|---|
 | `STRATA_DS_FAST_KERNELS` | `auto` | as above; one card keeps the old kernels unless forced |
 | `STRATA_DS_PLAIN_FIRST` | unset; `chat`/`serve`/`bench` set `1` | keep the plain weights on GPU 0, where the decode state lives |
-| `STRATA_DS_PF_TOKENS` | 2048 one card, 512 two | tokens of one prompt chunk (at most 2048) |
+| `STRATA_DS_PF_TOKENS` | 256 one card, 512 two | tokens of one prompt chunk (at most 2048) |
 | `STRATA_DS_KV_TOKENS` | `--ctx` | KV rows GPU 0 must still be able to take before it gives up a slab |
 | `STRATA_DS_PROF` | unset | print `inkling2: preloaded N/24 ...` and the per-chunk profile |
 | `STRATA_DS_NO_AFFINITY` | unset | pick the GPU per expert instead of per stacked tensor |

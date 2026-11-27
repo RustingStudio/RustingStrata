@@ -21,9 +21,9 @@ fn ink_attn_prefill_kp16_fallback_covers_every_query() {
     unsafe { std::env::set_var("STRATA_DS_FAST_KERNELS", "1") };
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
-        // kp16 is the f16-cache path of the CUDA and HIP backends; Vulkan has its own prefill, and a quantized KV
-        // or the measurement knobs select another kernel.
-        if (bk != "cuda" && bk != "hip")
+        // kp16 is the CUDA f16-cache path; Vulkan has its own prefill, and a quantized KV or the measurement knobs
+        // select another kernel.
+        if bk != "cuda"
             || std::env::var_os("STRATA_KV").is_some()
             || std::env::var_os("STRATA_DS_ATTN_OLD").is_some()
             || std::env::var_os("STRATA_DS_ATTN_KP4").is_some() { continue; }

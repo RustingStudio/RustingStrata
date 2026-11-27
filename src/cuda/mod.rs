@@ -17,13 +17,13 @@ pub(crate) const QTYPES: [GgmlType; 29] = {
     use GgmlType::*;
     [F32, BF16, F8E4M3, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_1, Q5_1, Q4_0, Q5_0, NVFP4]
 };
-pub(crate) const KERNELS: [&str; 73] = [
+pub(crate) const KERNELS: [&str; 71] = [
     "rope_freq", "rope_cs", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "situ_q", "softcap", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "kv_store_turbo", "attn_merge", "ha_post", "ha_wait", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8", "gemm_splitk_sum", "x_to_f16",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "dflash2_conv", "hadamard",
     "ink_mix", "ink_ctrl_gate", "ink_ctrl_out", "ink_ctrl_gate_b", "ink_ctrl_out_b", "ink_conv", "ink_conv_batch", "ink_clip", "ink_attn", "ink_attn_128", "ink_attn_merge",
-    "ink_attn_prefill_32", "ink_attn_prefill_64", "ink_attn_prefill_128", "ink_attn_prefill_128_old", "ink_attn_prefill_128_kp", "ink_attn_prefill_128_kp16", "ink_attn_prefill_sh_32", "ink_attn_prefill_sh_64", "ink_attn_prefill_sh_128", "ink_ffn_sum", "ink_ffn_sum_mb", "ink_slots", "ink_route", "attn_sel", "vit_attn",
+    "ink_attn_prefill_32", "ink_attn_prefill_64", "ink_attn_prefill_128", "ink_attn_prefill_128_old", "ink_attn_prefill_128_kp", "ink_attn_prefill_128_kp16", "ink_attn_prefill_sh_32", "ink_attn_prefill_sh_64", "ink_attn_prefill_sh_128", "ink_ffn_sum", "ink_route", "attn_sel", "vit_attn",
 ];
 
 pub use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
@@ -32,22 +32,21 @@ use crate::backend::ATT_SPLITS_1;
 /// Kernel-choice flags read from the environment once, when the `Gpu` is made: they sit on the token path, so a
 /// lookup per launch is not worth it.
 #[derive(Clone, Copy)]
-pub(crate) struct InkFlags {
+struct InkFlags {
     /// `STRATA_DS_FAST_KERNELS=auto` (default) uses the tiled controllers, `ink_attn_128` and `kp16` only when
     /// the run has more than one device; `1` forces them on, `0` forces the old kernels. One card keeps the
-    /// `main` kernels (the greedy output must not change). The HIP backend passes its own default here (see
-    /// `hip::ink_flags_from`).
-    pub(crate) fast: bool,
+    /// `main` kernels (the greedy output must not change).
+    fast: bool,
     /// `STRATA_CTRL_TILE=0` forces the per-token `ink_ctrl_*` pair; unset follows `fast`.
-    pub(crate) ctrl_tile: bool,
+    ctrl_tile: bool,
     /// `STRATA_DS_ATTN_OLD=1` keeps the scalar/one-query-a-warp attention kernels for a measurement window.
-    pub(crate) attn_old: bool,
+    attn_old: bool,
     /// `STRATA_DS_ATTN_KP4=1` selects the four-query 128-key tile prefill kernel.
-    pub(crate) attn_kp4: bool,
+    attn_kp4: bool,
 }
 
 impl InkFlags {
-    pub(crate) fn from_parts(fast: Option<&str>, multi: bool, ctrl: Option<&str>, attn_old: Option<&str>, attn_kp4: Option<&str>) -> Self {
+    fn from_parts(fast: Option<&str>, multi: bool, ctrl: Option<&str>, attn_old: Option<&str>, attn_kp4: Option<&str>) -> Self {
         let on = |v: Option<&str>, default: bool| v.map_or(default, |v| v != "0");
         let fast = match fast {
             None | Some("auto") => multi,
@@ -1530,16 +1529,6 @@ impl Backend for Gpu {
         launch!(self, "ink_ffn_sum", cfg((n.div_ceil(256) as u32, nt as u32), 256, 0), acc, d, wts, ne as i32, n as i32, cpu);
         Ok(())
     }
-    fn ink_pool(&self) -> bool { true }
-    fn ink_slots(&self, ids: u64, wts: u64, table: u64, slots: u64, wh: u64, h: u64, mb: u64, nh: usize, h_off: usize, step: u64, k: usize) -> anyhow::Result<()> {
-        anyhow::ensure!(k <= 32, "ink_slots: k={k}");
-        launch!(self, "ink_slots", cfg((1, 1), 256, 0), ids, wts, table, slots, wh, h, mb, nh as i32, h_off as i32, step, k as i32);
-        Ok(())
-    }
-    fn ink_ffn_sum_mb(&self, acc: u64, d: u64, wh: u64, k: usize, n: usize, mb: u64, y_off: usize, step: u64, slots: u64) -> anyhow::Result<()> {
-        launch!(self, "ink_ffn_sum_mb", cfg((n.div_ceil(256) as u32, 1), 256, 0), acc, d, wh, k as i32, n as i32, mb, y_off as i32, step, slots);
-        Ok(())
-    }
     fn ink_route(&self, logits: u64, bias: u64, ids: u64, wts: u64, gu_sc: u64, dn_sc: u64, gsc_out: u64, n_expert: usize, k: usize, exp_scale: f32, rows: usize) -> anyhow::Result<()> {
         anyhow::ensure!(n_expert <= 512 && k <= 32, "ink_route: n_expert={n_expert} k={k}");
         launch!(self, "ink_route", cfg((rows as u32, 1), 32, 0), logits, bias, ids, wts, gu_sc, dn_sc, gsc_out, n_expert as i32, k as i32, exp_scale);
@@ -1931,8 +1920,8 @@ mod tests {
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 441);
-        assert_eq!(sm70.len(), 372);
+        assert_eq!(sm80.len(), 439);
+        assert_eq!(sm70.len(), 370);
         assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmd")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());
