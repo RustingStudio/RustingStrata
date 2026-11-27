@@ -49,6 +49,8 @@ pub struct Gpu {
     pub kv_q8: bool,
     /// The Inkling 2 kernel-choice flags (`STRATA_DS_FAST_KERNELS` and friends), read once at creation.
     flags: crate::cuda::InkFlags,
+    /// The card's PCI address ("0000:0c:00.0"), read once: `mem_info` finds the card's sysfs entry by it.
+    pci: Option<String>,
     /// Opt-in shared memory per block on this device (64 KiB on RDNA).
     max_smem: usize,
     /// `argmax_rows` partials.
@@ -221,7 +223,8 @@ impl Gpu {
         let mut dev: *mut c_void = std::ptr::null_mut();
         hip.check(unsafe { (hip.host_device_ptr)(&mut dev, host, 0) }, "hipHostGetDevicePointer(ring)")?;
         let staging = Staging { _pin: Buf::new(dev as u64, RING, PinnedHost { hip: hip.clone(), p: host }), host: host.cast(), head: 0, busy: VecDeque::new() };
-        Ok(Gpu { hip, device, stream, side, marks, next_mark: Default::default(), pinned: Default::default(), fns, arch, kv_q8, flags: ink_flags(), max_smem, am: am_buf,
+        let pci = hip.pci_bus_id(device as i32);
+        Ok(Gpu { hip, device, stream, side, marks, next_mark: Default::default(), pinned: Default::default(), fns, arch, kv_q8, flags: ink_flags(), pci, max_smem, am: am_buf,
                  graphs: Mutex::new(HashMap::new()), fr: Mutex::new((HashMap::new(), Vec::new())), staging: Mutex::new(staging) })
     }
 
@@ -553,23 +556,22 @@ fn compile_cached(rtc: &ffi::Rtc, src: &str, arch: &str, tag: &str) -> anyhow::R
     Ok(b)
 }
 
-/// Free VRAM as the kernel driver counts it, for the amdgpu card at PCI address `bus` or, when the runtime gives none,
-/// the one whose VRAM size is `total` (to 256 MiB; with two cards of one size that may be the other card).
-/// `hipMemGetInfo` counts only compute allocations, so the desktop and other graphics clients look free to it and a
-/// budget taken from it squeezes them out (the compositor then fails to pin its framebuffer). Vulkan's memory budget
-/// already counts them.
+/// Free VRAM as the kernel driver counts it, for the amdgpu card at PCI address `bus`. When the runtime gives no
+/// address or no card has it, the card whose VRAM size is `total` (to 256 MiB; with two cards of one size that may be
+/// the other card). `hipMemGetInfo` counts only compute allocations, so the desktop and other graphics clients look
+/// free to it and a budget taken from it squeezes them out (the compositor then fails to pin its framebuffer).
+/// Vulkan's memory budget already counts them.
 fn drm_free(total: usize, bus: Option<&str>) -> Option<usize> {
     let read = |p: std::path::PathBuf| std::fs::read_to_string(p).ok()?.trim().parse::<usize>().ok();
-    std::fs::read_dir("/sys/class/drm").ok()?.flatten().find_map(|e| {
+    let free_where = |ours: &dyn Fn(&std::path::Path, usize) -> bool| std::fs::read_dir("/sys/class/drm").ok()?.flatten().find_map(|e| {
         let dev = e.path().join("device");
         let t = read(dev.join("mem_info_vram_total"))?;
-        let ours = match bus {
-            Some(b) => std::fs::canonicalize(&dev).ok()?.file_name()?.to_string_lossy().to_lowercase() == b,
-            None => t.abs_diff(total) <= 256 << 20,
-        };
-        if !ours { return None }
+        if !ours(&dev, t) { return None }
         Some(t.saturating_sub(read(dev.join("mem_info_vram_used"))?))
-    })
+    });
+    let at_bus = |dev: &std::path::Path, _| bus.is_some_and(|b| std::fs::canonicalize(dev).ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase())).is_some_and(|n| n == b));
+    free_where(&at_bus).or_else(|| free_where(&|_, t: usize| t.abs_diff(total) <= 256 << 20))
 }
 
 /// The kernel names to load: `cuda::kernel_names(false)` has no int8-mma GEMM, which needs no separate list here.
@@ -637,7 +639,7 @@ impl Backend for Gpu {
     fn mem_info(&self) -> anyhow::Result<(usize, usize)> {
         let (mut free, mut total) = (0usize, 0usize);
         self.hip.check(unsafe { (self.hip.mem_get_info)(&mut free, &mut total) }, "hipMemGetInfo")?;
-        Ok((free.min(drm_free(total, self.hip.pci_bus_id(self.device as i32).as_deref()).unwrap_or(usize::MAX)), total))
+        Ok((free.min(drm_free(total, self.pci.as_deref()).unwrap_or(usize::MAX)), total))
     }
 
     fn sync(&self) -> anyhow::Result<()> { self.wait() }
@@ -1387,20 +1389,24 @@ mod tests {
         }
     }
 
-    /// The desktop's VRAM is found on the card the device runs on, through its PCI address.
+    /// The desktop's VRAM is found on the card the device runs on, through its PCI address, and through the VRAM
+    /// size when no card has the address.
     #[test]
     fn drm_free_finds_the_device_by_its_pci_address() {
         let g = match Gpu::new(0) {
             Ok(g) => g,
             Err(e) => { eprintln!("skipping: HIP unavailable: {e:#}"); return; }
         };
-        let Some(bus) = g.hip.pci_bus_id(0) else { eprintln!("skipping: no PCI address from the runtime"); return };
+        let Some(bus) = g.pci.clone() else { eprintln!("skipping: no PCI address from the runtime"); return };
         let (mut free, mut total) = (0usize, 0usize);
         g.hip.check(unsafe { (g.hip.mem_get_info)(&mut free, &mut total) }, "hipMemGetInfo").unwrap();
         let drm = drm_free(total, Some(&bus)).unwrap_or_else(|| panic!("no amdgpu card at {bus} in /sys/class/drm"));
         eprintln!("{bus}: {:.2} GB free by the driver, {:.2} GB by HIP", drm as f64 / 1e9, free as f64 / 1e9);
         assert!(drm <= total);
-        assert!(drm_free(total, Some("0000:ff:1f.7")).is_none(), "an address with no card matched");
+        // The same card in another PCI function, which no card has: the size match finds the card.
+        let other = format!("{}{}", &bus[..bus.len() - 1], if bus.ends_with('7') { '6' } else { '7' });
+        let by_size = drm_free(total, Some(&other)).expect("the VRAM size finds the card when no card has the address");
+        assert!(by_size.abs_diff(drm) < 256 << 20, "{other}: {by_size} free, {bus}: {drm}");
     }
 
     /// The generated source compiles for this device through hiprtc (the CUDA source with `STRATA_HIP` taken).
