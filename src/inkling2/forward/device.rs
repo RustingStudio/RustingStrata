@@ -72,7 +72,7 @@ impl Scratch {
             cur: f(n), x: f(n), blocks: f(4 * n), bank: f(4 * n), outb: f(n), prelude: f(n), msg: f(4 * n), ins: f(3 * n), ins2: f(3 * n),
             gate: f(4 * rank), nrm: f(3 * n), nrm_xq: f(3 * xq_row_floats), q: f(q), r: f(c.n_head * c.n_rel), sink: f(c.n_head), og: f(q), k: f(c.n_head_kv * c.head_dim),
             v: f(c.n_head_kv * c.head_dim), kp: f(c.n_head_kv * c.n_conv), vp: f(c.n_head_kv * c.n_conv), att: f(q), proj: f(n), h: f(n),
-            h2: f(n), hn: f(n), wh: f(c.n_used), step: f(2), y: f(c.n_used * 2 * c.n_ff_exp), d: f(c.n_used * n), ids: f(3 * c.n_used), xh: f(n), xq: f(c.n_used * c.n_ff_exp), wc: f(c.n_used + n), rlogits: f(c.n_expert), amax: f(16), pos: f(1), acc: f(n),
+            h2: f(n), hn: f(n), wh: f(c.n_used.next_multiple_of(4)), step: f(4), y: f(c.n_used * 2 * c.n_ff_exp), d: f(c.n_used * n), ids: f(3 * c.n_used), xh: f(n), xq: f(c.n_used * c.n_ff_exp), wc: f(c.n_used + n), rlogits: f(c.n_expert), amax: f(16), pos: f(1), acc: f(n),
             logits: f(vocab), end: a - base,
         }
     }
