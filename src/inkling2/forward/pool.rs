@@ -263,9 +263,30 @@ impl Pool {
     }
 }
 
+impl Pool {
+    /// Drop the `Dev::pin`s of the filled slots: they are views of this pool's VRAM, which goes with the pool.
+    pub fn unpin_all(&mut self, d: &mut dev::Dev) {
+        let ne = self.ne;
+        for s in &mut self.slots {
+            for (ip, e) in s.owner.iter_mut().filter_map(Option::take) {
+                let h = &self.layers[ip].as_ref().unwrap().host;
+                d.unpin(h.gate_up.expert_host(e, ne).data);
+                d.unpin(h.down.expert_host(e, ne).data);
+            }
+        }
+    }
+}
+
 impl Drop for Pool {
-    /// Save the long counts: the next load places from them.
+    /// Unpin the slots (unless `unpin_all` ran) and save the long counts: the next load places from them.
     fn drop(&mut self) {
+        if self.slots.iter().any(|s| s.owner.iter().any(Option::is_some)) {
+            // try_lock: a caller that holds the device runs `unpin_all` itself before the pool goes.
+            match dev::get().map(|m| m.try_lock()) {
+                Some(Ok(mut d)) => self.unpin_all(&mut d),
+                _ => eprintln!("inkling2: expert pool dropped while the device was busy; its slots stay pinned"),
+            }
+        }
         if self.tokens < 16 { return; }
         let bytes: Vec<u8> = self.long.iter().flat_map(|v| v.to_le_bytes()).collect();
         if let Some(dir) = self.profile.parent() { let _ = std::fs::create_dir_all(dir); }

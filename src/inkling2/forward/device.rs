@@ -523,9 +523,19 @@ impl Device {
             let free = |d: &dev::Dev| d.parts[0].be.mem_info().map_or(0, |m| m.0);
             if free(&d) < bytes {
                 d.parts[0].be.sync()?;
-                let order: Vec<usize> = (c.loop_start..c.loop_end).chain(0..c.loop_start).chain(c.loop_end..c.n_layer).collect();
                 // Counted here: the driver may report the freed bytes late.
                 let mut short = bytes - free(&d);
+                // The expert pool goes first: its layers then run like the other layers without a slab. The budget
+                // falls by what the K/V rows need, so the expert cache can use the rest of the pool's room.
+                if let Some(mut p) = self.pool.take() {
+                    let had = free(&d);
+                    p.unpin_all(&mut d);
+                    drop(p);
+                    let got = free(&d).saturating_sub(had).min(short);
+                    d.parts[0].budget = d.parts[0].budget.saturating_sub(got);
+                    short -= got;
+                }
+                let order: Vec<usize> = (c.loop_start..c.loop_end).chain(0..c.loop_start).chain(c.loop_end..c.n_layer).collect();
                 for &ip in order.iter().rev() {
                     if short == 0 { break; }
                     if let Some(fe) = self.layers[ip].full_exps.take() {
