@@ -215,7 +215,8 @@ pub fn kv_q8() -> bool { kv_mode() == 1 }
 pub fn kv_legacy_symmetric(k: u32, v: u32) -> bool { k == v && k <= 3 }
 
 /// `STRATA_GEMM_FMA`: force the CUDA-core FMA fallback in the f16 prefill kernels instead of the sm_70 tensor-core
-/// path (`GEMM_TC` in kernels.cu). It covers both the f16 prefill GEMM and the prefill attention (`attn_prefill_t`):
+/// path (`GEMM_TC` in kernels.cu), and on sm_75 instead of `m16n8k8` (`MMA_FMA`, see `turing_fma`; Turing cards without
+/// tensor cores take it by default). It covers both the f16 prefill GEMM and the prefill attention (`attn_prefill_t`):
 /// the attention's P staging tile is part of every request, so the shared-memory size does not depend on it.
 /// Ignored on sm_80+, which always uses `mma.m16n8k16`.
 pub fn gemm_fma() -> bool { std::env::var_os("STRATA_GEMM_FMA").is_some() }
@@ -371,12 +372,20 @@ fn device_log(device: usize, name: &str, arch: &str, cc: (i32, i32), gemm_fma: b
     format!("cuda device {device}: {name}, {arch}{path}")
 }
 
-/// Turing cards without tensor cores (the GTX 16 series: TU116, TU117) still execute `mma.sync` m16n8k8, but far
-/// slower than CUDA-core FMA: on a GTX 1660 SUPER the f16 prefill ran ~3.5x slower than llama.cpp's. On sm_75,
-/// `STRATA_GEMM_FMA` or a "GTX 16" device name compiles the CUDA-core branch of `mma16816` instead (`MMA_FMA` in
-/// kernels.cu, covering the f16 prefill GEMM and the prefill attention); `STRATA_GEMM_TC=1` keeps the tensor cores.
-fn turing_fma(name: &str, cc: (i32, i32), gemm_fma: bool) -> bool {
-    cc == (7, 5) && std::env::var_os("STRATA_GEMM_TC").is_none() && (gemm_fma || name.contains("GTX 16"))
+/// The Turing chips without tensor cores, TU116 and TU117: the GTX 16 series, MX450/MX550, the T400-T2000 workstation
+/// and laptop cards and the CMP 30HX. CUDA does not report tensor cores, so the product name decides.
+fn no_tensor_cores(name: &str) -> bool {
+    const TU11X: [&str; 10] = ["MX450", "MX550", "T400", "T500", "T550", "T600", "T1000", "T1200", "T2000", "30HX"];
+    name.contains("GTX 16") || name.split_whitespace().any(|w| TU11X.contains(&w))
+}
+
+/// Turing cards without tensor cores still execute `mma.sync` m16n8k8, but far slower than CUDA-core FMA: on a GTX
+/// 1660 SUPER the f16 prefill ran ~3.5x slower than llama.cpp's. On sm_75 such a card, or `gemm_fma`
+/// (`STRATA_GEMM_FMA`) on any sm_75 card, compiles the CUDA-core branch of `mma16816` instead (`MMA_FMA` in
+/// kernels.cu, covering the f16 prefill GEMM and the prefill attention); `keep_tc` (`STRATA_GEMM_TC=1`) keeps the
+/// tensor cores.
+fn turing_fma(name: &str, cc: (i32, i32), gemm_fma: bool, keep_tc: bool) -> bool {
+    cc == (7, 5) && !keep_tc && (gemm_fma || no_tensor_cores(name))
 }
 
 /// Whether the device has int8 tensor cores, i.e. whether the `gemmi_*`/`gemmis_*` prefill GEMM exists in its cubin
@@ -624,7 +633,7 @@ impl Gpu {
         let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
         let gemm_fma = gemm_fma();
         let name = ctx.name().unwrap_or_default();
-        let mma_fma = turing_fma(&name, (maj, min), gemm_fma);
+        let mma_fma = turing_fma(&name, (maj, min), gemm_fma, std::env::var_os("STRATA_GEMM_TC").is_some());
         let fma_path = if (maj, min) >= (7, 5) { mma_fma } else { gemm_fma };  // the branch actually compiled
         crate::say!("{}", device_log(device, &name, arch, (maj, min), fma_path));
         let stream = ctx.new_stream()?;
@@ -1844,17 +1853,30 @@ mod tests {
     }
 
     #[test]
-    fn turing_fma_only_for_gtx16_on_sm75() {
-        // Reads STRATA_GEMM_TC; the test does not set it, so skip when the caller did.
-        if std::env::var_os("STRATA_GEMM_TC").is_some() { return; }
-        assert!(super::turing_fma("NVIDIA GeForce GTX 1660 SUPER", (7, 5), false));
-        assert!(super::turing_fma("NVIDIA GeForce GTX 1650", (7, 5), false));
-        assert!(!super::turing_fma("NVIDIA GeForce RTX 2070", (7, 5), false));
-        assert!(super::turing_fma("NVIDIA GeForce RTX 2070", (7, 5), true));  // STRATA_GEMM_FMA
-        assert!(!super::turing_fma("NVIDIA GeForce GTX 1660 SUPER", (8, 6), false));
-        assert!(!super::turing_fma("Tesla V100-SXM2-32GB", (7, 0), true));
+    fn turing_fma_only_for_turing_without_tensor_cores() {
+        // TU116/TU117 cards, at sm_75 only; `gemm_fma` (STRATA_GEMM_FMA) turns it on for any sm_75 card and `keep_tc`
+        // (STRATA_GEMM_TC) off. Flags are passed in, so the caller's environment does not matter.
+        for name in ["NVIDIA GeForce GTX 1660 SUPER", "NVIDIA GeForce GTX 1650", "NVIDIA GeForce GTX 1650 Ti with Max-Q Design",
+            "NVIDIA GeForce MX450", "NVIDIA T600 Laptop GPU", "Quadro T1000", "NVIDIA T1000 8GB", "NVIDIA CMP 30HX"] {
+            assert!(super::turing_fma(name, (7, 5), false, false), "{name}");
+            assert!(!super::turing_fma(name, (7, 5), false, true), "{name} with STRATA_GEMM_TC");
+        }
+        for name in ["NVIDIA GeForce RTX 2070", "Tesla T4", "Quadro RTX 4000", "NVIDIA TITAN RTX", "NVIDIA RTX A2000"] {
+            assert!(!super::turing_fma(name, (7, 5), false, false), "{name}");
+        }
+        assert!(super::turing_fma("NVIDIA GeForce RTX 2070", (7, 5), true, false));  // STRATA_GEMM_FMA
+        assert!(!super::turing_fma("NVIDIA GeForce GTX 1660 SUPER", (8, 6), false, false));
+        assert!(!super::turing_fma("Tesla V100-SXM2-32GB", (7, 0), true, false));
         assert!(super::device_log(0, "x", "sm_75", (7, 5), true).contains("CUDA-core FMA"));
         assert!(super::device_log(0, "x", "sm_75", (7, 5), false).contains("m16n8k8"));
+    }
+
+    #[test]
+    fn cubin_cache_key_changes_with_mma_fma() {
+        // A GTX 16 card must not load the tensor-core cubin from the cache: the define is in the source the key hashes.
+        let src = super::source(0, 0, false);
+        let fma = format!("#define MMA_FMA 1\n{src}");
+        assert_ne!(super::cache_key(&src, "sm_75", "12.4"), super::cache_key(&fma, "sm_75", "12.4"));
     }
 
     #[test]
