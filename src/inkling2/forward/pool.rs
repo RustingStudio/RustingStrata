@@ -116,7 +116,7 @@ impl Pool {
         }
         // Slots in proportion to each layout's experts, from what the budget and the card have left.
         let total: usize = kinds.iter().map(|k| k.1 * ne * k.2.len()).sum();
-        let free = d.parts[0].be.mem_info().map_or(0, |m| m.0).saturating_sub(f_res + (64 << 20));
+        let free = d.parts[0].be.mem_info().map_or(0, |m| m.0).saturating_sub(f_res + (512 << 20));
         let room = d.budget_left().saturating_sub(b_res).min(free);
         let frac = (room as f64 / total.max(1) as f64).min(1.0);
         let mut slots = vec![];
