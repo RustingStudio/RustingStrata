@@ -22,6 +22,7 @@ Reference machine unless stated: RTX 3060 12 GB, Ryzen 5 7600X, 32 GB RAM.
 | GLM-5.3-Flash UD-Q2_K_XL (119 GB) | 1.35-1.57 tok/s | 0.57-0.62 | - | [below](#glm-53-flash-ud-q2_k_xl-119-gb) |
 | DeepSeek-V4.1-Flash IQ2_XXS (249 GB) | 2-3.6 tok/s | 0.3-1.5 | - | [below](#deepseek-v41-flash-iq2_xxs-249-gb) |
 | Inkling 2 Mini IQ4_NL (17.6 GB), 566-token prompt | 35.8 tok/s (35.6-36.1) | 31.1 (31.0-31.1) | - | [below](#inkling-2-mini-against-llamacpp-as-servers-05k-to-32k-prompts) |
+| Kolibri 1.1 Q4_K_M (43.4 GB), 561-token prompt | 33.4 tok/s (32.0-35.8) | 27.0 (9.7-34.8) | - | [below](#kolibri-11-q4_k_m-434-gb) |
 | Recursive Flint 39.8B UD-Q5_K_XL, 4102-token prompt | 64.6 tok/s (63.8-65.6) | 48.6 (47.5-49.3) | - | [below](#recursive-flint-398b-ud-q5_k_xl) |
 
 ## Qwen3.6-35B-A3B UD-Q5_K_M
