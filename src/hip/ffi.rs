@@ -199,6 +199,14 @@ impl Hip {
         find_gfx(unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), PROP_BUF) })
     }
 
+    /// The device's PCI address as sysfs names it ("0000:0c:00.0"), or None when the runtime does not give it.
+    pub fn pci_bus_id(&self, device: c_int) -> Option<String> {
+        let f: unsafe extern "C" fn(*mut c_char, c_int, c_int) -> c_int = unsafe { Self::sym(&self._lib, "hipDeviceGetPCIBusId") }?;
+        let mut buf = [0 as c_char; 64];
+        if unsafe { f(buf.as_mut_ptr(), 64, device) } != HIP_SUCCESS { return None }
+        Some(unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().to_lowercase())
+    }
+
     pub fn device_name(&self, device: c_int) -> String {
         let mut buf = [0 as c_char; 256];
         let r = unsafe { (self.device_name)(buf.as_mut_ptr(), 256, device) };

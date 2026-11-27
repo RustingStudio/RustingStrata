@@ -553,15 +553,21 @@ fn compile_cached(rtc: &ffi::Rtc, src: &str, arch: &str, tag: &str) -> anyhow::R
     Ok(b)
 }
 
-/// Free VRAM as the kernel driver counts it, for the amdgpu card whose VRAM size is `total` (to 256 MiB). `hipMemGetInfo` counts
-/// only compute allocations, so the desktop and other graphics clients look free to it and a budget taken from it
-/// squeezes them out (the compositor then fails to pin its framebuffer). Vulkan's memory budget already counts them.
-fn drm_free(total: usize) -> Option<usize> {
+/// Free VRAM as the kernel driver counts it, for the amdgpu card at PCI address `bus` or, when the runtime gives none,
+/// the one whose VRAM size is `total` (to 256 MiB; with two cards of one size that may be the other card).
+/// `hipMemGetInfo` counts only compute allocations, so the desktop and other graphics clients look free to it and a
+/// budget taken from it squeezes them out (the compositor then fails to pin its framebuffer). Vulkan's memory budget
+/// already counts them.
+fn drm_free(total: usize, bus: Option<&str>) -> Option<usize> {
     let read = |p: std::path::PathBuf| std::fs::read_to_string(p).ok()?.trim().parse::<usize>().ok();
     std::fs::read_dir("/sys/class/drm").ok()?.flatten().find_map(|e| {
         let dev = e.path().join("device");
         let t = read(dev.join("mem_info_vram_total"))?;
-        if t.abs_diff(total) > 256 << 20 { return None }
+        let ours = match bus {
+            Some(b) => std::fs::canonicalize(&dev).ok()?.file_name()?.to_string_lossy().to_lowercase() == b,
+            None => t.abs_diff(total) <= 256 << 20,
+        };
+        if !ours { return None }
         Some(t.saturating_sub(read(dev.join("mem_info_vram_used"))?))
     })
 }
@@ -631,7 +637,7 @@ impl Backend for Gpu {
     fn mem_info(&self) -> anyhow::Result<(usize, usize)> {
         let (mut free, mut total) = (0usize, 0usize);
         self.hip.check(unsafe { (self.hip.mem_get_info)(&mut free, &mut total) }, "hipMemGetInfo")?;
-        Ok((free.min(drm_free(total).unwrap_or(usize::MAX)), total))
+        Ok((free.min(drm_free(total, self.hip.pci_bus_id(self.device as i32).as_deref()).unwrap_or(usize::MAX)), total))
     }
 
     fn sync(&self) -> anyhow::Result<()> { self.wait() }
@@ -1379,6 +1385,22 @@ mod tests {
                       at / (nh * hd), (at / hd) % nh, at % hd, want[at]);
             assert!(worst < 5e-3, "hd {hd}: max |diff| = {worst} at {at}");
         }
+    }
+
+    /// The desktop's VRAM is found on the card the device runs on, through its PCI address.
+    #[test]
+    fn drm_free_finds_the_device_by_its_pci_address() {
+        let g = match Gpu::new(0) {
+            Ok(g) => g,
+            Err(e) => { eprintln!("skipping: HIP unavailable: {e:#}"); return; }
+        };
+        let Some(bus) = g.hip.pci_bus_id(0) else { eprintln!("skipping: no PCI address from the runtime"); return };
+        let (mut free, mut total) = (0usize, 0usize);
+        g.hip.check(unsafe { (g.hip.mem_get_info)(&mut free, &mut total) }, "hipMemGetInfo").unwrap();
+        let drm = drm_free(total, Some(&bus)).unwrap_or_else(|| panic!("no amdgpu card at {bus} in /sys/class/drm"));
+        eprintln!("{bus}: {:.2} GB free by the driver, {:.2} GB by HIP", drm as f64 / 1e9, free as f64 / 1e9);
+        assert!(drm <= total);
+        assert!(drm_free(total, Some("0000:ff:1f.7")).is_none(), "an address with no card matched");
     }
 
     /// The generated source compiles for this device through hiprtc (the CUDA source with `STRATA_HIP` taken).
