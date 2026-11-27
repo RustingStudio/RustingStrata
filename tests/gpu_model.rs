@@ -705,7 +705,6 @@ fn gpu_image_prefill_matches_cpu() {
     let Some(mm) = common::mmproj_path() else { return };
     let g = Gguf::open(&p).unwrap();
     let m = Model::load(&g).unwrap();
-    if m.cfg.n_embd_ple != 0 || m.cfg.idx_top_k != 0 { eprintln!("SKIP: PLE/QSA model"); return }
     let tok = Tokenizer::from_gguf(&g).unwrap();
     let proj = rusting_strata::vision::VisionProjector::open(&mm).unwrap();
     let img = image::RgbImage::from_pixel(128, 128, image::Rgb([200, 0, 0]));

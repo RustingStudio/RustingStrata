@@ -1292,8 +1292,6 @@ impl<'a> GpuModel<'a> {
     /// is made current again after it.
     pub fn prefill_image_with(&mut self, p: &crate::vision::Prompt, embs: &[Vec<Vec<f32>>], between: &mut dyn FnMut(&mut Self) -> anyhow::Result<()>)
         -> anyhow::Result<Vec<f32>> {
-        let c = &self.m.cfg;
-        ensure!(c.n_embd_ple == 0 && c.idx_top_k == 0, "image input is not supported for this model yet ({} with PLE or QSA layers)", c.arch);
         self.reset()?;
         self.rows.clear();
         self.parked.clear();
@@ -1312,7 +1310,7 @@ impl<'a> GpuModel<'a> {
         for (i, &id) in p.ids.iter().enumerate() {
             if i > 0 && i % 64 == 0 { between(self)?; self.use_slot(cur); }
             logits = match rows.next_if(|r| r.0 == i) {
-                Some((_, x)) => self.step_embed(x, p.positions[i])?,
+                Some((_, x)) => self.step_embed(x, p.positions[i], id)?,
                 None => { self.rope_offset = p.positions[i][0] - self.pos as i32; self.step(id)? }
             };
         }
@@ -1320,12 +1318,18 @@ impl<'a> GpuModel<'a> {
         Ok(logits)
     }
 
-    /// `step` for an image token: `x` is its embedding (a projector row), `pos` its M-RoPE positions [t, y, x, z].
-    fn step_embed(&mut self, x: &[f32], pos: [i32; 4]) -> anyhow::Result<Vec<f32>> {
+    /// `step` for an image token: `x` is its embedding (a projector row), `pos` its M-RoPE positions [t, y, x, z],
+    /// `id` the placeholder token, whose PLE input the model takes as `Model::step_embed` does.
+    fn step_embed(&mut self, x: &[f32], pos: [i32; 4], id: u32) -> anyhow::Result<Vec<f32>> {
         if self.pos >= self.ctx { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
         self.kv_need(self.cur, self.pos + 1)?;
         let seq = self.begin_seq();
         self.gpu.put(&x.repeat(self.m.cfg.hc_n.max(1)), &self.x, 0)?;
+        if self.ple_ring.is_some() {
+            self.ple_undo = (self.ple_prev, vec![id]);
+            let pe = self.m.ple_embed(&mut self.ple_prev, id);
+            self.gpu.put(&pe, &self.bufs["emb"], 0)?;
+        }
         self.gpu.put(&[self.pos as i32, seq as i32], &self.step_buf, 0)?;
         self.gpu.put(&pos.map(|p| [p, seq as i32]).concat(), &self.mrope_buf, 0)?;
         self.mrope = true;
@@ -3409,7 +3413,11 @@ impl<'a> GpuModel<'a> {
                             mv2(&a.qp, &a.kp, "iq", "ik")?;
                             g.qsa_pool(p("ik"), a.ring, a.pool.addr(), a.kn.ptr, step, nt, c.n_rot, c.rope_base, eps)?;
                             g.rms_norm(p("iq"), QSA_D, a.qn.ptr, p("iqn"), QSA_D, QSA_D, nt * QSA_H, eps)?;
-                            g.rope_neox(p("iqn"), QSA_D, nt * QSA_H, QSA_H, c.n_rot, rope, c.rope_base)?;
+                            // An image row's query turns by its M-RoPE positions, as in attention.
+                            match (self.mrope, c.mrope_sections) {
+                                (true, Some(sec)) => g.rope_mrope(p("iqn"), QSA_D, nt * QSA_H, QSA_H, c.n_rot, self.mrope_buf.addr(), c.rope_base, sec)?,
+                                _ => g.rope_neox(p("iqn"), QSA_D, nt * QSA_H, QSA_H, c.n_rot, if self.mrope { self.mrope_buf.addr() } else { rope }, c.rope_base)?,
+                            }
                             g.qsa_select(p("iqn"), a.pool.addr(), b.score.addr(), b.sel.addr(), 0, step, 0, nt, b.nbs, b.top, b.sst, 0)?;
                             (b.sel.addr(), b.sst)
                         }
