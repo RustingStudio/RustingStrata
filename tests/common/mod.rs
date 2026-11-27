@@ -68,7 +68,8 @@ pub fn backends() -> Vec<(&'static str, Box<dyn Backend>)> {
     if wanted("hip") {
         match rusting_strata::hip::Gpu::new(0) {
             Ok(g) => v.push(("hip", Box::new(g))),
-            Err(e) if format!("{e}") == "HIP init" => eprintln!("SKIP: hip: {e:#}"),
+            // A missing runtime and a missing hiprtc both carry "HIP init" in the chain, the second under more context.
+            Err(e) if e.chain().any(|c| c.to_string() == "HIP init") => eprintln!("SKIP: hip: {e:#}"),
             Err(e) => panic!("{e:#}"),
         }
     } else {
