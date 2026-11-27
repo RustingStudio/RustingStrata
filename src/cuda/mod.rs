@@ -364,10 +364,19 @@ fn device_log(device: usize, name: &str, arch: &str, cc: (i32, i32), gemm_fma: b
         (c, _) if c < (7, 0) => " (pre-Volta, not supported)",  // not reached from `Gpu::new`: `min_arch_error`
         (c, false) if c < (7, 5) => " (Volta, m8n8k4)",
         (c, true) if c < (7, 5) => " (Volta fallback)",
+        (c, true) if c < (8, 0) => " (Turing, CUDA-core FMA)",
         (c, _) if c < (8, 0) => " (Turing, m16n8k8)",
         _ => "",  // sm_80+ always uses mma.m16n8k16
     };
     format!("cuda device {device}: {name}, {arch}{path}")
+}
+
+/// Turing cards without tensor cores (the GTX 16 series: TU116, TU117) still execute `mma.sync` m16n8k8, but far
+/// slower than CUDA-core FMA: on a GTX 1660 SUPER the f16 prefill ran ~3.5x slower than llama.cpp's. On sm_75,
+/// `STRATA_GEMM_FMA` or a "GTX 16" device name compiles the CUDA-core branch of `mma16816` instead (`MMA_FMA` in
+/// kernels.cu, covering the f16 prefill GEMM and the prefill attention); `STRATA_GEMM_TC=1` keeps the tensor cores.
+fn turing_fma(name: &str, cc: (i32, i32), gemm_fma: bool) -> bool {
+    cc == (7, 5) && std::env::var_os("STRATA_GEMM_TC").is_none() && (gemm_fma || name.contains("GTX 16"))
 }
 
 /// Whether the device has int8 tensor cores, i.e. whether the `gemmi_*`/`gemmis_*` prefill GEMM exists in its cubin
@@ -614,9 +623,14 @@ impl Gpu {
             .unwrap_or(48 << 10).max(48 << 10) as u32;
         let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
         let gemm_fma = gemm_fma();
-        crate::say!("{}", device_log(device, &ctx.name().unwrap_or_default(), arch, (maj, min), gemm_fma));
+        let name = ctx.name().unwrap_or_default();
+        let mma_fma = turing_fma(&name, (maj, min), gemm_fma);
+        let fma_path = if (maj, min) >= (7, 5) { mma_fma } else { gemm_fma };  // the branch actually compiled
+        crate::say!("{}", device_log(device, &name, arch, (maj, min), fma_path));
         let stream = ctx.new_stream()?;
-        let module = ctx.load_module(ptx(&source(kv_k_mode, kv_v_mode, !gemm_fma && (maj, min) < (7, 5)), arch, (maj, min))?).context("load cubin")?;
+        let src = source(kv_k_mode, kv_v_mode, !gemm_fma && (maj, min) < (7, 5));
+        let src = if mma_fma { format!("#define MMA_FMA 1\n{src}") } else { src };
+        let module = ctx.load_module(ptx(&src, arch, (maj, min))?).context("load cubin")?;
         let i8_gemm = int8_gemm_arch((maj, min));
         let turing = !int8_mma && (maj, min) >= (7, 5);
         // The per-block dynamic shared memory ceiling the driver reports: 96 KiB on Volta per the roadmap, but
