@@ -4357,8 +4357,12 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     if stream { c["index"] = k.into(); }
                     c
                 }).collect();
-                if stream { json!({"tool_calls": c}) }
-                else { json!({"role": "assistant", "content": if content.is_empty() { None } else { Some(content) }, "tool_calls": c}) }
+                if stream { return json!({"tool_calls": c}); }
+                // The text before the calls opens with the reasoning when the prompt ended in an open think block.
+                let (r, a) = split_think(think_open, content);
+                let mut m = json!({"role": "assistant", "content": if a.is_empty() { None } else { Some(a) }, "tool_calls": c});
+                if !r.is_empty() { m["reasoning_content"] = r.into(); }
+                m
             };
             if anth {
                 let reason = if calls.is_some() { "tool_use" } else if stop { "end_turn" } else { "max_tokens" };
