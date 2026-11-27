@@ -748,6 +748,9 @@ impl Gpu {
         let mut q8 = self.q8.lock().unwrap();
         let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
         let reuse = same && q8.1 == key;
+        // Without SAME_X x may hold new rows: the f16 copy of an earlier gemmm_* must not serve a later SAME_X GEMM
+        // (an int8 or tile-list GEMM converts nothing, so its x would match the old key).
+        if !same { *self.xk.lock().unwrap() = None; }
         // The int8 path loads q8 rows 16 bytes at a time: their stride (cols * 11 / 8) is aligned only for cols % 128 == 0.
         // A gemm inside a batch cannot quantize x (the quantize and the gemm would land on different streams): when
         // the cached q8 rows are not x's (or, without SAME_X, may not be), use the f16 kernel. Volta and Turing have no int8 tensor-core mma: there the
