@@ -877,6 +877,62 @@ fn slot_kv_grows() {
     }
 }
 
+/// `step_batch` on a model split over two devices (the same GPU opened twice) gives the bits of one device, and one
+/// device gives the same bits twice (two CUDA streams raced in the batched DeltaNet GEMMs). No expert slots and a fixed
+/// CPU share: half the missed experts run on the CPU, half are staged.
+#[test]
+fn split_batch_matches_one_part() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let prompts: Vec<Vec<u32>> = ["The capital of France is", "def fib(n):\n    return", "Once upon a time, in a small village by the sea, there",
+                                  "2 + 2 =", "The quick brown fox", "import numpy as np\n"].iter().map(|s| tok.encode(s).unwrap()).collect();
+    // SAFETY: the GPU lock serializes every test that loads a model, the only readers of these variables.
+    unsafe { std::env::set_var("STRATA_EXPERT_MB", "0"); std::env::set_var("STRATA_CPU_FRAC", "0.5") };
+    for bk in ["cuda", "vulkan"] {
+        let open = || -> Option<Box<dyn rusting_strata::backend::Backend>> {
+            Some(match bk { "cuda" => Box::new(rusting_strata::cuda::Gpu::new(0).ok()?), _ => Box::new(rusting_strata::vulkan::Vk::new(0).ok()?) })
+        };
+        let Some(one) = open() else { continue };
+        let run = |gm: &mut GpuModel| -> Vec<(u32, Vec<f32>)> {
+            gm.adapt_every = 0;
+            let mut out = vec![];
+            // The prompts one at a time, then all in shared forwards (`prefill_slots`, as serve does), each followed
+            // by batched steps.
+            for shared in [false, true] {
+                for s in 0..prompts.len() { gm.use_slot(s); gm.reset().unwrap(); }
+                if shared {
+                    let jobs: Vec<_> = prompts.iter().enumerate().map(|(s, ids)| (s, 0u64, &ids[..], 0, ids.len() - 1)).collect();
+                    out.extend(gm.prefill_slots(&jobs, &mut |_| Ok(())).unwrap().into_iter().map(|(l, _)| (0, l)));
+                } else {
+                    for (s, ids) in prompts.iter().enumerate() { gm.use_slot(s); out.push((0, gm.prefill(ids).unwrap())); }
+                }
+                let mut toks: Vec<u32> = vec![11; prompts.len()];
+                for _ in 0..4 {
+                    let rows: Vec<(usize, u32, bool)> = toks.iter().enumerate().map(|(s, &t)| (s, t, true)).collect();
+                    let got = gm.step_batch(&rows).unwrap();
+                    toks = got.iter().map(|r| r.0).collect();
+                    out.extend(got);
+                }
+            }
+            out
+        };
+        let mut gm = GpuModel::load_slots(&m, one, 256, 16, 512 << 20, prompts.len()).unwrap();
+        if gm.batch_cap() == 0 { eprintln!("split_batch_matches_one_part {bk}: no step_batch for this model, skipped"); continue; }
+        if !gm.is_moe() { eprintln!("split_batch_matches_one_part {bk}: a dense model batches in one part only, skipped"); continue; }
+        let want = run(&mut gm);
+        assert!(run(&mut gm) == want, "{bk}: two runs of step_batch on one part differ");
+        drop(gm);
+        let mut sp = GpuModel::load_split(&m, vec![open().unwrap(), open().unwrap()], 256, 16, 512 << 20, 0, prompts.len()).unwrap();
+        assert!(sp.batch_cap() > 0, "{bk}: no step_batch on the split model");
+        let got = run(&mut sp);
+        assert!(got == want, "{bk}: split step_batch differs from one part");
+    }
+    unsafe { std::env::remove_var("STRATA_EXPERT_MB"); std::env::remove_var("STRATA_CPU_FRAC") };
+}
+
 /// `prefill_slots` (several prompts in shared forwards, one of them continuing a saved state) against `prefill_cached`
 /// of each prompt alone, with the tolerance of `batch_matches_single`.
 #[test]

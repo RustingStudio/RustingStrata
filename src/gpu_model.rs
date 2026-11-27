@@ -1098,17 +1098,19 @@ impl<'a> GpuModel<'a> {
         if ns > 1 { for q in &mut seqs { q.saved = alloc_saved(&*gpu, &layers, true)?; } }
         let saved = std::mem::take(&mut seqs[0].saved);
         // `step_batch` covers plain dense attention models in one part; the rest decode `STEP_ROWS` rows a forward.
-        // A model with DeltaNet layers or experts takes the layers of the prefill (`prefill_chunk` in rows mode).
-        let plain = output_norm.is_some() && output.is_some() && range.start == 0 && !mtp && c.hc_n == 0 && c.n_embd_ple == 0 && !qsa_on
-            && c.hadamard.is_none() && layers.iter().enumerate().all(|(il, l)| l.attn_norm.is_some() && l.post_norm.is_some() && l.mhc.is_none() && l.ple.is_none()
-                && c.rope_layer.get(il).copied().unwrap_or(true));
+        // A model with DeltaNet layers or experts takes the layers of the prefill (`prefill_chunk` in rows mode), also
+        // over the parts of a --device split.
         let dense = layers.iter().all(|l| matches!(l.mixer, Mixer::Attn { .. }) && matches!(l.ffn, Ffn::Dense { .. }));
+        let one = range.start == 0 && last;
+        let plain = (one || !dense) && (!last || output_norm.is_some() && output.is_some()) && !mtp && c.hc_n == 0 && c.n_embd_ple == 0 && !qsa_on
+            && c.hadamard.is_none() && layers.iter().enumerate().all(|(il, l)| l.attn_norm.is_some() && l.post_norm.is_some() && l.mhc.is_none() && l.ple.is_none()
+                && c.rope_layer.get(range.start + il).copied().unwrap_or(true));
         let bt = match &pf {
             Some(p) if ns > STEP_ROWS && plain && gpu.kv_rows() => {
                 // ponytail: 128 rows a forward, the size of the CUDA argmax scratch; split the argmax to go past it.
                 let cap = ns.min(p.chunk).min(128);
                 let rows = p.chunk;
-                Some(Batch { dense, cap, rows, step: gpu.zeros::<i32>(2 * rows)?, kvt: gpu.zeros::<u64>(layers.len() * 2 * rows)?, logits: gpu.zeros::<f32>(cap * c.n_vocab)?,
+                Some(Batch { dense, cap, rows, step: gpu.zeros::<i32>(2 * rows)?, kvt: gpu.zeros::<u64>(layers.len() * 2 * rows)?, logits: gpu.zeros::<f32>(if last { cap * c.n_vocab } else { 1 })?,
                              amax: gpu.zeros::<i32>(cap)?, attp: gpu.zeros::<f32>(cap * c.n_head * ATT_SPLITS * (c.head_dim + 2))? })
             }
             _ => None,
@@ -1370,7 +1372,7 @@ impl<'a> GpuModel<'a> {
     /// Most tokens of one `verify` forward on this backend (4 on CUDA, `TMAX` on Vulkan).
     pub fn tmax(&self) -> usize { self.gpu.verify_rows() }
 
-    pub fn batch_cap(&self) -> usize { self.bt.as_ref().map_or(0, |b| b.cap) }
+    pub fn batch_cap(&self) -> usize { if self.parts().all(|p| p.bt.is_some()) { self.bt.as_ref().map_or(0, |b| b.cap) } else { 0 } }
 
     pub fn is_moe(&self) -> bool { self.m.cfg.is_moe() }
 
