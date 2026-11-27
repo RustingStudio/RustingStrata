@@ -1098,6 +1098,31 @@ mod avx2 {
             hsum(acc) + sumf
         }
     }
+
+    /// A trellis row (blocks of B bytes for 128 values) times Q8_K activations: the int16 codebook of
+    /// `quant::TQ_STATES_I16`, one 8-byte table row per state, `_mm256_madd_epi16` against the sign-extended
+    /// activations. Two trellis blocks share one Q8_K block. Not the bits of the f32 kernel (`STRATA_TQ_INT`).
+    pub fn dot_tq_i<const B: usize>(row: &[u8], xq: &[Q8K]) -> f32 {
+        unsafe {
+            let tab = crate::quant::TQ_STATES_I16.as_ptr() as *const i64;
+            let rows4 = |s: [usize; 4]| _mm256_setr_epi64x(*tab.add(s[0]), *tab.add(s[1]), *tab.add(s[2]), *tab.add(s[3]));
+            let mut acc = _mm256_setzero_ps();
+            for (i, b) in row.chunks_exact(B).enumerate() {
+                let (qs, y) = (&b[2..B], &xq[i / 2]);
+                let a = y.qs.as_ptr().add(128 * (i % 2));
+                let buf = crate::quant::tq_stream(qs);
+                let st = |t: usize| crate::quant::tq_state_in(&buf, qs, t);
+                let mut sum = _mm256_setzero_si256();
+                for m in 0..8 {
+                    let w = rows4([0, 1, 2, 3].map(|k| st(4 * m + k)));
+                    let x = _mm256_cvtepi8_epi16(_mm_loadu_si128(a.add(16 * m) as *const __m128i));
+                    sum = _mm256_add_epi32(sum, _mm256_madd_epi16(w, x));
+                }
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(sum), acc);
+            }
+            hsum(acc) * (1.0 / 8192.0)
+        }
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vnni", target_feature = "avx512vbmi"))]
@@ -1622,13 +1647,12 @@ mod avx512 {
 /// A trellis row (blocks of B bytes for 128 values, `quant::tq_points`) times x, in f32: the codebook is not on an
 /// int8 grid, so these types have no Q8_K kernel. Eight partial sums per block, where `Tensor::matvec` adds in order.
 fn dot_tq<const B: usize>(row: &[u8], x: &[f32]) -> f32 {
-    use crate::quant::{TQ_LUT as L, tq_points};
-    let mut sum = 0f32;
+    let (st, mut sum) = (&**crate::quant::TQ_STATES, 0f32);
     for (b, xb) in row.chunks_exact(B).zip(x.chunks_exact(128)) {
         let (qs, mut acc) = (&b[2..B], [0f32; 8]);
         for (t, xs) in xb.chunks_exact(8).enumerate() {
-            let ((p0, p1), (p2, p3)) = (tq_points(qs, 2 * t), tq_points(qs, 2 * t + 1));
-            let w = [L[p0][0], L[p0][1], L[p1][0], L[p1][1], L[p2][0], L[p2][1], L[p3][0], L[p3][1]];
+            let (u, v) = (&st[crate::quant::tq_state(qs, 2 * t)], &st[crate::quant::tq_state(qs, 2 * t + 1)]);
+            let w = [u[0], u[1], u[2], u[3], v[0], v[1], v[2], v[3]];
             for i in 0..8 { acc[i] += w[i] * xs[i]; }
         }
         sum += d16(b) * acc.iter().sum::<f32>();
@@ -1682,6 +1706,15 @@ pub fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
             GgmlType::IQ1S => return Some(avx512::dot_iq1s),
             GgmlType::IQ2XXS => return Some(avx512::dot_iq2xxs),
             GgmlType::IQ3S => return Some(avx512::dot_iq3s),
+            _ => {}
+        }
+    }
+    #[cfg(target_feature = "avx2")]
+    if std::env::var_os("STRATA_SCALAR").is_none() && std::env::var_os("STRATA_TQ_INT").is_some() {
+        match ty {
+            GgmlType::TQ2T => return Some(avx2::dot_tq_i::<34>),
+            GgmlType::TQK6 => return Some(avx2::dot_tq_i::<26>),
+            GgmlType::TQK7 => return Some(avx2::dot_tq_i::<30>),
             _ => {}
         }
     }
@@ -1995,6 +2028,35 @@ mod tests {
         }
     }
 
+    /// Single-thread speed of the trellis kernels: `cargo test --release --lib tq_dot_speed -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn tq_dot_speed() {
+        let mut r = 0x9E3779B97F4A7C15u64;
+        let mut rnd = || { r ^= r << 13; r ^= r >> 7; r ^= r << 17; r as u8 };
+        let (n, rows) = (2048, 512);
+        let x: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.7548777).fract() - 0.5) * 2.0).collect();
+        for ty in [GgmlType::TQ2T, GgmlType::TQK6, GgmlType::TQK7] {
+            let rb = n / 128 * ty.block_bytes();
+            let mut m: Vec<u8> = (0..rows * rb).map(|_| rnd()).collect();
+            for b in m.chunks_exact_mut(ty.block_bytes()) { b[..2].copy_from_slice(&f16::from_f32(0.01).to_le_bytes()); }
+            let dot = float_dot(ty).unwrap();
+            let t = std::time::Instant::now();
+            let mut s = 0f32;
+            for _ in 0..20 { for row in m.chunks_exact(rb) { s += dot(row, &x); } }
+            println!("{}: {:.1} ns a block ({s})", ty.name(), t.elapsed().as_nanos() as f64 / (20 * rows * n / 128) as f64);
+            #[cfg(target_feature = "avx2")]
+            {
+                let dot = match ty { GgmlType::TQ2T => avx2::dot_tq_i::<34>, GgmlType::TQK6 => avx2::dot_tq_i::<26>, _ => avx2::dot_tq_i::<30> };
+                let xq = quantize_q8k(&x);
+                let t = std::time::Instant::now();
+                let mut s = 0f32;
+                for _ in 0..20 { for row in m.chunks_exact(rb) { s += dot(row, &xq); } }
+                println!("{} int: {:.1} ns a block ({s})", ty.name(), t.elapsed().as_nanos() as f64 / (20 * rows * n / 128) as f64);
+            }
+        }
+    }
+
     /// The trellis kernels equal the f32 dequantized dot on random blocks.
     #[test]
     fn tq_dots_match_dequant() {
@@ -2009,6 +2071,15 @@ mod tests {
             let want: f64 = w.iter().zip(&x).map(|(&a, &b)| a as f64 * b as f64).sum();
             let got = float_dot(ty).unwrap()(&row, &x);
             assert!(((got as f64 - want) / want.abs().max(1e-3)).abs() < 1e-5, "{}: {got} vs {want}", ty.name());
+            #[cfg(target_feature = "avx2")]
+            {
+                let dot = match ty { GgmlType::TQ2T => avx2::dot_tq_i::<34>, GgmlType::TQK6 => avx2::dot_tq_i::<26>, _ => avx2::dot_tq_i::<30> };
+                let mut xp = x.clone();
+                xp.resize(768, 0.0);
+                let gi = dot(&row, &quantize_q8k(&xp)) as f64;
+                let l1: f64 = w.iter().zip(&x).map(|(&a, &b)| (a as f64 * b as f64).abs()).sum();
+                assert!((gi - want).abs() < 1e-2 * l1, "{} int: {gi} vs {want}", ty.name());
+            }
         }
     }
 

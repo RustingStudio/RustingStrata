@@ -1879,12 +1879,20 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 // The reasoning is dim on a terminal; it starts in the prompt when the template opens the block itself.
                 let dim = term::out();
                 if dim && think_cap.is_some_and(|c| c.0) { print!("\x1b[2m"); }
+                let (h0, t0) = (r.expert_summary(), Instant::now());
                 let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut smp, logits, room(&engine, ids.len(), n), think_cap, &mut |t| {
                     if dim { print!("{}", t.replace("<think>", "\x1b[2m<think>").replace("</think>", "</think>\x1b[0m")); } else { print!("{t}"); }
                     std::io::stdout().flush()?;
                     Ok(false)
                 })?;
                 println!("{}", if dim { "\x1b[0m" } else { "" });
+                // One status line a reply: its decode speed and, with an expert cache, its own expert hit rate.
+                let hit = match (h0, r.expert_summary()) {
+                    (Some(a), Some(b)) if b.hits + b.misses > a.hits + a.misses =>
+                        format!(", expert hit rate {:.1}%", 100.0 * (b.hits - a.hits) as f64 / (b.hits + b.misses - a.hits - a.misses) as f64),
+                    _ => String::new(),
+                };
+                say!("decode: {:.1} tok/s, {} tok{hit}", out.len() as f64 / t0.elapsed().as_secs_f64().max(1e-9), out.len());
                 msgs.push(Msg::new("assistant", &answer(&tok.decode(&out)?)));
             }
             r.finish()?;
@@ -4056,7 +4064,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             };
             let key_name = if who.name.is_empty() { "open" } else { who.name.as_str() };
             // The `done:` line of a chat request, and its line in the usage log.
-            let log = |last: &serve::Last| {
+            let log = |last: &serve::Last, experts: &str| {
                 let decode_s = last.decode_ms / 1e3;
                 let prefill_s = last.prefill_ms / 1e3;
                 // Cached prompt tokens were not prefilled again, so they do not count toward the prefill speed.
@@ -4064,7 +4072,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 let decode_tps = if decode_s > 0.0 { last.completion_tokens as f64 / decode_s } else { 0.0 };
                 let prefill_tps = if prefill_s > 0.0 { new_prompt as f64 / prefill_s } else { 0.0 };
                 say!("done: key={key_name} model={} prompt={} tok ({} cached) -> {} tok in {decode_s:.2} s, \
-                    decode {decode_tps:.1} tok/s, prefill {prefill_tps:.1} tok/s, finish={}",
+                    decode {decode_tps:.1} tok/s, prefill {prefill_tps:.1} tok/s{experts}, finish={}",
                     last.model, last.prompt_tokens, last.cached_tokens, last.completion_tokens, last.finish);
                 if let Some(f) = &s.usage {
                     let mut v = json!(last);
@@ -4090,7 +4098,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     Ok(d) => {
                         let last = serve::Last { at: created, model: name.into(), system_tokens: 0, cached_tokens: d.cached, prompt_tokens: d.prompt,
                             completion_tokens: d.completion, prefill_ms: d.prefill_s * 1e3, decode_ms: (total_ms - d.prefill_s * 1e3).max(0.0), finish: d.finish.into() };
-                        log(&last);
+                        log(&last, "");
                         st.record(last);
                         Ok(())
                     }
@@ -4124,6 +4132,9 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             // One line per chat request, and one when it finishes (see `log` above).
             say!("request: {method} {p} key={key_name} model={name} prompt={} tok stream={} tools={}",
                 ids.len(), req.stream, req.tools.len());
+            // The request's own expert hit rate, from the cache counters before and after it.
+            let hits = |r: &Runner| r.expert_summary().map(|s| (s.hits, s.misses));
+            let h0 = hits(r);
             let mut smp = e.sampler();
             smp.temp = req.temperature.unwrap_or(smp.temp);
             smp.top_k = req.top_k.unwrap_or(smp.top_k);
@@ -4228,6 +4239,10 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 if busy { st.busy -= 1; }
                 gpu_stats(r, &mut st);
             }
+            let experts = match (h0, hits(r)) {
+                (Some((h0, m0)), Some((h1, m1))) if h1 + m1 > h0 + m0 => format!(", expert hit rate {:.1}%", 100.0 * (h1 - h0) as f64 / (h1 + m1 - h0 - m0) as f64),
+                _ => String::new(),
+            };
             let decoded = t1.elapsed();
             let ms = |d: Duration| d.as_secs_f64() * 1e3;
             let mut last = serve::Last { at: created, model: name.into(), system_tokens: n_system, cached_tokens: cached,
@@ -4241,7 +4256,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     last.finish = if gone { "cut" } else { "error" }.into();
                     // A request that failed before its prefill ended measured no prefill speed (t1 is still t0).
                     if !prefilled { last.prefill_ms = 0.0; }
-                    if prefilled || !gone { log(&last); }
+                    if prefilled || !gone { log(&last, &experts); }
                     if !req.stream && !gone {
                         let sent = send(&mut w, "500 Internal Server Error", json!({"error": {"message": format!("{err:#}"), "type": "server_error"}}));
                         serve::exit_if_gpu_dead(&err);
@@ -4255,7 +4270,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             last.completion_tokens = out.len();
             last.finish = if calls.is_some() { "tool_calls" } else if stop { "stop" } else { "length" }.into();
             let timings = llama_timings(&last);
-            log(&last);
+            log(&last, &experts);
             s.stats.lock().unwrap().record(last);
             let calls_json = |(content, calls): &(String, Vec<(String, String)>), stream: bool| {
                 let c: Vec<_> = calls.iter().enumerate().map(|(k, (f, a))| {

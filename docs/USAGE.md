@@ -136,6 +136,10 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 - `STRATA_AVX512=1` uses the AVX-512 kernels for experts that run on the CPU, in a build for a CPU that has
   AVX-512 VNNI and VBMI (a `target-cpu=native` build on such a machine; the release binaries do not have them). Their
   results differ from the default kernels in the last bits, so greedy output can change at a near tie.
+- `STRATA_TQ_INT=1` runs the CPU experts of trellis files (Gyro TQ2_T, TQK6, TQK7) with an int16 codebook against
+  int8 activations, as the original Strata does, instead of the default f32 kernel. On a Ryzen 5 7600X with the
+  RTX 3060 at `--vram-margin 4096` (about 8 GB free) and `--fixed-experts`, Gyro-S decodes at 12.3-12.6 tok/s against
+  8.3-8.7. Its results are not the bits of the f32 kernel, so greedy output differs.
 - `--vram-margin` MB of VRAM left free. One value applies to every device; `512,256` gives one per device in
   `--device` order, and `0:512,1:256` gives one per GPU index. On a GPU that drives no display, `--vram-margin 256` keeps more experts
   resident (+1-2% prefill); 128 runs out of memory.

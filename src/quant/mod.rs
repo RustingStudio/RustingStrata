@@ -157,7 +157,11 @@ pub static TQ_LUT: [[f32; 2]; 2048] = {
 /// from bit `(31 - t) K` on, least significant first, circular over the 32 K bits. The points are two 11-bit fields
 /// of the state times 0x9e3779b1.
 #[inline]
-pub fn tq_points(qs: &[u8], t: usize) -> (usize, usize) {
+pub fn tq_points(qs: &[u8], t: usize) -> (usize, usize) { state_points(tq_state(qs, t)) }
+
+/// The 15-bit state of trellis step `t` (see `tq_points`).
+#[inline]
+pub fn tq_state(qs: &[u8], t: usize) -> usize {
     let n = qs.len();
     let s = if n == 32 { (qs[(t + 31) & 31] as u32) << 8 | qs[t] as u32 } else {
         let off = (31 - t) * (n / 4);
@@ -165,9 +169,45 @@ pub fn tq_points(qs: &[u8], t: usize) -> (usize, usize) {
         let w = |i: usize| qs[if i < n { i } else { i - n }] as u32;  // i < 2 n; a division here costs a third of a dot
         (qs[b] as u32 | w(b + 1) << 8 | w(b + 2) << 16) >> (off & 7)
     };
-    let x = (s & 0x7fff).wrapping_mul(0x9e3779b1);
+    (s & 0x7fff) as usize
+}
+
+/// A TQK stream with its first 4 bytes repeated after it, so `tq_state_in` reads a state with one 4-byte load.
+#[inline(always)]
+pub fn tq_stream(qs: &[u8]) -> [u8; 36] {
+    let (n, mut b) = (qs.len(), [0u8; 36]);
+    if n < 32 {
+        b[..n].copy_from_slice(qs);
+        b[n..n + 4].copy_from_slice(&qs[..4]);
+    }
+    b
+}
+
+/// `tq_state(qs, t)`, with `buf = tq_stream(qs)`.
+#[inline(always)]
+pub fn tq_state_in(buf: &[u8; 36], qs: &[u8], t: usize) -> usize {
+    let n = qs.len();
+    if n == 32 { return tq_state(qs, t) }
+    let off = (31 - t) * (n / 4);
+    (u32::from_le_bytes(buf[off >> 3..][..4].try_into().unwrap()) >> (off & 7) & 0x7fff) as usize
+}
+
+#[inline]
+fn state_points(s: usize) -> (usize, usize) {
+    let x = (s as u32).wrapping_mul(0x9e3779b1);
     ((x >> 21) as usize, ((x >> 10) & 2047) as usize)
 }
+
+/// The four values of each trellis state (its two codebook points), 512 KB: a step is one load instead of the hash
+/// and two loads, and the values are the same f32s.
+pub static TQ_STATES: std::sync::LazyLock<Box<[[f32; 4]]>> = std::sync::LazyLock::new(|| (0..1 << 15).map(|s| {
+    let (a, b) = state_points(s);
+    [TQ_LUT[a][0], TQ_LUT[a][1], TQ_LUT[b][0], TQ_LUT[b][1]]
+}).collect());
+
+/// `TQ_STATES` times 8192, rounded to int16 (|values| < 4), for the integer CPU kernel.
+pub static TQ_STATES_I16: std::sync::LazyLock<Box<[[i16; 4]]>> =
+    std::sync::LazyLock::new(|| TQ_STATES.iter().map(|v| v.map(|x| (x * 8192.0).round() as i16)).collect());
 
 /// TQ2_T (34 bytes), TQK7 (30), TQK6 (26): f16 d, then 32 trellis steps; step t gives values 4 t .. 4 t + 4, the two
 /// codebook points of `tq_points` times d.
@@ -462,6 +502,18 @@ fn nvfp4(b: &[u8], y: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tq_state_in_matches() {
+        let mut r = 0x12345678u32;
+        for n in [24, 28, 32] {
+            for _ in 0..200 {
+                let qs: Vec<u8> = (0..n).map(|_| { r ^= r << 13; r ^= r >> 17; r ^= r << 5; r as u8 }).collect();
+                let buf = super::tq_stream(&qs);
+                for t in 0..32 { assert_eq!(super::tq_state_in(&buf, &qs, t), super::tq_state(&qs, t)); }
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
