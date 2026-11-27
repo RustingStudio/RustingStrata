@@ -85,6 +85,13 @@ template <typename T> __device__ __forceinline__ T shfl_up_sync(unsigned, T v, u
 template <typename T> __device__ __forceinline__ T shfl_sync(unsigned, T v, int src, int width = 32) { return __shfl(v, src, width); }
 __device__ __forceinline__ unsigned ballot_sync(unsigned, int predicate) { return (unsigned)__ballot(predicate); }
 __device__ __forceinline__ int any_sync(unsigned, int predicate) { return (int)(__ballot(predicate) != 0); }
+// CUDA's __ldcg loads through L2 only, so a block reads what other blocks wrote (the split-K segments). hiprtc
+// declares it only for halves; agent-scope atomic loads skip the CU's L1 the same way.
+__device__ __forceinline__ float4 ldcg(const float4* p) {
+    const float* f = (const float*)p;
+    return make_float4(__hip_atomic_load(f, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT), __hip_atomic_load(f + 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT),
+                       __hip_atomic_load(f + 2, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT), __hip_atomic_load(f + 3, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT));
+}
 
 // ---- matrix cores (gfx11/gfx12 WMMA) ----
 // D[16x16] += A[16x16] * B^T[16x16]: both operands are 16 rows of 16 halves, which is exactly how the prefill GEMM
@@ -152,6 +159,7 @@ __device__ __forceinline__ strata_hk strata_ld_wmma_t(const unsigned short* p, i
 #define __shfl_sync(...) (strata_hip::shfl_sync(__VA_ARGS__))
 #define __ballot_sync(m, p) (strata_hip::ballot_sync((m), (p)))
 #define __any_sync(m, p) (strata_hip::any_sync((m), (p)))
+#define __ldcg(p) (strata_hip::ldcg(p))
 // The compiled-out sm_80+ paths still mention these; no CUDA-only helper may survive into a HIP build.
 #define __trap() __builtin_trap()
 #define __nanosleep(cycles) __builtin_amdgcn_s_sleep(1)

@@ -109,7 +109,7 @@ fn source(kv_q8: bool) -> String {
          __device__ const unsigned char ksigns_iq2xs[128] = {{{}}};\n\
          __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n\
          __device__ const float tq_lut[4096] = {{{}}};\n\
-         #define LLAMA_Q8 {}\n#define KV_MODE {}\n#define GEMM_TC 0\n#define GEMM_WMMA (STRATA_WMMA && {})\n\
+         #define LLAMA_Q8 {}\n#define KV_MODE {}\n#define K_MODE KV_MODE\n#define V_MODE KV_MODE\n#define TQ_KBITS 4\n#define TQ_VBITS 4\n#define GEMM_TC 0\n#define GEMM_WMMA (STRATA_WMMA && {})\n\
          #define GEMM_BM {}\n#define GEMM_BK {}\n#define GEMM_MIN_BLOCKS 1\n#define GEMV_LOADW {}\n\
          #define FA_BQ {}\n#define FA_BK {}\n{}",
         include_str!("compat.h"),
