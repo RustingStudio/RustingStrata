@@ -286,7 +286,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a crate::tokenizer::Tokenizer, name: &'a st
         let images = if grids.is_empty() { None } else { Some((&grids[..], &embs[..])) };
         let seq = prompt_seq(&tok, &chat_prompt(&view, q.think.unwrap_or(false)), images)?;
         let ids: Vec<u32> = seq.iter().map(|(id, _)| *id).collect();
-        anyhow::ensure!(ids.len() < ctx, "prompt is {} tokens, the limit is {}", ids.len(), ctx - 1);
+        anyhow::ensure!(ids.len() < ctx, "{}", crate::serve::too_long(ids.len(), ctx - 1));
         let t = std::time::Instant::now();
         let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
         // A failed feed leaves part of the prompt in the cache, so the next request starts over.

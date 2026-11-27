@@ -385,7 +385,7 @@ pub fn generate_image_opts(
     let tok = Tokenizer::from_gguf(g)?;
     let mut m = opts.build_model(g, &tok)?;
     let seq = prompt_seq(&tok, prompt, images)?;
-    ensure!(!seq.is_empty() && seq.len() < m.max_ctx, "prompt is {} tokens, the limit is {}", seq.len(), m.max_ctx);
+    ensure!(!seq.is_empty() && seq.len() < m.max_ctx, "{}", crate::serve::too_long(seq.len(), m.max_ctx));
     let trace = std::env::var_os("STRATA_DS_TRACE").is_some();
     if trace {
         let ids: Vec<u32> = seq.iter().map(|&(t, _)| t).collect();
@@ -527,7 +527,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str, opts: Inkling2O
         let seq = prompt_seq(tok, &render_with_effort(&q.messages, &q.tools, &effort), has_images.then_some((&grids[..], &embs[..])))?;
         let ids: Vec<u32> = seq.iter().map(|&(t, _)| t).collect();
         ensure!(!ids.is_empty(), "cannot encode prompt");
-        ensure!(ids.len() < m.max_ctx, "prompt is {} tokens, the limit is {}", ids.len(), m.max_ctx);
+        ensure!(ids.len() < m.max_ctx, "{}", crate::serve::too_long(ids.len(), m.max_ctx));
         let t = std::time::Instant::now();
         if q.stream && !q.head_sent { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
         let (keep, logits) = crate::serve::alive(c, q.stream, || if !has_images && m.toks.len() < ids.len() && ids.starts_with(&m.toks) {

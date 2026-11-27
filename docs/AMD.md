@@ -59,8 +59,9 @@ Environment variables; set any of them to turn the feature off:
 - `STRATA_VK_ATTN_BUDGET=N`: query-key pairs of prefill attention per submit (default 268435456 with cooperative matrices, 33554432 without; 0 disables slicing).
 - `STRATA_VK_DP_OLD`: use the old per-query prefill attention fallback instead of the tiled one (A/B and rollback).
 - `STRATA_VK_NO_COND`: no conditional rendering.
+- `STRATA_VK_DP4=0` or `1`: whether the GEMM of quantized weights uses int8 dot products when the card has no int8 cooperative matrices. By default it does when the driver says the card has them in hardware; a card without (Vega 10, gfx900) takes the float GEMM, as llama.cpp does (issue #133).
 - `STRATA_VK_NO_TQ`: no separate transfer queue for expert uploads.
-- `STRATA_VK_SMEM_LIMIT=49152`: treat the device as allowing this much workgroup shared memory. The AMD proprietary driver reports 32768 on an RX 9070 XT although the card has 64 KB; RustingStrata raises that to 49152 itself on RDNA3/4 cards with this driver (no kernel needs more). For any other card that reports too little, set it by hand. Do not set it above what the card really has (issue #20).
+- `STRATA_VK_SMEM_LIMIT=49152`: treat the device as allowing this much workgroup shared memory. The AMD proprietary driver reports 32768 on an RX 9070 XT although the card has 64 KB; RustingStrata raises that to 49152 itself with this driver (RDNA3/4 and GCN such as Vega; no kernel needs more). For any other card that reports too little, set it by hand. Do not set it above what the card really has (issue #20).
 - `radv_device_coherent_memory=false`: undo the RADV option RustingStrata sets.
 
 If one of these makes a problem go away, say which one in the report.

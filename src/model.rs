@@ -48,7 +48,7 @@ impl Model<'_> {
 }
 
 /// qwen4exp per-layer embedding (PLE): n-gram hash constants from the GGUF.
-struct Ple { mult: Vec<u64>, off: Vec<u64>, vocab: Vec<u64>, eos: i64, heads_per_ngram: usize }
+struct Ple { mult: Vec<u64>, off: Vec<u64>, vocab: Vec<u64>, eos: i64, heads_per_ngram: usize, direct: Option<crate::weights::DirectRows> }
 
 // PLE geometry, checked against the GGUF at load: n-grams up to 3 tokens, `heads_per_ngram` hash heads per n-gram order,
 // a 4-tap causal conv dilated by the n-gram size, so it reads rows t-9, t-6, t-3, t.
@@ -290,11 +290,15 @@ impl<'a> Model<'a> {
             let heads_per_ngram = int("heads_per_ngram")? as usize;
             anyhow::ensure!(int("ngram_size")? == PLE_NGRAM as u64 && heads_per_ngram > 0
                 && int("conv_kernel")? == PLE_KERNEL as u64, "unsupported PLE geometry");
-            let ple = Ple { mult: arr("layer_multipliers")?, off: arr("head_offsets")?, vocab: arr("head_vocab_sizes")?, eos: int("eos_token_id")? as i64, heads_per_ngram };
+            let t = w.get("per_layer_token_embd.weight")?;
+            let direct = g.tensors.get("per_layer_token_embd.weight").and_then(|i| {
+                let (f, at) = g.file_of(i);
+                crate::weights::DirectRows::open(f, at, t.row_bytes())
+            });
+            let ple = Ple { mult: arr("layer_multipliers")?, off: arr("head_offsets")?, vocab: arr("head_vocab_sizes")?, eos: int("eos_token_id")? as i64, heads_per_ngram, direct };
             let heads = (PLE_NGRAM - 1) * heads_per_ngram;
             anyhow::ensure!(ple.mult.len() == PLE_NGRAM && ple.off.len() == heads && ple.vocab.len() == heads
                 && ple.vocab.iter().all(|&v| v > 0) && heads * cfg.n_embd_ple == cfg.n_embd, "bad PLE metadata");
-            w.get("per_layer_token_embd.weight")?;
             Some(ple)
         } else {
             w.get("output_norm.weight")?;
@@ -571,7 +575,16 @@ impl<'a> Model<'a> {
         if rows.is_empty() { return Vec::new() }
         let (table, d) = (self.w.get("per_layer_token_embd.weight").unwrap(), self.cfg.n_embd_ple);
         let mut emb = vec![0f32; self.cfg.n_embd];
-        for (r, e) in rows.into_iter().zip(emb.chunks_exact_mut(d)) { table.row(r as usize, e); }
+        let direct = self.ple.as_ref().and_then(|p| p.direct.as_ref());
+        // ponytail: no row cache; each token reads its 16 rows from the drive. Cache hot rows if a drive is too slow.
+        let mut buf = Vec::new();
+        for (r, e) in rows.into_iter().zip(emb.chunks_exact_mut(d)) {
+            match direct.map(|f| f.read(r as usize, &mut buf)) {
+                Some(Ok(b)) => table.row_of(b, e),
+                Some(Err(err)) => { crate::say!("PLE row {r}: {err}; read through the map"); table.row(r as usize, e) }
+                None => table.row(r as usize, e),
+            }
+        }
         emb
     }
 

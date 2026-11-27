@@ -102,6 +102,13 @@ pub fn gone(c: &std::net::TcpStream) -> bool {
 /// The longest time a stream sends nothing.
 const KEEP: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// The error text for a prompt longer than the context. Clients that compact a conversation when it overflows (Pi, and
+/// others with the same patterns) look for these words: "prompt is too long" (Anthropic) and "exceeds the available
+/// context size" (llama.cpp server) (issue #130).
+pub fn too_long(prompt: usize, limit: usize) -> String {
+    format!("prompt is too long: {prompt} tokens, the limit is {limit} (the request exceeds the available context size; raise --ctx)")
+}
+
 /// Runs `f`, the prefill of a request. For a stream, whose response head is written before the call, an SSE comment
 /// goes out every 15 s until `f` returns, so a client that waits a limited time for the next byte keeps waiting
 /// through a long prompt (`f` must not write to `c`).

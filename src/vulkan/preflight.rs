@@ -89,14 +89,16 @@ impl Vk {
             let float = ty.float_x();
             let mut push = |name: &'static str, spec: Vec<u32>| pairs.push((name, spec));
             // gemm_raw: `f = !mmq(ty) || cols % 128 != 0`; the float kernel takes every type, the int8 one the rest.
-            if float || !crate::cuda::Gpu::mmq(ty) {
+            // Without int8 cooperative matrices or hardware int8 dot products every type takes the float kernel.
+            let no_i8 = self.0.coop_i8 == 0 && !self.0.dp4;
+            if float || !crate::cuda::Gpu::mmq(ty) || no_i8 {
                 if self.0.coop { push("gemm_f", ws.clone()); push("gemm_fs", ws.clone()); }
                 else { push("gemm_f_dp", ws.clone()); }
             }
             if !float {
                 if self.0.coop_i8 == 32 { push("gemmi", ws.clone()); push("gemmi_s", ws.clone()); }
                 else if self.0.coop_i8 == 16 { push("gemmi_16", ws.clone()); push("gemmi_s_16", ws.clone()); }
-                else { push("gemmi_dp", ws.clone()); }
+                else if !no_i8 { push("gemmi_dp", ws.clone()); }
                 for nt in 1..=4 { push("gemv_q", [&ws[..], &[nt]].concat()); }
                 for nm in [1u32, 4, 8, 17] { push("moe_gemv_q", [&ws[..], &[nm]].concat()); }
                 push("dequant", ws.clone());

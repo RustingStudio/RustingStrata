@@ -423,7 +423,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a crate::tokenizer::Tokenizer, name: &'a st
         let mut lim = crate::grammar::Constraint::new(q, tok)?;
         if let Some(l) = &mut lim { l.eos.extend(&stop); }
         let ids = tok.encode(&chat_prompt_tools(&q.messages, &q.tools)).ok().filter(|i| !i.is_empty()).context("cannot encode prompt")?;
-        anyhow::ensure!(ids.len() < ctx, "prompt is {} tokens, the limit is {}", ids.len(), ctx - 1);
+        anyhow::ensure!(ids.len() < ctx, "{}", crate::serve::too_long(ids.len(), ctx - 1));
         let t = std::time::Instant::now();
         let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
         if q.stream && !q.head_sent { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }

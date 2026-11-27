@@ -189,6 +189,9 @@ struct Inner {
     dp_tile: bool,
     /// Int8 cooperative matrix K-dimension (`32` for NVIDIA `16x16x32`, `16` for AMD RDNA3/3.5 `16x16x16`, `0` = off).
     coop_i8: u32,
+    /// The device has hardware 4 x int8 dot products: without int8 cooperative matrices, GEMMs of quantized
+    /// weights run as gemmi_dp, else as gemm_f_dp (`gemm_raw`).
+    dp4: bool,
     /// VK_AMD_device_coherent_memory is enabled (the mailbox uses `BAR_AMD`).
     amd_coherent: bool,
     /// An AMD GPU without it: the CPU expert mailbox cannot work (the GPU caches it), so a timeout names the fix.
@@ -440,6 +443,16 @@ impl Vk {
             else if shape(32, vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32) { 32 }
             else if shape(16, vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32) { 16 }
             else { 0 };
+        // Without int8 cooperative matrices the int8 GEMM (gemmi_dp) sums with dotPacked4x8EXT. A device without a
+        // 4 x int8 dot instruction (Vega 10 / gfx900: it came with gfx906) has the driver emulate it, and llama.cpp
+        // takes its float GEMM there; so does gemm_raw (issue #133). STRATA_VK_DP4=0 or 1 overrides the device's answer.
+        let mut idp = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
+        unsafe { instance.get_physical_device_properties2(pd, &mut vk::PhysicalDeviceProperties2::default().push_next(&mut idp)) };
+        let dp4 = match std::env::var("STRATA_VK_DP4").ok().as_deref() {
+            Some("0") => false,
+            Some(_) => true,
+            None => idp.integer_dot_product4x8_bit_packed_signed_accelerated != 0,
+        };
         // The tiled fallback needs a 1024-thread workgroup and 32 KB of shared memory (see attn_prefill_tile.comp).
         let dev_props = unsafe { instance.get_physical_device_properties(pd) };
         let limits = dev_props.limits;
@@ -503,11 +516,12 @@ impl Vk {
         // device with Xid 13). STRATA_VK_SMEM_LIMIT pretends the device reports another value, so a test can exercise
         // the refusal without a doctored shader.
         let mut smem_limit = unsafe { instance.get_physical_device_properties(pd) }.limits.max_compute_shared_memory_size;
-        // The AMD proprietary driver on Windows reports 32768 on RDNA3/4 cards (cooperative matrices), which really have
-        // 64 KB (issue #20; vulkaninfo agrees with the driver, Linux RADV reports 65536). No kernel needs more than 49152.
+        // The AMD proprietary driver on Windows reports 32768 on RDNA3/4 cards (cooperative matrices) and on GCN (Vega,
+        // issue #133), which really have 64 KB (issue #20; vulkaninfo agrees with the driver, Linux RADV reports 65536).
+        // No kernel needs more than 49152.
         let mut drv = vk::PhysicalDeviceDriverProperties::default();
         unsafe { instance.get_physical_device_properties2(pd, &mut vk::PhysicalDeviceProperties2::default().push_next(&mut drv)) };
-        if drv.driver_id == vk::DriverId::AMD_PROPRIETARY && coop && smem_limit == 32768 { smem_limit = 49152; }
+        if drv.driver_id == vk::DriverId::AMD_PROPRIETARY && smem_limit == 32768 { smem_limit = 49152; }
         if let Ok(v) = std::env::var("STRATA_VK_SMEM_LIMIT") { smem_limit = v.parse().context("STRATA_VK_SMEM_LIMIT")?; }
         let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(qf);
         let pool = unsafe { dev.create_command_pool(&pool_info, None) }?;
@@ -522,7 +536,7 @@ impl Vk {
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
         let ts_period = limits.timestamp_period;
         let rcp_d = dev_props.vendor_id == 0x1002;
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, gfx11, wave64, rcp_d, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_k_mode, kv_v_mode, smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, gfx11, wave64, rcp_d, coop, dp_tile, coop_i8, dp4, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_k_mode, kv_v_mode, smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -559,8 +573,8 @@ impl Vk {
         let yn = |b: bool| if b { "yes" } else { "no" };
         let amd = if v.0.amd_plain || v.0.amd_coherent { format!(", device-coherent memory {}", yn(v.0.amd_coherent)) } else { String::new() };
         let i8_s = match v.0.coop_i8 { 32 => "yes (16x16x32)", 16 => "yes (16x16x16)", _ => "no" };
-        crate::say!("vulkan: {name} ({} {}){amd}, cooperative matrix f16 {} int8 {i8_s}, conditional rendering {}, maxComputeSharedMemorySize {}",
-            s(&drv.driver_name), s(&drv.driver_info), yn(v.0.coop), yn(v.0.cr.is_some() && !v.0.st().no_cond), v.0.smem_limit);
+        crate::say!("vulkan: {name} ({} {}){amd}, cooperative matrix f16 {} int8 {i8_s}, int8 dot product {}, conditional rendering {}, maxComputeSharedMemorySize {}",
+            s(&drv.driver_name), s(&drv.driver_info), yn(v.0.coop), yn(v.0.dp4), yn(v.0.cr.is_some() && !v.0.st().no_cond), v.0.smem_limit);
         if !v.0.coop { crate::say!("vulkan: prefill attention: {} (no cooperative matrices)", if v.0.dp_tile { "tiled" } else { "per-query" }); }
         Ok(v)
     }
@@ -1028,7 +1042,7 @@ impl Vk {
         // A gemm inside a batch cannot quantize x (the quantize and the gemm would not be ordered): when the cached
         // q8 rows are not x's (or, without SAME_X, may not be), use the f16 kernel (as on CUDA).
         let int8 = crate::cuda::Gpu::mmq(ty) && cols.is_multiple_of(128);
-        let f = !int8 || (!reuse && self.0.st().batch);
+        let f = !int8 || (!reuse && self.0.st().batch) || (self.0.coop_i8 == 0 && !self.0.dp4);
         // A dense GEMM of few workgroups runs as gemm_fs/gemmi_s (cooperative matrices only), 32 positions a
         // workgroup (as on CUDA).
         let sm = tiles == 0 && grid[0] * grid[1] < 112 && if f { self.0.coop } else { self.0.coop_i8 != 0 };

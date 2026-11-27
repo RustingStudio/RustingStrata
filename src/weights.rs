@@ -20,11 +20,16 @@ pub struct Tensor<'a> {
 }
 
 impl<'a> Tensor<'a> {
-    fn row_bytes(&self) -> usize { self.ty.row_bytes(self.cols as u64) }
+    pub fn row_bytes(&self) -> usize { self.ty.row_bytes(self.cols as u64) }
 
     pub fn row(&self, r: usize, out: &mut [f32]) {
         let rb = self.row_bytes();
-        dequant_row(self.ty, &self.data[r * rb..(r + 1) * rb], out);
+        self.row_of(&self.data[r * rb..(r + 1) * rb], out);
+    }
+
+    /// A row of this tensor from `bytes`, its bytes read elsewhere (`DirectRows`).
+    pub fn row_of(&self, bytes: &[u8], out: &mut [f32]) {
+        dequant_row(self.ty, bytes, out);
         if self.scale != 1.0 {
             for v in out.iter_mut() { *v *= self.scale; }
         }
@@ -330,12 +335,76 @@ pub fn net_fs(path: &std::path::Path) -> bool {
     net_fs_in(&p, &mounts)
 }
 
-/// `net_fs` for the text of a mountinfo file: the type of the longest mount point that is a prefix of `p` decides.
-// ponytail: a mount point with a space is written with \040 and does not match, so the mount above it decides.
+/// `net_fs` for the text of a mountinfo file.
 fn net_fs_in(p: &std::path::Path, mounts: &str) -> bool {
+    fs_type_in(p, mounts).is_some_and(|t| ["cifs", "smb3", "smbfs", "nfs", "nfs4", "9p", "ceph", "glusterfs"].contains(&t) || t.starts_with("fuse."))
+}
+
+/// The file system type of `p` in the text of a mountinfo file: the longest mount point that is a prefix of `p` decides.
+// ponytail: a mount point with a space is written with \040 and does not match, so the mount above it decides.
+fn fs_type_in<'m>(p: &std::path::Path, mounts: &'m str) -> Option<&'m str> {
     mounts.lines().filter_map(|l| { let (a, b) = l.split_once(" - ")?; Some((a.split(' ').nth(4)?, b.split(' ').next()?)) })
-        .filter(|(m, _)| p.starts_with(m)).max_by_key(|(m, _)| m.len())
-        .is_some_and(|(_, t)| ["cifs", "smb3", "smbfs", "nfs", "nfs4", "9p", "ceph", "glusterfs"].contains(&t) || t.starts_with("fuse."))
+        .filter(|(m, _)| p.starts_with(m)).max_by_key(|(m, _)| m.len()).map(|(_, t)| t)
+}
+
+/// Rows of a mapped table read from its file with `pread` and `O_DIRECT`, past the page cache and the file system's
+/// own readahead. On ZFS a page fault in the mapped Flash-Next n-gram table starts ZFS's prefetch (up to 64 MB by
+/// default), which no madvise reaches: a few scattered rows a token then read about 40 times the bytes they need
+/// (issue #132). `STRATA_DIRECT_ROWS=1` reads this way on any file system, `0` never; by default on ZFS when the model
+/// does not fit in RAM (when it fits, the preload keeps the table in the page cache).
+pub struct DirectRows { f: std::fs::File, at: u64, row: usize }
+
+impl DirectRows {
+    /// For the table at byte `at` of `path`, `row` bytes a row.
+    pub fn open(path: &std::path::Path, at: u64, row: usize) -> Option<DirectRows> {
+        let on = match std::env::var("STRATA_DIRECT_ROWS").ok().as_deref() {
+            Some("0") => false,
+            Some(_) => true,
+            None => !fits_ram() && path.canonicalize().ok().zip(std::fs::read_to_string("/proc/self/mountinfo").ok())
+                .is_some_and(|(p, m)| fs_type_in(&p, &m) == Some("zfs")),
+        };
+        if !on { return None; }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // O_DIRECT differs between architectures.
+            const O_DIRECT: i32 = if cfg!(any(target_arch = "aarch64", target_arch = "arm")) { 0o200000 }
+                else if cfg!(any(target_arch = "powerpc", target_arch = "powerpc64")) { 0o400000 } else { 0o40000 };
+            match std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECT).open(path) {
+                Ok(f) => {
+                    crate::say!("reading rows of {} with O_DIRECT (STRATA_DIRECT_ROWS=0 maps them)", path.display());
+                    return Some(DirectRows { f, at, row });
+                }
+                Err(e) => crate::say!("O_DIRECT open of {}: {e}; its rows are read through the map", path.display()),
+            }
+        }
+        None
+    }
+
+    /// The bytes of row `r`, read into `buf` (whole 4 KiB pages, as O_DIRECT needs).
+    pub fn read<'b>(&self, r: usize, buf: &'b mut Vec<u8>) -> std::io::Result<&'b [u8]> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            const P: u64 = 4096;
+            let o = self.at + (r * self.row) as u64;
+            let a = o & !(P - 1);
+            let (len, start) = ((((o + self.row as u64) + P - 1) & !(P - 1)) - a, (o - a) as usize);
+            buf.resize(len as usize + P as usize, 0);
+            let s = buf.as_ptr().align_offset(P as usize);
+            let w = &mut buf[s..s + len as usize];
+            let mut n = 0;
+            // The last page of the file reads short; the row is in it.
+            while n < start + self.row {
+                let k = self.f.read_at(&mut w[n..], a + n as u64)?;
+                if k == 0 { return Err(std::io::ErrorKind::UnexpectedEof.into()); }
+                n += k;
+            }
+            Ok(&buf[s + start..s + start + self.row])
+        }
+        #[cfg(not(unix))]
+        { let _ = (r, buf); Err(std::io::ErrorKind::Unsupported.into()) }
+    }
 }
 
 #[test]
@@ -348,6 +417,29 @@ fn net_fs_reads_mountinfo() {
     let on = |p: &str| net_fs_in(std::path::Path::new(p), m);
     assert!(on("/mnt/nas/a.gguf") && on("/home/u/remote/a.gguf"));
     assert!(!on("/mnt/nas/local/a.gguf") && !on("/mnt/nasty/a.gguf") && !on("/home/u/a.gguf") && !on("/mnt/win/a.gguf"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn direct_rows_read_what_the_file_holds() {
+    let path = std::env::temp_dir().join(format!("strata-direct-{}", std::process::id()));
+    let bytes: Vec<u8> = (0..19_017u32).map(|i| (i * 7 % 251) as u8).collect();
+    std::fs::write(&path, &bytes).unwrap();
+    // SAFETY: tests that read this variable run in no other thread of this binary.
+    unsafe { std::env::set_var("STRATA_DIRECT_ROWS", "1") };
+    // A table at an odd offset with rows that cross pages; the last row ends 4 bytes before EOF.
+    let (at, row) = (13u64, 1000usize);
+    let d = DirectRows::open(&path, at, row);
+    unsafe { std::env::remove_var("STRATA_DIRECT_ROWS") };
+    // tmpfs has no O_DIRECT before Linux 6.6; then there is nothing to check.
+    if let Some(d) = d {
+        let mut buf = Vec::new();
+        for r in [0, 3, 4, 18] {
+            let o = at as usize + r * row;
+            assert_eq!(d.read(r, &mut buf).unwrap(), &bytes[o..o + row], "row {r}");
+        }
+    }
+    std::fs::remove_file(&path).ok();
 }
 
 /// Counts a newly mapped model file; with `read`, when the files fit in RAM (`fits_ram`), a background thread starts

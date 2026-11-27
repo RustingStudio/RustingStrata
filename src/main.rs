@@ -125,6 +125,11 @@ struct Engine {
     /// repeat exactly.
     #[arg(long)]
     fixed_experts: bool,
+    /// Qwen3.8 Flash-Next: the GGUF that holds the n-gram table (`per_layer_token_embd`), for a model file without it
+    /// (`-noPLE`) or to use another quant of the table. Without it, a model with no table takes the one file next to
+    /// it whose name has "PLE" in it (`STRATA_PLE`).
+    #[arg(long)]
+    ple: Option<PathBuf>,
     /// Host RAM left free for the OS, in MB. The cap is `total RAM - margin` and bounds memory the process owns
     /// (baked tensors, LoRA factors, `--cache-ram`); the mmapped model is evictable page cache and is not counted.
     #[arg(long, default_value_t = 512)]
@@ -1312,6 +1317,11 @@ fn start() -> anyhow::Result<()> {
         && sm.value_source("ctx") == Some(clap::parser::ValueSource::CommandLine) {
         rusting_strata::CTX.store(n, std::sync::atomic::Ordering::Relaxed);
     }
+    // Read by `Gguf::open`, which every command calls before it looks at its engine flags.
+    if let Some((_, sm)) = m.subcommand() && let Ok(Some(p)) = sm.try_get_one::<PathBuf>("ple") {
+        // SAFETY: no other thread runs yet.
+        unsafe { std::env::set_var("STRATA_PLE", p) };
+    }
     let Some(cmd) = <Cli as clap::FromArgMatches>::from_arg_matches(&m).unwrap_or_else(|e| e.exit()).cmd else {
         // Started without arguments, as by a double click: keep the window open on an error so it can be read.
         let Some(Cmd::Serve { model, models_dir, addr, api_key, mcp, open, host, mut engine }) = Cli::parse_from(["rustingstrata", "serve", "--gpu", "--open"]).cmd else { unreachable!() };
@@ -2088,6 +2098,17 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                                 }
                             }
                             return reply(json!({"object": "list", "data": data}), "200 OK");
+                        }
+                        // llama-server's server properties: clients with a llama.cpp provider (maki, issue #131) read
+                        // the context length here.
+                        Ok(r) if r.method == "GET" && r.path.split('?').next() == Some("/props") && (k.read().unwrap().any() || serve::host_ok(&r.host, &a, &allowed)) => {
+                            let state = st.lock().unwrap();
+                            let alias = state.model.clone().unwrap_or_else(|| state.file.clone());
+                            let b = json!({"role": "model", "model_alias": alias, "model_path": state.file, "total_slots": state.slots.max(1),
+                                "default_generation_settings": {"n_ctx": state.ctx, "params": {}}, "n_ctx_train": state.ctx_train,
+                                "build_info": concat!("rustingstrata ", env!("CARGO_PKG_VERSION"))});
+                            drop(state);
+                            return reply(b, "200 OK");
                         }
                         _ => {}
                     }
@@ -4157,7 +4178,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 Err(err) => return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
             };
             let n = room(e, ids.len(), req.max_tokens.unwrap_or(usize::MAX).min(s.max_tokens));
-            if n == 0 { return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("prompt of {} tokens fills the context", ids.len()), "type": "invalid_request_error"}})); }
+            if n == 0 { return send(&mut w, "400 Bad Request", json!({"error": {"message": serve::too_long(ids.len(), e.ctx), "type": "invalid_request_error"}})); }
             let id = format!("chatcmpl-{i}");
             let chunk = |delta: serde_json::Value, finish: Option<&str>| json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": name,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});

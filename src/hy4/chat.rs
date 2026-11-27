@@ -132,7 +132,7 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
     let mut m = Hy4Model::new(g)?;
     let max_ctx = m.cfg.n_ctx;
     let ids = tok.encode(prompt)?;
-    anyhow::ensure!(!ids.is_empty() && ids.len() < max_ctx, "prompt is {} tokens, the limit is {max_ctx}", ids.len());
+    anyhow::ensure!(!ids.is_empty() && ids.len() < max_ctx, "{}", crate::serve::too_long(ids.len(), max_ctx));
     if std::env::var_os("STRATA_DS_TRACE").is_some() { crate::say!("prompt tokens: {ids:?}"); }
     let logits = m.prefill(&ids);
     let (out, _) = decode(&mut m, &tok, &mut None, logits, n.min(max_ctx - ids.len()), show);
@@ -188,7 +188,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str) -> anyhow::Resu
     Ok(Box::new(move |c: &mut std::net::TcpStream, q: &crate::serve::ChatRequest| {
         let mut lim = crate::grammar::Constraint::new(q, tok)?;
         let ids = tok.encode(&render(&q.messages, &q.tools, q.think.unwrap_or(false), q.preserve_thinking)).ok().filter(|i| !i.is_empty()).context("cannot encode prompt")?;
-        anyhow::ensure!(ids.len() < max_ctx, "prompt is {} tokens, the limit is {max_ctx}", ids.len());
+        anyhow::ensure!(ids.len() < max_ctx, "{}", crate::serve::too_long(ids.len(), max_ctx));
         let t = std::time::Instant::now();
         let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
         if q.stream && !q.head_sent { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }

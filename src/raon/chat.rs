@@ -235,7 +235,7 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize, draft_model: Option<&Path>) ->
     }
     let max_ctx = m.cfg.n_ctx;
     let ids = tok.encode(prompt)?;
-    anyhow::ensure!(!ids.is_empty() && ids.len() < max_ctx, "prompt is {} tokens, the limit is {max_ctx}", ids.len());
+    anyhow::ensure!(!ids.is_empty() && ids.len() < max_ctx, "{}", crate::serve::too_long(ids.len(), max_ctx));
     let logits = m.prefill(&ids);
     decode(&mut m, df.as_mut(), &tok, logits, n.min(max_ctx - ids.len()), show);
     println!();
@@ -297,7 +297,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str) -> anyhow::Resu
         m.set_effort(q.reasoning_effort.as_deref(), think);
         let ids = tok.encode(&render(&q.messages, &q.tools, think, q.preserve_thinking))
             .ok().filter(|i| !i.is_empty()).context("cannot encode prompt")?;
-        anyhow::ensure!(ids.len() < max_ctx, "prompt is {} tokens, the limit is {max_ctx}", ids.len());
+        anyhow::ensure!(ids.len() < max_ctx, "{}", crate::serve::too_long(ids.len(), max_ctx));
         let t = std::time::Instant::now();
         let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
         if q.stream {

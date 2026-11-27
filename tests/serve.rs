@@ -426,6 +426,8 @@ fn serve_without_a_model() {
     assert!(req("GET", "/", "").0.contains("200"), "the page loads without a key");
     let (s, b) = req("GET", "/v1/models?x=1", "acme-0123456789abcdef");
     assert!(s.contains("200") && b.contains(r#""data":[]"#), "{s} {b}");
+    let (s, b) = req("GET", "/props", "acme-0123456789abcdef");
+    assert!(s.contains("200") && b.contains(r#""n_ctx":"#), "llama-server props: {s} {b}");
     let (s, b) = req("GET", "/api/stats", "acme-0123456789abcdef");
     assert!(s.contains("403") && b.contains("permission_error"), "{s} {b}");
     assert!(req("GET", "/metrics", "root-0123456789abcdef").1.contains("strata_up"));

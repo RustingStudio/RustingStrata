@@ -3,7 +3,7 @@
 use anyhow::{Context, bail};
 use memmap2::Mmap;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::quant::GgmlType;
 
@@ -42,7 +42,7 @@ pub struct Gguf {
 
 /// A mapped model file. `weights::preload` counted its bytes; unmapping takes them off the count, so a file that was
 /// opened only to read its metadata, or the model before a switch, does not make the next one look too large for RAM.
-struct Map(Mmap);
+struct Map(Mmap, PathBuf);
 
 impl Drop for Map {
     fn drop(&mut self) { crate::weights::unmapped(self.0.len()); }
@@ -105,6 +105,7 @@ impl Gguf {
                 for (k, t) in std::mem::take(&mut s.tensors) { anyhow::ensure!(g.tensors.insert(k.clone(), t).is_none(), "tensor {k} in two shards"); }
             }
         }
+        g.add_ple(path)?;
         // The reads are queued by `weights::preload`, one call per file. Said here because nothing else shows it: the
         // pages are not mapped into the process, so its resident size does not grow.
         #[cfg(target_os = "linux")]
@@ -113,6 +114,46 @@ impl Gguf {
                 g.files.iter().map(|(m, _)| m.0.len()).sum::<usize>() >> 20, path.file_name().and_then(|s| s.to_str()).unwrap_or("the model"));
         }
         Ok(g)
+    }
+
+    /// A Qwen3.8 Flash-Next file without its n-gram table (`-noPLE`) takes the table from another GGUF: `--ple`
+    /// (`STRATA_PLE`), else the one file next to the model whose name has "PLE" in it and that holds the table, as
+    /// llama.cpp's `--ple` and Strata load it (issue #127).
+    fn add_ple(&mut self, path: &Path) -> anyhow::Result<()> {
+        const T: &str = "per_layer_token_embd.weight";
+        let Some(arch) = self.meta.get("general.architecture").and_then(Value::as_str) else { return Ok(()) };
+        let given = std::env::var_os("STRATA_PLE").map(PathBuf::from);
+        if !self.meta.contains_key(&format!("{arch}.ple.heads_per_ngram")) || (self.tensors.contains_key(T) && given.is_none()) { return Ok(()) }
+        let file = match given {
+            Some(p) => p,
+            None => {
+                let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+                let mut found: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path())
+                    .filter(|p| p.file_name() != path.file_name() && p.extension().is_some_and(|e| e == "gguf")
+                        && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.to_ascii_lowercase().contains("ple"))
+                        && Self::open_one(p, 0, false).is_ok_and(|g| g.tensors.contains_key(T)))
+                    .collect();
+                found.sort();
+                match found.len() {
+                    0 => bail!("{}: this file has no n-gram table ({T}); put its GGUF (a name with PLE in it) next to the model or pass it with --ple", path.display()),
+                    1 => found.pop().unwrap(),
+                    _ => bail!("{}: several n-gram table files next to the model ({}); choose one with --ple", path.display(),
+                        found.iter().filter_map(|p| p.file_name()?.to_str()).collect::<Vec<_>>().join(", ")),
+                }
+            }
+        };
+        let mut s = Self::open_one(&file, self.files.len(), true)?;
+        let t = s.tensors.remove(T).with_context(|| format!("{}: no tensor {T}", file.display()))?;
+        crate::say!("n-gram table: {T} from {}", file.display());
+        self.files.append(&mut s.files);
+        self.tensors.insert(T.into(), t);
+        Ok(())
+    }
+
+    /// The file a tensor's data is in and the offset of the data in it.
+    pub fn file_of(&self, t: &TensorInfo) -> (&Path, u64) {
+        let (m, o) = &self.files[t.file];
+        (&m.1, (*o as u64) + t.offset)
     }
 
     /// `general.architecture` of a model, from its first shard and without starting to read the file into the page
@@ -130,7 +171,7 @@ impl Gguf {
             let _ = mmap.advise(memmap2::Advice::HugePage);
         }
         crate::weights::preload(&mmap, read && !crate::weights::net_fs(path));
-        let mmap = Map(mmap);
+        let mmap = Map(mmap, path.to_path_buf());
         let mut c = Cur { b: &mmap.0, p: 0 };
         if c.take(4)? != b"GGUF" { bail!("{}: not a GGUF file", path.display()); }
         let ver = c.u32()?;

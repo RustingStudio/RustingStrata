@@ -186,6 +186,10 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   text only with `STRATA_FIXED_EXPERTS=1`, because the adaptive expert split moves the logits a little),
   `/v1/chat/completions` only (no `/v1/messages`). `calibrate` measures their prefill chunk only
   ([CALIBRATION.md](CALIBRATION.md)). The context limit is `--ctx` (or the page's context setting) when given, else the trained context.
+- `--ple FILE` (or `STRATA_PLE`) is for Qwen3.8 Flash-Next: the GGUF with the n-gram table
+  (`per_layer_token_embd.weight`), for a model file without it (a `-noPLE` file) or to take the table from another
+  file. Without `--ple`, a model file with no table takes the one `.gguf` next to it whose name has `PLE` in it and
+  that holds the table; if there are none or several, the load stops and asks for `--ple`.
 - `--lora PATH:SCALE` applies a LoRA adapter at runtime, see [LORA.md](LORA.md).
 - `--mcp FILE` (`serve` only, or `STRATA_MCP`) lists the MCP servers whose tools the chat page may call, see
   [Tools (MCP)](#tools-mcp).
@@ -223,6 +227,11 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   request run alone. An image request (`--mmproj`) takes a slot too: its prompt runs a token at a time between the
   other slots' steps, and its reply decodes beside the batched forward, one token a step. With `--gpu` the image encoder runs on the GPU too
   (`STRATA_VISION_CPU=1` keeps it on the CPU; see docs/VISION.md).
+- A prompt longer than the context gets `400` with the message `prompt is too long: N tokens, the limit is M (the
+  request exceeds the available context size; raise --ctx)`. Agents that compact a conversation when it overflows
+  (Pi, and others that look for the Anthropic or llama.cpp server words) start their compaction on it.
+- `GET /props` answers like llama-server's (`default_generation_settings.n_ctx`, `n_ctx_train`, `model_alias`,
+  `total_slots`), for clients with a llama.cpp provider that read the context size there.
 - `temperature`, `top_k`, `top_p`, `min_p` and `seed` are honored; decoding is greedy when they are left out.
   `min_p` (0 to 1, `--min-p`, default 0 = off) drops the tokens whose probability is below `min_p` times the
   best token's, as in llama.cpp.
@@ -259,6 +268,10 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   the new text. The chat page's continue button uses this.
 - Thinking is on by default (`--think false` turns it off). A request overrides it with `chat_template_kwargs.enable_thinking`
   (Anthropic: `thinking: {"type": "enabled"}`; `enable_thinking: false` turns it off for that request).
+  Inkling 2 has no setting without thinking: at effort 0 (`--think false`, `enable_thinking: false` or
+  `reasoning_effort: "none"`) the model itself still writes a short thinking block, in llama.cpp too. So with thinking
+  off the engine makes the reply start with the answer. A request that declares tools keeps the short thinking block,
+  because the tool calls get worse without it. A `reasoning_effort` in the request has priority over `enable_thinking`.
 - `tools` and `tool_choice` work as in the OpenAI API: calls come back as `tool_calls` with `finish_reason:
   "tool_calls"`. `tool_choice: "required"` does not force a call. A streamed chat on `/v1/chat/completions` sends each
   call's name as soon as the model writes it, and for a model with `<function=..>` calls (Qwen3.5, Qwen3.6, Qwen3
@@ -363,9 +376,16 @@ file system that caches data, or from a tmpfs copy.
 
 When the model files fit in RAM with 4 GiB to spare, they are read into the page cache in the background from the
 start and nothing is dropped, so experts that run on the CPU do not wait for the drive on their first use.
-`STRATA_PRELOAD=1` forces that, `STRATA_PRELOAD=0` turns it off.
+`STRATA_PRELOAD=1` forces that, `STRATA_PRELOAD=0` turns it off. On Linux the RAM is the cgroup's memory limit when
+that is lower than the machine's RAM (a container or a systemd unit with `MemoryMax`), since the page cache counts
+toward the limit.
 A file on a network file system (SMB, NFS, a FUSE mount) is not read ahead, because that asks the server for the whole
 file at once: its pages are read when they are used (`STRATA_PRELOAD=1` reads it ahead all the same).
+
+On ZFS a page fault in a mapped file starts ZFS's own prefetch, which madvise does not reach. For the Qwen3.8
+Flash-Next n-gram table, 16 scattered rows a token, that reads many times the bytes the rows need. So when the model
+does not fit in RAM and the table is on ZFS, its rows are read with `O_DIRECT` instead of through the map;
+`STRATA_DIRECT_ROWS=1` does that on any file system, `STRATA_DIRECT_ROWS=0` never.
 
 Otherwise bytes copied to VRAM are dropped from the page cache (`MADV_DONTNEED`), so on a model close to the machine's
 RAM the experts that missed VRAM keep their pages; `STRATA_COLD_KEEP=1` only marks them reclaimable instead. `serve` learns

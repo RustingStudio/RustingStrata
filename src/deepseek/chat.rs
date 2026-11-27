@@ -101,7 +101,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str) -> anyhow::Resu
     Ok(Box::new(move |c: &mut std::net::TcpStream, q: &crate::serve::ChatRequest| {
         let mut lim = crate::grammar::Constraint::new(q, tok)?;
         let ids = tok.encode(&Template::Ds.render(&q.messages, &q.tools, q.think.unwrap_or(false), q.preserve_thinking.unwrap_or(true), true)).ok().filter(|i| !i.is_empty()).context("cannot encode prompt")?;
-        anyhow::ensure!(ids.len() <= ctx, "prompt is {} tokens, the limit is {ctx}", ids.len());
+        anyhow::ensure!(ids.len() <= ctx, "{}", crate::serve::too_long(ids.len(), ctx));
         let t = std::time::Instant::now();
         let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
         if q.stream && !q.head_sent { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
