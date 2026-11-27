@@ -1085,7 +1085,7 @@ __device__ __forceinline__ void ldsm4t(u32* r, const u16* p) {
 }
 __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-#if __CUDA_ARCH__ >= 750
+#if __CUDA_ARCH__ >= 750 && !MMA_FMA
     // Turing (sm_75) has no m16n8k16 f16 mma: the same product is two m16n8k8 steps, k = 0..7 and k = 8..15
     // (the a0/a1, a2/a3 and b0, b1 fragments are those half-K fragments of the k16 layout).
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
@@ -1093,6 +1093,8 @@ __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a2), "r"(a3), "r"(b1));
 #else
+    // Also taken on sm_75 with MMA_FMA: the GTX 16 series (TU116/TU117) has no tensor cores and runs m16n8k8 far
+    // slower than this CUDA-core version (see `turing_fma` in mod.rs).
     // D[16,8] += A[16,16] * B[16,8] on CUDA cores. mma.sync.aligned.m16n8k16 is sm_80+ (unlike ldmatrix, which is
     // sm_75+, hence the different guard). Lane l = 4*g + t (g = l >> 2, t = l & 3) owns A rows g / g+8 at the
     // k-halves {2t, 2t+1, 2t+8, 2t+9}, and B column g at those same k. The four accumulators are sums over all 16
