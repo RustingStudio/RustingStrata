@@ -131,6 +131,8 @@ the KV cache than a 16 GB card has left over for experts, so the run above strea
 - `STRATA_NO_GRAPH=1` turns capture off for both GPU backends.
 - `STRATA_HIP_WMMA=0` uses the CUDA-core multiplications in the prefill GEMM and in both products of the prefill
   attention instead of the matrix cores.
+- `STRATA_DS_FAST_KERNELS=0` runs Inkling 2 on the older attention and controller kernels (see "Faster Inkling 2
+  kernels" below); `1` forces the faster ones under `--fixed-experts` too.
 
 ## Why the prefill GEMM does not use int8 matrix cores
 
@@ -266,6 +268,22 @@ slots instead of 32 were slower (838, 823): each one is a pool slot less.
 
 Left: `ink_mix` runs 120 times a token at 12 µs in one workgroup (about 1 ms, but a faster reduction order breaks the
 bit parity with Vulkan), and a first run without a profile.
+
+### Faster Inkling 2 kernels
+
+By default HIP runs Inkling 2 on the kernels that the CUDA backend uses only with two cards (`InkFlags`): the
+key-parallel prompt attention `ink_attn_prefill_128_kp16`, the tiled loop controllers for prompt chunks and the
+128-key decode attention `ink_attn_128`. They sum in another order than the older kernels, so greedy text can differ
+from the older kernels and from Vulkan at a near tie. `--fixed-experts` keeps the older kernels, and its output stays
+bit-identical to Vulkan. `STRATA_DS_FAST_KERNELS` switches them as on CUDA.
+
+The prompt attention was 54% of the kernel time of a 4096-token prompt. With the faster set, `bench --pp 512,4096
+--tg 64`, alternating runs with a browser open on the desktop:
+
+| | pp 4096 | decode |
+|---|---|---|
+| older kernels | 701, 908, 1001 tok/s | 51-62 tok/s |
+| faster kernels | 1531, 1648, 1686 tok/s | 52-66 tok/s |
 
 ## Credits
 
