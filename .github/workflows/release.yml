@@ -1,6 +1,6 @@
-# Builds Linux and Windows binaries when a version tag (v1.2.0, ...) is pushed and attaches them to a draft release,
-# which is published by hand. CUDA kernels compile at run time through NVRTC and the Vulkan shaders are committed,
-# so the build needs neither the CUDA toolkit nor a Vulkan SDK.
+# Builds Linux (x86_64 & aarch64) and Windows binaries when a version tag (v1.2.0, ...) is pushed and attaches them
+# to a draft release, which is published by hand. CUDA kernels compile at run time through NVRTC and the Vulkan shaders
+# are committed, so the build needs neither the CUDA toolkit nor a Vulkan SDK.
 name: release
 on:
   push:
@@ -21,29 +21,50 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04  # the oldest glibc the binary will need
+            target: x86_64-unknown-linux-gnu
+            rustflags: -C target-cpu=x86-64-v3
             bin: rustingstrata
             asset: rustingstrata-linux-x86_64
+            cross: false
+          - os: ubuntu-22.04  # matches JetPack 6 glibc (2.35) on NVIDIA Jetson AGX Orin
+            target: aarch64-unknown-linux-gnu
+            rustflags: -C target-cpu=cortex-a78ae
+            bin: rustingstrata
+            asset: rustingstrata-linux-aarch64
+            cross: true
           - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rustflags: -C target-cpu=x86-64-v3
             bin: rustingstrata.exe
             asset: rustingstrata-windows-x86_64.exe
+            cross: false
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
     env:
-      # .cargo/config.toml builds for the local CPU; release binaries target x86-64-v3 (AVX2 and FMA: Intel Haswell,
-      # AMD Zen and later) instead, without debug info.
-      RUSTFLAGS: -C target-cpu=x86-64-v3
       CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=x86-64-v3
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-cpu=x86-64-v3
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=cortex-a78ae
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+      CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - run: rustup update stable
-      - run: cargo build --release --locked
+      - if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+      - run: |
+          rustup update stable
+          rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
       # Only the upload step gets the token, so build scripts of dependencies cannot read it.
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp target/release/${{ matrix.bin }} ${{ matrix.asset }}
+          cp target/${{ matrix.target }}/release/${{ matrix.bin }} ${{ matrix.asset }}
           gh release upload "$GITHUB_REF_NAME" ${{ matrix.asset }} --repo "$GITHUB_REPOSITORY"
         shell: bash
