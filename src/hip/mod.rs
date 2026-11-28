@@ -253,16 +253,15 @@ impl Gpu {
         self.hip.check(unsafe { (self.hip.stream_sync)(self.stream) }, "hipStreamSynchronize")
     }
 
-    /// Record the point `stream` has reached in the next mark event.
+    /// Record the point `stream` has reached in the next mark event, and return the slot it went to.
     ///
-    /// Returns the absolute mark number, not the slot: the 64 events are a ring, and a slot is reused every 64 marks.
-    /// A prompt chunk on the pool path records a few marks per layer run, so a caller can hold a mark across a wrap;
-    /// `wait_mark` sees that from the numbers and synchronises instead of waiting on a slot that now holds a later
-    /// point, which would let a copy race the kernel writing the slots it reads.
+    /// The 64 events are a ring, so a mark held across 64 later marks refers to a later point by the time it is
+    /// waited on. That over-synchronises, which is safe: the marks exist to save a wait between the two streams,
+    /// never to stand in for one, and no caller may depend on a mark being exactly the point it recorded.
     fn mark(&self, stream: ffi::Stream) -> anyhow::Result<usize> {
-        let n = self.next_mark.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.marks[n % MARKS].record(stream)?;
-        Ok(n)
+        let i = self.next_mark.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % MARKS;
+        self.marks[i].record(stream)?;
+        Ok(i)
     }
 
     /// `htod` on `stream`: queue the copy and return once `src` may be reused. From pageable memory the runtime
@@ -297,12 +296,12 @@ impl Gpu {
         Ok(())
     }
 
+    /// Wait on `stream` until the point mark `n` recorded has run.
+    ///
+    /// Once the ring has wrapped, slot `n % MARKS` holds a later mark: waiting on it orders `stream` after that later
+    /// point, which is past the one asked for. Over-synchronising is safe and costs only a longer wait, where a host
+    /// `hipStreamSynchronize` here would stall the CPU on every layer run of a long prompt.
     fn wait_mark(&self, stream: ffi::Stream, n: usize) -> anyhow::Result<()> {
-        // A slot the ring has since reused: the point marked is gone, and waiting on the slot would wait for a later
-        // point or return at once. Everything marked has run by then, so a synchronisation is the honest answer.
-        if n + MARKS <= self.next_mark.load(std::sync::atomic::Ordering::Relaxed) {
-            return self.hip.check(unsafe { (self.hip.stream_sync)(stream) }, "hipStreamSynchronize(wait_mark)");
-        }
         self.hip.check(unsafe { (self.hip.stream_wait_event)(stream, self.marks[n % MARKS].ev, 0) }, "hipStreamWaitEvent")
     }
 

@@ -27,6 +27,23 @@ pub(crate) mod dev {
         /// reuse its `ts` grows by a few entries a token.
         free_ts: Vec<usize>,
     }
+    /// The position a `pin` takes: one a previous `unpin` gave back, else the end of `ts`.
+    fn take_ts(ts: &mut Vec<GpuTensor>, free: &mut Vec<usize>, t: GpuTensor) -> usize {
+        match free.pop() {
+            Some(i) => { ts[i] = t; i }
+            None => { ts.push(t); ts.len() - 1 }
+        }
+    }
+    /// Give a position back. Every hole at the end goes, not only when it is the top of `free`: that vector is in no
+    /// order, so the entry that makes the tail free may sit anywhere in it.
+    fn give_ts(ts: &mut Vec<GpuTensor>, free: &mut Vec<usize>, i: usize) {
+        ts[i] = GpuTensor::new(ts[i].ty, 0, 0, Buf::new(0, 0, ()));
+        free.push(i);
+        while let Some(pos) = free.iter().position(|&s| s + 1 == ts.len()) {
+            ts.pop();
+            free.swap_remove(pos);
+        }
+    }
     pub struct SlabBuf { buf: Buf, bytes: usize, acct: usize, freed: std::sync::Arc<std::sync::atomic::AtomicUsize> }
     impl SlabBuf {
         pub fn addr(&self) -> u64 { self.buf.addr() }
@@ -156,35 +173,26 @@ pub(crate) mod dev {
         assert_eq!(d.expert_grouped((0x1000, 64), &data, GgmlType::F32, 0, 0, 1.0, false), Some(0));
         assert!(d.group.is_none());
     }
-    /// The free list `pin`/`unpin` keep for the pool's tensor positions: a swap must not grow `ts`, and a free hole
-    /// that is the last entry must shrink it, so an idle pool sits at its starting size.
+    /// The pool pins and unpins its slots for as long as it runs: `ts` must not grow with the swaps, and every hole
+    /// at the end is reclaimed. Drives the helpers `Dev::pin`/`unpin` use, on the vectors alone (no device).
     #[test]
-    fn the_pool_free_list_reuses_positions_and_shrinks_from_the_top() {
-        let mut ts: Vec<u8> = (0..4).collect();
-        let mut free: Vec<usize> = vec![];
-        let mut unpin = |slot: usize, ts: &mut Vec<u8>, free: &mut Vec<usize>| {
-            free.push(slot);
-            while let Some(&last) = free.last() {
-                if last + 1 != ts.len() { break }
-                ts.pop();
-                free.pop();
-            }
-        };
-        let mut pin = |ts: &mut Vec<u8>, free: &mut Vec<usize>| -> usize {
-            match free.pop() { Some(i) => { ts[i] = 0xFF; i } None => { ts.push(0xFF); ts.len() - 1 } }
-        };
-        // Scattered swaps: the holes come back, the length stays.
-        unpin(1, &mut ts, &mut free);
-        unpin(2, &mut ts, &mut free);
-        assert_eq!((ts.len(), free.clone()), (4, vec![1, 2]));
-        assert_eq!(pin(&mut ts, &mut free), 2);
-        assert_eq!(pin(&mut ts, &mut free), 1);
-        assert_eq!((ts.len(), free.len()), (4, 0));
-        // A tail slot is reclaimed, so a pool that drains ends where it started.
-        for s in [3, 2, 1, 0] { unpin(s, &mut ts, &mut free); }
-        assert!(ts.is_empty() && free.is_empty());
-        assert_eq!(pin(&mut ts, &mut free), 0);
-        assert_eq!(ts.len(), 1);
+    fn a_pool_swap_reuses_its_ts_position_and_reclaims_the_tail() {
+        let (mut ts, mut free) = (vec![], vec![]);
+        let t = |i: u64| GpuTensor::new(GgmlType::F32, 1, 1, Buf::new(0x1000 + 8 * i, 8, ()));
+        for i in 0..5 { take_ts(&mut ts, &mut free, t(i)); }
+        assert_eq!(ts.len(), 5);
+        // The order that a top-only shrink gets wrong: 3 frees while 4 is still live, so `free` is [3, 1] when 4 goes.
+        give_ts(&mut ts, &mut free, 3);
+        give_ts(&mut ts, &mut free, 1);
+        assert_eq!((ts.len(), free.clone()), (5, vec![3, 1]), "holes under a live tail stay");
+        give_ts(&mut ts, &mut free, 4);
+        // 4 and 3 go; 2 is still live, so `free` stops holding 3 (it was under the reclaimed run) and 1 stays.
+        assert_eq!((ts.len(), free.clone()), (3, vec![1]), "the tail run 4, 3 is reclaimed");
+        // A re-pin takes the hole back instead of appending, and the position holds the new address.
+        assert_eq!(take_ts(&mut ts, &mut free, t(9)), 1);
+        assert_eq!((ts.len(), ts[1].ptr), (3, 0x1000 + 72));
+        for i in [0, 1, 2] { give_ts(&mut ts, &mut free, i); }
+        assert!(ts.is_empty() && free.is_empty(), "the pool ends at its starting size");
     }
 
     fn open() -> Option<Dev> {
@@ -463,11 +471,8 @@ pub(crate) mod dev {
             let t = GpuTensor::new(ty, rows, cols, Buf::new(addr, data.len(), ())).with_scale(scale);
             // A position `unpin` gave back, else the end: a pool slot is pinned and unpinned for as long as it runs,
             // so appending would grow `ts` without bound.
-            let p = &mut self.parts[0];
-            let i = match p.free_ts.pop() {
-                Some(i) => { p.ts[i] = t; i }
-                None => { p.ts.push(t); p.ts.len() - 1 }
-            } as u32;
+            let Part { ts, free_ts, .. } = &mut self.parts[0];
+            let i = take_ts(ts, free_ts, t) as u32;
             self.ex.insert(k, self.exs.len());
             self.exs.push((i, k, self.now, 0.0));
             self.pinned.insert(k);
@@ -479,17 +484,7 @@ pub(crate) mod dev {
             let p = self.ex.remove(&k).unwrap();
             let (i, ..) = self.exs.swap_remove(p);
             if p < self.exs.len() { self.ex.insert(self.exs[p].1, p); }
-            let p = &mut self.parts[gpu_of(i)];
-            let slot = (i & (1 << SHIFT) - 1) as usize;
-            p.ts[slot] = GpuTensor::new(p.ts[slot].ty, 0, 0, Buf::new(0, 0, ()));
-            p.free_ts.push(slot);
-            // A hole that is also the last entry goes: `pin` reuses from the top, so a pool that empties ends at its
-            // starting size instead of its high-water mark.
-            while let Some(&last) = p.free_ts.last() {
-                if last + 1 != p.ts.len() { break }
-                p.ts.pop();
-                p.free_ts.pop();
-            }
+            { let Part { ts, free_ts, .. } = &mut self.parts[gpu_of(i)]; give_ts(ts, free_ts, (i & (1 << SHIFT) - 1) as usize) }
         }
         pub fn gemv(&self, i: u32, x: &[f32], y: &mut [f32], staged: Option<(&[u8], GgmlType, usize, usize, f32)>) {
             let p = &self.parts[if i == STAGED { 0 } else { gpu_of(i) }];
