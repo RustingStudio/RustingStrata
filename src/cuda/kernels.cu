@@ -3380,38 +3380,41 @@ template <int N, int S = N / 2> __device__ __forceinline__ float warp_sum_scatte
 #define LLAMA_NTH 6
 __device__ __forceinline__ float rh(float x) { return h2f(f2h(x)); }
 
-// Scalar KV element load matching GLSL ldkv().
-template <int M, int BITS = TQ_KBITS> __device__ __forceinline__ float ldkv1(const u16* c, size_t off, int hd) {
+// Scalar KV element load matching GLSL ldkv(): value w (0 <= w < hd) of cache row `row`, hd values a row.
+template <int M, int BITS = TQ_KBITS> __device__ __forceinline__ float ldkv1_at(const u16* c, size_t row, unsigned w, int hd) {
     if constexpr (M >= 4) {
-        int we = off % hd;
-        const unsigned char* r = (const unsigned char*)c + off / hd * (hd / 2 + hd / 16);
-        float norm = h2f(*(const u16*)(r + hd / 2 + 2 * (we >> 7)));
-        unsigned b = r[we / 2];
-        int q = (we & 1) == 0 ? (int)(b & 15u) : (int)(b >> 4);
+        const unsigned char* r = (const unsigned char*)c + row * (hd / 2 + hd / 16);
+        float norm = h2f(*(const u16*)(r + hd / 2 + 2 * (w >> 7)));
+        unsigned b = r[w / 2];
+        int q = (w & 1) == 0 ? (int)(b & 15u) : (int)(b >> 4);
         return rh(tq_centroid<BITS>(q) * norm);
     } else if constexpr (M == 3) {
-        int w = off % hd;
-        const unsigned char* r = (const unsigned char*)c + off / hd * (3 * hd / 8);
+        const unsigned char* r = (const unsigned char*)c + row * (3 * hd / 8);
         unsigned b = r[w / 4];
         float d = h2f(*(const u16*)(r + hd / 4 + 2 * (w / 32)));
         float mn = h2f(*(const u16*)(r + hd / 4 + hd / 16 + 2 * (w / 32)));
         int q = (b >> (2 * (w & 3))) & 3;
         return rh(fmaf((float)q, d, mn));
     } else if constexpr (M == 2) {
-        int w = off % hd;
-        const unsigned char* r = (const unsigned char*)c + off / hd * (hd / 2 + hd / 16);
+        const unsigned char* r = (const unsigned char*)c + row * (hd / 2 + hd / 16);
         unsigned b = r[w / 2];
         float d = h2f(*(const u16*)(r + hd / 2 + 2 * (w / 32)));
         int q = (int)((w & 1) == 0 ? (b & 15u) : (b >> 4)) - 8;
         return rh((float)q * d);
     } else if constexpr (M == 1) {
-        int w = off % hd;
-        const signed char* r = (const signed char*)c + off / hd * (hd + hd / 16);
+        const signed char* r = (const signed char*)c + row * (hd + hd / 16);
         float d = h2f(*(const u16*)(r + hd + 2 * (w / 32)));
         return rh((float)r[w] * d);
     } else {
-        return h2f(c[off]);
+        return h2f(c[row * hd + w]);
     }
+}
+// The same value by its flat offset. On a quantized cache that is `off / hd` and `off % hd`, a division by the runtime
+// hd for every value (the card has no integer divide), so a kernel that walks the rows calls ldkv1_at: ink_attn on a
+// q4 cache took 2.03 ms a launch at 29k positions through this one and takes 0.98 (24 heads on 8, RTX 3060 Ti).
+template <int M, int BITS = TQ_KBITS> __device__ __forceinline__ float ldkv1(const u16* c, size_t off, int hd) {
+    if constexpr (M == 0) return h2f(c[off]);
+    else return ldkv1_at<M, BITS>(c, off / hd, (unsigned)(off % hd), hd);
 }
 
 // One block of 128 per (row, tok) of w values (w at most 128, w % 32 == 0 when a side is quantized and dst != 0).
@@ -3473,11 +3476,11 @@ extern "C" __global__ void ink_clip(float* x, const float* scale, int w, float t
     }
 }
 
-// Attention of one token in two launches. Supports KV_MODE 0/1/2/3 via ldkv1().
+// Attention of one token in two launches. Supports KV_MODE 0/1/2/3 via ldkv1_at().
 extern "C" __global__ void ink_attn(const float* q, const float* r, const float* sink, const u16* k, const u16* v,
                                     const float* bias, float* sc, int rows, int at, int ring, int nkv, int hd, int nr, int ext, const int* pos_ptr) {
     __shared__ float qs[128], ps[64], acc[128];
-    int h = blockIdx.x, kh = h / (gridDim.x / nkv), kw = nkv * hd, t = threadIdx.x, lane = t & 31;
+    int h = blockIdx.x, kh = h / (gridDim.x / nkv), t = threadIdx.x, lane = t & 31;
     if (pos_ptr) {
         int pos = *pos_ptr;
         rows = min(pos + 1, ring);
@@ -3502,9 +3505,9 @@ extern "C" __global__ void ink_attn(const float* q, const float* r, const float*
     float scale = 1.f / sqrtf((float)hd);
     for (int j = t >> 5; j < n; j += 4) {
         int i = i0 + j, dist = at - i < 0 ? at - i + rows : at - i;
-        size_t ko = (size_t)i * kw + kh * hd;
+        size_t kr = (size_t)i * nkv + kh;  // the cache row of this key and head: no division a value to find it
         float d = 0.f;
-        for (int c = lane; c < hd; c += 32) d += qs[c] * ldkv1<K_MODE, TQ_KBITS>(k, ko + c, hd);
+        for (int c = lane; c < hd; c += 32) d += qs[c] * ldkv1_at<K_MODE, TQ_KBITS>(k, kr, c, hd);
         d *= scale;
         if (dist < ext) for (int c = lane; c < nr; c += 32) d += r[h * nr + c] * bias[dist * nr + c];
         d = warp_sum(d);
@@ -3518,7 +3521,8 @@ extern "C" __global__ void ink_attn(const float* q, const float* r, const float*
     __syncthreads();
     int c = t % hd, parts = 128 / hd;
     float a = 0.f;
-    for (int j = t / hd; j < n; j += parts) a += ps[j] * ldkv1<V_MODE, TQ_VBITS>(v, (size_t)(i0 + j) * kw + kh * hd + c, hd);
+    size_t vr = (size_t)(i0 + t / hd) * nkv + kh;  // the cache row of this thread's first key; its next key is parts keys on
+    for (int j = t / hd; j < n; j += parts, vr += parts * nkv) a += ps[j] * ldkv1_at<V_MODE, TQ_VBITS>(v, vr, c, hd);
     acc[t] = a;
     __syncthreads();
     float* o = sc + ((size_t)h * gridDim.y + blockIdx.y) * (hd + 2);
@@ -3624,6 +3628,85 @@ extern "C" __global__ void __launch_bounds__(128) ink_attn_128(const float* q, c
 #else
 // A quantized KV cache keeps the scalar kernel: this entry point is never selected (see ink_attn in cuda/mod.rs).
 extern "C" __global__ void __launch_bounds__(128) ink_attn_128(const float*, const float*, const float*, const u16*,
+        const u16*, const float*, float*, int, int, int, int, int, int, int, const int*) { __trap(); }
+#endif
+
+#if K_MODE == 2 && V_MODE == 2
+// ink_attn_128 on a q4 cache, whose row of 128 values is 72 bytes: the nibbles, then the four block scales. A 128-thread
+// block owns 128 key positions and stages their K rows in shared memory with coalesced 8-byte loads; lane i of warp w
+// scores key 32w + i from 4-byte words of 8 nibbles, so there is no shuffle per key, and V is read 2 bytes (4 values) a
+// lane, one key at a time. Every value is the f16 ldkv1_at gives (rh of nibble times block scale): the output differs
+// from ink_attn's only by the order of the sums. ink_attn reads one nibble a lane a step, with a byte load, a scale
+// load and the index arithmetic for each: 0.98 ms a launch at 29k positions (24 heads on 8, RTX 3060 Ti) against
+// 0.29 here.
+extern "C" __global__ void __launch_bounds__(128) ink_attn_128_q4(const float* q, const float* r, const float* sink,
+        const u16* k, const u16* v, const float* bias, float* sc, int rows, int at, int ring, int nkv, int hd,
+        int nr, int ext, const int* pos_ptr) {
+    constexpr int HD = 128, RB = HD / 2 + HD / 16;
+    __shared__ __align__(16) float qs[HD], rs[32], lg[128], ac[4][HD];
+    __shared__ __align__(8) unsigned char ks[128 * RB];
+    int h = blockIdx.x, kh = h / (gridDim.x / nkv);
+    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    if (pos_ptr) { int pos = *pos_ptr; rows = min(pos + 1, ring); at = pos % ring; }
+    int i0 = blockIdx.y * 128, n = i0 < rows ? min(128, rows - i0) : 0;
+    float* o = sc + ((size_t)h * gridDim.y + blockIdx.y) * (HD + 2);
+    if (n == 0) {  // a chunk past the keys: a neutral partial for the merge (exp(-3e38) is 0)
+        if (tid < HD) o[2 + tid] = 0.f;
+        if (tid == 0) { o[0] = -3.0e38f; o[1] = 0.f; }
+        return;
+    }
+    if (tid < HD) qs[tid] = q[h * HD + tid] * rsqrtf((float)HD);
+    if (tid < nr) rs[tid] = r[h * nr + tid];
+    // Row kh of key i0 in each cache, and the bytes from one key to the next.
+    const unsigned char* kb = (const unsigned char*)k + ((size_t)i0 * nkv + kh) * RB;
+    const unsigned char* vb = (const unsigned char*)v + ((size_t)i0 * nkv + kh) * RB;
+    size_t step = (size_t)nkv * RB;
+    for (int i = tid; i < 128 * (RB / 8); i += 128) {
+        int row = i / (RB / 8), part = i % (RB / 8);
+        unsigned long long x = 0;
+        if (row < n) x = *(const unsigned long long*)(kb + (size_t)row * step + part * 8);
+        *(unsigned long long*)(ks + row * RB + part * 8) = x;
+    }
+    __syncthreads();
+    int i = i0 + tid;
+    float l = -3.0e38f;
+    if (tid < n) {
+        const unsigned char* kr = ks + tid * RB;
+        float d = 0.f;
+        for (int g = 0; g < HD / 32; g++) {
+            float s = h2f(*(const u16*)(kr + HD / 2 + 2 * g));
+            for (int m = 0; m < 4; m++) {
+                unsigned w = *(const unsigned*)(kr + 16 * g + 4 * m);
+                const float* qq = qs + 32 * g + 8 * m;
+                for (int e = 0; e < 8; e++) d += qq[e] * rh((float)((int)((w >> (4 * e)) & 15u) - 8) * s);
+            }
+        }
+        int dist = at - i; if (dist < 0) dist += rows;
+        if (dist < ext) for (int c = 0; c < nr; c++) d += rs[c] * bias[(size_t)dist * nr + c];
+        l = d - sink[h];
+    }
+    float mx = block_max(l);
+    float p = tid < n ? expf(l - mx) : 0.f;
+    lg[tid] = p;
+    float z = block_sum(p);
+    __syncthreads();
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    for (int j = warp; j < n; j += 4) {
+        float pj = lg[j];
+        const unsigned char* vr = vb + (size_t)j * step;
+        unsigned w = *(const u16*)(vr + 2 * lane);
+        float s = h2f(*(const u16*)(vr + HD / 2 + 2 * (lane >> 3)));
+        a0 += pj * rh((float)((int)(w & 15u) - 8) * s); a1 += pj * rh((float)((int)((w >> 4) & 15u) - 8) * s);
+        a2 += pj * rh((float)((int)((w >> 8) & 15u) - 8) * s); a3 += pj * rh((float)((int)(w >> 12) - 8) * s);
+    }
+    *(float4*)&ac[warp][4 * lane] = make_float4(a0, a1, a2, a3);
+    __syncthreads();
+    if (tid < HD) o[2 + tid] = ac[0][tid] + ac[1][tid] + ac[2][tid] + ac[3][tid];
+    if (tid == 0) { o[0] = mx; o[1] = z; }
+}
+#else
+// Another cache format keeps its kernel: this entry point is never selected (see ink_attn_pick in cuda/mod.rs).
+extern "C" __global__ void __launch_bounds__(128) ink_attn_128_q4(const float*, const float*, const float*, const u16*,
         const u16*, const float*, float*, int, int, int, int, int, int, int, const int*) { __trap(); }
 #endif
 
