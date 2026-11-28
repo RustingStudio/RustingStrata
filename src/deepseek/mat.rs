@@ -20,7 +20,13 @@ pub(crate) mod dev {
     /// A tensor id holds its GPU in the top 8 bits (so STAGED, GPU 255, is never a real id) and its index there below.
     const SHIFT: u32 = 24;
     pub fn gpu_of(id: u32) -> usize { (id >> SHIFT) as usize }
-    pub(crate) struct Part { pub(crate) be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, stage: Buf, bytes: usize, pub(crate) budget: usize, room: usize }
+    pub(crate) struct Part {
+        pub(crate) be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, stage: Buf, bytes: usize,
+        pub(crate) budget: usize, room: usize,
+        /// Positions in `ts` whose `pin` was dropped: the pool re-pins the same expert over a long run, and without
+        /// reuse its `ts` grows by a few entries a token.
+        free_ts: Vec<usize>,
+    }
     pub struct SlabBuf { buf: Buf, bytes: usize, acct: usize, freed: std::sync::Arc<std::sync::atomic::AtomicUsize> }
     impl SlabBuf {
         pub fn addr(&self) -> u64 { self.buf.addr() }
@@ -150,6 +156,37 @@ pub(crate) mod dev {
         assert_eq!(d.expert_grouped((0x1000, 64), &data, GgmlType::F32, 0, 0, 1.0, false), Some(0));
         assert!(d.group.is_none());
     }
+    /// The free list `pin`/`unpin` keep for the pool's tensor positions: a swap must not grow `ts`, and a free hole
+    /// that is the last entry must shrink it, so an idle pool sits at its starting size.
+    #[test]
+    fn the_pool_free_list_reuses_positions_and_shrinks_from_the_top() {
+        let mut ts: Vec<u8> = (0..4).collect();
+        let mut free: Vec<usize> = vec![];
+        let mut unpin = |slot: usize, ts: &mut Vec<u8>, free: &mut Vec<usize>| {
+            free.push(slot);
+            while let Some(&last) = free.last() {
+                if last + 1 != ts.len() { break }
+                ts.pop();
+                free.pop();
+            }
+        };
+        let mut pin = |ts: &mut Vec<u8>, free: &mut Vec<usize>| -> usize {
+            match free.pop() { Some(i) => { ts[i] = 0xFF; i } None => { ts.push(0xFF); ts.len() - 1 } }
+        };
+        // Scattered swaps: the holes come back, the length stays.
+        unpin(1, &mut ts, &mut free);
+        unpin(2, &mut ts, &mut free);
+        assert_eq!((ts.len(), free.clone()), (4, vec![1, 2]));
+        assert_eq!(pin(&mut ts, &mut free), 2);
+        assert_eq!(pin(&mut ts, &mut free), 1);
+        assert_eq!((ts.len(), free.len()), (4, 0));
+        // A tail slot is reclaimed, so a pool that drains ends where it started.
+        for s in [3, 2, 1, 0] { unpin(s, &mut ts, &mut free); }
+        assert!(ts.is_empty() && free.is_empty());
+        assert_eq!(pin(&mut ts, &mut free), 0);
+        assert_eq!(ts.len(), 1);
+    }
+
     fn open() -> Option<Dev> {
         // Unset or 0: every matvec runs on the CPU.
         if std::env::var("STRATA_DS_GPU").map_or(true, |v| v == "0") { return None; }
@@ -183,7 +220,7 @@ pub(crate) mod dev {
             let budget = capped_budget(budget, f, margin_of(i));
             // Room for the plain weights before moving on to the next GPU: what is free, less the expert cache and a margin.
             let room = f.saturating_sub(budget + (768 << 20));
-            Some(Part { be, ts: vec![], x, y, stage, bytes: 0, budget, room })
+            Some(Part { be, ts: vec![], x, y, stage, bytes: 0, budget, room, free_ts: vec![] })
         }).collect::<Option<Vec<_>>>()?;
         Some(Dev { parts, ..Default::default() })
     }
@@ -423,9 +460,14 @@ pub(crate) mod dev {
         pub fn pin(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize, scale: f32, addr: u64) {
             let k = data.as_ptr() as usize;
             if self.ex.contains_key(&k) { return; }
+            let t = GpuTensor::new(ty, rows, cols, Buf::new(addr, data.len(), ())).with_scale(scale);
+            // A position `unpin` gave back, else the end: a pool slot is pinned and unpinned for as long as it runs,
+            // so appending would grow `ts` without bound.
             let p = &mut self.parts[0];
-            p.ts.push(GpuTensor::new(ty, rows, cols, Buf::new(addr, data.len(), ())).with_scale(scale));
-            let i = p.ts.len() as u32 - 1;
+            let i = match p.free_ts.pop() {
+                Some(i) => { p.ts[i] = t; i }
+                None => { p.ts.push(t); p.ts.len() - 1 }
+            } as u32;
             self.ex.insert(k, self.exs.len());
             self.exs.push((i, k, self.now, 0.0));
             self.pinned.insert(k);
@@ -437,8 +479,17 @@ pub(crate) mod dev {
             let p = self.ex.remove(&k).unwrap();
             let (i, ..) = self.exs.swap_remove(p);
             if p < self.exs.len() { self.ex.insert(self.exs[p].1, p); }
-            let t = &mut self.parts[gpu_of(i)].ts[(i & (1 << SHIFT) - 1) as usize];
-            *t = GpuTensor::new(t.ty, 0, 0, Buf::new(0, 0, ()));
+            let p = &mut self.parts[gpu_of(i)];
+            let slot = (i & (1 << SHIFT) - 1) as usize;
+            p.ts[slot] = GpuTensor::new(p.ts[slot].ty, 0, 0, Buf::new(0, 0, ()));
+            p.free_ts.push(slot);
+            // A hole that is also the last entry goes: `pin` reuses from the top, so a pool that empties ends at its
+            // starting size instead of its high-water mark.
+            while let Some(&last) = p.free_ts.last() {
+                if last + 1 != p.ts.len() { break }
+                p.ts.pop();
+                p.free_ts.pop();
+            }
         }
         pub fn gemv(&self, i: u32, x: &[f32], y: &mut [f32], staged: Option<(&[u8], GgmlType, usize, usize, f32)>) {
             let p = &self.parts[if i == STAGED { 0 } else { gpu_of(i) }];
