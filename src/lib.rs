@@ -37,6 +37,7 @@ pub mod deepseek;
 pub mod gemma4;
 pub mod glm;
 pub mod hy4;
+pub mod gigachat4;
 pub mod kolibri;
 pub mod inkling2;
 pub mod ngram;

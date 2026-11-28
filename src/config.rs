@@ -262,7 +262,7 @@ pub struct ModelConfig {
 }
 
 /// Architectures with their own forward and server outside `ModelConfig` (`src/main.rs` dispatches on them).
-pub const OWN_ARCHS: [&str; 8] = ["gemma4", "glm5-next", "deepseek41", crate::hy4::ARCH, crate::kolibri::ARCH, crate::inkling2::ARCH, crate::inkling2::ARCH_RUNS, crate::raon::ARCH];
+pub const OWN_ARCHS: [&str; 9] = ["gemma4", "glm5-next", "deepseek41", crate::hy4::ARCH, crate::kolibri::ARCH, crate::gigachat4::ARCH, crate::inkling2::ARCH, crate::inkling2::ARCH_RUNS, crate::raon::ARCH];
 
 impl ModelConfig {
     pub fn from_gguf(g: &Gguf) -> anyhow::Result<ModelConfig> {

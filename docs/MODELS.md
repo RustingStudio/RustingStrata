@@ -20,6 +20,7 @@ The engine picks the code path from `general.architecture` in the file.
 | [GLM-5.3-Flash](#glm-53-flash-ud-q2_k_xl-119-gb) | `glm5-next` | own forward, matvecs and expert cache on the CUDA card, greedy only |
 | [Hy4-flash](#hy4-flash-iq2_siq2_xxs-85-gb) | `hy_v4_flash` | own forward, matvecs and expert cache on CUDA or Vulkan, greedy only |
 | [Kolibri 1.1](#kolibri-11-q4_k_m-434-gb) | `kolibri1` | own forward, matvecs, expert cache and attention on CUDA or Vulkan, greedy only |
+| [GigaChat 4](#gigachat-4-37b-a4b-q4_k_m-23-gb) | `gigachat4` | own forward, matvecs and expert cache on the card, attention on the CPU, greedy only |
 | [Inkling 2 Mini](#inkling-2-mini-iq4_nl-176-gb) | `inkling2_loop`, `inkling2` | own forward, matvecs and expert cache on CUDA or Vulkan |
 | Raon-1 mini | `raon1` | own forward (4-stream Raon-mHC, 18 RDA + 7 gated NoPE MLA, SiTU-GLU MoE, effort steering), matvecs on CUDA or Vulkan |
 
@@ -114,6 +115,34 @@ the card are read from the drive through the page cache, and the first request a
 path was run on the RTX 3060 only (no AMD or Intel card); its kernel for the attention over picked keys needs about
 35 KB of workgroup shared memory, and on a card with a smaller limit those layers' attention runs on the CPU.
 Decoding is greedy, there are no stop strings, and the model's thinking arrives inside `content`.
+
+## GigaChat 4 (37B-A4B Q4_K_M, 23 GB)
+
+`chat`, `generate`, `serve`, `score`, `bench` and `check` detect the `gigachat4` architecture
+([ai-sage/GigaChat4-37B-A4B](https://huggingface.co/ai-sage/GigaChat4-37B-A4B)) and run its own forward: 32 layers,
+three Gated DeltaNet layers then one MLA layer (one latent K/V head) whose lightning indexer picks 2048 keys once the
+context is longer than that; every norm is a gated RMS norm; a dense FFN in the first layer, then 192 experts a layer
+with 8 routed by a sigmoid and one shared, all with clamped SwiGLU; soft-capped logits. The MTP layer of the file is
+not run.
+
+```bash
+rustingstrata chat --model GigaChat4-37B-A4B-Q4_K_M.gguf
+rustingstrata serve --model GigaChat4-37B-A4B-Q4_K_M.gguf --port 8080
+```
+
+The matrix products and the routed experts that fit run on the card; the other experts run on the CPU at the same
+time. The DeltaNet recurrence, the MLA attention and the indexer run on the CPU. A prompt goes through the layers in
+chunks of 1024 tokens (`STRATA_DS_CHUNK`). The chat template is the GGUF's (`<|role_sep|>` / `<|message_sep|>`
+turns); thinking is on by default, `--think false` (or `"think": false` / `"reasoning_effort": "none"` in a request)
+gives an empty think block.
+
+Quality: llama.cpp's greedy tokens fed through RustingStrata's forward (`tools/parity.py`, 8 prompts, 32 tokens each)
+give the same top token at 255 of 256 steps; the miss is a near tie (top-2 gap 0.14). After a 3104-token prompt, where
+the indexer picks the keys, 38 of 40 steps agree, both misses near ties (gap 0.14).
+
+Caveats: only CUDA was run (RTX 3060); the Vulkan path is untested. Decoding is greedy, there are no stop strings and
+no tool calls, and the model's thinking arrives inside `content`. The indexer scores every earlier key on the CPU, so
+its cost grows with the context.
 
 ## DeepSeek-V4.1-Flash (IQ2_XXS, 249 GB)
 

@@ -40,7 +40,7 @@ impl Rope {
     }
 
     /// (cos, sin) for pair index i (dim 2i,2i+1) at position pos. Net mscale is 1 (attn factor cancels).
-    fn cs(&self, pos: f32, i: usize) -> (f32, f32) {
+    pub(crate) fn cs(&self, pos: f32, i: usize) -> (f32, f32) {
         let extrap = pos * self.base.powf(-2.0 * i as f32 / self.n_dims as f32);
         let interp = self.freq_scale * extrap;
         let theta = if self.ext != 0.0 {

@@ -1523,6 +1523,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }} }
             let arch = g.get("general.architecture").ok().and_then(|v| v.as_str()).unwrap_or("");
             if arch == rusting_strata::kolibri::ARCH { score_tokenwise!(rusting_strata::kolibri::chat, rusting_strata::kolibri::forward::KolibriModel) }
+            if arch == rusting_strata::gigachat4::ARCH { score_tokenwise!(rusting_strata::gigachat4::chat, rusting_strata::gigachat4::forward::GigaChat4Model) }
             if rusting_strata::inkling2::is_arch(arch) { score_tokenwise!(rusting_strata::inkling2::chat, rusting_strata::inkling2::forward::Inkling2Model) }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
@@ -1571,6 +1572,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 anyhow::ensure!(image.is_empty(), "--image is not supported for hy_v4_flash");
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 return rusting_strata::hy4::chat::generate(&g, &prompt, n);
+            }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::gigachat4::ARCH) {
+                anyhow::ensure!(image.is_empty(), "--image is not supported for gigachat4");
+                let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
+                return rusting_strata::gigachat4::chat::generate(&g, &prompt, n);
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::kolibri::ARCH) {
                 anyhow::ensure!(image.is_empty(), "--image is not supported for kolibri1");
@@ -1707,7 +1713,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             engine.own_warn(&g);
             engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
             if let Some(arch) = g.get("general.architecture").ok().and_then(|v| v.as_str()) {
-                if arch == "deepseek41" || arch == "glm5-next" || arch == "gemma4" || arch == rusting_strata::hy4::ARCH || arch == rusting_strata::kolibri::ARCH || arch == rusting_strata::raon::ARCH || rusting_strata::inkling2::is_arch(arch) {
+                if arch == "deepseek41" || arch == "glm5-next" || arch == "gemma4" || arch == rusting_strata::hy4::ARCH || arch == rusting_strata::kolibri::ARCH || arch == rusting_strata::gigachat4::ARCH || arch == rusting_strata::raon::ARCH || rusting_strata::inkling2::is_arch(arch) {
                     engine.ds_env()?;
                     // A --ctx below the test grows to fit it, as on the main engine.
                     if rusting_strata::CTX.load(std::sync::atomic::Ordering::Relaxed) != 0 { rusting_strata::CTX.store(engine.ctx, std::sync::atomic::Ordering::Relaxed); }
@@ -1719,6 +1725,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         bench_hy4(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else if arch == rusting_strata::kolibri::ARCH {
                         bench_kolibri(&g, &model, &pp, tg, reps, json_out, &mut engine)
+                    } else if arch == rusting_strata::gigachat4::ARCH {
+                        bench_gigachat4(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else if arch == rusting_strata::raon::ARCH {
                         bench_raon(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else if rusting_strata::inkling2::is_arch(arch) {
@@ -1841,6 +1849,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 println!("check: hy_v4_flash ok: {} layers, {} experts ({} used), {} tensors, every tensor of the forward is present", m.cfg.n_layer, m.cfg.n_expert, m.cfg.n_used, g.tensors.len());
                 return Ok(());
             }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::gigachat4::ARCH) {
+                let m = rusting_strata::gigachat4::forward::GigaChat4Model::new(&g)?;
+                println!("check: gigachat4 ok: {} layers, {} experts ({} used), {} tensors, every tensor of the forward is present", m.cfg.n_layer, m.cfg.n_expert, m.cfg.n_used, g.tensors.len());
+                return Ok(());
+            }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::kolibri::ARCH) {
                 let m = rusting_strata::kolibri::forward::KolibriModel::new(&g)?;
                 println!("check: kolibri1 ok: {} layers, {} experts ({} used), {} tensors, every tensor of the forward is present", m.cfg.n_layer, m.cfg.n_expert, m.cfg.n_used, g.tensors.len());
@@ -1943,6 +1956,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::hy4::ARCH) {
                 anyhow::ensure!(image.is_empty(), "--image is not supported for hy_v4_flash");
                 return rusting_strata::hy4::chat::chat(&g, system, n, think);
+            }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::gigachat4::ARCH) {
+                anyhow::ensure!(image.is_empty(), "--image is not supported for gigachat4");
+                return rusting_strata::gigachat4::chat::chat(&g, system, n, think);
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::kolibri::ARCH) {
                 anyhow::ensure!(image.is_empty(), "--image is not supported for kolibri1");
@@ -2482,6 +2499,7 @@ fn $name(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out:
 }
 bench_tokenwise!(bench_hy4, rusting_strata::hy4::forward::Hy4Model);
 bench_tokenwise!(bench_kolibri, rusting_strata::kolibri::forward::KolibriModel);
+bench_tokenwise!(bench_gigachat4, rusting_strata::gigachat4::forward::GigaChat4Model);
 bench_tokenwise!(bench_raon, rusting_strata::raon::forward::RaonModel);
 
 /// `strata bench` for Gemma 4, with the `gpu_defaults` of its generate and chat paths.
@@ -2918,7 +2936,7 @@ fn model_has_mtp(g: &Gguf, aux: bool) -> bool {
 fn arch_default_chunk(arch: &str) -> Option<usize> {
     if arch == "gemma4" { Some(256) }
     else if arch == "glm5-next" { Some(512) }
-    else if arch == rusting_strata::hy4::ARCH || arch == rusting_strata::kolibri::ARCH { Some(1024) }
+    else if arch == rusting_strata::hy4::ARCH || arch == rusting_strata::kolibri::ARCH || arch == rusting_strata::gigachat4::ARCH { Some(1024) }
     else if rusting_strata::inkling2::is_arch(arch) { Some(256) }  // its GPU prefill clamps to 256
     else if arch == "deepseek41" { None }
     else { Some(4096) }
@@ -4006,6 +4024,7 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
             "deepseek41" => rusting_strata::deepseek::chat::serve(&g, &tok, &name)?,
             rusting_strata::hy4::ARCH => rusting_strata::hy4::chat::serve(&g, &tok, &name)?,
             rusting_strata::kolibri::ARCH => rusting_strata::kolibri::chat::serve(&g, &tok, &name)?,
+            rusting_strata::gigachat4::ARCH => rusting_strata::gigachat4::chat::serve(&g, &tok, &name)?,
             rusting_strata::raon::ARCH => rusting_strata::raon::chat::serve(&g, &tok, &name)?,
             _ => rusting_strata::inkling2::chat::serve(&g, &tok, &name, rusting_strata::inkling2::chat::Inkling2Opts {
                 max_ctx: 0, sampler: engine.sampler(), thinking_budget: engine.thinking_budget, think_default: engine.think_default,
@@ -5127,7 +5146,7 @@ mod calibrate_cli_tests {
     #[test]
     fn the_baseline_chunk_is_each_engines_own_default() {
         let s = CalibSettings::new(PathBuf::from("m.gguf"));
-        for (arch, want) in [("gemma4", 256), ("glm5-next", 512), ("hy_v4_flash", 1024), ("kolibri1", 1024),
+        for (arch, want) in [("gemma4", 256), ("glm5-next", 512), ("hy_v4_flash", 1024), ("kolibri1", 1024), ("gigachat4", 1024),
                              ("inkling2_loop", 256), ("inkling2", 256), ("qwen35moe", 4096)] {
             let space = build_space(arch, &s, true);
             let base = baseline_knobs(&space, arch);

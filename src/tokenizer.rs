@@ -77,7 +77,7 @@ impl Tokenizer {
             "qwen35" => &[QWEN35_RE], "qwen2" => &[QWEN2_RE], "joyai-llm" | "hy_v4" => &JOYAI_RE,
             "flint" => &FLINT_RE,
             "glm4" | "glm5" | "chatglm-bpe" => &[GLM4_RE],
-            "inkling2" => &[GPT4O_RE],
+            "inkling2" | "gigachat4" => &[GPT4O_RE],
             "raon" => &[RAON_RE],
             _ => bail!("unsupported pre-tokenizer '{pre}'"),
         };
@@ -123,6 +123,8 @@ impl Tokenizer {
             if let Some(id) = inner.token_to_id(t) && !eos.contains(&id) { eos.push(id); }
         }
         if pre == "inkling2" && let Some(id) = inner.token_to_id("<|content_model_end_sampling|>") && !eos.contains(&id) { eos.push(id); }
+        // A GigaChat 4 reply ends with the turn separator.
+        if pre == "gigachat4" && let Some(id) = inner.token_to_id("<|message_sep|>") && !eos.contains(&id) { eos.push(id); }
         if pre == "flint" {
             // llama.cpp treats these turn markers as end of generation for Flint.
             for t in ["<|user|>", "<|observation|>"] {
