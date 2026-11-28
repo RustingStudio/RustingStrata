@@ -1706,7 +1706,7 @@ impl<'a> GpuModel<'a> {
     }
 
     /// Snapshot the current saved GPU state into a host-memory `Parked` record if it fits in `cache_ram`.
-    fn snapshot_saved(&self) -> anyhow::Result<Option<Parked>> {
+    fn snapshot_saved(&self, cap: usize) -> anyhow::Result<Option<Parked>> {
         let n = self.saved_ids.len();
         if n == 0 { return Ok(None) }
         let mut size = 0;
@@ -1715,7 +1715,7 @@ impl<'a> GpuModel<'a> {
             size += q.kv_bufs().iter().map(|(b, r)| b.len() / r * n).sum::<usize>() + q.slot().iter().map(|b| b.len()).sum::<usize>();
             p = q.next.as_deref();
         }
-        if size > self.cache_ram { return Ok(None) }
+        if size > cap { return Ok(None) }
         let mut parts = vec![];
         let mut p = Some(self);
         while let Some(q) = p {
@@ -1737,7 +1737,7 @@ impl<'a> GpuModel<'a> {
     /// Copy the saved state to host memory, so a later request that continues it can take it back (`unpark`); the
     /// least recently parked states go when they exceed `cache_ram`.
     fn park(&mut self) -> anyhow::Result<()> {
-        if let Some(pk) = self.snapshot_saved()? {
+        if let Some(pk) = self.snapshot_saved(self.cache_ram)? {
             self.insert_parked(pk);
             if self.prompt_cache_path.is_some() {
                 if let Err(e) = self.save_prompt_cache() {
@@ -1751,7 +1751,7 @@ impl<'a> GpuModel<'a> {
     /// Snapshot the current saved state into `parked` and persist to `prompt_cache_path` (Warm Start).
     pub(crate) fn sync_saved_to_prompt_cache(&mut self) -> anyhow::Result<()> {
         if self.prompt_cache_path.is_none() { return Ok(()) }
-        if let Some(pk) = self.snapshot_saved()? {
+        if let Some(pk) = self.snapshot_saved(self.cache_ram)? {
             self.insert_parked(pk);
             self.save_prompt_cache()?;
         }
@@ -1781,9 +1781,14 @@ impl<'a> GpuModel<'a> {
 
     /// Save up to 4 most recent `Parked` states to `self.prompt_cache_path` atomically.
     pub fn save_prompt_cache(&self) -> anyhow::Result<()> {
-        use std::io::Write;
         let Some(path) = &self.prompt_cache_path else { return Ok(()) };
         if self.parked.is_empty() { return Ok(()) }
+        self.write_states(path, &self.parked.iter().take(4).collect::<Vec<_>>())
+    }
+
+    /// Write `entries` to `path` (a temporary file renamed over it), in the format `read_states` reads.
+    fn write_states(&self, path: &std::path::Path, entries: &[&Parked]) -> anyhow::Result<()> {
+        use std::io::Write;
         if let Some(parent) = path.parent() && !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1793,7 +1798,6 @@ impl<'a> GpuModel<'a> {
         w.write_all(b"STRATAPC")?;
         w.write_all(&1u32.to_le_bytes())?;
         w.write_all(&self.prompt_cache_fingerprint().to_le_bytes())?;
-        let entries: Vec<&Parked> = self.parked.iter().take(4).collect();
         w.write_all(&(entries.len() as u32).to_le_bytes())?;
         for pk in entries {
             w.write_all(&pk.owner.to_le_bytes())?;
@@ -1825,12 +1829,34 @@ impl<'a> GpuModel<'a> {
 
     /// Enable Warm Start persistence at `path` and load any existing compatible states into `self.parked`.
     pub fn load_prompt_cache(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
-        use std::io::Read;
         self.prompt_cache_path = Some(path.to_path_buf());
         if !path.exists() {
             return Ok(());
         }
-        let f = std::fs::File::open(path)?;
+        let loaded = self.read_states(path)?;
+        let mut total_toks = 0usize;
+        let mut total_bytes = 0usize;
+        for pk in loaded.into_iter().rev() {
+            total_toks += pk.ids.len();
+            total_bytes += pk.bytes();
+            self.insert_parked(pk);
+        }
+        if !self.parked.is_empty() {
+            crate::say!(
+                "warm start: loaded {} cached prefix state(s) ({total_toks} tokens, {:.1} MB) from {}",
+                self.parked.len(),
+                total_bytes as f64 / 1048576.0,
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// The states in a file of `write_states`; refused when this model's layout (or `--kv`) differs.
+    fn read_states(&self, path: &std::path::Path) -> anyhow::Result<Vec<Parked>> {
+        use std::io::Read;
+        let f = std::fs::File::open(path).with_context(|| path.display().to_string())?;
+        let file_len = f.metadata()?.len() as usize;
         let mut r = std::io::BufReader::with_capacity(8 << 20, f);
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
@@ -1876,6 +1902,7 @@ impl<'a> GpuModel<'a> {
                 for _ in 0..n_slot {
                     r.read_exact(&mut u8b)?;
                     let len = u64::from_le_bytes(u8b) as usize;
+                    ensure!(len <= file_len, "{}: truncated or corrupt", path.display());
                     let mut buf = vec![0u8; len];
                     r.read_exact(&mut buf)?;
                     slot.push(buf);
@@ -1886,6 +1913,7 @@ impl<'a> GpuModel<'a> {
                 for _ in 0..n_kv {
                     r.read_exact(&mut u8b)?;
                     let len = u64::from_le_bytes(u8b) as usize;
+                    ensure!(len <= file_len, "{}: truncated or corrupt", path.display());
                     let mut buf = vec![0u8; len];
                     r.read_exact(&mut buf)?;
                     kv.push(buf);
@@ -1894,22 +1922,39 @@ impl<'a> GpuModel<'a> {
             }
             loaded.push(Parked { ids, owner, parts });
         }
-        let mut total_toks = 0usize;
-        let mut total_bytes = 0usize;
-        for pk in loaded.into_iter().rev() {
-            total_toks += pk.ids.len();
-            total_bytes += pk.bytes();
-            self.insert_parked(pk);
-        }
-        if !self.parked.is_empty() {
-            crate::say!(
-                "warm start: loaded {} cached prefix state(s) ({total_toks} tokens, {:.1} MB) from {}",
-                self.parked.len(),
-                total_bytes as f64 / 1048576.0,
-                path.display()
-            );
-        }
-        Ok(())
+        Ok(loaded)
+    }
+
+    /// Write slot `s`'s saved state (its cached prompt) to `path` (`serve --slot-save-path`); returns its tokens and
+    /// the file size.
+    pub fn save_slot(&mut self, s: usize, path: &std::path::Path) -> anyhow::Result<(usize, u64)> {
+        ensure!(s < self.slots().max(1), "no slot {s}");
+        self.use_slot(s);
+        let pk = self.snapshot_saved(usize::MAX)?.context("the slot holds no cached prompt")?;
+        self.write_states(path, &[&pk])?;
+        Ok((pk.ids.len(), std::fs::metadata(path)?.len()))
+    }
+
+    /// Make the state in `path` (`save_slot`) slot `s`'s saved state, owned by `owner`: the next prompt that
+    /// continues it starts from there. Returns its tokens.
+    pub fn restore_slot(&mut self, s: usize, path: &std::path::Path, owner: u64) -> anyhow::Result<usize> {
+        ensure!(s < self.slots().max(1), "no slot {s}");
+        let mut pk = self.read_states(path)?.into_iter().next().context("no saved state in the file")?;
+        self.use_slot(s);
+        pk.owner = owner;
+        let n = pk.ids.len();
+        self.parked.insert(0, pk);
+        if let Err(e) = self.unpark(0) { self.reset()?; return Err(e); }
+        Ok(n)
+    }
+
+    /// Forget slot `s`'s cached prompt; returns its tokens.
+    pub fn erase_slot(&mut self, s: usize) -> anyhow::Result<usize> {
+        ensure!(s < self.slots().max(1), "no slot {s}");
+        self.use_slot(s);
+        let n = self.saved_ids.len();
+        self.reset()?;
+        Ok(n)
     }
 
     /// Make parked state `i` the saved state and return to it; the saved state is parked in its place.
@@ -1919,6 +1964,17 @@ impl<'a> GpuModel<'a> {
         self.kv_need(self.cur, p.ids.len())?;
         // A slot that never saved has no buffers to take the state yet.
         if self.saved.is_empty() { self.save_state()?; }
+        // A state read from a file must fit the buffers it goes to.
+        ensure!(p.parts.len() == self.parts().count(), "saved state does not fit this model's buffers");
+        let mut q = Some(&*self);
+        for c in &p.parts {
+            let Some(m) = q else { break };
+            let (slot, kv) = (m.slot(), m.kv_bufs());
+            ensure!(slot.len() == c.slot.len() && slot.iter().zip(&c.slot).all(|(b, d)| b.len() == d.len())
+                && kv.len() == c.kv.len() && kv.iter().zip(&c.kv).all(|((b, r), d)| d.len() == b.len() / r * p.ids.len()),
+                "saved state does not fit this model's buffers");
+            q = m.next.as_deref();
+        }
         let mut q = Some(&mut *self);
         for c in p.parts {
             let Some(m) = q else { break };

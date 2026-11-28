@@ -432,6 +432,12 @@ fn serve_without_a_model() {
     assert!(s.contains("403") && b.contains("permission_error"), "{s} {b}");
     assert!(req("GET", "/metrics", "root-0123456789abcdef").1.contains("strata_up"));
     assert!(get("GARBAGE\r\n\r\n").0.contains("400"));
+    // Slot files: admin only, and 501 without --slot-save-path.
+    let slot = |key: &str| get(&format!("POST /slots/0?action=save HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {key}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"));
+    let (s, b) = slot("acme-0123456789abcdef");
+    assert!(s.contains("403"), "{s} {b}");
+    let (s, b) = slot("root-0123456789abcdef");
+    assert!(s.contains("501") && b.contains("--slot-save-path"), "{s} {b}");
     // /api/load with a path: admin only, a full path, and a file that starts with the GGUF magic.
     let load = |path: &std::path::Path, key: &str| {
         let body = serde_json::json!({"path": path}).to_string();
@@ -492,6 +498,84 @@ fn serve_rejects_a_bad_parallel_count() {
         assert!(!out.status.success(), "--parallel {n} exited 0: {err}");
         assert!(err.contains(&format!("--parallel {n}: 1 to 255 slots")), "--parallel {n}: {err}");
     }
+}
+
+/// `--slot-save-path`: the slot of prompt A saved and erased, B asked, the file restored into another slot: A is
+/// answered with its prompt cached (no prefill of it), with one slot and with `--parallel 2`. Model- and GPU-gated like
+/// `serve_parallel_smoke`.
+#[test]
+fn serve_slot_save_restore() {
+    let Some(model) = std::env::var_os("STRATA_MODEL").filter(|p| std::path::Path::new(p).exists()) else {
+        eprintln!("SKIP: no STRATA_MODEL"); return
+    };
+    if !std::env::var("STRATA_TEST_BACKENDS").is_ok_and(|v| v.split(',').any(|b| b.trim().eq_ignore_ascii_case("cuda"))) {
+        eprintln!("SKIP: STRATA_TEST_BACKENDS does not select cuda");
+        return
+    }
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    use std::io::{Read, Write};
+    let dir = std::env::temp_dir().join(format!("strata-slots-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for parallel in ["1", "2"] {
+        let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+        let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_rustingstrata"))
+            .args(["serve", "--model"]).arg(&model)
+            .args(["--gpu", "--backend", "cuda", "--ctx", "1024", "--parallel", parallel, "--fixed-experts", "--cache-ram", "0", "--addr", &addr, "--slot-save-path"]).arg(&dir)
+            .spawn().unwrap();
+        let post = |path: &str, body: &str| -> String {
+            let mut c = std::net::TcpStream::connect(&addr).unwrap();
+            write!(c, "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            let mut s = String::new();
+            c.read_to_string(&mut s).unwrap();
+            s
+        };
+        let json = |r: &str| -> serde_json::Value { serde_json::from_str(r.split_once("\r\n\r\n").map_or("", |x| x.1)).unwrap_or_default() };
+        let result = (|| -> Result<(), String> {
+            let mut up = false;
+            for _ in 0..3000 {
+                if let Ok(mut c) = std::net::TcpStream::connect(&addr) {
+                    let _ = write!(c, "GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+                    let mut s = String::new();
+                    let _ = c.read_to_string(&mut s);
+                    if s.starts_with("HTTP/1.1 200") { up = true; break; }
+                }
+                if p.try_wait().unwrap().is_some() { return Err("server exited before it loaded the model".into()) }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if !up { return Err("server did not become healthy within 300 s".into()) }
+            let chat = |text: &str| {
+                let body = serde_json::json!({"messages": [{"role": "user", "content": text}], "max_tokens": 4, "temperature": 0}).to_string();
+                json(&post("/v1/chat/completions", &body))
+            };
+            let a = format!("Here is a list of numbers: {}. Reply with one word.", (0..120).map(|i| i.to_string()).collect::<Vec<_>>().join(", "));
+            let b = "Tell me a short fact about the moon. Reply with one word.";
+            let first = chat(&a);
+            let n = first["usage"]["prompt_tokens"].as_u64().ok_or(format!("chat A: {first}"))?;
+            // The slot that took A saves it; the others hold no prompt.
+            let slots = parallel.parse::<usize>().unwrap();
+            let (src, saved) = (0..slots).map(|i| (i, json(&post(&format!("/slots/{i}?action=save"), r#"{"filename":"a.bin"}"#))))
+                .find(|(_, v)| v["n_saved"].as_u64().is_some_and(|k| k > 0)).ok_or("no slot saved A")?;
+            let bad = post("/slots/0?action=restore", r#"{"filename":"../a.bin"}"#);
+            if !bad.starts_with("HTTP/1.1 400") { return Err(format!("a path outside the folder: {bad}")) }
+            // A's state leaves the GPU; it comes back from the file into the last slot.
+            let erased = json(&post(&format!("/slots/{src}?action=erase"), "{}"));
+            if erased["n_erased"] != saved["n_saved"] { return Err(format!("erase: {erased} after {saved}")) }
+            chat(b);
+            let dst = (src + 1) % slots;
+            let restored = json(&post(&format!("/slots/{dst}?action=restore"), r#"{"filename":"a.bin"}"#));
+            if restored["n_restored"] != saved["n_saved"] { return Err(format!("restore: {restored} after {saved}")) }
+            let again = chat(&a);
+            let cached = again["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
+            if cached + 16 < n { return Err(format!("A after restore: {cached} of {n} prompt tokens cached: {again}")) }
+            Ok(())
+        })();
+        #[cfg(unix)]
+        let _ = std::process::Command::new("kill").args(["-TERM", &p.id().to_string()]).status();
+        let _ = p.kill();
+        let _ = p.wait();
+        if let Err(e) = result { let _ = std::fs::remove_dir_all(&dir); panic!("--parallel {parallel}: {e}") }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `serve --parallel 2 --kv q8` answers two concurrent chat requests (end to end through the binary). Model- and

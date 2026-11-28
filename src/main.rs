@@ -271,6 +271,11 @@ struct Hosting {
     /// configured for this name keep working when another model is loaded.
     #[arg(long)]
     alias: Option<String>,
+    /// Folder for `POST /slots/{id}?action=save|restore` (llama-server's endpoints, admin key): a slot's cached
+    /// prompt is written to a file there and read back later, also by another server run of the same model and
+    /// `--kv`. Without it the endpoints answer 501.
+    #[arg(long, value_name = "DIR")]
+    slot_save_path: Option<PathBuf>,
 }
 
 /// `Own`: a model outside the main engine (`config::OWN_ARCHS`). Its chat answers a request whole, so the token
@@ -523,11 +528,13 @@ impl Engine {
         let mut ngram_cfg = self.ngram_config()?;
         ngram_cfg.n_vocab = m.cfg.n_vocab;
         let auto_chunk = self.chunk.is_none();
+        let (mtp_given, short_given, threads_given) = (self.mtp.is_some(), self.short.is_some(), self.threads.is_some());
+        let mut mtp_cal = false;
         self.chunk.get_or_insert(get("chunk").unwrap_or(4096));
         // The draft count was measured with this draft file (`calibrate --mtp-model/--draft-model`), or with none.
         let aux = self.aux_model_path().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
         let cal_mtp = get("mtp").filter(|_| v["aux"].as_str() == aux.as_deref());
-        if aux.is_some() && self.mtp.is_none() { self.mtp = cal_mtp; }
+        if aux.is_some() && self.mtp.is_none() { self.mtp = cal_mtp; mtp_cal = cal_mtp.is_some(); }
         if let Some(df) = &m.cfg.dflash {
             if self.mtp.is_none() {
                 self.mtp = Some(df.block_size.saturating_sub(1).max(1));
@@ -538,15 +545,22 @@ impl Engine {
             self.mtp = Some(1);
         } else if ngram_cfg.is_enabled() && self.mtp.is_none() {
             self.mtp = Some(0);
-        } else {
-            self.mtp.get_or_insert(cal_mtp.unwrap_or(0));
+        } else if self.mtp.is_none() {
+            self.mtp = Some(cal_mtp.unwrap_or(0));
+            mtp_cal = cal_mtp.is_some();
         }
         let short = self.short.unwrap_or_else(|| get("short").unwrap_or(32));
         // The global pool can be built once; a model loaded later by `serve` keeps the first one's threads.
         // GPU expert work is memory-bound, so SMT siblings only add contention (6 threads beat 12 on the reference
         // 6-core/12-thread Ryzen). CPU-only inference keeps every logical core.
         let gpu_threads = bk.is_some().then(physical_cores).flatten();
-        if let Some(n) = self.threads.or(get("threads")).or(gpu_threads) {
+        let threads = self.threads.or(get("threads")).or(gpu_threads);
+        // Every tuning value and where it came from, so a run says what it uses.
+        let settings = |e: &Self, chunk: usize, mtp: usize| say!("settings: ctx {}, kv {}, chunk {chunk} ({}), mtp {mtp} ({}), short {short} ({}), threads {} ({}), cache-ram {} MB",
+            e.ctx, e.kv, setting_source("chunk", !auto_chunk, get("chunk").is_some()), setting_source("mtp", mtp_given, mtp_cal),
+            setting_source("short", short_given, get("short").is_some()),
+            threads.map_or("all".into(), |n| n.to_string()), setting_source("threads", threads_given, get("threads").is_some()), e.cache_ram);
+        if let Some(n) = threads {
             let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
         }
         let aux_heads = m.cfg.n_nextn.max(usize::from(m.cfg.dflash.is_some() || m.draft_model.is_some()));
@@ -554,6 +568,7 @@ impl Engine {
             let (notes, _, mtp) = resolve_flags(false, self.parallel, self.mtp(), aux_heads)?;
             for n in notes { say!("{n}"); }
             self.mtp = Some(mtp);
+            settings(self, 0, mtp);
             return Ok(Runner::Cpu(m, State::new(&m.cfg)));
         };
         let (notes, parallel, mtp) = resolve_flags(true, self.parallel, self.mtp(), aux_heads)?;
@@ -601,6 +616,7 @@ impl Engine {
             let tok = Tokenizer::from_gguf(&m.w.g).ok();
             g.ngram = Some(rusting_strata::ngram::NgramDrafter::new(ngram_cfg, tok.as_ref())?);
         }
+        settings(self, self.chunk(), mtp);
         g.short = short;
         g.cache_ram = self.cache_ram << 20;
         if let Some(p) = &self.prompt_cache {
@@ -1311,8 +1327,116 @@ fn main() {
     }
 }
 
+/// `--preset FILE` of any command, and the flags it set that the command line did not (`settings_line`).
+static PRESET: std::sync::OnceLock<(PathBuf, Vec<String>)> = std::sync::OnceLock::new();
+
+/// `--preset FILE`: the preset's flags, put before the command line's own, which win over them. A preset has
+/// `name = value` lines with the names of the flags (`ctx = 32768`, `kv = "q8"`, `fixed_experts = true`,
+/// `device = [0, 1]`) and `#` comments. A key that is a flag of another command is skipped, so one preset serves
+/// `serve`, `chat` and `calibrate`; a key that is no flag at all is an error.
+fn expand_preset(args: Vec<std::ffi::OsString>) -> anyhow::Result<Vec<std::ffi::OsString>> {
+    let s: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    let Some(i) = s.iter().position(|a| a == "--preset" || a.starts_with("--preset=")) else { return Ok(args) };
+    let path = PathBuf::from(match s[i].strip_prefix("--preset=") { Some(p) => p, None => s.get(i + 1).context("--preset needs a file")? });
+    let root = <Cli as clap::CommandFactory>::command();
+    let sub = s.get(1).and_then(|n| root.find_subcommand(n))
+        .with_context(|| format!("--preset goes after a command, as in `rustingstrata serve --preset {}`", path.display()))?;
+    let find = |c: &clap::Command, k: &str| c.get_arguments().find(|a| a.get_long() == Some(k) || a.get_all_aliases().is_some_and(|v| v.contains(&k))).cloned();
+    let given: Vec<clap::Id> = s[2..].iter().filter_map(|a| a.strip_prefix("--"))
+        .filter_map(|a| find(sub, a.split('=').next().unwrap_or(a))).map(|a| a.get_id().clone()).collect();
+    let text = std::fs::read_to_string(&path).with_context(|| format!("--preset {}", path.display()))?;
+    let (mut out, mut set) = (args[..2].to_vec(), vec![]);
+    for (n, k, vals) in parse_preset(&text).with_context(|| path.display().to_string())? {
+        let key = k.replace('_', "-");
+        let Some(a) = find(sub, &key) else {
+            anyhow::ensure!(root.get_subcommands().any(|c| find(c, &key).is_some()), "{}:{n}: `{k}` is not a flag of any command", path.display());
+            continue
+        };
+        if given.contains(a.get_id()) { continue }
+        if a.get_action().takes_values() {
+            out.extend(vals.iter().map(|v| format!("--{key}={v}").into()));
+        } else if vals == ["true"] {
+            out.push(format!("--{key}").into());
+        } else {
+            anyhow::ensure!(vals == ["false"], "{}:{n}: `{k}` is true or false", path.display());
+        }
+        set.push(key);
+    }
+    out.extend_from_slice(&args[2..]);
+    let _ = PRESET.set((path, set));
+    Ok(out)
+}
+
+/// The lines of a preset: (line number, name, values). A value is a number, `true`/`false`, a word, a string in `"`
+/// (with `\\` and `\"`) or `'`, or a list of them in `[...]`.
+fn parse_preset(text: &str) -> anyhow::Result<Vec<(usize, String, Vec<String>)>> {
+    let mut out = vec![];
+    for (n, l) in text.lines().enumerate().map(|(n, l)| (n + 1, l.trim())) {
+        if l.is_empty() || l.starts_with('#') { continue }
+        let (k, v) = l.split_once('=').with_context(|| format!("line {n}: `name = value`, not {l:?}"))?;
+        let k = k.trim();
+        anyhow::ensure!(!k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)), "line {n}: bad name {k:?}");
+        let vals = preset_values(v.trim()).with_context(|| format!("line {n}: bad value {:?}", v.trim()))?;
+        out.push((n, k.to_string(), vals));
+    }
+    Ok(out)
+}
+
+fn preset_values(v: &str) -> Option<Vec<String>> {
+    let mut c = v.chars().peekable();
+    let array = c.next_if_eq(&'[').is_some();
+    let mut out = vec![];
+    loop {
+        while c.next_if(|ch| ch.is_whitespace() || array && *ch == ',').is_some() {}
+        match c.peek().copied() {
+            Some(']') if array => { c.next(); break }
+            None | Some('#') if !array => break,
+            None | Some('#') => return None,
+            Some(q @ ('"' | '\'')) => {
+                c.next();
+                let mut s = String::new();
+                loop {
+                    match c.next()? {
+                        ch if ch == q => break,
+                        '\\' if q == '"' => s.push(c.next()?),
+                        ch => s.push(ch),
+                    }
+                }
+                out.push(s);
+            }
+            Some(_) => out.push(std::iter::from_fn(|| c.next_if(|ch| !ch.is_whitespace() && !"],#".contains(*ch))).collect()),
+        }
+        if !array { break }
+    }
+    while c.next_if(|ch| ch.is_whitespace()).is_some() {}
+    (c.peek().is_none_or(|&ch| ch == '#') && (array || out.len() == 1 && !out[0].is_empty())).then_some(out)
+}
+
+/// `text` with each `key = value` line of `set` replaced, or added at the end (`calibrate --preset`).
+fn set_preset_keys(text: &str, set: &[(&str, String)]) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    for (k, v) in set {
+        let line = format!("{k} = {v}");
+        let same = |l: &String| l.split_once('=').is_some_and(|(a, _)| a.trim().replace('-', "_") == k.replace('-', "_") && !a.trim_start().starts_with('#'));
+        match lines.iter().position(same) { Some(i) => lines[i] = line, None => lines.push(line) }
+    }
+    lines.join("\n") + "\n"
+}
+
+/// Where a tuning value came from, for `settings_line`.
+fn setting_source(key: &str, given: bool, calibrated: bool) -> &'static str {
+    if given { if PRESET.get().is_some_and(|(_, k)| k.iter().any(|k| k == key)) { "preset" } else { "flag" } }
+    else if calibrated { "calibration" } else { "default" }
+}
+
+/// The command line, with `--preset` on every command (`expand_preset` has read it).
+fn cli_command() -> clap::Command {
+    <Cli as clap::CommandFactory>::command().mut_subcommands(|c| c.arg(clap::Arg::new("preset").long("preset").value_name("FILE")
+        .help("Read flags from FILE (`name = value` lines, see docs/USAGE.md); flags given here win")))
+}
+
 fn start() -> anyhow::Result<()> {
-    let m = <Cli as clap::CommandFactory>::command().get_matches();
+    let m = cli_command().get_matches_from(expand_preset(std::env::args_os().collect())?);
     if let Some((_, sm)) = m.subcommand() && let Ok(Some(&n)) = sm.try_get_one::<usize>("ctx")
         && sm.value_source("ctx") == Some(clap::parser::ValueSource::CommandLine) {
         rusting_strata::CTX.store(n, std::sync::atomic::Ordering::Relaxed);
@@ -1663,6 +1787,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                          samples, reps, warmup, pp, tg, chunk_values, task, seed,
                          dry_run, timeout, minutes, out, sub } => {
             set_kv_env_for(&kv, None, None)?;  // read by Gpu::new and Vk::new; expands turbo pair aliases
+            anyhow::ensure!(PRESET.get().is_none() || !model.as_ref().is_some_and(|m| m.is_dir()), "--preset holds the tuning of one model: give --model a file, not a folder");
             if !lora.is_empty() { say!("note: --lora is ignored by calibrate; calibration uses the base model"); }
             if split.is_some() { say!("note: --split is ignored by calibrate; measurements use the free-VRAM split"); }
 
@@ -2137,7 +2262,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 });
             });
             let s = Serving { rx: rx.into(), waiting, stop, addr, allowed_hosts, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir, model: model.clone(), extra,
-                dl: Default::default(), stats, opts: Default::default(), idle: host.auto_unload.map(Duration::from_secs), asleep: Default::default(), parked: Default::default(), alias: host.alias };
+                dl: Default::default(), stats, opts: Default::default(), idle: host.auto_unload.map(Duration::from_secs), asleep: Default::default(), parked: Default::default(), alias: host.alias,
+                slot_dir: host.slot_save_path };
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
             say!("listening on {} (models folder: {})", term::hl(&url), s.dir.display());
@@ -3021,6 +3147,13 @@ fn calibrate_v2(s: &CalibSettings) -> anyhow::Result<()> {
         result.samples_used, result.stop_reason, result.elapsed_ms as f64 / 1000.0);
     let path = write_calibration(s, &result, &workloads, &arch, &backend_name, &gpu)?;
     println!("{}\nwritten to {}", serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&path)?)?)?, path.display());
+    // `--preset`: the tuned values go into it, where later runs read them as flags.
+    if let Some((preset, _)) = PRESET.get() {
+        let k = &result.best.knobs;
+        let set: Vec<(&str, String)> = ["chunk", "mtp", "short"].into_iter().filter_map(|n| Some((n, k.i(n)?.to_string()))).collect();
+        std::fs::write(preset, set_preset_keys(&std::fs::read_to_string(preset)?, &set))?;
+        say!("written to {}: {}", preset.display(), set.iter().map(|(k, v)| format!("{k} = {v}")).collect::<Vec<_>>().join(", "));
+    }
     Ok(())
 }
 
@@ -3331,6 +3464,8 @@ struct Serving {
     /// fails), and the chat request that waits for a load (answered once the model has loaded).
     asleep: std::sync::Mutex<Option<PathBuf>>,
     parked: std::sync::Mutex<Option<Queued>>,
+    /// `--slot-save-path`.
+    slot_dir: Option<PathBuf>,
 }
 
 /// A complete request from the queue, with its key's place when `--max-per-key` counts it (freed once answered).
@@ -3456,6 +3591,27 @@ enum Job {
     Step { slot: usize, token: u32, logits: bool, back: std::sync::mpsc::Sender<anyhow::Result<(u32, Vec<f32>)>> },
     /// The request is done with its slot.
     Done(usize),
+    /// `POST /slots/{id}` (`slot_action`), refused while a request holds the slot.
+    Slot { slot: usize, action: String, file: Option<(String, PathBuf)>, owner: u64, back: std::sync::mpsc::Sender<anyhow::Result<serde_json::Value>> },
+}
+
+/// Save, restore or erase slot `id`'s cached prompt; answers as llama-server does.
+fn slot_action(g: &mut GpuModel, id: usize, action: &str, file: Option<(String, PathBuf)>, owner: u64) -> anyhow::Result<serde_json::Value> {
+    let t = Instant::now();
+    let ms = || t.elapsed().as_secs_f64() * 1e3;
+    Ok(match (action, file) {
+        ("save", Some((f, p))) => {
+            let (n, bytes) = g.save_slot(id, &p)?;
+            say!("slot {id}: saved {n} tokens to {}", p.display());
+            json!({"id_slot": id, "filename": f, "n_saved": n, "n_written": bytes, "timings": {"save_ms": ms()}})
+        }
+        ("restore", Some((f, p))) => {
+            let n = g.restore_slot(id, &p, owner)?;
+            say!("slot {id}: restored {n} tokens from {}", p.display());
+            json!({"id_slot": id, "filename": f, "n_restored": n, "n_read": std::fs::metadata(&p).map_or(0, |m| m.len()), "timings": {"restore_ms": ms()}})
+        }
+        _ => json!({"id_slot": id, "n_erased": g.erase_slot(id)?}),
+    })
 }
 
 /// A request's handle on the model under `--parallel`; dropping it frees the slot.
@@ -3519,6 +3675,8 @@ struct Sched {
     chats: std::collections::VecDeque<Job>,
     steps: Vec<(usize, u32, bool, std::sync::mpsc::Sender<anyhow::Result<(u32, Vec<f32>)>>)>,
     since: Option<Instant>,
+    /// `Job::Slot`s, run before the next prefill.
+    slot_jobs: Vec<Job>,
 }
 
 impl Sched {
@@ -3551,6 +3709,7 @@ impl Sched {
             match j {
                 Job::Done(s) => { self.held[s] = false; self.tick += 1; self.freed[s] = self.tick; }
                 Job::Step { slot, token, logits, back } => { self.since.get_or_insert_with(Instant::now); self.steps.push((slot, token, logits, back)); }
+                j @ Job::Slot { .. } => self.slot_jobs.push(j),
                 c => self.chats.push_back(c),
             }
         }
@@ -3649,6 +3808,11 @@ impl Serving {
                 // A request that comes now stays in the queue and loads the model again.
                 if live.load(Relaxed) == 0 && self.idle.is_some_and(|d| last.lock().unwrap().elapsed() >= d) { idle = true; break; }
                 s.take(&jobs, s.wait());
+                for j in std::mem::take(&mut s.slot_jobs) {
+                    let Job::Slot { slot, action, file, owner, back } = j else { unreachable!() };
+                    let busy = s.held.get(slot).copied().unwrap_or(false);
+                    let _ = back.send(if busy { Err(anyhow::anyhow!("slot {slot} is busy with a request")) } else { slot_action(g, slot, &action, file, owner) });
+                }
                 // Prefill between decode steps, in the free slot whose saved state the prompt extends the furthest, else
                 // the least recently used one.
                 s.chats.retain(|j| !matches!(j, Job::Chat { gone, .. } | Job::Image { gone, .. } if gone.load(Relaxed)));
@@ -4025,6 +4189,34 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 Err(err) => send(&mut w, "502 Bad Gateway", json!({"error": {"message": format!("{err:#}"), "type": "server_error"}})),
             }
         }
+        // llama-server's slot files (`--slot-save-path`).
+        ("POST", r) if r.starts_with("/slots/") => {
+            let bad = |w: &mut TcpStream, m: String| send(w, "400 Bad Request", json!({"error": {"message": m, "type": "invalid_request_error"}}));
+            let Some(dir) = &s.slot_dir else { return send(&mut w, "501 Not Implemented", json!({"error": {"message": "slot save and restore need --slot-save-path", "type": "not_supported_error"}})) };
+            let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
+            let Ok(id) = r["/slots/".len()..].parse::<usize>() else { return bad(&mut w, format!("bad slot id in {r}")) };
+            let action = path.split_once('?').and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix("action="))).unwrap_or_default().to_string();
+            let file = match action.as_str() {
+                "erase" => None,
+                "save" | "restore" => {
+                    let v = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default();
+                    let f = v["filename"].as_str().unwrap_or_default();
+                    if !serve::plain_file_name(f) { return bad(&mut w, format!("bad filename {f:?}: a plain file name, no folders")); }
+                    Some((f.to_string(), dir.join(f)))
+                }
+                a => return bad(&mut w, format!("action must be save, restore or erase, not {a:?}")),
+            };
+            let res = match &mut l.r {
+                Runner::Gpu(g) => slot_action(g, id, &action, file, who.id),
+                Runner::Slot(c) => {
+                    let (back, rx) = std::sync::mpsc::channel();
+                    c.tx.send(Job::Slot { slot: id, action, file, owner: who.id, back }).map_err(|_| anyhow::anyhow!("model gone"))
+                        .and_then(|_| rx.recv().map_err(|_| anyhow::anyhow!("model gone"))?)
+                }
+                _ => return send(&mut w, "501 Not Implemented", json!({"error": {"message": "slot save and restore are not available for this model", "type": "not_supported_error"}})),
+            };
+            match res { Ok(v) => send(&mut w, "200 OK", v), Err(err) => bad(&mut w, format!("{err:#}")) }
+        }
         ("GET", "/api/download") => send(&mut w, "200 OK", json!(*s.dl.lock().unwrap())),
         ("POST", "/api/download/cancel") => { s.dl.lock().unwrap().cancel = true; send(&mut w, "200 OK", json!(*s.dl.lock().unwrap())) }
         // Runs on its own thread so chats go on meanwhile; the page polls GET /api/download.
@@ -4372,6 +4564,41 @@ mod interface_tests {
         let args = super::interface_args(&mut &b"\n\nn\n\n"[..], models.clone()).unwrap();
         assert_eq!(args, ["chat", "--model", "/m/a.gguf"]);
         assert!(super::interface_args(&mut &b"1\n"[..], models).is_err(), "the input ended before the last answer");
+    }
+}
+
+#[cfg(test)]
+mod preset_tests {
+    #[test]
+    fn parses_values() {
+        let v = super::parse_preset("# x\nctx = 4096\nkv = \"q8\" # note\nmodel = 'C:\\m.gguf'\ndevice = [0, 1]\nx_y = true\n").unwrap();
+        let v: Vec<_> = v.into_iter().map(|(_, k, v)| (k, v)).collect();
+        assert_eq!(v, [("ctx", vec!["4096"]), ("kv", vec!["q8"]), ("model", vec!["C:\\m.gguf"]), ("device", vec!["0", "1"]), ("x_y", vec!["true"])]
+            .map(|(k, v)| (k.to_string(), v.into_iter().map(String::from).collect::<Vec<_>>())));
+        assert_eq!(super::preset_values(r#""a\"b""#).unwrap(), ["a\"b"]);
+        for bad in ["ctx", "= 1", "ctx = ", "ctx = 1 2", "ctx = \"x", "d = [1, 2", "a b = 1"] { assert!(super::parse_preset(bad).is_err(), "{bad}"); }
+    }
+    #[test]
+    fn command_line_wins_and_other_commands_keys_are_skipped() {
+        let p = std::env::temp_dir().join(format!("strata-preset-{}.toml", std::process::id()));
+        std::fs::write(&p, "ctx = 4096\nkv = \"q8\"\nfixed_experts = true\nllama_numerics = false\napi_key = \"x\"\n").unwrap();
+        let args = ["rustingstrata", "chat", "--model", "m.gguf", "--preset", p.to_str().unwrap(), "--ctx", "8192"].map(std::ffi::OsString::from).to_vec();
+        let out = super::expand_preset(args).unwrap();
+        let out: Vec<_> = out.iter().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(out, ["rustingstrata", "chat", "--kv=q8", "--fixed-experts", "--model", "m.gguf", "--preset", p.to_str().unwrap(), "--ctx", "8192"]);
+        let m = super::cli_command().try_get_matches_from(&out).unwrap();
+        let Some(super::Cmd::Chat { engine, .. }) = <super::Cli as clap::FromArgMatches>::from_arg_matches(&m).unwrap().cmd else { panic!() };
+        assert_eq!((engine.ctx, engine.kv.as_str(), engine.fixed_experts), (8192, "q8", true));
+        std::fs::write(&p, "ctxx = 1\n").unwrap();
+        let err = super::expand_preset(["rustingstrata", "chat", "--preset", p.to_str().unwrap()].map(std::ffi::OsString::from).to_vec()).unwrap_err();
+        assert!(format!("{err:#}").contains("`ctxx` is not a flag"), "{err:#}");
+        let _ = std::fs::remove_file(&p);
+    }
+    #[test]
+    fn calibration_replaces_keys_in_place() {
+        let t = "# mine\nmodel = \"m.gguf\"\nchunk = 512 # old\n#mtp = 9\n";
+        assert_eq!(super::set_preset_keys(t, &[("chunk", "2048".into()), ("mtp", "2".into())]),
+            "# mine\nmodel = \"m.gguf\"\nchunk = 2048\n#mtp = 9\nmtp = 2\n");
     }
 }
 

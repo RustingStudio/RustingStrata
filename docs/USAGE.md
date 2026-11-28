@@ -133,6 +133,26 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   same name (from another repo or quantizer) does not use it, and a warning asks to calibrate again. Vulkan adds
   `-vulkan` to the name, and a run on several cards adds the devices in `--device` order (`-dev0-1`), so a two-card
   calibration does not replace the one-card one.
+  A load prints the values it uses and where each came from: `settings: ctx 32768, kv q8, chunk 2048
+  (calibration), mtp 1 (preset), short 32 (default), threads 6 (default), cache-ram 4096 MB`.
+- `--preset FILE` (any command) reads flags from a file, one `name = value` line each, with the flag names
+  (`-` or `_`), so the settings of a setup live in one file:
+
+  ```toml
+  # qwen-32k.toml
+  model = "/models/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf"
+  ctx = 32768
+  kv = "q8"
+  fixed_experts = true
+  device = [0, 1]
+  ```
+
+  `rustingstrata serve --preset qwen-32k.toml` runs it, and a flag on the command line wins over the file
+  (`--ctx 8192`). A key that only another command takes is skipped (one file serves `serve`, `chat` and
+  `calibrate`); a key that is no flag at all is an error. A flag can be set to `true` but not turned off from the
+  file. `rustingstrata calibrate --preset qwen-32k.toml` measures that setup and writes the tuned `chunk`, `mtp`
+  and `short` into the file (a line it had is replaced in place, comments stay), where later runs read them as
+  flags; the calibration file is written as before for runs without a preset.
 - `STRATA_AVX512=1` uses the AVX-512 kernels for experts that run on the CPU, in a build for a CPU that has
   AVX-512 VNNI and VBMI (a `target-cpu=native` build on such a machine; the release binaries do not have them). Their
   results differ from the default kernels in the last bits, so greedy output can change at a near tie.
@@ -314,6 +334,14 @@ OpenCode and other agents use the OpenAI address.
 - A request with another history (an agent's side request for a title or a summary) parks the conversation's state in
   host memory (`--cache-ram`, 4096 MB by default), and the next request that continues it takes it back.
 - With customer keys, each key reuses only its own cached conversations; see [HOSTING.md](HOSTING.md).
+- `serve --slot-save-path DIR` turns on llama-server's slot endpoints (admin key only, main engine on the GPU):
+  `POST /slots/0?action=save` with `{"filename": "a.bin"}` writes slot 0's cached prompt to `DIR/a.bin`
+  (`n_saved`, `n_written`, `timings.save_ms`), `?action=restore` with the same body reads it back (`n_restored`,
+  `n_read`, `timings.restore_ms`), and `?action=erase` drops it (`n_erased`). The next request whose prompt starts
+  with the restored tokens prefills only the rest, even after a restart. The file holds the KV cache in the
+  server's `--kv` type and is only read by the same model, `--kv` and device split. A file name is letters, digits,
+  `-`, `_` and `.`, with no folder. Under `--parallel` the slot ids are 0 to N-1, and a slot that is answering a
+  request is refused. Without the flag, and for the models outside the main engine, the endpoints answer 501.
 
 ## Several GPUs
 

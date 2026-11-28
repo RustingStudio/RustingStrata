@@ -80,6 +80,12 @@ pub fn read_request(r: &mut impl BufRead) -> anyhow::Result<Request> {
     Ok(Request { method, path, host, auth, json, proxied, body, queued: None })
 }
 
+/// A slot file name (`POST /slots/{id}`): letters, digits, `-`, `_` and `.`, not starting with `.`, so it stays
+/// inside `--slot-save-path`.
+pub fn plain_file_name(f: &str) -> bool {
+    !f.is_empty() && f.len() <= 255 && !f.starts_with('.') && f.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+}
+
 /// Host header check against DNS rebinding: a loopback name, the host the server was bound to, or a name the user
 /// explicitly allowed (`--allowed-hosts` / `STRATA_ALLOWED_HOSTS`).
 pub fn host_ok(host: &str, bound: &str, allowed: &[String]) -> bool {
@@ -714,6 +720,12 @@ fn date(secs: u64) -> String {
 
 #[cfg(test)]
 mod usage_tests {
+    #[test]
+    fn slot_file_names_stay_in_the_folder() {
+        for f in ["a.bin", "slot_0-save.bin", "x"] { assert!(super::plain_file_name(f), "{f}"); }
+        for f in ["", ".", "..", "../x", "a/b", "a\\b", ".hidden", "c:x", "a b", "\u{e9}"] { assert!(!super::plain_file_name(f), "{f}"); }
+    }
+
     use super::{Last, Usage, date};
 
     #[test]
