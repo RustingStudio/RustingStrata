@@ -20,6 +20,34 @@ const LONG_KEEP: f32 = 0.9999;
 /// Slots past each pool's own for a prompt chunk's experts that are not in it (`stage`).
 pub(super) const STAGE: usize = 32;
 
+/// Bytes the pool keeps free on GPU 0 after its own allocations: at least 512 MB (`--vram-margin`'s default, which
+/// the maintainer measured: the CUDA graph of the core layers needs that much), at least what this call allocated for
+/// the LUT and gate/bias slabs plus 64 MB, and at least what the K/V growth to the context and the decode and prefill
+/// buffers still need (`state`). The pool fills first and those buffers come after it, so the floor is where that room
+/// comes from: a larger `--vram-margin` raises it, a smaller one cannot go below it.
+fn pool_floor(f_res: usize, margin: usize, state: usize) -> usize {
+    margin.max(512 << 20).max(f_res + (64 << 20)).max(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_floor_follows_the_vram_margin_and_the_state() {
+        let (f_res, mib) = (384 << 20, 1 << 20);
+        let state = 1200 * mib;
+        // No margin given: the 512 MB default stands (the maintainer's fix), above the pool's own 448 MB.
+        assert_eq!(pool_floor(f_res, 0, 300 * mib), 512 * mib);
+        assert_eq!(pool_floor(f_res, 0, state), state);
+        // A larger margin wins; a smaller one does not go below the 512 MB default.
+        assert_eq!(pool_floor(f_res, 2048 * mib, state), 2048 * mib);
+        assert_eq!(pool_floor(f_res, 128 * mib, 300 * mib), 512 * mib);
+        // A 16k context needs its K/V rows whether the margin says so or not (the prefill OOM when it was dropped).
+        assert!(pool_floor(f_res, 512 * mib, 1800 * mib) > 512 * mib);
+    }
+}
+
 pub(super) struct PoolLayer {
     pub pool: usize,
     pub table_dev: Buf,
@@ -58,8 +86,9 @@ pub(super) struct Pool {
 
 impl Pool {
     /// The pool for layers `need` with what the weight budget has left, or None when nothing fits or the backend
-    /// has no pool kernels.
-    pub fn new(m: &Inkling2Model, d: &mut dev::Dev, need: &[usize], runs: Vec<(usize, usize)>) -> Option<Pool> {
+    /// has no pool kernels. `state` is what the forward still allocates after the pool up to the context (see
+    /// `device::state_bytes`): the free floor is the larger of it and `--vram-margin`.
+    pub fn new(m: &Inkling2Model, d: &mut dev::Dev, need: &[usize], runs: Vec<(usize, usize)>, state: usize) -> Option<Pool> {
         let (c, ne) = (&m.cfg, m.cfg.n_expert);
         if !d.parts[0].be.ink_pool() { return None; }
         let (b_res, f_res) = (64 << 20, 384 << 20);
@@ -114,16 +143,28 @@ impl Pool {
             }
             eprintln!("inkling2: pinned {gb:.2} GB of experts in {:.1} s", t0.elapsed().as_secs_f64());
         }
-        // Slots in proportion to each layout's experts, from what the budget and the card have left.
+        // Slots in proportion to each layout's experts, from what the budget and the card have left. The free floor is
+        // `pool_floor`: the 512 MB default (or a larger `--vram-margin`), at least what this call allocated, and what
+        // the K/V rows to the context and the decode and prefill buffers still need (`state`): those are allocated
+        // after the pool, out of this room.
         let total: usize = kinds.iter().map(|k| k.1 * ne * k.2.len()).sum();
-        let free = d.parts[0].be.mem_info().map_or(0, |m| m.0).saturating_sub(f_res + (512 << 20));
+        let floor = pool_floor(f_res, crate::deepseek::mat::dev_margin(), state);
+        let free = d.parts[0].be.mem_info().map_or(0, |m| m.0).saturating_sub(floor);
         let room = d.budget_left().saturating_sub(b_res).min(free);
         let frac = (room as f64 / total.max(1) as f64).min(1.0);
         let mut slots = vec![];
         for k in &kinds {
-            let n = (frac * (ne * k.2.len()) as f64) as usize;
-            let n = n.saturating_sub(STAGE).min(ne * k.2.len());
-            let buf = d.alloc_room((n + STAGE) * k.1, b_res, f_res);
+            // A layout takes its share; when that does not fit (the floor was raised by a later allocation), the rest
+            // of the room, down to its staging slots alone: the Q8 layers' experts still get a pool, if a small one.
+            let want = ((frac * (ne * k.2.len()) as f64) as usize).saturating_sub(STAGE).min(ne * k.2.len());
+            let avail = d.parts[0].be.mem_info().map_or(0, |m| m.0).saturating_sub(floor).min(d.budget_left().saturating_sub(b_res));
+            let (n, buf) = match d.alloc_room((want + STAGE) * k.1, b_res, floor) {
+                Some(b) => (want, Some(b)),
+                None => {
+                    let fit = (avail / k.1).saturating_sub(STAGE).min(want);
+                    (fit, d.alloc_room((fit + STAGE) * k.1, b_res, floor))
+                }
+            };
             let n = if buf.is_some() { n } else { 0 };
             slots.push(Slots { buf, bytes: k.1, owner: vec![None; n] });
         }
@@ -264,8 +305,10 @@ impl Pool {
 }
 
 impl Pool {
-    /// Drop the `Dev::pin`s of the filled slots: they are views of this pool's VRAM, which goes with the pool.
-    pub fn unpin_all(&mut self, d: &mut dev::Dev) {
+    /// Drop the `Dev::pin`s of the filled slots and return the bytes the pool's slot buffers hold (what its `Drop`
+    /// frees): the pins are views of this pool's VRAM, which goes with the pool. The caller must hold the device and
+    /// drop the pool right after.
+    pub fn unpin_all(&mut self, d: &mut dev::Dev) -> usize {
         let ne = self.ne;
         for s in &mut self.slots {
             for (ip, e) in s.owner.iter_mut().filter_map(Option::take) {
@@ -274,17 +317,28 @@ impl Pool {
                 d.unpin(h.down.expert_host(e, ne).data);
             }
         }
+        self.slots.iter().filter_map(|s| s.buf.as_ref()).map(|b| b.len()).sum::<usize>()
+            + self.layers.iter().flatten().map(|l| l._gi.len() + l.bias.len()
+                + l.gu_scale.as_ref().map_or(0, |b| b.len()) + l.dn_scale.as_ref().map_or(0, |b| b.len())).sum::<usize>()
     }
 }
 
 impl Drop for Pool {
     /// Unpin the slots (unless `unpin_all` ran) and save the long counts: the next load places from them.
+    ///
+    /// Every path that drops a pool while the device is held calls `unpin_all` first. This is for the paths where the
+    /// device is open but free to take: `Pool` is owned by `Device`, so its `Drop` runs as the `Device` field is
+    /// dropped, and a `Device` is dropped when a model is (normally with no one holding the device) or when a decode
+    /// or prefill state gives way (also outside a device lock). A caller that does hold the lock would leave the slots
+    /// pinned to VRAM that is freed a moment later, so the cases are listed and none of them holds it:
+    /// `Inkling2Model::reset`/`forget` (keeps the pool), the `self.device = None` fallbacks in `forward.rs` (the
+    /// device is taken out of the model and dropped outside every lock), and `prepare`'s growth path (`unpin_all`).
     fn drop(&mut self) {
         if self.slots.iter().any(|s| s.owner.iter().any(Option::is_some)) {
-            // try_lock: a caller that holds the device runs `unpin_all` itself before the pool goes.
             match dev::get().map(|m| m.try_lock()) {
-                Some(Ok(mut d)) => self.unpin_all(&mut d),
-                _ => eprintln!("inkling2: expert pool dropped while the device was busy; its slots stay pinned"),
+                Some(Ok(mut d)) => { let _ = self.unpin_all(&mut d); }
+                Some(Err(_)) => eprintln!("inkling2: the expert pool's slots are still pinned: its Drop ran under the device lock"),
+                None => {}
             }
         }
         if self.tokens < 16 { return; }
