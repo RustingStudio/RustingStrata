@@ -57,7 +57,7 @@ pub(super) fn pf_tokens() -> usize {
 
 /// Device addresses of the regions of the decode scratch buffer (`sc` lives in `Device::sc_buf` so `--ctx` scales dynamically).
 #[derive(Clone, Copy)]
-struct Scratch {
+pub(super) struct Scratch {
     cur: u64, x: u64, blocks: u64, bank: u64, outb: u64, prelude: u64, msg: u64, ins: u64, ins2: u64, gate: u64, nrm: u64, nrm_xq: u64,
     q: u64, r: u64, sink: u64, og: u64, k: u64, v: u64, kp: u64, vp: u64, att: u64, proj: u64, h: u64, h2: u64, hn: u64, wh: u64, step: u64,
     y: u64, d: u64, ids: u64, xh: u64, xq: u64, wc: u64, rlogits: u64, amax: u64, pos: u64, acc: u64, logits: u64, end: u64,
@@ -67,7 +67,15 @@ impl Scratch {
     fn at(base: u64, c: &Inkling2Config, rank: usize, vocab: usize) -> Self {
         let (n, q, mut a) = (c.n_embd, c.n_head * c.head_dim, base);
         let xq_row_floats = (n + n.div_ceil(32) * 4).div_ceil(16) * 4;
-        let mut f = |floats: usize| { a += 4 * floats as u64; a - 4 * floats as u64 };
+        // Every region starts at a multiple of 4 floats (16 bytes): `situ_q` and the other kernels read `float4`, and
+        // an unaligned address faults on CUDA. `wh` and `step` are padded at their fields too, so a reader of
+        // `c.n_used` floats reads what it always did; the rounding here also covers `ids`, `wc`, `pos` and any other
+        // region whose width is not a multiple of 4 floats on some config.
+        let mut f = |floats: usize| {
+            let at = a;
+            a += 4 * floats.next_multiple_of(4) as u64;
+            at
+        };
         Scratch {
             cur: f(n), x: f(n), blocks: f(4 * n), bank: f(4 * n), outb: f(n), prelude: f(n), msg: f(4 * n), ins: f(3 * n), ins2: f(3 * n),
             gate: f(4 * rank), nrm: f(3 * n), nrm_xq: f(3 * xq_row_floats), q: f(q), r: f(c.n_head * c.n_rel), sink: f(c.n_head), og: f(q), k: f(c.n_head_kv * c.head_dim),
@@ -75,6 +83,17 @@ impl Scratch {
             h2: f(n), hn: f(n), wh: f(c.n_used.next_multiple_of(4)), step: f(4), y: f(c.n_used * 2 * c.n_ff_exp), d: f(c.n_used * n), ids: f(3 * c.n_used), xh: f(n), xq: f(c.n_used * c.n_ff_exp), wc: f(c.n_used + n), rlogits: f(c.n_expert), amax: f(16), pos: f(1), acc: f(n),
             logits: f(vocab), end: a - base,
         }
+    }
+
+    /// Every region's offset is a multiple of 4 floats: the kernels that read `float4` need that, and the base of the
+    /// scratch buffer is aligned as any allocation is.
+    #[cfg(test)]
+    pub(super) fn aligned(base: u64, c: &Inkling2Config, rank: usize, vocab: usize) -> bool {
+        let s = Self::at(base, c, rank, vocab);
+        [s.cur, s.x, s.blocks, s.bank, s.outb, s.prelude, s.msg, s.ins, s.ins2, s.gate, s.nrm, s.nrm_xq, s.q, s.r,
+            s.sink, s.og, s.k, s.v, s.kp, s.vp, s.att, s.proj, s.h, s.h2, s.hn, s.wh, s.step, s.y, s.d, s.ids, s.xh,
+            s.xq, s.wc, s.rlogits, s.amax, s.pos, s.acc, s.logits, s.end]
+            .iter().all(|&at| (at - base) % 16 == 0)
     }
 }
 
@@ -218,6 +237,20 @@ fn grown(need: usize, max_ctx: usize) -> usize { (need + need / 4).next_multiple
 fn room(d: &mut dev::Dev, need: usize) {
     let free = d.parts[0].be.mem_info().map_or(0, |m| m.0);
     if free < need { d.release(0, need - free); }
+}
+
+/// Bytes GPU 0 still needs free after the expert pool: the K/V rows of the layers that grow, to `rows` (the configured
+/// context), plus as many again for the rows they hold during a growth (`prepare` allocates the new buffer before it
+/// frees the old, and after earlier prompts the old one can be up to `rows` long, not the rows of the load), the
+/// score buffer for them, the prefill scratch of `pf_tokens()` rows (allocated before the K/V growth) and the reserve
+/// `prepare` keeps. The pool leaves this much (or `--vram-margin`, whichever is larger) free, so the K/V growth of a 16k
+/// prompt finds the room it needs instead of dropping the pool, and the prompt scratch is allocated once instead of
+/// being halved to 256 rows (`prefill_rows`).
+fn state_bytes(be: &dyn Backend, c: &Inkling2Config, kw: usize, rows: usize, nt: usize, vocab_rows: usize, rank: usize) -> usize {
+    let n_att = (0..c.n_slot()).filter(|&il| !c.swa[layer_of(c, il)]).count();
+    let kv = |r: usize| 2 * n_att * r * be.kv_row_words(kw);
+    2 * kv(rows) + sc_bytes(c, rows) + PrefillScratch::bytes(be, c, rank, vocab_rows, nt, false)
+        + Scratch::at(0, c, rank, vocab_rows).end as usize + (512 << 20)
 }
 
 /// Bytes of the attention partials for `rows` full-attention rows.
@@ -442,7 +475,15 @@ impl Device {
             let need: Vec<usize> = (0..c.n_layer).filter(|&ip| layers[ip].full_exps.is_none()).collect();
             let pool = (one_gpu && !need.is_empty() && cpu_share <= 0.0 && std::env::var_os("STRATA_FIXED_EXPERTS").is_none()).then(|| {
                 let runs = run_order(c).into_iter().filter(|r| need.contains(&r.1)).collect();
-                super::pool::Pool::new(m, &mut dev::get().unwrap().lock().unwrap(), &need, runs)
+                let state = {
+                    let g = dev::get().unwrap();
+                    let d = g.lock().unwrap();
+                    // The K/V rows to the configured context (`m.max_ctx`), the rows it holds at load (`full`) and the
+                    // full prefill chunk: the pool must leave room for what a later 16k prompt allocates while the old
+                    // buffers are still live, or the growth drops it (see `state_bytes`).
+                    state_bytes(&*d.parts[0].be, c, kw, m.max_ctx, pf_tokens(), m.output.rows, rank)
+                };
+                super::pool::Pool::new(m, &mut dev::get().unwrap().lock().unwrap(), &need, runs, state)
             }).flatten();
             let all_full = rem.is_none() && (0..c.n_layer).all(|ip| layers[ip].full_exps.is_some() || pool.as_ref().is_some_and(|p| p.layer(ip).is_some()));
             let core = c.loop_end - c.loop_start;
@@ -527,13 +568,18 @@ impl Device {
                 let mut short = bytes - free(&d);
                 // The expert pool goes first: its layers then run like the other layers without a slab. The budget
                 // falls by what the K/V rows need, so the expert cache can use the rest of the pool's room.
+                // `unpin_all` runs here, while the device is held: the pool's `Drop` cannot take the lock and would
+                // leave the slots pinned to VRAM that is freed a moment later. The bytes are counted from the pool's
+                // own slots, not from `mem_info` after the drop: the driver may report freed VRAM late (as the count
+                // above notes), and a late report made the layer loop below take expert layers it did not need to.
                 if let Some(mut p) = self.pool.take() {
-                    let had = free(&d);
-                    p.unpin_all(&mut d);
+                    let got = p.unpin_all(&mut d);
+                    let freed = got.min(short);
+                    d.parts[0].budget = d.parts[0].budget.saturating_sub(freed);
+                    short -= freed;
                     drop(p);
-                    let got = free(&d).saturating_sub(had).min(short);
-                    d.parts[0].budget = d.parts[0].budget.saturating_sub(got);
-                    short -= got;
+                    // The pooled layers have no experts on the device now: `step_fast` would skip their FFN.
+                    self.all_full = false;
                 }
                 let order: Vec<usize> = (c.loop_start..c.loop_end).chain(0..c.loop_start).chain(c.loop_end..c.n_layer).collect();
                 for &ip in order.iter().rev() {

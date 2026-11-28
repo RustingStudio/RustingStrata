@@ -1592,4 +1592,27 @@ mod tests {
         let r = 2f32.sqrt() / 2.0;
         assert!((got[0] - r).abs() < 1e-4 && (got[1] - r).abs() < 1e-4, "{got:?}");
     }
+
+    /// A config with no file behind it: the shapes the scratch layout uses.
+    fn scratch_cfg(n_embd: usize, n_head: usize, n_used: usize) -> Inkling2Config {
+        Inkling2Config {
+            n_layer: 3, n_ctx: 4096, n_embd, n_head, n_head_kv: n_head / 3, head_dim: 128, n_expert: 128, n_used,
+            n_ff_exp: 1152, n_vocab: 1024, eps: 1e-6, n_swa: 1024, swa: vec![true, false, true], n_conv: 4,
+            exp_scale: 8.0, situ_beta: 4.0, situ_linear_beta: 25.0, block_size: 6, softcap: 30.0, n_rel: 16,
+            rel_extent: 1024, qk_clip: 22.6, rel_clip: 8.0, log_floor: 8192.0, log_alpha: 0.1,
+            loop_start: 1, loop_end: 2, loop_count: 1, ctx: 4096,
+        }
+    }
+
+    /// Every region of the decode scratch is 16-byte aligned: `situ_q` reads `float4` from `y`, which follows `hn`,
+    /// `wh` and `step`. At the model's sizes most widths are a multiple of 4 floats anyway, so the odd ones are taken
+    /// too (`ids` is 3 * n_used floats, `pos` one), along with odd vocabularies.
+    #[test]
+    fn decode_scratch_regions_are_16_byte_aligned() {
+        for (n_embd, n_head, n_used, vocab) in [(2304, 24, 8, 248320), (2304, 24, 7, 1021), (2560, 32, 9, 1024), (2304, 24, 5, 999)] {
+            let c = scratch_cfg(n_embd, n_head, n_used);
+            assert!(device::Scratch::aligned(0, &c, 64, vocab), "n_used {n_used}, vocab {vocab}");
+            assert!(device::Scratch::aligned(1 << 20, &c, 64, vocab), "n_used {n_used}, vocab {vocab}, other base");
+        }
+    }
 }
