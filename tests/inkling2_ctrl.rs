@@ -17,7 +17,7 @@ fn tiled_controllers_match_per_token() {
     unsafe { std::env::set_var("STRATA_DS_FAST_KERNELS", "1") };
     for (bk, gpu) in common::backends() {
         let gpu = &*gpu;
-        if bk != "cuda" { continue; }
+        if bk != "cuda" && bk != "hip" { continue; }
         let (rank, count, n, nt) = (4usize, 3usize, 128usize, 64usize);
         let down_w: Vec<u16> = xs(count * rank * 2 * n + 7)[7..].iter().map(|&v| half::f16::from_f32(v * 0.25).to_bits()).collect();
         let gain_w: Vec<u16> = xs(count * rank * n + 13)[13..].iter().map(|&v| half::f16::from_f32(v * 0.25).to_bits()).collect();

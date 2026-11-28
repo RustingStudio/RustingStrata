@@ -35,11 +35,22 @@ pub struct Gpu {
     hip: Arc<ffi::Hip>,
     device: usize,
     stream: ffi::Stream,
+    /// The copy queue of `htod_side`, and the events its marks are recorded in (reused round robin: a wait already
+    /// queued keeps the record it saw).
+    side: ffi::Stream,
+    marks: Vec<Event>,
+    next_mark: std::sync::atomic::AtomicUsize,
+    /// Host ranges `pin_host` registered (start, end, the address registered): `htod` copies from them directly.
+    pinned: std::sync::RwLock<Vec<(usize, usize, usize)>>,
     fns: HashMap<String, ffi::Func>,
     /// "gfx1201": the target hiprtc compiled for.
     arch: String,
     /// `--kv q8` (the kernels were compiled with `KV_MODE` 0 or 1; HIP has no q4/q2 cache rows).
     pub kv_q8: bool,
+    /// The Inkling 2 kernel-choice flags (`STRATA_DS_FAST_KERNELS` and friends), read once at creation.
+    flags: crate::cuda::InkFlags,
+    /// The card's PCI address ("0000:0c:00.0"), read once: `mem_info` finds the card's sysfs entry by it.
+    pci: Option<String>,
     /// Opt-in shared memory per block on this device (64 KiB on RDNA).
     max_smem: usize,
     /// `argmax_rows` partials.
@@ -178,6 +189,9 @@ impl Gpu {
         let obj = compile_cached(rtc, &src, &arch, &tag)?;
         let mut stream: ffi::Stream = std::ptr::null_mut();
         hip.check(unsafe { (hip.stream_create)(&mut stream, ffi::STREAM_NON_BLOCKING) }, "hipStreamCreate")?;
+        let mut side: ffi::Stream = std::ptr::null_mut();
+        hip.check(unsafe { (hip.stream_create)(&mut side, ffi::STREAM_NON_BLOCKING) }, "hipStreamCreate(side)")?;
+        let marks = (0..MARKS).map(|_| Event::new(&hip)).collect::<anyhow::Result<Vec<_>>>()?;
         let mut module: ffi::Module = std::ptr::null_mut();
         hip.check(unsafe { (hip.module_load)(&mut module, obj.as_ptr().cast()) }, "hipModuleLoadData")?;
         let mut fns = HashMap::new();
@@ -209,7 +223,8 @@ impl Gpu {
         let mut dev: *mut c_void = std::ptr::null_mut();
         hip.check(unsafe { (hip.host_device_ptr)(&mut dev, host, 0) }, "hipHostGetDevicePointer(ring)")?;
         let staging = Staging { _pin: Buf::new(dev as u64, RING, PinnedHost { hip: hip.clone(), p: host }), host: host.cast(), head: 0, busy: VecDeque::new() };
-        Ok(Gpu { hip, device, stream, fns, arch, kv_q8, max_smem, am: am_buf,
+        let pci = hip.pci_bus_id(device as i32);
+        Ok(Gpu { hip, device, stream, side, marks, next_mark: Default::default(), pinned: Default::default(), fns, arch, kv_q8, flags: ink_flags(), pci, max_smem, am: am_buf,
                  graphs: Mutex::new(HashMap::new()), fr: Mutex::new((HashMap::new(), Vec::new())), staging: Mutex::new(staging) })
     }
 
@@ -234,7 +249,51 @@ impl Gpu {
     }
 
     fn wait(&self) -> anyhow::Result<()> {
+        self.hip.check(unsafe { (self.hip.stream_sync)(self.side) }, "hipStreamSynchronize(side)")?;
         self.hip.check(unsafe { (self.hip.stream_sync)(self.stream) }, "hipStreamSynchronize")
+    }
+
+    /// Record the point `stream` has reached in the next mark event.
+    fn mark(&self, stream: ffi::Stream) -> anyhow::Result<usize> {
+        let i = self.next_mark.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % MARKS;
+        self.marks[i].record(stream)?;
+        Ok(i)
+    }
+
+    /// `htod` on `stream`: queue the copy and return once `src` may be reused. From pageable memory the runtime
+    /// stages the buffer inside the call, and large copies go through the pinned ring so the DMA does not stop the
+    /// host (expert streaming during prefill).
+    fn htod_on(&self, stream: ffi::Stream, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
+        let (s0, s1) = (src.as_ptr() as usize, src.as_ptr() as usize + src.len());
+        if src.len() < RING_MIN || self.pinned.read().unwrap().iter().any(|&(a, b, _)| a <= s0 && s1 <= b) {
+            let r = unsafe { (self.hip.memcpy_async)((dst.addr() + off as u64) as *mut c_void, src.as_ptr().cast(), src.len(),
+                                                     ffi::MEMCPY_H2D, stream) };
+            return self.hip.check(r, "hipMemcpyAsync(htod)");
+        }
+        let mut g = self.staging.lock().unwrap();
+        for (i, c) in src.chunks(RING).enumerate() {
+            if g.head + c.len() > RING { g.head = 0; }
+            let (a, b) = (g.head, g.head + c.len());
+            // Regions still being read by an earlier copy have to complete before the host overwrites them.
+            while g.busy.iter().any(|&(s, e, _)| s < b && a < e) {
+                let (_, _, ev) = g.busy.pop_front().unwrap();
+                self.hip.check(unsafe { (self.hip.event_sync)(ev.ev) }, "hipEventSynchronize")?;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), g.host.add(a), c.len()) };
+            let r = unsafe { (self.hip.memcpy_async)((dst.addr() + (off + i * RING) as u64) as *mut c_void,
+                                                     g.host.add(a) as *const c_void, c.len(), ffi::MEMCPY_H2D, stream) };
+            self.hip.check(r, "hipMemcpyAsync(htod ring)")?;
+            let ev = Event::new(&self.hip)?;
+            ev.record(stream)?;
+            g.busy.push_back((a, b, ev));
+            g.head = b;
+        }
+        Ok(())
+    }
+
+    fn wait_mark(&self, stream: ffi::Stream, i: usize) -> anyhow::Result<()> {
+        self.hip.check(unsafe { (self.hip.stream_wait_event)(stream, self.marks[i % MARKS].ev, 0) }, "hipStreamWaitEvent")
     }
 
     fn ptr(&self, b: &Buf) -> u64 { b.addr() }
@@ -305,7 +364,17 @@ impl Gpu {
     /// `pair.1` (token stride `pair.2`).
     fn gemvq_pair(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize,
                   pair: (i64, i64, i32, f32), z: u32) -> anyhow::Result<()> {
-        if !(1..=4).contains(&nt) { bail!("gemvn: {nt} inputs (1 to 4)"); }
+        // gemvn takes 4 inputs at most; a larger batch (Inkling 2's draft verify, up to 16 rows) runs 4 at a time and
+        // quantizes x itself, since xq holds the scales of all nt rows after all the rows (as on CUDA).
+        if nt > 4 {
+            for t0 in (0..nt).step_by(4) {
+                let (xt, yt) = (x + 4 * (t0 * x_stride) as u64, y + 4 * (t0 * y_stride) as u64);
+                let y2 = if z == 2 { pair.1 + 4 * t0 as i64 * (pair.2 as i64 - y_stride as i64) } else { 0 };
+                self.gemvq_pair(w, xt, x_stride, 0, yt, y_stride, (nt - t0).min(4), (pair.0, y2, pair.2, pair.3), z)?;
+            }
+            return Ok(());
+        }
+        if nt == 0 { bail!("gemvn: no inputs"); }
         let (ncols, k1) = Self::gemv_cols("gemv", w.ty, w.cols)?;
         let (mut c, rpw) = Self::gemv_cfg(w.ty, w.rows, w.cols, 1);
         let per = c.shared_mem_bytes;
@@ -377,6 +446,35 @@ impl Gpu {
     }
 
     fn grid(n: usize) -> LaunchConfig { cfg((n.div_ceil(256) as u32, 1), 256, 0) }
+
+    /// The decode attention kernel and its key positions per block, chosen as on CUDA (`cuda::Gpu::ink_attn_kernel`).
+    fn ink_attn_kernel(&self, hd: usize, nr: usize) -> (&'static str, usize) {
+        if hd == 128 && nr <= 32 && !self.kv_q8 && self.flags.fast && !self.flags.attn_old { ("ink_attn_128", 128) } else { ("ink_attn", 64) }
+    }
+}
+
+/// `flags` for a HIP `Gpu`, from the same variables as CUDA's: `STRATA_DS_FAST_KERNELS` `0`/`1` mean what they do
+/// there, but unset or `auto` is the fast set. `--fixed-experts` (`STRATA_FIXED_EXPERTS`) keeps the old kernels, as
+/// its output must stay bit-identical to Vulkan (`docs/HIP.md`).
+fn ink_flags_from(fast: Option<&str>, fixed: bool, ctrl: Option<&str>, attn_old: Option<&str>, attn_kp4: Option<&str>) -> crate::cuda::InkFlags {
+    let default = !fixed;
+    let fast = match fast {
+        None | Some("auto") => default,
+        Some("0") => false,
+        Some(_) => true,
+    };
+    // The tiled pair follows `fast` when `STRATA_CTRL_TILE` is unset, as on CUDA.
+    crate::cuda::InkFlags::from_parts(Some(if fast { "1" } else { "0" }), false, ctrl, attn_old, attn_kp4)
+}
+
+fn ink_flags() -> crate::cuda::InkFlags {
+    ink_flags_from(
+        std::env::var("STRATA_DS_FAST_KERNELS").ok().as_deref(),
+        std::env::var_os("STRATA_FIXED_EXPERTS").is_some(),
+        std::env::var("STRATA_CTRL_TILE").ok().as_deref(),
+        std::env::var("STRATA_DS_ATTN_OLD").ok().as_deref(),
+        std::env::var("STRATA_DS_ATTN_KP4").ok().as_deref(),
+    )
 }
 
 /// Pinned host allocation freed with the runtime that made it.
@@ -396,6 +494,14 @@ struct Staging {
     host: *mut u8,
     head: usize,
     busy: VecDeque<(usize, usize, Event)>,
+}
+
+impl Drop for Gpu {
+    /// Unlock what `pin_host` locked, before the mapping it belongs to goes.
+    fn drop(&mut self) {
+        let _ = self.wait();
+        for &(_, _, p) in self.pinned.read().unwrap().iter() { unsafe { (self.hip.host_unregister)(p as *mut c_void) }; }
+    }
 }
 
 /// A `hipEvent_t` that destroys itself.
@@ -420,6 +526,8 @@ impl Drop for Event {
 const GRAPHS_MAX: usize = 32;
 
 const RING: usize = 64 << 20;
+/// Mark events of the copy queue (`Gpu::mark`).
+const MARKS: usize = 64;
 const RING_MIN: usize = 256 << 10;
 
 fn alloc_raw(hip: &Arc<ffi::Hip>, bytes: usize) -> anyhow::Result<Buf> {
@@ -448,6 +556,24 @@ fn compile_cached(rtc: &ffi::Rtc, src: &str, arch: &str, tag: &str) -> anyhow::R
     Ok(b)
 }
 
+/// Free VRAM as the kernel driver counts it, for the amdgpu card at PCI address `bus`. When the runtime gives no
+/// address or no card has it, the card whose VRAM size is `total` (to 256 MiB; with two cards of one size that may be
+/// the other card). `hipMemGetInfo` counts only compute allocations, so the desktop and other graphics clients look
+/// free to it and a budget taken from it squeezes them out (the compositor then fails to pin its framebuffer).
+/// Vulkan's memory budget already counts them.
+fn drm_free(total: usize, bus: Option<&str>) -> Option<usize> {
+    let read = |p: std::path::PathBuf| std::fs::read_to_string(p).ok()?.trim().parse::<usize>().ok();
+    let free_where = |ours: &dyn Fn(&std::path::Path, usize) -> bool| std::fs::read_dir("/sys/class/drm").ok()?.flatten().find_map(|e| {
+        let dev = e.path().join("device");
+        let t = read(dev.join("mem_info_vram_total"))?;
+        if !ours(&dev, t) { return None }
+        Some(t.saturating_sub(read(dev.join("mem_info_vram_used"))?))
+    });
+    let at_bus = |dev: &std::path::Path, _| bus.is_some_and(|b| std::fs::canonicalize(dev).ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase())).is_some_and(|n| n == b));
+    free_where(&at_bus).or_else(|| free_where(&|_, t: usize| t.abs_diff(total) <= 256 << 20))
+}
+
 /// The kernel names to load: `cuda::kernel_names(false)` has no int8-mma GEMM, which needs no separate list here.
 fn kernel_names() -> Vec<String> { crate::cuda::kernel_names(false) }
 
@@ -462,36 +588,32 @@ impl Backend for Gpu {
         Ok(b)
     }
 
-    /// Queue a host-to-device copy on the stream and return once `src` may be reused: from pageable memory the
-    /// runtime stages the buffer inside the call, and large copies go through the pinned ring so the DMA does not
-    /// stop the host (expert streaming during prefill).
-    fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> {
-        anyhow::ensure!(off + src.len() <= dst.len(), "htod: {} bytes at {off} into {}", src.len(), dst.len());
-        if src.len() < RING_MIN {
-            let r = unsafe { (self.hip.memcpy_async)((dst.addr() + off as u64) as *mut c_void, src.as_ptr().cast(), src.len(),
-                                                     ffi::MEMCPY_H2D, self.stream) };
-            return self.hip.check(r, "hipMemcpyAsync(htod)");
-        }
-        let mut g = self.staging.lock().unwrap();
-        for (i, c) in src.chunks(RING).enumerate() {
-            if g.head + c.len() > RING { g.head = 0; }
-            let (a, b) = (g.head, g.head + c.len());
-            // Regions still being read by an earlier copy have to complete before the host overwrites them.
-            while g.busy.iter().any(|&(s, e, _)| s < b && a < e) {
-                let (_, _, ev) = g.busy.pop_front().unwrap();
-                self.hip.check(unsafe { (self.hip.event_sync)(ev.ev) }, "hipEventSynchronize")?;
+    /// `htod_on` the kernels' stream.
+    fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> { self.htod_on(self.stream, src, dst, off) }
+
+    fn htod_side(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()> { self.htod_on(self.side, src, dst, off) }
+
+    /// `hipHostRegister` of the pages under `data`, read-only when the runtime takes that flag (the model file is
+    /// mapped read-only).
+    fn pin_host(&self, data: &[u8]) -> anyhow::Result<bool> {
+        const PAGE: usize = 4096;
+        let (a, b) = (data.as_ptr() as usize, data.as_ptr() as usize + data.len());
+        if self.pinned.read().unwrap().iter().any(|&(s, e, _)| s <= a && b <= e) { return Ok(true); }
+        let (pa, pb) = (a & !(PAGE - 1), b.div_ceil(PAGE) * PAGE);
+        let mut last = 0;
+        for flags in [ffi::HOST_REGISTER_READ_ONLY | ffi::HOST_REGISTER_PORTABLE, ffi::HOST_REGISTER_PORTABLE] {
+            last = unsafe { (self.hip.host_register)(pa as *mut c_void, pb - pa, flags) };
+            if last == ffi::HIP_SUCCESS {
+                self.pinned.write().unwrap().push((pa, pb, pa));
+                return Ok(true);
             }
-            unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), g.host.add(a), c.len()) };
-            let r = unsafe { (self.hip.memcpy_async)((dst.addr() + (off + i * RING) as u64) as *mut c_void,
-                                                     g.host.add(a) as *const c_void, c.len(), ffi::MEMCPY_H2D, self.stream) };
-            self.hip.check(r, "hipMemcpyAsync(htod ring)")?;
-            let ev = Event::new(&self.hip)?;
-            ev.record(self.stream)?;
-            g.busy.push_back((a, b, ev));
-            g.head = b;
         }
-        Ok(())
+        self.hip.check(last, "hipHostRegister").map(|_| false)
     }
+    fn side_mark(&self) -> anyhow::Result<usize> { self.mark(self.side) }
+    fn main_waits(&self, m: usize) -> anyhow::Result<()> { self.wait_mark(self.stream, m) }
+    fn main_mark(&self) -> anyhow::Result<usize> { self.mark(self.stream) }
+    fn side_waits(&self, m: usize) -> anyhow::Result<()> { self.wait_mark(self.side, m) }
 
     fn dtoh(&self, src: &Buf, off: usize, dst: &mut [u8]) -> anyhow::Result<()> {
         anyhow::ensure!(off + dst.len() <= src.len(), "dtoh: {} bytes at {off} from {}", dst.len(), src.len());
@@ -517,7 +639,7 @@ impl Backend for Gpu {
     fn mem_info(&self) -> anyhow::Result<(usize, usize)> {
         let (mut free, mut total) = (0usize, 0usize);
         self.hip.check(unsafe { (self.hip.mem_get_info)(&mut free, &mut total) }, "hipMemGetInfo")?;
-        Ok((free, total))
+        Ok((free.min(drm_free(total, self.pci.as_deref()).unwrap_or(usize::MAX)), total))
     }
 
     fn sync(&self) -> anyhow::Result<()> { self.wait() }
@@ -750,6 +872,157 @@ impl Backend for Gpu {
     fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize, snap: u64, nsnap: usize) -> anyhow::Result<()> {
         launch!(self, "conv_seq", Self::grid(t * ch), qkv, state, w, y, ch as i32, kw as i32, t as i32);
         launch!(self, "conv_state", Self::grid(ch), qkv, state, ch as i32, kw as i32, t as i32, snap, nsnap as i32);
+        Ok(())
+    }
+    fn graph_drop(&self, key: u64) -> anyhow::Result<()> {
+        self.graphs.lock().unwrap().remove(&key);
+        Ok(())
+    }
+
+    fn situ(&self, y: u64, n: usize, rows: usize, scale: u64, beta: f32, lb: f32) -> anyhow::Result<()> {
+        launch!(self, "situ", Self::grid(n * rows), y, n as i32, rows as i32, scale, beta, lb);
+        Ok(())
+    }
+
+    fn situ_q(&self, y: u64, n: usize, rows: usize, s: u64, beta: f32, lb: f32, xq: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(n % 32 == 0, "situ_q: n ({n}) must be a multiple of 32");
+        launch!(self, "situ_q", cfg((n.div_ceil(256) as u32, rows as u32), 32, 0), y, n as i32, s, beta, lb, xq);
+        Ok(())
+    }
+
+    fn softcap(&self, x: u64, n: usize, cap: f32) -> anyhow::Result<()> {
+        launch!(self, "softcap", Self::grid(n), x, n as i32, cap);
+        Ok(())
+    }
+
+    fn hadamard(&self, x: u64, u: u64, s: u64, out: u64, n: usize, block: usize, rows: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(block <= 1024, "prism.hadamard.block_size {block}: at most 1024 on the GPU");
+        launch!(self, "hadamard", cfg(((rows * n / block) as u32, 1), block as u32, 0), x, u, s, out, n as i32, block as i32, 1.0 / (block as f32).sqrt());
+        Ok(())
+    }
+
+    // ---- Inkling 2 (the same kernels and launch shapes as src/cuda) ----
+
+    fn ink_mix_n(&self, blocks: u64, nb: usize, cur: u64, q: u64, nq: usize, out: u64, n: usize, nt: usize) -> anyhow::Result<()> {
+        launch!(self, "ink_mix", cfg((nq as u32, nt as u32), 256, 0), blocks, nb as i32, cur, q, out, n as i32, nt as i32);
+        Ok(())
+    }
+
+    fn ink_ctrl_n(&self, down: u64, gain: u64, forget: u64, cur: u64, nins: usize, msg: u64, gate: u64, out: u64, n: usize, rank: usize, count: usize, nt: usize) -> anyhow::Result<()> {
+        // As CUDA: a prompt chunk uses the tiled pair (a weight row is read once per 64 tokens), a decoded token
+        // the per-token pair. Both pairs read and write the same gate layout.
+        if nt >= 64 && rank <= 64 && n % 64 == 0 && self.flags.ctrl_tile {
+            let g1 = cfg((count as u32, nt.div_ceil(64) as u32), 256, 0);
+            let g2 = LaunchConfig { grid_dim: (count as u32, n.div_ceil(64) as u32, nt.div_ceil(64) as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            launch!(self, "ink_ctrl_gate_b", g1, down, cur, nins as i32, msg, gate, n as i32, rank as i32, nt as i32);
+            launch!(self, "ink_ctrl_out_b", g2, gain, forget, gate, cur, nins as i32, msg, out, n as i32, rank as i32, nt as i32);
+            return Ok(());
+        }
+        let g1 = LaunchConfig { grid_dim: (rank as u32, count as u32, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let g2 = LaunchConfig { grid_dim: (n.div_ceil(256) as u32, count as u32, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        launch!(self, "ink_ctrl_gate", g1, down, cur, nins as i32, msg, gate, n as i32, rank as i32, nt as i32);
+        launch!(self, "ink_ctrl_out", g2, gain, forget, gate, cur, nins as i32, msg, out, n as i32, rank as i32, nt as i32);
+        Ok(())
+    }
+
+    fn ink_conv(&self, cur: u64, w: u64, taps: u64, hist: u64, out: u64, n: usize, n_conv: usize, per: usize) -> anyhow::Result<()> {
+        launch!(self, "ink_conv", Self::grid(n), cur, w, taps, hist, out, n as i32, n_conv as i32, per as i32);
+        Ok(())
+    }
+
+    fn ink_conv_batch(&self, cur: u64, w: u64, taps: u64, hist: u64, out: u64, n: usize, n_conv: usize, per: usize, nt: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(cur != out, "ink_conv_batch: out must not alias cur");
+        anyhow::ensure!(n_conv <= 8, "ink_conv_batch: n_conv={n_conv} > 8");
+        launch!(self, "ink_conv_batch", cfg((n.div_ceil(256) as u32, nt as u32), 256, 0), cur, w, taps, hist, out, n as i32, n_conv as i32, per as i32, nt as i32, 0i32);
+        launch!(self, "ink_conv_batch", Self::grid(n), cur, w, taps, hist, out, n as i32, n_conv as i32, per as i32, nt as i32, 1i32);
+        Ok(())
+    }
+
+    fn ink_clip_n(&self, x: u64, scale: u64, w: usize, rows: usize, nt: usize, thr: f32, eps: f32, mul: f32,
+                  dst: u64, dst_at0: usize, dst_ring: usize, pos0: usize, log_alpha: f32, log_floor: f32) -> anyhow::Result<()> {
+        anyhow::ensure!(w <= 128, "ink_clip_n: w={w} > 128");
+        anyhow::ensure!(crate::cuda::kv_mode() == 0 || dst == 0 || w % 32 == 0, "ink_clip_n: quantized KV requires w % 32 == 0 (got {w})");
+        let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
+        let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
+        launch!(self, "ink_clip", cfg((rows as u32, nt as u32), 128, 0),
+            x, scale, w as i32, thr, eps, mul, dst, dst_at0 as i32, ring as i32, pos0 as i32, log_alpha, fl, 0u64);
+        Ok(())
+    }
+
+    fn ink_clip_pos(&self, x: u64, scale: u64, w: usize, rows: usize, nt: usize, thr: f32, eps: f32, mul: f32,
+                    dst: u64, dst_ring: usize, pos_ptr: u64, log_alpha: f32, log_floor: f32) -> anyhow::Result<()> {
+        anyhow::ensure!(w <= 128, "ink_clip_pos: w={w} > 128");
+        anyhow::ensure!(crate::cuda::kv_mode() == 0 || dst == 0 || w % 32 == 0, "ink_clip_pos: quantized KV requires w % 32 == 0 (got {w})");
+        let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
+        let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
+        launch!(self, "ink_clip", cfg((rows as u32, nt as u32), 128, 0),
+            x, scale, w as i32, thr, eps, mul, dst, 0i32, ring as i32, 0i32, log_alpha, fl, pos_ptr);
+        Ok(())
+    }
+
+    fn ink_attn(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, rows: usize, at: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
+        let (kn, ck) = self.ink_attn_kernel(hd, nr);
+        let chunks = rows.div_ceil(ck) as u32;
+        launch!(self, kn, cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, rows as i32, at as i32, 1i32, nkv as i32, hd as i32, nr as i32, ext as i32, 0u64);
+        launch!(self, "ink_attn_merge", cfg((nh as u32, 1), 128, 0), sc, gate, out, chunks as i32, hd as i32);
+        Ok(())
+    }
+
+    fn ink_attn_pos(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, max_rows: usize, ring: usize, pos_ptr: u64, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
+        let (kn, ck) = self.ink_attn_kernel(hd, nr);
+        let chunks = max_rows.div_ceil(ck) as u32;
+        launch!(self, kn, cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, 0i32, 0i32, ring.max(1) as i32, nkv as i32, hd as i32, nr as i32, ext as i32, pos_ptr);
+        launch!(self, "ink_attn_merge", cfg((nh as u32, 1), 128, 0), sc, gate, out, chunks as i32, hd as i32);
+        Ok(())
+    }
+
+    fn ink_attn_prefill(&self, q: u64, r: u64, sink: u64, gate: u64, kc: u64, vc: u64, kc_new: u64, vc_new: u64, bias: u64, out: u64,
+                        pos: usize, nt: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize, ring: usize, win: usize) -> anyhow::Result<()> {
+        // The key-parallel kernels are the same choice as CUDA's; they need the f16 cache (kp16/kp are compiled
+        // for KV_MODE 0 only). `win` rides in the kernel's `ring` argument as on CUDA's old path.
+        if hd == 128 && !self.kv_q8 && (self.flags.fast || self.flags.attn_kp4) && !self.flags.attn_old {
+            let (kn, qb) = if self.flags.attn_kp4 { ("ink_attn_prefill_128_kp", 4) } else { ("ink_attn_prefill_128_kp16", 16) };
+            launch!(self, kn, cfg((nt.div_ceil(qb) as u32, nh as u32), 128, 0),
+                q, r, sink, gate, kc, vc, kc_new, vc_new, bias, out,
+                pos as i32, nt as i32, nh as i32, nkv as i32, nr as i32, ext as i32, ring.max(1) as i32, win as i32);
+            return Ok(());
+        }
+        if hd == 128 && self.flags.attn_old {
+            launch!(self, "ink_attn_prefill_128_old", cfg((nt.div_ceil(4) as u32, nh as u32), 128, 0),
+                q, r, sink, gate, kc, vc, kc_new, vc_new, bias, out,
+                pos as i32, nt as i32, nh as i32, nkv as i32, nr as i32, ext as i32, ring.max(1) as i32, win as i32);
+            return Ok(());
+        }
+        let kn = match hd {
+            32 => "ink_attn_prefill_32",
+            64 => "ink_attn_prefill_64",
+            128 => "ink_attn_prefill_128",
+            _ => bail!("ink_attn_prefill: unsupported hd={hd}"),
+        };
+        launch!(self, kn, cfg((nt.div_ceil(4) as u32, nh as u32), 128, 0),
+            q, r, sink, gate, kc, vc, kc_new, vc_new, bias, out,
+            pos as i32, nt as i32, nh as i32, nkv as i32, nr as i32, ext as i32, ring.max(1) as i32, win as i32);
+        Ok(())
+    }
+
+    fn ink_ffn_sum_n(&self, acc: u64, d: u64, wts: u64, ne: usize, n: usize, nt: usize, cpu: u64) -> anyhow::Result<()> {
+        launch!(self, "ink_ffn_sum", cfg((n.div_ceil(256) as u32, nt as u32), 256, 0), acc, d, wts, ne as i32, n as i32, cpu);
+        Ok(())
+    }
+
+    fn ink_pool(&self) -> bool { true }
+    fn ink_slots(&self, ids: u64, wts: u64, table: u64, slots: u64, wh: u64, h: u64, mb: u64, nh: usize, h_off: usize, step: u64, k: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(k <= 32, "ink_slots: k={k}");
+        launch!(self, "ink_slots", cfg((1, 1), 256, 0), ids, wts, table, slots, wh, h, mb, nh as i32, h_off as i32, step, k as i32);
+        Ok(())
+    }
+    fn ink_ffn_sum_mb(&self, acc: u64, d: u64, wh: u64, k: usize, n: usize, mb: u64, y_off: usize, step: u64, slots: u64) -> anyhow::Result<()> {
+        launch!(self, "ink_ffn_sum_mb", cfg((n.div_ceil(256) as u32, 1), 256, 0), acc, d, wh, k as i32, n as i32, mb, y_off as i32, step, slots);
+        Ok(())
+    }
+    fn ink_route(&self, logits: u64, bias: u64, ids: u64, wts: u64, gu_sc: u64, dn_sc: u64, gsc_out: u64, n_expert: usize, k: usize, exp_scale: f32, rows: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(n_expert <= 512 && k <= 32, "ink_route: n_expert={n_expert} k={k}");
+        launch!(self, "ink_route", cfg((rows as u32, 1), 32, 0), logits, bias, ids, wts, gu_sc, dn_sc, gsc_out, n_expert as i32, k as i32, exp_scale);
         Ok(())
     }
 
@@ -1114,6 +1387,26 @@ mod tests {
                       at / (nh * hd), (at / hd) % nh, at % hd, want[at]);
             assert!(worst < 5e-3, "hd {hd}: max |diff| = {worst} at {at}");
         }
+    }
+
+    /// The desktop's VRAM is found on the card the device runs on, through its PCI address, and through the VRAM
+    /// size when no card has the address.
+    #[test]
+    fn drm_free_finds_the_device_by_its_pci_address() {
+        let g = match Gpu::new(0) {
+            Ok(g) => g,
+            Err(e) => { eprintln!("skipping: HIP unavailable: {e:#}"); return; }
+        };
+        let Some(bus) = g.pci.clone() else { eprintln!("skipping: no PCI address from the runtime"); return };
+        let (mut free, mut total) = (0usize, 0usize);
+        g.hip.check(unsafe { (g.hip.mem_get_info)(&mut free, &mut total) }, "hipMemGetInfo").unwrap();
+        let drm = drm_free(total, Some(&bus)).unwrap_or_else(|| panic!("no amdgpu card at {bus} in /sys/class/drm"));
+        eprintln!("{bus}: {:.2} GB free by the driver, {:.2} GB by HIP", drm as f64 / 1e9, free as f64 / 1e9);
+        assert!(drm <= total);
+        // The same card in another PCI function, which no card has: the size match finds the card.
+        let other = format!("{}{}", &bus[..bus.len() - 1], if bus.ends_with('7') { '6' } else { '7' });
+        let by_size = drm_free(total, Some(&other)).expect("the VRAM size finds the card when no card has the address");
+        assert!(by_size.abs_diff(drm) < 256 << 20, "{other}: {by_size} free, {bus}: {drm}");
     }
 
     /// The generated source compiles for this device through hiprtc (the CUDA source with `STRATA_HIP` taken).
