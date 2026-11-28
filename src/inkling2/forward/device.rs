@@ -90,9 +90,10 @@ impl Scratch {
     #[cfg(test)]
     pub(super) fn aligned(base: u64, c: &Inkling2Config, rank: usize, vocab: usize) -> bool {
         let s = Self::at(base, c, rank, vocab);
+        // `end` is the size of the region, not an address in it: it must not be checked against `base`.
         [s.cur, s.x, s.blocks, s.bank, s.outb, s.prelude, s.msg, s.ins, s.ins2, s.gate, s.nrm, s.nrm_xq, s.q, s.r,
             s.sink, s.og, s.k, s.v, s.kp, s.vp, s.att, s.proj, s.h, s.h2, s.hn, s.wh, s.step, s.y, s.d, s.ids, s.xh,
-            s.xq, s.wc, s.rlogits, s.amax, s.pos, s.acc, s.logits, s.end]
+            s.xq, s.wc, s.rlogits, s.amax, s.pos, s.acc, s.logits]
             .iter().all(|&at| (at - base) % 16 == 0)
     }
 }

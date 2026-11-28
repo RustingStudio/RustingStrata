@@ -27,22 +27,29 @@ pub(crate) mod dev {
         /// reuse its `ts` grows by a few entries a token.
         free_ts: Vec<usize>,
     }
-    /// The position a `pin` takes: one a previous `unpin` gave back, else the end of `ts`.
+    /// The position a `pin` takes: the lowest hole a previous `unpin` gave back, else the end of `ts`.
+    ///
+    /// Lowest, not highest: a high hole sits next to the tail, and refilling it keeps the tail occupied, so `give_ts`
+    /// could never reclaim it and `ts` would stay at its high-water mark under churn. Taking low holes leaves the
+    /// high ones free for the tail run.
     fn take_ts(ts: &mut Vec<GpuTensor>, free: &mut Vec<usize>, t: GpuTensor) -> usize {
-        // The last is the largest hole: reusing it keeps `ts` short while the pool is busy.
-        match free.pop() {
-            Some(i) => { ts[i] = t; i }
-            None => { ts.push(t); ts.len() - 1 }
+        if free.is_empty() {
+            ts.push(t);
+            return ts.len() - 1;
         }
+        // `free` is ascending, so the lowest hole is the front. A `Vec` of holes is short next to `ts`.
+        let i = free.remove(0);
+        ts[i] = t;
+        i
     }
-    /// Give a position back. `free` stays sorted ascending, so the largest hole is at the end: reclaiming the tail
-    /// is then a pop, not a scan of the whole list per reclaimed entry, and the largest hole is what `take_ts` reuses.
+    /// Give a position back. `free` stays sorted ascending, so the tail run is reclaimed from the back with a pop
+    /// rather than a scan of the whole list per reclaimed entry.
     fn give_ts(ts: &mut Vec<GpuTensor>, free: &mut Vec<usize>, i: usize) {
         ts[i] = GpuTensor::new(ts[i].ty, 0, 0, Buf::new(0, 0, ()));
         match free.binary_search(&i) {
-            // Already a hole: a second `unpin` of the same entry would give it away twice, and two later pins would
-            // write two experts into one position.
-            Ok(_) => return,
+            // Two `unpin`s of one entry would hand the same position out twice, and two pins would then write two
+            // experts into it. Catch it at the call site rather than as a wrong read much later.
+            Ok(_) => { debug_assert!(false, "give_ts: position {i} was already a hole"); return }
             Err(at) => free.insert(at, i),
         }
         while free.last().is_some_and(|&s| s + 1 == ts.len()) {
@@ -187,22 +194,38 @@ pub(crate) mod dev {
         let t = |i: u64| GpuTensor::new(GgmlType::F32, 1, 1, Buf::new(0x1000 + 8 * i, 8, ()));
         for i in 0..5 { take_ts(&mut ts, &mut free, t(i)); }
         assert_eq!(ts.len(), 5);
-        // The order that a top-only shrink gets wrong: 3 frees while 4 is still live, so `free` is [3, 1] when 4 goes.
+        // The order a top-only shrink gets wrong: 3 and 1 free while 4 is still live.
         give_ts(&mut ts, &mut free, 3);
         give_ts(&mut ts, &mut free, 1);
         assert_eq!((ts.len(), free.clone()), (5, vec![1, 3]), "holes under a live tail stay");
         give_ts(&mut ts, &mut free, 4);
-        // 4 and 3 go; 2 is still live, so `free` stops holding 3 (it was under the reclaimed run) and 1 stays.
         assert_eq!((ts.len(), free.clone()), (3, vec![1]), "the tail run 4, 3 is reclaimed");
-        // A re-pin takes the hole back instead of appending, and the position holds the new address.
+        // The lowest hole is reused, so the high ones stay free for the next tail reclaim.
         assert_eq!(take_ts(&mut ts, &mut free, t(9)), 1);
-        assert_eq!((ts.len(), ts[1].ptr), (3, 0x1000 + 72));
-        // A second give of the same position is ignored: a duplicate would let two pins share one entry.
+        assert_eq!((ts.len(), ts[1].ptr, free.clone()), (3, 0x1000 + 72, vec![]));
+        // The tail goes as soon as its slot is freed, with no holes left behind.
+        give_ts(&mut ts, &mut free, 2);
+        assert_eq!((ts.len(), free.clone()), (2, vec![]), "the tail shrinks");
+        // A pool that drains ends at its starting size.
+        give_ts(&mut ts, &mut free, 0);
         give_ts(&mut ts, &mut free, 1);
-        give_ts(&mut ts, &mut free, 1);
-        assert_eq!(free.iter().filter(|&&s| s == 1).count(), 1);
-        for i in [0, 1, 2] { give_ts(&mut ts, &mut free, i); }
         assert!(ts.is_empty() && free.is_empty(), "the pool ends at its starting size");
+    }
+
+    /// A second `give_ts` of one position is a caller bug that would hand it out twice. Debug builds stop at the call
+    /// site; release builds drop it instead of corrupting the list.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_duplicate_give_ts_is_caught_in_debug_builds() {
+        let (mut ts, mut free) = (vec![], vec![]);
+        let t = |i: u64| GpuTensor::new(GgmlType::F32, 1, 1, Buf::new(0x1000 + 8 * i, 8, ()));
+        take_ts(&mut ts, &mut free, t(0));
+        give_ts(&mut ts, &mut free, 0);
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| give_ts(&mut ts, &mut free, 0)));
+        std::panic::set_hook(hook);
+        assert!(caught.is_err(), "the duplicate must panic in a debug build");
     }
 
     fn open() -> Option<Dev> {
