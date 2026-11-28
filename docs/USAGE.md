@@ -287,11 +287,14 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 - A request whose last message has role `assistant` (and no tool calls) continues that message: the reply holds only
   the new text. The chat page's continue button uses this.
 - Thinking is on by default (`--think false` turns it off). A request overrides it with `chat_template_kwargs.enable_thinking`
-  (Anthropic: `thinking: {"type": "enabled"}`; `enable_thinking: false` turns it off for that request).
+  (Anthropic: `thinking: {"type": "enabled"}` or `{"type": "disabled"}`).
   Inkling 2 has no setting without thinking: at effort 0 (`--think false`, `enable_thinking: false` or
   `reasoning_effort: "none"`) the model itself still writes a short thinking block, in llama.cpp too. So with thinking
   off the engine makes the reply start with the answer. A request that declares tools keeps the short thinking block,
   because the tool calls get worse without it. A `reasoning_effort` in the request has priority over `enable_thinking`.
+- The reasoning comes apart from the answer: as `reasoning_content` on `/v1/chat/completions` (also in a reply that
+  ends in tool calls), and as a `thinking` block before the `text` block on `/v1/messages`. Streamed, that block's
+  pieces are `thinking_delta`s, and it stops after an empty `signature_delta` (a local model has no signature).
 - `tools` and `tool_choice` work as in the OpenAI API: calls come back as `tool_calls` with `finish_reason:
   "tool_calls"`. `tool_choice: "required"` does not force a call. A streamed chat on `/v1/chat/completions` sends each
   call's name as soon as the model writes it, and for a model with `<function=..>` calls (Qwen3.5, Qwen3.6, Qwen3
