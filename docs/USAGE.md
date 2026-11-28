@@ -343,8 +343,9 @@ where), a layer's FFN runs on the card that holds it, and the attention and tail
 
 `STRATA_DS_FAST_KERNELS` selects the kernels:
 
-- `auto` (default): the tiled controllers, `ink_attn_128` and the 16-query prefill (`kp16`) only when the run has more
-  than one device. One card keeps the `main` kernels, so the greedy output does not change.
+- `auto` (default): the tiled controllers, the 128-key decode attention (`ink_attn_128`, with `--kv q4`
+  `ink_attn_128_q4`) and the 16-query prefill (`kp16`, f16 cache) only when the run has more than one device. One card
+  keeps the `main` kernels, so the greedy output does not change.
 - `1`: force them on one card (the one-card kernel numbers in the PR).
 - `0`: force the old kernels on two cards (the A/B).
 

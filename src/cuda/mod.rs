@@ -17,12 +17,12 @@ pub(crate) const QTYPES: [GgmlType; 29] = {
     use GgmlType::*;
     [F32, BF16, F8E4M3, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_1, Q5_1, Q4_0, Q5_0, NVFP4]
 };
-pub(crate) const KERNELS: [&str; 71] = [
+pub(crate) const KERNELS: [&str; 72] = [
     "rope_freq", "rope_cs", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "situ_q", "softcap", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "kv_store_turbo", "attn_merge", "ha_post", "ha_wait", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8", "gemm_splitk_sum", "x_to_f16",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "dflash2_conv", "hadamard",
-    "ink_mix", "ink_ctrl_gate", "ink_ctrl_out", "ink_ctrl_gate_b", "ink_ctrl_out_b", "ink_conv", "ink_conv_batch", "ink_clip", "ink_attn", "ink_attn_128", "ink_attn_merge",
+    "ink_mix", "ink_ctrl_gate", "ink_ctrl_out", "ink_ctrl_gate_b", "ink_ctrl_out_b", "ink_conv", "ink_conv_batch", "ink_clip", "ink_attn", "ink_attn_128", "ink_attn_128_q4", "ink_attn_merge",
     "ink_attn_prefill_32", "ink_attn_prefill_64", "ink_attn_prefill_128", "ink_attn_prefill_128_old", "ink_attn_prefill_128_kp", "ink_attn_prefill_128_kp16", "ink_attn_prefill_sh_32", "ink_attn_prefill_sh_64", "ink_attn_prefill_sh_128", "ink_ffn_sum", "ink_route", "attn_sel", "vit_attn",
 ];
 
@@ -33,9 +33,10 @@ use crate::backend::ATT_SPLITS_1;
 /// lookup per launch is not worth it.
 #[derive(Clone, Copy)]
 struct InkFlags {
-    /// `STRATA_DS_FAST_KERNELS=auto` (default) uses the tiled controllers, `ink_attn_128` and `kp16` only when
-    /// the run has more than one device; `1` forces them on, `0` forces the old kernels. One card keeps the
-    /// `main` kernels (the greedy output must not change).
+    /// `STRATA_DS_FAST_KERNELS=auto` (default) uses the tiled controllers, the 128-key decode attention
+    /// (`ink_attn_128`, on a q4 cache `ink_attn_128_q4`) and `kp16` only when the run has more than one device;
+    /// `1` forces them on, `0` forces the old kernels. One card keeps the `main` kernels (the greedy output must not
+    /// change).
     fast: bool,
     /// `STRATA_CTRL_TILE=0` forces the per-token `ink_ctrl_*` pair; unset follows `fast`.
     ctrl_tile: bool,
@@ -993,13 +994,24 @@ impl Gpu {
     }
 }
 
+/// The decode attention entry point and its key positions per block, for the cache mode `kv_mode` (0 = f16, 2 = q4,
+/// 10 = K and V in different formats): at head_dim 128 an f16 and a q4 cache each have a kernel that scores a 128-key
+/// tile a block (`tile`: the fast kernels are on and `STRATA_DS_ATTN_OLD` is not set), the scalar one takes 64 keys
+/// and every format. A 128-key kernel keeps the relative-bias row in 32 shared floats, so a wider `nr` uses the
+/// scalar kernel. Pure so a CPU test can pin the choice.
+fn ink_attn_pick(kv_mode: u32, tile: bool, hd: usize, nr: usize) -> (&'static str, usize) {
+    match kv_mode {
+        0 if tile && hd == 128 && nr <= 32 => ("ink_attn_128", 128),
+        2 if tile && hd == 128 && nr <= 32 => ("ink_attn_128_q4", 128),
+        _ => ("ink_attn", 64),
+    }
+}
+
 impl Gpu {
-    /// The decode attention entry point and its key positions per block: the f16 head_dim 128 kernel scores a
-    /// 128-key tile a block, the scalar one 64 keys (`STRATA_DS_ATTN_OLD=1` keeps it for a measurement window;
-    /// the flag is cached in `flags` at `Gpu` creation). The 128-key kernel keeps the relative-bias row in 32
-    /// shared floats, so a wider `nr` uses the scalar kernel.
+    /// `ink_attn_pick` for this device (`STRATA_DS_ATTN_OLD=1` keeps the scalar kernel for a measurement window; the
+    /// flags are cached in `flags` at `Gpu` creation).
     pub(crate) fn ink_attn_kernel(&self, hd: usize, nr: usize) -> (&'static str, usize) {
-        if hd == 128 && nr <= 32 && self.kv_mode == 0 && self.flags.fast && !self.flags.attn_old { ("ink_attn_128", 128) } else { ("ink_attn", 64) }
+        ink_attn_pick(self.kv_mode, self.flags.fast && !self.flags.attn_old, hd, nr)
     }
 }
 
@@ -1920,8 +1932,8 @@ mod tests {
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 439);
-        assert_eq!(sm70.len(), 370);
+        assert_eq!(sm80.len(), 440);
+        assert_eq!(sm70.len(), 371);
         assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmd")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());
@@ -2119,5 +2131,21 @@ mod tests {
         assert!(kp4.attn_kp4 && !kp4.attn_old);
         let off = super::InkFlags::from_parts(None, true, Some("0"), Some("0"), Some("0"));
         assert!(!off.ctrl_tile && !off.attn_old && !off.attn_kp4);
+    }
+
+    /// The 128-key decode attention is for head_dim 128, a relative-bias row of at most 32 and an f16 or a q4 cache
+    /// (K and V both); every other cache format, a mixed one included, and the old-kernel settings keep `ink_attn`.
+    #[test]
+    fn ink_attn_pick_by_cache_format() {
+        let scalar = ("ink_attn", 64);
+        assert_eq!(super::ink_attn_pick(0, true, 128, 16), ("ink_attn_128", 128));
+        assert_eq!(super::ink_attn_pick(2, true, 128, 16), ("ink_attn_128_q4", 128));
+        assert_eq!(super::ink_attn_pick(2, true, 128, 32), ("ink_attn_128_q4", 128));
+        for kv in [1, 3, 4, 5, 6, 10] { assert_eq!(super::ink_attn_pick(kv, true, 128, 16), scalar, "kv mode {kv}"); }
+        for kv in [0, 2] {
+            assert_eq!(super::ink_attn_pick(kv, false, 128, 16), scalar, "kv mode {kv}: one card, or STRATA_DS_ATTN_OLD");
+            assert_eq!(super::ink_attn_pick(kv, true, 64, 16), scalar, "kv mode {kv}: head_dim 64");
+            assert_eq!(super::ink_attn_pick(kv, true, 128, 40), scalar, "kv mode {kv}: nr 40");
+        }
     }
 }
