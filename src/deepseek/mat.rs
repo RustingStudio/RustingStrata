@@ -29,19 +29,25 @@ pub(crate) mod dev {
     }
     /// The position a `pin` takes: one a previous `unpin` gave back, else the end of `ts`.
     fn take_ts(ts: &mut Vec<GpuTensor>, free: &mut Vec<usize>, t: GpuTensor) -> usize {
+        // The last is the largest hole: reusing it keeps `ts` short while the pool is busy.
         match free.pop() {
             Some(i) => { ts[i] = t; i }
             None => { ts.push(t); ts.len() - 1 }
         }
     }
-    /// Give a position back. Every hole at the end goes, not only when it is the top of `free`: that vector is in no
-    /// order, so the entry that makes the tail free may sit anywhere in it.
+    /// Give a position back. `free` stays sorted ascending, so the largest hole is at the end: reclaiming the tail
+    /// is then a pop, not a scan of the whole list per reclaimed entry, and the largest hole is what `take_ts` reuses.
     fn give_ts(ts: &mut Vec<GpuTensor>, free: &mut Vec<usize>, i: usize) {
         ts[i] = GpuTensor::new(ts[i].ty, 0, 0, Buf::new(0, 0, ()));
-        free.push(i);
-        while let Some(pos) = free.iter().position(|&s| s + 1 == ts.len()) {
+        match free.binary_search(&i) {
+            // Already a hole: a second `unpin` of the same entry would give it away twice, and two later pins would
+            // write two experts into one position.
+            Ok(_) => return,
+            Err(at) => free.insert(at, i),
+        }
+        while free.last().is_some_and(|&s| s + 1 == ts.len()) {
             ts.pop();
-            free.swap_remove(pos);
+            free.pop();
         }
     }
     pub struct SlabBuf { buf: Buf, bytes: usize, acct: usize, freed: std::sync::Arc<std::sync::atomic::AtomicUsize> }
@@ -184,13 +190,17 @@ pub(crate) mod dev {
         // The order that a top-only shrink gets wrong: 3 frees while 4 is still live, so `free` is [3, 1] when 4 goes.
         give_ts(&mut ts, &mut free, 3);
         give_ts(&mut ts, &mut free, 1);
-        assert_eq!((ts.len(), free.clone()), (5, vec![3, 1]), "holes under a live tail stay");
+        assert_eq!((ts.len(), free.clone()), (5, vec![1, 3]), "holes under a live tail stay");
         give_ts(&mut ts, &mut free, 4);
         // 4 and 3 go; 2 is still live, so `free` stops holding 3 (it was under the reclaimed run) and 1 stays.
         assert_eq!((ts.len(), free.clone()), (3, vec![1]), "the tail run 4, 3 is reclaimed");
         // A re-pin takes the hole back instead of appending, and the position holds the new address.
         assert_eq!(take_ts(&mut ts, &mut free, t(9)), 1);
         assert_eq!((ts.len(), ts[1].ptr), (3, 0x1000 + 72));
+        // A second give of the same position is ignored: a duplicate would let two pins share one entry.
+        give_ts(&mut ts, &mut free, 1);
+        give_ts(&mut ts, &mut free, 1);
+        assert_eq!(free.iter().filter(|&&s| s == 1).count(), 1);
         for i in [0, 1, 2] { give_ts(&mut ts, &mut free, i); }
         assert!(ts.is_empty() && free.is_empty(), "the pool ends at its starting size");
     }
