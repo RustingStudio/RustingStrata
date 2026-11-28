@@ -1113,7 +1113,8 @@ impl Device {
                 be.gemvq(out_w, pf.p.hn, n, pf.p.nrm_xq, pf.logits_buf.addr(), vrows, nt)?;
             } else {
                 be.rms_norm(pf.p.h, n, self.out_norm.addr(), pf.p.hn, n, n, nt, c.eps)?;
-                be.gemm_dense(out_w, nt, pf.p.hn, n, pf.logits_buf.addr(), vrows, 0)?;
+                be.gemm_dense(out_w, nt, pf.p.hn, n, pf.logits_buf.addr(), vrows,
+                    if be.name() == "cuda" { crate::backend::BATCHED } else { 0 })?;
             }
             if c.softcap != 0.0 {
                 be.softcap(pf.logits_buf.addr(), nt * vrows, c.softcap)?;
@@ -1184,11 +1185,14 @@ impl Device {
         nt <= if verify && be.name() == "cuda" { 6 } else { VERIFY_MAX }
     }
 
-    fn proj_n(be: &dyn Backend, w: &GpuTensor, small: bool, nt: usize, x: u64, xq: u64, y: u64, act: i32) -> Result<()> {
+    /// A verified draft checks several rows at once. On CUDA, mark its GEMMs as batched so the launcher uses the
+    /// few-row int8 kernel (weights are decoded into MMA fragments once) instead of the tile-list prefill GEMM.
+    /// Plain prefill keeps the old flag, and the matvec path (`small`) is unchanged.
+    fn proj_n(be: &dyn Backend, w: &GpuTensor, small: bool, nt: usize, x: u64, xq: u64, y: u64, act: i32, batched: bool) -> Result<()> {
         if small {
             be.gemvq(w, x, w.cols, xq, y, w.rows, nt)
         } else {
-            be.gemm_dense(w, nt, x, w.cols, y, w.rows, act)
+            be.gemm_dense(w, nt, x, w.cols, y, w.rows, if batched { act | crate::backend::BATCHED } else { act })
         }
     }
 
@@ -1211,6 +1215,7 @@ impl Device {
             let be = &*d.parts[0].be;
             let w = |x: &Mat| d.tensor(x.gpu.unwrap());
             let small = Self::small(be, nt, verify_mode);
+            let batched = verify_mode && !small && be.name() == "cuda";
             let (mut ins, mut n_in) = (*cur_a, 1);
             if let Some(q) = &l.res_query {
                 (ins, n_in) = (p.ins, q.len() / (4 * n));
@@ -1236,18 +1241,18 @@ impl Device {
             }
             let inp = |j: usize| p.nrm + f(j.min(n_n - 1) * nt * n);
             let sx = crate::backend::SAME_X;
-            Self::proj_n(be, w(&ml.wq), small, nt, inp(0), norm_xq(0), p.q, 0)?;
-            Self::proj_n(be, w(&ml.gate), small, nt, inp(0), norm_xq(0), p.og, sx)?;
-            Self::proj_n(be, w(&ml.rel), small, nt, inp(0), norm_xq(0), p.r, sx)?;
-            Self::proj_n(be, w(&ml.sink), small, nt, inp(0), norm_xq(0), p.sink, sx)?;
+            Self::proj_n(be, w(&ml.wq), small, nt, inp(0), norm_xq(0), p.q, 0, batched)?;
+            Self::proj_n(be, w(&ml.gate), small, nt, inp(0), norm_xq(0), p.og, sx, batched)?;
+            Self::proj_n(be, w(&ml.rel), small, nt, inp(0), norm_xq(0), p.r, sx, batched)?;
+            Self::proj_n(be, w(&ml.sink), small, nt, inp(0), norm_xq(0), p.sink, sx, batched)?;
             let k_sx = if n_n == 1 { sx } else { 0 };
-            Self::proj_n(be, w(&ml.wk), small, nt, inp(1), norm_xq(1), p.k, k_sx)?;
+            Self::proj_n(be, w(&ml.wk), small, nt, inp(1), norm_xq(1), p.k, k_sx, batched)?;
             if let Some([kp, _]) = &ml.conv_proj {
-                Self::proj_n(be, w(kp), small, nt, inp(1), norm_xq(1), p.kp, sx)?;
+                Self::proj_n(be, w(kp), small, nt, inp(1), norm_xq(1), p.kp, sx, batched)?;
             }
-            Self::proj_n(be, w(&ml.wv), small, nt, inp(2), norm_xq(2), p.v, k_sx)?;
+            Self::proj_n(be, w(&ml.wv), small, nt, inp(2), norm_xq(2), p.v, k_sx, batched)?;
             if let Some([_, vp]) = &ml.conv_proj {
-                Self::proj_n(be, w(vp), small, nt, inp(2), norm_xq(2), p.vp, sx)?;
+                Self::proj_n(be, w(vp), small, nt, inp(2), norm_xq(2), p.vp, sx, batched)?;
             }
             if verify_mode {
                 be.dtod(&pf.buf, (p.k - buf_o) as usize, &pf.conv_log, log_base, 4 * nt * kw)?;
@@ -1312,7 +1317,7 @@ impl Device {
                     }
                 }
             }
-            Self::proj_n(be, w(&ml.wo), small, nt, p.att, 0, p.proj, 0)?;
+            Self::proj_n(be, w(&ml.wo), small, nt, p.att, 0, p.proj, 0, batched)?;
             if verify_mode {
                 be.dtod(&pf.buf, (p.proj - buf_o) as usize, &pf.conv_log, log_base + 4 * VERIFY_MAX * 2 * kw, 4 * nt * n)?;
             }
@@ -1340,7 +1345,7 @@ impl Device {
                 m.lap(0, t_prep);
                 let t_gpu = std::time::Instant::now();
                 if fe.part == 0 {
-                    Self::pf_ffn_core(be, m, ip, fe, pf, nt, small, use_gemm)?;
+                    Self::pf_ffn_core(be, m, ip, fe, pf, nt, small, batched, use_gemm)?;
                 } else {
                     // Experts on GPU 1: the normed rows cross over, the experts run there, the sum comes back.
                     let r = self.rem.as_ref().ok_or_else(|| anyhow::anyhow!("experts on GPU 1 without a scratch there"))?;
@@ -1354,7 +1359,7 @@ impl Device {
                         let xh: Vec<f32> = be.get(&pf.buf, ((p.xh - o0) / 4) as usize, nt * xw)?;
                         be1.put(&xh, &pf1.buf, ((pf1.p.xh - o1) / 4) as usize)?;
                     }
-                    Self::pf_ffn_core(be1, m, ip, fe, pf1, nt, small, use_gemm)?;
+                    Self::pf_ffn_core(be1, m, ip, fe, pf1, nt, small, batched, use_gemm)?;
                     let acc: Vec<f32> = be1.get(&pf1.acc_buf, 0, nt * n)?;
                     be.put(&acc, &pf.acc_buf, 0)?;
                 }
@@ -1395,11 +1400,11 @@ impl Device {
     /// The routed experts of a prompt chunk on the GPU `be` runs on: from the normed rows in `pf.p.hn` (and, below the
     /// GEMM size, their quantized copy in `pf.p.xh`) to the weighted sum in `pf.acc_buf`.
     #[allow(clippy::too_many_arguments)]
-    fn pf_ffn_core(be: &dyn Backend, m: &Inkling2Model, ip: usize, fe: &FullExps, pf: &PrefillScratch, nt: usize, small: bool, use_gemm: bool) -> Result<()> {
+    fn pf_ffn_core(be: &dyn Backend, m: &Inkling2Model, ip: usize, fe: &FullExps, pf: &PrefillScratch, nt: usize, small: bool, batched: bool, use_gemm: bool) -> Result<()> {
         let (c, ml) = (&m.cfg, &m.layers[ip]);
         let (n, nf, k) = (c.n_embd, c.n_ff_exp, c.n_used);
         let (p, buf_o) = (pf.p, pf.buf.addr());
-        Self::proj_n(be, &fe.gate_inp, small, nt, p.hn, 0, p.rlogits, 0)?;
+        Self::proj_n(be, &fe.gate_inp, small, nt, p.hn, 0, p.rlogits, 0, batched)?;
         let gu_sc = fe.gu_scale.as_ref().map_or(0, |b| b.addr());
         let dn_sc = fe.dn_scale.as_ref().map_or(0, |b| b.addr());
         let gsc_out = if gu_sc != 0 { p.gsc } else { 0 };
