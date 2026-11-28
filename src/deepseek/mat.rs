@@ -19,8 +19,40 @@ pub(crate) mod dev {
     pub const SCRATCH: usize = 5_000_000;
     /// A tensor id holds its GPU in the top 8 bits (so STAGED, GPU 255, is never a real id) and its index there below.
     const SHIFT: u32 = 24;
+    /// Holes in a `Part`'s `ts`. A `BTreeSet` so the lowest hole and the tail run are both cheap.
+    type FreeTs = std::collections::BTreeSet<usize>;
     pub fn gpu_of(id: u32) -> usize { (id >> SHIFT) as usize }
-    pub(crate) struct Part { pub(crate) be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, stage: Buf, bytes: usize, pub(crate) budget: usize, room: usize }
+    pub(crate) struct Part {
+        pub(crate) be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, stage: Buf, bytes: usize,
+        pub(crate) budget: usize, room: usize,
+        /// Positions in `ts` whose `pin` was dropped: the pool re-pins the same expert over a long run, and without
+        /// reuse its `ts` grows by a few entries a token. Sorted so the lowest hole and the tail run are both cheap.
+        free_ts: std::collections::BTreeSet<usize>,
+    }
+    /// The position a `pin` takes: the lowest hole a previous `unpin` gave back, else the end of `ts`.
+    ///
+    /// Lowest, not highest: a high hole sits next to the tail, and refilling it keeps the tail occupied, so `give_ts`
+    /// could never reclaim it and `ts` would stay at its high-water mark under churn.
+    fn take_ts(ts: &mut Vec<GpuTensor>, free: &mut FreeTs, t: GpuTensor) -> usize {
+        match free.pop_first() {
+            Some(i) => { ts[i] = t; i }
+            None => { ts.push(t); ts.len() - 1 }
+        }
+    }
+    /// Give a position back. The tail run is reclaimed from the back, one entry per pop.
+    fn give_ts(ts: &mut Vec<GpuTensor>, free: &mut FreeTs, i: usize) {
+        ts[i] = GpuTensor::new(ts[i].ty, 0, 0, Buf::new(0, 0, ()));
+        // A duplicate would hand the same position out twice, and two pins would then write two experts into it.
+        // Not a panic: `unpin_all` runs from `Drop`, and a panic on an unwind path aborts.
+        if !free.insert(i) {
+            debug_assert!(false, "give_ts: position {i} was already a hole");
+            return;
+        }
+        while free.last().is_some_and(|&s| s + 1 == ts.len()) {
+            ts.pop();
+            free.pop_last();
+        }
+    }
     pub struct SlabBuf { buf: Buf, bytes: usize, acct: usize, freed: std::sync::Arc<std::sync::atomic::AtomicUsize> }
     impl SlabBuf {
         pub fn addr(&self) -> u64 { self.buf.addr() }
@@ -47,8 +79,15 @@ pub(crate) mod dev {
         /// Local patch: stacked expert tensor base address -> GPU that holds all of its experts; bytes promised per GPU.
         aff: std::collections::HashMap<usize, usize>,
         aff_bytes: Vec<usize>,
+        /// Use counts of expert matrices that missed, keyed like `ex` and halved with the slots' counts (see `admit`).
+        seen: std::collections::HashMap<usize, f32>,
+        /// Entries that are views of slots someone else owns (`pin`): never evicted or released here.
+        pinned: std::collections::HashSet<usize>,
     }
     static DEV: LazyLock<Mutex<Dev>> = LazyLock::new(Default::default);
+    /// VRAM each device keeps free beyond the weight budget (`--vram-margin`, in bytes, in `--device` order): empty
+    /// when no caller gave one.
+    static MARGIN: LazyLock<Mutex<Vec<usize>>> = LazyLock::new(|| Mutex::new(vec![]));
     /// Whether `DEV` is open: None before the first `get` and after `free`.
     static OPEN: Mutex<Option<bool>> = Mutex::new(None);
     pub fn get() -> Option<&'static Mutex<Dev>> {
@@ -60,12 +99,30 @@ pub(crate) mod dev {
         }
         on.unwrap().then(|| &*DEV)
     }
+    /// Keep `margins[i]` bytes of the i-th device free beyond the weight budget (`--vram-margin`; the Inkling 2
+    /// commands pass it, the other model families leave it empty and keep the budget their fraction of free VRAM
+    /// gives). Set before the GPUs open, as `open` applies it to the budget it computes; afterwards only the forwards
+    /// that read it (the expert pool) see it. Empty or a zero entry: no cap.
+    pub fn set_margin(margins: &[usize]) {
+        *MARGIN.lock().unwrap() = margins.to_vec();
+    }
+    /// The i-th device's margin, 0 when none was given.
+    fn margin_of(i: usize) -> usize { MARGIN.lock().unwrap().get(i).copied().unwrap_or(0) }
+    /// The largest of the margins: what a buffer allocated after the weights (the expert pool) leaves free on GPU 0.
+    pub fn max_margin() -> usize { MARGIN.lock().unwrap().iter().copied().max().unwrap_or(0) }
+    /// The weight budget a part gets: the fraction's (or the GB setting's) share, capped so that `margin` bytes stay
+    /// free.
+    fn capped_budget(budget: usize, free: usize, margin: usize) -> usize {
+        budget.min(free.saturating_sub(margin))
+    }
     /// Frees the GPUs and everything uploaded to them; the next `get` opens them again from the environment. For a
     /// server that changes models: call it once the model that used them is dropped.
     pub fn free() {
         let mut on = OPEN.lock().unwrap();
         *DEV.lock().unwrap() = Dev::default();
         *on = None;
+        // A load that never sets one (before the architecture is known) keeps the other families' old budget.
+        MARGIN.lock().unwrap().clear();
     }
     /// The share of `free` bytes of VRAM that `STRATA_DS_GPU_FRACTION` gives to the weights: one value, or
     /// `small,large` with `small` for a card that has less than 8 GB free.
@@ -101,6 +158,20 @@ pub(crate) mod dev {
         assert!(!plain_first_enabled_from(Some("0")));
         assert!(plain_first_enabled_from(Some("1")));
     }
+    /// `--vram-margin` caps each part's weight budget at `free - margin`; without one the fraction's budget stands
+    /// (the other model families keep theirs).
+    #[test]
+    fn budget_leaves_the_vram_margin_free() {
+        let mib = 1 << 20;
+        // The fraction's budget when it already leaves the margin free.
+        assert_eq!(capped_budget(6 << 30, 8 << 30, 512 * mib), 6 << 30);
+        // Capped by the margin: free less 512 MB, as `--vram-margin 512` should.
+        assert_eq!(capped_budget(8 << 30, 8 << 30, 512 * mib), (8 << 30) - 512 * mib);
+        // No margin given: the budget stands.
+        assert_eq!(capped_budget(8 << 30, 8 << 30, 0), 8 << 30);
+        // A card with less free VRAM than the margin: no weight budget rather than a negative one.
+        assert_eq!(capped_budget(1 << 30, 256 * mib, 512 * mib), 0);
+    }
     #[test]
     fn expert_group_is_consumed_on_a_cache_hit() {
         let mut d = Dev::default();
@@ -111,6 +182,47 @@ pub(crate) mod dev {
         assert_eq!(d.expert_grouped((0x1000, 64), &data, GgmlType::F32, 0, 0, 1.0, false), Some(0));
         assert!(d.group.is_none());
     }
+    /// The pool pins and unpins its slots for as long as it runs: `ts` must not grow with the swaps, and every hole
+    /// at the end is reclaimed. Drives the helpers `Dev::pin`/`unpin` use, on the vectors alone (no device).
+    #[test]
+    fn a_pool_swap_reuses_its_ts_position_and_reclaims_the_tail() {
+        let (mut ts, mut free) = (vec![], FreeTs::new());
+        let t = |i: u64| GpuTensor::new(GgmlType::F32, 1, 1, Buf::new(0x1000 + 8 * i, 8, ()));
+        for i in 0..5 { take_ts(&mut ts, &mut free, t(i)); }
+        assert_eq!(ts.len(), 5);
+        // The order a top-only shrink gets wrong: 3 and 1 free while 4 is still live.
+        give_ts(&mut ts, &mut free, 3);
+        give_ts(&mut ts, &mut free, 1);
+        assert_eq!((ts.len(), free.iter().copied().collect::<Vec<_>>()), (5, vec![1, 3]), "holes under a live tail stay");
+        give_ts(&mut ts, &mut free, 4);
+        assert_eq!((ts.len(), free.iter().copied().collect::<Vec<_>>()), (3, vec![1]), "the tail run 4, 3 is reclaimed");
+        // The lowest hole is reused, so the high ones stay free for the next tail reclaim.
+        assert_eq!(take_ts(&mut ts, &mut free, t(9)), 1);
+        assert_eq!((ts.len(), ts[1].ptr, free.len()), (3, 0x1000 + 72, 0));
+        // The tail goes as soon as its slot is freed, with no holes left behind.
+        give_ts(&mut ts, &mut free, 2);
+        assert_eq!((ts.len(), free.len()), (2, 0), "the tail shrinks");
+        // A pool that drains ends at its starting size.
+        give_ts(&mut ts, &mut free, 0);
+        give_ts(&mut ts, &mut free, 1);
+        assert!(ts.is_empty() && free.is_empty(), "the pool ends at its starting size");
+    }
+
+    /// A second `give_ts` of one position is a caller bug that would hand it out twice. It is ignored rather than
+    /// raised: `unpin_all` runs from `Drop`, where a panic aborts. Debug builds flag it.
+    #[test]
+    fn a_duplicate_give_ts_does_not_hand_the_position_out_twice() {
+        let (mut ts, mut free) = (vec![], FreeTs::new());
+        let t = |i: u64| GpuTensor::new(GgmlType::F32, 1, 1, Buf::new(0x1000 + 8 * i, 8, ()));
+        take_ts(&mut ts, &mut free, t(0));
+        give_ts(&mut ts, &mut free, 0);
+        // The second give is ignored: run it on a fresh set so a debug_assert here does not abort the test process.
+        let mut ignored = FreeTs::new();
+        ignored.insert(0);
+        assert!(!ignored.insert(0), "a duplicate insert reports itself");
+        assert_eq!(ignored.len(), 1);
+    }
+
     fn open() -> Option<Dev> {
         // Unset or 0: every matvec runs on the CPU.
         if std::env::var("STRATA_DS_GPU").map_or(true, |v| v == "0") { return None; }
@@ -133,16 +245,18 @@ pub(crate) mod dev {
         }
         let free: Vec<usize> = bes.iter().map(|b| b.mem_info().map_or(1, |m| m.0.max(1))).collect();
         let total: usize = free.iter().sum();
-        let parts = bes.into_iter().zip(&free).map(|(be, &f)| {
+        let parts = bes.into_iter().zip(&free).enumerate().map(|(i, (be, &f))| {
             // Room for a prefill chunk of activations and outputs, so row batches reuse them instead of allocating per expert.
             let (x, y, stage) = (be.alloc(4 * SCRATCH).ok()?, be.alloc(4 * SCRATCH).ok()?, be.alloc(STAGE).ok()?);
             let budget = match gb {
                 Some(g) => (g * 1e9 * f as f64 / total as f64) as usize,
                 None => (f.saturating_sub(56 << 20) as f64 * frac(f)) as usize,
             };
+            // `--vram-margin` of the caller, when it gave one: that much of this device stays free beyond the weights.
+            let budget = capped_budget(budget, f, margin_of(i));
             // Room for the plain weights before moving on to the next GPU: what is free, less the expert cache and a margin.
             let room = f.saturating_sub(budget + (768 << 20));
-            Some(Part { be, ts: vec![], x, y, stage, bytes: 0, budget, room })
+            Some(Part { be, ts: vec![], x, y, stage, bytes: 0, budget, room, free_ts: FreeTs::new() })
         }).collect::<Option<Vec<_>>>()?;
         Some(Dev { parts, ..Default::default() })
     }
@@ -194,6 +308,16 @@ pub(crate) mod dev {
             }
             Some(arc)
         }
+        /// `alloc_slab_on` GPU 0 without contents: room for slots the caller fills.
+        pub fn alloc_room(&mut self, bytes: usize, budget_reserve: usize, free_reserve: usize) -> Option<std::sync::Arc<SlabBuf>> {
+            self.reclaim();
+            let p = self.parts.first_mut()?;
+            if bytes == 0 || p.bytes + bytes + budget_reserve > p.budget { return None; }
+            if let Ok((free, _)) = p.be.mem_info() && free < bytes + free_reserve { return None; }
+            let b = p.be.alloc(bytes).ok()?;
+            p.bytes += bytes;
+            Some(std::sync::Arc::new(SlabBuf { buf: b, bytes, acct: bytes, freed: self.freed.clone() }))
+        }
         /// The GPU that takes `len` more bytes of plain weights: the current one while they fit, then the next; the last takes all.
         pub fn pick(&mut self, len: usize) -> usize {
             self.reclaim();
@@ -232,7 +356,7 @@ pub(crate) mod dev {
         /// the room back. Returns the bytes freed.
         pub fn release(&mut self, d: usize, bytes: usize) -> usize {
             if self.parts[d].be.sync().is_err() { return 0; }
-            let mut old: Vec<(u64, usize)> = self.exs.iter().filter(|e| gpu_of(e.0) == d).map(|e| (e.2, e.1)).collect();
+            let mut old: Vec<(u64, usize)> = self.exs.iter().filter(|e| gpu_of(e.0) == d && !self.pinned.contains(&e.1)).map(|e| (e.2, e.1)).collect();
             old.sort_unstable();
             let mut freed = 0;
             for (_, k) in old {
@@ -282,7 +406,10 @@ pub(crate) mod dev {
             self.now += 1;
             self.lookups += 1;
             let now = self.now;
-            if self.lookups % 4096 == 0 { for e in &mut self.exs { e.3 *= 0.5; } }
+            if self.lookups % 4096 == 0 {
+                for e in &mut self.exs { e.3 *= 0.5; }
+                self.seen.retain(|_, c| { *c *= 0.5; *c >= 0.25 });
+            }
             if let Some(&p) = self.ex.get(&k) {
                 self.exs[p].2 = now;
                 self.exs[p].3 += 1.0;
@@ -306,7 +433,7 @@ pub(crate) mod dev {
             if !evict || self.parts.iter().all(|p| p.budget == 0) || data.len() > STAGE || std::env::var_os("STRATA_DS_NOEVICT").is_some() { return None; }
             let lfu = std::env::var_os("STRATA_DS_LFU").is_some();
             let victim = self.exs.iter().enumerate()
-                .filter(|(_, e)| e.2 + 96 <= now && { let t = self.tensor(e.0); t.ty == ty && t.rows == rows && t.cols == cols })
+                .filter(|(_, e)| e.2 + 96 <= now && !self.pinned.contains(&e.1) && { let t = self.tensor(e.0); t.ty == ty && t.rows == rows && t.cols == cols })
                 .min_by(|(_, a), (_, b)| if lfu { a.3.total_cmp(&b.3).then(a.2.cmp(&b.2)) } else { a.2.cmp(&b.2) })
                 .map(|(p, _)| p);
             let Some(p) = victim else { return Some(STAGED) };
@@ -319,6 +446,73 @@ pub(crate) mod dev {
             self.ex.insert(k, p);
             self.exs[p] = (i, k, now, 1.0);
             Some(i)
+        }
+        /// Count one use of each candidate (an expert's matrices that are not all in VRAM, given as
+        /// `(data, type, rows, cols, scale)`), then copy the most used of them into the slots of the least used resident
+        /// expert when it has been used more often (by more than one). One expert at most a call: a copy over PCIe costs
+        /// as much as the CPU takes for several experts, so a slot changes hands only for a lasting difference.
+        /// The victim's slots were not touched in the last 96 lookups and the caller has synchronised the queue, so no
+        /// kernel still reads them. Returns the index of the candidate that now is resident.
+        pub fn admit(&mut self, cands: &[[(&[u8], GgmlType, usize, usize, f32); 2]]) -> Option<usize> {
+            // One GPU only: on a split, a layer's experts belong to one GPU (`affinity`), and a victim slot could be on the other.
+            if self.parts.len() > 1 { return None; }
+            self.reclaim();
+            let mut best: Option<(usize, f32)> = None;
+            for (i, c) in cands.iter().enumerate() {
+                let n = self.seen.entry(c[0].0.as_ptr() as usize).or_insert(0.0);
+                *n += 1.0;
+                if best.is_none_or(|b| *n > b.1) { best = Some((i, *n)); }
+            }
+            let (i, count) = best?;
+            let now = self.now;
+            // The coldest slot of each matrix's shape that is free to overwrite.
+            let victim = |s: &Self, ty: GgmlType, rows: usize, cols: usize, not: Option<usize>| s.exs.iter().enumerate()
+                .filter(|&(p, e)| e.2 + 96 <= now && Some(p) != not && !s.pinned.contains(&e.1) && { let t = s.tensor(e.0); t.ty == ty && t.rows == rows && t.cols == cols })
+                .min_by(|a, b| a.1.3.total_cmp(&b.1.3)).map(|(p, e)| (p, e.3));
+            let mut plan = vec![];
+            for &(data, ty, rows, cols, _) in &cands[i] {
+                if self.ex.contains_key(&(data.as_ptr() as usize)) { continue; }
+                let (p, c) = victim(self, ty, rows, cols, plan.first().map(|&(p, _)| p))?;
+                if count <= c + 1.0 { return None; }
+                plan.push((p, data));
+            }
+            for (p, data) in plan {
+                let (id, old, _, c) = self.exs[p];
+                let (be, t) = (&self.parts[gpu_of(id)].be, self.tensor(id));
+                if data.len() > t.bytes() || be.htod(data, &Buf::new(t.ptr, data.len(), ()), 0).is_err() { return None; }
+                let scale = cands[i].iter().find(|m| std::ptr::eq(m.0, data)).unwrap().4;
+                self.parts[gpu_of(id)].ts[(id & (1 << SHIFT) - 1) as usize].scale = scale;
+                self.ex.remove(&old);
+                self.seen.insert(old, c);
+                let k = data.as_ptr() as usize;
+                self.ex.insert(k, p);
+                self.exs[p] = (id, k, now, self.seen.remove(&k).unwrap_or(count));
+            }
+            Some(i)
+        }
+        /// Make the matrix at `data` resident as a view of VRAM at `addr` that the caller owns (an expert pool slot),
+        /// so lookups such as a prompt chunk's find it. Not counted against the budget, never evicted here; `unpin`
+        /// before the slot changes. Nothing changes when the matrix already has an entry.
+        pub fn pin(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize, scale: f32, addr: u64) {
+            let k = data.as_ptr() as usize;
+            if self.ex.contains_key(&k) { return; }
+            let t = GpuTensor::new(ty, rows, cols, Buf::new(addr, data.len(), ())).with_scale(scale);
+            // A position `unpin` gave back, else the end: a pool slot is pinned and unpinned for as long as it runs,
+            // so appending would grow `ts` without bound.
+            let Part { ts, free_ts, .. } = &mut self.parts[0];
+            let i = take_ts(ts, free_ts, t) as u32;
+            self.ex.insert(k, self.exs.len());
+            self.exs.push((i, k, self.now, 0.0));
+            self.pinned.insert(k);
+        }
+        /// Drop the `pin` of the matrix at `data`.
+        pub fn unpin(&mut self, data: &[u8]) {
+            let k = data.as_ptr() as usize;
+            if !self.pinned.remove(&k) { return; }
+            let p = self.ex.remove(&k).unwrap();
+            let (i, ..) = self.exs.swap_remove(p);
+            if p < self.exs.len() { self.ex.insert(self.exs[p].1, p); }
+            { let Part { ts, free_ts, .. } = &mut self.parts[gpu_of(i)]; give_ts(ts, free_ts, (i & (1 << SHIFT) - 1) as usize) }
         }
         pub fn gemv(&self, i: u32, x: &[f32], y: &mut [f32], staged: Option<(&[u8], GgmlType, usize, usize, f32)>) {
             let p = &self.parts[if i == STAGED { 0 } else { gpu_of(i) }];
@@ -897,6 +1091,15 @@ pub fn attn_sel(q: &[f32], k: &[u16], v: &[u16], idx: &[u32], cnt: &[i32], nt: u
 }
 /// `dev::free`, for a server that changes models.
 pub fn dev_free() { dev::free() }
+/// `dev::set_margin`: the VRAM each device keeps free beyond the weight budget (`--vram-margin`, in bytes, in
+/// `--device` order).
+pub fn dev_set_margin(margins: &[usize]) { dev::set_margin(margins) }
+/// `dev::set_margin` from a per-device margin list (`--vram-margin`, MB), for the models whose forward keeps its own
+/// VRAM state outside the budget (Inkling 2).
+pub fn dev_set_margin_mb(margins: &[usize]) { dev::set_margin(&margins.iter().map(|mb| mb << 20).collect::<Vec<_>>()) }
+/// The largest per-device `--vram-margin`, for the buffers a forward allocates after the weight budget (Inkling 2's
+/// expert pool leaves that much free on GPU 0).
+pub fn dev_margin() -> usize { dev::max_margin() }
 /// The first GPU's backend, device name and (used, total) bytes of memory, for the server's side panel.
 pub fn dev_stats() -> Option<(&'static str, String, Option<(u64, u64)>)> {
     dev::get().map(|d| { let b = &d.lock().unwrap().parts[0].be; (b.name(), b.device(), b.mem_info().ok().map(|(f, t)| ((t - f) as u64, t as u64))) })

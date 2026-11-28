@@ -2564,6 +2564,59 @@ extern "C" __global__ void vit_attn(const float* q, const float* k, const float*
     }
 }
 
+// Inkling 2 decode, after ink_route: the expert pool lookup of the k routed experts (slots[j] = table[ids[j]], -1 =
+// on the CPU; wh[j] = wts[j] on a hit, else 0), the routing copied to the host-mapped mailbox `mb` (cpu_worker's
+// layout for one token), and the request flag raised with the activation `h` when an expert missed, else only the
+// skip flag. One block; step[1] is the CPU worker's sequence number.
+extern "C" __global__ void ink_slots(const int* ids, const float* wts, const int* table, int* slots, float* wh,
+                                     const float* h, unsigned int* mb, int nh, int h_off, const int* step, int k) {
+    __shared__ int miss;
+    unsigned int seq = step[1];
+    if (threadIdx.x == 0) miss = 0;
+    __syncthreads();
+    if (threadIdx.x < k) {
+        int j = threadIdx.x, id = ids[j], s = table[id];
+        float w = wts[j];
+        slots[j] = s; wh[j] = s >= 0 ? w : 0.0f;
+        mb[32 + j] = id; mb[32 + k + j] = __float_as_uint(w); mb[32 + 2 * k + j] = s;
+        if (s < 0) miss = 1;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) mb[1] = 1;
+    if (!miss) { if (threadIdx.x == 0) ((volatile unsigned int*)mb)[2] = seq; return; }
+    for (int i = threadIdx.x; i < nh; i += blockDim.x) mb[h_off + i] = __float_as_uint(h[i]);
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) *(volatile unsigned int*)mb = seq;
+}
+
+// ink_ffn_sum of the pool's experts (wh, 0 for an expert on the CPU) plus, when one missed, the CPU worker's sum at
+// word y_off of the mailbox, once its done flag is step[1].
+extern "C" __global__ void ink_ffn_sum_mb(float* acc, const float* d, const float* wh, int k, int n, const unsigned int* mb,
+                                          int y_off, const int* step, const int* slots) {
+    unsigned int seq = step[1];
+    __shared__ int miss;
+    if (threadIdx.x == 0) {
+        int m = 0;
+        for (int j = 0; j < k; j++) m |= slots[j] < 0;
+        if (m) {
+            unsigned int spins = 0;
+            while (((volatile const unsigned int*)mb)[16] != seq) {
+                __nanosleep(100);
+                if (++spins == (1u << 27)) __trap();  // ~15 s: CPU worker gone
+            }
+            __threadfence_system();
+        }
+        miss = m;
+    }
+    __syncthreads();
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    float o = miss ? __uint_as_float(((volatile const unsigned int*)mb)[y_off + c]) : 0.f;
+    for (int e = 0; e < k; e++) if (wh[e] != 0.f) o += wh[e] * d[(size_t)e * n + c];
+    acc[c] = o;
+}
+
 __device__ __forceinline__ unsigned ink_f2key(float x) {
     unsigned u = __float_as_uint(x == 0.0f ? 0.0f : x);
     return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);

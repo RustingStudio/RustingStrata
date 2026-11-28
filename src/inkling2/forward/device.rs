@@ -44,20 +44,22 @@ struct DSlot { k: Buf, v: Buf, hist: Buf, cap: usize }
 /// prompt chunk on, a prefill scratch. The activations come over the host once per layer run (about 10 KB per token).
 struct Remote { part: usize, scr: Buf, s: Scratch, pf: Option<PrefillScratch> }
 
-/// Tokens of one prompt chunk on the device: `STRATA_DS_PF_TOKENS` (default 256 on one card, 512 on two or more;
-/// at most 2048).
+/// Tokens of one prompt chunk on the device: `STRATA_DS_PF_TOKENS` (default 2048 on one card, 512 on two or more;
+/// at most 2048). On one card each chunk copies the pool's missing experts into the
+/// staging slots again, so a longer chunk spreads that copy over more tokens; the scratch costs about 0.55 GB of VRAM
+/// per 1024 rows, and `prefill_rows` halves the chunk when VRAM has no room for it.
 pub(super) fn pf_tokens() -> usize {
     let multi = std::env::var("STRATA_DS_DEVICES")
         .map_or(false, |v| v.split(',').filter(|d| !d.trim().is_empty()).count() > 1);
-    let default = if multi { 512 } else { 256 };
+    let default = if multi { 512 } else { 2048 };
     std::env::var("STRATA_DS_PF_TOKENS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(default).clamp(1, 2048)
 }
 
 /// Device addresses of the regions of the decode scratch buffer (`sc` lives in `Device::sc_buf` so `--ctx` scales dynamically).
 #[derive(Clone, Copy)]
-struct Scratch {
+pub(super) struct Scratch {
     cur: u64, x: u64, blocks: u64, bank: u64, outb: u64, prelude: u64, msg: u64, ins: u64, ins2: u64, gate: u64, nrm: u64, nrm_xq: u64,
-    q: u64, r: u64, sink: u64, og: u64, k: u64, v: u64, kp: u64, vp: u64, att: u64, proj: u64, h: u64, h2: u64, hn: u64,
+    q: u64, r: u64, sink: u64, og: u64, k: u64, v: u64, kp: u64, vp: u64, att: u64, proj: u64, h: u64, h2: u64, hn: u64, wh: u64, step: u64,
     y: u64, d: u64, ids: u64, xh: u64, xq: u64, wc: u64, rlogits: u64, amax: u64, pos: u64, acc: u64, logits: u64, end: u64,
 }
 
@@ -65,14 +67,36 @@ impl Scratch {
     fn at(base: u64, c: &Inkling2Config, rank: usize, vocab: usize) -> Self {
         let (n, q, mut a) = (c.n_embd, c.n_head * c.head_dim, base);
         let xq_row_floats = (n + n.div_ceil(32) * 4).div_ceil(16) * 4;
-        let mut f = |floats: usize| { a += 4 * floats as u64; a - 4 * floats as u64 };
+        // Every region starts at a multiple of 4 floats (16 bytes): `situ_q` and the other kernels read `float4`, and
+        // an unaligned address faults on CUDA. `wh` and `step` are padded at their fields too, so a reader of
+        // `c.n_used` floats reads what it always did; the rounding here also covers `ids`, `wc`, `pos` and any other
+        // region whose width is not a multiple of 4 floats on some config.
+        let mut f = |floats: usize| {
+            let at = a;
+            a += 4 * floats.next_multiple_of(4) as u64;
+            at
+        };
         Scratch {
             cur: f(n), x: f(n), blocks: f(4 * n), bank: f(4 * n), outb: f(n), prelude: f(n), msg: f(4 * n), ins: f(3 * n), ins2: f(3 * n),
             gate: f(4 * rank), nrm: f(3 * n), nrm_xq: f(3 * xq_row_floats), q: f(q), r: f(c.n_head * c.n_rel), sink: f(c.n_head), og: f(q), k: f(c.n_head_kv * c.head_dim),
             v: f(c.n_head_kv * c.head_dim), kp: f(c.n_head_kv * c.n_conv), vp: f(c.n_head_kv * c.n_conv), att: f(q), proj: f(n), h: f(n),
-            h2: f(n), hn: f(n), y: f(c.n_used * 2 * c.n_ff_exp), d: f(c.n_used * n), ids: f(3 * c.n_used), xh: f(n), xq: f(c.n_used * c.n_ff_exp), wc: f(c.n_used + n), rlogits: f(c.n_expert), amax: f(16), pos: f(1), acc: f(n),
+            h2: f(n), hn: f(n), wh: f(c.n_used.next_multiple_of(4)), step: f(4), y: f(c.n_used * 2 * c.n_ff_exp), d: f(c.n_used * n), ids: f(3 * c.n_used), xh: f(n), xq: f(c.n_used * c.n_ff_exp), wc: f(c.n_used + n), rlogits: f(c.n_expert), amax: f(16), pos: f(1), acc: f(n),
             logits: f(vocab), end: a - base,
         }
+    }
+
+    /// Every region starts on a multiple of 4 floats and the buffer's total is one too: the kernels that read `float4`
+    /// need the first, and `end` is the size the scratch buffer is allocated with, so a misaligned `end` would make
+    /// the last region run past the allocation. `end` is an offset from `base` (the size), so it is checked directly
+    /// rather than against `base`.
+    #[cfg(test)]
+    pub(super) fn aligned(base: u64, c: &Inkling2Config, rank: usize, vocab: usize) -> bool {
+        let s = Self::at(base, c, rank, vocab);
+        [s.cur, s.x, s.blocks, s.bank, s.outb, s.prelude, s.msg, s.ins, s.ins2, s.gate, s.nrm, s.nrm_xq, s.q, s.r,
+            s.sink, s.og, s.k, s.v, s.kp, s.vp, s.att, s.proj, s.h, s.h2, s.hn, s.wh, s.step, s.y, s.d, s.ids, s.xh,
+            s.xq, s.wc, s.rlogits, s.amax, s.pos, s.acc, s.logits]
+            .iter().all(|&at| (at - base) % 16 == 0)
+            && s.end % 16 == 0
     }
 }
 
@@ -183,6 +207,7 @@ pub(super) struct Device {
     pf: Option<PrefillScratch>,
     s: Scratch,
     rank: usize,
+    /// Every layer's experts run on the device: in a slab, or in `pool` with the CPU worker for the rest.
     all_full: bool,
     /// GPU 1's share of the FFN layers (None when every layer's experts are on GPU 0).
     rem: Option<Remote>,
@@ -190,8 +215,10 @@ pub(super) struct Device {
     seg_graph: bool,
     /// Blocks in the depth mix after the loop (what `layer_attn` counted when the loop graph was recorded).
     loop_nb: usize,
-    /// Key of the recorded `step_fast` graph, by `argmax` (0: none).
-    graph_keys: [u64; 2],
+    /// VRAM slots and the CPU worker for the layers without a slab (decode only; None under `--fixed-experts`).
+    pool: Option<super::pool::Pool>,
+    /// Keys of the recorded `step_fast` graphs, by `argmax`, and of `core_graph` (0: none).
+    graph_keys: [u64; 3],
     /// Positions whose rows both sides hold, and whether the device has run tokens after them.
     synced: usize,
     ahead: bool,
@@ -213,6 +240,20 @@ fn grown(need: usize, max_ctx: usize) -> usize { (need + need / 4).next_multiple
 fn room(d: &mut dev::Dev, need: usize) {
     let free = d.parts[0].be.mem_info().map_or(0, |m| m.0);
     if free < need { d.release(0, need - free); }
+}
+
+/// Bytes GPU 0 still needs free after the expert pool: the K/V rows of the layers that grow, to `rows` (the configured
+/// context), plus as many again for the rows they hold during a growth (`prepare` allocates the new buffer before it
+/// frees the old, and after earlier prompts the old one can be up to `rows` long, not the rows of the load), the
+/// score buffer for them, the prefill scratch of `pf_tokens()` rows (allocated before the K/V growth) and the reserve
+/// `prepare` keeps. The pool leaves this much (or `--vram-margin`, whichever is larger) free, so the K/V growth of a 16k
+/// prompt finds the room it needs instead of dropping the pool, and the prompt scratch is allocated once instead of
+/// being halved to 256 rows (`prefill_rows`).
+fn state_bytes(be: &dyn Backend, c: &Inkling2Config, kw: usize, rows: usize, nt: usize, vocab_rows: usize, rank: usize) -> usize {
+    let n_att = (0..c.n_slot()).filter(|&il| !c.swa[layer_of(c, il)]).count();
+    let kv = |r: usize| 2 * n_att * r * be.kv_row_words(kw);
+    2 * kv(rows) + sc_bytes(c, rows) + PrefillScratch::bytes(be, c, rank, vocab_rows, nt, false)
+        + Scratch::at(0, c, rank, vocab_rows).end as usize + (512 << 20)
 }
 
 /// Bytes of the attention partials for `rows` full-attention rows.
@@ -255,6 +296,17 @@ fn shapes_fit(m: &Inkling2Model, rank: usize) -> bool {
 }
 
 /// The layer whose weights slot `il` runs.
+/// (slot, layer) of each layer run of a token, in the order it runs them.
+fn run_order(c: &Inkling2Config) -> Vec<(usize, usize)> {
+    let core = c.loop_end - c.loop_start;
+    let mut runs: Vec<(usize, usize)> = (0..c.loop_start).map(|il| (il, il)).collect();
+    for pass in 0..c.loop_count {
+        runs.extend((c.loop_start..c.loop_end).map(|ip| (if pass == 0 { ip } else { c.n_layer + (pass - 1) * core + ip - c.loop_start }, ip)));
+    }
+    runs.extend((c.loop_end..c.n_layer).map(|il| (il, il)));
+    runs
+}
+
 fn layer_of(c: &Inkling2Config, il: usize) -> usize {
     if il < c.n_layer { il } else { c.loop_start + (il - c.n_layer) % (c.loop_end - c.loop_start) }
 }
@@ -338,7 +390,13 @@ impl Device {
             let cpu_share = std::env::var("STRATA_DS_CPU_SHARE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
             let (mut n_full, mut slab_bytes, mut per_part) = (0usize, 0usize, [0usize; 2]);
             let mut rem: Option<Remote> = None;
-            if cpu_share <= 0.0 && c.n_expert <= 512 && c.n_used <= 32 {
+            // With the expert pool (`pool`), every layer keeps its most used experts in VRAM instead: no slabs.
+            // STRATA_INK_SLABS=1 keeps the slabs and pools only the layers they leave out. One GPU only: a split
+            // keeps upstream's slabs on both cards.
+            let one_gpu = dev::get().unwrap().lock().unwrap().parts.len() == 1;
+            let pooled = one_gpu && cpu_share <= 0.0 && std::env::var_os("STRATA_FIXED_EXPERTS").is_none()
+                && std::env::var_os("STRATA_INK_SLABS").is_none() && dev::get().unwrap().lock().unwrap().parts[0].be.ink_pool();
+            if cpu_share <= 0.0 && c.n_expert <= 512 && c.n_used <= 32 && !pooled {
                 let (b_res, f_res) = (64 << 20, 384 << 20);
                 let (n_parts, pf_cap, vocab) = (dev::get().unwrap().lock().unwrap().parts.len().min(2), pf_tokens(), m.output.rows);
                 let (res0, res1) = {
@@ -411,16 +469,32 @@ impl Device {
                 }
             }
             if std::env::var_os("STRATA_DS_PROF").is_some() {
-                crate::say!("inkling2: preloaded {n_full}/{} expert layers ({:.2} GB: {:.2} on GPU 0, {:.2} on GPU 1) as contiguous slabs",
-                    c.n_layer, slab_bytes as f64 / 1e9, per_part[0] as f64 / 1e9, per_part[1] as f64 / 1e9);
+                crate::say!("inkling2: preloaded {n_full}/{} expert layers ({:.2} GB: {:.2} on GPU 0, {:.2} on GPU 1) as contiguous slabs; {} experts, {} used, core {}..{} x{}, budget left {:.2} GB",
+                    c.n_layer, slab_bytes as f64 / 1e9, per_part[0] as f64 / 1e9, per_part[1] as f64 / 1e9,
+                    c.n_expert, c.n_used, c.loop_start, c.loop_end, c.loop_count, crate::deepseek::mat::budget_left() as f64 / 1e9);
             }
-            let all_full = rem.is_none() && layers.iter().all(|l| l.full_exps.is_some());
+            // The layers without a slab: a pool of expert slots in what the budget has left, the CPU worker for the
+            // rest. Not under --fixed-experts, whose numerics must not depend on the placement, and not on a split.
+            let need: Vec<usize> = (0..c.n_layer).filter(|&ip| layers[ip].full_exps.is_none()).collect();
+            let pool = (one_gpu && !need.is_empty() && cpu_share <= 0.0 && std::env::var_os("STRATA_FIXED_EXPERTS").is_none()).then(|| {
+                let runs = run_order(c).into_iter().filter(|r| need.contains(&r.1)).collect();
+                let state = {
+                    let g = dev::get().unwrap();
+                    let d = g.lock().unwrap();
+                    // The K/V rows to the configured context (`m.max_ctx`), the rows it holds at load (`full`) and the
+                    // full prefill chunk: the pool must leave room for what a later 16k prompt allocates while the old
+                    // buffers are still live, or the growth drops it (see `state_bytes`).
+                    state_bytes(&*d.parts[0].be, c, kw, m.max_ctx, pf_tokens(), m.output.rows, rank)
+                };
+                super::pool::Pool::new(m, &mut dev::get().unwrap().lock().unwrap(), &need, runs, state)
+            }).flatten();
+            let all_full = rem.is_none() && (0..c.n_layer).all(|ip| layers[ip].full_exps.is_some() || pool.as_ref().is_some_and(|p| p.layer(ip).is_some()));
             let core = c.loop_end - c.loop_start;
             let seg_graph = rem.is_some() && std::env::var_os("STRATA_DS_NO_SEG_GRAPH").is_none()
                 && layers.iter().all(|l| l.full_exps.is_some())
                 && (c.loop_start..c.loop_end).all(|ip| layers[ip].full_exps.as_ref().is_some_and(|fe| fe.part == 0))
                 && (c.loop_count * core) % 2 == 0;
-            Ok(Device { layers, loops, slots, out_query, out_norm, scr, sc_buf, pf: None, s, rank, all_full, rem, seg_graph, loop_nb: 0, graph_keys: [0; 2], synced: 0, ahead: false })
+            Ok(Device { layers, loops, slots, out_query, out_norm, scr, sc_buf, pf: None, s, rank, all_full, rem, seg_graph, loop_nb: 0, pool, graph_keys: [0; 3], synced: 0, ahead: false })
         })();
         made.inspect_err(|e| crate::say!("inkling2: no room in VRAM for the decode state ({e:#}); the tokens run as prompt chunks do")).ok()
     }
@@ -493,9 +567,24 @@ impl Device {
             let free = |d: &dev::Dev| d.parts[0].be.mem_info().map_or(0, |m| m.0);
             if free(&d) < bytes {
                 d.parts[0].be.sync()?;
-                let order: Vec<usize> = (c.loop_start..c.loop_end).chain(0..c.loop_start).chain(c.loop_end..c.n_layer).collect();
                 // Counted here: the driver may report the freed bytes late.
                 let mut short = bytes - free(&d);
+                // The expert pool goes first: its layers then run like the other layers without a slab. The budget
+                // falls by what the K/V rows need, so the expert cache can use the rest of the pool's room.
+                // `unpin_all` runs here, while the device is held: the pool's `Drop` cannot take the lock and would
+                // leave the slots pinned to VRAM that is freed a moment later. The bytes are counted from the pool's
+                // own slots, not from `mem_info` after the drop: the driver may report freed VRAM late (as the count
+                // above notes), and a late report made the layer loop below take expert layers it did not need to.
+                if let Some(mut p) = self.pool.take() {
+                    let got = p.unpin_all(&mut d);
+                    let freed = got.min(short);
+                    d.parts[0].budget = d.parts[0].budget.saturating_sub(freed);
+                    short -= freed;
+                    drop(p);
+                    // The pooled layers have no experts on the device now: `step_fast` would skip their FFN.
+                    self.all_full = false;
+                }
+                let order: Vec<usize> = (c.loop_start..c.loop_end).chain(0..c.loop_start).chain(c.loop_end..c.n_layer).collect();
                 for &ip in order.iter().rev() {
                     if short == 0 { break; }
                     if let Some(fe) = self.layers[ip].full_exps.take() {
@@ -587,12 +676,14 @@ impl Device {
         let (mut emb, mut cur) = (vec![0f32; n], vec![0f32; n]);
         m.tok_embd.row_into(tok as usize, &mut emb);
         rms_norm_w(&emb, &m.tok_norm, c.eps, &mut cur);
-        let d = dev::get().unwrap().lock().unwrap();
+        let mut d = dev::get().unwrap().lock().unwrap();
         let be = &*d.parts[0].be;
-        (|| -> Result<(Vec<f32>, u32)> {
+        let out = (|| -> Result<(Vec<f32>, u32)> {
             if !self.ahead { self.to_device(m, be, pos)?; }
             be.put(&cur, &self.scr, ((self.s.cur - o) / 4) as usize)?;
             be.put(&[pos as i32], &self.scr, ((self.s.pos - o) / 4) as usize)?;
+            let seq = self.pool.as_mut().map_or(0, |p| p.worker.begin());
+            be.put(&[pos as i32, seq as i32], &self.scr, ((self.s.step - o) / 4) as usize)?;
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::hash::DefaultHasher::new();
@@ -695,13 +786,88 @@ impl Device {
                     be.argmax_rows(self.s.logits, c.n_vocab, 1, self.s.amax)?;
                 }
             }
-            if argmax {
-                let id = be.get::<i32>(&self.scr, ((self.s.amax - o) / 4) as usize, 1)?[0] as u32;
-                Ok((Vec::new(), id))
+            let out = if argmax {
+                (Vec::new(), be.get::<i32>(&self.scr, ((self.s.amax - o) / 4) as usize, 1)?[0] as u32)
             } else {
-                Ok((be.get(&self.scr, ((self.s.logits - o) / 4) as usize, c.n_vocab)?, 0))
+                (be.get(&self.scr, ((self.s.logits - o) / 4) as usize, c.n_vocab)?, 0)
+            };
+            Ok(out)
+        })().expect("inkling2 device fast step");
+        // The read waited for the token: the pool's slots are free to change.
+        if let Some(p) = &mut self.pool {
+            p.adapt(&mut d).expect("inkling2 expert pool");
+            if std::env::var_os("STRATA_DS_PROF").is_some() && pos % 32 == 0 {
+                let [hit, miss, moved] = std::mem::take(&mut p.stats);
+                eprintln!("PROF pool at {pos}: {hit} expert uses in VRAM, {miss} on the CPU, {moved} copied in; CPU worker {:.1} ms a token",
+                    p.worker.busy().as_secs_f64() * 1e3 / p.tokens.max(1) as f64);
             }
-        })().expect("inkling2 device fast step")
+        }
+        out
+    }
+
+    /// The core passes as one HIP/CUDA graph when every core layer has its experts in VRAM: about 1100 launches a
+    /// token that would otherwise each leave the card idle for a few microseconds. Recorded again every 64
+    /// positions (the attention's row bound) and when a buffer moves. False: the caller runs the layers one by one.
+    fn core_graph(&mut self, m: &Inkling2Model, pos: usize, nb: &mut usize) -> bool {
+        let c = &m.cfg;
+        if !(c.loop_start..c.loop_end).all(|ip| self.layers[ip].full_exps.as_ref().is_some_and(|fe| fe.part == 0)) { return false; }
+        let (n, core, o) = (c.n_embd, c.loop_end - c.loop_start, self.scr.addr());
+        let n_pre = *nb;
+        // The block count after the last pass: the passes after the first start again from the prelude's.
+        let nb_end = n_pre + (c.loop_start..c.loop_end).filter(|ip| ip % c.block_size == 0).count();
+        let swaps = core * c.loop_count;
+        let d = dev::get().unwrap().lock().unwrap();
+        let be = &*d.parts[0].be;
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::hash::DefaultHasher::new();
+            (pos / 64, n_pre, self.sc_buf.addr(), self.s.cur).hash(&mut h);
+            for sl in &self.slots { sl.k.addr().hash(&mut h); }
+            0x494E_4B43_0000_0000u64 | (h.finish() & 0x0000_FFFF_FFFF_FFFF)
+        };
+        let last = std::mem::replace(&mut self.graph_keys[2], key);
+        let s0 = self.s;
+        (|| -> Result<()> {
+            if last != 0 && last != key { be.graph_drop(last)?; }
+            be.put(&[pos as i32], &self.scr, ((self.s.pos - o) / 4) as usize)?;
+            let mut ran = false;
+            be.graph(key, &mut || {
+                ran = true;
+                self.s = s0;
+                let mut nb = n_pre;
+                for pass in 0..c.loop_count {
+                    let n_bank = nb.saturating_sub(n_pre + 1);
+                    if pass > 0 {
+                        let s = self.s;
+                        if n_bank > 0 {
+                            be.dtod(&self.scr, (s.blocks - o) as usize + 4 * (n_pre + 1) * n, &self.scr, (s.bank - o) as usize, 4 * n_bank * n)?;
+                        }
+                        be.dtod(&self.scr, (s.cur - o) as usize, &self.scr, (s.outb - o) as usize, 4 * n)?;
+                        be.dtod(&self.scr, (s.prelude - o) as usize, &self.scr, (s.cur - o) as usize, 4 * n)?;
+                        nb = n_pre;
+                    }
+                    for ip in c.loop_start..c.loop_end {
+                        let il = if pass == 0 { ip } else { c.n_layer + (pass - 1) * core + ip - c.loop_start };
+                        if pass > 0 {
+                            let s = self.s;
+                            be.ink_mix(s.bank, n_bank, s.outb, self.loops[ip - c.loop_start].msg_query.addr(), 4, s.msg, n)?;
+                        }
+                        self.layer_attn(be, &d, m, il, ip, pass > 0, pos, true, &mut nb)?;
+                        self.layer_ffn_gpu(be, m, il, ip)?;
+                    }
+                }
+                anyhow::ensure!(nb == nb_end, "inkling2 core graph: {nb} blocks, expected {nb_end}");
+                Ok(())
+            })?;
+            // A replay runs nothing here: put the scratch roles where the layers would have left them.
+            if !ran {
+                self.s = s0;
+                if swaps % 2 == 1 { (self.s.cur, self.s.x) = (s0.x, s0.cur); }
+            }
+            Ok(())
+        })().expect("inkling2 device core graph");
+        *nb = nb_end;
+        true
     }
 
     fn step_layers(&mut self, m: &Inkling2Model, tok: u32) -> usize {
@@ -723,6 +889,10 @@ impl Device {
         // Every pass of the core starts from the prelude output.
         copy(&*lock().parts[0].be, &self.scr, self.s.cur, self.s.prelude);
         let n_pre = nb;
+        if self.core_graph(m, pos, &mut nb) {
+            for il in c.loop_end..c.n_layer { self.layer(m, il, il, false, pos, &mut nb); }
+            return nb;
+        }
         for pass in 0..c.loop_count {
             // The bank of the previous pass: its blocks after the first core block, and its output.
             let n_bank = nb.saturating_sub(n_pre + 1);
@@ -816,7 +986,10 @@ impl Device {
         }
         let target = need_nt.max(pf_tokens());
         let mut tries = vec![target];
-        if need_nt < target { tries.push(need_nt.max(128)); tries.push(need_nt.max(64)); tries.push(need_nt); }
+        // A smaller scratch when VRAM is short: halve down to 256 rows, then the old small sizes.
+        let mut cap = target / 2;
+        while cap >= 256 && cap >= need_nt { tries.push(cap); cap /= 2; }
+        if need_nt < 256 { tries.push(need_nt.max(128)); tries.push(need_nt.max(64)); tries.push(need_nt); }
         let mut last_err = None;
         for cap in tries {
             match PrefillScratch::alloc(be, c, self.rank, vocab_rows, cap, false) {
@@ -901,6 +1074,15 @@ impl Device {
 
     /// Run a chunk of token IDs or raw vision embeddings (`Some(emb)` skips `tok_norm`, matching `inkling2.cpp::build_inputs`).
     /// When `capture_dspark` is true, also returns the 4 target layer hidden states `[5, 23, 41, 48]` (`[4][nt][n_embd]`).
+    /// Rows the next prompt chunks may have: `want`, or half of it down to 256 when VRAM has no room for that scratch.
+    pub(super) fn prefill_rows(&mut self, m: &Inkling2Model, want: usize) -> usize {
+        let d = dev::get().unwrap().lock().unwrap();
+        let be = &*d.parts[0].be;
+        let mut cap = want;
+        while cap > 256 && self.ensure_pf(be, &m.cfg, m.output.rows, cap).is_err() { cap /= 2; }
+        cap
+    }
+
     pub(super) fn prefill_chunk_seq(
         &mut self,
         m: &Inkling2Model,
@@ -1365,6 +1547,19 @@ impl Device {
                 be.add(*x_a, p.acc2, nt * n)?;
                 m.lap(5, t_gpu);
                 true
+            } else if self.pool.as_ref().is_some_and(|q| q.has_room(ip)) {
+                m.lap(0, t_prep);
+                let t_gpu = std::time::Instant::now();
+                let on = self.prefill_ffn_pool(be, m, ip, nt, small, h)?;
+                if on {
+                    if verify_mode {
+                        be.dtod(&pf.acc_buf, 0, &pf.conv_log, log_base + 4 * VERIFY_MAX * (2 * kw + n), 4 * nt * n)?;
+                    }
+                    be.ink_conv_batch(pf.acc_buf.addr(), l.convs[3].addr(), 0, hist(3), p.acc2, n, nc, hd, nt)?;
+                    be.add(*x_a, p.acc2, nt * n)?;
+                    m.lap(5, t_gpu);
+                }
+                on
             } else {
                 be.rms_norm(h, n, l.ffn_norm.addr(), p.hn, n, n, nt, c.eps)?;
                 m.lap(0, t_prep);
@@ -1481,6 +1676,135 @@ impl Device {
             be.moe_combine_seq(pf.acc_buf.addr(), p.d, p.wts, ma + inv_off as u64, k, 0, 0, n, nt)?;
         }
         Ok(())
+    }
+
+    /// The routed experts of a prompt chunk in a pool layer: the pool's slots, and the chunk's other experts copied
+    /// into the staging slots in rounds of `pool::STAGE`, with a wait before each refill. The experts run in the
+    /// order of their rounds, so a round's rows are one block. False: a small batch with more misses than staging
+    /// slots, left to the host path (`p.hn` holds the normed input).
+    fn prefill_ffn_pool(&self, be: &dyn Backend, m: &Inkling2Model, ip: usize, nt: usize, small: bool, h: u64) -> Result<bool> {
+        use super::pool::STAGE;
+        let (c, ml, l) = (&m.cfg, &m.layers[ip], &self.layers[ip]);
+        let pool = self.pool.as_ref().unwrap();
+        let pl = pool.layer(ip).unwrap();
+        let pf = self.pf.as_ref().unwrap();
+        let (p, buf_o) = (pf.p, pf.buf.addr());
+        let (n, nf, k) = (c.n_embd, c.n_ff_exp, c.n_used);
+        let ((gt, gr, gc), (dt, dr, dc)) = (pl.gu, pl.dn);
+        let (base, stride) = pool.base(pl);
+        let (dn_base, st0) = (base + pl.dn_off as u64, pool.stage(pl));
+        let use_gemm = !small && gc % 64 == 0 && dc % 64 == 0;
+        if use_gemm || gt.float_x() {
+            be.rms_norm(h, n, l.ffn_norm.addr(), p.hn, n, n, nt, c.eps)?;
+        } else {
+            be.rms_norm_q(h, n, l.ffn_norm.addr(), p.hn, n, n, nt, c.eps, p.xh, 0)?;
+        }
+        Self::proj_n(be, &pl.gate_inp, small, nt, p.hn, 0, p.rlogits, 0)?;
+        let gu_sc = pl.gu_scale.as_ref().map_or(0, |b| b.addr());
+        let dn_sc = pl.dn_scale.as_ref().map_or(0, |b| b.addr());
+        be.ink_route(p.rlogits, pl.bias.addr(), p.ids, p.wts, gu_sc, dn_sc, if gu_sc != 0 { p.gsc } else { 0 }, c.n_expert, k, c.exp_scale, nt)?;
+        let ids: Vec<i32> = be.get(&pf.buf, ((p.ids - buf_o) / 4) as usize, nt * k)?;
+        let mut by_e: Vec<Vec<(usize, usize)>> = vec![vec![]; c.n_expert];
+        for (t, row) in ids.chunks_exact(k).enumerate() {
+            for (j, &e) in row.iter().enumerate() { by_e[e as usize].push((t, j)); }
+        }
+        let mut slot = vec![-1i32; c.n_expert];
+        let (mut resident, mut missing) = (vec![], vec![]);
+        for e in (0..c.n_expert).filter(|&e| !by_e[e].is_empty()) {
+            slot[e] = pool.slot(ip, e);
+            if slot[e] >= 0 { resident.push(e) } else { missing.push(e) }
+        }
+        // Staging copies go on the copy queue (`Backend::htod_side`) into `st0 + first..`, and return its mark. The
+        // copy queue first waits for the kernels queued so far, which may still read those slots (an earlier round or
+        // layer run).
+        let stage = |round: &[usize], first: usize, slot: &mut [i32]| -> Result<usize> {
+            be.side_waits(be.main_mark()?)?;
+            for (j, &e) in round.iter().enumerate() {
+                pool.upload_on(be, ip, e, st0 + first + j, true)?;
+                slot[e] = (st0 + first + j) as i32;
+            }
+            be.side_mark()
+        };
+        if !use_gemm {
+            if missing.len() > STAGE { return Ok(false); }
+            if !missing.is_empty() { let m = stage(&missing, 0, &mut slot)?; be.main_waits(m)?; }
+            let sids: Vec<i32> = ids.iter().map(|&e| slot[e as usize]).collect();
+            be.put(&sids, &pf.buf, ((p.ids - buf_o) / 4) as usize)?;
+            let xh_tok_floats = (n + n.div_ceil(32) * 4).div_ceil(16) * 4;
+            for tok0 in (0..nt).step_by(16) {
+                let (bt, ids_a) = ((nt - tok0).min(16), p.ids + (4 * tok0 * k) as u64);
+                let np = bt * k;
+                let gsc_a = if gu_sc != 0 { p.gsc + f(tok0 * k) } else { 0 };
+                let (hn_a, xh_a, acc_a) = (p.hn + f(tok0 * n), p.xh + f(tok0 * xh_tok_floats), pf.acc_buf.addr() + f(tok0 * n));
+                be.moe_gemv(gt, gr, gc, base, stride, ids_a, np, hn_a, n, k, p.y, None, xh_a)?;
+                if dt.float_x() || nf % 32 != 0 {
+                    be.situ(p.y, nf, np, gsc_a, c.situ_beta, c.situ_linear_beta)?;
+                    be.moe_gemv(dt, dr, dc, dn_base, stride, ids_a, np, p.y, 2 * nf, 1, p.d, None, 0)?;
+                } else {
+                    be.situ_q(p.y, nf, np, gsc_a, c.situ_beta, c.situ_linear_beta, p.xq)?;
+                    be.moe_gemv(dt, dr, dc, dn_base, stride, ids_a, np, p.y, 2 * nf, 1, p.d, None, p.xq)?;
+                }
+                be.ink_ffn_sum_n(acc_a, p.d, p.wts + f(tok0 * k), k, n, bt, 0)?;
+            }
+            return Ok(true);
+        }
+        use crate::backend::GEMM_BM;
+        // Groups: the residents, then one per round of misses. The rounds alternate between the two halves of the
+        // staging slots: while the kernels run on one half, the copy queue fills the other, and the residents run
+        // while the first two rounds copy in.
+        const HALF: usize = STAGE / 2;
+        let mut groups: Vec<Vec<usize>> = vec![resident];
+        groups.extend(missing.chunks(HALF).map(|r| r.to_vec()));
+        let rounds = groups.len() - 1;
+        let mut ready = vec![0usize; rounds];
+        let np = nt * k;
+        let (mut xrow, mut inv, mut gsc_rows) = (Vec::with_capacity(np), vec![0i32; np], Vec::with_capacity(np));
+        let mut rows = vec![(0usize, 0usize); c.n_expert];
+        for &e in groups.iter().flatten() {
+            rows[e] = (xrow.len(), by_e[e].len());
+            for &(t, j) in &by_e[e] {
+                inv[t * k + j] = xrow.len() as i32;
+                xrow.push(t as i32);
+                if !ml.gu_scale.is_empty() { gsc_rows.push(ml.gu_scale[e]); }
+            }
+        }
+        let max_tiles = (0..c.n_expert).map(|e| by_e[e].len().div_ceil(GEMM_BM)).sum::<usize>();
+        let dn_off = 16 * max_tiles;
+        let xr_off = 2 * dn_off;
+        let inv_off = xr_off + 4 * np;
+        ensure!(inv_off + 4 * np <= pf.meta.len(), "prefill meta overflow");
+        be.put(&xrow, &pf.meta, xr_off / 4)?;
+        be.put(&inv, &pf.meta, inv_off / 4)?;
+        let gsc_a = if !gsc_rows.is_empty() { be.put(&gsc_rows, &pf.buf, ((p.gsc - buf_o) / 4) as usize)?; p.gsc } else { 0 };
+        let ma = pf.meta.addr();
+        for (gi, g) in groups.iter().enumerate() {
+            // The first two rounds are staged once the residents' kernels are queued: the host's part of a copy (into
+            // the pinned ring) then runs while the card works.
+            if gi == 1 { for i in 0..rounds.min(2) { ready[i] = stage(&groups[1 + i], (i % 2) * HALF, &mut slot)?; } }
+            if gi > 0 { be.main_waits(ready[gi - 1])?; }
+            let (mut tg, mut td) = (vec![], vec![]);
+            for &e in g {
+                let (m0, cnt) = rows[e];
+                let at = slot[e] as u64 * stride as u64;
+                for a in (0..cnt).step_by(GEMM_BM) {
+                    let tag = (m0 + a) as u64 | ((GEMM_BM.min(cnt - a) as u64) << 32);
+                    tg.extend([base + at, tag]);
+                    td.extend([dn_base + at, tag]);
+                }
+            }
+            if tg.is_empty() { continue; }
+            be.put(&tg, &pf.meta, 0)?;
+            be.put(&td, &pf.meta, dn_off / 8)?;
+            let (r0, r1) = (rows[g[0]].0, g.iter().map(|&e| rows[e].0 + rows[e].1).max().unwrap());
+            be.gemm(gt, gr, gc, ma, tg.len() / 2, p.hn, n, nt, ma + xr_off as u64, p.y, 2 * nf, 0)?;
+            be.situ(p.y + f(r0 * 2 * nf), nf, r1 - r0, if gsc_a != 0 { gsc_a + f(r0) } else { 0 }, c.situ_beta, c.situ_linear_beta)?;
+            be.gemm(dt, dr, dc, ma + dn_off as u64, td.len() / 2, p.y, 2 * nf, np, 0, p.d, n, 0)?;
+            // Round r + 2 takes this round's half once the kernels above are done with it (`stage` waits for them).
+            if gi > 0 && gi + 1 < rounds { ready[gi + 1] = stage(&groups[gi + 2], ((gi - 1) % 2) * HALF, &mut slot)?; }
+        }
+        be.memset(&pf.acc_buf)?;
+        be.moe_combine_seq(pf.acc_buf.addr(), p.d, p.wts, ma + inv_off as u64, k, 0, 0, n, nt)?;
+        Ok(true)
     }
 
     fn layer_attn(&self, be: &dyn Backend, d: &dev::Dev, m: &Inkling2Model, il: usize, ip: usize, msgs: bool, pos: usize, graph: bool, nb: &mut usize) -> Result<()> {
@@ -1608,7 +1932,7 @@ impl Device {
     }
 
     fn layer_ffn_gpu(&mut self, be: &dyn Backend, m: &Inkling2Model, il: usize, ip: usize) -> Result<bool> {
-        let Some(fe) = &self.layers[ip].full_exps else { return Ok(false) };
+        let Some(fe) = &self.layers[ip].full_exps else { return self.layer_ffn_pool(be, m, il, ip) };
         Self::ffn_core(be, &m.cfg, self.s, fe)?;
         self.ffn_tail(be, m, il, ip)?;
         Ok(true)
@@ -1631,6 +1955,39 @@ impl Device {
         let acc: Vec<f32> = be1.get(&r.scr, ((rs.acc - o1) / 4) as usize, n)?;
         be0.put(&acc, &self.scr, ((s.acc - o0) / 4) as usize)?;
         self.ffn_tail(be0, m, il, ip)?;
+        Ok(true)
+    }
+
+    /// `layer_ffn_gpu` of a layer in the expert pool: the router and the slot lookup on the device, the experts in a
+    /// slot there, the others on the CPU worker (mailbox `il`), whose sum the combine waits for only after a miss.
+    fn layer_ffn_pool(&mut self, be: &dyn Backend, m: &Inkling2Model, il: usize, ip: usize) -> Result<bool> {
+        let Some(pool) = &self.pool else { return Ok(false) };
+        let Some(pl) = pool.layer(ip) else { return Ok(false) };
+        let (c, ds, s) = (&m.cfg, &self.slots[il], self.s);
+        let (n, hd, nc, nf, k) = (c.n_embd, c.head_dim, c.n_conv, c.n_ff_exp, c.n_used);
+        let hist3 = ds.hist.addr() + f(hists(c).0[3]);
+        let (base, stride) = pool.base(pl);
+        let mb = pool.worker.mb(il);
+        let slots = s.ids + f(k);
+        be.gemv(&pl.gate_inp, s.hn, s.rlogits)?;
+        let gu_sc = pl.gu_scale.as_ref().map_or(0, |b| b.addr());
+        let dn_sc = pl.dn_scale.as_ref().map_or(0, |b| b.addr());
+        let gsc_a = if gu_sc != 0 { s.ids + f(2 * k) } else { 0 };
+        be.ink_route(s.rlogits, pl.bias.addr(), s.ids, s.wc, gu_sc, dn_sc, gsc_a, c.n_expert, k, c.exp_scale, 1)?;
+        be.ink_slots(s.ids, s.wc, pl.table_dev.addr(), slots, s.wh, s.hn, mb, n, pool.worker.layout.h, s.step, k)?;
+        let ((gt, gr, gc), (dt, dr, dc)) = (pl.gu, pl.dn);
+        be.moe_gemv(gt, gr, gc, base, stride, slots, k, s.hn, n, k, s.y, None, s.xh)?;
+        if dt.float_x() {
+            be.situ(s.y, nf, k, gsc_a, c.situ_beta, c.situ_linear_beta)?;
+            be.moe_gemv(dt, dr, dc, base + pl.dn_off as u64, stride, slots, k, s.y, 2 * nf, 1, s.d, None, 0)?;
+        } else {
+            be.situ_q(s.y, nf, k, gsc_a, c.situ_beta, c.situ_linear_beta, s.xq)?;
+            be.moe_gemv(dt, dr, dc, base + pl.dn_off as u64, stride, slots, k, s.y, 2 * nf, 1, s.d, None, s.xq)?;
+        }
+        be.ink_ffn_sum_mb(s.acc, s.d, s.wh, k, n, mb, pool.worker.layout.y, s.step, slots)?;
+        be.ink_conv(s.acc, self.layers[ip].convs[3].addr(), 0, hist3, s.acc, n, nc, hd)?;
+        be.add(s.x, s.acc, n)?;
+        (self.s.cur, self.s.x) = (s.x, s.cur);
         Ok(true)
     }
 
@@ -1712,7 +2069,7 @@ impl Device {
         let be = &*d.parts[0].be;
         match gpu {
             Some(tg) => {
-                m.balance(&m.cpu_share, adapt, tg, tc);
+                m.balance_split(adapt, tg, tc);
                 // `cpu` and `r` are per-dimension sums (`run_experts` returns the weighted mix), not per-expert
                 // weights: both have length `n`, and the elementwise add is the host total.
                 debug_assert_eq!(cpu.len(), n);

@@ -131,6 +131,8 @@ the KV cache than a 16 GB card has left over for experts, so the run above strea
 - `STRATA_NO_GRAPH=1` turns capture off for both GPU backends.
 - `STRATA_HIP_WMMA=0` uses the CUDA-core multiplications in the prefill GEMM and in both products of the prefill
   attention instead of the matrix cores.
+- `STRATA_DS_FAST_KERNELS=0` runs Inkling 2 on the older attention and controller kernels (see "Faster Inkling 2
+  kernels" below); `1` forces the faster ones under `--fixed-experts` too.
 
 ## Why the prefill GEMM does not use int8 matrix cores
 
@@ -187,6 +189,101 @@ FP32 scan, and on CUDA it is 0.73-0.87x, i.e. slower.
    from 10% to 1% with the faster attention says the copies now wait on the CPU less than they used to).
 2. Decode on an MoE model: the expert residency policy, not a kernel. That is where the multi-x is (see the reference
    numbers from Strata in the handoff).
+
+## Inkling 2 decode
+
+Inkling 2 Mini UD-Q4_K_XL, 9070 XT, X470 (PCIe 3.0) with dual-channel DDR4 (36 GB/s read), `bench --pp 512 --tg 64`.
+The core layers (6..18, run three times) and the prelude keep all 128 experts in VRAM as slabs. What does not fit runs
+as hybrid layers: the host routes, the GPU runs the cached experts and the CPU the rest. These are the coda, layers
+20-23 of which are Q8_0 at 8.5 MB an expert.
+
+| | 18 slabs (desktop holds 3.3 GB) | 22 slabs (desktop idle) |
+|---|---|---|
+| before | 34.5 tok/s | 48.2 tok/s |
+| after | 39.5 tok/s | 51.8 tok/s |
+
+A token at 18 slabs: 13.5 ms of kernels, then ~9 ms of CPU experts (32 of the coda's 48, 260 MB at 29 GB/s, near the
+DRAM limit). What changed, largest first:
+
+- Copying a missed expert up for one use cost 2.5 ms and the CPU 0.25 ms. The share controller balanced the two sides'
+  times, but a layer has about six misses, so it settled on one copy in most layers and a sync in every one. `plan`
+  now picks the split from the measured cost of one expert on each side (`stage_count`): here, no copies.
+- The VRAM cache froze with what prefill touched first. `Dev::admit` gives a slot to an expert used more often than
+  the coldest resident one. The coda routes are skewed (100 experts out of 768 take 60-67% of the uses), and layers
+  18-19 went from about 9 to 15 of their 16 uses on the GPU. Q8_0 layers cannot take NVFP4 slots, and no VRAM is left.
+- The core passes run as one graph in the hybrid step (`core_graph`): 0.8 ms.
+
+### The expert pool
+
+Since then, every layer keeps only its most used experts in VRAM (`inkling2/forward/pool.rs`), and a decode token
+never comes back to the host:
+
+- `ink_route` routes on the device, and `ink_slots` looks each expert up in the layer's slot table. An expert that
+  is not in VRAM goes to the CPU worker (`worker.rs`) through the mailbox of `cpu_worker`, with the routing and
+  the activation. `ink_ffn_sum_mb` waits for the worker's sum only in a layer run that missed. The token is one
+  graph.
+- After each token the routing counts (decayed per token) decide the placement. Up to 4 missed experts go into free
+  slots and 2 into the slots of less used ones. The long counts are saved as
+  `~/.cache/rusting_strata/inkling2-profile-*.f32` when the model goes, and they place the next load.
+- A prompt chunk runs from the same slots. The chunk's other experts are copied into 32 staging slots a pool, in
+  rounds, before the GEMMs run.
+
+| 12 GB weight budget, desktop holds 3 GB | pp 512 | pp 4096 | decode |
+|---|---|---|---|
+| slabs and hybrid layers (above) | 443 tok/s | 438 tok/s | 39.8 / 38.9 tok/s |
+| pool, no profile yet | 329 | 378 | 49.7 / 55.7 |
+| pool, profile of one earlier run | 436 | 426 | 60.5 / 58.9 |
+
+Decode after the prompt of each column. At this budget the pool holds 68% of each layout's experts and keeps 98% of
+a token's expert uses in VRAM; the CPU worker takes 1.8 ms a token. Greedy text is no longer bit-identical to
+Vulkan: the placement decides which experts round on the CPU. `--fixed-experts` keeps the slabs and is.
+`STRATA_INK_SLABS=1` keeps the slabs and pools only the layers they leave out.
+
+### Prompt chunks of 2048 rows
+
+A prompt chunk copies each layer run's missing experts into the staging slots, and a chunk of 256 rows already
+touches most of a layer's 128 experts, so the copies repeated every 256 tokens. Prompt chunks now have 2048 rows
+(`STRATA_DS_PF_TOKENS`); the scratch costs about 0.55 GB of VRAM per 1024 rows, and the chunk halves when it does
+not fit. 9.5 GB weight budget, desktop at 2.2 GB, `bench --pp 512,4096 --tg 32`:
+
+| rows | pp 512 | pp 4096 | decode | peak VRAM, card |
+|---|---|---|---|---|
+| 256 | 265 tok/s | 278 tok/s | 49.5 tok/s | 13.47 GB |
+| 2048 | 387 | 767 | 48.9 | 14.61 GB |
+| 4096 | 393 | 891 | 48.8 | 15.48 GB |
+
+At 2048 rows a core layer run still misses 40-45 of the ~125 experts it uses (6-7% of the uses); most of those
+serve 9 or more rows.
+
+The missed experts are copied on a second stream (`Backend::htod_side`) into two halves of the staging slots: the
+residents run while the first two rounds copy in, then each round runs while the next one fills the other half.
+pp 4096 went from 775 to 834 tok/s (same routing profile, greedy text unchanged); with the copies left out it would
+be 1105. What is left is the host's copy into the pinned ring (one thread, about 10 GB/s; more threads did not help)
+and the routing read at each layer, before which no copy can start.
+
+`STRATA_INK_PIN=1` page-locks the pooled experts in the mapped file (`hipHostRegister`, read-only; 15.8 GB in
+1.8 s), so the staging copies and the pool's swaps between tokens are DMAs from the file's pages: pp 4096 855 tok/s,
+decode 51-53. It keeps that much RAM locked while the model is loaded, so it is not the default. 64 or 96 staging
+slots instead of 32 were slower (838, 823): each one is a pool slot less.
+
+Left: `ink_mix` runs 120 times a token at 12 µs in one workgroup (about 1 ms, but a faster reduction order breaks the
+bit parity with Vulkan), and a first run without a profile.
+
+### Faster Inkling 2 kernels
+
+By default HIP runs Inkling 2 on the kernels that the CUDA backend uses only with two cards (`InkFlags`): the
+key-parallel prompt attention `ink_attn_prefill_128_kp16`, the tiled loop controllers for prompt chunks and the
+128-key decode attention `ink_attn_128`. They sum in another order than the older kernels, so greedy text can differ
+from the older kernels and from Vulkan at a near tie. `--fixed-experts` keeps the older kernels, and its output stays
+bit-identical to Vulkan. `STRATA_DS_FAST_KERNELS` switches them as on CUDA.
+
+The prompt attention was 54% of the kernel time of a 4096-token prompt. With the faster set, `bench --pp 512,4096
+--tg 64`, alternating runs with a browser open on the desktop:
+
+| | pp 4096 | decode |
+|---|---|---|
+| older kernels | 701, 908, 1001 tok/s | 51-62 tok/s |
+| faster kernels | 1531, 1648, 1686 tok/s | 52-66 tok/s |
 
 ## Credits
 
