@@ -436,6 +436,22 @@ impl Engine {
         Ok(())
     }
 
+    /// `--vram-margin` for Inkling 2, whose forward keeps its own VRAM state outside the `dev` budget: the weights
+    /// leave that much of every device free and the expert pool leaves what the K/V growth to the context still needs.
+    /// Before the model opens the GPUs, so the weight budget is computed with it. The other model families never call
+    /// this and keep the budget their fraction of free VRAM gives.
+    fn inkling_margin(&self) -> anyhow::Result<()> {
+        let mb = vram_margins(&self.vram_margin, &self.device)?;
+        rusting_strata::deepseek::mat::dev_set_margin_mb(&mb);
+        Ok(())
+    }
+
+    /// The per-device `--vram-margin` (MB) a model of its own forward gets: Some for Inkling 2, None for the others.
+    fn own_margin(&self, g: &Gguf) -> anyhow::Result<Option<Vec<usize>>> {
+        let ink = g.get("general.architecture").ok().and_then(|v| v.as_str()).is_some_and(rusting_strata::inkling2::is_arch);
+        Ok(ink.then(|| vram_margins(&self.vram_margin, &self.device)).transpose()?)
+    }
+
     /// Models on their own code path never call `Engine::runner`, the only place that reads a calibration file.
     /// Apply the measured chunk through the environment those engines actually read. Context and threads are not
     /// searched (they are memory choices), so this never touches the global CTX: doing that once made an explicit
@@ -1459,6 +1475,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 return rusting_strata::raon::chat::generate(&g, &prompt, n, engine.draft_model.as_deref());
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) .is_some_and(rusting_strata::inkling2::is_arch) {
+                engine.inkling_margin()?;
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 let max_ctx = 0;
                 let mmproj = engine.mmproj_for(&model);
@@ -1531,6 +1548,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let mut ink = if g.get("general.architecture").ok().and_then(|v| v.as_str()).is_some_and(rusting_strata::inkling2::is_arch) {
                 rusting_strata::inkling2::chat::gpu_defaults();
                 engine.ds_env()?;
+                engine.inkling_margin()?;
                 Some(rusting_strata::inkling2::forward::Inkling2Model::new_with_ctx(&g, n)?)
             } else {
                 None
@@ -1828,6 +1846,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 return rusting_strata::raon::chat::chat(&g, system, n, think, engine.draft_model.as_deref());
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) .is_some_and(rusting_strata::inkling2::is_arch) {
+                engine.inkling_margin()?;
                 let max_ctx = 0;
                 let mmproj = engine.mmproj_for(&model);
                 let opts = rusting_strata::inkling2::chat::Inkling2Opts {
@@ -2410,6 +2429,7 @@ fn bench_inkling2(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, 
     // The same defaults `chat`, `generate` and `serve` set: without them the plain weights spread over both cards,
     // `Device::new` refuses the second one and the whole benchmark runs the host path (about a fifth of the speed).
     rusting_strata::inkling2::chat::gpu_defaults();
+    engine.inkling_margin()?;
     let tok = Tokenizer::from_gguf(g)?;
     let max_ctx = engine.ctx.max(pp.iter().copied().max().unwrap_or(0) + tg + 64);
     let opts = rusting_strata::inkling2::chat::Inkling2Opts {
@@ -3831,8 +3851,10 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
     let arch = g.get("general.architecture")?.as_str().context("general.architecture")?;
     s.stats.lock().unwrap().ctx_train = g.meta.get(&format!("{arch}.context_length")).and_then(|v| v.as_u64());
     let tok = Tokenizer::from_gguf(&g)?;
-    // Declared before the model, so it is dropped after it.
-    let _own = rusting_strata::config::OWN_ARCHS.contains(&arch).then(OwnState::new);
+    // Declared before the model, so it is dropped after it. `--vram-margin` reaches the `dev` budget only for
+    // Inkling 2: its pool and graphs need the room, the other architectures keep the fraction's budget.
+    let margin_mb = engine.own_margin(&g)?;
+    let _own = rusting_strata::config::OWN_ARCHS.contains(&arch).then(|| OwnState::new(margin_mb.as_deref()));
     let (aux_g, m);
     let mut r = if _own.is_some() {
         let mmproj = engine.mmproj_for(model);
@@ -3893,13 +3915,17 @@ fn gpu_stats(r: &Runner, s: &mut serve::Stats) {
 struct OwnState(Vec<(&'static str, Option<std::ffi::OsString>)>);
 
 impl OwnState {
-    fn new() -> OwnState {
+    /// Called before a model of its own forward opens the GPUs: `margin` is the Inkling 2 `--vram-margin` (None for
+    /// the other architectures, which keep the budget their fraction of free VRAM gives).
+    fn new(margin: Option<&[usize]>) -> OwnState {
+        if let Some(mb) = margin { rusting_strata::deepseek::mat::dev_set_margin_mb(mb) }
         OwnState(["STRATA_DS_GPU", "STRATA_DS_GPU_FRACTION", "STRATA_DS_GPU_EXPERTS", "STRATA_DS_NOEVICT", "STRATA_GLM_PREFETCH"].map(|k| (k, std::env::var_os(k))).into())
     }
 }
 
 impl Drop for OwnState {
     fn drop(&mut self) {
+        // `dev_free` clears the margin too.
         rusting_strata::deepseek::mat::dev_free();
         for (k, v) in &self.0 {
             unsafe { match v { Some(v) => std::env::set_var(k, v), None => std::env::remove_var(k) } }
@@ -4668,7 +4694,7 @@ mod bench_tests {
     fn own_state_restores_the_environment() {
         // Safety: no other test reads this variable.
         unsafe { std::env::remove_var("STRATA_GLM_PREFETCH") };
-        let st = super::OwnState::new();
+        let st = super::OwnState::new(None);
         unsafe { std::env::set_var("STRATA_GLM_PREFETCH", "2") };
         drop(st);
         assert!(std::env::var_os("STRATA_GLM_PREFETCH").is_none());

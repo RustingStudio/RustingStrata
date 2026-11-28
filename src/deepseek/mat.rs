@@ -53,6 +53,9 @@ pub(crate) mod dev {
         pinned: std::collections::HashSet<usize>,
     }
     static DEV: LazyLock<Mutex<Dev>> = LazyLock::new(Default::default);
+    /// VRAM each device keeps free beyond the weight budget (`--vram-margin`, in bytes, in `--device` order): empty
+    /// when no caller gave one.
+    static MARGIN: LazyLock<Mutex<Vec<usize>>> = LazyLock::new(|| Mutex::new(vec![]));
     /// Whether `DEV` is open: None before the first `get` and after `free`.
     static OPEN: Mutex<Option<bool>> = Mutex::new(None);
     pub fn get() -> Option<&'static Mutex<Dev>> {
@@ -64,12 +67,30 @@ pub(crate) mod dev {
         }
         on.unwrap().then(|| &*DEV)
     }
+    /// Keep `margins[i]` bytes of the i-th device free beyond the weight budget (`--vram-margin`; the Inkling 2
+    /// commands pass it, the other model families leave it empty and keep the budget their fraction of free VRAM
+    /// gives). Set before the GPUs open, as `open` applies it to the budget it computes; afterwards only the forwards
+    /// that read it (the expert pool) see it. Empty or a zero entry: no cap.
+    pub fn set_margin(margins: &[usize]) {
+        *MARGIN.lock().unwrap() = margins.to_vec();
+    }
+    /// The i-th device's margin, 0 when none was given.
+    fn margin_of(i: usize) -> usize { MARGIN.lock().unwrap().get(i).copied().unwrap_or(0) }
+    /// The largest of the margins: what a buffer allocated after the weights (the expert pool) leaves free on GPU 0.
+    pub fn max_margin() -> usize { MARGIN.lock().unwrap().iter().copied().max().unwrap_or(0) }
+    /// The weight budget a part gets: the fraction's (or the GB setting's) share, capped so that `margin` bytes stay
+    /// free.
+    fn capped_budget(budget: usize, free: usize, margin: usize) -> usize {
+        budget.min(free.saturating_sub(margin))
+    }
     /// Frees the GPUs and everything uploaded to them; the next `get` opens them again from the environment. For a
     /// server that changes models: call it once the model that used them is dropped.
     pub fn free() {
         let mut on = OPEN.lock().unwrap();
         *DEV.lock().unwrap() = Dev::default();
         *on = None;
+        // A load that never sets one (before the architecture is known) keeps the other families' old budget.
+        MARGIN.lock().unwrap().clear();
     }
     /// The share of `free` bytes of VRAM that `STRATA_DS_GPU_FRACTION` gives to the weights: one value, or
     /// `small,large` with `small` for a card that has less than 8 GB free.
@@ -105,6 +126,20 @@ pub(crate) mod dev {
         assert!(!plain_first_enabled_from(Some("0")));
         assert!(plain_first_enabled_from(Some("1")));
     }
+    /// `--vram-margin` caps each part's weight budget at `free - margin`; without one the fraction's budget stands
+    /// (the other model families keep theirs).
+    #[test]
+    fn budget_leaves_the_vram_margin_free() {
+        let mib = 1 << 20;
+        // The fraction's budget when it already leaves the margin free.
+        assert_eq!(capped_budget(6 << 30, 8 << 30, 512 * mib), 6 << 30);
+        // Capped by the margin: free less 512 MB, as `--vram-margin 512` should.
+        assert_eq!(capped_budget(8 << 30, 8 << 30, 512 * mib), (8 << 30) - 512 * mib);
+        // No margin given: the budget stands.
+        assert_eq!(capped_budget(8 << 30, 8 << 30, 0), 8 << 30);
+        // A card with less free VRAM than the margin: no weight budget rather than a negative one.
+        assert_eq!(capped_budget(1 << 30, 256 * mib, 512 * mib), 0);
+    }
     #[test]
     fn expert_group_is_consumed_on_a_cache_hit() {
         let mut d = Dev::default();
@@ -137,13 +172,15 @@ pub(crate) mod dev {
         }
         let free: Vec<usize> = bes.iter().map(|b| b.mem_info().map_or(1, |m| m.0.max(1))).collect();
         let total: usize = free.iter().sum();
-        let parts = bes.into_iter().zip(&free).map(|(be, &f)| {
+        let parts = bes.into_iter().zip(&free).enumerate().map(|(i, (be, &f))| {
             // Room for a prefill chunk of activations and outputs, so row batches reuse them instead of allocating per expert.
             let (x, y, stage) = (be.alloc(4 * SCRATCH).ok()?, be.alloc(4 * SCRATCH).ok()?, be.alloc(STAGE).ok()?);
             let budget = match gb {
                 Some(g) => (g * 1e9 * f as f64 / total as f64) as usize,
                 None => (f.saturating_sub(56 << 20) as f64 * frac(f)) as usize,
             };
+            // `--vram-margin` of the caller, when it gave one: that much of this device stays free beyond the weights.
+            let budget = capped_budget(budget, f, margin_of(i));
             // Room for the plain weights before moving on to the next GPU: what is free, less the expert cache and a margin.
             let room = f.saturating_sub(budget + (768 << 20));
             Some(Part { be, ts: vec![], x, y, stage, bytes: 0, budget, room })
@@ -980,6 +1017,15 @@ pub fn attn_sel(q: &[f32], k: &[u16], v: &[u16], idx: &[u32], cnt: &[i32], nt: u
 }
 /// `dev::free`, for a server that changes models.
 pub fn dev_free() { dev::free() }
+/// `dev::set_margin`: the VRAM each device keeps free beyond the weight budget (`--vram-margin`, in bytes, in
+/// `--device` order).
+pub fn dev_set_margin(margins: &[usize]) { dev::set_margin(margins) }
+/// `dev::set_margin` from a per-device margin list (`--vram-margin`, MB), for the models whose forward keeps its own
+/// VRAM state outside the budget (Inkling 2).
+pub fn dev_set_margin_mb(margins: &[usize]) { dev::set_margin(&margins.iter().map(|mb| mb << 20).collect::<Vec<_>>()) }
+/// The largest per-device `--vram-margin`, for the buffers a forward allocates after the weight budget (Inkling 2's
+/// expert pool leaves that much free on GPU 0).
+pub fn dev_margin() -> usize { dev::max_margin() }
 /// The first GPU's backend, device name and (used, total) bytes of memory, for the server's side panel.
 pub fn dev_stats() -> Option<(&'static str, String, Option<(u64, u64)>)> {
     dev::get().map(|d| { let b = &d.lock().unwrap().parts[0].be; (b.name(), b.device(), b.mem_info().ok().map(|(f, t)| ((t - f) as u64, t as u64))) })
