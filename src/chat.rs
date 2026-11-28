@@ -125,9 +125,10 @@ impl Msg {
     pub fn new(role: &str, content: &str) -> Msg { Msg { role: role.into(), content: content.into(), reasoning: None, calls: vec![], images: vec![] } }
 
     /// Parses one OpenAI message. Roles are limited to the ones the templates know, because the role goes into the
-    /// prompt verbatim.
+    /// prompt verbatim. OpenAI's `developer` role means `system` and is read as one (#136).
     pub fn from_json(m: &Json) -> anyhow::Result<Msg> {
         let role = m.get("role").as_str().context("message without role")?;
+        let role = if role == "developer" { "system" } else { role };
         if !["system", "user", "assistant", "tool"].contains(&role) { bail!("unknown role {role:?}"); }
         let mut images = vec![];
         let content = match m.get("content") {
@@ -762,6 +763,13 @@ impl Think {
 #[cfg(test)]
 mod think_tests {
     use super::*;
+    /// Issue 136: a `developer` message is a `system` message; a role no template knows is still refused.
+    #[test]
+    fn developer_role_is_system() {
+        let m = |r: &str| Msg::from_json(&serde_json::from_str::<Json>(&format!(r#"{{"role":"{r}","content":"be brief"}}"#)).unwrap());
+        assert_eq!(m("developer").unwrap().role, "system");
+        assert!(m("narrator").is_err());
+    }
     /// Issue 122: at every point of a reply, each streamed call is a prefix of the call the finished reply parses to,
     /// and a long string parameter streams before its call ends.
     #[test]
